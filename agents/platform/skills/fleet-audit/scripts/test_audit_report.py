@@ -33065,6 +33065,16 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(len(latest["document"]["findings"]), 4)
         self.assertEqual(self.recorder.calls, [])
 
+    def test_the_stored_envelope_carries_the_summary_as_its_chat_report(self):
+        """#5618: the A2A gateway posts the envelope's report, the words the chat record holds."""
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        report = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual(report["schema"], "kube-agents.report/v1")
+        self.assertEqual(report["text"], out["summary"])
+        self.assertFalse(report["silent"])
+        # A no-ledger summary has its card, the one the cron relay lays out.
+        self.assertEqual(report["card"]["schema"], "kube-agents.chat/v1")
+
     def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
         """#4268: `finish` reads its run's start before its checks. A later
         `start` that rewrites the run record as soon as `findings_predate_run`
@@ -33606,6 +33616,23 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(lines[-1], "Ledger: https://github.com/acme/fleet/issues/7")
         self.assertNotIn("chat_report", self.stdout_json())
 
+    def test_the_stored_envelope_carries_the_ledger_report_as_its_chat_report(self):
+        """#5618: the A2A gateway posts the envelope's report in place of the run's final message."""
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        [(_, text)] = self.entries()
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        report = latest[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual(
+            (report["schema"], report["text"], report["silent"]), ("kube-agents.report/v1", text, False)
+        )
+        # A ledger card needs the fetched issue; the text stands alone.
+        self.assertNotIn("card", report)
+
     def test_detail_lines_sit_between_the_audit_line_and_the_ledger_url(self):
         payload = {"status": "UPDATED", "issue_url": "https://github.com/acme/fleet/issues/7",
                    "new": 2, "resolved": 1, "prs_opened": ["https://github.com/acme/fleet/pull/9"],
@@ -33717,6 +33744,10 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(repo, "acme/fleet")
         self.assertTrue(text.splitlines()[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
         self.assertTrue(text.splitlines()[-1].startswith("Ledger: "))
+        # #5618: the stored envelope carries the same words for the A2A gateway.
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        report = latest[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual((report["text"], report["silent"]), (text, bool(self.stdout_json()["silent_ok"])))
 
     def test_a_finish_with_no_start_does_not_join_a_stale_record(self):
         audit_report.open_chat_report(AUDIT, "acme/a", NOW)
@@ -35492,6 +35523,17 @@ class TestStoreLedger(HarnessTestCase):
         own = self.a_later_start_lands_after_the_staleness_check()
         self.assertEqual(self.finish(make_doc()), 0, self.err)
         self.assert_the_envelope_keeps_its_runs_start(self.latest(), own)
+
+    def test_the_store_ledger_envelope_carries_the_summary_as_its_chat_report(self):
+        """#5618: as stored, the envelope's report is the summary the chat record holds."""
+        self.start()
+        self.touch(self.NETPOL)
+        self.assertEqual(self.finish(make_doc()), 0, self.err)
+        out = self.stdout_json()
+        report = self.latest()[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual(report["schema"], "kube-agents.report/v1")
+        self.assertEqual(report["text"], out["summary"])
+        self.assertEqual(report["silent"], bool(out["silent_ok"]))
 
     # -- the decision ----------------------------------------------------------
 
@@ -38923,3 +38965,37 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnvelopeChatReport(unittest.TestCase):
+    """#5618: the envelope's `report` object, bounded and redacted."""
+
+    def test_the_text_is_cut_on_a_character_boundary_under_its_cap(self):
+        text = "é" * audit_report.ENVELOPE_REPORT_TEXT_MAX
+        report = audit_report.envelope_chat_report(text, False)
+        cut = report["text"].encode("utf-8")
+        self.assertLessEqual(len(cut), audit_report.ENVELOPE_REPORT_TEXT_MAX)
+        self.assertTrue(text.startswith(report["text"]))
+
+    def test_the_text_gets_the_bodys_redaction_backstop(self):
+        secret = "ghp_" + "a" * 36
+        report = audit_report.envelope_chat_report(f"Token {secret} leaked.", True)
+        self.assertNotIn(secret, report["text"])
+        self.assertTrue(report["silent"])
+
+    def test_a_card_over_its_cap_is_left_out(self):
+        fake = type(sys)("slack_audit_report")
+        fake.chat_from_summary = lambda text: ({"schema": "kube-agents.chat/v1", "title": "x" * audit_report.ENVELOPE_REPORT_CARD_MAX}, text)
+        with patch.dict(sys.modules, {"slack_audit_report": fake}):
+            self.assertNotIn("card", audit_report.envelope_chat_report("t", False))
+
+    def test_a_card_that_fails_to_build_leaves_the_text(self):
+        fake = type(sys)("slack_audit_report")
+
+        def boom(text):
+            raise ValueError("no card")
+
+        fake.chat_from_summary = boom
+        with patch.dict(sys.modules, {"slack_audit_report": fake}):
+            report = audit_report.envelope_chat_report("Two findings.", False)
+        self.assertEqual((report["text"], "card" in report), ("Two findings.", False))

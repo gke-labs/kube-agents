@@ -2972,6 +2972,19 @@ MANIFEST_STARTED_KEY = "started_at"
 # so a reader can tell a report from a run that started before its own window
 # from one this run produced, where `finished_at` alone cannot.
 ENVELOPE_STARTED_KEY = "started_at"
+# The chat-ready report `finish` stores in the envelope for the A2A gateway's
+# relay, which posts it in place of the run's final message (#5618,
+# scheduling-on-profiles.md §1 item 2): the same words the chat record holds,
+# whether the run was quiet, and the card where one is built from the text
+# alone. The gateway reads it through the broker and trusts only the broker's
+# writer stamp beside the envelope, never this object, for whose run it is.
+ENVELOPE_REPORT_KEY = "report"
+ENVELOPE_REPORT_SCHEMA = "kube-agents.report/v1"
+# Bounds that keep the envelope well under the store's 1 MiB cap whatever the
+# findings: the gateway cuts the text at the same 24 KiB and drops a card over
+# 32 KiB, so nothing past these would reach a channel.
+ENVELOPE_REPORT_TEXT_MAX = 24 * 1024
+ENVELOPE_REPORT_CARD_MAX = 32 * 1024
 # `report_envelope`'s default for `started_at`: read the run start when the
 # envelope is built. `_finish` passes the start it read before its checks.
 RUN_START_UNREAD = object()
@@ -5014,6 +5027,55 @@ def since_scheduled_line(payload: dict, delta_known: bool = True) -> str | None:
     if not changes:
         return None
     return CHAT_REPORT_SINCE_SCHEDULED_LINE.format(changes=HEADLINE_CLAUSE_SEPARATOR.join(changes))
+
+
+def _clip_utf8(text: str, limit: int) -> str:
+    """`text` cut to at most `limit` UTF-8 bytes on a character boundary."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit].decode("utf-8", errors="ignore")
+
+
+def _summary_chat_card(text: str) -> dict | None:
+    """The `kube-agents.chat/v1` card of a no-ledger summary, or None.
+
+    `slack_audit_report.chat_from_summary` builds it from the text alone, as
+    the cron relay does for the same report; a ledger report's card needs the
+    fetched issue and is left to the text. Optional: anything that keeps the
+    card from building, or one over ENVELOPE_REPORT_CARD_MAX, leaves the text.
+    """
+    try:
+        import slack_audit_report  # noqa: PLC0415 -- on sys.path only with the platform scripts
+
+        built = slack_audit_report.chat_from_summary(text)
+    except Exception as exc:  # noqa: BLE001 -- the card is optional; the text stands
+        log(f"WARNING: no chat card for the stored report: {exc}")
+        return None
+    if built is None or not isinstance(built[0], dict):
+        return None
+    card = _redact_document(built[0])
+    if len(json.dumps(card, ensure_ascii=False).encode("utf-8")) > ENVELOPE_REPORT_CARD_MAX:
+        return None
+    return card
+
+
+def envelope_chat_report(text: str, silent: bool) -> dict:
+    """The envelope's `report` object (ENVELOPE_REPORT_KEY) for `text`.
+
+    `text` is the run's chat report, the words the chat record holds for this
+    repository; `silent` is `finish`'s quiet verdict for it (`silent_ok`).
+    The body's redaction backstop is applied, as to the envelope's document.
+    """
+    report: dict = {
+        "schema": ENVELOPE_REPORT_SCHEMA,
+        "text": _clip_utf8(redact_secrets(text), ENVELOPE_REPORT_TEXT_MAX),
+        "silent": bool(silent),
+    }
+    card = _summary_chat_card(text)
+    if card is not None:
+        report["card"] = card
+    return report
 
 
 def render_chat_report(
@@ -24136,9 +24198,32 @@ def _finish_without_forge(
     envelope.update(marker)
     # A diverted run wrote nothing to the ledger, so when its write fails the
     # stored record of the last published run is still correct.
+    since_scheduled = since_scheduled_line(payload, delta_known)
+
+    def no_forge_summary(held_by_store: bool) -> str:
+        # The store is the only record on this install, so the note says
+        # whether it holds this run rather than promising it.
+        return render_no_forge_summary(
+            audit_id,
+            data,
+            gaps,
+            new_ids,
+            resolved_ids,
+            delta_known,
+            held,
+            unreachable_note(unreachable, stored=held_by_store, probe=probe),
+            len(unpublished),
+            since_scheduled=since_scheduled,
+            unread=unread,
+            stored=held_by_store,
+        )
+
+    # The envelope's report is read only once the store holds it, so it is
+    # rendered as stored.
+    envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(
+        no_forge_summary(True), bool(payload["silent_ok"]) and unreachable is None
+    )
     stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
-    # The store is the only record on this install, so the note says whether
-    # it holds this run rather than promising it.
     note = unreachable_note(unreachable, stored=stored, probe=probe)
     payload["no_forge"] = note
     payload.update(marker)
@@ -24147,20 +24232,7 @@ def _finish_without_forge(
     # every run: the install is set up to publish, and nothing else tells the
     # operator that it does not.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored and unreachable is None
-    payload["summary"] = render_no_forge_summary(
-        audit_id,
-        data,
-        gaps,
-        new_ids,
-        resolved_ids,
-        delta_known,
-        held,
-        note,
-        len(unpublished),
-        since_scheduled=since_scheduled_line(payload, delta_known),
-        unread=unread,
-        stored=stored,
-    )
+    payload["summary"] = no_forge_summary(stored)
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
@@ -24874,29 +24946,37 @@ def _finish_store_ledger(
     envelope[LEDGER_KEY] = LEDGER_STORE
     if listing_refusal:
         envelope[REMEDIATION_REFUSED_KEY] = listing_refusal
+    since_scheduled = since_scheduled_line(payload, delta_known)
+
+    def store_ledger_summary(held_by_store: bool) -> str:
+        return render_no_forge_summary(
+            audit_id,
+            data,
+            gaps,
+            new_ids,
+            resolved_ids,
+            delta_known,
+            held,
+            store_ledger_note(decision, stored=held_by_store, noun=noun),
+            len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
+            since_scheduled=since_scheduled,
+            unread=sorted(unread_ids),
+            stored=held_by_store,
+            prs=payload,
+            unaccounted=unaccounted_ids,
+            noun=noun,
+        )
+
+    # The envelope's report is read only once the store holds it, so it is
+    # rendered as stored.
+    envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(store_ledger_summary(True), bool(payload["silent_ok"]))
     stored = write_report(audit_id, envelope, now, ledger_unchanged=held_open)
     note = store_ledger_note(decision, stored=stored, noun=noun)
     payload[LEDGER_NOTE_KEY] = note
     # The store is the only record of this ledger, so a run it does not hold
     # is never quiet.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored
-    payload["summary"] = render_no_forge_summary(
-        audit_id,
-        data,
-        gaps,
-        new_ids,
-        resolved_ids,
-        delta_known,
-        held,
-        note,
-        len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
-        since_scheduled=since_scheduled_line(payload, delta_known),
-        unread=sorted(unread_ids),
-        stored=stored,
-        prs=payload,
-        unaccounted=unaccounted_ids,
-        noun=noun,
-    )
+    payload["summary"] = store_ledger_summary(stored)
     append_chat_report(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
@@ -26718,23 +26798,25 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             not_rechecked=not_rechecked,
             started_at=run_started,
         )
-        stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         # A HELD line prints no counts, so it keeps its own label.
         whole_run = baseline.from_entry and payload["status"] == "CLEAN"
         run_resolved = 0 if gaps else len(set(baseline.ids) - retired_ids)
         whole_run_payload = whole_run_chat_payload(
             payload, baseline, scheduled, published_ids, gaps, reported_under_gap, retired_ids
         )
+        chat_text = render_chat_report(
+            audit_id,
+            whole_run_payload if whole_run else payload,
+            data,
+            baseline.known if whole_run else delta_known,
+            (0, run_resolved) if whole_run else None,
+        )
+        envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(chat_text, bool(payload["silent_ok"]))
+        stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         append_chat_report(
             audit_id,
             repo,
-            render_chat_report(
-                audit_id,
-                whole_run_payload if whole_run else payload,
-                data,
-                baseline.known if whole_run else delta_known,
-                (0, run_resolved) if whole_run else None,
-            ),
+            chat_text,
             now,
             refinish=bool(payload.get(REFINISH_KEY)),
             whole_run=whole_run,
@@ -27277,7 +27359,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         not_rechecked=unread_entries,
         started_at=run_started,
     )
-    stored = write_report(audit_id, envelope, now)
     run_counts = None
     if baseline.from_entry and baseline.known:
         # The run's delta, on the yardsticks and filters this run's own took.
@@ -27288,18 +27369,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         if gaps or baseline.stale_scheme:
             run_resolved = []
         run_counts = (len(run_new), len(run_resolved))
+    chat_text = render_chat_report(
+        audit_id,
+        whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
+        if baseline.from_entry
+        else payload,
+        data,
+        baseline.known if baseline.from_entry else delta_known,
+        run_counts,
+    )
+    envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(chat_text, bool(payload["silent_ok"]))
+    stored = write_report(audit_id, envelope, now)
     append_chat_report(
         audit_id,
         repo,
-        render_chat_report(
-            audit_id,
-            whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
-            if baseline.from_entry
-            else payload,
-            data,
-            baseline.known if baseline.from_entry else delta_known,
-            run_counts,
-        ),
+        chat_text,
         now,
         refinish=bool(payload.get(REFINISH_KEY)),
         whole_run=baseline.from_entry,
