@@ -83,7 +83,8 @@ _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 MAX_KUBECONFIG_BYTES = 1 << 20
 
 # The broker's read-only Cloud API relay: `GET {broker}/v1/gcp/<host>/<path>`
-# forwards a permitted Google API read on the broker's credential. Declared
+# forwards a permitted Google API read on the broker's credential (a `POST`
+# for the one read whose arguments are a JSON body). Declared
 # here rather than in the broker because both sides spell it and this is the
 # module both import; `credential_proxy` re-exports it. `ApiSession` below is
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
@@ -2301,6 +2302,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # The body is read, or lost: nothing reads the response again. The
             # status stays on the error.
             exc.close()
+        if not isinstance(answer, dict):
+            # Valid JSON, but not an object, so no refusal document either.
+            # The status is the whole answer, as above.
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
@@ -2318,7 +2323,7 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
 
 
 class ApiSession:
-    """A requests-shaped session whose GETs to a Google API go through the broker.
+    """A requests-shaped session whose reads of a Google API go through the broker.
 
     The sandbox holds no Google credential, so a script that needs a Cloud
     Monitoring read cannot call `monitoring.googleapis.com` itself. This
@@ -2391,11 +2396,23 @@ class ApiSession:
         the collectors that make hundreds of these calls own their own pacing
         for a quota refusal.
         """
+        return self._send(url, params=params, timeout=timeout)
+
+    def post(self, url: str, *, json, timeout=None):
+        """One relayed POST of a JSON body, on the same schedule as `get`.
+
+        For a read whose arguments travel in a body, which the broker's table
+        names with a body check (Logging `entries:list`). The broker reads the
+        body, holds it to that check, and forwards its own copy of it.
+        """
+        return self._send(url, timeout=timeout, json_body=json)
+
+    def _send(self, url: str, **kwargs):
         attempts_made = 0
         started = self._clock()
         deadline = retry_deadline_seconds()
         while True:
-            response = self._get_once(url, params=params, timeout=timeout)
+            response = self._get_once(url, **kwargs)
             attempts_made += 1
             if not self._refused_admission(response):
                 return response
@@ -2431,11 +2448,12 @@ class ApiSession:
             return False
         return busy_reply_retryable(self._json_body(response))
 
-    def _get_once(self, url: str, *, params=None, timeout=None, headers=None):
+    def _get_once(self, url: str, *, params=None, timeout=None, headers=None, json_body=None):
         """One relayed GET, moved to the stateful broker when the exec tier cannot be reached.
 
         `headers` are sent beside the caller's credential (the get-credentials
-        check's GET_CREDENTIALS_CHECK_HEADER)."""
+        check's GET_CREDENTIALS_CHECK_HEADER). With `json_body` the request is
+        a POST of that body, for `post`."""
         caller_timeout = timeout
         started = time.monotonic()
         with self._lock:
@@ -2447,6 +2465,13 @@ class ApiSession:
             # refusing it.
             timeout = _exec_connect_bound(timeout)
         try:
+            if json_body is not None:
+                return self._http.post(
+                    self.relay_url(url, endpoint),
+                    json=json_body,
+                    headers={**authorization_headers(), **(headers or {})},
+                    timeout=timeout,
+                )
             return self._http.get(
                 self.relay_url(url, endpoint),
                 params=params,
@@ -2457,7 +2482,7 @@ class ApiSession:
             with self._lock:
                 if self._endpoint == endpoint and self._fallback is not None:
                     # The first reader to fail moves the session. Every relay
-                    # call is a GET, so sending it again is safe even when the
+                    # call is a read, so sending it again is safe even when the
                     # error came after the request left, and the rest of the
                     # session stays on the stateful broker: a missing exec
                     # Service would otherwise cost each read its connect bound.
@@ -2471,7 +2496,7 @@ class ApiSession:
             left = _time_left(caller_timeout, time.monotonic() - started)
             if left is False:
                 raise
-            return self._get_once(url, params=params, timeout=left, headers=headers)
+            return self._get_once(url, params=params, timeout=left, headers=headers, json_body=json_body)
 
 
 def _exec_connect_bound(timeout):

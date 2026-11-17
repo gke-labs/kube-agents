@@ -1027,6 +1027,15 @@ class TestTheRulesReject(unittest.TestCase):
         problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:not-a-role}}", fixtures=["rbac-overgrant", "not-a-role"])
         self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
 
+    def test_a_profile_directive_is_held_to_the_shape_the_harness_reads(self):
+        # #5945: [bench:profile ...] addresses the ask to a profile; a
+        # malformed one errors every run before the agent sees the ask.
+        good = "[bench:profile name=cluster project=p1 location=us-east1 cluster=prod] what is failing"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("name= is required", prompt="[bench:profile project=p1] what is failing")
+        self._only("no closing", prompt="[bench:profile name=cluster what is failing")
+        self._only("must open the prompt", prompt="what is failing [bench:profile name=cluster] here")
+
     def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
         # world-open-ingress is in the catalogue with cluster_slot: null: the
         # runner records no cluster for it, so every run would fail.

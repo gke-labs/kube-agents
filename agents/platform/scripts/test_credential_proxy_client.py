@@ -1062,6 +1062,22 @@ class VcsCallErrorTest(unittest.TestCase):
                     # The status is read off the error after the close.
                     self.assertEqual(caught.exception.status, status)
 
+    def test_a_refusal_whose_json_body_is_not_an_object_is_the_status_alone(self):
+        # Valid JSON, but no refusal document: something between the client and
+        # the broker answered. The caller gets the same error as for a body
+        # that is not JSON, and the refusal is closed.
+        for body in (b"[]", b'"busy"', b"503", b"true", b"null"):
+            for status in (404, 502):
+                with self.subTest(body=body, status=status):
+                    stream = io.BytesIO(body)
+                    error = self._held_refusal(status, stream)
+                    with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                        with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                            credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                    self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
 
 class TestCallerCredential(SubmittedPayloadTestCase):
     """The client half of the broker's authentication.
@@ -1503,6 +1519,10 @@ class ApiSessionTest(unittest.TestCase):
             self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
             return "upstream-response"
 
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            self.calls.append({"method": "POST", "url": url, "json": json, "headers": headers, "timeout": timeout})
+            return "upstream-response"
+
     def setUp(self):
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
@@ -1531,6 +1551,24 @@ class ApiSessionTest(unittest.TestCase):
             self.http.calls,
         )
         self.assertEqual(credential_proxy_client.authorization_headers(), self.http.calls[0]["headers"])
+
+    def test_post_sends_the_json_body_to_the_relayed_url_with_the_caller_token(self):
+        session = credential_proxy_client.ApiSession(http=self.http)
+        body = {"resourceNames": ["projects/kagents-dev"], "filter": "severity>=ERROR", "pageSize": 1000}
+        self.assertEqual(
+            "upstream-response",
+            session.post("https://logging.googleapis.com/v2/entries:list", json=body, timeout=120),
+        )
+        self.assertEqual(
+            [{
+                "method": "POST",
+                "url": f"{self.ENDPOINT}/v1/gcp/logging.googleapis.com/v2/entries:list",
+                "json": body,
+                "headers": {"Authorization": "Bearer caller-token"},
+                "timeout": 120,
+            }],
+            self.http.calls,
+        )
 
     def test_the_relay_prefix_is_the_shared_constant(self):
         session = credential_proxy_client.ApiSession(http=self.http)
@@ -2002,9 +2040,14 @@ class TestBrokerUnreachable(unittest.TestCase):
         """A caller that reads only the URLError (vcs, workspaces) sees no change."""
         import socket
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind(probe.getsockname())
         request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
         with self.assertRaises(urllib.error.URLError) as caught:
             credential_proxy_client.open_broker_request(request)
@@ -2021,6 +2064,7 @@ class TestApiSessionExecTier(unittest.TestCase):
     class FlakyHttp:
         def __init__(self, unreachable_hosts=()):
             self.calls = []
+            self.posted = []
             self.unreachable_hosts = set(unreachable_hosts)
 
         def get(self, url, *, params=None, headers=None, timeout=None):
@@ -2028,6 +2072,10 @@ class TestApiSessionExecTier(unittest.TestCase):
             if urllib.parse.urlsplit(url).netloc in self.unreachable_hosts:
                 raise ConnectionError(f"cannot connect to {url}")
             return "upstream-response"
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            self.posted.append(json)
+            return self.get(url, headers=headers, timeout=timeout)
 
     def setUp(self):
         directory = Path(tempfile.mkdtemp())
@@ -2089,6 +2137,27 @@ class TestApiSessionExecTier(unittest.TestCase):
             [urllib.parse.urlsplit(url).netloc for url in http_.calls],
         )
         self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+
+    def test_a_post_falls_back_with_its_body_when_the_exec_tier_is_down(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        body = {"resourceNames": ["projects/p"]}
+        with patch("sys.stderr", new=io.StringIO()):
+            answer = credential_proxy_client.ApiSession(http=http_).post(
+                "https://logging.googleapis.com/v2/entries:list", json=body
+            )
+        self.assertEqual("upstream-response", answer)
+        self.assertEqual(["exec-tier:8765", "stateful:8765"], [urllib.parse.urlsplit(url).netloc for url in http_.calls])
+        self.assertEqual([body, body], http_.posted, "both attempts are POSTs that carry the body")
+
+    def test_a_post_in_a_custom_universe_goes_to_that_universes_host_on_both_attempts(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_UNIVERSE_DOMAIN": "apis-tpczero.example"}), \
+                patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.ApiSession(http=http_).post(
+                "https://logging.googleapis.com/v2/entries:list", json={"resourceNames": ["projects/p"]}
+            )
+        relayed = f"{credential_proxy_client.API_RELAY_PREFIX}logging.apis-tpczero.example/v2/entries:list"
+        self.assertEqual([self.EXEC + relayed, self.STATEFUL + relayed], http_.calls)
 
     def test_the_exec_attempt_gets_the_shims_connect_bound_and_the_callers_read_timeout(self):
         seen = []
@@ -2225,9 +2294,10 @@ class TestShimEntryRouting(unittest.TestCase):
         self.shim = self.root / "credential-proxy-exec"
         shutil.copy(credential_proxy_client.__file__, self.shim)
         (self.root / "kubectl").symlink_to(self.shim)
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
         self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
         type(self).answers.clear()
         type(self).requests.clear()
@@ -2298,6 +2368,17 @@ class TestShimEntryRouting(unittest.TestCase):
         refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
         self.assertEqual(2, refused.returncode)
         self.assertIn("invalid choice", refused.stderr)
+
+    def test_the_unreachable_port_stays_reserved_during_the_test(self):
+        """Holding the probe socket bound without listening refuses connects while
+        preventing another process from taking the port (#6044)."""
+        import socket
+
+        parsed = urllib.parse.urlsplit(self.closed)
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind((parsed.hostname, parsed.port))
 
 
 class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):

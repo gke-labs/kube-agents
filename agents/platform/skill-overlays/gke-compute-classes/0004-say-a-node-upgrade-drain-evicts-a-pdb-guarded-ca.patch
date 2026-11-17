@@ -2,6 +2,7 @@ Subject: Say a node upgrade drain evicts a PDB-guarded canary after an hour
 
 Why: The lifecycle table's "Low risk" row tells the agent a `maxUnavailable: 0` PDB holds off a node upgrade until the rollout ends, but GKE's upgrade drain respects a PDB for at most one hour and then evicts, so a multi-hour canary needs a maintenance window or exclusion. This replaces the footer correction the skill used to carry, so the agent reads it in the table it loads rather than in a footer that contradicts the table. The CRITICAL K8S DISTINCTION callout below the canary example listed upgrades among the disruptions a PDB protects against; it now points at the one-hour limit.
 Local-Issue: #2692
+Eval-Case: compute-class-canary-active-migration-pdb-probe
 Upstream-Issue: none filed yet
 Retire-When: when the upstream lifecycle reference states the one-hour PDB limit for node upgrades
 

@@ -621,9 +621,10 @@ with "Not a roster admission."
   - the case requests a pull request, which writes to the pool's GitOps repository, and the scan
     asserts nothing there that the case depends on. A repository assertion is a `state` entry
     on the subject that `hack/fleet-fixture-state.py` names in its `REPOSITORY_SUBJECT`
-    constant, so it counts only once the scan really reads pool repositories. It must sit on
-    one of the case's roles, or anywhere in the catalog for a case that lists no role
-    (`repository_asserted_roles` in the test).
+    constant, `repository/<path>`: today the declared-intent note
+    (`knowledge/notification-relay-no-pdb.md`) on the five `declared-*` roles, held by git blob
+    sha to the content provisioning seeds. It must sit on one of the case's roles, or anywhere
+    in the catalog for a case that lists no role (`repository_asserted_roles` in the test).
 
   The admission pull request names the assertion that guards the case. If none exists, it adds
   one to the scan first.
@@ -1043,17 +1044,25 @@ erroring verifier, an empty record on a task that provisions nothing — a recor
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
 case leaves the list.
 
-A broken seeded-fleet fixture is not a reason to demote. After it writes the fleet kubeconfigs,
-`hack/ci-eval-pr.sh` runs `hack/fleet-fixture-state.py` against the leased project. A case
+A broken seeded-fleet fixture is not a reason to demote. After it writes the fleet kubeconfigs
+and mints its grading token, `hack/ci-eval-pr.sh` runs `hack/fleet-fixture-state.py` against
+the leased project. A case
 whose grade depends on a role that scan read and found out of its designed state, after the pool
 verifier's convergence wait and on the hourly scan's last two passes too (a role a
-`fixture_role:` check reads, or the case's only `fixtures:` role) is not run. Each of its repetitions is recorded as infrastructure under `fixture-drift:<role>` and
+`fixture_role:` check reads, or the case's only `fixtures:` role) is not run. A drift the scan
+read in the pool's GitOps repository, the declared-intent note on a `declared-*` role, needs no
+hourly confirmation: the hourly scan holds no credential for that repository and never asserts
+the note, and a file's content does not flap, so the lease-time read alone excuses the cases on
+it. Such a drift surfaces on those records, whose drift line names the command that prints the
+replace command; the pool owner runs it. Each of its repetitions is recorded as infrastructure under `fixture-drift:<role>` and
 the scan's own words, and the suite leaves the case out of its coverage floor, so it cannot
 red or hold a pull request ([the scorer](designs/eval-scorer.md#the-verdict-ladder)). The
 dashboard classes the case `fixture-drift`, the nightly files no `nightly-red` issue for it
 (three such nights in a row file the infra owner's kept-from-running issue, one per case), and the fixture itself is the [seeded-fleet scan](ci-health.md#the-seeded-fleet-scan)'s to
 report. A role the scan could not read, a scan that failed, a pull request that changes the
-fleet catalog, the scan or the case itself: each leaves the case graded as usual.
+fleet catalog, the scan, the seeded content a repository assertion reads against
+(`scripts/gitops_seed_files.py`), the verifier that reads it, or the case itself: each leaves the
+case graded as usual.
 
 A collapse of consistency-drift-outlier on several unrelated pull requests at once is a fleet
 question before it is a case question. Check that seeded-a, -b and -d still carry their master

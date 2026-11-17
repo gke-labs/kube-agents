@@ -2199,6 +2199,13 @@ On GKE, `GKE_PROJECT_ID` is also pinned, to `spec.harness.projectID`. The reconc
 management project when `RECONCILE_PROJECT` is empty, so it is pinned for the same reason. A kind
 install does not pin it, because the container env there carries no project.
 
+`KUBEAGENTS_DIAL_ADMINS` names the Slack members who may change the autonomy dial on the Slack Home
+tab. It is pinned on every install from `spec.deployment.env`, keeping only the comma-separated entries
+shaped like a Slack member ID. Unset, it is pinned empty, which lets nobody change the dial. A value
+none of whose entries is a member ID is pinned as `none`, which also matches nobody. Session KV checks
+a dial change against it before it records one. Unpinned, a line the agent wrote into the PVC `.env`
+could name who may change what the agent may change. It is not in the container env.
+
 The stall watch's three knobs from [`spec.harness.stallWatch`](#specharnessstallwatch) are pinned too:
 `STALL_WATCH_EXCLUDE_NAMESPACES` (a comma list), `STALL_WATCH_MIN_AGE_MINUTES` and
 `STALL_WATCH_KINDS` (a comma list, or `all`). They are pinned on every install, empty when the CR

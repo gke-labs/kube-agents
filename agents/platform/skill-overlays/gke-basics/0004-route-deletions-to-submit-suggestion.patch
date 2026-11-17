@@ -2,6 +2,7 @@ Subject: Route deletions to submit-suggestion
 
 Why: on a delete request the delegated worker loaded gke-basics, not submit-suggestion, and ran `kubectl delete ns` (#3077, measured on #3086's first green run). The description routes deletions to submit-suggestion, and a gotcha says a delete is never `kubectl delete`.
 Local-Issue: #3077
+Eval-Case: delete-namespace-unowned-stops
 Upstream-Issue: none
 Retire-When: never; submit-suggestion is this repository's skill
 
