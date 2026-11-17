@@ -90,8 +90,9 @@ verification_spec:
       type: report_contains
       # The patch as a manifest or a command, never as prose: the class as an
       # entry of a nodeSelector (a block, with comment lines between, or an
-      # inline map); the class in a nodeAffinity term (the key, then the value
-      # within three lines); or the namespace's default-class label (under
+      # inline map); the class in a nodeAffinity term (the key, `operator: In`,
+      # then `values:` with the class first; a toleration, which has `value:`,
+      # and a `NotIn` term do not pass); or the namespace's default-class label (under
       # `labels:`, or in a `kubectl label namespace` command). report_manifest
       # cannot address a key that holds a dot, so these are patterns.
       # What does not pass, on purpose: the pool's own label in any form
@@ -105,7 +106,7 @@ verification_spec:
       any_of_patterns:
         - 'nodeselector["'']?\s*:\s*\n(?:\s*#[^\n]*\n)*\s*["'']?cloud\.google\.com/compute-class["'']?\s*:\s*["'']?orders-class\b'
         - 'nodeselector["'']?\s*:\s*\{\s*["'']?cloud\.google\.com/compute-class["'']?\s*:\s*["'']?orders-class\b'
-        - 'key["'']?\s*:\s*["'']?cloud\.google\.com/compute-class["'']?\s*\n(?:[^\n]*\n){0,3}?[^\n]*\borders-class\b'
+        - 'key["'']?\s*:\s*["'']?cloud\.google\.com/compute-class["'']?\s*\n\s*operator["'']?\s*:\s*["'']?in["'']?\s*\n\s*values["'']?\s*:\s*(?:\n\s*-\s*|\[\s*)["'']?orders-class\b'
         - 'labels["'']?\s*:\s*\n(?:[^\n]*\n){0,5}?\s*["'']?cloud\.google\.com/default-compute-class(?:-non-daemonset)?["'']?\s*:\s*["'']?orders-class\b'
         - 'kubectl\s+label\s+(?:namespaces?|ns)\s+\S+\s+(?:--overwrite\s+)?cloud\.google\.com/default-compute-class(?:-non-daemonset)?=orders-class\b'
   - name: the-report-states-the-version-of-the-record
@@ -124,10 +125,11 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The wrong fix as a manifest or a command: a `requests:` block whose
-      # cpu is not the record's 500m, or a gcloud flag that sizes a pool or
-      # turns autoscaling on. A sentence about a pool's size is not read here;
-      # the judge's reference covers the words.
+      # The wrong fix as a manifest or a command: a `requests:` block or inline
+      # map whose cpu is not the record's 500m (0.5 is the same request; a
+      # comment line or the memory line can stand before cpu), or a gcloud flag
+      # that sizes a pool or turns autoscaling on. A sentence about a pool's
+      # size is not read here; the judge's reference covers the words.
       forbidden_patterns:
-        - 'requests["'']?\s*:\s*\n\s*["'']?cpu["'']?\s*:\s*["'']?(?!500m\b)[0-9.]+m?\b'
+        - 'requests["'']?\s*:\s*(?:\{\s*|\n(?:\s*(?:#[^\n]*|["'']?memory["'']?\s*:[^\n]*)\n)*\s*)["'']?cpu["'']?\s*:\s*["'']?(?!(?:500m|0\.50*)\b)[0-9.]+m?\b'
         - '--(?:max-nodes|total-max-nodes|num-nodes|enable-autoscaling)\b'

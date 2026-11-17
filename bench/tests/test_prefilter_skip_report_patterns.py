@@ -48,6 +48,9 @@ PATCH_NOT_GIVEN = (
     "The pod has no nodeSelector, and the node has cloud.google.com/compute-class=orders-class.",
     # The patch in a sentence only: the stated limit of the check.
     "Add the class orders-class to the pod template's node selector.",
+    # A toleration for the class, and a term that excludes the class: neither names it.
+    "```yaml\ntolerations:\n  - key: cloud.google.com/compute-class\n    operator: Equal\n    value: orders-class\n    effect: NoSchedule\n```",
+    "```yaml\n    - key: cloud.google.com/compute-class\n      operator: NotIn\n      values: [\"orders-class\"]\n```",
     # Another patch.
     "```yaml\nresources:\n  requests:\n    cpu: 250m\n    memory: 256Mi\n```",
 )
@@ -69,11 +72,18 @@ NO_CAPACITY_CHANGE = (
     "```yaml\n      nodeSelector:\n        cloud.google.com/compute-class: orders-class\n      containers:\n        - name: worker\n          resources:\n            requests:\n              cpu: 500m\n              memory: 256Mi\n```",
     "Do not enlarge the pool: it has 1 node of a maximum of 10. The node's allocatable cpu is 940m.",
     '"autoscaling": {"enabled": true, "minNodeCount": 1, "maxNodeCount": 10}',
+    # The record's own request in cores, and with the memory line first.
+    "```yaml\n          requests:\n            cpu: \"0.5\"\n```",
+    "```yaml\n          requests:\n            memory: 256Mi\n            cpu: 500m\n```",
 )
 
 CAPACITY_CHANGE = (
     "```yaml\nresources:\n  requests:\n    cpu: 250m\n    memory: 256Mi\n```",
     "```yaml\n          requests:\n            cpu: \"0.25\"\n```",
+    # cpu after the memory line, after a comment line, and in an inline map.
+    "```yaml\n          requests:\n            memory: 256Mi\n            cpu: 250m\n```",
+    "```yaml\n          requests:\n            # fits the node\n            cpu: 250m\n```",
+    "```yaml\n          requests: {cpu: 250m, memory: 256Mi}\n```",
     "```bash\ngcloud container clusters update orders-prod-1 --enable-autoscaling --node-pool default-pool\n```",
     "```bash\ngcloud container node-pools update default-pool --cluster orders-prod-1 --max-nodes 20\n```",
     "```bash\ngcloud container node-pools update default-pool --total-max-nodes=20\n```",
