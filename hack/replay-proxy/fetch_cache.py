@@ -9,9 +9,10 @@ normalizer version (a different version's keys never match), and downloads
 them into a cache directory laid out the way replay_cache.py reads it
 (variants nested again, one directory per context). It also writes the
 records' runs, per build, for the lane's verdict comparison (lane_report.py),
-from records back to the bucket's 30-day lifecycle: an answer is kept under
-the night that first wrote it, which can be that old, and its verdict is read
-from that night's newest record (one small object per older build).
+from records back to the bucket's 30-day lifecycle: an answer's object, and
+so its `served_from`, is the night that first wrote it, which can be that old,
+though a night inside the window produced it; its verdict is read from that
+night's newest record (one small object per older build).
 
 An answer is loaded only from a record that says its night's passing runs
 produced it: an alternate (`alts/`) must be in the record's `produced` list

@@ -15,7 +15,8 @@ Reported:
   and every request after it in its conversation), by the role of the first
   differing message and by the miss signature the proxy logged;
 - with `--verdicts`, whether each conversation's run verdict matched the
-  verdict of the run that recorded its first served answer;
+  verdict of the build that first wrote its first served answer's object
+  (which may not be the night that produced it);
 - answers per key: of the served requests, how many came from a key with
   several saved answers (the proxy hands those out in turn), and of those
   keys, how many had more than one of their answers served;

@@ -15,9 +15,10 @@ which the Prow job exports). It writes, into `--out`:
 - `verdicts.json`: per case, the lane's repetitions (outcome, requests and
   prompt tokens, how many were served) beside the outcomes of the same case in
   each nightly that served it; and, per conversation that was served anything,
-  whether its run's verdict matched the recording's. Only answers from runs
-  that passed are published (publish_cache.py), so a recording's verdict is a
-  pass, and a mismatch is a replayed run that failed. A conversation whose run
+  whether its run's verdict matched the recording's. Only answers a passing
+  run gave are published (publish_cache.py), though the run that first saved
+  an answer's object may have failed; a mismatch is a replayed run that
+  failed. A conversation whose run
   can't be told (run_attribution.py), whose run bench-gate graded as neither a
   pass nor a fail (infra, blocked, not_applicable), or whose recording night
   is in no record the fetch read is `unknown`, each counted by reason in
