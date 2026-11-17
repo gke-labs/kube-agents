@@ -252,6 +252,7 @@ AUDITS: dict[str, AuditSpec] = {
             "hpa-floors-at-one",
             "pdb-overlapping",
             "untargeted-compute-class-workload",
+            "hpa-aggressive-scaledown",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -1244,6 +1245,7 @@ CHECK_PHRASES = {
     "hpa-floors-at-one": "{object} can scale down to one replica",
     "pdb-overlapping": "{object} has overlapping disruption budgets",
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
+    "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
