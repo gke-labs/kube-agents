@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -75,6 +76,12 @@ class BoardSnapshotTest(unittest.TestCase):
 
     def snap(self, kanban=None, audit=None):
         return board_snapshot.snapshot(self.session, kanban, NOW, self.profiles, audit or (lambda: None))
+
+    def test_the_dial_section_is_built_and_never_breaks_the_board(self):
+        board = board_snapshot.snapshot(self.session, None, NOW, self.profiles, lambda: None, lambda db: {"enabled": True, "level": "explain"})
+        self.assertEqual(board["dial"], {"enabled": True, "level": "explain"})
+        with mock.patch.dict(sys.modules, {"dial_state": None}):
+            self.assertEqual(board_snapshot.default_dial(self.session), {"enabled": False})
 
     def test_clusters_are_the_fleet_with_their_open_findings_worst_first(self):
         findings_queue.register_findings(
