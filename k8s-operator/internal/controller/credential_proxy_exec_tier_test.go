@@ -258,10 +258,17 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 			t.Errorf("exec pod reads %s from a Secret", e.Name)
 		}
 	}
-	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar, credentialProxyA2AChatCallersEnvVar} {
+	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar} {
 		if _, ok := env[name]; ok {
 			t.Errorf("exec pod carries %s", name)
 		}
+	}
+	// The A2A gateway stays an allowed caller on the exec tier while Chat is
+	// armed, so the binding that holds it to the a2a-chat audience (which
+	// this tier never confers) must come along, or the gateway's account
+	// could present the shell audience here (#6090).
+	if got := env[credentialProxyA2AChatCallersEnvVar].Value; got != "system:serviceaccount:ns:a2a-gateway" {
+		t.Errorf("exec pod %s = %q, want the A2A gateway's binding carried over", credentialProxyA2AChatCallersEnvVar, got)
 	}
 	if env[credentialProxyRoleEnv].Value != credentialProxyExecRole {
 		t.Errorf("role %q, want exec", env[credentialProxyRoleEnv].Value)

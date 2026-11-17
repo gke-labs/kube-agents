@@ -95,6 +95,16 @@ MUTATIONS: list[Mutation] = [
         "operator's does",
     ),
     Mutation(
+        "A3-a2a-chat-binding-off-the-exec-tier",
+        "k8s-operator/internal/controller/credential_proxy_exec_tier.go",
+        ("\tcredentialProxyA2AChatAudienceEnvVar: true,\n",
+         "\tcredentialProxyA2AChatAudienceEnvVar: true,\n\tcredentialProxyA2AChatCallersEnvVar:  true,\n"),
+        "test_A3_the_exec_tier_keeps_the_a2a_chat_binding",
+        "leave the a2a-chat binding off the exec tier beside its audience, since "
+        "that tier runs no Chat relay -- the A2A gateway stays an allowed caller "
+        "there and may present the shell audience to /v1/exec",
+    ),
+    Mutation(
         "A3-a2a-chat-callers-env-renamed",
         "agents/platform/scripts/credential_proxy.py",
         ('A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"\n',
