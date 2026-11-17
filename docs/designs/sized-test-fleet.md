@@ -188,12 +188,16 @@ the sized fleet's install in the soak window, once each, through the eval harnes
 | `agent-kanban-smoke`                  | Which GKE clusters run in this project now.                           |
 | `upgrade-chat-request-runs-collector` | Whether the clusters are patched and set to stay current on upgrades. |
 
-`upgrade-chat-request-runs-collector` checks the commands the agent runs, so it runs as it is. The
-other two check that the answer names the pool's clusters (`seeded-a`, `seeded-b`, `seeded-c`), so
-the lane runs a variant of each, `chat-routing-fleet-question-sized` and `agent-kanban-smoke-sized`,
-whose checks address the sized fleet by its fixture role (`sized-fleet-m`) instead, as the case
-format asks ([`bench-case-format.md`](bench-case-format.md)): the runner resolves the role to the
-size's cluster names from the fixture catalogue.
+All three check that the answer names the pool's clusters. Two require `seeded-a`, `seeded-b` and
+`seeded-c`, and `upgrade-chat-request-runs-collector` requires `seeded-a`, whose missing upgrade
+notifications it asks about. So the lane runs a `-sized` variant of each:
+`chat-routing-fleet-question-sized`, `agent-kanban-smoke-sized` and
+`upgrade-chat-request-runs-collector-sized`. Their checks address the sized fleet by the size's
+fixture role (`sized-fleet-m`, or `sized-fleet-l` on the L night) instead, as the case format asks
+([`bench-case-format.md`](bench-case-format.md)). The sized clusters leave their upgrade
+notifications unset, as `seeded-a` does, so the third variant asks them the same question. A role
+maps to one cluster slot in the fixture catalogue today, so a role that resolves to all of a size's
+clusters is new runner work.
 The originals stay on the eval nightlies; this lane is one more run of each question, at fleet scale. A file,
 `hack/eval/sized-fleet-cases.txt`, lists them, so a case joins or leaves in one line. Their results
 are eval records, in the eval dashboard under their own lane; they do not change the scale verdict.
@@ -408,8 +412,9 @@ Each item is its own pull request after this design merges.
    OOM kills are new.
 3. **The records.** The upload to the results bucket, the size and window in the record key, the
    cost record with its price table.
-4. **The chat cases.** The two `-sized` variants, `hack/eval/sized-fleet-cases.txt`, and the soak
-   window's call to the eval harness against the sized install.
+4. **The chat cases.** The three `-sized` variants, a sized role that resolves to all of its size's
+   clusters, `hack/eval/sized-fleet-cases.txt`, and the soak window's call to the eval harness
+   against the sized install.
 5. **The nightly.** `hack/ci-scale-nightly.sh`, the `sized-fleet-runner` identity and its grants,
    the two periodics in `oss-test-infra`, and the CI health bot's watch on them. The script always
    runs `down`, also when a step fails, and the sweep in step 1 deletes clusters an aborted run
