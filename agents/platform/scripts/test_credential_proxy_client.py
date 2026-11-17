@@ -7,6 +7,7 @@ reaches the right cluster - or is rejected outright.
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
+import contextlib
 import http.client
 import http.server
 import io
@@ -1060,6 +1061,22 @@ class VcsCallErrorTest(unittest.TestCase):
                 if raised is credential_proxy_client.WorkspaceRequestError:
                     # The status is read off the error after the close.
                     self.assertEqual(caught.exception.status, status)
+
+    def test_a_refusal_whose_json_body_is_not_an_object_is_the_status_alone(self):
+        # Valid JSON, but no refusal document: something between the client and
+        # the broker answered. The caller gets the same error as for a body
+        # that is not JSON, and the refusal is closed.
+        for body in (b"[]", b'"busy"', b"503", b"true", b"null"):
+            for status in (404, 502):
+                with self.subTest(body=body, status=status):
+                    stream = io.BytesIO(body)
+                    error = self._held_refusal(status, stream)
+                    with patch.object(credential_proxy_client, "open_broker_request", side_effect=error):
+                        with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                            credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                    self.assertEqual(caught.exception.status, status)
+                    self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                    self.assertTrue(stream.closed, "vcs_call left the refusal open")
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -3387,6 +3404,110 @@ class KubeconfigLockOwnerTest(unittest.TestCase):
         self.root.chmod(0o500)
         self.addCleanup(self.root.chmod, 0o700)
         self.assertIn(f"{self.lock}: Permission denied; context {self.TARGET_CTX} was not checked or registered", self.merge())
+
+
+class DefaultKubeconfigFolderOwnerTest(unittest.TestCase):
+    """A caller creates its default kubeconfig only in a folder that it owns. Root in the shell
+    pod has the agent's shared file as its default: a file that root made there was one whose
+    contexts the agent could never register, because only a kubeconfig's owner changes it."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+    ENV = {
+        "KUBE_PROXY_URL": PROXY_URL, "KUBE_PROXY_HOST_CONTEXT": HOST_CTX, "KUBE_PROXY_CA_FILE": CA_FILE,
+        "CREDENTIAL_PROXY_TOKEN_FILE": TOKEN_FILE, "KUBECONFIG": "",
+    }
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.folder = self.root / "opt" / "data"
+        self.folder.mkdir(parents=True)
+        self.kubeconfig = self.folder / ".kubeconfig"
+        self.worker_home = self.root / "home" / "node"
+        self.worker_kubeconfig = self.worker_home / ".kube" / "config"
+
+    def caller(self, uid, worker_uid=-2):
+        """`uid` as the caller, with the test's folders as the sandbox's. No caller is hermes,
+        and none is a worker unless `worker_uid` says so."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.dict("os.environ", self.ENV, clear=False))
+        stack.enter_context(patch.object(credential_proxy_client.os, "geteuid", return_value=uid))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", worker_uid))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig))
+        stack.enter_context(patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.kubeconfig))
+        return stack
+
+    def kubectl_with_a_context(self):
+        """What the sandbox's kubectl wrapper runs for `kubectl --context <ctx>`."""
+        credential_proxy_client.ensure_kube_proxy_context_for_argv(["kubectl", f"--context={self.TARGET_CTX}", "get", "pods"])
+
+    def test_the_merge_creates_nothing_for_a_caller_that_does_not_own_the_folder(self):
+        with self.caller(os.geteuid() + 1):
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                self.kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        self.assertEqual([], list(self.folder.iterdir()), "no kubeconfig, no lock, no record")
+
+    def test_the_host_kubeconfig_is_not_made_for_a_caller_that_does_not_own_the_folder(self):
+        with self.caller(os.geteuid() + 1):
+            credential_proxy_client._ensure_host_kubeconfig_initialized(self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE)
+        self.assertEqual([], list(self.folder.iterdir()))
+
+    @unittest.skipIf(os.geteuid() == 0, "root owns the test's folder")
+    def test_root_creates_nothing_in_a_folder_that_another_uid_owns(self):
+        with self.caller(0):
+            self.kubectl_with_a_context()
+        self.assertEqual([], list(self.folder.iterdir()))
+
+    def test_after_a_kubectl_by_another_caller_the_owners_kubectl_creates_and_registers(self):
+        with self.caller(os.geteuid() + 1):
+            self.kubectl_with_a_context()
+        self.assertEqual([], list(self.folder.iterdir()), "the other caller left nothing for the owner to trip on")
+        with self.caller(os.geteuid()):
+            self.kubectl_with_a_context()
+        text = self.kubeconfig.read_text(encoding="utf-8")
+        self.assertIn(f"current-context: {self.HOST_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+    @contextlib.contextmanager
+    def a_worker_whose_home_another_uid_owns(self):
+        """A worker's home can be an emptyDir with an fsGroup: root owns the mount point, and the
+        worker makes `.kube` in it. The rule asks who owns the folder that holds the file, and
+        not who owns the folder above it."""
+        self.worker_home.mkdir(parents=True)
+
+        def with_another_owner_of_the_home(real):
+            def stand_in(path, *args, **kwargs):
+                info = real(path, *args, **kwargs)
+                if not isinstance(path, (str, os.PathLike)) or Path(path) != self.worker_home:
+                    return info
+                fields = list(info)
+                fields[4] = info.st_uid + 1  # index 4 of a stat result is st_uid
+                return os.stat_result(fields)
+            return stand_in
+
+        with self.caller(os.geteuid(), worker_uid=os.geteuid()), \
+                patch.object(os, "stat", with_another_owner_of_the_home(os.stat)), \
+                patch.object(os, "lstat", with_another_owner_of_the_home(os.lstat)):
+            self.assertEqual(os.geteuid() + 1, self.worker_home.stat().st_uid, "the stand-in owner is in force")
+            yield
+
+    def test_a_worker_whose_home_another_uid_owns_still_gets_its_host_kubeconfig(self):
+        with self.a_worker_whose_home_another_uid_owns():
+            credential_proxy_client._ensure_host_kubeconfig_initialized(self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE)
+        self.assertIn(f"current-context: {self.HOST_CTX}", self.worker_kubeconfig.read_text(encoding="utf-8"))
+
+    def test_the_merge_still_creates_the_kubeconfig_of_such_a_worker(self):
+        with self.a_worker_whose_home_another_uid_owns():
+            credential_proxy_client._merge_context_into_kubeconfig_file(
+                self.worker_kubeconfig, self.TARGET_CTX, self.PROXY_URL, self.CA_FILE, self.TOKEN_FILE
+            )
+        self.assertIn(f"current-context: {self.TARGET_CTX}", self.worker_kubeconfig.read_text(encoding="utf-8"))
 
 
 class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
