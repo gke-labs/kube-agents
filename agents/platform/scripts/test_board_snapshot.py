@@ -393,6 +393,41 @@ class BoardSnapshotNextModeTest(unittest.TestCase):
         self.assertEqual(board["clusters"], [{"name": "host", "findings": 0}])
         self.assertEqual(board["cluster_count"], 1)
 
+    def test_a_numeric_project_id_still_shows_the_management_projects_clusters(self):
+        # spec.harness.projectId may be the project NUMBER (GCP_PROJECT_ID
+        # then carries it), while the Cluster Agent profiles name the project
+        # ID. The reconcile snapshot's management row has the ID; the board
+        # takes the management project from there, as agent_roster and the
+        # scope render already do (#6245), not from GCP_PROJECT_ID.
+        os.environ["GCP_PROJECT_ID"] = "123456789012"
+        (self.home / board_snapshot.fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}]}))
+        self.next_mode([], {})
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        board = self.snap()
+        self.assertEqual(board["clusters"], [{"name": "host", "findings": 0}])
+        self.assertEqual(board["cluster_count"], 1)
+
+    def test_a_numeric_project_id_with_no_snapshot_falls_back_to_it(self):
+        # No reconcile snapshot yet (or no management row): the board keeps
+        # GCP_PROJECT_ID, as before, and says the project's clusters aren't
+        # listed rather than inventing an ID.
+        os.environ["GCP_PROJECT_ID"] = "123456789012"
+        self.next_mode([], {})
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        self.assertEqual([r["name"] for r in self.snap()["clusters"]], ["123456789012 (clusters not listed here)"])
+
+    def test_a_project_id_is_used_as_it_is_whatever_the_snapshot_says(self):
+        # Only a number is looked up, as agent_roster does: an install that
+        # names its project by ID keeps it, even while a stale snapshot (a
+        # reused volume, say) still names another management project.
+        (self.home / board_snapshot.fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "old-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}]}))
+        self.next_mode([], {})
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        self.profile("cluster-old-mgmt-gone-us-central1", "old-mgmt", "gone")
+        self.assertEqual(self.snap()["clusters"], [{"name": "host", "findings": 0}])
+
     def test_an_install_with_no_container_scope_shows_the_management_projects_clusters(self):
         # Every next install today: no folder, organization, Shared VPC host or
         # Metrics Scope, so the scope publisher never runs and the management
