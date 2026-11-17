@@ -5030,10 +5030,12 @@ def since_scheduled_line(payload: dict, delta_known: bool = True) -> str | None:
 
 
 def _clip_utf8(text: str, limit: int) -> str:
-    """`text` cut to at most `limit` UTF-8 bytes on a character boundary."""
-    raw = text.encode("utf-8")
-    if len(raw) <= limit:
-        return text
+    """`text` cut to at most `limit` UTF-8 bytes on a character boundary.
+
+    A lone surrogate (a broken escape in the findings JSON) has no UTF-8 form
+    and becomes "?" rather than failing the run.
+    """
+    raw = text.encode("utf-8", errors="replace")
     return raw[:limit].decode("utf-8", errors="ignore")
 
 
@@ -5055,9 +5057,25 @@ def _summary_chat_card(text: str) -> dict | None:
     if built is None or not isinstance(built[0], dict):
         return None
     card = _redact_document(built[0])
-    if len(json.dumps(card, ensure_ascii=False).encode("utf-8")) > ENVELOPE_REPORT_CARD_MAX:
+    # Measured as `write_report` writes it (ASCII escapes, indented), so the
+    # cap is what the card costs on disk.
+    if len(json.dumps(card, indent=2)) > ENVELOPE_REPORT_CARD_MAX:
         return None
     return card
+
+
+def attach_chat_report(envelope: dict, render: Callable[[], str], silent: bool) -> None:
+    """Set the envelope's `report` from `render()`'s text. Best-effort.
+
+    Called before `write_report`, so anything that keeps the report from
+    building, a render included, leaves the envelope without one and the
+    store write and the run go on: the gateway then posts the run's final
+    message, as before the report existed.
+    """
+    try:
+        envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(render(), silent)
+    except Exception as exc:  # noqa: BLE001 -- the report is optional; the store write is not
+        log(f"WARNING: the stored envelope carries no chat report: {exc}")
 
 
 def envelope_chat_report(text: str, silent: bool) -> dict:
@@ -24220,8 +24238,8 @@ def _finish_without_forge(
 
     # The envelope's report is read only once the store holds it, so it is
     # rendered as stored.
-    envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(
-        no_forge_summary(True), bool(payload["silent_ok"]) and unreachable is None
+    attach_chat_report(
+        envelope, lambda: no_forge_summary(True), bool(payload["silent_ok"]) and unreachable is None
     )
     stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
     note = unreachable_note(unreachable, stored=stored, probe=probe)
@@ -24969,7 +24987,7 @@ def _finish_store_ledger(
 
     # The envelope's report is read only once the store holds it, so it is
     # rendered as stored.
-    envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(store_ledger_summary(True), bool(payload["silent_ok"]))
+    attach_chat_report(envelope, lambda: store_ledger_summary(True), bool(payload["silent_ok"]))
     stored = write_report(audit_id, envelope, now, ledger_unchanged=held_open)
     note = store_ledger_note(decision, stored=stored, noun=noun)
     payload[LEDGER_NOTE_KEY] = note
@@ -26811,7 +26829,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             baseline.known if whole_run else delta_known,
             (0, run_resolved) if whole_run else None,
         )
-        envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(chat_text, bool(payload["silent_ok"]))
+        attach_chat_report(envelope, lambda: chat_text, bool(payload["silent_ok"]))
         stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         append_chat_report(
             audit_id,
@@ -27378,7 +27396,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         baseline.known if baseline.from_entry else delta_known,
         run_counts,
     )
-    envelope[ENVELOPE_REPORT_KEY] = envelope_chat_report(chat_text, bool(payload["silent_ok"]))
+    attach_chat_report(envelope, lambda: chat_text, bool(payload["silent_ok"]))
     stored = write_report(audit_id, envelope, now)
     append_chat_report(
         audit_id,

@@ -33075,6 +33075,14 @@ class TestNoForge(BaseTestCase):
         # A no-ledger summary has its card, the one the cron relay lays out.
         self.assertEqual(report["card"]["schema"], "kube-agents.chat/v1")
 
+    def test_a_lone_surrogate_in_the_findings_still_stores_the_run(self):
+        """A broken emoji escape (`"\\ud83d"`) survives json.loads; the report must not fail `finish`."""
+        out = self.finish(make_doc(findings=[make_finding(fid="s", title="Namespace \ud83d has no NetworkPolicy", obj="crit-\ud83d")]))
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["status"], audit_report.NO_FORGE_STATUS)
+        self.assertNotIn("\ud83d", latest[audit_report.ENVELOPE_REPORT_KEY]["text"])
+        self.assertTrue(out["summary"])
+
     def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
         """#4268: `finish` reads its run's start before its checks. A later
         `start` that rewrites the run record as soon as `findings_predate_run`
@@ -38963,10 +38971,6 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestEnvelopeChatReport(unittest.TestCase):
     """#5618: the envelope's `report` object, bounded and redacted."""
 
@@ -38999,3 +39003,23 @@ class TestEnvelopeChatReport(unittest.TestCase):
         with patch.dict(sys.modules, {"slack_audit_report": fake}):
             report = audit_report.envelope_chat_report("Two findings.", False)
         self.assertEqual((report["text"], "card" in report), ("Two findings.", False))
+
+    def test_a_lone_surrogate_does_not_fail_the_report(self):
+        """A broken emoji escape in the findings has no UTF-8 form: it becomes "?"."""
+        report = audit_report.envelope_chat_report("Payments \ud83d namespace.", False)
+        self.assertEqual(report["text"], "Payments ? namespace.")
+
+    def test_a_report_that_cannot_build_leaves_the_envelope_without_one(self):
+        envelope = {"audit_id": "x"}
+
+        def boom():
+            raise RuntimeError("render failed")
+
+        audit_report.attach_chat_report(envelope, boom, False)
+        self.assertEqual(envelope, {"audit_id": "x"})
+
+
+
+if __name__ == "__main__":
+    unittest.main()
+
