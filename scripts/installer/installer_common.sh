@@ -4673,17 +4673,8 @@ is_existing_cluster_network_policy_satisfied() {
 }
 
 
-# Writes the terraform.tfvars the full-install composition consumes, from the
-# install.env variable set in the environment (load it first). The same
-# generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
-# front-ends can never describe different installs.
-#
-# create_cluster comes from a liveness probe, not from the interview, so
-# "use an existing cluster" against a name that does not exist still creates
-# it. A cluster that exists but is already in OUR state stays
-# create_cluster = true — flipping it off would remove the resource from
-# configuration and plan the cluster's destruction (lifecycle.sh guards this
-# too).
+# How much of kubectl's stderr a refused Secret read quotes back.
+readonly SECRET_READ_ERR_MAX_BYTES=400
 # The credentials install.env may not carry (PERSIST_SECRETS_ON_DISK=false),
 # which write_tfvars_from_state recovers from the live Secret.
 readonly RECOVERED_SECRET_KEYS="API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT"
@@ -4732,7 +4723,7 @@ recover_secret_keys_from_live_secret() {
     --context "$ctx" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
     -o json 2>"$err_file")" || read_rc=$?
   local read_err
-  read_err="$(head -c 400 "$err_file" | tr '\n' ' ')"
+  read_err="$(head -c "$SECRET_READ_ERR_MAX_BYTES" "$err_file" | tr '\n' ' ')"
   rm -f "$err_file"
 
   if [ "$read_rc" -ne 0 ]; then
@@ -4807,6 +4798,17 @@ refuse_blanking_live_secret_keys() {
   return 0
 }
 
+# Writes the terraform.tfvars the full-install composition consumes, from the
+# install.env variable set in the environment (load it first). The same
+# generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
+# front-ends can never describe different installs.
+#
+# create_cluster comes from a liveness probe, not from the interview, so
+# "use an existing cluster" against a name that does not exist still creates
+# it. A cluster that exists but is already in OUR state stays
+# create_cluster = true — flipping it off would remove the resource from
+# configuration and plan the cluster's destruction (lifecycle.sh guards this
+# too).
 write_tfvars_from_state() {
   local dest="$1"
   local image_tag="${2:-${IMAGE_TAG:-$IMAGE_TAG_FALLBACK}}"
@@ -4948,25 +4950,16 @@ write_tfvars_from_state() {
   # re-install must keep the live salt: regenerating it re-anonymises every
   # chat user, severing their past sessions from their future ones.
   #
-  # Only when kubectl's CURRENT context is this install's cluster (the name
-  # get-credentials writes — set just above for adoption, and by upgrade.sh
-  # and uninstall.sh before they generate). A stale context pointing at some
-  # other install would otherwise silently donate that environment's
-  # credentials to this one.
-  local expected_ctx
-  expected_ctx="$(gke_context_name)"
-  #
-  # The read names the context, so it can only reach this install's cluster.
-  # When a cluster exists, recovery runs even if current-context points
-  # elsewhere (get-credentials above is best-effort, and a shared kubeconfig
-  # can be switched underneath): skipping it there would write the keys empty.
-  # A context that is missing then fails the read, which stops an applying run.
+  # Only when the probe above found the cluster: a confirmed-absent cluster
+  # has no Secret, and a kubeconfig context left behind by an uninstall would
+  # otherwise send the read to an endpoint that is gone and stop a fresh
+  # install. The read names this install's context, so it can only reach this
+  # cluster, whatever current-context says (get-credentials above is
+  # best-effort, and a shared kubeconfig can be switched underneath). A
+  # context that is missing then fails the read, which stops an applying run.
   LIVE_SECRET_NONEMPTY_KEYS=""
-  if command -v kubectl >/dev/null 2>&1; then
-    if [ "$cluster_exists" = "true" ] ||
-      [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-      recover_secret_keys_from_live_secret "$expected_ctx" || return 1
-    fi
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    recover_secret_keys_from_live_secret "$(gke_context_name)" || return 1
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than

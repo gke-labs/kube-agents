@@ -2283,9 +2283,8 @@ class InstallerCommonTest(unittest.TestCase):
         kubectl_stub = (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
-            # Recovery is gated on the current context being this install's
-            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name
-            # and asserts that secret reads explicitly pass --context.
+            # Recovery runs when the cluster exists, and the stub asserts that
+            # the Secret read names this install's context explicitly.
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
             # One read of the whole Secret (-o json), on this install's context.
             f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*"-o json"*) '
@@ -2298,6 +2297,8 @@ class InstallerCommonTest(unittest.TestCase):
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 kubectl_script=kubectl_stub,
+                describe_stub=self._CLUSTER_EXISTS,
+                gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
@@ -2326,7 +2327,12 @@ class InstallerCommonTest(unittest.TestCase):
             "esac\n"
         )
 
+    # The cluster probe finds the cluster: recovery runs only then.
+    _CLUSTER_EXISTS = "printf 'False\\n'; exit 0"
+
     def _recover(self, read_arm, env=None, log=None, current_ctx=None, **run_kwargs):
+        run_kwargs.setdefault("describe_stub", self._CLUSTER_EXISTS)
+        run_kwargs.setdefault("gcloud_extra_cases", "  *get-credentials*) exit 0 ;;\n")
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -2414,7 +2420,6 @@ class InstallerCommonTest(unittest.TestCase):
         # would write the keys empty, so an existing cluster is read through
         # its own context by name whatever current-context says.
         exists = dict(
-            describe_stub="printf 'False\\n'; exit 0",
             gcloud_extra_cases="  *get-credentials*) exit 1 ;;\n",
             current_ctx="gke_other-project_us-east1_other-cluster",
         )
@@ -2432,6 +2437,21 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('api_server_key    = "live-api-key"', tfvars)
             self.assertIn(f"--context {self._CTX}", log.read_text())
+
+    def test_a_cluster_the_probe_found_absent_is_not_read_whatever_the_context(self):
+        # After an uninstall the context stays current, pointing at an endpoint
+        # that is gone. A fresh install with the same names must not read it,
+        # fail, and stop: a confirmed-absent cluster has no Secret.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "kubectl.log"
+            log.touch()
+            proc, tfvars = self._recover(
+                'echo "Unable to connect to the server: dial tcp: lookup gone: no such host" >&2; exit 1',
+                env={"API_SERVER_KEY": "k"}, log=log,
+                describe_stub='echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND" >&2; exit 1')
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIsNotNone(tfvars)
+            self.assertNotIn("get secret", log.read_text())
 
     def test_a_404_that_is_not_this_secrets_own_is_not_an_absence(self):
         # kubectl prints (NotFound) for any 404, a proxy's included; only the
@@ -2709,7 +2729,9 @@ class InstallerCommonTest(unittest.TestCase):
         env = dict(self._OPENAI_COMPATIBLE_ENV, OPENAI_COMPATIBLE_API_KEY="")
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub)
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub,
+                             describe_stub=self._CLUSTER_EXISTS,
+                             gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n")
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('openai_compatible_api_key = "recovered-key"', dest.read_text())
 

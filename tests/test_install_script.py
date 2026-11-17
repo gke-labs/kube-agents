@@ -9320,6 +9320,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
             env=env,
             kubectl_script=kubectl_stub,
+            # The cluster exists (recovery runs only then); get-credentials succeeds.
+            describe_stub="printf 'False\\n'; exit 0",
+            gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
