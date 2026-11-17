@@ -534,7 +534,7 @@ func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("a well-formed reference was refused: %v", err)
 	}
-	if !ok.Profiles[0].HasJobTemplate() {
+	if !ok.Profiles[0].HasJobTemplate("unattended") {
 		t.Error("a profile naming a template doesn't run as Jobs")
 	}
 	for name, mutate := range map[string]func(*DispatchProfile){
@@ -555,7 +555,60 @@ func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
 			}
 		})
 	}
-	if (DispatchProfile{}).HasJobTemplate() {
+	if (DispatchProfile{}).HasJobTemplate("unattended") {
 		t.Error("a profile with no template runs as Jobs")
+	}
+}
+
+// A per-tier reference covers each live tier and no draining one; one that
+// isn't per tier, or an inline template, is the unattended-mode tier's alone,
+// which the caller holds the tier to (#5646).
+func TestHasJobTemplateIsPerTierOnlyUnderAPerTierReference(t *testing.T) {
+	perTier := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"},
+		DrainingTiers:  []DrainingTier{{Tier: "triage", Until: time.Now().Add(time.Hour)}},
+		JobTemplateRef: &DispatchJobTemplateRef{Hash: "h", PerTier: true}}
+	legacy := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"}, JobTemplateRef: &DispatchJobTemplateRef{Hash: "h"}}
+	inline := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"}, JobTemplate: json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)}
+	for _, c := range []struct {
+		name    string
+		p       DispatchProfile
+		tier    string
+		has     bool
+		perTier bool
+	}{
+		{"per tier, read", perTier, "read", true, true},
+		{"per tier, unattended", perTier, "unattended", true, true},
+		{"per tier, draining", perTier, "triage", false, true},
+		{"per tier, unknown", perTier, "nope", false, true},
+		{"unattended only", legacy, "read", true, false},
+		// Not held to the profile's tiers: the caller holds the tier to the
+		// unattended side, as before per-tier templates.
+		{"unattended only, a tier the profile doesn't list", legacy, "batch", true, false},
+		{"inline", inline, "unattended", true, false},
+		{"none", DispatchProfile{Name: "tse", Tiers: []string{"read"}}, "read", false, false},
+	} {
+		if got := c.p.HasJobTemplate(c.tier); got != c.has {
+			t.Errorf("%s: HasJobTemplate(%s) = %v, want %v", c.name, c.tier, got, c.has)
+		}
+		if got := c.p.JobTemplatesPerTier(); got != c.perTier {
+			t.Errorf("%s: JobTemplatesPerTier = %v, want %v", c.name, got, c.perTier)
+		}
+	}
+}
+
+// A lease record says whether its task ran on a Job, and one that didn't
+// writes no key, so a dispatcher one image behind reads it as before.
+func TestALeaseRecordSaysItRanOnAJob(t *testing.T) {
+	raw, err := json.Marshal(LeaseRecord{TaskID: "t", OnJob: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back LeaseRecord
+	if err := json.Unmarshal(raw, &back); err != nil || !back.OnJob {
+		t.Fatalf("round trip %s: %+v, %v", raw, back, err)
+	}
+	raw, _ = json.Marshal(LeaseRecord{TaskID: "t"})
+	if strings.Contains(string(raw), "onJob") {
+		t.Errorf("a pool task's record %s carries onJob", raw)
 	}
 }

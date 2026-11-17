@@ -276,6 +276,11 @@ type LeaseRecord struct {
 	// and acks it without running or failing it again. A tombstone holds no
 	// worker and is never re-adopted or renewed.
 	FinishedAt time.Time `json:"finishedAt,omitzero"`
+	// OnJob says the task was confirmed to the pod of a Job of its own, so a
+	// restarted dispatcher that re-adopts it deletes that Job when the task
+	// ends (#5646). A record from a dispatcher that predates the field
+	// leaves it unset; such a task ran on a Job only at an unattended tier.
+	OnJob bool `json:"onJob,omitempty"`
 }
 
 // Finished reports whether the record is a tombstone.
@@ -393,8 +398,18 @@ type DispatchJobTemplateRef struct {
 	// param, DispatchJobTemplateName (NameFor).
 	Name string `json:"name,omitempty"`
 	// Hash is the rendering's hash, as the object's
-	// DispatchJobTemplateHashAnnotation carries it.
+	// DispatchJobTemplateHashAnnotation carries it. With PerTier it is one
+	// hash over every tier's rendering, stamped on each tier's param, so a
+	// change to any tier's template moves them all together.
 	Hash string `json:"hash"`
+	// PerTier says the profile has a template at each of its live tiers, not
+	// only at its unattended-mode one (#5646): permit-carrying tasks run in
+	// their own one-pod Job at whatever tier they were admitted at. The
+	// unattended-mode tier's param keeps the profile's own name
+	// (DispatchJobTemplateName), which a dispatcher that predates the field
+	// reads; every other tier's is DispatchJobTierTemplateName. Unset, the
+	// reference is to the unattended-mode tier's template alone.
+	PerTier bool `json:"perTier,omitempty"`
 }
 
 // dispatchJobTemplatePrefix is a profile's DispatchJobTemplate name, less the
@@ -403,8 +418,21 @@ type DispatchJobTemplateRef struct {
 const dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
 
 // DispatchJobTemplateName is the DispatchJobTemplate that holds profile's Job
-// template in the profile namespace.
+// template in the profile namespace: its unattended-mode tier's.
 func DispatchJobTemplateName(profile string) string { return dispatchJobTemplatePrefix + profile }
+
+// dispatchJobTierTemplatePrefix is a (profile, tier)'s DispatchJobTemplate
+// name, less "<profile>-<tier>": the operator's dispatchJobTierTemplatePrefix,
+// which must stay the same string. Not the profile prefix, so no tier's name
+// can be another profile's unattended-mode one.
+const dispatchJobTierTemplatePrefix = "kube-agents-dispatch-job-tier-"
+
+// DispatchJobTierTemplateName is the DispatchJobTemplate that holds profile's
+// Job template at tier, for a tier other than its unattended-mode one, when
+// its reference is PerTier (#5646).
+func DispatchJobTierTemplateName(profile, tier string) string {
+	return dispatchJobTierTemplatePrefix + profile + "-" + tier
+}
 
 // NameFor is the DispatchJobTemplate r names for profile: its Name when it
 // carries one, else the profile's own param.
@@ -460,9 +488,31 @@ func sameDurables(a, b []DispatchDurable) bool {
 // against DispatchJobTemplateRef.Hash.
 const DispatchJobTemplateHashAnnotation = "kubeagents.x-k8s.io/dispatch-template-hash"
 
-// HasJobTemplate says the profile's unattended tasks run as Jobs: the config
-// names a template, inline or by reference.
-func (p DispatchProfile) HasJobTemplate() bool {
+// HasJobTemplate says the config names a template a task of p's at tier can
+// run on as a Job. An inline template, or a reference that isn't PerTier, is
+// the unattended-mode tier's only: true for any tier, and the caller holds
+// the tier to the unattended side. A PerTier reference covers each live tier
+// (#5646), and no draining one, whose template the operator drops at once.
+func (p DispatchProfile) HasJobTemplate(tier string) bool {
+	switch {
+	case len(p.JobTemplate) > 0:
+		return true
+	case p.JobTemplateRef == nil:
+		return false
+	case !p.JobTemplateRef.PerTier:
+		return true
+	}
+	return slices.Contains(p.Tiers, tier)
+}
+
+// JobTemplatesPerTier says p's templates are per tier (#5646), so a task at
+// a tier that isn't unattended can still run as a Job.
+func (p DispatchProfile) JobTemplatesPerTier() bool {
+	return p.JobTemplateRef != nil && p.JobTemplateRef.PerTier && len(p.JobTemplate) == 0
+}
+
+// HasAnyJobTemplate says the config names some template for p.
+func (p DispatchProfile) HasAnyJobTemplate() bool {
 	return len(p.JobTemplate) > 0 || p.JobTemplateRef != nil
 }
 
