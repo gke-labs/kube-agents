@@ -1023,7 +1023,7 @@ type TuningSpec struct {
 	//
 	// Unset means 10, the operator's default - a "busy day" sizing: at the
 	// session-pod shape's default requests (150m CPU / 320Mi, SessionResources)
-	// ten concurrent sessions hold 1.5 CPU / 3.2Gi, which a small dev cluster
+	// ten concurrent sessions hold 1.5 CPU / about 3.1Gi, which a small dev cluster
 	// absorbs without preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's

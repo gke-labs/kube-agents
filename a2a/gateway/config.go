@@ -666,7 +666,7 @@ type Config struct {
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// default requests (150m/320Mi, SessionResources) ten concurrent sessions
-	// hold 1.5 CPU / 3.2Gi, which a small dev cluster absorbs without
+	// hold 1.5 CPU / about 3.1Gi, which a small dev cluster absorbs without
 	// preemption. Raising it buys more
 	// concurrent delegations at that per-pod price plus model-quota
 	// contention; lowering it turns busy-hour delegations into refusals
