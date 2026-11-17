@@ -716,7 +716,15 @@ def load_external_doc_records(repo: Path, extra_repos: Optional[Iterable[str]] =
 _QTY = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)$")
 _UNITS = {"": 1, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12,
           "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4}
-_POD_SPEC_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "Job", "ReplicaSet"})
+_POD_SPEC_WORKLOAD_KINDS = frozenset({
+    "Deployment",
+    "StatefulSet",
+    "DaemonSet",
+    "Job",
+    "ReplicaSet",
+    "ReplicationController",
+})
+_REPLICA_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "ReplicaSet"})
 
 
 def _match_glob(pattern: str, target: str) -> bool:
@@ -838,6 +846,18 @@ def _doc_applicable_to_path(doc: Any, path_expr: str) -> bool:
         return kind in _POD_SPEC_WORKLOAD_KINDS
     if path_expr.startswith("spec.jobTemplate.spec."):
         return kind == "CronJob"
+    if path_expr == "spec.replicas" or path_expr.startswith((
+        "spec.replicas.",
+        "spec.strategy.",
+        "spec.minReadySeconds",
+        "spec.revisionHistoryLimit",
+        "spec.progressDeadlineSeconds",
+    )):
+        return kind in _REPLICA_WORKLOAD_KINDS
+    if path_expr.startswith(("spec.serviceName", "spec.volumeClaimTemplates", "spec.podManagementPolicy")):
+        return kind == "StatefulSet"
+    if path_expr.startswith(("spec.schedule", "spec.concurrencyPolicy", "spec.startingDeadlineSeconds")):
+        return kind == "CronJob"
     return True
 
 
@@ -873,21 +893,6 @@ def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str],
             applicable = [d for d in docs if _doc_applicable_to_path(d, path_expr)]
             if applicable:
                 docs = applicable
-        if len(docs) > 1:
-            matching_kinds = {
-                str(d.get("kind") or "").strip()
-                for d in docs
-                if isinstance(d, dict)
-                and str(d.get("kind") or "").strip()
-                and yaml_get(d, path_expr) is not None
-            }
-            if matching_kinds:
-                kind_filtered = [
-                    d for d in docs
-                    if isinstance(d, dict) and str(d.get("kind") or "").strip() in matching_kinds
-                ]
-                if kind_filtered:
-                    docs = kind_filtered
         for doc in docs:
             actual = yaml_get(doc, path_expr)
             if actual is None and op not in ("absent", "present"):

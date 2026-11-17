@@ -34,7 +34,32 @@ RECORD_ID_RE = re.compile(r"(DEC|LES)-\d{4}-\d{3,}")
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.S)
 QTY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)$")
 PATH_SEG_RE = re.compile(r"([^\[]+)(?:\[([^=\]]+)=([^\]]+)\])?")
-POD_SPEC_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "Job", "ReplicaSet"})
+POD_SPEC_WORKLOAD_KINDS = frozenset({
+    "Deployment",
+    "StatefulSet",
+    "DaemonSet",
+    "Job",
+    "ReplicaSet",
+    "ReplicationController",
+})
+REPLICA_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "ReplicaSet"})
+OVERSIZE_WILDCARD_ALL_GLOBS = frozenset({
+    "*",
+    "**",
+    "**/*",
+    "*.yaml",
+    "*.yml",
+    "**/*.yaml",
+    "**/*.yml",
+})
+LOCKFILE_NAMES = frozenset({
+    "pnpm-lock.yaml",
+    "pnpm-lock.yml",
+    "yarn.lock.yaml",
+    "package-lock.yaml",
+    "Chart.lock",
+    "flake.lock",
+})
 UNITS = {
     "": 1.0,
     "m": 1e-3,
@@ -167,6 +192,18 @@ def _doc_applicable_to_path(doc: Any, path_expr: str) -> bool:
         return kind in POD_SPEC_WORKLOAD_KINDS
     if path_expr.startswith("spec.jobTemplate.spec."):
         return kind == "CronJob"
+    if path_expr == "spec.replicas" or path_expr.startswith((
+        "spec.replicas.",
+        "spec.strategy.",
+        "spec.minReadySeconds",
+        "spec.revisionHistoryLimit",
+        "spec.progressDeadlineSeconds",
+    )):
+        return kind in REPLICA_WORKLOAD_KINDS
+    if path_expr.startswith(("spec.serviceName", "spec.volumeClaimTemplates", "spec.podManagementPolicy")):
+        return kind == "StatefulSet"
+    if path_expr.startswith(("spec.schedule", "spec.concurrencyPolicy", "spec.startingDeadlineSeconds")):
+        return kind == "CronJob"
     return True
 
 
@@ -213,22 +250,6 @@ def evaluate_guard(
             applicable = [d for d in docs if _doc_applicable_to_path(d, path_expr)]
             if applicable:
                 docs = applicable
-        if len(docs) > 1:
-            matching_kinds = {
-                str(d.get("kind") or "").strip()
-                for d in docs
-                if isinstance(d, dict)
-                and str(d.get("kind") or "").strip()
-                and yaml_get(d, path_expr) is not None
-            }
-            if matching_kinds:
-                kind_filtered = [
-                    d
-                    for d in docs
-                    if isinstance(d, dict) and str(d.get("kind") or "").strip() in matching_kinds
-                ]
-                if kind_filtered:
-                    docs = kind_filtered
         for doc in docs:
             actual = yaml_get(doc, path_expr)
             if actual is None and op not in ("absent", "present"):
@@ -582,11 +603,25 @@ def check_changed_files(
                     and not _target_file_matches_narrow_cluster(fpath, s_clusters)
                 ):
                     continue
-                if (
-                    any(match_glob(g, fpath) for g in s_paths)
-                    or (isinstance(exp, dict) and exp.get("file") and match_glob(str(exp["file"]), fpath))
-                    or (s_res and fpath.lower().endswith((".yaml", ".yml")))
-                ):
+                exp_file = str(exp.get("file") or "").strip() if isinstance(exp, dict) else ""
+                if exp_file and not match_glob(exp_file, fpath):
+                    continue
+                bname = Path(fpath).name
+                is_lockfile = (
+                    bname in LOCKFILE_NAMES
+                    or bname.lower().endswith(("-lock.yaml", "-lock.yml", ".lock.yaml", ".lock.yml"))
+                )
+                path_matched = any(match_glob(g, fpath) for g in s_paths)
+                exp_file_specific_matched = bool(
+                    exp_file and exp_file not in OVERSIZE_WILDCARD_ALL_GLOBS and match_glob(exp_file, fpath)
+                )
+                res_yaml_matched = bool(
+                    s_res
+                    and fpath.lower().endswith((".yaml", ".yml"))
+                    and not is_lockfile
+                    and (_is_fleet_wide(s_clusters) or _target_file_matches_narrow_cluster(fpath, s_clusters))
+                )
+                if path_matched or exp_file_specific_matched or res_yaml_matched:
                     hits.add(fpath)
                 continue
             if fpath in sup_for_rec:
