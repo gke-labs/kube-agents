@@ -140,3 +140,33 @@ func TestTheGatewayReadsTheDMIdleTTL(t *testing.T) {
 		}
 	}
 }
+
+// A second DM message sent while the first task runs is a steer: it starts no
+// task, but it is a second message, so the conversation goes back on IdleTTL.
+func TestASteeredDMIsNotSingleTurn(t *testing.T) {
+	r, spawn := startReuseRig(t)
+	ctx := context.Background()
+	conv := "discord:dm/c-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m1", Text: "hello"}
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	waitFor(t, "the turn on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m2", Text: "and the nodes too"}
+	waitFor(t, "the steer recorded", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.SteeredSession != ""
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if len(spawn.calls()) != 1 || rec.SteeredSession != rec.BusSession || rec.singleTurnDM() {
+		t.Fatalf("after a steer: spawns %d, steered %q, bus %q, singleTurnDM %v; want one pod, the steer on it, and not single-turn",
+			len(spawn.calls()), rec.SteeredSession, rec.BusSession, rec.singleTurnDM())
+	}
+	// A later pod (the reap, then a new question) starts single-turn again.
+	rec.BusSession = "chat-next-1"
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "task-next", Addressee: "chat-next-1"})
+	if !rec.singleTurnDM() {
+		t.Error("a new pod's first turn was not single-turn after an earlier pod's steer")
+	}
+}

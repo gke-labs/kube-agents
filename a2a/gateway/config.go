@@ -1245,7 +1245,8 @@ func (c *Config) validateCapabilityCeiling() error {
 const defaultDMIdleTTL = 5 * time.Minute
 
 // singleTurnDM reports whether rec is a DM whose current pod has taken at
-// most one human turn. Two things are left out of the count:
+// most one human turn and no steer (SteeredSession). Two things are left out
+// of the count:
 //   - a wake (Role set): a session pod without cluster access delegates every
 //     cluster read, and the child's result comes back as a wake addressed to
 //     the pod, so counting wakes would put nearly every one-question DM on
@@ -1258,6 +1259,11 @@ const defaultDMIdleTTL = 5 * time.Minute
 //     question the user asks, and each pod mints a fresh bus session.
 func (rec *SessionRecord) singleTurnDM() bool {
 	if rec.Kind != sessionKindDM {
+		return false
+	}
+	// A follow-up steered into the running task is a second message for this
+	// pod even though it started no task.
+	if rec.SteeredSession != "" && rec.SteeredSession == rec.BusSession {
 		return false
 	}
 	n := 0
