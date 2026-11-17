@@ -1227,7 +1227,7 @@ has moved. A server restarted in place (a new `start`) reloads whatever file the
 synced, which can be the old one, so it confirms only when a load time later than its start
 arrives, or when it started more than the kubelet's sync window (90 seconds: the sync period
 plus the Secret cache's lag) after the write. A new pod confirms when the API server created
-it after the write, by the live Secret's last managedFields time. nats-server 2.10 serves no
+it after the write, by the operator's own managedFields entry on the live Secret (another manager's later edit doesn't move it). A change to the bus's TLS Secret while a reload is pending (a renewed certificate, which the reloader also acts on) folds every server, so the move that follows re-arms the wait. A reload sent by hand can't be told apart, and is left to whoever sends it. nats-server 2.10 serves no
 config digest to compare instead. A server it can't read, or can't show holds the newest
 write, hasn't loaded the config: the reload stays pending, and so does the profile hold
 below, until every server is confirmed. A pod at an ordinal past what the StatefulSet asks
@@ -1242,9 +1242,11 @@ kubelet write, so a restarted wait usually sees no further move, and nothing the
 reports says whether the newest write was in the one it saw. If the value hasn't moved
 within three minutes, or can't be read, the operator deletes that server's pod so it restarts
 onto the new config: one server per pass, only once every other server has been Ready for
-30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. The fresh
-pod mounts the current Secret, so its creation after the write confirms it, and the pending
-record stays until it is read. That is a `BusConfigReloadFailed` Warning, or a Normal
+30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. When exactly
+one server isn't Ready and hasn't confirmed, it goes first, since restarting it costs no
+quorum. The fresh pod mounts the current Secret, so its creation after the write confirms
+it, and the pending record stays until it is read. A pod created after the write is given a
+full three minutes from its own creation to come up before it can be restarted. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
 restart is kept even then: confirming by the absence of a move would admit a profile whose
 deny the server might not hold. The kubelet takes up to about a minute to write
