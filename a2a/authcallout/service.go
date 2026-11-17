@@ -429,7 +429,9 @@ func (s *Service) decide(ctx context.Context, m *nats.Msg) {
 		// "Authorization Violation" whether its token was bad, the callout
 		// was down, or the response was malformed — so this log line and
 		// the $SYS disconnect advisory are the only places the reason
-		// exists. Log the identity, never the token.
+		// exists. Log the identity, never the token nor the password: the
+		// reason is built from what the client sent, so no step below may
+		// format either into it (ParseDispatcherBucketCredential once did).
 		s.log.Warn("refusing a connection",
 			"reason", err,
 			"host", req.ClientInformation.Host,
@@ -814,6 +816,9 @@ func permissionsFor(grants Grants) *jwt.Permissions {
 	p := &jwt.Permissions{}
 	p.Pub.Allow.Add(grants.Publish...)
 	p.Sub.Allow.Add(grants.Subscribe...)
+	// The entry's own denies, on top of its allows (Grants.DenyPublish).
+	p.Pub.Deny.Add(grants.DenyPublish...)
+	p.Sub.Deny.Add(grants.DenySubscribe...)
 	if len(p.Pub.Allow) == 0 {
 		p.Pub.Deny.Add(">")
 	}

@@ -259,7 +259,8 @@ parse_args() {
 
 write_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-uninstall-report.json"
+  # KUBE_AGENTS_UNINSTALL_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_UNINSTALL_REPORT_FILE:-/tmp/kube-agents-uninstall-report.json}"
   cat << EOF > "$report_file"
 {
   "status": "$(json_escape "$status")",

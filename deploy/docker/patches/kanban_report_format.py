@@ -145,8 +145,10 @@ written), and splits anything past 4000 characters across messages:
   The step is for the requester to send: never act on it yourself, before
   or after kanban_complete.
 - A question gets that paragraph and nothing more: at most four sentences and
-  600 characters in all, as short as the answer allows, with no table, no
-  section and no list of the commands you ran. Decide by what the card asks:
+  600 characters in all, aiming for under 400, with no table, no section and
+  no list of the commands you ran. Its evidence says what you found, not
+  how: name no command, script, kube context or the time you ran them.
+  Decide by what the card asks:
   whether something is true (a yes-or-no or status question) gets the
   answer, with no claims, sections or Sources list unless the card asks for
   them; why something broke gets the report. A closing request to report or summarize never turns a
