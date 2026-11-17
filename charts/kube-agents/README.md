@@ -1590,7 +1590,7 @@ on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
-target named per task by the `project`, `location` and `cluster` parameters.
+target named per task by the `project`, `cluster` and `location` parameters.
 Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because

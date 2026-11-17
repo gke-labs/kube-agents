@@ -604,9 +604,11 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 }
 
 // TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow is the guard renderA2APermission
-// names, and it exists because a deny list has two ways to reach the server as
-// nothing at all -- neither of which fails, logs, or changes the rendered config
-// in a way a reader would notice.
+// names, and it exists because a deny list without an allow beside it doesn't
+// narrow the principal the way its author meant. For a static principal that is
+// silent: nothing fails, logs, or changes the rendered config in a way a reader
+// would notice. For a callout principal it is loud, a refused map, but still
+// not what was meant.
 //
 //  1. STATIC principals. renderA2APermission renders a direction with no allow
 //     entries as `deny = [">"]` and drops the author's deny list on the floor.
@@ -668,7 +670,9 @@ func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
 			"measures nothing")
 	}
 
-	for _, id := range a2aIdentities(agent) {
+	// The gateway's map entry too (gatewayCalloutEntry, #5301): the one
+	// callout principal that carries denies, and only in the map.
+	for _, id := range append(a2aIdentities(agent), gatewayCalloutEntry(agent)) {
 		for _, d := range []struct {
 			kind  string
 			allow []string
@@ -678,6 +682,11 @@ func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
 			{"subscribe", id.subscribe, id.denySubscribe},
 		} {
 			if len(d.deny) == 0 {
+				continue
+			}
+			if id.auth == a2aAuthCallout && id.narrowing != "" {
+				t.Errorf("callout principal %q narrows on %q and carries a %s deny %v: a narrowed entry's grants "+
+					"are derived and may carry none, so the map is refused", id.user, id.narrowing, d.kind, d.deny)
 				continue
 			}
 			if id.auth == a2aAuthCallout && len(d.allow) == 0 {
