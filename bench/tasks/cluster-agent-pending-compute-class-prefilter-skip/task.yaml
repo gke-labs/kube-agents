@@ -1,0 +1,133 @@
+# Registered in hack/eval/nightly-cases.txt (nightly tier).
+#
+# Domain: cluster debugging. Journey: pods stay Pending with "Insufficient
+# cpu", and the tempting answer is a larger pool or lower requests. The cause
+# is that the pods name no ComputeClass while the pool carries a compute-class
+# label, so the Cluster Autoscaler does not try a scale-up for them. The
+# Cluster Agent's pod-pending-scheduling skill must name that as the likely
+# cause, state the cluster's version, and give the class for the pod template
+# as the patch.
+#
+# The record in the prompt is what kubectl returns for the skill's reads (the
+# pod, its events, the nodes, the namespace's labels, the server's version),
+# in the shape of a test run on GKE 1.35.8-gke.1796000. Every name in it is
+# invented. The cluster of the record is registered nowhere, so the prompt
+# lets the front door choose any Cluster Agent, and the case needs no fixture.
+#
+# The record does not hold the node pools' limits, which the skill reads with
+# gcloud. That is on purpose: with them in the record, the agent names the
+# cause without the skill's note too. So the case grades the diagnosis from
+# the kubectl evidence, where the answer without the note is a capacity fix.
+#
+# Why not a seeded cluster. The fleet's ComputeClass cluster (slot c) holds its
+# labelled pool at one node by an autoscaling maximum of 1 and follows the
+# REGULAR channel, so nothing is Pending there, the pool is always at its
+# maximum, and the version moves. A live case there would give the agent a
+# premise that the cluster does not show.
+#
+# What the case does not grade: that the agent runs the reads itself. The
+# record gives their output, and the prompt forbids commands.
+#
+# The checks read the work product, not the prose of the diagnosis: the patch
+# as a manifest or a command, the version string of the record, and a capacity
+# change offered as a manifest or a command. The judge's reference
+# (expected_output) holds the diagnosis in words.
+#
+# The capped-pool diagnosis of the same skill is
+# cluster-agent-pending-replicas-capped-pool.
+#
+# Planted defect required: none.
+id: cluster-agent-pending-compute-class-prefilter-skip
+name: A Cluster Agent names a ComputeClass pre-filter skip for Pending pods, not a small pool
+
+domain: cluster-debugging
+owner: Fuxiao-Gao
+
+prompt: |-
+  Ask a Cluster Agent to find why the pods in the record below stay Pending, with its skill pod-pending-scheduling, and give me its finding and the patch.
+  The record is from a cluster that is not registered with you, so no agent can read it now. Choose any one Cluster Agent yourself and do not ask me which. It must work from the record only and run no command against a cluster.
+
+  Record (cluster orders-prod-1, namespace orders, Deployment orders-worker, 3 replicas, all Pending for 7 minutes):
+  - The pod (kubectl get pod orders-worker-7d9c6b5f48-k2m9p -n orders): owner ReplicaSet orders-worker-7d9c6b5f48; nodeSelector: null; affinity: null; tolerations: only the two default not-ready and unreachable tolerations; priorityClassName: null; requests: cpu 500m, memory 256Mi; no volume claims; condition PodScheduled=False, reason Unschedulable.
+  - The events of the pod: "FailedScheduling", count 2, message "0/1 nodes are available: 1 Insufficient cpu. no new claims to deallocate, preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod." And "NotTriggerScaleUp", count 34 in 7 minutes, message "Pod didn't trigger scale-up:" with nothing after the colon.
+  - The nodes (NAME, POOL, CLASS, TAINTS, CPU, MEMORY): gke-orders-prod-1-default-pool-5c1e9a42-x7kq, default-pool, orders-class, <none>, 940m, 2869468Ki. There is no other node.
+  - The namespace's labels: {"kubernetes.io/metadata.name":"orders"}
+  - The server's version (kubectl version): v1.35.8-gke.1796000
+  - Resource quotas and claims in the namespace: none.
+expected_output: >-
+  The Planning Agent hands the work to one Cluster Agent without asking which
+  cluster. The answer quotes the scheduler's message and says that the likely
+  cause is a ComputeClass pre-filter skip: the pods name no ComputeClass (no
+  cloud.google.com/compute-class in a nodeSelector or a required nodeAffinity,
+  and no default class on the namespace), the only pool carries the class
+  label orders-class, and the autoscaler's repeated event gives no reason. It
+  states the cluster's version, 1.35.8-gke.1796000, as a version where this
+  behaviour was seen. It says that the node pools' limits are not in the
+  record, and it names the reads that confirm the cause. The patch is cloud.google.com/compute-class: orders-class
+  in the nodeSelector of the orders-worker pod template (or the namespace
+  default-class label). It does not call the cause a capacity shortage, and it
+  does not give a larger pool or lower requests as the fix. Nothing is run
+  against a cluster.
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: false
+
+verification_spec:
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    mode: assert
+    check:
+      # The work is a Cluster Agent's: a worker with a cluster profile's tag is
+      # on the trajectory. On the inject lane the scorer grades this entry only
+      # on a record that carries the workers' tagged entries.
+      type: worker_agents
+      required_agents: ["cluster-.+"]
+  - name: the-reply-carries-the-class-for-the-pods
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The patch as a manifest or a command, never as prose: the class as an
+      # entry of a nodeSelector (a block, with comment lines between, or an
+      # inline map); the class in a nodeAffinity term (the key, then the value
+      # within three lines); or the namespace's default-class label (under
+      # `labels:`, or in a `kubectl label namespace` command). report_manifest
+      # cannot address a key that holds a dot, so these are patterns.
+      # What does not pass, on purpose: the pool's own label in any form
+      # (`...compute-class=orders-class`, or a node pool's JSON, where it is
+      # under "labels" with another key), and a sentence that says what is
+      # absent ("the namespace lacks cloud.google.com/default-compute-class").
+      # Accepted and stated: a reply that gives the patch only in a sentence,
+      # with no manifest and no command, fails.
+      # bench/tests/test_prefilter_skip_report_patterns.py holds one form for
+      # each pattern and the forms that must not pass.
+      any_of_patterns:
+        - 'nodeselector["'']?\s*:\s*\n(?:\s*#[^\n]*\n)*\s*["'']?cloud\.google\.com/compute-class["'']?\s*:\s*["'']?orders-class\b'
+        - 'nodeselector["'']?\s*:\s*\{\s*["'']?cloud\.google\.com/compute-class["'']?\s*:\s*["'']?orders-class\b'
+        - 'key["'']?\s*:\s*["'']?cloud\.google\.com/compute-class["'']?\s*\n(?:[^\n]*\n){0,3}?[^\n]*\borders-class\b'
+        - 'labels["'']?\s*:\s*\n(?:[^\n]*\n){0,5}?\s*["'']?cloud\.google\.com/default-compute-class(?:-non-daemonset)?["'']?\s*:\s*["'']?orders-class\b'
+        - 'kubectl\s+label\s+(?:namespaces?|ns)\s+\S+\s+(?:--overwrite\s+)?cloud\.google\.com/default-compute-class(?:-non-daemonset)?=orders-class\b'
+  - name: the-report-states-the-version-of-the-record
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The version as the record gives it, with or without the "v" that
+      # kubectl prints. The skill's own text names 1.35.8 with no patch
+      # suffix, so a reply that repeats the skill and states no version that
+      # it read does not pass.
+      required_patterns:
+        - '\bv?1\.35\.8-gke\.1796000\b'
+  - name: the-reply-offers-no-capacity-change
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The wrong fix as a manifest or a command: a `requests:` block whose
+      # cpu is not the record's 500m, or a gcloud flag that sizes a pool or
+      # turns autoscaling on. A sentence about a pool's size is not read here;
+      # the judge's reference covers the words.
+      forbidden_patterns:
+        - 'requests["'']?\s*:\s*\n\s*["'']?cpu["'']?\s*:\s*["'']?(?!500m\b)[0-9.]+m?\b'
+        - '--(?:max-nodes|total-max-nodes|num-nodes|enable-autoscaling)\b'
