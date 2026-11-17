@@ -443,9 +443,7 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 	"7": {"account", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
-	// 8 is taken by #5937 (held); gaps are allowed, and a later lander
-	// rebuilds its row on the newest landed one.
-	"9": {"account", "denyPublish", "denySubscribe", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"8": {"account", "denyPublish", "denySubscribe", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // The schema constant is the newest version the table records, and each
