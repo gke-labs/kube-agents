@@ -17,7 +17,7 @@ at the instance. These tests hold the installer to that:
   CA when it starts, is restarted.
 
 The Terraform rendering itself is in
-terraform/examples/full-install/tests/github_enterprise.tftest.hcl.
+terraform/examples/full-install/tftests/github_enterprise.tftest.hcl.
 """
 
 import base64
