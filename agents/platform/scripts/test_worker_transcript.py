@@ -986,6 +986,42 @@ class TestScrubStepText(unittest.TestCase):
         self.assertTrue(worker_transcript.named_value_is_sensitive(REDACTOR, "client-key-data"))
 
 
+def _deepest_python_call(function, *args):
+    """How many Python frames `function` runs at its deepest, itself counted
+    as 1. `sys.setprofile` sees each call and each return of a Python
+    function, also one that a pattern's `sub` calls back; a C function
+    counts for nothing. The number does not depend on the recursion limit
+    of the run, while the function stays below that limit. The garbage
+    collector is off for the call: a finalizer that it ran in the middle
+    would count as a call of the function's. So would a Python signal
+    handler; no test in this file sets one."""
+    import gc
+
+    depth = deepest = 0
+
+    def note(frame, event, arg):
+        nonlocal depth, deepest
+        if event == "call":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif event == "return":
+            depth -= 1
+
+    collects = gc.isenabled()
+    gc.disable()
+    try:
+        before = sys.getprofile()
+        sys.setprofile(note)
+        try:
+            function(*args)
+        finally:
+            sys.setprofile(before)
+    finally:
+        if collects:
+            gc.enable()
+    return deepest
+
+
 class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
     """Three patterns were quadratic on a long run (#5901). Their linear forms
     must give the same output as the old forms: the same key, scheme and
@@ -1123,6 +1159,21 @@ class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
         ):
             with self.subTest(cmd=cmd):
                 self.assertEqual(_scrub("tool_call", cmd), want)
+
+    def test_blank_quoted_spans_keeps_its_depth_in_python_frames(self):
+        # The callback runs one Python frame below the rule and calls no
+        # Python function, also for the single quotes inside an open double
+        # quote. A callback of its own for those (a second `re.sub`) gives
+        # the same output one frame deeper, so the rule reaches the
+        # recursion limit one frame sooner in a deeply nested step. No other
+        # test in this file sees that.
+        #
+        # First, the count does see a function that a pattern's `sub` calls
+        # back: the second lambda runs one frame below the first.
+        self.assertEqual(_deepest_python_call(lambda: worker_transcript.SHELL_QUOTED_SPAN_RE.sub(lambda match: "", "'a'")), 2)
+        for text in ("echo plain", "echo 'a b'", 'echo "c d"', 'echo "c d', "x 'a' 'b' \"c 'd' 'e' f"):
+            with self.subTest(text=text):
+                self.assertEqual(_deepest_python_call(worker_transcript.blank_quoted_spans, text), 2)
 
     def test_a_long_run_scrubs_in_linear_time(self):
         # The whole scrub. Each command took seconds on the old forms (1.6 s
@@ -1315,6 +1366,26 @@ class TestJsonBlockRuleKeepsItsOutput(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), want)
+
+    def test_the_block_rule_keeps_its_depth_in_python_frames(self):
+        # The block callback runs one Python frame below
+        # `scrub_secret_blocks`, and the pair function one frame below the
+        # callback, for a pair only. A call of the pair function for a
+        # string that opens no pair gives the same output one frame deeper
+        # on such a block, so the rule reaches the recursion limit one frame
+        # sooner. No other test in this file sees that. The callback's other
+        # paths have a text each: a block that is not masked, and a marker
+        # of an earlier document that the callback steps over.
+        for text, deepest in (
+            ('"stringData":{"a","b"}', 2),
+            ('{"kind":"Secret",\n"data":{"a","b"}}', 2),
+            ('{"level":"info","data":{"a","b"}}', 2),
+            ('x "kind": 1\n{"apiVersion":"v1","data":{"a","b"}}', 2),
+            ('"stringData":{"a":"b"}', 3),
+            ('{"kind":"Secret",\n"data":{"a":"b","c":"d"}}', 3),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_deepest_python_call(worker_transcript.scrub_secret_blocks, REDACTOR, text), deepest)
 
     def test_many_blocks_scrub_in_linear_time(self):
         # The whole scrub. Each text took seconds on the old forms (1.3 s to
