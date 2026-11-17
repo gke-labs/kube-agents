@@ -864,6 +864,37 @@ class BrokerPodNameTests(unittest.TestCase):
                     self.assertEqual(expect, name[57])
                 self.assertTrue(store.is_broker_pod_name(f"{agent}-credential-proxy-", name))
 
+    def test_any_valid_hash_passes(self) -> None:
+        # No hash is pinned: a pod of another ReplicaSet of the same broker
+        # Deployment (a stale or newer pod-template hash) passes as any does.
+        for length in self.LENGTHS:
+            agent = self.agent(length)
+            prefix = f"{agent}-credential-proxy-"
+            for pod_hash in ("7b9f8c6d5", "5d4c8f9b7", "b", "zzzzzzzzzz"):
+                name = generated_pod_name(f"{agent}-credential-proxy", pod_hash, "q7w9z")
+                with self.subTest(length=length, hash=pod_hash):
+                    self.assertTrue(store.is_broker_pod_name(prefix, name), name)
+
+    def test_the_exec_tier_boundary(self) -> None:
+        # 36, the longest agent name with an exec tier: its pod is refused,
+        # though truncation leaves the remainder a bare "exec".
+        agent = self.agent(EXEC_TIER_MAX_AGENT_NAME)
+        prefix = f"{agent}-credential-proxy-"
+        exec_pod = generated_pod_name(agent + EXEC_TIER_SUFFIX, "68b5fc9d47")
+        self.assertEqual("exec", exec_pod[len(prefix):-5])
+        self.assertFalse(store.is_broker_pod_name(prefix, exec_pod))
+        self.assertTrue(store.is_broker_pod_name(prefix, generated_pod_name(f"{agent}-credential-proxy", "68b5fc9d47")))
+        # 37: the operator renders no exec tier (credentialProxyExecTierMaxAgentName),
+        # and the broker's pod passes. An exec-shaped name is cut to "exe",
+        # indistinguishable from a broker pod whose hash begins "exe", and
+        # passes; recorded here so a change to that is deliberate.
+        agent = self.agent(EXEC_TIER_MAX_AGENT_NAME + 1)
+        prefix = f"{agent}-credential-proxy-"
+        self.assertTrue(store.is_broker_pod_name(prefix, generated_pod_name(f"{agent}-credential-proxy", "68b5fc9d47")))
+        exec_shaped = generated_pod_name(agent + EXEC_TIER_SUFFIX, "68b5fc9d47")
+        self.assertEqual("exe", exec_shaped[len(prefix):-5])
+        self.assertTrue(store.is_broker_pod_name(prefix, exec_shaped))
+
     def test_no_prefix_refuses(self) -> None:
         self.assertFalse(store.is_broker_pod_name("", BROKER_POD))
 
