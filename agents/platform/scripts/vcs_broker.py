@@ -2365,6 +2365,8 @@ class VcsBroker:
         payload: dict[str, Any],
         pinned_target: bool = False,
     ) -> dict[str, Any]:
+        if verb in WRITE_VERBS:
+            refuse_dial_gated_labels(payload)
         bound = self._bind(payload)
         # Before anything else that could spend a call: a forge with no labels
         # refuses a label field by name, so a filter is not silently ignored
@@ -2554,9 +2556,9 @@ WRITE_VERBS = frozenset(
 # default, is today's behaviour. `none` is explain-only: the broker refuses
 # PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
 # and labels stay open to it, because an issue is how an audit reports.
-# Read on every request through write_mode(), the one place a second source
-# (a runtime setting) can be added. Today its only source is the broker's env,
-# so on a pod a change applies once the operator has rolled the broker.
+# Read on every request through write_mode(), which takes the most restrictive
+# of the broker's env (applies once the operator has rolled the broker) and the
+# Slack autonomy dial (applies at once; see dial_level below).
 WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
 WRITE_MODE_PROPOSE = "propose"
 WRITE_MODE_NONE = "none"
@@ -2577,19 +2579,139 @@ PROPOSE_VERBS = frozenset(
 def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     """The install's write mode and the raw value it was read from.
 
-    Unset or empty is `propose`. A value that is neither mode is `none`: a
-    setting someone wrote to restrict the agent must not lift the restriction
-    because it was misspelt.
+    The most restrictive of two sources: the broker's env, and the Slack
+    autonomy dial (`dial_level`), whose Explain is `none`. Unset or empty env
+    is `propose`. A value that is neither mode is `none`: a setting someone
+    wrote to restrict the agent must not lift the restriction because it was
+    misspelt. When the dial is what restricts, the raw value is
+    :data:`WRITE_MODE_DIAL_RAW`, so `write_mode_detail` names the dial rather
+    than the env.
     """
     raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
     value = raw.strip().lower()
     if not value:
-        return WRITE_MODE_PROPOSE, raw
-    return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+        mode = WRITE_MODE_PROPOSE
+    else:
+        mode = value if value in WRITE_MODES else WRITE_MODE_NONE
+    if mode == WRITE_MODE_PROPOSE and dial_level(environ) == DIAL_EXPLAIN:
+        return WRITE_MODE_NONE, WRITE_MODE_DIAL_RAW
+    return mode, raw
+
+
+# The Slack autonomy dial's level, the runtime source write_mode() reads beside
+# the env, set through set_dial_level(), so a new level applies with no pod
+# restart. The credential proxy's dial route calls it when the Slack adapter
+# reports a level. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# gets spec.deployment.env); off, the dial is not a source at all. On, a broker
+# with no level set since it started reads the level it last stored on its
+# state emptyDir (kept across a container restart, not a new Pod), and with none
+# stored, Explain: it fails closed. The dial only ever restricts.
+DIAL_ENV = "KUBEAGENTS_DIAL"
+# On the broker's state emptyDir: it outlives a container restart, not the Pod.
+DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
+# write_mode()'s raw value when the dial, not the env, is what restricts. It
+# starts with a NUL, which no environment value can hold, so an env set to the
+# same visible text is still read (and explained) as a misspelt env.
+WRITE_MODE_DIAL_RAW = "\x00dial:explain"
+DIAL_EXPLAIN = "explain"
+DIAL_PROPOSE = "propose"
+DIAL_AUTOMERGE = "automerge"
+DIAL_LEVELS = (DIAL_EXPLAIN, DIAL_PROPOSE, DIAL_AUTOMERGE)
+_dial_lock = threading.Lock()
+_dial_level: str | None = None
+_dial_reported = False
+# The label the customer's pipeline merges on (automation_rules.AUTOMERGE_LABEL;
+# a test holds the two equal). Below Auto-merge no write verb may add it.
+DIAL_GATED_LABELS = frozenset({"kube-agents:auto-merge"})
+DIAL_ADDING_LABEL_FIELDS = ("labels", "labelsAdd")
+
+
+def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if environ is None else environ).get(DIAL_ENV, "").strip().lower() == "on"
+
+
+def _dial_state_path() -> Path:
+    return Path(DIAL_STATE_FILE)
+
+
+def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
+    """The dial's level, or None while `KUBEAGENTS_DIAL` is not `on`."""
+    if not dial_enabled(environ):
+        return None
+    with _dial_lock:
+        if _dial_level is not None:
+            return _dial_level
+    try:
+        stored = _dial_state_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        stored = ""
+    return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
+
+
+def set_dial_level(level: str) -> None:
+    """Record the level the gateway reported; ValueError for anything but a level."""
+    global _dial_level, _dial_reported
+    if level not in DIAL_LEVELS:
+        raise ValueError(f"level must be one of {', '.join(DIAL_LEVELS)}")
+    path = _dial_state_path()
+    with _dial_lock:
+        _dial_level = level
+        _dial_reported = True
+        # Kept on the broker's own volume, so a restarted broker process keeps
+        # it; best effort, because the gateway reports it again within a minute.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(level + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOGGER.warning("could not store the dial level at %s: %s", path, exc)
+
+
+def dial_reported() -> bool:
+    """Whether the gateway has reported the dial's level to this broker process."""
+    with _dial_lock:
+        return _dial_reported
+
+
+def dial_allows_automerge(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the dial lets a fix carry the auto-merge label: off, or at Auto-merge."""
+    level = dial_level(environ)
+    return level is None or level == DIAL_AUTOMERGE
+
+
+def refuse_dial_gated_labels(payload: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a write that adds the auto-merge label while the dial is below Auto-merge.
+
+    Compared folded and stripped: a forge matches label names that way, so a
+    spelling that differs only in case is the same label to the pipeline. Each
+    value is also split on commas, because an adapter may join the list with
+    commas and its forge reads that as several labels. Removing it is always
+    allowed, and a read (a list filter) never comes here.
+    """
+    if dial_allows_automerge(environ):
+        return
+    for field in DIAL_ADDING_LABEL_FIELDS:
+        values = payload.get(field)
+        values = [values] if isinstance(values, str) else values if isinstance(values, (list, tuple)) else []
+        names = [part for v in values if isinstance(v, str) for part in v.split(",")]
+        if any(name.strip().casefold() in DIAL_GATED_LABELS for name in names):
+            raise WorkspaceError(
+                "the autonomy dial is not at Auto-merge proven fixes, so no pull request or issue may carry "
+                "the auto-merge label. Leave the label off; an install admin raises the dial on the Slack "
+                "app's Home tab.",
+                status=403,
+                code="DIAL_AUTOMERGE_OFF",
+            )
 
 
 def write_mode_detail(raw: str) -> str:
-    """Why `raw` reads as `none` when it is neither mode, or "" when it is one (or unset)."""
+    """Why `raw` reads as `none` when it is neither mode or the dial restricts, or "" when it is one (or unset)."""
+    if raw == WRITE_MODE_DIAL_RAW:
+        return (
+            f"{DIAL_ENV} is on and the autonomy dial is at Explain, which the broker treats as none; "
+            "with no level set since this broker Pod started it reads Explain"
+        )
     value = raw.strip().lower()
     if not value or value in WRITE_MODES:
         return ""
@@ -2704,6 +2826,18 @@ __all__ = [
     "WRITE_MODE_PROPOSE",
     "WRITE_MODES",
     "WRITE_VERBS",
+    "DIAL_AUTOMERGE",
+    "DIAL_ENV",
+    "DIAL_EXPLAIN",
+    "DIAL_LEVELS",
+    "DIAL_PROPOSE",
+    "WRITE_MODE_DIAL_RAW",
+    "dial_enabled",
+    "dial_level",
+    "dial_reported",
+    "set_dial_level",
+    "dial_allows_automerge",
+    "refuse_dial_gated_labels",
     "write_mode",
     "write_mode_detail",
     "max_bundle_bytes",

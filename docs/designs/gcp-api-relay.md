@@ -151,10 +151,18 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
-   writes `api disabled request_id=%s rule=%s`. These records carry the log's envelope only;
-   the `audit` mapping the exec route attaches to its records (the site's
-   [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)) is
-   not attached on this route.
+   writes `api disabled request_id=%s rule=%s`. Each of these records also carries the
+   `audit` mapping the exec route attaches to its records (the site's
+   [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)), so
+   a relayed read is in the same `tool_execution_audit` trail as a brokered command. The
+   `tool` is `gcp-api`, apart from `gcloud` so that a `gcloud` record still means a process
+   ran; the `subcommand` is the service word of a host the table names (`monitoring`,
+   `cloudtrace`, `container`) and `other` for any other host. The first line is `started`; the
+   verdict is `rejected` for a 400, `blocked` with the `rule` for a 403, `completed` with
+   `duration_ms` and `upstream_status` for a forwarded answer whatever its status, and
+   `failed` for the disabled relay, a credential the broker cannot obtain and each upstream
+   failure. A `failed` record carries `duration_ms` only when the upstream answered (an
+   answer over the cap, a redirect, a body the projection cannot read). The mapping never carries the host, the path or the query.
 
 Named constants, declared at the top of `credential_proxy.py` per the engineering rules:
 

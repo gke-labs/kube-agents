@@ -68,8 +68,9 @@ import (
 )
 
 const (
-	// auditReportStorePort is the listener's port. start-services.sh binds the
-	// same number (AUDIT_REPORT_STORE_PORT); Session KV keeps 8699 on loopback.
+	// auditReportStorePort is the listener's port, the number
+	// audit_report_store.py binds (its LISTEN_PORT); Session KV keeps 8699 on
+	// loopback.
 	auditReportStorePort     = int32(8700)
 	auditReportStorePortName = "report-store"
 	auditReportStoreSuffix   = "-report-store"
@@ -81,16 +82,21 @@ const (
 	// Named without credential words, which gosec's G101 reads as a
 	// hardcoded credential.
 	auditReportStoreTokenVolume    = "audit-report-store-ksa"
-	auditReportStoreTokenMountPath = "/var/run/secrets/kubeagents/audit-report-store"
+	auditReportStoreTokenMountPath = "/var/run/secrets/kubeagents/audit-report-store" // #nosec G101 -- Mount path, not a credential
 
 	// On agent-api-auth: the switch start-services.sh reads, and the one
 	// subject the listener accepts.
 	auditReportStoreEnabledEnv        = "AUDIT_REPORT_STORE_ENABLED"
 	auditReportStoreAllowedSubjectEnv = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
-	// And the name prefix of the broker Deployment's pods, which the token's
-	// kubernetes.io.pod.name claim must carry: the broker's ServiceAccount is
-	// shared with the exec tier and kube-proxy, so the subject alone is not
-	// the broker.
+	// And the name prefix of the broker Deployment's pods, `<agent>-credential-proxy-`:
+	// the broker's ServiceAccount is shared with the exec tier and kube-proxy,
+	// so the subject alone is not the broker. The listener
+	// (audit_report_store.is_broker_pod_name) accepts the token's
+	// kubernetes.io.pod.name claim only if it is (prefix + hash + "-")[:58]
+	// plus 5 random characters, the API server's generateName cut, so long
+	// agent names still pass; and it refuses a name whose remainder after the
+	// prefix begins with "exec", the exec tier's pods, at every length where
+	// the tier can exist (credentialProxyExecTierMaxAgentName).
 	auditReportStoreAllowedPodPrefixEnv = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
 	// On the broker: where the listener is, and the token it presents.
 	auditReportStoreURLEnv       = "AUDIT_REPORT_STORE_URL"
