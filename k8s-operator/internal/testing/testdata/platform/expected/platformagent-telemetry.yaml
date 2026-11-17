@@ -329,7 +329,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
+      storage: 4Gi
 status: {}
 ---
 apiVersion: v1
@@ -1247,7 +1247,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 1Gi
+            storage: 4Gi
       status: {}
 status:
   availableReplicas: 0
@@ -4634,6 +4634,10 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next
               kubeagents.x-k8s.io/a2a-component: provision
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: bus-migration
         - podSelector:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next

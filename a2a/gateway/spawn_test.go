@@ -741,3 +741,49 @@ func TestFromEnvReadsTheExecTierURL(t *testing.T) {
 		t.Errorf("CredentialProxyExecURL = %q with the variable unset, want empty", cfg.CredentialProxyExecURL)
 	}
 }
+
+func TestSpawnPropagatesImagePullRefsAndUniverseDomain(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv(envImagePullRefs, " mirror-pull , extra-pull , mirror-pull , ")
+	t.Setenv(envGoogleCloudUniverseDomain, "universe.example.test")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cfg.ImagePullRefs, ",") != "mirror-pull,extra-pull" {
+		t.Fatalf("ImagePullRefs = %v, want [mirror-pull extra-pull]", cfg.ImagePullRefs)
+	}
+	if cfg.UniverseDomain != "universe.example.test" {
+		t.Fatalf("UniverseDomain = %q, want universe.example.test", cfg.UniverseDomain)
+	}
+
+	cs := k8sfake.NewSimpleClientset()
+	cfg.Namespace = "test-ns"
+	cfg.WorkerImage = "img"
+	cfg.SessionServiceAccount = "agent-a2a-session"
+	cfg.TaskDeadline = 15 * time.Minute
+	cfg.SessionClusterView = true
+	cfg.CredentialProxyURL = "http://proxy:8765"
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-pull", Addressee: "chat-otter-pull"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-pull", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pod.Spec.ImagePullSecrets) != 2 || pod.Spec.ImagePullSecrets[0].Name != "mirror-pull" || pod.Spec.ImagePullSecrets[1].Name != "extra-pull" {
+		t.Fatalf("spawned pod ImagePullSecrets = %v, want [mirror-pull extra-pull]", pod.Spec.ImagePullSecrets)
+	}
+	var gotUniverse string
+	for _, ev := range pod.Spec.Containers[0].Env {
+		if ev.Name == envGoogleCloudUniverseDomain {
+			gotUniverse = ev.Value
+		}
+	}
+	if gotUniverse != "universe.example.test" {
+		t.Fatalf("spawned pod %s = %q, want universe.example.test", envGoogleCloudUniverseDomain, gotUniverse)
+	}
+}
