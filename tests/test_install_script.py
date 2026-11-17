@@ -2819,6 +2819,11 @@ verify_local_source_ref() {
   echo "VERIFIED_IMAGE_TAG=$2"
   exit 0
 }
+# The panel reads gVisor from the live install when install.env is silent
+# (resolve_existing_install_gvisor), and it sources installer_common.sh
+# itself, so a function stub would be overwritten. An explicit value wins
+# and keeps that read off the gcloud on PATH (#5893's guard).
+export ENABLE_GVISOR="false"
 PROJECT_ID="test-project"
 PARAM_IMAGE_TAG="0.4.0"
 run_menu_system "."
@@ -2849,6 +2854,7 @@ gcloud() { return 1; }
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2900,6 +2906,7 @@ EOF
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -2930,6 +2937,7 @@ PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
 CHAT_TOPIC_NAME="custom-topic"
 CHAT_SUB_NAME="platform-agent-chat-events-sub"
+export ENABLE_GVISOR="false"
 run_menu_system "."
 """
         proc = self._run_install_func(cmd)
@@ -9692,6 +9700,59 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
 
+    def test_only_an_explicit_gvisor_off_confirms_the_pool_destroy(self):
+        # guard_gvisor_pool_teardown reads KUBEAGENTS_ALLOW_NODE_POOL_DESTROY.
+        # An explicit --enable-gvisor=false or "No" at the interview's prompt
+        # (both set PARAM_ENABLE_GVISOR_EXPLICIT) confirms it; ENABLE_GVISOR=false
+        # from install.env alone does not (#5824).
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text('#!/bin/bash\necho "ALLOW=${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-unset}"\n')
+        lifecycle_sh.chmod(0o755)
+        log_file = self._tmp_path / "provision.log"
+        cases = (
+            ("export ENABLE_GVISOR=false; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=true"),
+            ("export ENABLE_GVISOR=false", "ALLOW=unset"),
+            ("export ENABLE_GVISOR=true; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=unset"),
+        )
+        for setup, want in cases:
+            with self.subTest(setup=setup):
+                proc = self._run_func(
+                    f'unset KUBEAGENTS_ALLOW_NODE_POOL_DESTROY; {setup}; run_lifecycle_apply "{repo_dir}" "{log_file}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(want, log_file.read_text())
+
+    def test_the_interviews_no_marks_gvisor_explicit(self):
+        text = _INSTALL_SH.read_text()
+        start = text.index('prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)"')
+        yes_default = text[start:]
+        yes_default = yes_default[: yes_default.index("    else\n")]
+        self.assertIn('enable_gvisor="false"', yes_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', yes_default)
+        # No as the default (install.env already false), kept at the prompt:
+        # the operator affirmed it, so it confirms the destroy too.
+        no_default = text[text.index('prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)"'):]
+        no_default = no_default[: no_default.index("    fi\n")]
+        self.assertIn("else", no_default)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', no_default[no_default.index("else"):])
+
+    def test_the_enable_gvisor_flag_marks_the_choice_explicit(self):
+        for flag, want in (("--enable-gvisor=false", "M=[true]"), ("--enable-gvisor=true", "M=[true]")):
+            with self.subTest(flag=flag):
+                proc = self._run_func(f'parse_args {flag}; echo "M=[${{PARAM_ENABLE_GVISOR_EXPLICIT:-}}]"')
+                self.assertIn(want, proc.stdout, proc.stderr)
+        proc = self._run_func('parse_args; echo "M=[${PARAM_ENABLE_GVISOR_EXPLICIT:-}]"')
+        self.assertIn("M=[]", proc.stdout, proc.stderr)
+
+    def test_the_control_panel_reads_gvisor_from_the_live_install(self):
+        text = _INSTALL_SH.read_text()
+        panel = text[text.index("run_menu_system() {"):]
+        panel = panel[: panel.index("\n}\n")]
+        self.assertIn('enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"', panel)
+        self.assertNotIn("${ENABLE_GVISOR:-false}", panel)
+
     def test_successful_apply_writes_log_file_and_succeeds(self):
         repo_dir = self._tmp_path / "mock-repo"
         compose_dir = repo_dir / "terraform" / "examples" / "full-install"
@@ -13638,6 +13699,7 @@ prompt_menu() {{
     3) printf -v "$var" '%s' "6" ;;
   esac
 }}
+export ENABLE_GVISOR="false"
 run_menu_system "{repo_tmp}"
 """,
                         source_common=False,

@@ -461,6 +461,39 @@ readonly SLACK_LANE_APP_TOKEN_SECRET="slack-eval-app-token"
 readonly SLACK_LANE_CHANNEL_SECRET="slack-eval-channel-id"
 readonly SLACK_LANE_TEST_USER_SECRET="slack-eval-test-user-id"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
+
+# The agent gateway runs one replica, so a node drain or an autoscaler
+# consolidation replaces its pod, and the replacement can wait a minute or more
+# for a node (#6040: a ScaleDown took it mid-check on #3554's smoke). The checks
+# that talk to it through a tunnel (step 7's connectivity check and the web
+# console gate) tolerate ONE such replacement each: when an attempt fails and
+# the gateway's Running pod is not the one the check started with, they wait
+# for the Deployment to roll out and retry without spending an attempt. A
+# second replacement, or a replacement that never becomes Ready, fails as
+# before. Accepted edges: a failure that merely coincides with a replacement
+# (a 403, say) fails one retry and one rollout wait later than it would have;
+# `rollout status` can answer before the Deployment reflects the new pod, which
+# wastes the free retry; and under next a Ready pod's bridge may not consume
+# yet. Each costs time or an attempt, never a wrong pass. The availability fix
+# is a second replica (#4206).
+readonly GATEWAY_REPLACEMENT_WAIT_TIMEOUT="600s"
+# A terminating pod keeps phase Running through its grace period, so one with
+# a deletionTimestamp is left out: it is the pod being replaced, not the gateway.
+gateway_pod_uids() {
+  { kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true; } |
+    awk 'NF == 1 { print $1 }' | sort | tr '\n' ' '
+}
+# <uids at the check's start> <check name>. 0 when the pod was replaced and the
+# replacement rolled out (retry without spending an attempt), 1 otherwise.
+await_gateway_replacement() {
+  local started="$1" check="$2" now
+  now="$(gateway_pod_uids)"
+  [ -n "${started}" ] && [ "${now}" != "${started}" ] || return 1
+  echo "the agent gateway pod was replaced during ${check} (#6040); waiting up to ${GATEWAY_REPLACEMENT_WAIT_TIMEOUT} for the replacement, once"
+  kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout="${GATEWAY_REPLACEMENT_WAIT_TIMEOUT}" || return 1
+}
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
 # (credential_proxy_manifests.go).
@@ -2662,6 +2695,8 @@ gate_web_console() {
   WEB_CONSOLE_BODY_FILE="$(mktemp)"
   WEB_CONSOLE_DETAIL="no attempt ran"
   rc=1
+  local gateway_uids replacement_seen="false"
+  gateway_uids="$(gateway_pod_uids)"
   : >"${WEB_CONSOLE_PF_LOG}"
   for ((attempt = 1; attempt <= WEB_CONSOLE_GATE_ATTEMPTS; attempt++)); do
     # Kill any previous tunnel and start a fresh one; the log is appended so
@@ -2677,6 +2712,12 @@ gate_web_console() {
     rc=0
     web_console_probe "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" || rc=$?
     [ "${rc}" -eq 0 ] && break
+    if [ "${replacement_seen}" = "false" ] && await_gateway_replacement "${gateway_uids}" "the web console gate (${label})"; then
+      replacement_seen="true"
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; the replacement is up, retrying without spending the attempt"
+      attempt=$((attempt - 1))
+      continue
+    fi
     if [ "${rc}" -ne "${WEB_CONSOLE_PROBE_RETRY}" ]; then
       echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; a fresh tunnel would not change that"
       break
@@ -3353,6 +3394,8 @@ readonly AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/doc
 readonly PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
 readonly CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
 CONNECTIVITY_OK="false"
+CONNECTIVITY_GATEWAY_UIDS="$(gateway_pod_uids)"
+CONNECTIVITY_REPLACEMENT_SEEN="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
   # Kill any previous tunnel and start a fresh one; the log is appended so a
@@ -3386,6 +3429,12 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
     FAIL_REASON="empty response after port-forward drop"
   else
     FAIL_REASON="unexpected response: ${HEALTH_RESP}"
+  fi
+  if [ "${CONNECTIVITY_REPLACEMENT_SEEN}" = "false" ] && await_gateway_replacement "${CONNECTIVITY_GATEWAY_UIDS}" "the API connectivity check"; then
+    CONNECTIVITY_REPLACEMENT_SEEN="true"
+    echo "connectivity attempt ${attempt}/${CONNECTIVITY_ATTEMPTS} failed: ${FAIL_REASON}; the replacement is up, retrying without spending the attempt"
+    attempt=$((attempt - 1))
+    continue
   fi
   if [ "${attempt}" -lt "${CONNECTIVITY_ATTEMPTS}" ]; then
     echo "connectivity attempt ${attempt}/${CONNECTIVITY_ATTEMPTS} failed: ${FAIL_REASON}; respawning tunnel"

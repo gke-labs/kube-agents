@@ -171,6 +171,31 @@ type SessionRecord struct {
 	// text. More than one, because a follow-up ends seconds after the control
 	// it follows.
 	RetiredCardStops []string `json:"retiredCardStops,omitempty"`
+	// Delivery is where an unattended run's result goes, recorded by the
+	// trigger ingress on a trigger's own conversation
+	// (trigger:<source>/<ns>/<name>) for the relay to route (#4685 Track 3).
+	// nil everywhere else.
+	Delivery *lib.ScheduleDelivery `json:"delivery,omitempty"`
+	// TriggerRuns are the recent runs the trigger ingress started on this
+	// conversation, oldest first, at most triggerRunsKept: each run's
+	// idempotency key and task. A repeat of any of them is answered with its
+	// task and starts nothing, since a second mint would overwrite the grant
+	// revision the first task's envelope pins.
+	TriggerRuns []TriggerRun `json:"triggerRuns,omitempty"`
+}
+
+// TriggerRun is one run the trigger ingress started: its idempotency key and
+// its task (SessionRecord.TriggerRuns).
+type TriggerRun struct {
+	Key  string `json:"key"`
+	Task string `json:"task"`
+	// Capability is the run's grant, pinned when it was minted, and
+	// CorrelationID its envelope's: a run recorded but not yet published is
+	// published again with both, never minted again.
+	Capability    *capability.Ref `json:"capability,omitempty"`
+	CorrelationID string          `json:"correlationId,omitempty"`
+	// Published says the run's submission is on the bus.
+	Published bool `json:"published,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,
