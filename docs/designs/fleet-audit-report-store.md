@@ -208,7 +208,7 @@ It checks the issuer, the audience, the expiry, that the subject is the broker's
 that the token is bound to a pod of the broker's Deployment (the ServiceAccount is shared with the
 exec tier). A failed check is 401, a wrong subject or pod 403, and a JWKS it cannot read 503, never
 an accept. The API server, the token it reads the JWKS with and the store's root are fixed in the
-listener, not read from the environment, which `spec.deployment.env` reaches. The
+listener, not read from the environment, which `spec.deployment.env` reaches.
 A rule in the gateway policy `<agent>-gateway-netpol` admits only the broker's pods to the port.
 It is a rule there rather than a policy of its own, so an operator rollback, which renders that
 policy without it, drops it and leaves nothing isolating the pod. With

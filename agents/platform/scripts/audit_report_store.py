@@ -96,6 +96,9 @@ REPORT_DIR_MODE = 0o755
 REPORT_FILE_MODE = 0o644
 REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 STORE_PATH_SEPARATOR = "%2F"
+# The longest directory name the store creates, in bytes: NAME_MAX on Linux
+# and macOS. A longer owner or name is a 400 before any directory is made.
+STORE_DIR_NAME_MAX_BYTES = 255
 # One envelope. audit_report.py keeps the ledger body near 1 MB across the
 # ring (MAX_BODY_CHARS is 64 KiB an envelope) and the findings document is
 # unbounded there; here a single envelope is capped at 1 MiB, and anything
@@ -119,10 +122,26 @@ AUDIENCE = "kubeagents-audit-report-store"
 # pods (the exec tier among them), so the subject alone is not the broker.
 ALLOWED_SUBJECT_ENV = "AUDIT_REPORT_STORE_ALLOWED_SUBJECT"
 ALLOWED_POD_PREFIX_ENV = "AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX"
-# What a Deployment pod's name adds to its Deployment's: `<rs hash>-<suffix>`.
-# Exactly two segments, so `<agent>-credential-proxy-exec-<hash>-<suffix>`,
-# the exec tier's, does not pass under the broker's prefix.
-DEPLOYMENT_POD_SUFFIX_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+\Z")
+# How Kubernetes names a Deployment's pod, modelled exactly. The ReplicaSet is
+# `<deployment>-<pod-template-hash>` and its pods' generateName is that plus
+# "-"; the API server's SimpleNameGenerator cuts a generateName to
+# POD_GENERATE_NAME_MAX_BASE characters and then adds
+# POD_GENERATE_NAME_RANDOM_LENGTH random ones. So a broker pod is named
+# (P + hash + "-")[:58] + random, with P the prefix the operator renders
+# (`<agent>-credential-proxy-`). For an agent name of about 30 characters or
+# more the "-" after the hash is cut, and from about 41 the prefix itself.
+POD_GENERATE_NAME_MAX_BASE = 58  # 63 (a DNS label) minus the random suffix
+POD_GENERATE_NAME_RANDOM_LENGTH = 5
+POD_TEMPLATE_HASH_MIN_LENGTH = 1
+POD_TEMPLATE_HASH_MAX_LENGTH = 10  # a uint32, safe-encoded
+_POD_NAME_PART_RE = re.compile(r"[a-z0-9]*\Z")
+# The exec tier's pods share the broker's ServiceAccount and are named
+# `<agent>-credential-proxy-exec-tier-<hash>-<random>`, under the broker's
+# prefix. Their remainder after it begins with this, which no pod-template
+# hash does (its alphabet has no vowels), so a name whose remainder begins
+# with it is refused at every length, including where the truncation would
+# otherwise leave a bare "exec" that reads as a hash.
+EXEC_TIER_REMAINDER_PREFIX = "exec"
 # Where the JWKS comes from and the token it is read with: fixed, never from
 # the environment, for the same reason as the root. A CR that could move the
 # API server would be handed the pod's own token and could answer with a JWKS
@@ -191,7 +210,7 @@ def _http_get_json(url: str, token: str | None, ca_file: str | None) -> dict:
         raise JWKSUnavailable(f"GET {url}: answer over {JWKS_MAX_BYTES} bytes")
     try:
         document = json.loads(body)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise JWKSUnavailable(f"GET {url}: not JSON") from exc
     if not isinstance(document, dict):
         raise JWKSUnavailable(f"GET {url}: not a JSON object")
@@ -257,11 +276,17 @@ class TokenVerifier:
             forced = not expired and kid not in self._keys and (
                 self._forced_at is None or now - self._forced_at >= JWKS_FORCED_REFRESH_SECONDS
             )
+            # A kid the cache lacks, inside the hold after a failed fetch, is
+            # one the cluster may well have: the JWKS is unavailable (503),
+            # not the key unknown (401), whichever branch reaches it.
+            held = self._failed_at is not None and now - self._failed_at < JWKS_FAILURE_HOLD_SECONDS
             if not expired and not forced:
                 assert self._issuer is not None
+                if held and kid not in self._keys:
+                    raise JWKSUnavailable("the last JWKS fetch failed moments ago and the key id is not cached")
                 return self._issuer, self._keys.get(kid)
-            if self._failed_at is not None and now - self._failed_at < JWKS_FAILURE_HOLD_SECONDS:
-                if expired:
+            if held:
+                if expired or kid not in self._keys:
                     raise JWKSUnavailable("the last JWKS fetch failed moments ago")
                 assert self._issuer is not None
                 return self._issuer, self._keys.get(kid)
@@ -301,7 +326,7 @@ class TokenVerifier:
             header = json.loads(_b64url_decode(parts[0]))
             claims = json.loads(_b64url_decode(parts[1]))
             signature = _b64url_decode(parts[2])
-        except (ValueError, binascii.Error, UnicodeDecodeError):
+        except (ValueError, RecursionError, binascii.Error, UnicodeDecodeError):
             raise AuthRefused(401, "malformed JWT") from None
         if not isinstance(header, dict) or not isinstance(claims, dict):
             raise AuthRefused(401, "malformed JWT")
@@ -345,14 +370,47 @@ class TokenVerifier:
         kube = claims.get("kubernetes.io")
         pod = kube.get("pod") if isinstance(kube, dict) else None
         pod_name = pod.get("name") if isinstance(pod, dict) else None
-        if (
-            not prefix
-            or not isinstance(pod_name, str)
-            or not pod_name.startswith(prefix)
-            or not DEPLOYMENT_POD_SUFFIX_RE.match(pod_name[len(prefix):])
-        ):
+        if not isinstance(pod_name, str) or not is_broker_pod_name(prefix, pod_name):
             raise AuthRefused(403, "the token is not bound to a broker pod")
         return subject
+
+
+def _lower_alnum(text: str) -> bool:
+    return bool(_POD_NAME_PART_RE.match(text))
+
+
+def is_broker_pod_name(prefix: str, pod_name: str) -> bool:
+    """Whether (prefix + hash + "-")[:58] + random can produce `pod_name`.
+
+    The hash is POD_TEMPLATE_HASH_MIN_LENGTH to POD_TEMPLATE_HASH_MAX_LENGTH
+    lowercase alphanumerics and the random part POD_GENERATE_NAME_RANDOM_LENGTH.
+    A name whose remainder after the prefix begins with
+    EXEC_TIER_REMAINDER_PREFIX is refused: that is the exec tier's.
+    """
+    if not prefix or len(pod_name) <= POD_GENERATE_NAME_RANDOM_LENGTH:
+        return False
+    if pod_name.startswith(prefix) and pod_name[len(prefix):].startswith(EXEC_TIER_REMAINDER_PREFIX):
+        return False
+    base, random_part = pod_name[:-POD_GENERATE_NAME_RANDOM_LENGTH], pod_name[-POD_GENERATE_NAME_RANDOM_LENGTH:]
+    if not _lower_alnum(random_part) or len(base) > POD_GENERATE_NAME_MAX_BASE:
+        return False
+    if len(prefix) >= POD_GENERATE_NAME_MAX_BASE:
+        # The prefix itself was cut: nothing of the hash is left to check.
+        return base == prefix[:POD_GENERATE_NAME_MAX_BASE]
+    if not base.startswith(prefix):
+        return False
+    rest = base[len(prefix):]
+    if len(base) < POD_GENERATE_NAME_MAX_BASE or rest.endswith("-"):
+        # Not cut, or cut exactly after the "-": rest is the whole hash and "-".
+        pod_hash = rest[:-1]
+        return (
+            rest.endswith("-")
+            and POD_TEMPLATE_HASH_MIN_LENGTH <= len(pod_hash) <= POD_TEMPLATE_HASH_MAX_LENGTH
+            and _lower_alnum(pod_hash)
+        )
+    # Cut inside the hash or just before its "-": rest is the hash's first
+    # characters.
+    return len(rest) <= POD_TEMPLATE_HASH_MAX_LENGTH and _lower_alnum(rest)
 
 
 def _signature_valid(alg: str, key: dict, signing_input: bytes, signature: bytes) -> bool:
@@ -428,12 +486,19 @@ def store_dirs_for_key(key: str) -> tuple[str, str]:
     if not _plain_segment(owner) or not below or not all(_plain_segment(part) for part in below):
         raise Refused(400, "the store key has a part that is not a plain path segment")
     if len(below) == 1:
-        return owner, below[0]
+        return _bounded(owner, below[0])
     if owner == "github.com" and len(below) == 2:
-        return below[0], below[1]
+        return _bounded(below[0], below[1])
     if "." not in owner:
         raise Refused(400, "a store key below a host names the host first")
-    return owner, STORE_PATH_SEPARATOR.join(below)
+    return _bounded(owner, STORE_PATH_SEPARATOR.join(below))
+
+
+def _bounded(owner: str, name: str) -> tuple[str, str]:
+    for part in (owner, name):
+        if len(part.encode("utf-8")) > STORE_DIR_NAME_MAX_BYTES:
+            raise Refused(400, f"a store key part is over {STORE_DIR_NAME_MAX_BYTES} bytes")
+    return owner, name
 
 
 def store_key_for_dirs(owner: str, name: str) -> str:
@@ -508,12 +573,19 @@ def _open_child_dir(parent_fd: int, name: str, create: bool) -> int:
     except OSError as exc:
         if exc.errno in _SYMLINK_ERRNOS:
             raise _symlink_refusal(name) from None
+        if exc.errno == errno.ENAMETOOLONG:
+            # A backstop: store_dirs_for_key bounds what a request can name.
+            raise Refused(400, "a store path component is too long") from None
         raise
     try:
         os.mkdir(name, REPORT_DIR_MODE, dir_fd=parent_fd)
         created = True
     except FileExistsError:
         created = False
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            raise Refused(400, "a store path component is too long") from None
+        raise
     try:
         fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except OSError as exc:
@@ -565,10 +637,22 @@ def _read_at(dir_fd: int, name: str) -> bytes:
         if exc.errno in _SYMLINK_ERRNOS:
             raise _symlink_refusal(name) from None
         raise
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+    # Checked on the raw fd, before fdopen: fdopen refuses a directory itself
+    # (IsADirectoryError, a 500), and the fd must close on every path.
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise _symlink_refusal(name)
-        data = handle.read(REPORT_MAX_BYTES + 1)
+        chunks = []
+        remaining = REPORT_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
     if len(data) > REPORT_MAX_BYTES:
         raise Refused(409, f"a stored entry is over {REPORT_MAX_BYTES} bytes")
     return data
@@ -621,6 +705,24 @@ def _all_ring_names(runs_fd: int) -> list[str]:
     return sorted(names)
 
 
+def _ring_holds(runs_fd: int, data: bytes) -> bool:
+    """Whether a ring entry is byte-identical to `data`, newest first, stopping at the first match.
+
+    An entry that cannot be read (over REPORT_MAX_BYTES, which the file
+    store's writer does not cap, gone, or no longer a regular file) is a
+    non-match, never an error: one bad old entry must not refuse every PUT
+    latest until it ages out. `data` is at most REPORT_MAX_BYTES, so it can
+    equal no oversized entry anyway.
+    """
+    for entry in reversed(_ring_names(runs_fd)):
+        try:
+            if _read_at(runs_fd, entry) == data:
+                return True
+        except (Refused, OSError):
+            continue
+    return False
+
+
 def _ring_of(root: str, parts: list[str]) -> list[str]:
     try:
         with _DirChain(root, parts + [REPORT_RUNS_DIR], create=False) as runs:
@@ -634,7 +736,7 @@ def _validated_body(body: bytes) -> bytes:
         raise Refused(413, f"the body is over {REPORT_MAX_BYTES} bytes")
     try:
         document = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise Refused(400, "the body is not JSON") from None
     if not isinstance(document, dict):
         raise Refused(400, "the body is not a JSON object")
@@ -687,7 +789,7 @@ def list_streams(root: str) -> list[dict]:
                         latest = json.loads(_read_at(chain.fd, REPORT_LATEST_NAME))
                     if isinstance(latest, dict) and isinstance(latest.get("finished_at"), str):
                         finished = latest["finished_at"]
-                except (_Missing, Refused, OSError, ValueError):
+                except (_Missing, Refused, OSError, ValueError, RecursionError):
                     pass
                 streams.append(
                     {
@@ -754,7 +856,7 @@ def _handle_store(
                 except _Missing:
                     raise Refused(409, "latest must be a copy of a run in the ring") from None
                 try:
-                    if not any(_read_at(runs_fd, entry) == data for entry in _ring_names(runs_fd)):
+                    if not _ring_holds(runs_fd, data):
                         raise Refused(409, "latest must be a copy of a run in the ring")
                 finally:
                     os.close(runs_fd)

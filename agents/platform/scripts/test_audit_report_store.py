@@ -555,7 +555,13 @@ class HardeningTests(StoreTestCase):
         self.assertEqual({"ALLOWED_SUBJECT_ENV", "ALLOWED_POD_PREFIX_ENV"}, read)
 
     def test_setting_the_old_overrides_changes_nothing(self) -> None:
+        # A stream under the overridden root: a listener that honoured
+        # FLEET_AUDIT_REPORTS_DIR would list it.
         elsewhere = self.tmp / "elsewhere"
+        planted = elsewhere / "compliance-audit" / "acme" / "gitops" / "runs"
+        planted.mkdir(parents=True)
+        (planted / f"{STAMP_1}.json").write_text("{}")
+        before = sorted(str(p) for p in elsewhere.rglob("*"))
         hostile = {
             "FLEET_AUDIT_REPORTS_DIR": str(elsewhere),
             "AUDIT_REPORT_STORE_API_SERVER": "http://127.0.0.1:1",
@@ -564,9 +570,28 @@ class HardeningTests(StoreTestCase):
         with mock.patch.dict(os.environ, hostile):
             client = TestClient(store.create_app(store.TokenVerifier(fetch=self.fetch)))
             self.assertEqual(store.DEFAULT_REPORTS_DIR, client.app.state.root)
-            self.assertEqual(204, self.put_run(STAMP_1).status_code)
-        self.assertFalse(elsewhere.exists())
-        self.assertTrue((self.root / "compliance-audit" / "acme" / "gitops" / "runs" / f"{STAMP_1}.json").is_file())
+            # Read-only, so the default root is never created on this machine.
+            listed = client.request("GET", "/v1/audit-reports", headers={"Authorization": f"Bearer {self.token}"})
+            self.assertEqual(200, listed.status_code)
+            self.assertNotIn(
+                {"audit_id": "compliance-audit", "key": "acme%2Fgitops", "newest_run": STAMP_1,
+                 "latest_finished_at": None},
+                listed.json(),
+            )
+            # The default fetch goes to the fixed API server with the fixed SA directory.
+            seen = []
+
+            def recording(url, token, ca_file):
+                seen.append((url, ca_file))
+                raise store.JWKSUnavailable("not dialled in a test")
+
+            with mock.patch.object(store, "_http_get_json", side_effect=recording):
+                with self.assertRaises(store.JWKSUnavailable):
+                    store.fetch_cluster_keys()
+            self.assertEqual(
+                [(store.DEFAULT_API_SERVER + store.DISCOVERY_PATH, str(Path(store.DEFAULT_SA_DIR) / "ca.crt"))], seen
+            )
+        self.assertEqual(before, sorted(str(p) for p in elsewhere.rglob("*")))
 
     def test_fifos_are_refused_without_blocking(self) -> None:
         directory = self.root / "compliance-audit" / "acme" / "gitops"
@@ -592,6 +617,78 @@ class HardeningTests(StoreTestCase):
         directory.mkdir(parents=True)
         (directory / "latest.json").write_bytes(b" " * (store.REPORT_MAX_BYTES + 1))
         self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
+
+    def test_an_oversized_older_ring_entry_does_not_refuse_put_latest(self) -> None:
+        # The file store's writer has no size cap, so the ring can hold one.
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        runs.mkdir(parents=True)
+        (runs / f"{STAMP_1}.json").write_bytes(b" " * (store.REPORT_MAX_BYTES + 1))
+        (runs / f"{STAMP_2}.json").write_text('{"run": 2}')
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", b'{"run": 2}').status_code)
+        # And a body matching nothing is still a 409, not an error from the big entry.
+        self.assertEqual(409, self.call("PUT", f"{STREAM}/latest", b'{"run": 3}').status_code)
+
+    def test_a_directory_or_fifo_in_the_ring_is_a_non_match(self) -> None:
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        runs.mkdir(parents=True)
+        (runs / f"{STAMP_1}.json").write_text('{"run": 1}')
+        real = store._ring_names
+        # Turn the newest entry into a directory after the ring is listed, as a
+        # racing writer could.
+        def racing(runs_fd):
+            names = real(runs_fd)
+            (runs / f"{STAMP_2}.json").mkdir()
+            return names + [f"{STAMP_2}.json"]
+
+        with mock.patch.object(store, "_ring_names", side_effect=racing):
+            self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", b'{"run": 1}').status_code)
+
+    def test_put_latest_reads_the_ring_newest_first_and_stops_at_the_match(self) -> None:
+        runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
+        runs.mkdir(parents=True)
+        stamps = [f"202611{day:02d}T000000.000000Z" for day in range(1, store.REPORT_HISTORY + 1)]
+        for i, stamp in enumerate(stamps):
+            (runs / f"{stamp}.json").write_text(json.dumps({"run": i}))
+        reads = []
+        real = store._read_at
+
+        def counting(dir_fd, name):
+            reads.append(name)
+            return real(dir_fd, name)
+
+        with mock.patch.object(store, "_read_at", side_effect=counting):
+            newest = json.dumps({"run": len(stamps) - 1}).encode()
+            self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", newest).status_code)
+            self.assertEqual([f"{stamps[-1]}.json"], reads)
+            reads.clear()
+            third = json.dumps({"run": len(stamps) - 3}).encode()
+            self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", third).status_code)
+            self.assertEqual([f"{stamp}.json" for stamp in reversed(stamps[-3:])], reads)
+
+    def test_a_directory_at_latest_is_refused_without_leaking_an_fd(self) -> None:
+        directory = self.root / "compliance-audit" / "acme" / "gitops"
+        (directory / "runs").mkdir(parents=True)
+        (directory / "runs" / f"{STAMP_1}.json").write_text("{}")
+        (directory / "latest.json").mkdir()
+        # Warm up: the first request opens sockets and threads of its own.
+        self.call("GET", f"{STREAM}/latest")
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
+            listed = self.call("GET", "/v1/audit-reports")
+            self.assertEqual(200, listed.status_code)
+            self.assertEqual(STAMP_1, listed.json()[0]["newest_run"])
+        self.assertEqual(before, len(os.listdir("/dev/fd")))
+        # And directly.
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            before = len(os.listdir("/dev/fd"))
+            with self.assertRaises(store.Refused) as caught:
+                store._read_at(fd, "latest.json")
+            self.assertEqual(409, caught.exception.status)
+            self.assertEqual(before, len(os.listdir("/dev/fd")))
+        finally:
+            os.close(fd)
 
     def test_latest_compares_only_the_newest_ring_entries(self) -> None:
         runs = self.root / "compliance-audit" / "acme" / "gitops" / "runs"
@@ -692,6 +789,116 @@ class TokenCheckAloneTests(StoreTestCase):
             self.assertEqual(403, self.call("GET", f"{STREAM}/runs").status_code)
 
 
+# The exec tier exists only for agent names up to 63 minus this suffix
+# (credentialProxyExecTierMaxAgentName in k8s-operator).
+EXEC_TIER_SUFFIX = "-credential-proxy-exec-tier"
+EXEC_TIER_MAX_AGENT_NAME = 63 - len(EXEC_TIER_SUFFIX)
+
+
+def generated_pod_name(deployment: str, pod_hash: str, random_part: str = "x2k4q") -> str:
+    """What the ReplicaSet controller and SimpleNameGenerator name a Deployment's pod."""
+    return (f"{deployment}-{pod_hash}-")[:58] + random_part
+
+
+class BrokerPodNameTests(unittest.TestCase):
+    """The pod-name check against Kubernetes' own naming, at every agent-name length that changes it."""
+
+    LENGTHS = (5, 29, 30, 31, 35, 36, 40, 41, 50)
+    HASHES = ("7b9f8c6d5", "68b5fc9d47")
+
+    @staticmethod
+    def agent(length: int) -> str:
+        return ("agent" + "z" * length)[:length]
+
+    def test_constants(self) -> None:
+        self.assertEqual(58, store.POD_GENERATE_NAME_MAX_BASE)
+        self.assertEqual(5, store.POD_GENERATE_NAME_RANDOM_LENGTH)
+        self.assertEqual((1, 10), (store.POD_TEMPLATE_HASH_MIN_LENGTH, store.POD_TEMPLATE_HASH_MAX_LENGTH))
+        self.assertEqual(36, EXEC_TIER_MAX_AGENT_NAME)
+
+    def test_table(self) -> None:
+        for length in self.LENGTHS:
+            agent = self.agent(length)
+            prefix = f"{agent}-credential-proxy-"
+            for pod_hash in self.HASHES:
+                broker = generated_pod_name(f"{agent}-credential-proxy", pod_hash)
+                with self.subTest(length=length, hash=pod_hash, case="broker"):
+                    self.assertTrue(store.is_broker_pod_name(prefix, broker), broker)
+                if length <= EXEC_TIER_MAX_AGENT_NAME:
+                    for deployment in (agent + EXEC_TIER_SUFFIX, f"{agent}-credential-proxy-exec"):
+                        exec_pod = generated_pod_name(deployment, pod_hash)
+                        with self.subTest(length=length, hash=pod_hash, case="exec", name=exec_pod):
+                            self.assertFalse(store.is_broker_pod_name(prefix, exec_pod), exec_pod)
+                refused = {
+                    "another agent's broker": generated_pod_name(f"{'y' * length}-credential-proxy", pod_hash),
+                    "the kube-proxy": generated_pod_name(f"{agent}-kube-proxy", pod_hash),
+                    "an extra segment": f"{prefix}{pod_hash}-extra-x2k4q",
+                    "uppercase throughout": broker.upper(),
+                    "an uppercase random part": broker[:-1] + "Q",
+                    "an uppercase hash": f"{prefix}{pod_hash.upper()}-x2k4q",
+                    "a random part one short": broker[:-1],
+                    "a random part one long": broker + "q",
+                    "no hash": f"{prefix}-x2k4q",
+                    "no random part": f"{prefix}{pod_hash}-",
+                    "the prefix alone": prefix,
+                    "a dot in the random part": broker[:-1] + ".",
+                }
+                if len(prefix) + 12 <= 58:
+                    # Only an untruncated name shows an 11-character hash.
+                    refused["an 11-character hash"] = generated_pod_name(f"{agent}-credential-proxy", "a" * 11)
+                for case, name in refused.items():
+                    with self.subTest(length=length, hash=pod_hash, case=case, name=name):
+                        self.assertFalse(store.is_broker_pod_name(prefix, name), name)
+
+    def test_the_cut_points(self) -> None:
+        # The "-" after a 10-character hash is the 58th character at 29, so
+        # from 30 it is cut, and from 41 the prefix itself is cut.
+        for length, expect in ((29, "-"), (30, "7"), (41, None)):
+            agent = self.agent(length)
+            name = generated_pod_name(f"{agent}-credential-proxy", "68b5fc9d47")
+            with self.subTest(length=length):
+                self.assertEqual(63, len(name))
+                if expect is None:
+                    self.assertFalse(name.startswith(f"{agent}-credential-proxy-"))
+                else:
+                    self.assertEqual(expect, name[57])
+                self.assertTrue(store.is_broker_pod_name(f"{agent}-credential-proxy-", name))
+
+    def test_any_valid_hash_passes(self) -> None:
+        # No hash is pinned: a pod of another ReplicaSet of the same broker
+        # Deployment (a stale or newer pod-template hash) passes as any does.
+        for length in self.LENGTHS:
+            agent = self.agent(length)
+            prefix = f"{agent}-credential-proxy-"
+            for pod_hash in ("7b9f8c6d5", "5d4c8f9b7", "b", "zzzzzzzzzz"):
+                name = generated_pod_name(f"{agent}-credential-proxy", pod_hash, "q7w9z")
+                with self.subTest(length=length, hash=pod_hash):
+                    self.assertTrue(store.is_broker_pod_name(prefix, name), name)
+
+    def test_the_exec_tier_boundary(self) -> None:
+        # 36, the longest agent name with an exec tier: its pod is refused,
+        # though truncation leaves the remainder a bare "exec".
+        agent = self.agent(EXEC_TIER_MAX_AGENT_NAME)
+        prefix = f"{agent}-credential-proxy-"
+        exec_pod = generated_pod_name(agent + EXEC_TIER_SUFFIX, "68b5fc9d47")
+        self.assertEqual("exec", exec_pod[len(prefix):-5])
+        self.assertFalse(store.is_broker_pod_name(prefix, exec_pod))
+        self.assertTrue(store.is_broker_pod_name(prefix, generated_pod_name(f"{agent}-credential-proxy", "68b5fc9d47")))
+        # 37: the operator renders no exec tier (credentialProxyExecTierMaxAgentName),
+        # and the broker's pod passes. An exec-shaped name is cut to "exe",
+        # indistinguishable from a broker pod whose hash begins "exe", and
+        # passes; recorded here so a change to that is deliberate.
+        agent = self.agent(EXEC_TIER_MAX_AGENT_NAME + 1)
+        prefix = f"{agent}-credential-proxy-"
+        self.assertTrue(store.is_broker_pod_name(prefix, generated_pod_name(f"{agent}-credential-proxy", "68b5fc9d47")))
+        exec_shaped = generated_pod_name(agent + EXEC_TIER_SUFFIX, "68b5fc9d47")
+        self.assertEqual("exe", exec_shaped[len(prefix):-5])
+        self.assertTrue(store.is_broker_pod_name(prefix, exec_shaped))
+
+    def test_no_prefix_refuses(self) -> None:
+        self.assertFalse(store.is_broker_pod_name("", BROKER_POD))
+
+
 class JWKSRequestTests(unittest.TestCase):
     """The key fetch asks for the media type the API server serves the JWKS as."""
 
@@ -737,6 +944,92 @@ def setUpModule():
 
 def tearDownModule():
     store._now = setUpModule.original
+
+
+class RoundThreeTests(StoreTestCase):
+    """A rotated kid during a failed fetch, overlong store keys, deeply nested JSON."""
+
+    def test_a_rotated_kid_during_a_failed_fetch_is_503_until_a_fetch_succeeds(self) -> None:
+        clock = [1000.0]
+        rotated = RSAKey("k2", slot=2)
+        state = {"keys": [self.key.jwk()], "fail": False, "fetches": 0}
+
+        def fetch():
+            state["fetches"] += 1
+            if state["fail"]:
+                raise store.JWKSUnavailable("down")
+            return ISSUER, list(state["keys"])
+
+        verifier = store.TokenVerifier(fetch=fetch, monotonic=lambda: clock[0])
+        self.assertEqual(BROKER, verifier.verify(f"Bearer {self.token}"))
+        state["fail"] = True
+        for step in range(4):
+            with self.subTest(step=step), self.assertRaises(store.AuthRefused) as caught:
+                verifier.verify(f"Bearer {mint(rotated)}")
+            self.assertEqual(503, caught.exception.status)
+            # A cached kid still verifies inside the hold.
+            self.assertEqual(BROKER, verifier.verify(f"Bearer {self.token}"))
+            clock[0] += 2
+        # The forced-refresh rate limit holds: one failed fetch in the window.
+        self.assertEqual(2, state["fetches"])
+        clock[0] += max(store.JWKS_FAILURE_HOLD_SECONDS, store.JWKS_FORCED_REFRESH_SECONDS)
+        state["fail"] = False
+        state["keys"] = [self.key.jwk(), rotated.jwk()]
+        self.assertEqual(BROKER, verifier.verify(f"Bearer {mint(rotated)}"))
+        self.assertEqual(3, state["fetches"])
+
+    def test_overlong_store_keys_are_400_and_create_nothing(self) -> None:
+        name_parts = "%252F".join(["abcdefghij"] * 30)
+        streams = {
+            "owner": f"/v1/audit-reports/compliance-audit/{'a' * 256}%2Fgitops",
+            "name": f"/v1/audit-reports/compliance-audit/gitlab.com%2F{name_parts}",
+            "github name": f"/v1/audit-reports/compliance-audit/acme%2F{'g' * 256}",
+        }
+        for case, stream in streams.items():
+            with self.subTest(case):
+                self.assertEqual(400, self.put_run(STAMP_1, stream=stream).status_code)
+                self.assertEqual(400, self.call("GET", f"{stream}/latest").status_code)
+        self.assertFalse(self.root.exists() and any(self.root.iterdir()))
+        # 255 bytes still passes.
+        ok = f"/v1/audit-reports/compliance-audit/{'a' * 255}%2Fgitops"
+        self.assertEqual(204, self.put_run(STAMP_1, stream=ok).status_code)
+
+    def test_enametoolong_on_the_path_is_400(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for create in (False, True):
+                with self.subTest(create=create), self.assertRaises(store.Refused) as caught:
+                    store._open_child_dir(fd, "x" * 300, create)
+                self.assertEqual(400, caught.exception.status)
+        finally:
+            os.close(fd)
+
+    def test_deeply_nested_json(self) -> None:
+        nested = b"[" * 100000 + b"]" * 100000
+        self.assertEqual(400, self.call("PUT", f"{STREAM}/runs/{STAMP_1}", nested).status_code)
+        self.assertEqual(400, self.call("PUT", f"{STREAM}/latest", nested).status_code)
+        # A nested latest.json is skipped by the listing (the stream is listed
+        # without a finished_at). GET latest hands stored bytes back unparsed.
+        directory = self.root / "compliance-audit" / "acme" / "gitops"
+        (directory / "runs").mkdir(parents=True)
+        (directory / "runs" / f"{STAMP_1}.json").write_text("{}")
+        (directory / "latest.json").write_bytes(nested)
+        listed = self.call("GET", "/v1/audit-reports")
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual(
+            [{"audit_id": "compliance-audit", "key": "acme%2Fgitops", "newest_run": STAMP_1,
+              "latest_finished_at": None}],
+            listed.json(),
+        )
+        # A nested JWT payload is a malformed token.
+        header = _b64(json.dumps({"alg": "RS256", "kid": self.key.kid}).encode())
+        payload = _b64(b"[" * 5000 + b"]" * 5000)
+        self.assertEqual(401, self.call("GET", f"{STREAM}/runs", token=f"{header}.{payload}.c2ln").status_code)
+        # And a nested JWKS answer is the JWKS unavailable.
+        with mock.patch.object(store.json, "loads", side_effect=RecursionError("deep")):
+            with self.assertRaises(store.JWKSUnavailable):
+                store.fetch_cluster_keys(self.api.url, str(self.sa_dir))
 
 
 class FutureStampTests(StoreTestCase):

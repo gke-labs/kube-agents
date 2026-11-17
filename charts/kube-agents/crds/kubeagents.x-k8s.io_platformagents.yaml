@@ -10422,6 +10422,21 @@ spec:
                             || self.profiles.childReserve < (has(self.profiles.ceiling)
                             ? self.profiles.ceiling : (has(self.maxInProgress) ? self.maxInProgress
                             : 6))"
+                    universeDomain:
+                      description: |-
+                        UniverseDomain is the Google Cloud API universe domain for this install
+                        (for example, "googleapis.com" on standard Google Cloud, or a custom API
+                        domain on Google Cloud Dedicated / Sovereign Cloud). When omitted, the
+                        operator probes the GKE metadata server
+                        (/computeMetadata/v1/universe/universe-domain) and falls back to
+                        "googleapis.com" outside GCE/GKE. One PlatformAgent spans a single
+                        universe domain: when set and the host metadata server reports a
+                        different universe domain, the operator refuses the mismatch and marks
+                        the CR Degraded with reason UniverseDomainMismatch rather than sending
+                        tokens across universe boundaries.
+                      maxLength: 253
+                      pattern: ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$
+                      type: string
                   required:
                     - clusterName
                     - location
@@ -12359,6 +12374,15 @@ spec:
                     picked up within a day.
                   format: int64
                   type: integer
+                resolvedUniverseDomain:
+                  description: |-
+                    ResolvedUniverseDomain is the Google Cloud API universe domain the
+                    operator resolved for this install from spec.harness.universeDomain or
+                    from the GKE metadata server (/computeMetadata/v1/universe/universe-domain).
+                    Written by the Ready status update; absent before a pass reaches it, when
+                    spec.harness.universeDomain is unset and the metadata server did not
+                    answer (for example on kind), and while the served CRD predates the field.
+                  type: string
                 serviceStatus:
                   description: ServiceStatus holds internal/external endpoints.
                   properties:
@@ -12410,6 +12434,12 @@ spec:
                         install gets when discovery is switched off or could not complete.
                       type: string
                   type: object
+                universeDomainSource:
+                  description: |-
+                    UniverseDomainSource reports how ResolvedUniverseDomain was determined
+                    ("Spec" when spec.harness.universeDomain is set, "Discovered" when read
+                    from the GKE metadata server). Absent alongside ResolvedUniverseDomain.
+                  type: string
                 usage:
                   description: |-
                     Usage summarises the agent's activity: the interfaces its spec enables and
