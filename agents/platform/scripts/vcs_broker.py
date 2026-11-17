@@ -437,7 +437,7 @@ def _age_seconds(created: Any, now: datetime) -> float | None:
 
 # A GKE cluster as the fleet audit names it, `<project>/<location>/<name>`,
 # each part as GKE allows it, so none can reach gcloud as a flag.
-_GKE_CLUSTER = re.compile(r"([a-z][a-z0-9-]{4,28}[a-z0-9])/([a-z]+-[a-z]+[0-9](?:-[a-z])?)/([a-z](?:[-a-z0-9]{0,38}[a-z0-9])?)")
+_GKE_CLUSTER = re.compile(r"([a-z][a-z0-9-]{4,28}[a-z0-9])/([a-z]+-[a-z]+[0-9]+(?:-[a-z0-9]+)?)/([a-z](?:[-a-z0-9]{0,38}[a-z0-9])?)")
 _KUBERNETES_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 
 
@@ -2608,14 +2608,20 @@ class VcsBroker:
         proposal = view.get("proposal") or {}
         checks: list[dict] = []
         if on:
-            viewer = self._viewer(bound)
-            reason = self._practice_refusal(bound, payload, viewer, proposal, view.get("diff"), checks)
+            try:
+                viewer = self._viewer(bound)
+                reason = self._practice_refusal(bound, payload, viewer, proposal, view.get("diff"), checks)
+            except Exception as exc:  # noqa: BLE001 -- a failed read is a reason not to label
+                LOGGER.warning("practice label: a read failed repo=%s number=%s type=%s: %s",
+                               bound.repo, number, type(exc).__name__, str(exc)[:400])
+                reason, checks = "a read the judgement needs failed", []
         else:
             # Off reads no cluster and no rules; it only takes back a label an
             # earlier `practice` or `on` left.
             reason = "KUBEAGENTS_AUTOMERGE is off"
         want = automerge_eligibility.LABEL_FOR_SWITCH.get(switch) if reason is None else None
         carried = _reserved_labels_on(proposal)
+        after: dict[str, Any] | None = None
         if want is not None:
             if want not in carried:
                 bound.forge.label_ensure(
@@ -2635,7 +2641,11 @@ class VcsBroker:
             if after.get("sourceRevision") != proposal.get("sourceRevision"):
                 reason, want = "the proposal's branch moved while it was judged", None
         stale = [label for label in carried if label != want]
-        if stale and proposal.get("state") == OPEN_PROPOSAL_STATE:
+        if stale and after is None:
+            # The judgement took time; a pull request that merged meanwhile
+            # keeps its label, which the post-merge step-down reads.
+            after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+        if stale and (after or {}).get("state") == OPEN_PROPOSAL_STATE:
             bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
         LOGGER.info(
             "practice label repo=%s number=%s switch=%s labelled=%s reason=%s checks=%s",

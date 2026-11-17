@@ -99,15 +99,17 @@ class FakeForge:
 
     labels = True
 
-    def __init__(self, view, moved=False):
+    def __init__(self, view, moved=False, later=None):
         self.view = view
         self.moved = moved
+        self.later = later or {}
         self.calls = []
 
     def proposal_view(self, api, repo, payload):
         self.calls.append(("proposal-view", payload))
-        if self.moved and len([c for c in self.calls if c[0] == "proposal-view"]) > 1:
-            return {"proposal": {**self.view["proposal"], "sourceRevision": "b" * 40}}
+        if len([c for c in self.calls if c[0] == "proposal-view"]) > 1:
+            later = {**self.view["proposal"], **self.later}
+            return {"proposal": {**later, "sourceRevision": "b" * 40} if self.moved else later}
         return self.view
 
     def proposal_list(self, api, repo, payload):
@@ -133,18 +135,21 @@ class PracticeLabelTest(unittest.TestCase):
         self.reads = []
 
     def run_verb(self, *, switch="practice", state="open", author="kube-agents[bot]", diff=None, labels=(),
-                 rules=ALLOW_DEV, env="dev", items=None, read_code=0, target="main", moved=False):
+                 rules=ALLOW_DEV, env="dev", items=None, read_code=0, target="main", moved=False,
+                 later=None, read_raises=None):
         view = {
             "proposal": {
                 "state": state, "author": author, "labels": list(labels), "target": target, "sourceRevision": "a" * 40,
             },
             "diff": diff_adding(PATH, TEXT) if diff is None else diff,
         }
-        forge = FakeForge(view, moved=moved)
+        forge = FakeForge(view, moved=moved, later=later)
         items = [deployment()] if items is None else items
 
         def cluster_read(argv, context):
             self.reads.append((argv, context))
+            if read_raises is not None and argv[0] == "kubectl":
+                raise read_raises
             if argv[0] == "gcloud":
                 return read_code, json.dumps({"resourceLabels": {"environment": env}}), "denied"
             return read_code, json.dumps({"items": items}), "denied"
@@ -260,6 +265,27 @@ class PracticeLabelTest(unittest.TestCase):
             answer, calls = self.run_verb()
         self.assertFalse(answer["labelled"])
         self.assertEqual((self.writes(calls), self.reads), ([], []))
+
+    def test_a_read_that_raises_refuses_and_still_takes_the_label_off(self):
+        class ExcludedCluster(Exception):
+            pass
+
+        answer, calls = self.run_verb(labels=[ae.AUTOMERGE_LABEL], switch="on", read_raises=ExcludedCluster("excluded"))
+        self.assertFalse(answer["labelled"])
+        self.assertNotIn("excluded", answer["reason"])
+        self.assertEqual(self.writes(calls), [("proposal-update", {"number": 7, "labelsRemove": [ae.AUTOMERGE_LABEL]})])
+
+    def test_a_pull_request_that_merged_while_judged_keeps_its_label(self):
+        answer, calls = self.run_verb(labels=[ae.AUTOMERGE_LABEL], switch="on", items=[deployment(ready=1)],
+                                      later={"state": "merged"})
+        self.assertFalse(answer["labelled"])
+        self.assertEqual(self.writes(calls), [])
+
+    def test_two_digit_regions_and_long_zone_suffixes_are_read(self):
+        for cluster in ("acme-prod-1/europe-west10/fleet-1", "acme-prod-1/us-central1-ai1a/fleet-1"):
+            with self.subTest(cluster=cluster):
+                self.assertIsNotNone(vcs_broker._gke_cluster(cluster))
+        self.assertIsNone(vcs_broker._gke_cluster("acme-prod-1/--zone=x/fleet-1"))
 
     def test_a_failed_read_says_nothing_of_what_it_read(self):
         answer, _ = self.run_verb(read_code=1)

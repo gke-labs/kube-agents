@@ -17167,6 +17167,13 @@ def sync_open_remediation_labels(
         counts = severity_counts(group)
         highest = next((s for s in SEVERITIES if counts[s]), SEVERITIES[-1])
         sync_remediation_labels(repo, number, audit_id, highest)
+        # The broker re-judges an open disruption-budget fix every run, so a
+        # label it applied comes off once the switch, the rules or the cluster
+        # no longer allow it.
+        if carries_practice_label(pr) or any(
+            str(f.get("check") or "") == GENERATED_FIX_CHECK for f in group
+        ):
+            request_practice_label(repo, number)
 
 
 class _GroupPush(NamedTuple):

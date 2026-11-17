@@ -358,6 +358,23 @@ class PracticeLabelRequestTest(unittest.TestCase):
         self.assertFalse(audit_report.carries_practice_label({"labels": [{"name": "audit:remediation"}]}))
         self.assertFalse(audit_report.carries_practice_label(None))
 
+    def test_each_run_asks_again_for_an_open_budget_fix_or_a_labelled_one(self):
+        no_pdb = {"id": "no-pdb.f-1", "check": "no-pdb", "severity": "medium"}
+        other = {"id": "x.f-2", "check": "privileged", "severity": "medium"}
+        for findings, labels, asked in (
+            ([no_pdb], [], True),
+            ([other], [{"name": "kube-agents:auto-merge"}], True),
+            ([other], [], False),
+        ):
+            with self.subTest(findings=findings, labels=labels), \
+                    mock.patch.object(audit_report, "forge_has_labels", return_value=True), \
+                    mock.patch.object(audit_report, "remediation_groups", return_value=[findings]), \
+                    mock.patch.object(audit_report, "sync_remediation_labels"), \
+                    mock.patch.object(audit_report, "request_practice_label") as request:
+                pr = {"number": 9, "state": "OPEN", "labels": labels}
+                audit_report.sync_open_remediation_labels("acme/infra", "a", findings, {f["id"]: pr for f in findings})
+                self.assertEqual(request.call_args_list, [mock.call("acme/infra", "9")] if asked else [])
+
     def test_the_label_names_are_the_brokers(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
         import automerge_eligibility

@@ -103,14 +103,14 @@ With the switch `practice` or `on`, each time the fleet audit opens or refreshes
    one's name. The new budget's selector is the workload's live selector and selects no other
    workload's pods.
 
-A pull request that carries a label and no longer qualifies loses it the next time the audit
-refreshes it, which includes after the switch is turned back to `off`. A change of switch value swaps
+A pull request that carries a label and no longer qualifies loses it on the audit's next
+run, which includes after the switch is turned back to `off`. A change of switch value swaps
 one label for the other. The broker reads all of this itself, and no request from the agent can add,
 remove or create either label. The pull request's body shows the same safety checks under **Safety
 checks**.
 
 A push kube-agents makes to the branch takes the label off at once. A push made any other way keeps
-it until the next refresh, so a pipeline that merges on the label should also require that every
+it until the audit's next run, so a pipeline that merges on the label should also require that every
 commit on the pull request is kube-agents' own.
 
 The labels are applied only on GitHub and Gitea. Bitbucket has no labels, and on GitLab a `/label` line in a comment or a description sets a
