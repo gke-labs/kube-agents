@@ -273,4 +273,6 @@ def run(
             'AND textPayload:"OOMKilling"', record.started)
     except (kube.CommandError, subprocess.SubprocessError) as exc:
         record.errors.append(f"could not read Cloud Logging: {exc}")
+        # An unread log is not a clean one: the crash check fails on it, as on an unread pod list.
+        record.sandbox_changed.append(f"Cloud Logging unread: {exc}")
     return record, verdict(record, wanted, first_run)

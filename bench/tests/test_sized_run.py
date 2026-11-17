@@ -135,6 +135,34 @@ class RunTest(unittest.TestCase):
         self.assertFalse(result["green"])
         self.assertTrue(any("burst window" in e for e in result["errors"]), result["errors"])
 
+    def run_with(self, pod_states, log_lines):
+        """A run whose audits all complete, with the end-of-run pod list and log reads given."""
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with mock.patch.object(sr.operations, "reset"), \
+                mock.patch.object(sr.operations, "trigger_jobs", return_value=[]), \
+                mock.patch.object(sr.operations, "job_statuses", return_value={j: "completed" for j in sr.audits()}), \
+                mock.patch.object(sr.operations, "job_seconds", return_value={}), \
+                mock.patch.object(sr, "pod_states", side_effect=pod_states), \
+                mock.patch.object(sr, "log_lines", side_effect=log_lines):
+            return sr.run(project="p", host_cluster="h", host_context="ctx", namespace="ns",
+                          check_fleet=lambda: {"findings": []}, soak_seconds=3600,
+                          clock=lambda: now[0], sleep=sleep)[1]
+
+    def test_an_unread_cloud_logging_fails_the_crash_check(self):
+        result = self.run_with(pod_states=[{}, {}], log_lines=sr.subprocess.SubprocessError("logging read failed"))
+        failures = result["checks"]["no_crash"]["failures"]
+        self.assertFalse(result["green"])
+        self.assertTrue(any("Cloud Logging unread" in f for f in failures), failures)
+
+    def test_an_unread_pod_list_at_the_end_fails_the_crash_check(self):
+        result = self.run_with(pod_states=[{}, sr.kube.CommandError("gateway pod missing")], log_lines=lambda *a: [])
+        self.assertFalse(result["checks"]["no_crash"]["passed"])
+        self.assertFalse(result["green"])
+
 
 class RemarkTest(unittest.TestCase):
     def test_an_unclaimed_mark_is_made_again_after_ten_minutes(self):

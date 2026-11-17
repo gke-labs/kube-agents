@@ -54,6 +54,26 @@ class TeardownTest(unittest.TestCase):
         self.assertTrue(any("down failed" in f for f in verdict["checks"]["teardown"]["failures"]))
 
 
+class RunDownTest(unittest.TestCase):
+    def test_a_run_that_raises_still_deletes_the_fleet(self):
+        with mock.patch.object(cli, "run_once", side_effect=RuntimeError("boom")), \
+                mock.patch.object(cli, "cmd_down") as down, \
+                mock.patch.object(cli, "leftover_clusters", return_value=[]), \
+                mock.patch.object(cli, "interruptible"), mock.patch.object(cli, "shielded"):
+            with self.assertRaises(RuntimeError):
+                cli.run_and_delete(args(results_bucket=None))
+        down.assert_called_once()
+
+
+class LeftoverTest(unittest.TestCase):
+    def test_leftovers_are_matched_by_run_and_size(self):
+        with mock.patch.object(cli.kube, "gcloud", return_value="") as gcloud:
+            cli.leftover_clusters(args(size="M", run_id="manual"))
+        query = next(a for a in gcloud.call_args.args if a.startswith("--filter="))
+        self.assertIn("resourceLabels.kube-agents-scale-run=manual", query)
+        self.assertIn("resourceLabels.kube-agents-scale-size=m", query)
+
+
 class WarmupTest(unittest.TestCase):
     def test_waits_until_every_client_has_fired_once(self):
         reads = iter([

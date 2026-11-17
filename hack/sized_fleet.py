@@ -308,8 +308,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def leftover_clusters(args: argparse.Namespace) -> list[str]:
-    """The run's clusters still in the project, by its run label."""
-    out = kube.gcloud("container", "clusters", "list", f"--filter=resourceLabels.{sized_records.RUN_LABEL}={args.run_id}",
+    """The run's clusters still in the project, by its run and size labels.
+
+    By the size too: two sizes run by hand both carry the default run id, and one size's fleet is
+    not the other's leftover.
+    """
+    out = kube.gcloud("container", "clusters", "list",
+                      f"--filter=resourceLabels.{sized_records.RUN_LABEL}={args.run_id} "
+                      f"AND resourceLabels.{sized_records.SIZE_LABEL}={args.size.lower()}",
                       "--format=value(name)", project=args.project)
     return out.split()
 

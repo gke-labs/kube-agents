@@ -55,6 +55,8 @@ NANOS = 1e9
 ON_DEMAND = "OnDemand"
 SPEND_FAMILIES = ("litellm_spend_metric_total", "litellm_spend_metric")
 RUN_LABEL = "kube-agents-scale-run"
+# The fleet size, lowercase, as bench/tf/sized-fleet/main.tf labels each cluster.
+SIZE_LABEL = "kube-agents-scale-size"
 ROUND = 4
 GET_ATTEMPTS = 3
 GET_RETRY_SECONDS = 5
