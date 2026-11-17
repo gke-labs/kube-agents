@@ -1172,8 +1172,7 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
 # written list, each line with its issue, never a way to seat a new case.
 SEAT_BAR_EXEMPT = [
     ("agent-kanban-smoke", "c-slot", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
-    ("vcs-spent-branch-reuse", "c-repository", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
-    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
+    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing on its roles about that repository"),
 ]
 FLEET_FIXTURE_STATE_SCRIPT = REPO_ROOT / "hack" / "fleet-fixture-state.py"
 FLEET_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
@@ -1382,11 +1381,13 @@ class SeatBarTest(unittest.TestCase):
         self.assertEqual(self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": [{"op": "absent"}]})), [])
 
     def test_an_exemption_covers_its_own_mechanism_only(self):
-        # vcs-spent-branch-reuse is exempt for its pool-repository write; a
-        # slot read added to it would be a c-slot finding the entry does not cover.
+        # pdb-remediation-pr is exempt for its pool-repository write; a slot
+        # read added to it would be a c-slot finding the entry does not cover.
+        # (vcs-spent-branch-reuse lists no role, so the scan's declared-intent
+        # note assertion, anywhere in the catalog, cleared its entry.)
         exempt = {(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT}
-        self.assertIn(("vcs-spent-branch-reuse", "c-repository"), exempt)
-        self.assertNotIn(("vcs-spent-branch-reuse", "c-slot"), exempt)
+        self.assertIn(("pdb-remediation-pr", "c-repository"), exempt)
+        self.assertNotIn(("pdb-remediation-pr", "c-slot"), exempt)
         doc = {"verification_spec": [{"name": "o", "role": "objective", "check": {
             "type": "report_contains", "required_phrases": ["seeded-b"]}}]}
         self.assertEqual(sorted(r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())), ["c-repository", "c-slot"])
