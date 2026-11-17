@@ -18,6 +18,8 @@ itself, and a ref with no uninstall.sh is refused rather than driven with an
 engine it does not carry.
 """
 
+import json
+import os
 import pathlib
 import re
 import shlex
@@ -33,6 +35,56 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _UNINSTALL_SH = _REPO_ROOT / "uninstall.sh"
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 _INSTALL_DEFAULTS = _REPO_ROOT / "install.defaults.env"
+
+# uninstall.sh's variable for its report file, a seam for tests, and the path a real
+# run writes, which the uninstall skill names.
+_REPORT_FILE_ENV = "KUBE_AGENTS_UNINSTALL_REPORT_FILE"
+_REPORT_DEFAULT_FILE = "/tmp/kube-agents-uninstall-report.json"
+
+
+def setUpModule():
+    # write_report runs for real in tests here. Its report goes to a file of
+    # this run of the module. The path a real run writes is one fixed file,
+    # which two runs of this module at the same time would share.
+    global _REPORT_DIR, _REPORT_ENV_BEFORE
+    _REPORT_DIR = tempfile.TemporaryDirectory()
+    _REPORT_ENV_BEFORE = os.environ.get(_REPORT_FILE_ENV)
+    os.environ[_REPORT_FILE_ENV] = str(pathlib.Path(_REPORT_DIR.name) / pathlib.Path(_REPORT_DEFAULT_FILE).name)
+
+
+def tearDownModule():
+    if _REPORT_ENV_BEFORE is None:
+        os.environ.pop(_REPORT_FILE_ENV, None)
+    else:
+        os.environ[_REPORT_FILE_ENV] = _REPORT_ENV_BEFORE
+    _REPORT_DIR.cleanup()
+
+
+class ReportFileTest(unittest.TestCase):
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real run writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_report with the variable
+        unset would write that file."""
+        source = _UNINSTALL_SH.read_text()
+        self.assertEqual(source.count(_REPORT_DEFAULT_FILE), 1, "the script names the report path in one place")
+        self.assertEqual(
+            source.count(f'  local report_file="${{{_REPORT_FILE_ENV}:-{_REPORT_DEFAULT_FILE}}}"\n'),
+            1,
+            "write_report takes the variable, then the documented path",
+        )
+
+    def test_write_report_writes_the_file_the_variable_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "report.json"
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"\nwrite_report "PROBE" >/dev/null'],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={_REPORT_FILE_ENV: str(report)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(report.read_text())["status"], "PROBE")
 
 
 class ResolveStateLocationTest(unittest.TestCase):
@@ -1197,11 +1249,6 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
         self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
         self.assertLess(budget_at, call_at)
-        # And the mode: the generator refuses a value outside the CRD's enum,
-        # and a teardown must not stop on a typo in install.env.
-        mode_at = text.find('export PLATFORM_AGENT_MODE=""')
-        self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
-        self.assertLess(mode_at, call_at)
         # And the Slack home channel policy, refused outside the same kind of enum.
         policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
         self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")

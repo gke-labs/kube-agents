@@ -282,9 +282,17 @@ class DropEvalCandidateTest(unittest.TestCase):
         self.assertIn(_TAG, self._remote_tags(remote))
 
     def _remote_tags(self, remote):
+        """Lists the tags of the bare stand-in for the remote.
+
+        The call names the repository with --git-dir. Where git has
+        safe.bareRepository=explicit, it refuses a bare repository that it finds
+        from the working directory. The -c sets that option for this call, so a
+        call that finds the repository from `cwd=` fails on every machine with
+        git 2.38 or later, not only where the machine's git configuration has
+        the option.
+        """
         return subprocess.run(
-            ["git", "tag", "-l"],
-            cwd=str(remote),
+            ["git", "-c", "safe.bareRepository=explicit", "--git-dir", str(remote), "tag", "-l"],
             check=True,
             capture_output=True,
             text=True,

@@ -5505,6 +5505,51 @@ def test_a_rename_away_from_a_kept_path_is_a_change_to_it(token, github):
     assert _pr_check(unchanged_paths=_KEPT).verify(5.0).status == "fail"
 
 
+def test_files_read_under_a_rate_limit_name_the_limit_not_a_permission(token, github):
+    """#6105: a pull request's files answered with the installation's limit
+    used to read as "needs `pull_requests: read`"; the reason names the limit."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (
+        403, {"message": "API rate limit exceeded for installation ID 157029058."}
+    )
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_rate_limit_reason_reads_the_reads_headers(monkeypatch):
+    """A 403 whose body names no limit but whose headers do (no budget left)
+    is a limit; with neither, there is no limit reason."""
+    verifiers._last_forge_error_headers.set({"X-RateLimit-Remaining": "0"})
+    assert "rate-limited" in verifiers._rate_limit_reason(403, {"message": "Forbidden"}, "x")
+    verifiers._last_forge_error_headers.set(None)
+    assert verifiers._rate_limit_reason(403, {"message": "Resource not accessible by integration"}, "x") is None
+
+
+def test_a_nan_header_waits_as_if_absent(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Reset": "1100"}) == 101.0
+
+
+def test_a_429_on_the_commits_page_names_the_limit(token, github):
+    """A 429 that outlasts the wait on `_head_push`'s commits page used to
+    fall through to "unexpected GitHub response 429"; it names the limit,
+    as every other grading read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (429, {"message": "Too many requests"})
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "rate-limited" in res.reason, res.reason
+    assert "unexpected GitHub response" not in res.reason
+
+
 def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
@@ -7145,6 +7190,115 @@ def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeyp
     finally:
         verifiers._forge_unavailable.reset(token)
     assert seen == [(noted, "answered 429")]
+
+
+def _ci_grading_token(monkeypatch, tmp_path) -> str:
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    (tmp_path / "t").write_text("ghs_fake\n")
+    monkeypatch.setenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, str(tmp_path / "t"))
+    return forges.read_token(forges.forge_name())
+
+
+def _limited_then(answers):
+    """A fake _http_get_json that plays answers in order, each (status,
+    payload, headers), setting the headers as the real one does for an error."""
+    remaining = list(answers)
+
+    def get(url, tok, timeout):
+        status, payload, headers = remaining.pop(0)
+        if status // 100 != 2:
+            verifiers._last_forge_error_headers.set(headers)
+        return status, payload
+
+    return get
+
+
+_INSTALLATION_LIMIT = {"message": "API rate limit exceeded for installation ID 157029058."}
+
+
+def test_a_grading_read_waits_out_the_installation_limit_until_its_reset(monkeypatch, tmp_path):
+    """#6105: the shared installation's limit answers a 403 with no
+    Retry-After and an X-RateLimit-Reset minutes away; the read waits until
+    then and answers what the read after the reset says, noting nothing."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}),
+        (200, [], None),
+    ]))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert slept == [121.0]
+    assert seen == []
+
+
+def test_a_limit_that_outlasts_the_budget_answers_as_transient(monkeypatch, tmp_path):
+    """The wait is bounded: past the budget the read answers the 403, noted
+    transient, so the check reads as the forge's weather, and the process
+    has waited exactly the budget."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "150")
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, _INSTALLATION_LIMIT, {"Retry-After": "60"})] * 10))
+    seen: list[tuple[bool, str]] = []
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0)[0] == 403
+    finally:
+        verifiers._forge_unavailable.reset(token)
+    assert slept == [60.0, 60.0, 30.0]
+    assert seen == [(True, "answered 403")]
+
+
+def test_a_local_token_and_a_permission_403_never_wait(monkeypatch, tmp_path):
+    """Only the CI grading token waits: a local token can be the agent's own.
+    And a 403 that names no limit is a permission, answered at once."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    slept: list[float] = []
+    monkeypatch.setattr(verifiers.time, "sleep", slept.append)
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    monkeypatch.delenv(forges.GITHUB_TOKEN_FILE_ENV_VAR, raising=False)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, _INSTALLATION_LIMIT, {"Retry-After": "60"})]))
+    assert verifiers._forge_get_json("https://api.github.com/x", "ghp_personal", 1.0)[0] == 403
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([(403, {"message": "Resource not accessible by integration"}, {})]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0)[0] == 403
+    assert slept == []
+
+
+def test_a_past_reset_waits_the_floor_and_an_infinite_budget_is_capped(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "inf")
+    assert verifiers._forge_rate_limit_budget() == verifiers._FORGE_RATE_LIMIT_BUDGET_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "0")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == 0
+
+
+@pytest.mark.parametrize(
+    "status, payload, headers, limited",
+    [
+        (429, None, None, True),
+        (403, _INSTALLATION_LIMIT, None, True),
+        (403, {"message": "You have exceeded a secondary rate limit."}, None, True),
+        (403, None, {"X-RateLimit-Remaining": "0"}, True),
+        (403, None, {"Retry-After": "5"}, True),
+        (403, {"message": "Resource not accessible by integration"}, {"X-RateLimit-Remaining": "4000"}, False),
+        (404, _INSTALLATION_LIMIT, None, False),
+    ],
+)
+def test_what_reads_as_a_rate_limit(status, payload, headers, limited):
+    assert verifiers.is_rate_limit_answer(status, payload, headers) is limited
 
 
 def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):

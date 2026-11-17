@@ -13,7 +13,7 @@ graph TD
     ProxySvc -->|Port 8080| ProxyPod[Replay Pod]
 
     subgraph Persistent Cache
-        ProxyPod <-->|Read / Write KV Store| PVC[(1Gi ReadWriteOnce Disk)]
+        ProxyPod <-->|Read / Write KV Store| PVC[(4Gi ReadWriteOnce Disk)]
     end
 
     ProxyPod -->|Cache Miss| RealSvc[Service: inference-gateway-upstream]
@@ -79,7 +79,7 @@ Deploy the persistent volume, gateway routing, and standalone proxy in the `kube
 
 ```bash
 cd examples/inference-replay
-# 1. Provision the 1Gi Persistent Disk (PVC)
+# 1. Provision the 4Gi Persistent Disk (PVC)
 kubectl apply -f pvc.yaml
 # 2. Create the mode ConfigMap (defaults to 'off' — pure pass-through)
 kubectl apply -f configmap.yaml

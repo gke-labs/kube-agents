@@ -72,7 +72,7 @@ readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
 readonly BREAKING_CHANGE_SUBJECT_REGEX='^[a-z]+(\([^)]+\))?!:'
 readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+'
 # The site's rollback page, which a refused downgrade names: it has the steps a
-# breaking change asks for, such as going through `today` first.
+# breaking change asks for.
 readonly ROLLBACK_DOC="https://gke-labs.github.io/kube-agents/deploy/rollback/"
 # The downgrade check reads commit messages and ancestry only, so a history it
 # has to fetch carries commits and no trees or file contents.
@@ -106,6 +106,7 @@ PARAM_DROP_UNDECLARED_VALUES="false"
 # the older release cannot read, so a rollback across one is refused unless
 # the operator has read the commits the refusal names and asks for it.
 PARAM_ALLOW_BREAKING_DOWNGRADE="false"
+PARAM_ALLOW_NODE_POOL_DESTROY="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -367,6 +368,11 @@ Options:
                            as a breaking change: a rollback to an older release,
                            or a commit build moved to a release that lacks it.
                            Without it the move is refused and each commit named.
+  --allow-node-pool-destroy
+                           Let a full upgrade destroy the gVisor node pool
+                           (ENABLE_GVISOR="false" on a Standard install that runs
+                           one). Without it the apply refuses, so a lost or
+                           wrong install.env line cannot take the pool away.
   --help, -h               Show this help message
 
 Examples:
@@ -690,35 +696,6 @@ harness_retag_keys() {
 # Assigns rather than prints, for the reasons recorded_plugin_image_tag_keys
 # gives. Arguments: release, namespace, schema path.
 RETAG_VALUES_JSON=""
-# refuse_full_apply_dropping_next <schema>: a full apply renders the CR from
-# the target tree's composition, and a chart that predates platformAgent.mode
-# renders no mode, so Helm takes spec.mode off the CR and the operator retires
-# the A2A stack. retag_values refuses the same drop on the other two arms; this
-# is the full arm's half, keyed on what the apply would render (install.env's
-# PLATFORM_AGENT_MODE), since a full apply does not reuse the recorded values.
-# Read inline for retag_values' reason: installer_common.sh is the target
-# tree's, and a target that predates the key predates its helpers too.
-refuse_full_apply_dropping_next() {
-  local schema="$1"
-  [ "${PLATFORM_AGENT_MODE:-}" = "next" ] || return 0
-  if [ "$(trap - ERR; python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        schema = json.load(f)
-except (OSError, ValueError):
-    sys.stdout.write("unreadable")
-    sys.exit(0)
-props = ((schema.get("properties") or {}).get("platformAgent") or {}).get("properties") or {}
-sys.stdout.write("declared" if "mode" in props else "absent")
-' "$schema" 2>/dev/null || true)" != "absent" ]; then
-    return 0
-  fi
-  print_error "install.env sets PLATFORM_AGENT_MODE=next, and the chart this run applies predates spec.mode support (its values.schema.json does not declare platformAgent.mode). The apply would render no mode, take spec.mode off the PlatformAgent and switch the install back to today."
-  print_info "Upgrade to a release whose chart declares platformAgent.mode, or, to leave next on purpose, set PLATFORM_AGENT_MODE=today in install.env and run again."
-  return 1
-}
-
 retag_values() {
   local release="$1" namespace="$2" schema="$3" revision values stderr_file dropped_file key
   RETAG_VALUES_JSON=""
@@ -821,25 +798,6 @@ sys.stdout.buffer.write(text.encode("utf-8"))
   if [ ! -s "$dropped_file" ]; then
     rm -f "$dropped_file"
     return 0
-  fi
-  # A recorded `next` on a chart that predates platformAgent.mode is never
-  # dropped, with the flag or without: the chart would render no mode, Helm
-  # would take spec.mode off the CR, and the operator would retire the A2A
-  # stack on a run that only re-tags images. A recorded `today` drops freely,
-  # since an absent mode is today. Read here, not through installer_common.sh's
-  # helpers: that file is the target tree's, and a target that predates the key
-  # predates them too.
-  if grep -qxF 'platformAgent.mode' "$dropped_file" &&
-    [ "$(printf '%s' "$values" | (trap - ERR; python3 -c '
-import json, sys
-values = json.loads(sys.stdin.buffer.read()) or {}
-sys.stdout.write(str((values.get("platformAgent") or {}).get("mode") or ""))
-' 2>/dev/null) || true)" = "next" ]; then
-    RETAG_VALUES_JSON=""
-    rm -f "$dropped_file"
-    print_error "The release records platformAgent.mode: next, and the chart this run applies predates spec.mode support (its values.schema.json does not declare the key). Dropping it would take spec.mode off the PlatformAgent and switch the install back to today on a re-tag."
-    print_info "Re-tag to a release whose chart declares platformAgent.mode, or, to leave next on purpose, set PLATFORM_AGENT_MODE=today in install.env and run --upgrade-mode=full first, then re-tag."
-    return 1
   fi
   if [ "$PARAM_DROP_UNDECLARED_VALUES" != "true" ]; then
     RETAG_VALUES_JSON=""
@@ -1388,7 +1346,7 @@ check_downgrade() {
     return 0
   fi
   print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to move anyway."
-  print_info "Rolling back a release (${ROLLBACK_DOC}) has the steps a breaking change can need, such as going through today first."
+  print_info "Rolling back a release (${ROLLBACK_DOC}) has the steps a breaking change can need."
   exit 1
 }
 
@@ -1534,6 +1492,7 @@ parse_args() {
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
       --allow-breaking-downgrade) PARAM_ALLOW_BREAKING_DOWNGRADE="true"; shift ;;
+      --allow-node-pool-destroy) PARAM_ALLOW_NODE_POOL_DESTROY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -1553,7 +1512,8 @@ parse_args() {
 
 write_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-upgrade-report.json"
+  # KUBE_AGENTS_UPGRADE_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_UPGRADE_REPORT_FILE:-/tmp/kube-agents-upgrade-report.json}"
   cat << EOF > "$report_file"
 {
   "status": "$(json_escape "$status")",
@@ -1583,6 +1543,10 @@ run_lifecycle() {
     KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
     export KUBE_AGENTS_STATE_BUCKET KUBE_AGENTS_STATE_PREFIX
+    # lifecycle.sh's guard_gvisor_pool_teardown reads this; only the flag sets it.
+    if [ "$PARAM_ALLOW_NODE_POOL_DESTROY" = "true" ]; then
+      export KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true
+    fi
     ./lifecycle.sh "$@"
   )
 }
@@ -1795,6 +1759,10 @@ main() {
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
+  if [ "$PARAM_ALLOW_NODE_POOL_DESTROY" = "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+    print_error "--allow-node-pool-destroy applies to --upgrade-mode=full, the only mode that runs Terraform. Harness and operator upgrades touch no node pool."
+    exit 1
+  fi
   if [ "$PARAM_DROP_UNDECLARED_VALUES" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "full" ]; then
     print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
     exit 1
@@ -2161,24 +2129,17 @@ main() {
     if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
       refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" "$SCOPE_CHECK_MODE_WARN"
     fi
-    # Each mode call is guarded: installer_common.sh is the target tree's,
-    # and one from before spec.mode support (this script piped, or run with
-    # --image-tag onto an older release) defines neither the notice nor
-    # DEFAULT_PLATFORM_AGENT_MODE, so the run skips the notice rather than
-    # abort. retag_values' refusal of a dropped `next` lives in this file and
-    # still runs there.
-    if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
-      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
-    fi
-    # The Slack settings the full arm refuses when next hands Slack to the
-    # A2A gateway, warned here, as the scope check is.
-    if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
-      refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
+    # The Slack settings the full arm refuses when Slack moves to the A2A
+    # gateway, warned here, as the scope check is. Guarded: installer_common.sh
+    # is the target tree's, and an older one (this script piped, or run with
+    # --image-tag onto an older release) may not define the check.
+    if declare -F refuse_slack_gateway_settings_from_env >/dev/null; then
+      refuse_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
     fi
     # A chat backend the gateway holds with no home channel (#3320): warned
     # on every run, applying or not, and again at the end.
-    if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
-      warn_next_home_channel_unset_from_env
+    if declare -F warn_gateway_home_channel_unset_from_env >/dev/null; then
+      warn_gateway_home_channel_unset_from_env
     fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
@@ -2203,8 +2164,8 @@ main() {
         write_report "PLAN_FAILED"
         ;;
     esac
-    if declare -F print_next_home_channel_unset_summary >/dev/null; then
-      print_next_home_channel_unset_summary
+    if declare -F print_gateway_home_channel_unset_summary >/dev/null; then
+      print_gateway_home_channel_unset_summary
     fi
     exit "$plan_status"
   fi
@@ -2226,14 +2187,6 @@ main() {
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
-      # The mode: a retag re-applies the recorded values, mode included, onto
-      # a chart that declares platformAgent.mode (retag_values refuses a
-      # recorded next the target chart does not declare, rather than drop it),
-      # and says when a full upgrade would move it (from the values just read).
-      # Guarded, as at the plan's notice: an older target's helpers lack it.
-      if declare -F note_platform_agent_mode_for_retag >/dev/null; then
-        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
-      fi
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
@@ -2254,10 +2207,6 @@ main() {
       # calls, not substitutions: a failed read stops the run here, once, with
       # its own message shown.
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
-      # Guarded, as at the plan's notice: an older target's helpers lack it.
-      if declare -F note_platform_agent_mode_for_retag >/dev/null; then
-        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
-      fi
       harness_retag_keys "$RETAG_VALUES_JSON"
       # After the reads, not before them: they are the last things this arm
       # does that can fail without having changed anything.
@@ -2287,11 +2236,7 @@ main() {
           exit 1
         fi
       fi
-      # install.env's next onto a chart that predates platformAgent.mode is
-      # refused, not dropped, as retag_values does on the other two arms. Ahead
-      # of the notice below, which an older target's helpers cannot print.
-      refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1
-      # If this apply moves Slack to the A2A gateway (next, Slack on), the
+      # With Slack on, the A2A gateway holds it, with Google Chat or without, and the
       # Slack settings the gateway cannot use are refused: an email in the
       # allowlist, a home channel that is not a channel id, a list of bot
       # tokens. The generator above has already recovered a token the
@@ -2300,27 +2245,15 @@ main() {
       # A refusal removes the tfvars the generator just wrote, which render
       # the refused settings, as install.sh does; a moved checkout's previous
       # tfvars come back from restore_moved_checkout.
-      if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
-        if ! refuse_next_slack_gateway_settings_from_env; then
+      if declare -F refuse_slack_gateway_settings_from_env >/dev/null; then
+        if ! refuse_slack_gateway_settings_from_env; then
           rm -f "$tfvars_file"
           exit 1
         fi
       fi
-      if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
-        warn_next_home_channel_unset_from_env
+      if declare -F warn_gateway_home_channel_unset_from_env >/dev/null; then
+        warn_gateway_home_channel_unset_from_env
       fi
-      # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
-      # install.env, so a key edited since the last apply switches the install
-      # here, and the run says so first, from the reads the scope check made.
-      # Nothing asks between here and the apply, so the notice says that.
-      # Guarded, as at the plan's notice: an older target's helpers lack it.
-      if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
-        announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
-      fi
-      # No refusal of an install.env that names no mode: the CRD defaults
-      # spec.mode to next and the webhook rewrites today, so a keyless file
-      # cannot move the install back. (Compatibility shim: the mode machinery
-      # goes with the installer piece.)
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
       # project, so a container it cannot bind, or a policy that forbids the
@@ -2435,10 +2368,10 @@ main() {
     fi
     CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
       PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
-      print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+      print_chat_setup_checklists
   fi
-  if declare -F print_next_home_channel_unset_summary >/dev/null; then
-    print_next_home_channel_unset_summary
+  if declare -F print_gateway_home_channel_unset_summary >/dev/null; then
+    print_gateway_home_channel_unset_summary
   fi
 }
 
