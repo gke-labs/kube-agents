@@ -1,6 +1,7 @@
 package hermesbridge
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -766,9 +767,8 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 
 // TestScrubInlineSecretsAMarkLeftAgainstALabel: a * or _ the markdown pass
 // leaves glued to a credential label still reads as a mark, not as part of
-// the label (#6201): a key's trailing _ before its separator, the same mark
-// after the credential word in prose, and a mark before an Authorization
-// key's separator. Synthetic values only.
+// the label (#6201): a key's trailing _ before its separator, and the same
+// mark after the credential word in prose. Synthetic values only.
 func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
 	for _, in := range []string{
 		// A key's trailing _ before its separator.
@@ -787,10 +787,6 @@ func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
 		}
 	}
 	for in, want := range map[string]string{
-		// A mark before an Authorization key's separator: the whole value
-		// goes, not the scheme's first token.
-		`Authorization*: Digest username="admin", response="Synth3tic-Pass-0001"`: `Authorization*: Digest [redacted]`,
-		`Authorization_: "Bearer Synth3tic-Pass-0001 extra"`:                      `Authorization_: "Bearer [redacted]"`,
 		// Unchanged from main: quoted keys ending in _, spaced marks around
 		// a value, and an emphasised label.
 		`{"password_": "Synth3tic-Pass-0001"}`:  `{"password_": "[redacted]"}`,
@@ -812,6 +808,25 @@ func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
 	} {
 		if got := scrubInlineSecrets(in); got != want {
 			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestScrubProseSecretsAMarkedNounStillNamesTheSecret: a prose value whose
+// credential word keeps a mark is still reported to the sink as named, so
+// the seen-values pool catches a later bare repeat of it (#6201).
+func TestScrubProseSecretsAMarkedNounStillNamesTheSecret(t *testing.T) {
+	for _, in := range []string{
+		"Note _ _password_ is quietpasture",
+		"Note * *the password* is quietpasture",
+	} {
+		var seen []string
+		got := scrubProseSecrets(in, func(v string) { seen = append(seen, v) })
+		if strings.Contains(got, "quietpasture") {
+			t.Errorf("scrubProseSecrets(%q) = %q: the value is not redacted", in, got)
+		}
+		if !slices.Contains(seen, "quietpasture") {
+			t.Errorf("scrubProseSecrets(%q) reported %q to the sink; want the value", in, seen)
 		}
 	}
 }

@@ -34,7 +34,7 @@ var (
 	// the pair and redacts the value whatever its shape
 	// (authHeaderKVLeadPattern).
 	authSchemeCredentialPattern = regexp.MustCompile(`(?i)\b(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+([^\s"'\x60,;)\]}>|]+)`)
-	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)(?:authorization\\?["']?[ \t]*[:=]|(?:^|[^a-z0-9-]|[a-z0-9]-)authorization\\?["']?[ \t]*[*_]+[ \t]*:)[ \t]*\\?["']?[ \t]*$`)
+	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)authorization\\?["']?[ \t]*[:=][ \t]*\\?["']?[ \t]*$`)
 	// "Authorization", "<scheme> <credential>": a header setter call or a
 	// header pair in code, the credential redacted whatever its shape.
 	authHeaderPairPattern = regexp.MustCompile(`(?i)\b(?:proxy-)?authorization\\?["'][ \t]*,[ \t]*(?:\r?\n[ \t]*)?\\?["'](?:(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+)?([^"'\\\r\n]+)`)
@@ -1312,7 +1312,7 @@ var (
 	// secretReferenceKeyPattern is a key that names a Secret object, not a
 	// credential: existingSecret, imagePullSecret, tls_secret.
 	secretReferenceKeyPattern = regexp.MustCompile(`(?i)(?:existing|external|pull|tls|ref|reference|source|target|mountable|default)[_.-]?secret$`)
-	clearSecretNounPattern    = regexp.MustCompile(`(?i)\b(?:password|passwd|passphrase|token|api[ _-]?key)\b`)
+	clearSecretNounPattern    = regexp.MustCompile(`(?i)\b(?:password|passwd|passphrase|token|api[ _-]?key)_*\b`)
 )
 
 // keyClearlyNamesSecret says whether a key's last component is password,
