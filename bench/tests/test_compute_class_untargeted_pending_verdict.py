@@ -1,11 +1,11 @@
 """compute-class-untargeted-pending-probe reads two verdict lines, not prose.
 
 The objective passes when one line is the missing-class cause, another is the
-version-scope verdict, and no line is a wrong verdict. A verdict counts only
-when nothing but punctuation follows it on its line. ``report_contains``
-lowercases the report and drops emphasis and backticks before the patterns run,
-so a bolded, quoted or bulleted verdict line counts, and a verdict named inside
-a sentence does not.
+version-scope verdict, and no line is a wrong verdict. ``report_contains``
+lowercases the report, drops emphasis and backticks, and folds a list marker
+or a quote mark at the start of a line and a stop at its end before the
+patterns run. So a bolded, quoted or bulleted verdict line counts; a verdict
+inside a sentence, and a verdict with a hedge or a cross after it, do not.
 """
 
 from __future__ import annotations
@@ -55,6 +55,8 @@ def test_both_verdict_lines_pass():
         # A sentence that opens with a rejected verdict is prose, not a verdict.
         f"{CAUSE}\n{SCOPE}\n\n- {WRONG_CAUSE} is ruled out: no scale-up was tried.\n",
         f"{CAUSE}\n{SCOPE}\n\n{WRONG_SCOPES[0]} would hold only if 1.36.4 behaved as 1.35.8 does.\n",
+        # A cross after a wrong verdict rejects it; the line is not that verdict.
+        f"{CAUSE}\n{SCOPE}\n{WRONG_CAUSE} \u274c\n",
     ):
         assert _passes(report), report
 
@@ -72,6 +74,9 @@ def test_a_wrong_missing_or_prose_verdict_fails():
         f"{CAUSE} or STOCKOUT\n{SCOPE}\n",
         f"{CAUSE}\n{SCOPE} (but STILL-PENDING-EXPECTED until tested)\n",
         f"{CAUSE} is wrong; it is a stockout\n{SCOPE}\n",
+        # A mark that hedges the verdict stays on the line, so the line is not the verdict.
+        f"{CAUSE}?\n{SCOPE}\n",
+        f"{CAUSE}\n{SCOPE} \u26a0\ufe0f\n",
         f"It is not {WRONG_CAUSE}; the pods name no class, and the scale-up was seen on that version.",
         "The cause is that the pods name no class. After the upgrade a scale-up was seen.",
     ):

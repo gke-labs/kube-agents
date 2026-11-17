@@ -21,8 +21,12 @@
 # line asks what is known for the version the cluster is about to run. It has
 # three choices so that "nothing is known" has its own answer: only the skill's
 # version scope gives the one that passes. The verifier lowercases the report
-# and drops emphasis and backticks, so the patterns are lowercase;
-# fold_decoration lets a numbered, bolded or quoted verdict line count;
+# and drops emphasis and backticks, so the patterns are lowercase.
+# fold_decoration takes a list marker, a quote mark or a heading from the
+# start of a line and a stop or a closer from its end, so each pattern is the
+# folded line and nothing more. A mark that hedges or negates the verdict (a
+# question mark, a warning sign, a cross) stays on the line, so such a line is
+# not a verdict, for the right one or for a wrong one;
 # bench/tests/test_compute_class_untargeted_pending_verdict.py pins both sides.
 # The prompt's sentence about a hand-off is for the Planning Agent, not for the
 # skill: without it, a card written in the Planning Agent's own words left the
@@ -89,15 +93,13 @@ verification_spec:
       type: all
       checks:
         - type: report_contains
-          any_of_patterns: ["(?m)^\\W*cause:\\s*pods-name-no-class\\W*$"]
-          forbidden_patterns: ["(?m)^\\W*cause:\\s*stockout\\W*$"]
+          any_of_patterns: ["(?m)^cause: pods-name-no-class$"]
+          forbidden_patterns: ["(?m)^cause: stockout$"]
           fold_decoration: true
         - type: report_contains
-          any_of_patterns: ["(?m)^\\W*after-upgrade:\\s*scale-up-was-seen\\W*$"]
+          any_of_patterns: ["(?m)^after-upgrade: scale-up-was-seen$"]
           forbidden_patterns:
-            [
-              "(?m)^\\W*after-upgrade:\\s*(?:still-pending-expected|no-record)\\W*$",
-            ]
+            ["(?m)^after-upgrade: (?:still-pending-expected|no-record)$"]
           fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
