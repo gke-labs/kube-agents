@@ -210,6 +210,11 @@ _NO_WORKER_CALLS_REASON = (
 # audit_report.py, REPORTS_DIR), on whichever pod ran the audit's shell, and the
 # marker the store read prints its listing after.
 REPORT_STORE_ROOT = "/opt/data/fleet-audit/reports"
+# The envelope's own record of when the run that published it opened
+# (audit_report.ENVELOPE_STARTED_KEY). The store read copies it only when the
+# envelope has it, so an older image's envelope (no key) reads apart from a
+# run that could not name its start (the key, null).
+_ENVELOPE_STARTED_KEY = "started_at"
 _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
@@ -929,14 +934,34 @@ _HALF_MINUTE = timedelta(seconds=30)
 # Kanban tools return cards, and a card's result is a worker's own words.
 _KANBAN_TOOL_PREFIX = "kanban_"
 # What worker_trajectory's in-pod script puts in place of a result when the
-# pod's redactor will not load (its WITHHELD), and the marker its clip ends a
-# cut result with. Both live inside that script's source, so they are
+# pod's redactor will not load (its WITHHELD), and the marker its clip puts
+# on a cut value. Both live inside that script's source, so they are
 # spelled again here; test_report_times_in_window.py pins them to it. The
 # script's other placeholder, worker_trajectory.WITHHELD_READ_RESULT for the
 # one result of a call that read a credential, is a recorded call whose
 # output is redacted: it starts with `[REDACTED_` and is never a read gap.
 _WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
-_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# ``worker_trajectory.clip``'s marker. On an argument it ends the string. On a
+# result the kept tail follows it after ``... ``, and an older record ends on
+# it; ``_clipped_result_marker`` finds it by that shape, so the same words
+# printed inside a worker's own output are not read as the cut.
+_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]")
+_CLIPPED_ARGS = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+_CLIPPED_TAIL_LEAD = "... "
+
+
+def _clipped_result_marker(result: str) -> re.Match[str] | None:
+    """The marker the pod put on ``result``, or None when the result is whole.
+
+    The last occurrence that ends the string or opens the kept tail: the
+    marker sits after the whole head, so an occurrence the worker's own
+    output carries earlier is never the last one of that shape.
+    """
+    found = None
+    for match in _CLIPPED_RESULT.finditer(result):
+        if match.end() == len(result) or result.startswith(_CLIPPED_TAIL_LEAD, match.end()):
+            found = match
+    return found
 
 
 def _minute(instant: datetime) -> datetime:
@@ -1029,7 +1054,7 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             # A credential read, recorded without its output: no time in it,
             # and no gap in the capture.
             continue
-        if _CLIPPED_RESULT.search(result):
+        if _clipped_result_marker(result):
             clipped += 1
         minutes |= _output_minutes(result, dates)
     return minutes, withheld, clipped
@@ -1883,7 +1908,7 @@ class ToolCalledVerifier(BaseVerifier):
     the tool answered rather than only that it was called, such as Hermes'
     ``<persisted-output>`` notice for a result too large to return whole. A
     worker call's result is clipped in the pod, so the pattern must match near
-    the start of it. A call whose result the capture could not read (none
+    its start or near its end. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
     check ``status="error"``, since a pattern over it would read as no match --
     but only when its arguments are withheld too, cut where the clip left them
@@ -1961,7 +1986,7 @@ class ToolCalledVerifier(BaseVerifier):
         if set(args) == {"raw"} and isinstance(args["raw"], str):
             # worker_trajectory's clip() ends a cut argument string with the
             # same marker it ends a cut result with.
-            clip = _CLIPPED_RESULT.search(args["raw"])
+            clip = _CLIPPED_ARGS.search(args["raw"])
             if clip is None:
                 args = _clipped_string_args(args["raw"], self.arguments)
             else:
@@ -2013,7 +2038,18 @@ class ToolCalledVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         entries = [entry for entry in snap.trajectory if isinstance(entry, dict)]
-        if self.scope != "router" and not any(entry.get("agent") for entry in entries):
+        # The harness's NO_WORKER_CALLS_ENTRY says the workers ran and made no
+        # call, on a clean capture: grade zero calls instead of an unobservable subject.
+        names = {entry.get("name") for entry in entries}
+        # Only the leaves the scorer grades beside the entry (cases.worker_calls_checks):
+        # workers scope, no result pattern, so both transports agree.
+        no_worker_calls = (
+            self.scope == "workers"
+            and self.result is None
+            and worker_trajectory.NO_WORKER_CALLS_ENTRY in names
+            and worker_trajectory.GAP_ENTRY not in names
+        )
+        if self.scope != "router" and not no_worker_calls and not any(entry.get("agent") for entry in entries):
             return VerificationResult(
                 success=False,
                 status="error",
@@ -3751,8 +3787,9 @@ _EVIDENCE_BLOCK_RE = re.compile(
 # before the reply is searched for the label.
 _EVIDENCE_HEADING = "**Evidence for verified claims**"
 _VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
-# ``worker_trajectory.clip``'s marker on a result cut in the pod.
-_CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# The head of a result cut in the pod is what sits before the marker
+# ``_clipped_result_marker`` finds; the kept tail after it is for a reader of
+# the record, not decoded here.
 # The head of a terminal result as the pod stores it: ``{"output": "``.
 _OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
 # The longest escape a cut can split (``\uXXXX``), trimmed one character at a
@@ -3847,16 +3884,19 @@ def _terminal_output(result: str) -> tuple[str, bool]:
     repeated-call notice), which is advice to the model and not output, so
     the leading JSON object is decoded and whatever follows it is left
     alone; that also reads a result whose clip landed inside the note. A
-    result whose JSON itself was cut no longer parses; its surviving head
-    is decoded as a JSON string, less any escape the cut split.
+    result whose JSON itself was cut is read up to the pod's marker: the
+    kept tail can close the string and the object again, so a decode that
+    succeeds with the marker inside the object is not a whole result. Its
+    surviving head is decoded as a JSON string, less any escape the cut split.
     """
+    clipped = _clipped_result_marker(result)
     try:
-        parsed, _ = json.JSONDecoder().raw_decode(result)
+        parsed, end = json.JSONDecoder().raw_decode(result)
     except ValueError:
-        parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        parsed, end = None, 0
+    whole = clipped is None or clipped.start() >= end
+    if whole and isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
         return parsed["output"], False
-    clipped = _CLIPPED_RESULT_RE.search(result)
     if not clipped:
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
@@ -4332,7 +4372,8 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     is not transient. Every other non-2xx answer or OSError (a 404, a
     permission 403, a redirect, a certificate failure, a host that does not
     resolve or refuses the connection, an unknown forge) is noted as not
-    transient, and keeps the check's error plain."""
+    transient, and keeps the check's error plain unless the check drops it as
+    not behind the error."""
     try:
         status, payload = _http_get_json(url, token, timeout)
     except OSError as exc:
@@ -4373,6 +4414,48 @@ def _note_forge_read(transient: bool, what: str) -> None:
         noted.append((transient, what))
 
 
+def _forge_reads_mark() -> int:
+    """Where the current candidate's forge reads start in the decision's list."""
+    noted = _forge_unavailable.get()
+    return len(noted) if noted is not None else 0
+
+
+def _forge_read_handled(status: int) -> None:
+    """The caller read the non-2xx answer of the read it just made as control
+    flow (a fallback, a page that is not there), so that read explains no
+    error: its entry leaves the decision. Only that read's own entry, and only
+    when it was not transient."""
+    noted = _forge_unavailable.get()
+    if noted and noted[-1] == (False, f"answered {status}"):
+        noted.pop()
+
+
+class _RejectedCandidates(list):
+    """A forge-reading check's rejected candidates. A rejection is a verdict,
+    so a rejected candidate's reads explain no error and leave the decision,
+    when every one of them was a plain answer (a 404, say). When one was
+    transient, the rejection may rest on an outage the code cannot tell from
+    a verdict, so the entries stay and a plain one is added: the check's error
+    stays on rung 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._since = 0
+
+    def begin(self) -> None:
+        """Start a candidate: only reads noted after this count for it."""
+        self._since = _forge_reads_mark()
+
+    def append(self, reason: str) -> None:
+        noted = _forge_unavailable.get()
+        if noted is not None:
+            if any(transient for transient, _ in noted[self._since:]):
+                noted.append((False, "a candidate rejected beside a transient read"))
+            else:
+                del noted[self._since:]
+        super().append(reason)
+
+
 class _UnresolvedCandidates(list):
     """pull_request_opened's unevaluable candidates. One left unevaluable with
     no transient forge read behind it (a malformed answer, a clause not
@@ -4385,8 +4468,7 @@ class _UnresolvedCandidates(list):
 
     def begin(self) -> None:
         """Start a candidate: only reads noted after this count for it."""
-        noted = _forge_unavailable.get()
-        self._since = len(noted) if noted is not None else 0
+        self._since = _forge_reads_mark()
 
     def append(self, reason: str) -> None:
         noted = _forge_unavailable.get()
@@ -4400,8 +4482,10 @@ def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult])
     the check's forge reads that did not answer 2xx were all transient
     (:func:`_forge_get_json`), and there was at least one.
 
-    One read that failed for another reason keeps the error plain, whichever
-    read the error came from. Only an ``error`` is marked: a pass or a fail
+    One read that failed for another reason keeps the error plain, unless the
+    check showed it did not produce the error: a read it answered as control
+    flow (:func:`_forge_read_handled`), or a candidate it rejected
+    (:class:`_RejectedCandidates`). Only an ``error`` is marked: a pass or a fail
     was decided on what the reads did return. The marker leads, so the reason
     the check gave is kept whole."""
 
@@ -4846,9 +4930,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
 
         budget = single_call_timeout(timeout_sec)
         matches: list[dict[str, Any]] = []
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         unseen: list[str] = []
         for repo, number in seen:
+            rejected.begin()
             slug = f"{repo}#{number}"
             url = _issue_api_url(forge, repo, number)
             try:
@@ -4862,6 +4947,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 )
             if status_code == 404:
                 if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    # The project read decides what the 404 means.
+                    _forge_read_handled(status_code)
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -5256,8 +5343,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         window_start = started - timedelta(seconds=self.max_clock_skew_sec)
         budget = single_call_timeout(timeout_sec)
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         for repo, number in seen:
+            rejected.begin()
             slug = f"{repo}#{number}"
             if _gitlab_path_key(repo) != _gitlab_path_key(gitops_repo):
                 rejected.append(
@@ -5276,6 +5364,8 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 )
             if status_code == 404:
                 if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    # The project read decides what the 404 means.
+                    _forge_read_handled(status_code)
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -5458,8 +5548,8 @@ class PullRequestContentCheck(BaseModel):
     quantifier: Literal["all", "any"] = "all"
     # `admits_disruption` only: the workload the budget protects, as the case
     # planted it. Given rather than read, because the workload's manifest is a
-    # file the pull request does not add, and reading it would need
-    # `contents: read`, which the grading mint does not grant.
+    # file the pull request does not add, and this check reads only the
+    # pull request's files listing, never `/contents`.
     replicas: int | None = Field(default=None, ge=2)
     pod_labels: dict[str, str] = Field(default_factory=dict)
 
@@ -6045,6 +6135,24 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # needs only `pull_requests: read`. A glob that names any other file is an
     # error (see _head_files).
     content: list[PullRequestContentCheck] = Field(default_factory=list)
+    # Substrings the pull request's description must contain, each verbatim
+    # and case-sensitive. For the evidence section submit_suggestion.py renders
+    # into every proposal body (#4966): a body that is one line of prose passes
+    # every other clause here. Read from the same `/issues/{n}` answer as the
+    # rest (GitLab: the merge request's `description`), so it costs no call.
+    body_contains: list[str] = Field(default_factory=list)
+
+    def _body_missing(self, body: object) -> str | None:
+        """Why the description fails :attr:`body_contains`, or None."""
+        text = body if isinstance(body, str) else ""
+        absent = [phrase for phrase in self.body_contains if phrase not in text]
+        if not absent:
+            return None
+        return (
+            f"its description lacks {', '.join(repr(p) for p in absent)} "
+            "(`body_contains`) -- the proposal does not carry the evidence "
+            "a reviewer needs to judge it"
+        )
 
     def _head_files(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -6055,9 +6163,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
         Only added files are read. Any other file a glob names (modified,
         renamed, copied), or an added one GitHub left no patch for (large or
         binary), would have to come from ``/contents``, which needs
-        ``contents: read``; the grading mint (hack/ci-eval-pr.sh) does not ask
-        for it, so such a match is unevaluable rather than graded on half the
-        pull request.
+        ``contents: read``. This check makes no ``/contents`` read (the grading
+        mint carries the permission since #5519, but nothing here uses it yet),
+        so such a match is unevaluable rather than graded on half the pull
+        request.
         """
         globs = [g for check in self.content for g in check.paths]
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
@@ -6093,8 +6202,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"{owner}/{repo}#{number}: the content globs name {named}"
                 + (f" and {more} more" if more > 0 else "")
                 + ", which the files listing does not carry whole; `content` reads only files "
-                "the pull request adds, and reading any other needs `contents: read`, which "
-                "the grading mint does not grant, so the content checks could not be evaluated"
+                "the pull request adds, and reading any other needs a `/contents` read "
+                "(`contents: read`) this check does not make, so the content checks could "
+                "not be evaluated"
             )
         return texts, None
 
@@ -6339,6 +6449,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         first, payload = _forge_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
+        if first in (403, 404):
+            # The pulls endpoint answers for the same number; the issues
+            # endpoint's refusal is a route, not the error.
+            _forge_read_handled(first)
         if first in (401, 403, 404):
             status_code, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
         if 401 in (first, status_code):
@@ -6394,7 +6508,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         file count and the commit total, and is skipped when ``_resolve``
         already fell through to it; dating the head commit needs the commits
         listing, whose last page holds it. ``/commits/{sha}`` would be one call
-        and wants ``contents: read``, which grading does not carry.
+        and wants ``contents: read``; this check makes no such call.
 
         A page GitHub has not got (404, or one the head is not on) dates
         nothing, comes back ``None``, and the caller does not reject on it: an
@@ -6456,6 +6570,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             budget,
         )
         if status == 404:
+            _forge_read_handled(status)
             return changed, None, payload, None, None
         if status == 401:
             return (
@@ -6531,11 +6646,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         slug = f"{repo}!{number}"
         status, mr = _forge_get_json(f"{base}/merge_requests/{number}", token, budget)
         if status == 404:
-            why = (
-                _gitlab_project_unseen(repo, token, budget)
-                if _is_configured_gitlab_project(repo)
-                else None
-            )
+            why = None
+            if _is_configured_gitlab_project(repo):
+                # The project read decides what the 404 means.
+                _forge_read_handled(status)
+                why = _gitlab_project_unseen(repo, token, budget)
             if why:
                 return "unresolved", f"{slug}: {why}", None
             return "reject", f"{slug}: no such merge request (404)", None
@@ -6575,6 +6690,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
         changed = int(count) if count.isdigit() else None
         if changed == 0:
             return "reject", f"{slug}: changes no files, so it carries no proposed fix", None
+        missing = self._body_missing(mr.get("description"))
+        if missing:
+            return "reject", f"{slug}: {missing}", None
         head_sha = str(mr.get("sha") or "")
         pushed = None
         if head_sha:
@@ -6589,7 +6707,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 ), None
             if status == 200 and isinstance(commit, dict):
                 pushed = _parse_github_time(commit.get("committed_date"))
-            elif status != 404:
+            elif status == 404:
+                _forge_read_handled(status)
+            else:
                 return "unresolved", (
                     f"unexpected GitLab response {status} for {slug}'s head commit; "
                     "this check could not be evaluated"
@@ -6836,13 +6956,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "before this run, so the window was not widened)"
                 )
         budget = single_call_timeout(timeout_sec)
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         # A candidate the API cannot answer for only ends the check if nothing
         # else resolves. An agent that mistypes a repository slug beside the
         # real URL would otherwise error, and an error is rung 2, which reds the
         # eval job for every open pull request.
         unresolved = _UnresolvedCandidates()
         for owner, repo, number in seen:
+            rejected.begin()
             unresolved.begin()
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
@@ -6954,6 +7075,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 rejected.append(
                     f"{slug}: changes no files, so it carries no proposed fix"
                 )
+                continue
+            # The body as the endpoint that answered returned it: both
+            # `/issues/{n}` and `/pulls/{n}` carry `body`.
+            missing = self._body_missing(payload.get("body"))
+            if missing:
+                rejected.append(f"{slug}: {missing}")
                 continue
             if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
                 rejected.append(
@@ -7254,7 +7381,8 @@ class GitHubWritesVerifier(BaseVerifier):
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
     :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the four first-run audits keep their clock, so
+    keeps the sweep on and the five first-run audits keep their clock until
+    the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
     does not link it from a run whose workers' calls were not read back --
@@ -7289,9 +7417,9 @@ class GitHubWritesVerifier(BaseVerifier):
     comes from ``BENCH_GITLAB_TOKEN`` and the host from ``BENCH_GITLAB_HOST``
     (gitlab.com unless set). ``owner`` pins the top-level group.
 
-    WHAT IT CANNOT SEE. The branch listing wants ``contents: read``, which the
-    grading credential does not carry; a listing GitHub refuses is a note in
-    the reason and ``raw``, and the check grades on pull requests alone.
+    WHAT IT MAY NOT SEE. The branch listing wants ``contents: read``, which the
+    eval's grading mint carries since #5519; a listing GitHub refuses is a
+    note in the reason and ``raw``, and the check grades on pull requests alone.
     Unreadable pull requests -- a 401, a denial, a repository the credential
     cannot see, an API it could not reach -- are ``status="error"``: the
     absence of an observation, never a pass.
@@ -8315,6 +8443,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
+        "webhook-backend-unreachable",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -9004,7 +9133,8 @@ def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
-    the envelope's ``status``, ``repo`` and ``finished_at``, each further top-level
+    the envelope's ``status``, ``repo`` and ``finished_at``, its ``started_at`` when
+    it has one (absent stays absent), each further top-level
     key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
     and the ids of the findings in its ``document`` (this run's own, never ids it
     only carried), or the ``error`` that kept it unread. The rest stays in the pod.
@@ -9018,6 +9148,8 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
         with open(path, encoding="utf-8") as handle:
             envelope = json.load(handle)
         entry = {{key: envelope.get(key) for key in {wanted!r}}}
+        if {_ENVELOPE_STARTED_KEY!r} in envelope:
+            entry[{_ENVELOPE_STARTED_KEY!r}] = envelope[{_ENVELOPE_STARTED_KEY!r}]
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
         out.append(entry)
@@ -9070,7 +9202,11 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     finished at or after the run started (``TranscriptSnapshot.started_at``
     less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
     ``fired_at`` a case's stack recorded in that file in the agent container,
-    for a scheduled run the stack fired and waited out before the turn), has
+    for a scheduled run the stack fired and waited out before the turn), and,
+    when it records its run's start (``started_at``), whose run opened at or
+    after that same bound -- a run from an earlier repetition can finish inside
+    this one; an envelope with the key and no start is such a run, and one
+    from an older image, with no key, is read by ``finished_at`` alone -- has
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
     the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
@@ -9123,20 +9259,48 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         if not read_any:
             return "error", "neither the sandbox nor the agent container could be read", None
         fresh = []
+        started_early = 0
         for envelope in envelopes:
             try:
                 finished = datetime.fromisoformat(str(envelope.get("finished_at")))
             except ValueError:
                 continue
-            if finished.tzinfo is not None and finished >= since:
-                fresh.append(envelope)
-        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at", *self.required_envelope)} for e in envelopes]}
+            if finished.tzinfo is None or finished < since:
+                continue
+            # An envelope that names its run's start counts only when that run
+            # opened inside the window: a run from an earlier repetition can
+            # finish inside this one. One with the key and no start is such a
+            # late finish too, and so is one whose start is after its finish (a
+            # later run's stamp); an older image writes no key and is read by
+            # `finished_at` alone. The start is stamped in whole seconds, so the
+            # bound is floored to the second for it.
+            if _ENVELOPE_STARTED_KEY in envelope:
+                try:
+                    began = datetime.fromisoformat(str(envelope.get(_ENVELOPE_STARTED_KEY)))
+                except ValueError:
+                    began = None
+                if (
+                    began is None
+                    or began.tzinfo is None
+                    or began < since.replace(microsecond=0)
+                    or began > finished
+                ):
+                    started_early += 1
+                    continue
+            fresh.append(envelope)
+        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *self.required_envelope)
+        raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
         if not fresh:
+            window = "the stack fired the audit" if self.since_state_file else "the run started"
+            early = (
+                f"; {started_early} finished since but came from a run that opened before then or named no start"
+                if started_early
+                else ""
+            )
             return (
                 "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since "
-                f"{'the stack fired the audit' if self.since_state_file else 'the run started'} "
-                f"({len(envelopes)} older or unreadable)",
+                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since {window} "
+                f"({len(envelopes) - started_early} older or unreadable{early})",
                 raw,
             )
         failures = []

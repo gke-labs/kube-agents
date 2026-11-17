@@ -84,7 +84,9 @@ the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
 ([Nightly bugs](#nightly-bugs)), keeps an issue open for the owner of each
 domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)), renders the weekly health email beside
-`data.json` ([The weekly health email](#the-weekly-health-email)), and appends
+`data.json` ([The weekly health email](#the-weekly-health-email)), once a week
+cross-checks the Slack lane's overhead against `autopush` and `staging`
+([The Slack cross-check](#the-slack-cross-check)), and appends
 `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
@@ -541,7 +543,8 @@ daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
 its record is its logs bucket and nothing else reads a failed build of it. A fifth,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
-and publishes no dashboard data, so nothing else reads a failed build of it either. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
+`ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
@@ -567,8 +570,14 @@ Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
 hourly and this tick reads its latest finished build every fifteen minutes, so
 every build is read and counted once, and one failed build followed by a clean
-one is a flap. The sweep's note waits until two consecutive checks have failed;
-the reconciles' first failed build is the news. Any project's failure fails a
+one is a flap. The sweep's note waits until two consecutive checks have failed.
+A reconcile's first failed build is the news only when it owes a hand step (a
+refused plan, a locked state, an unmapped project or a runner fault, a run that
+failed before reaching a project or whose check of `main` failed, or a report it
+wrote none of or could not read); a failure the next run retries (a stockout, a
+409, an expired plan token)
+is noted once the same project has failed in two consecutive runs, and a silent
+one still advances the counts. Any project's failure fails a
 sweep run, so a per-project threshold could never fire before the run's; the
 per-project counts name, in the message, the projects that failed in this check
 and the ones before it.
@@ -577,8 +586,9 @@ read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
 that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
-recovery needs a build that passed: a failed check under the threshold writes
-no note and is not one. One whose latest finished
+recovery needs a build that passed, or for the postsubmit reconcile a later
+daily run that reached its projects (below): a failed check under the
+threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
@@ -589,7 +599,8 @@ message is built from (where the job acts, what stops happening when it fails
 and resumes when it recovers, what it does and how often, what a failure costs),
 a one-line summary of what the run did from its report, and the report's detail
 lines, up to five: for the reconcile the projects it refused, failed or was
-interrupted in, each with its reason and its one next step, then how many it
+interrupted in, each with its reason and its one next step (a project that
+failed in consecutive runs leads, with its count), then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
@@ -616,7 +627,7 @@ digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
+reconcile, when a later daily run at the same fleet tree reached the projects it failed on (a pass that held and planned them, or a run that failed elsewhere and applied them; a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines and a
 "how it died" line (the log line that says so, the node, a Warning pod event)
 under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
@@ -687,6 +698,15 @@ delegation-ceiling condition above: DEGRADED under its own name, its own
 message and advice, so a fleet-wide worker stall (#1879) is named here rather
 than read only as "not evaluated" on every pull request.
 
+A repetition graded `infra` under a reason that leads with
+`KUBE_AGENTS_FORGE_UNAVAILABLE` is a forge repetition: every check that errored
+did so because a forge read failed for a while during grading (a 5xx, a dropped
+connection, a GitHub rate limit on grading's own token). It is not a storm
+repetition either, so the storm rule and the pass-rate denominators leave it
+out, and a case whose ungraded repetitions are of this kind, with no storm
+repetition, is classed `forge-unavailable` on the run page (its Do is a
+retest).
+
 Three other shapes get a comment, each one line with the same marker and
 dedupe. A run the suite marked **not evaluated** — an admitted case, or every
 case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
@@ -708,7 +728,14 @@ link has the list), and that nothing about the change is implied:
 Ran 27 min · build log
 ```
 
-When every recorded case was lost the box says so. While `health.json`'s
+When every lost case lost its checks to a forge read that failed during
+grading, the box names that stage instead ("a forge read failed during
+grading, so the checks that read it could not be evaluated"), and when every
+lost case hit the delegation ceiling it says delegated work was still running
+when the harness stopped waiting: the agent ran in both. A mix of the two says
+the agent ran but the harness could not grade the result; any other mix keeps
+the wording above. Beside any of these three stages the storm line below, and its link to the
+brief, are left out, so they cannot read as their cause. When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
 went red on the same run (the dashboard's roster can be newer than the
@@ -940,6 +967,32 @@ repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
 
+When one change breaks many cases, they get one issue. Before filing, the
+cases that would each file are grouped by the night their current run of red
+nights began and a check that every graded failing repetition of that run
+names (read from the grading line's tripped safeguards, or the failed checks
+after a low score). Three or more cases on one such key file one issue in
+place of one each, labelled `nightly-red`, each case's `domain:<slug>` and
+`needs-triage`, and listing each case's nights as a per-case issue does. It goes to the
+domain's `owner:` when the cases share a domain, and to `infra_owner` in
+`domains.yaml` when they span domains, with each case's effective owner
+@-mentioned. The issue carries every case's marker, so the dedupe treats it as each
+case's issue (matched on those markers alone, never on a case named in its
+text); a triager who
+deletes a case's marker line splits that case off, and it files on its own if
+it stays red. Once every case it names has a recovery night after the issue
+opened (or, once a case's red nights have left the 14-night window, a pass
+after the issue opened), the bot comments once, listing each case's clear
+night; a group issue gets no per-case recovery comment. A part
+that graded nothing that night (no project, a setup death) is skipped, as for
+one case, so it does not count as clear. A case that reaches 3 red nights a
+tick after its group was filed files on its own. The issue names no check: the
+check is used to group and stays on the dashboard. Three, not two: two cases
+sharing a check from one night are often a probe and its audit in one domain,
+one owner either way, and three unrelated cases breaking the same check the
+same night are rarely a coincidence. On 2026-11-09 one grader change (#4973)
+filed ten per-case issues to five owners.
+
 Two infrastructure shapes file an issue labelled `nightly-red`, `Infra` and
 `needs-triage` instead of a domain label, assigned to `infra_owner` in
 `domains.yaml` with `infra_backup` mentioned (`nightly_infra.py` holds the
@@ -992,6 +1045,88 @@ coverage-gap filer with it ([Coverage gaps](#coverage-gaps));
 `CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
 `python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
 against any `data.json`; `--live` writes.
+
+## Nightly triage
+
+`scripts/eval_dashboard/nightly_triage.py` puts a model between the filer and
+a person, so the assignee gets a bug that is really theirs. The filer routes by
+who owns the case, which is the wrong person whenever the case is not at fault:
+on 2026-11-09, ten issues for one grader change went to five case owners, and
+each diagnosed it separately.
+
+Armed, the filer files a domain or group bug (not an infra issue) unassigned,
+labelled `triage:pending`, with every @-mention in its body written as code so
+the filing notifies no one, and a `kube-agents-bot:triage-pending` marker
+naming who its own rule would assign and mention. The `nightly-triage` job runs
+after each tick and handles at most 5 such issues, oldest first, in two steps
+with two identities:
+
+- **Gather**, as the archive reader (`github-actions@kube-agents-prow`): from
+  `data.json`, each case's last green and first red nightly commits and every
+  failing repetition's grading line on its red nights; the tail of up to three
+  transcripts from the nightly's private bucket; `git log` between those
+  commits on a full-history checkout, with each pull request's title and author
+  from GitHub; and the candidate fixes, open pull requests touching the same
+  files and commits on those files merged since the first red night. It writes
+  only to the runner's disk.
+- **Route**, as the publisher (`CI_HEALTH_SA`): one call to Gemini on Vertex AI
+  through the job's Workload Identity, model `NIGHTLY_TRIAGE_MODEL`
+  (`gemini-4-argon` unless the repository variable names another), billed to
+  `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
+  capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
+  then grading lines) and the answer at 16,384, thinking included. The model returns a
+  classification, a suspected pull request, an open or merged fix, a priority
+  and a confidence. A pull request outside the commit window, or a fix outside
+  the candidates, is set aside rather than trusted.
+
+| Verdict                                                                    | Assigned to                                 |
+| -------------------------------------------------------------------------- | ------------------------------------------- |
+| Product bug or grader/harness, with a suspected pull request in the window | that pull request's author                  |
+| Grader/harness, no suspected pull request                                  | `infra_owner` in `domains.yaml`             |
+| Infra                                                                      | `infra_owner`                               |
+| Case needs rework, low confidence, or no verdict                           | the filer's rule (case owner, domain owner) |
+
+A suspected pull request also has to have merged between the issue's last
+green night and its first red one (the same nights that bound the commit
+window, by UTC date, the green one a day early to cover a build that started
+just before midnight). One that merged outside them, or an issue with no green
+night on record, routes by the filer's rule: with no green night the commit
+window is the 80 commits before the first red night, which can reach back
+weeks.
+
+The first login GitHub accepts is assigned, the rule's logins behind it; a
+person without access to the issues repository is not assignable there, and
+the issue falls to the rule. The job then posts one comment on the issue with
+the verdict, the evidence, the suspected pull request and the fix (linked in
+full, since pull requests live in this repository), @-mentions the people the
+filer would have, swaps `triage:pending` for `triage:agent`, and marks the body
+`triage-done`. The comment goes only to the issues repository
+(`KUBE_AGENTS_ISSUES_REPO`, private), so it names cases and quotes grading
+lines; the job log carries issue numbers, pull request numbers and logins only.
+
+A model call that fails, times out, stops at its token cap or answers off the
+schema routes by the filer's rule, and the comment says so in one line. An
+issue whose evidence was not gathered waits for the next tick; one still
+waiting two hours after it was filed is routed by the rule without a model
+call, by the job or, when the job fails before routing, by a step of the tick
+itself. A failed GitHub write leaves the issue pending, and the next tick
+resumes it without another model call: an assignee already set is kept, and a
+comment already posted is not posted again. The body is marked done on a fresh
+read and the labels are added and removed one by one, so an edit a person made
+meanwhile stays. The filer files for triage only into a separate issues
+repository, the route step writes to no other, and the job's own token holds
+no issue write.
+
+Unarmed, the job dry-runs on the issues the filer filed that tick (which the
+filer assigned as before) and prints what it would assign; a manual run of the
+workflow with `triage_issues` set to issue numbers of the issues repository
+does the same for those issues. Setting the repository variable
+`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true`;
+`CI_HEALTH_MUTE=true` disarms both. Switched off while issues still wait,
+the tick routes each by the rule without a model call. The call needs
+`roles/aiplatform.user` for `CI_HEALTH_SA` on `NIGHTLY_TRIAGE_PROJECT`, with
+the Vertex AI API enabled there; until then every call fails and every issue
+goes by the rule.
 
 ## The nightly section
 
@@ -1262,8 +1397,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median; and its cache hit rate when repetitions carry the prompt
-split), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when at least 30 repetitions carry the prompt
+split); the tile says the figure is one repetition of one scenario, all agents, a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1276,8 +1411,8 @@ are left out of the median and their number is shown. The change compares
 the two weeks' figures over the scenarios with a full count in both weeks.
 Each such scenario's median is taken over its full counts in each week, and a
 week's figure is the median of those per-scenario medians, so every scenario
-weighs the same and its partial counts do not move it. When full counts carry the prompt
-split, the tile and the Chat line add the cache hit rate: their cache reads over their
+weighs the same and its partial counts do not move it. When at least 30 full counts carry the prompt
+split (`TOKENS_CACHE_MIN_RUNS`; fewer say little about caching), the tile and the Chat line add the cache hit rate: their cache reads over their
 whole prompt (`cached / (input + cached + cache_write)`), summed over those repetitions so
 a long run weighs by its tokens; the tile also gives how many repetitions it covers. The
 tokens tile and the Chat line are left out when no repetition the week compared carries a
@@ -1349,6 +1484,40 @@ renders against any downloaded pair (it reads the issues with `gh`), and
 `python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
 prints the message body it would post.
 
+## The Slack cross-check
+
+The Slack lane's overhead is measured on a quiet CI channel, so the nightly
+pages' estimated Slack times are a floor. Once a week the tick checks that
+floor against real traffic: `scripts/eval_dashboard/slack_crosscheck.py`
+reads the A2A gateway's Slack histograms (delivery lag, a post's time, time
+to first ack) on `autopush` and `staging`'s host clusters over the last seven
+days, from each environment's Managed Service for Prometheus, and sets them
+beside the lane's nightly values for the same days in `data.json`. It is
+published as `slack-crosscheck.json` beside `data.json`: `lane` (`nights` and
+the four values), `environments.<name>` (`project`, the four values,
+`deliveries` and each value's `ratio` to the lane's, or `error`), `complete`,
+`window_days` and `generated_at`. The lane's quantiles are the mean of its
+nightly quantiles, not pooled ones. A metric an environment does not serve
+yet reads as `null`. A complete run within the last seven days skips with one
+log line.
+
+It reads as the publisher, which needs `roles/monitoring.viewer` on the two
+environments' projects, `kube-agents-autopush` (autopush) and
+`kube-agents-gkedemos` (staging):
+
+```bash
+for p in kube-agents-autopush kube-agents-gkedemos; do
+  gcloud projects add-iam-policy-binding "$p" --role=roles/monitoring.viewer \
+    --member=serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
+done
+```
+
+An environment whose project refuses the read is skipped with one log line
+naming the role, and any other failure is logged and recorded as its `error`.
+A run that reads no environment publishes nothing; one that reads only some
+publishes with `complete: false`, which does not count as the week's run, so
+each tick reads again and a grant takes effect on the next one.
+
 ## The seeded-fleet scan
 
 Presence probes passed on 2026-09-07 while every slot-a fixture sat Pending on
@@ -1360,7 +1529,7 @@ the top of every hour (`0 * * * *`, a second cron in the same workflow; the
 `github.event.schedule` guards send each run to one job) it runs
 `scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
 temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
-`hack/fleet-fixture-state.py --wait 0 --report`, eight projects at a time, and
+`hack/fleet-fixture-state.py --wait 0 --report`, ten projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
 and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
@@ -1390,10 +1559,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
-describes and the `gcloud compute instances list` and `gcloud compute
-firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+describes and the `gcloud compute instances list`, `gcloud compute
+firewall-rules list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm` and
 `world-open-ingress`, which have no cluster slot; the account holds
-`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+`roles/compute.viewer` for them, which includes
+`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
@@ -1472,7 +1643,9 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
+failure line gone from its serial buffer, is cleared by the re-apply too, because the
+reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
@@ -1509,7 +1682,7 @@ the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 `verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,gemini_api_key,token_minter_kms --report`
-against every pool project, eight at a time, and publishes
+against every pool project, ten at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
 `forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project with provider `gemini` in their eval-model pair (`docs/ci-pool-projects.md` 5.10); a lane whose pair names `vertex_ai` does not read the key. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
@@ -1631,7 +1804,7 @@ mean "retest" by that word, and this one has nothing to retest for.
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
 past which it starts no check and cuts every command short, so a stall costs the reads it
 hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
-scan's own ceiling (1620 s: five waves of eight projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
+scan's own ceiling (1620 s: five waves of ten projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
 laptop as whoever is logged in.

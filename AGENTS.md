@@ -13,7 +13,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images: review skills (adversarial, security, docs-drift, chat UX, skill quality) run against pull requests and clusters, `review-preflight` runs the pre-PR set in a context that did not write the change, the `install-`/`uninstall-`/`upgrade-kube-agents` lifecycle skills drive the installer scripts, and `edit-mirrored-skill` edits mirrored `gke-*` skills.
 - `.agents/rules/`: Repository-level rules, one file per family: code (`core_engineering.md`), workflows (`github_actions.md`), pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`), chat UX (`chat_ux.md`), public posts (`public_surfaces.md`).
-- `a2a/`: bus Go module: wire library, `a2a` topics CLI (`docs/designs/spec-a2a-payloads.md`), gateway, auth-callout, `persona/` (bus content), `lib/persona/` (persona format).
+- `a2a/`: bus Go module: wire library, `a2a` topics CLI (`docs/designs/spec-a2a-payloads.md`), gateway, auth-callout, `memory/` (OKF Curator), `persona/` (bus content), `lib/persona/` (persona format).
 - `charts/`: Canonical Helm chart (`kube-agents`) deploying the operator and profiles.
 - `terraform/`: Reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`), plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Dockerfile, Kustomize bases, shared runtime assets.
@@ -170,7 +170,7 @@ user" clauses here. Agents with a user in the loop follow this file.
   `type(optional-scope): description` (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`; breaking changes marked with `!` before `:` or a
   `BREAKING CHANGE:` footer). Confirm the title prefix with the author before opening a PR.
-- Push PR branches to a fork, not to the upstream repository.
+- Push PR branches to a fork, not upstream.
 - **Pin every third-party GitHub Action to a full commit SHA with a version comment**
   (`uses: actions/checkout@3d3c42e… # v7.0.1`), and **guard automatically-triggered credentialed
   workflows against forks** with `if: github.repository == 'gke-labs/kube-agents'` on every job.
@@ -179,23 +179,23 @@ user" clauses here. Agents with a user in the loop follow this file.
   A bug fix fills in **Bug Fix: Preventing Recurrence**: why it shipped, what catches it now, where
   else it lives ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **AI Agent Attribution:** No AI co-author trailers (`Co-Authored-By:`) on commits; note AI
-  assistance in the PR description instead.
+  assistance in the PR description.
 - **Write PR titles, bodies, commits, and review replies straight:** plain declaratives leading with
-  the outcome, without self-grading (`comprehensive`, `production-ready`).
-- **Adversarial and docs-drift self-review before opening a PR:** run `review-adversarial`
-  (`.agents/skills/review-adversarial/SKILL.md`) and `review-docs-drift`
-  (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff **in a clean context that
-  did not write the change** (`/pr-preflight` spawns one). Fix confirmed findings and record one
-  merged disposition list under **Self-Review**: what you looked for, what was found, the context
-  used. Mechanics: [`pre_pr_review.md`](.agents/rules/pre_pr_review.md).
+  the outcome, without self-grading (`comprehensive`).
+- **Self-review before opening a PR:** run `review-adversarial`, `review-docs-drift` and, when chat
+  output changes, `review-chat-ux` on your diff **in a clean context that did not write it**
+  (`/pr-preflight` spawns them). Fix confirmed findings; under **Self-Review** list every
+  disposition, what you looked for and the context ([mechanics](.agents/rules/pre_pr_review.md)).
+- **Show a user-facing change:** a PR changing what a user sees carries a screenshot under **UX
+  change**; CI checks it ([mechanics](.agents/rules/pre_pr_review.md#ux-change)).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how it
   ran against a running installation, the eval loop or exemption record for agent
   behaviour changes, or "Not live-tested" and why. Mechanics:
   [`pre_pr_review.md`](.agents/rules/pre_pr_review.md); what the section may carry:
   [`public_surfaces.md`](.agents/rules/public_surfaces.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
-  fixes into the sections rather than appending rounds; round-by-round history belongs in the
-  review threads ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
+  fixes into the sections, not appended rounds; per-round history goes in review threads
+  ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **The install has one engine: Terraform + Helm.** `terraform/examples/full-install` (via
   `lifecycle.sh`) owns every GCP resource and the chart every Kubernetes resource;
   `install.sh` / `uninstall.sh` / `upgrade.sh` only generate `terraform.tfvars` and drive it. Do not
@@ -215,9 +215,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
-  `--platform linux/amd64` Docker build (plus `scripts/check_image_layers.py` for a new `RUN`/`COPY`
-  in `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on
-  Terraform modules. Commands:
+  `--platform linux/amd64` Docker build (and `scripts/check_image_layers.py` for a new `RUN`/`COPY` in
+  `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on Terraform
+  modules, `scripts/dev/repeat_under_load.sh` on a new or changed test. Commands:
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#local-validation-before-committing).
 
 ### The behavioural presubmit gate

@@ -392,16 +392,24 @@ type fakeVerifier struct {
 	// refuseTarget refuses any ref asked about one of these targets.
 	refuseTarget map[capability.Scope]bool
 	calls        []string
+	triggers     []*capability.Trigger
 }
 
-func (v *fakeVerifier) CheckProfileRun(_ context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
+func (v *fakeVerifier) CheckProfileRun(_ context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope, trigger *capability.Trigger) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.calls = append(v.calls, fmt.Sprintf("%s|%s|%s|%s", ref.Key, profile, tier, target))
+	v.triggers = append(v.triggers, trigger)
 	if v.refuse[ref.Key] || v.refuseTarget[target] {
 		return &capability.Refusal{Rule: "the grant does not reach that target"}
 	}
 	return nil
+}
+
+func (v *fakeVerifier) triggerList() []*capability.Trigger {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]*capability.Trigger(nil), v.triggers...)
 }
 
 func (v *fakeVerifier) callList() []string {

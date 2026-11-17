@@ -49,6 +49,8 @@ from tests.testing.release import parse_required_release_images
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
+# The relabel job's token step in release-publish.yml: the one release-bot mint that pushes no tag.
+RELABEL_TOKEN_STEP = "relabel-token"
 _PROMOTION = _WORKFLOWS / "staging-promotion-pipeline.yml"
 _COMMON_SH = _REPO_ROOT / "scripts" / "release" / "common.sh"
 _POLLER = _REPO_ROOT / "scripts" / "release" / "poll_rc_eval_verdict.py"
@@ -319,8 +321,8 @@ class PromotionPipelineWiringTest(unittest.TestCase):
     def test_the_eval_wait_makes_its_credential_the_active_account(self):
         """The poller's `gcloud storage` reads run as the active account, which
         the explicit `gcloud auth login --cred-file` makes the auth step's
-        credential. (The reads were gsutil's until 2026-10, and gsutil ignored
-        GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
+        credential. (Until 2026-10 the reads used the legacy storage client,
+        which ignored GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
         credentials, no build was ever found, and the job reported `never_ran`,
         which reads as a broken eval lane rather than a missing login.
         ci-health.yml paid forty failed ticks to learn this.)
@@ -999,7 +1001,20 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                 self.assertTrue(token_steps, f"expected at least one release bot token step in {name}")
                 for step in token_steps:
                     self.assertEqual(step["with"].get("permission-contents"), "write")
+                    if step.get("id") == RELABEL_TOKEN_STEP:
+                        continue
                     self.assertEqual(step["with"].get("permission-workflows"), "write")
+
+    def test_the_relabel_token_pushes_no_tag_and_asks_for_no_workflows_scope(self):
+        """release-publish.yml's relabel job pushes a docs-only branch cut from main and opens a pull
+        request (#5673). Its branch holds no workflow change, so it needs no workflows scope, and
+        least privilege leaves it out; it does need pull-requests write to open the pull request."""
+        doc = _doc(_WORKFLOWS / "release-publish.yml")
+        steps = [step for step in doc["jobs"]["relabel-upgrade-table"]["steps"]
+                 if step.get("id") == RELABEL_TOKEN_STEP]
+        self.assertEqual(len(steps), 1)
+        scopes = {k: v for k, v in steps[0]["with"].items() if str(k).startswith("permission-")}
+        self.assertEqual(scopes, {"permission-contents": "write", "permission-pull-requests": "write"})
 
     def test_no_token_mint_uses_the_deprecated_app_id_input(self):
         """create-github-app-token v3.1.0 deprecated `app-id` for `client-id`, and the

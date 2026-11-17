@@ -10,7 +10,7 @@ The web console is a browser workspace for reviewing incident triage and talking
 <video controls loop muted playsinline preload="metadata" style="width: 100%; border-radius: 8px; border: 1px solid var(--sl-color-hairline);" src="/kube-agents/web-console-demo.mp4"></video>
 
 :::note
-The web console is distinct from the A2A console, which a `spec.mode: next` install serves without a flag. See [User interfaces](/kube-agents/reference/user-interfaces/) for a comparison of the browser pages.
+The web console is distinct from the A2A console, which every install serves without a flag. See [User interfaces](/kube-agents/reference/user-interfaces/) for a comparison of the browser pages.
 :::
 
 ## Turn it on and open it
@@ -55,7 +55,7 @@ To run a specific runbook, type `$` in the message box for autocomplete or open 
 
 From the header bar, you can also test and switch the active model or reasoning level against the cluster's inference gateway. Saving a model records `kubeagents.x-k8s.io/active-model`, `active-model-target`, and `reasoning-level` on the `PlatformAgent` resource. It also gives you a Helm values snippet so the choice persists across chart upgrades.
 
-Beside the model selector, the banner shows token and cost counters summed across reachable LiteLLM replicas since LiteLLM last restarted. Treat the cost figure as LiteLLM's price-table estimate rather than your cloud bill.
+Beside the model selector, the banner shows token and cost totals since install, read from the counters the operator keeps on the `PlatformAgent` status across LiteLLM restarts; the note under them says so and how many LiteLLM replicas answered. The operator refreshes those totals every few minutes, so the live LiteLLM figure can run ahead of them between polls. That reading needs the console's `PlatformAgent` read, which `webConsole.environment.enabled` (the default) grants. Without it, or while the status carries no totals yet, the banner shows the counters summed across reachable LiteLLM replicas since each last restarted, and the note says that instead. Treat the cost figure as LiteLLM's price-table estimate rather than your cloud bill.
 
 ## Connect repositories and open pull requests
 
@@ -75,7 +75,7 @@ Opening the release badge displays copyable `./upgrade.sh` and `helm upgrade` co
 
 ![Web console feedback modal with inference gateway draft polish](../../../assets/web-console/web-console-feedback.png)
 
-Select **Feedback** or **Bugs** to draft a bug report, feature request, or question for `gke-labs/kube-agents`. You can attach anonymized environment counts (versions, rollout dates, and counts of nodes, namespaces, workloads, and pods, with no cluster, project, or workload names). Select **Polish** to tighten your draft through the cluster's own inference gateway before opening a pre-filled GitHub issue.
+Select **Feedback** or **Bugs** to draft a bug report, feature request, or question for `gke-labs/kube-agents`. You can attach anonymized environment counts (versions, rollout dates, and counts of nodes, namespaces, workloads, and pods) with no cluster, project, or workload names. The attachment also carries the usage, tools and performance sections of the block the chat's [`/feedback summary`](/kube-agents/concepts/chatops/#feedback) prints, read from the `PlatformAgent` status. Those sections hold usage counters, proposal origins, the top tools by tool name, token and spend totals since install, and the agent's and a person's last-active times. The enabled chat interfaces are listed with the versions. Select **Polish** to tighten your draft through the cluster's own inference gateway before opening a pre-filled GitHub issue.
 
 ## Access control and privacy
 

@@ -147,6 +147,8 @@ const PAGE = {
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
+  // The nights an estimated Slack p95 is averaged over (slack_estimate.P95_NIGHTS).
+  slackP95Nights: 7,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -842,7 +844,7 @@ function agentSawHtml(inc, inWindow) {
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.cls === (inc.condition === "storm" ? "storm" : "delegation-ceiling") && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -1221,6 +1223,7 @@ function tagFor(c) {
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
+  if (c.cls === "forge-unavailable") return '<span class="tag storm">forge unavailable</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1229,22 +1232,30 @@ function tagFor(c) {
 // (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
 // the total or a three-rep case would read "all 0 reps lost". `fixture` is
 // the repetitions never run because the lease-time scan saw a fixture the
-// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way.
-function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0); }
+// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way,
+// and `forge` the repetitions whose checks errored on a forge read that failed
+// during grading (REP_FORGE).
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0) + (reps.forge || 0); }
 function lostText(reps) {
   const parts = [];
   if (reps.infra) parts.push(`${reps.infra} lost`);
   if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
   if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
   return parts.length ? ` (${parts.join(", ")})` : "";
 }
 function ungradedText(reps) {
   const total = plural(repTotal(reps), "rep");
-  if (reps.fixture && !reps.infra && !reps.ceiling) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
-  if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
-  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}`;
-  if (reps.fixture) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}`;
+  if (reps.fixture && !reps.infra && !reps.ceiling && !reps.forge) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
+  if (reps.ceiling && !reps.infra && !reps.forge) return `all ${total} hit the delegation ceiling with the worker still running`;
+  if (reps.forge && !reps.infra && !reps.ceiling && !reps.fixture) return `all ${total} not graded: a forge read failed during grading`;
+  // A mix: each kind that has repetitions, in lostText's order.
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost before grading`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
+  if (parts.length > 1) return `all ${total} ungraded: ${parts.join(", ")}`;
   return `all ${total} lost before grading`;
 }
 
@@ -1818,7 +1829,9 @@ function nightCaseRow(night, c, newly) {
   const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`,
     // A name the link grammar refuses could not reach the timing section.
     linkCaseIds([c.case]).length ? `<a href="${esc(nightTimingHref(night, [c.case]))}">timing</a>` : ""].filter(Boolean).join(" · ");
-  const p90 = Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "";
+  const p90 = (Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "") +
+    // The estimated end-to-end Slack time beside the agent time (slack_estimate.py).
+    (Number.isFinite(c.slack_e2e_s) ? `<br><small class="mut" title="estimated: agent time + that night's Slack delivery lag + a Slack post's time per message the reply posted">Slack ≈ ${esc(secText(c.slack_e2e_s))}</small>` : "");
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
     `<td>${nightStatePill(c)}</td>` +
     `<td class="num" title="repetitions passed / graded">${esc(nightRepText(c))}</td>` +
@@ -1826,6 +1839,17 @@ function nightCaseRow(night, c, newly) {
     nightShapeCell(c) +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
+}
+
+// The night's estimated Slack times, when the Slack lane recorded its overhead
+// that night (SCHEMA.md: nights[].slack); nothing otherwise.
+function nightSlackHtml(night) {
+  const s = night.slack;
+  if (!s || !Number.isFinite(s.e2e_p50_s)) return "";
+  const ack = Number.isFinite(s.first_ack_p50_s) ? ` · time to first ack p50 ${secText(s.first_ack_p50_s)}${Number.isFinite(s.first_ack_p95_s) ? `, p95 ${secText(s.first_ack_p95_s)}` : ""}` : "";
+  const p95 = Number.isFinite(s.e2e_p95_7n_s) ? ` (${PAGE.slackP95Nights}-night average ${secText(s.e2e_p95_7n_s)})` : "";
+  return `<p class="small"><b>Slack, estimated:</b> end to end p50 ${secText(s.e2e_p50_s)}, p95 ${secText(s.e2e_p95_s)}${p95}${ack}.</p>` +
+    `<p class="mut small">How: each case's agent time (median) + that night's Slack delivery lag + a Slack post's time for each message its reply posted, from the A2A gateway's metrics on the Slack lane's canaries. It is a lower bound: it misses what a busy workspace adds, such as rate limits under load, other posters in the channel, and a person's client rendering the message.</p>`;
 }
 
 function nightCasesTable(night) {
@@ -1941,7 +1965,7 @@ function nightlyHtml(link) {
     tile("Newly failing", `${night.previous_build == null || nightWithheldBy(night) ? "—" : night.newly_failing.length}`, nightWithheldBy(night) ? `no ${PAGE.nightPartWords[nightWithheldBy(night)] || nightWithheldBy(night)} on record` : night.previous_build == null ? "first night on record" : "against the night before") +
     (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     (shape ? tile("Opens on answer", `${pct(shape.opens_on_verdict / shape.n)}`, [`of ${plural(shape.n, "rep")}`, Number.isFinite(shape.answer_words_p50) ? `answer p50 ${plural(shape.answer_words_p50, "word")}` : "", `${shape.apology} with an apology`].filter(Boolean).join(" · ")) : "") +
-    `</div></div>`;
+    `</div>${nightSlackHtml(night)}</div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
     `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. Opens on answer counts the repetitions whose reply opens on its verdict rather than a lead-in or a heading, out of those measured, with the answer's median length under it; it is reported, never graded. The transcript is the first repetition's.</p></div>` +

@@ -37,7 +37,7 @@ namespaces and events in each cluster.
 | Pods                  | 17,385 (about 435 per cluster)                                                                               |
 | Namespaces            | 1,683 (about 42 per cluster)                                                                                 |
 | Deployments, Services | 7,643 and 7,520                                                                                              |
-| Install               | `main` at `0108e59d`, `spec.mode: next`, model `vertex_ai/gemini-3.5-flash`                                  |
+| Install               | `main` at `0108e59d`, `spec.mode: next`, the install's default model on Vertex AI                            |
 | Container size        | L: agent 8 CPU / 16 GB, credential proxy 8 CPU / 8 GB, event watcher 2 CPU / 4 GB; shell fixed 2 CPU / 2 GiB |
 | Host                  | 2 × e2-standard-4                                                                                            |
 
@@ -261,15 +261,15 @@ commands come from the Stall Watch sweep (inferred; the log does not name the ca
 
 ### Prices (Cloud Billing Catalog API)
 
-| SKU                                               | Price                     |
-| ------------------------------------------------- | ------------------------- |
-| Gemini 3.5 Flash Global Text Input - Predictions  | $1.50 per million tokens  |
-| Gemini 3.5 Flash Global Text Input Caching        | $0.15 per million tokens  |
-| Gemini 3.5 Flash Global Text Output - Predictions | $9.00 per million tokens  |
-| E2 Instance Core, Americas (us-central1)          | $0.02181159 per vCPU-hour |
-| E2 Instance Ram, Americas (us-central1)           | $0.00292353 per GiB-hour  |
-| Balanced PD Capacity (us-central1)                | $0.10 per GiB-month       |
-| Zonal Kubernetes Clusters                         | $0.10 per hour            |
+| SKU                                      | Price                     |
+| ---------------------------------------- | ------------------------- |
+| <model> Global Text Input - Predictions  | $1.50 per million tokens  |
+| <model> Global Text Input Caching        | $0.15 per million tokens  |
+| <model> Global Text Output - Predictions | $9.00 per million tokens  |
+| E2 Instance Core, Americas (us-central1) | $0.02181159 per vCPU-hour |
+| E2 Instance Ram, Americas (us-central1)  | $0.00292353 per GiB-hour  |
+| Balanced PD Capacity (us-central1)       | $0.10 per GiB-month       |
+| Zonal Kubernetes Clusters                | $0.10 per hour            |
 
 The install's LiteLLM runs with `VERTEXAI_LOCATION=global`, so the global SKUs apply. Regional
 SKUs cost 10% more.
@@ -308,7 +308,7 @@ The hourly series reproduces in Metrics Explorer with this PromQL:
 ```promql
 sum by (type) (increase(aiplatform_googleapis_com:publisher_online_serving_token_count{
   monitored_resource="aiplatform.googleapis.com/PublisherModel",
-  model_user_id="gemini-3.5-flash"}[1h]))
+  model_user_id="<the install's model>"}[1h]))
 ```
 
 ### Cost of one install at 42 clusters, steady operation

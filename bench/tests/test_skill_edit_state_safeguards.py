@@ -22,7 +22,7 @@ import yaml
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry
 
-from kube_agents_bench import transcript
+from kube_agents_bench import transcript, worker_trajectory
 from kube_agents_bench.cases import load_case
 
 CASE = (
@@ -217,6 +217,15 @@ def test_a_worker_that_did_not_end_its_card_fails(case: Path):
     assert _run(raw, ran) == "fail"
     refused = ran + [_call("kanban_complete", "error", summary="done")]
     assert _run(raw, refused) == "fail"
+
+
+@pytest.mark.parametrize("case", [CASE, SHELL_CASE], ids=["skill-manage", "shell"])
+def test_a_closed_card_with_no_worker_call_fails(case: Path):
+    """#5371: the harness's no-worker-calls entry (every awaited card closed, a
+    clean capture, no worker entry) says the workers made no call, so the
+    worker did not end its card: a graded fail, not an error."""
+    (raw,) = [e for e in _spec(case) if e["name"] == ENDED]
+    assert _run(raw, ROUTER + [worker_trajectory.no_worker_calls_entry(["t_1"])]) == "fail"
 
 
 @pytest.mark.parametrize("case", [CASE, SHELL_CASE], ids=["skill-manage", "shell"])

@@ -671,7 +671,8 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # before the allowlist entry was consulted at all, which is the same
         # trap --zones and --machine-type above were added for.
         "--port",
-        # `billing budgets list` requires it.
+        # `billing budgets list` requires it. Listed here for its arity only:
+        # _BILLING_ACCOUNT_VERB below is the one command that may pass it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud
         # synopsis. --output-path is deliberately absent from this set and
@@ -700,6 +701,22 @@ _GCLOUD_FILE_WRITE_FLAGS = frozenset({"--output-path", "--log-http-log-file"})
 _ASSET_SEARCH_VERB = ("asset", "search-all-resources")
 _ASSET_SEARCH_TYPE_FLAG = "--asset-types"
 _ASSET_SEARCH_REQUIRED_TYPE = "container.googleapis.com/Cluster"
+
+# `--billing-account` names a scope above a project. _GCLOUD_FLAGS_WITH_VALUE is one list for every
+# command, so the flag `billing budgets list` requires was also read on every other allowlisted
+# command, and `logging read` takes it: with it the read is of a billing account's logs, where the
+# selectors beside it (--folder, --organization, --bucket, --view, --resource-names) were never
+# listed and stay refused. So the flag passes on the one command it was listed for and is refused
+# on every other read, which also keeps it from a command allowlisted later that happens to take
+# it. IAM is still the outer bound either way.
+_BILLING_ACCOUNT_FLAG = "--billing-account"
+_BILLING_ACCOUNT_VERB = ("billing", "budgets", "list")
+_BILLING_ACCOUNT_RULE_ID = "gcp.billing-account-forbidden"
+_BILLING_ACCOUNT_REASON = (
+    "--billing-account selects a billing account, a scope above a project, and is allowed on "
+    "`gcloud billing budgets list` only."
+)
+_BILLING_ACCOUNT_REMOVAL = "Remove it; to read one project's logs or resources, pass --project."
 
 # gcloud boolean global flags that do not consume the following argument.
 # These are enumerated from gcloud help and are boolean **at the global parser
@@ -983,6 +1000,12 @@ def _gcloud_writes_a_file(argv: list[str]) -> str | None:
         if name in _GCLOUD_FILE_WRITE_FLAGS:
             return name
     return None
+
+
+def _gcloud_names_flag(argv: list[str], flag: str) -> bool:
+    """Whether any token is `flag` in either spelling. Any token, a flag's value included: gcloud
+    reads a token of that shape as the flag wherever it stands."""
+    return any(token.partition("=")[0] == flag for token in argv[1:])
 
 
 def _asset_search_type(argv: list[str]) -> str | None:
@@ -2020,6 +2043,20 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                 message=_GCLOUD_READ_ONLY_MESSAGE
                 + (_NEAREST_READ_HINT.format(command=nearest) if nearest else ""),
                 verb_tuple=_gcloud_verb_tuple(words),
+            )
+
+        # Only on a command the lines above found to be an allowed read, so a write keeps its own
+        # refusal.
+        if (
+            _gcloud_names_flag(argv, _BILLING_ACCOUNT_FLAG)
+            and tuple(words[: len(_BILLING_ACCOUNT_VERB)]) != _BILLING_ACCOUNT_VERB
+        ):
+            return _flag_refusal(
+                argv,
+                _BILLING_ACCOUNT_RULE_ID,
+                _BILLING_ACCOUNT_REASON,
+                _BILLING_ACCOUNT_REMOVAL,
+                _BILLING_ACCOUNT_FLAG,
             )
         return _ALLOWED
 

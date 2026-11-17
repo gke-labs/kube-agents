@@ -79,7 +79,10 @@ Environment:
         or a run that delivered nothing, and nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
-    AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
+    AGENT_TRANSPORT: ``api`` (default; everything above), ``slack`` (advisory, for
+        the Slack lane: a test user's post in a CI channel, read back from the
+        thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
+        ``AGENT_SLACK_TIMEOUT``, 600 s unset) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -150,6 +153,7 @@ from __future__ import annotations
 import atexit
 import fcntl
 import http.client
+import hashlib
 import json
 import logging
 import os
@@ -175,7 +179,8 @@ from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import slack_transport as slack
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -221,13 +226,19 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # trend lives.
 SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
-# The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
+# The doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
 # HTTP endpoint, which is identical under both modes and therefore says nothing
 # about the next stack; ``inject`` goes through the A2A gateway, which is the
 # stack the mode renders.
 TRANSPORT_API = "api"
 TRANSPORT_INJECT = "inject"
-_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
+# ``slack`` goes the way a person does: a test user's post in a CI channel, the
+# reply read back from the thread (slack_transport.py). Advisory, for the Slack
+# lane only (hack/slack-lane/run.sh).
+TRANSPORT_SLACK = "slack"
+_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT, TRANSPORT_SLACK})
+# The Slack transport's whole-turn budget when AGENT_SLACK_TIMEOUT is unset.
+_SLACK_DEFAULT_TIMEOUT = "600"
 
 # Board management tools that do not count as substantive worker action or final answer generation.
 _BOARD_NON_ACTION_TOOLS = frozenset({
@@ -302,6 +313,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     inject.EVENT_ENTRY_STATUS,
     inject.EVENT_ENTRY_ACTIVITY,
     worker_trajectory.GAP_ENTRY,
+    worker_trajectory.NO_WORKER_CALLS_ENTRY,
 })
 
 # Character ceiling for card detail quoted in infrastructure failure errors.
@@ -329,6 +341,26 @@ _LEASE_READ_TIMEOUT = 15
 # How much of a failed kubectl read's stderr the warning quotes.
 _KUBECTL_STDERR_LOG_CHARS = 300
 _INJECT_DEFAULT_LOCAL_PORT = 28099
+# The A2A door's local tunnel port for card-wait stopped asks (#5407), well
+# away from the door's own 8098 and from the inject tunnel's.
+_A2A_DOOR_DEFAULT_LOCAL_PORT = 28098
+# The trajectory entries a card-wait run records for the door: the send, and
+# the task's state once the cancel settled.
+_A2A_DOOR_SEND_ENTRY = "a2a_door.send"
+_A2A_DOOR_STATUS_ENTRY = "a2a_door.status"
+# How long after the cancel the harness waits for the task's terminal.
+_A2A_DOOR_CANCEL_SETTLE = 120.0
+# Seconds subtracted from the send time when asking the board which sessions
+# filed cards since: the board's created_at is the pod's clock, not this
+# machine's. Small next to the gap between stopped asks, which run one at a
+# time and each watch for many minutes, so an earlier case's cards stay out.
+_CARD_WAIT_CLOCK_SKEW = 30.0
+# The slowest the card-wait poll goes, whatever the delegation poll interval.
+_CARD_WAIT_POLL_CEILING = 5.0
+# Seconds the harness waits after first seeing a card before it cancels: the
+# coordinator turn that filed it may still be generating, and the bridge's
+# in-turn hold starts when that turn ends.
+_CARD_WAIT_SETTLE = 15.0
 # The Secret the operator renders the door's bearer token into, named in the
 # message a run without the token fails with. Suffix and key, so the message
 # can spell the whole kubectl read.
@@ -1010,6 +1042,18 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _closed_explicitly(card: board.BoardCard | None) -> bool:
+    """Whether the board holds ``card`` closed by an agent (:data:`_CLOSED_STATUS`,
+    or blocked with one of :data:`_CLOSING_BLOCK_KINDS`)."""
+    if card is None:
+        return False
+    # A breaker trip keeps an earlier block's kind and records the spawn's
+    # failure: a block with a failure error is the platform's, not a close.
+    return card.status == _CLOSED_STATUS or (
+        card.status == _BLOCKED_STATUS and card.block_kind in _CLOSING_BLOCK_KINDS and not card.error
+    )
+
+
 def _guardrail_blocked_cards(
     awaited: Sequence[str],
     on_board: dict[str, board.BoardCard] | None,
@@ -1133,6 +1177,14 @@ def _canonical_session_tokens(
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+# A card ended by an explicit close, which only an agent makes: completed, or
+# blocked with one of ``kanban_block``'s own kinds. The breaker's gave_up, the
+# rate-limit guardrail's ``transient`` block and the admission patch's
+# capacity block are the platform's, not a close, and neither is a card left
+# archived, failed or cancelled.
+_CLOSED_STATUS = "done"
+_BLOCKED_STATUS = "blocked"
+_CLOSING_BLOCK_KINDS = frozenset({"needs_input", "dependency", "capability"})
 _BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
 
 
@@ -2669,6 +2721,54 @@ def expand_agent_cluster_placeholders(prompt: str, context: str | None) -> tuple
     )
 
 
+# Placeholders for a seeded-fleet fixture's cluster, by the role it plays:
+# {{FLEET_CLUSTER_PROJECT:crashloop-workload}} and its LOCATION and NAME
+# siblings. A single-cluster profile has to be told its target, and a case
+# names the fixture's cluster by role, never by name (kube_agents_bench.fleet).
+# Expanded from the context hack/fleet-kubeconfigs.sh writes
+# (:func:`expand_fleet_cluster_placeholders`).
+_FLEET_CLUSTER_PLACEHOLDER = re.compile(
+    r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):(" + fleet.ROLE_PATTERN.pattern + r")\}\}"
+)
+
+
+def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
+    """``prompt`` with each named fixture role's cluster written in, and the
+    setup problem, if any.
+
+    A role the runner didn't resolve (no fleet context, no slot for the role,
+    or a slot it never reached) is a setup failure the caller records as
+    infrastructure, never the model's: the run can't be asked about a cluster
+    nobody provisioned.
+    """
+    roles = {m.group(2) for m in _FLEET_CLUSTER_PLACEHOLDER.finditer(prompt)}
+    if not roles:
+        return prompt, None
+    project = fleet.provisioned_project()
+    if not project:
+        return prompt, (
+            "the case prompt names a fleet fixture's cluster ({{FLEET_CLUSTER_*:<role>}}), but the "
+            "runner recorded no fleet project (hack/fleet-kubeconfigs.sh did not run)"
+        )
+    clusters = fleet.recorded_clusters()
+    resolved: dict[str, tuple[str, str]] = {}
+    for role in sorted(roles):
+        try:
+            slot = fleet.slot_of_role(role)
+        except fleet.FleetRoleUnresolved as exc:
+            return prompt, f"fleet role {role!r}: {exc}"
+        name, location = clusters.get(slot, ("", ""))
+        if not name or not location:
+            return prompt, f"fleet role {role!r}: the runner never reached slot {slot!r}, so its cluster is unknown"
+        resolved[role] = (name, location)
+
+    def value(m: re.Match[str]) -> str:
+        name, location = resolved[m.group(2)]
+        return {"PROJECT": project, "LOCATION": location, "NAME": name}[m.group(1)]
+
+    return _FLEET_CLUSTER_PLACEHOLDER.sub(value, prompt), None
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -2830,6 +2930,98 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     )
 
 
+def _execute_slack(prompt: str) -> AgentResult:
+    """The Slack transport: one ask as the test user, graded on the report the thread delivered.
+
+    The report is built the way the other transports build theirs
+    (:func:`_append_delivered`): the router's first content post, then each
+    later card post as a "Result of delegated task" section, or a "Question
+    from delegated task" section when it carries buttons, folded with
+    :func:`_fold_sections`. Slack shows no task id, so a section names its post
+    by timestamp (``slack-<ts>``). No trajectory is recorded, so a case that
+    checks a worker's tool calls cannot pass here.
+
+    Missing configuration is infrastructure, never graded, so the lane script's
+    skip and a half-configured run cannot read as the agent's failure. The
+    opening turn's seconds are post to answer, as Slack's timestamps show them.
+    """
+    missing = [name for name in slack.REQUIRED_ENV if not os.environ.get(name)]
+    if missing:
+        return _infra_failure(f"slack transport not configured: {', '.join(missing)} unset")
+    token = os.environ[slack.USER_TOKEN_ENV]
+    if not token.startswith(slack.USER_TOKEN_PREFIXES):
+        return _infra_failure(f"{slack.USER_TOKEN_ENV} is not a user token")
+    try:
+        timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)
+    except ValueError as exc:
+        return AgentResult.errored(str(exc))
+    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
+    try:
+        exchange = turn.run(prompt, timeout)
+    except (slack.SlackAPIError, OSError) as exc:
+        return _infra_failure(f"slack: {exc}")
+    timing = exchange.timing()
+    then_text = os.environ.get(slack.THEN_ENV, "").strip()
+    if then_text and exchange.outcome == "settled":
+        timing.update(_slack_then(turn, exchange, then_text, timeout))
+    elif then_text:
+        timing["slack_then_outcome"] = f"skipped: the first turn's outcome was {exchange.outcome}"
+    slack.write_timing(timing)
+    if timing["slack_post_to_answer_s"] is not None:
+        _write_turn_timing(timing["slack_post_to_answer_s"])
+    if exchange.outcome == "no_reply":
+        return _infra_failure(f"slack: no bot reply in the thread within {timeout:g}s")
+    errors = [] if exchange.outcome == "settled" else [f"slack: the turn had not settled by {timeout:g}s"]
+    report = _slack_report(exchange.posts)
+    return AgentResult(
+        output=report,
+        trajectory=[],
+        tokens={},
+        errors=errors,
+        metadata={
+            "transport": TRANSPORT_SLACK,
+            "final_message": report,
+            "outcome": exchange.outcome,
+            "window_posts": len(exchange.posts),
+            "slack_ask_ts": exchange.ask_ts,
+            "slack_reaction": exchange.reaction or None,
+            "slack_buttons": exchange.buttons,
+            "slack_transient_errors": len(exchange.errors),
+            **timing,
+        },
+    )
+
+
+def _slack_then(turn: Any, first: Any, text: str, timeout: float) -> dict[str, Any]:
+    """The lane's second turn (BENCH_SLACK_THEN) in the first ask's thread, as slack_then_* timing.
+
+    Not graded: the case grades the first turn. What it records is whether the
+    thread took the reply (a follow-up answered, a typed choice continued the
+    work), how fast, and the reply's own reaction.
+    """
+    try:
+        then = turn.follow_up(first, text, timeout)
+    except (slack.SlackAPIError, OSError) as exc:
+        return {"slack_then_outcome": f"error: {exc}"}
+    out: dict[str, Any] = {"slack_then_" + k.removeprefix("slack_"): v for k, v in then.timing().items()}
+    out["slack_then_outcome"] = then.outcome
+    out["slack_then_posts"] = len(then.posts)
+    out["slack_then_reaction"] = then.reaction or None
+    return out
+
+
+def _slack_report(posts: list[dict[str, Any]]) -> str:
+    """The thread's delivered report: the ack, then a section per card post."""
+    ack, cards = slack.split_thread(posts)
+    sections = [
+        (_QUESTION_SECTION if slack.has_buttons(p) else _RESULT_SECTION).format(
+            tid=slack.post_id(p), text=p.get("text", "")
+        )
+        for p in cards
+    ]
+    return _fold_sections(str((ack or {}).get("text", "")), sections)
+
+
 class _DelegationTransportExhausted(Exception):
     """The delegation wait lost its transport on every status-turn retry.
 
@@ -2909,6 +3101,8 @@ class KubeAgentsHarness(AgentHarness):
         transcript.clear()
         started_at = time.time()
         prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
+        if setup_problem is None:
+            prompt, setup_problem = expand_fleet_cluster_placeholders(prompt)
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
@@ -2951,6 +3145,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         if replay is not None:
             return self._execute_card_wake(replay, workspace_path)
+        if stop_hook.is_card_wait(prompt):
+            # Through the A2A door whatever the lane's transport: the door's
+            # turns hold for their cards, which is what the case stops.
+            return self._execute_card_wait(prompt)
         transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
         if transport not in _TRANSPORTS:
             return AgentResult.errored(
@@ -2969,7 +3167,248 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if transport == TRANSPORT_SLACK:
+            return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
+
+    def _execute_card_wait(self, prompt: str) -> AgentResult:
+        """A card-wait stopped ask (:data:`stop_hook.CARD_WAIT_DIRECTIVE`, #5407).
+
+        Sends the ask through the gateway's A2A door (:mod:`a2a_door`), whose
+        turns hold for their cards. Then it polls the task and the board. The
+        moment a card filed since the send is on the board and the task is
+        still ``working``, it cancels the task (``tasks/cancel``), which is how
+        an A2A caller stops one. The window and its two entries are then
+        :meth:`_stop_after_first_card`'s.
+
+        The session the turn runs in is found off the board: the door doesn't
+        show the gateway's bus contextId, which names it. Stopped asks run
+        alone in the serial second phase, so the session is the one ``a2a-*``
+        session with a card created since the send (less
+        :data:`_CARD_WAIT_CLOCK_SKEW`). Two sessions is a setup error, so a
+        leftover from an earlier case can't be taken for this one: its cards
+        were created before the send.
+
+        Infrastructure, never a pass: no token, a door that won't answer, a
+        task that ends before any card, no card by the deadline, or more than
+        one candidate session. Any of those means the run never reached the
+        moment the case is about.
+        """
+        try:
+            stop = stop_hook.parse(prompt)
+            local_port = _numeric_env("AGENT_A2A_DOOR_LOCAL_PORT", str(_A2A_DOOR_DEFAULT_LOCAL_PORT), int)
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
+            )
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+        assert stop is not None and stop.card_wait_deadline is not None
+        agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+        service = agent_service + a2a_door.SERVICE_SUFFIX
+        token = os.environ.get("AGENT_A2A_DOOR_TOKEN", "").strip()
+        if not token:
+            return _infra_failure(
+                "AGENT_A2A_DOOR_TOKEN is unset and the A2A door authenticates every request. Read it "
+                f"from the {agent_service}{a2a_door.TOKEN_SECRET_SUFFIX} Secret's "
+                f"`{a2a_door.TOKEN_SECRET_KEY}` key in {os.environ.get('AGENT_NAMESPACE', _DEFAULT_AGENT_NAMESPACE)}"
+            )
+        base_url = os.environ.get("AGENT_A2A_DOOR_URL")
+        own_tunnel = not base_url
+        target = [f"svc/{service}"]
+
+        def _tunnel(reset: bool) -> None:
+            if not own_tunnel:
+                return
+            if reset or target[0] == f"svc/{service}":
+                # Resolved on the first spawn and on a respawn only, not on
+                # every call: three kubectl reads per poll is waste.
+                target[0] = _gateway_door_target(agent_service, service) or f"svc/{service}"
+            forward = _reset_port_forward if reset else _ensure_port_forward
+            forward(local_port, service=target[0], remote_port=a2a_door.REMOTE_PORT)
+
+        door = a2a_door.Door(base_url or f"http://127.0.0.1:{local_port}", token)
+
+        def _with_retries(call: Callable[[], dict[str, Any]], what: str) -> dict[str, Any]:
+            last: Exception | None = None
+            for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+                try:
+                    _tunnel(reset=attempt > 1)
+                    return call()
+                except a2a_door.DoorError:
+                    # The door answered: a refusal, not a transport fault.
+                    raise
+                except a2a_door.DoorUnavailable as exc:
+                    if not exc.retryable:
+                        raise _TransportError(f"A2A door {what}: {exc}") from None
+                    last = exc
+                except RuntimeError as exc:  # a tunnel that won't come up
+                    last = exc
+                _log.warning("A2A door %s failed (%d/%d): %s", what, attempt, _MAX_TRANSPORT_FAILURES, last)
+                time.sleep(max(0.0, poll_interval))
+            raise _TransportError(f"A2A door {what}: {last}")
+
+        run_id, case_id, repetition = _inject_identity()
+        message_id = inject.message_id(run_id, case_id, repetition)
+        # A fixed context, so a retried send (the first reply lost after the
+        # door took it) is the same message on the same context, which the
+        # door dedupes, not a second turn the door refuses.
+        context_id = "bench-" + hashlib.sha256(message_id.encode()).hexdigest()[:24]
+        result = AgentResult(output="", trajectory=[], errors=[], metadata={"transport": "a2a-door"})
+        task_id = ""
+
+        def _abandon(detail: str) -> AgentResult:
+            """Infrastructure, after cancelling a task the send started and
+            archiving and purging any card filed since, so nothing of this
+            run keeps running into the next unit."""
+            if task_id:
+                try:
+                    door.cancel(task_id)
+                except (a2a_door.DoorError, a2a_door.DoorUnavailable) as exc:
+                    _log.warning("A2A door: cancel of abandoned task %s failed: %s", task_id, exc)
+            sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT) or []
+            for sid in sessions:
+                got = board.read_session_cards(_agent_shell, sid, _EXEC_TIMEOUT)
+                if got is not None and got.session_found and got.card_ids:
+                    live = [t for t in got.card_ids if str(got.cards.get(t, {}).get("status")) not in _TERMINAL_STATUSES]
+                    if live:
+                        _archive_stalled_cards(live, _EXEC_TIMEOUT, floor=self._pod_floor)
+                    _purge_card_state(list(got.card_ids), _EXEC_TIMEOUT, floor=self._pod_floor)
+            return _infra_failure(detail)
+
+        # The pod's clock at the run's start, when known: the board's
+        # created_at is the pod's, and every earlier unit's cards predate it.
+        since = float(self._pod_floor) if self._pod_floor is not None else time.time() - _CARD_WAIT_CLOCK_SKEW
+        try:
+            try:
+                task = _with_retries(
+                    lambda: door.send(stop.prompt, message_id=message_id, context_id=context_id), "message/send"
+                )
+            except a2a_door.DoorError as exc:
+                return _infra_failure(f"the A2A door refused message/send: {exc}")
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                return _infra_failure("the A2A door's message/send answered with no task id")
+            result.trajectory.append({
+                "name": _A2A_DOOR_SEND_ENTRY,
+                "args": {"task": task_id, "context": str(task.get("contextId") or "")},
+                "status": "completed",
+            })
+
+            # 1. Wait for the first card while the task works.
+            deadline = time.monotonic() + stop.card_wait_deadline
+            session = ""
+            while True:
+                task = _with_retries(lambda: door.get(task_id), "tasks/get")
+                state = a2a_door.task_state(task)
+                if state in a2a_door.TERMINAL_STATES:
+                    return _abandon(
+                        f"setup: the A2A door task ended {state} before any card was seen on the board, "
+                        "so the stop never landed during the card wait"
+                    )
+                sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT)
+                if sessions is not None and len(sessions) > 1:
+                    return _abandon(
+                        f"setup: {len(sessions)} sessions filed cards since the run started ({', '.join(sessions)}); "
+                        "a card-wait stop needs to run alone to know which is the case's"
+                    )
+                if sessions and state == a2a_door.STATE_WORKING:
+                    session = sessions[0]
+                    break
+                if time.monotonic() >= deadline:
+                    return _abandon(
+                        f"setup: no card was seen on the board within {stop.card_wait_deadline:.0f}s "
+                        f"while the task worked (last state {state or 'unknown'})"
+                    )
+                # Faster than the delegation poll: the hold can be short, and
+                # the stop has to land inside it.
+                time.sleep(min(max(poll_interval, 1.0), _CARD_WAIT_POLL_CEILING))
+
+            # A card is filed, but the coordinator turn that filed it may
+            # still be generating: the bridge's hold starts when that turn
+            # ends. A short settle biases the cancel into the hold. The
+            # bridge archives the session's cards on a cancel in either phase,
+            # so this is a known limit, not a false pass: the case shows the
+            # cancel stops the card, and #5529's unit test pins the cancel
+            # inside the wait itself.
+            time.sleep(_CARD_WAIT_SETTLE)
+            task = _with_retries(lambda: door.get(task_id), "tasks/get")
+            if a2a_door.task_state(task) in a2a_door.TERMINAL_STATES:
+                return _abandon(
+                    f"setup: the A2A door task ended {a2a_door.task_state(task)} within the {_CARD_WAIT_SETTLE:.0f}s "
+                    "settle after its card was filed, before the stop could land"
+                )
+
+            # 2. The stop: the door's cancel on the task, then its terminal.
+            # A transport failure here still goes through the stop's finish
+            # (send_stop raises it there), so the cards are archived and
+            # purged and the run is infrastructure.
+            cancel_error: Exception | None = None
+            refusal: a2a_door.DoorError | None = None
+            try:
+                _with_retries(lambda: door.cancel(task_id), "tasks/cancel")
+                cancel = (True, "tasks/cancel accepted after the turn filed its card")
+            except a2a_door.DoorError as exc:
+                cancel, refusal = (False, f"tasks/cancel refused: {exc}"), exc
+            except _TransportError as exc:
+                cancel, cancel_error = (False, str(exc)), exc
+            final = task
+            if cancel[0]:
+                end = time.monotonic() + _A2A_DOOR_CANCEL_SETTLE
+                while time.monotonic() < end:
+                    final = _with_retries(lambda: door.get(task_id), "tasks/get")
+                    if a2a_door.task_state(final) in a2a_door.TERMINAL_STATES:
+                        break
+                    time.sleep(max(poll_interval, 1.0))
+            elif cancel_error is None:
+                # A refused cancel settles nothing: one read, to tell a task
+                # that finished on its own from one still working.
+                final = _with_retries(lambda: door.get(task_id), "tasks/get")
+                # A cancel retried after a lost response is refused "already
+                # canceled" once the bridge has emitted the terminal (the
+                # gateway checks the terminal first): the first one took, and
+                # the task shows it. Any other refusal stays one.
+                if (
+                    refusal is not None
+                    and a2a_door.refused_as_already_canceled(refusal)
+                    and a2a_door.task_state(final) == a2a_door.STATE_CANCELED
+                ):
+                    cancel = (True, "tasks/cancel accepted: a retry was refused as already canceled, and the task is canceled")
+            final_state = a2a_door.task_state(final)
+            final_seen = final_state in a2a_door.TERMINAL_STATES
+            result.trajectory.append({
+                "name": _A2A_DOOR_STATUS_ENTRY,
+                "args": {"state": final_state, "final": final_seen},
+                "status": "completed",
+            })
+            if final_seen or final_state == a2a_door.STATE_WORKING:
+                # The door reports no token usage, so rung 3 reads the run off
+                # the task's status, in the inject transport's entry shape
+                # (scoring._a2a_run_evidence).
+                result.trajectory.append({
+                    "name": inject.EVENT_ENTRY_STATUS,
+                    "args": {"state": final_state, "final": final_seen},
+                    "result": None,
+                    "status": "completed",
+                })
+            if final_seen and final_state != "canceled":
+                # The turn finished on its own before the cancel took, or
+                # before a refused cancel could matter: the stop never
+                # landed, which is the setup's miss, not the agent's.
+                how = "after the cancel was accepted" if cancel[0] else f"and the cancel was refused ({cancel[1]})"
+                return _abandon(f"setup: the A2A door task ended {final_state}, not canceled, {how}")
+            result.output = a2a_door.task_text(final)
+            result.metadata["final_message"] = result.output
+
+            def _send_stop() -> tuple[bool, str]:
+                if cancel_error is not None:
+                    raise cancel_error
+                return cancel
+
+            card_wait = stop_hook.Stop(prompt=stop.prompt, observe_seconds=stop.observe_seconds)
+            self._stop_after_first_card(result, session, card_wait, send_stop=_send_stop, poll_interval=poll_interval)
+        except _TransportError as exc:
+            return _abandon(str(exc))
+        return result
 
     def _execute_api(
         self,
@@ -4489,7 +4928,12 @@ class KubeAgentsHarness(AgentHarness):
             # _settle's own gap entry stays, with its reasons; only what it
             # added besides is withheld.
             added = result.trajectory[before:]
-            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            kept = [
+                e
+                for e in added
+                if isinstance(e, dict)
+                and e.get("name") in (worker_trajectory.GAP_ENTRY, worker_trajectory.NO_WORKER_CALLS_ENTRY)
+            ]
             withheld = [e for e in added if e not in kept]
             result.trajectory[before:] = kept
             if withheld:
@@ -4894,6 +5338,19 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         logs_clean = logs is None or all(l is not None for l in logs.values())
+        # Every awaited card closed, a clean read, and not one worker entry or
+        # logged command: the workers made no call, which the workers-scope
+        # checks grade rather than set aside (worker_trajectory.NO_WORKER_CALLS_ENTRY).
+        if (
+            awaited
+            and trajectory_clean
+            and logs_clean
+            and on_board is not None
+            and not result.metadata.get("worker_commands")
+            and not any(isinstance(e, dict) and e.get("agent") for e in captured.entries)
+            and all(_closed_explicitly(on_board.get(t)) for t in awaited)
+        ):
+            result.trajectory.append(worker_trajectory.no_worker_calls_entry(awaited))
         worker_acted = (
             any(
                 isinstance(e, dict)

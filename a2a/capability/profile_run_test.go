@@ -42,7 +42,7 @@ func TestPermitsProfile(t *testing.T) {
 		{"a tier whose set lacks profile.run", Entry{Tier: TierPlatform, Scope: profileGrantScope, Delegate: podA, Profile: "tse"}, "tse", TierPlatform, targetInScope, "does not permit the verb"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := PermitsProfile(tc.e, tc.profile, tc.tier, tc.target)
+			err := PermitsProfile(tc.e, tc.profile, tc.tier, tc.target, nil)
 			if tc.refuse == "" {
 				if err != nil {
 					t.Fatalf("refused: %v", err)
@@ -123,15 +123,15 @@ func TestTheVerifierAnswersProfileRun(t *testing.T) {
 	c := clientAs(t, nc, podA)
 	ctx := context.Background()
 
-	if err := c.CheckProfileRun(ctx, root, "tse", TierRead, targetInScope); err != nil {
+	if err := c.CheckProfileRun(ctx, root, "tse", TierRead, targetInScope, nil); err != nil {
 		t.Fatalf("the grant's own profile at its tier for an in-scope target should be permitted: %v", err)
 	}
-	mustRefuse(t, c.CheckProfileRun(ctx, root, "cluster-agent", TierRead, targetInScope), "minted for another profile")
-	mustRefuse(t, c.CheckProfileRun(ctx, root, "tse", TierUnattended, targetInScope), "not the grant's tier")
-	mustRefuse(t, c.CheckProfileRun(ctx, root, "tse", TierRead, targetOutOfScope), "outside the capability's scope")
-	mustRefuse(t, c.CheckProfileRun(ctx, root, "tse", TierRead, installScope), "outside the capability's scope")
+	mustRefuse(t, c.CheckProfileRun(ctx, root, "cluster-agent", TierRead, targetInScope, nil), "minted for another profile")
+	mustRefuse(t, c.CheckProfileRun(ctx, root, "tse", TierUnattended, targetInScope, nil), "not the grant's tier")
+	mustRefuse(t, c.CheckProfileRun(ctx, root, "tse", TierRead, targetOutOfScope, nil), "outside the capability's scope")
+	mustRefuse(t, c.CheckProfileRun(ctx, root, "tse", TierRead, installScope, nil), "outside the capability's scope")
 	// Another principal asking about the same grant gets the walk's single answer.
-	mustRefuse(t, clientAs(t, nc, podEvil).CheckProfileRun(ctx, root, "tse", TierRead, targetInScope), WalkRefused)
+	mustRefuse(t, clientAs(t, nc, podEvil).CheckProfileRun(ctx, root, "tse", TierRead, targetInScope, nil), WalkRefused)
 }
 
 // A profile and tier on any other verb are refused rather than ignored, so a
@@ -182,7 +182,7 @@ func TestAHopCannotRelabelReadAsUnattended(t *testing.T) {
 	root := s.write(t, rootKey(t, gwTask), profileGrant(TierRead, "tse"))
 	hop := s.write(t, hopKey(t, podA, 0), Entry{Tier: TierUnattended, Scope: profileGrantScope, Delegate: podB, Profile: "tse", Parent: &root})
 	nc := serveVerifier(t, s)
-	mustRefuse(t, clientAs(t, nc, podB).CheckProfileRun(context.Background(), hop, "tse", TierUnattended, targetInScope), WalkRefused)
+	mustRefuse(t, clientAs(t, nc, podB).CheckProfileRun(context.Background(), hop, "tse", TierUnattended, targetInScope, nil), WalkRefused)
 }
 
 // A hop under a profile-less read root cannot pick a profile, and the root
@@ -192,5 +192,5 @@ func TestAHopCannotChooseAProfile(t *testing.T) {
 	root := s.write(t, rootKey(t, gwTask), Entry{Tier: TierRead, Scope: profileGrantScope, Delegate: podA})
 	hop := s.write(t, hopKey(t, podA, 0), Entry{Tier: TierRead, Scope: profileGrantScope, Delegate: podB, Profile: "anything", Parent: &root})
 	nc := serveVerifier(t, s)
-	mustRefuse(t, clientAs(t, nc, podB).CheckProfileRun(context.Background(), hop, "anything", TierRead, targetInScope), WalkRefused)
+	mustRefuse(t, clientAs(t, nc, podB).CheckProfileRun(context.Background(), hop, "anything", TierRead, targetInScope, nil), WalkRefused)
 }

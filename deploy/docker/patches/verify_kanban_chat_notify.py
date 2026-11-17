@@ -11,9 +11,10 @@ for the CLI from the first routed resolve on.
 1. Resolution: with ``A2A_NOTIFY_PLATFORM`` set and no Google Chat adapter
    connected, a collector counts ``google_chat`` as served and
    ``_adapter_for_subscription`` returns the stand-in, reused across
-   deliveries and never registered in ``runner.adapters``; with it unset,
-   neither happens. A threadless subscription and ``multiplex_profiles`` get
-   none, and the collector's claim is wrapped by the stale filter.
+   deliveries and never registered in ``runner.adapters``; with it and
+   ``A2A_NOTIFY_CONVERSATIONS`` both unset, neither happens. A threadless
+   subscription and ``multiplex_profiles`` get none, and the collector's
+   claim is wrapped by the stale filter.
 2. Send: ``a2a notify`` with the thread and a ``--`` before the text; exit 0
    is sent, exit 1 failed, exit 3 (outcome unknown) not a failure, and exit 4
    a failure that holds the route down.
@@ -177,6 +178,17 @@ def main() -> None:
     os.environ.pop(NOTIFY_CONVERSATIONS_ENV)
     check(notifier._adapter_for_subscription(runner, GCHAT, conv_sub, None) is None,
           "conversation: without A2A_NOTIFY_CONVERSATIONS a conversation's card gets no stand-in")
+    # A list: every platform it names is served, each with its own home stand-in.
+    os.environ[NOTIFY_PLATFORM_ENV] = "slack,google_chat"
+    collector = notifier._Collector(runner, kb=None, notifier_profile=None, gc_due=False, gc_retention_days=30)
+    check({"slack", "google_chat"} <= collector.active_platforms, "a list: both routed platforms are served")
+    slack_sub = dict(sub, platform="slack", chat_id="C0HOME", thread_id="1700000000.000100")
+    slack_adapter = notifier._adapter_for_subscription(runner, Platform("slack"), slack_sub, None)
+    check(isinstance(slack_adapter, ChatNotifyAdapter) and slack_adapter is not adapter,
+          "a list: slack gets its own home stand-in")
+    check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is adapter,
+          "a list: google_chat keeps its home stand-in across a slack resolve")
+    os.environ[NOTIFY_PLATFORM_ENV] = "google_chat"
     check(notifier._Collector._claim_for_sub.__name__ == "_kage_claim_for_sub",
           "the collector's claim is wrapped to drop stale events")
 

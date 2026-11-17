@@ -289,3 +289,139 @@ func TestMultiAdapterRoutesATerminalToItsBackend(t *testing.T) {
 		t.Error("a terminal for an unknown backend was accepted")
 	}
 }
+
+func TestMultiAdapterStampsTheBackendOnInbound(t *testing.T) {
+	s, g, c := newFakeAdapter(), newFakeAdapter(), newFakeAdapter()
+	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": s, "gchat": g, "console": c}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan InboundMessage, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Run(ctx, func(msg InboundMessage) { got <- msg })
+	s.inbox <- InboundMessage{Conversation: "slack:C1/1.1", AuthorID: "U1"}
+	g.inbox <- InboundMessage{Conversation: "gchat:spaces/A", AuthorID: "a@x"}
+	c.inbox <- InboundMessage{Conversation: "console:tab", AuthorID: "me", Backend: consoleBackend}
+	want := map[string]string{"slack:C1/1.1": "slack", "gchat:spaces/A": "gchat", "console:tab": "console"}
+	for range want {
+		select {
+		case msg := <-got:
+			if msg.Backend != want[msg.Conversation] {
+				t.Errorf("%s stamped %q, want %q", msg.Conversation, msg.Backend, want[msg.Conversation])
+			}
+		case <-time.After(time.Second):
+			t.Fatal("inbound not delivered")
+		}
+	}
+}
+
+// namedDMAdapter answers OpenDirect with its own name and the id it was
+// handed, so a test sees which backend a direct message reached and with
+// which id.
+type namedDMAdapter struct {
+	*fakeAdapter
+	name string
+}
+
+func (a namedDMAdapter) OpenDirect(userID string) (string, error) {
+	return a.name + ":dm:" + userID, nil
+}
+
+func TestMultiAdapterOpenDirectResolvesPerBackend(t *testing.T) {
+	s := namedDMAdapter{newFakeAdapter(), "slack"}
+	g, c := newFakeAdapter(), newFakeAdapter()
+	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": s, "gchat": g, "console": c}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.OpenDirect("slack:U1"); err != nil || got != "slack:dm:U1" {
+		t.Errorf("prefixed id: got %q, %v; want slack:dm:U1", got, err)
+	}
+	// A Slack guest id from another workspace carries the separator itself;
+	// the prefix in front of it still picks the backend.
+	if got, err := m.OpenDirect("slack:T1:U1"); err != nil || got != "slack:dm:T1:U1" {
+		t.Errorf("prefixed guest id: got %q, %v; want slack:dm:T1:U1", got, err)
+	}
+	if _, err := m.OpenDirect("U1"); err == nil {
+		t.Error("a bare id with two real backends was accepted")
+	}
+	if _, err := m.OpenDirect("T1:U1"); err == nil || !strings.Contains(err.Error(), "T1") {
+		t.Errorf("bare guest id with two real backends: err = %v, want one naming T1", err)
+	}
+	if _, err := m.OpenDirect("nosuch:U1"); err == nil || !strings.Contains(err.Error(), "nosuch") {
+		t.Errorf("unknown prefix: err = %v, want one naming nosuch", err)
+	}
+	d := namedDMAdapter{newFakeAdapter(), "discord"}
+	one := newTestMux(t, map[string]Adapter{"discord": d, "console": c})
+	if got, err := one.OpenDirect("1001"); err != nil || got != "discord:dm:1001" {
+		t.Errorf("bare id with one real backend: got %q, %v; want discord:dm:1001", got, err)
+	}
+	// One real backend takes any id it understands, a colon in it or not.
+	if got, err := one.OpenDirect("T1:U1"); err != nil || got != "discord:dm:T1:U1" {
+		t.Errorf("bare guest id with one real backend: got %q, %v; want discord:dm:T1:U1", got, err)
+	}
+	// A known backend the mux does not run is refused by name, not handed to
+	// the primary.
+	if _, err := one.OpenDirect("slack:U1"); err == nil || !strings.Contains(err.Error(), "slack") {
+		t.Errorf("unarmed backend with one real backend: err = %v, want one naming slack", err)
+	}
+}
+
+func TestMultiAdapterRestartsOneBackendWhileTheOtherServes(t *testing.T) {
+	// Slack fails at every start; gchat and the console keep serving.
+	bad := &flakyAdapter{err: errors.New("auth.test: invalid_auth")}
+	g, c := newFakeAdapter(), newFakeAdapter()
+	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": bad, "gchat": g, "console": c}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.restartBase, m.restartMax = time.Millisecond, 4*time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan InboundMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(msg InboundMessage) { got <- msg }) }()
+	deadline := time.Now().Add(time.Second)
+	for bad.runs.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if bad.runs.Load() < 3 {
+		t.Fatalf("slack restarted %d times, want at least 3", bad.runs.Load())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned while slack restarts: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	g.inbox <- InboundMessage{Conversation: "gchat:spaces/A", AuthorID: "a@x"}
+	select {
+	case msg := <-got:
+		if msg.Backend != "gchat" {
+			t.Errorf("gchat inbound stamped %q, want gchat", msg.Backend)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gchat stopped serving while slack restarts: inbound not delivered")
+	}
+	if _, err := m.Post("gchat:spaces/A", "still here"); err != nil {
+		t.Errorf("gchat stopped dispatching while slack restarts: %v", err)
+	}
+}
+
+// knownBackendName reads backendArms, so a backend added there is refused by
+// name without a second edit.
+func TestKnownBackendNameFollowsTheArmTable(t *testing.T) {
+	for _, arm := range backendArms {
+		if !knownBackendName(arm.name) {
+			t.Errorf("knownBackendName(%q) = false for a backendArms row", arm.name)
+		}
+	}
+	if !knownBackendName(consoleBackend) {
+		t.Errorf("knownBackendName(%q) = false", consoleBackend)
+	}
+	for _, name := range []string{"nosuch", "T1"} {
+		if knownBackendName(name) {
+			t.Errorf("knownBackendName(%q) = true", name)
+		}
+	}
+}

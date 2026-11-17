@@ -2,6 +2,9 @@ package capability
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -135,6 +138,73 @@ type Request struct {
 	// ignored by another.
 	Profile string `json:"profile,omitempty"`
 	Tier    Tier   `json:"tier,omitempty"`
+
+	// Trigger is profile.run's too: the trigger the submission claims,
+	// which must equal the grant's (nil only against a grant with none).
+	// Refused on any other verb, like Profile and Tier.
+	Trigger *Trigger `json:"trigger,omitempty"`
+	// RequestID binds a capability decision to the request that asked for
+	// it (#5647): the client draws a fresh one per check (requestIDBytes of
+	// crypto/rand, hex), the verifier echoes it in its Response, and the
+	// client acts only on the answer to its own question. Defence in depth for
+	// the dispatcher's admission, which mints a task's credentials on the
+	// verifier's answer; each check already has its own reply inbox. Omitted
+	// by a client from before it existed, which a verifier still answers; one
+	// that is present but not well-formed makes the request not well-formed.
+	RequestID string `json:"requestId,omitempty"`
+}
+
+// requestIDBytes is the entropy in one request id: 128 bits.
+const requestIDBytes = 16
+
+// acceptUnechoedReply is whether a client acts on a reply that carries no
+// request id, which is what a verifier from before #5647 sends. True for one
+// release, so a new client keeps working against an old verifier during a roll
+// and after a one-step rollback; a reply carrying a different id is never
+// acted on. The follow-up turns this false once a GA release with the echo is
+// published and isn't the newest (the N→N-1 window,
+// docs/site/src/content/docs/deploy/rollback.md), and an un-echoed reply then
+// fails the check closed at its timeout.
+const acceptUnechoedReply = true
+
+// newRequestID draws a fresh request id.
+func newRequestID() (string, error) {
+	var b [requestIDBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// validRequestID reports whether id is exactly what newRequestID produces:
+// requestIDBytes of lowercase hex.
+func validRequestID(id string) bool {
+	if len(id) != 2*requestIDBytes {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isAnswerTo reports whether resp is the answer to the request that carried
+// id: it echoes id, or it carries no id at all and acceptUnechoed holds (an
+// older verifier's reply). A reply carrying a different id never is.
+func isAnswerTo(resp Response, id string, acceptUnechoed bool) bool {
+	if resp.RequestID == "" {
+		return acceptUnechoed
+	}
+	return sameRequestID(resp.RequestID, id)
+}
+
+// sameRequestID compares the id a reply echoes against the one that was sent.
+// An empty echo never matches.
+func sameRequestID(got, want string) bool {
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // Response is a verdict and the rule behind it. It deliberately does NOT carry
@@ -144,6 +214,10 @@ type Request struct {
 type Response struct {
 	Allowed bool   `json:"allowed"`
 	Reason  string `json:"reason,omitempty"`
+	// RequestID echoes the request's id (#5647), so the caller can tell this
+	// answer is the answer to its own question. Empty when the request carried
+	// none, as a client from before #5647 sends.
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // Service answers verification requests. It holds the only Store in the
@@ -161,9 +235,17 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 		return Response{Reason: Reason(err)}
 	}
 	var req Request
-	if err := json.Unmarshal(data, &req); err != nil {
+	if err := json.Unmarshal(data, &req); err != nil || (req.RequestID != "" && !validRequestID(req.RequestID)) {
 		return Response{Reason: "the request is not well-formed"}
 	}
+	resp := s.decide(ctx, caller, req)
+	resp.RequestID = req.RequestID
+	return resp
+}
+
+// decide is Answer's verdict on a request that parsed. Answer stamps the
+// request id on whatever it returns, so no branch here can forget it.
+func (s *Service) decide(ctx context.Context, caller string, req Request) Response {
 	// The walk and the verb check are answered differently on purpose, and
 	// the split is the whole anti-oracle argument.
 	//
@@ -200,13 +282,13 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 		return Response{Reason: WalkRefused}
 	}
 	if req.Verb == VerbProfileRun {
-		if err := PermitsProfile(leaf, req.Profile, req.Tier, req.Resource); err != nil {
+		if err := PermitsProfile(leaf, req.Profile, req.Tier, req.Resource, req.Trigger); err != nil {
 			return Response{Reason: Reason(err)}
 		}
 		return Response{Allowed: true}
 	}
-	if req.Profile != "" || req.Tier != "" {
-		return Response{Reason: "profile and tier are only read for profile.run"}
+	if req.Profile != "" || req.Tier != "" || req.Trigger != nil {
+		return Response{Reason: "profile, tier and trigger are only read for profile.run"}
 	}
 	if err := Permits(leaf, req.Verb, req.Resource); err != nil {
 		return Response{Reason: Reason(err)}
@@ -416,13 +498,22 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 }
 
 // CheckProfileRun asks profile.run: may the grant at ref run profile at tier
-// for target. target is the task's target scope, or the install's namespace
-// scope for a task with none; it is never empty.
-func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, tier Tier, target Scope) error {
-	return c.check(ctx, Request{Ref: ref, Verb: VerbProfileRun, Resource: target, Profile: profile, Tier: tier})
+// for target, started by trigger. target is the task's target scope, or the
+// install's namespace scope for a task with none; it is never empty. trigger
+// is the one the submission claims (TriggerFromAuthority), nil when it claims
+// none; the verifier permits only when it equals the grant's.
+func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, tier Tier, target Scope, trigger *Trigger) error {
+	return c.check(ctx, Request{Ref: ref, Verb: VerbProfileRun, Resource: target, Profile: profile, Tier: tier, Trigger: trigger})
 }
 
 func (c *Client) check(ctx context.Context, req Request) error {
+	// One id per check. Every ask of the check is the same question, so the
+	// answer to any of them, late or not, is the answer to this one.
+	id, err := newRequestID()
+	if err != nil {
+		return err
+	}
+	req.RequestID = id
 	b, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -475,7 +566,7 @@ func (c *Client) check(ctx context.Context, req Request) error {
 		}
 		err := errUnreachable
 		if sub != nil {
-			err = c.ask(reach, timeout, reply, sub, b)
+			err = c.ask(reach, timeout, reply, sub, b, id)
 		}
 		if !errors.Is(err, errUnreachable) {
 			if attempt > 1 && c.Log != nil {
@@ -503,27 +594,42 @@ func (c *Client) check(ctx context.Context, req Request) error {
 // ask is one request and its answer, on the check's reply subscription.
 // errUnreachable means nothing answered; any other error is the verifier's
 // verdict or an answer that did not parse.
-func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte) error {
+// Only a reply that echoes id is this check's answer (#5647). A reply that
+// parses but carries a different id is not an answer at all: it is dropped,
+// and the wait goes on, so a correct answer later in the window is still acted
+// on, and with none the ask ends as every unanswered ask does, in
+// errUnreachable and, once the window is spent, a refusal. A reply with no id
+// is an older verifier's, acted on while acceptUnechoedReply holds.
+func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte, id string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := c.nc.PublishRequest(c.subject, reply, body); err != nil {
 		return errUnreachable
 	}
-	// No responders arrives here as nats.ErrNoResponders, within a
-	// millisecond: the server answers a request on a subject nobody is
-	// subscribed to with a 503 status. That is the shape of the gap after
-	// a bus restart, and the reason it was refused at once before the
-	// retry.
-	msg, err := sub.NextMsgWithContext(ctx)
-	if err != nil {
-		return errUnreachable
+	for {
+		// No responders arrives here as nats.ErrNoResponders, within a
+		// millisecond: the server answers a request on a subject nobody is
+		// subscribed to with a 503 status. That is the shape of the gap after
+		// a bus restart, and the reason it was refused at once before the
+		// retry.
+		msg, err := sub.NextMsgWithContext(ctx)
+		if err != nil {
+			return errUnreachable
+		}
+		var resp Response
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			return refuse(malformedAnswerRule)
+		}
+		if !isAnswerTo(resp, id, acceptUnechoedReply) {
+			if c.Log != nil {
+				c.Log.Warn("capability check dropped a reply that is not the answer to its request",
+					"caller", c.self, "carriedID", resp.RequestID != "")
+			}
+			continue
+		}
+		if !resp.Allowed {
+			return &Refusal{Rule: resp.Reason}
+		}
+		return nil
 	}
-	var resp Response
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return refuse(malformedAnswerRule)
-	}
-	if !resp.Allowed {
-		return &Refusal{Rule: resp.Reason}
-	}
-	return nil
 }

@@ -215,6 +215,11 @@ SNAPSHOT_HISTORY = "none"
 MAX_SNAPSHOT_PATHS = 256
 # How often the snapshot clone's size is measured while it runs.
 CLONE_WATCH_SECONDS = 0.5
+#: `revision-contains`'s ancestor: a full or abbreviated SHA-1 commit id (the scratch repository is SHA-1).
+ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,40}$")
+#: git's words, across server versions, for a fetch of a revision the remote does not have.
+MISSING_REVISION_MARKERS = ("not our ref", "couldn't find remote ref", "unadvertised object", "no such remote ref",
+                            "did not send all necessary objects")
 # A path entry, and all of them joined: well under the kernel's limits on one
 # argument (128 KiB) and on a command line, so git always starts.
 MAX_SNAPSHOT_PATH_BYTES = 4096
@@ -1152,7 +1157,14 @@ class VcsBroker:
         `baseBranch` is the repository's pinned base, or None when this install
         pins none for it. It is the read a caller with no clone uses to learn
         which branch its proposals must target.
+
+        `writeMode` is the install's write mode (:func:`write_mode`), so a caller
+        learns that branch and proposal writes are refused before it clones.
+        `writeModeDetail` says why when that `none` comes from a value that is
+        neither mode, as the broker's refusal does.
         """
+        mode, raw = write_mode()
+        detail = write_mode_detail(raw)
         try:
             forge, repo = self.registry.resolve(payload.get("repository"))
         except ForgeUnsupported as exc:
@@ -1163,9 +1175,14 @@ class VcsBroker:
                 "verbs": [],
                 "missing": [str(exc)],
                 "baseBranch": None,
+                "writeMode": mode,
+                **({"writeModeDetail": detail} if detail else {}),
             }
         answer = forge.capabilities(repo)
         answer["baseBranch"] = self._pinned_base(forge, repo)
+        answer["writeMode"] = mode
+        if detail:
+            answer["writeModeDetail"] = detail
         return answer
 
     def clone(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1842,6 +1859,76 @@ class VcsBroker:
         return bound.stamp(
             {"branch": {"name": branch, "exists": bool(revision), "revision": revision or None}}
         )
+
+    def revision_contains(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Whether `revision` contains `ancestor` on the remote: `{"contains": bool}`.
+
+        The post-merge check's question when a GitOps tool applied a commit
+        other than the merge commit: reconcilers track a branch, so a later
+        merge carries this one. git against the remote, like `branch-view`:
+        `revision`'s commits are fetched into a scratch repository, never
+        checked out, and the fetch is stopped at the clone's size ceiling
+        (`CLONE_TOO_LARGE`). `revision` is a full id, since it is what is
+        fetched; `ancestor` may be abbreviated (a forge can report a
+        merge commit by a short id) and is resolved after the fetch. A
+        revision the remote does not have is `REVISION_NOT_FOUND`; an
+        untrusted certificate or a refused credential is answered by its
+        cause, and any other failed fetch is the retryable `FORGE_CALL_FAILED`.
+        A revision that starts with `ancestor` contains it without a fetch.
+        """
+        bound = self._bind(payload)
+        ancestor = payload.get("ancestor")
+        ancestor = ancestor.strip().lower() if isinstance(ancestor, str) else ""
+        if not ANCESTOR_RE.match(ancestor):
+            raise WorkspaceError("ancestor must be a hex revision id of 7 to 40 characters")
+        revision = validate_revision(payload.get("revision"), "revision")
+        if revision.lower().startswith(ancestor):
+            return bound.stamp({"contains": True})
+        bound.ensure()
+        git = bound.git
+        root = self._scratch("contains")
+        try:
+            git(root, "init", "--quiet", "--bare")
+            last, stopped = [0.0], [False]
+
+            def over_ceiling() -> bool:
+                now = time.monotonic()
+                if now - last[0] < CLONE_WATCH_SECONDS:
+                    return False
+                last[0] = now
+                stopped[0] = _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes
+                return stopped[0]
+
+            fetched = git(
+                root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
+                check=False, stop=over_ceiling,
+            )
+            remedy = "The history of this one revision is over it; nothing in the request makes the fetch smaller."
+            if stopped[0]:
+                raise self._clone_too_large(bound.repo, remedy)
+            if fetched.returncode != 0:
+                stderr = fetched.stderr or ""
+                refusal = self._tls_refusal(stderr) or _git_refusal(bound.forge, bound.repo, stderr, "fetch")
+                if refusal is not None:
+                    raise refusal
+                if any(marker in stderr for marker in MISSING_REVISION_MARKERS):
+                    raise WorkspaceError(
+                        f"{bound.repo} has no revision {revision}",
+                        status=404,
+                        code="REVISION_NOT_FOUND",
+                    )
+                raise WorkspaceError(
+                    f"could not fetch {revision} from {bound.repo}: git exited {fetched.returncode}",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            self._enforce_ceiling(root, bound.repo, remedy=remedy)
+            present = git(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
+            full = (present.stdout or "").strip()
+            contains = present.returncode == 0 and bool(full) and self._is_ancestor(git, root, full, revision)
+        finally:
+            self._discard_scratch(root)
+        return bound.stamp({"contains": contains})
 
     def branch_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Delete a spent branch: one whose proposal is done with and whose tip it carried.
@@ -2678,6 +2765,142 @@ WRITE_VERBS = frozenset(
 )
 
 
+# The install's write mode: `writeMode` from the tier CR of #3659, as one
+# install-level setting the broker alone enforces until tiers take it over
+# (same field name and values, so that needs no migration). `propose`, the
+# default, is today's behaviour. `none` is explain-only: the broker refuses
+# PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
+# and labels stay open to it, because an issue is how an audit reports.
+# Read on every request through write_mode(), which takes the most restrictive
+# of the broker's env (applies once the operator has rolled the broker) and the
+# Slack autonomy dial (applies at once; see dial_level below).
+WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
+WRITE_MODE_PROPOSE = "propose"
+WRITE_MODE_NONE = "none"
+WRITE_MODES = (WRITE_MODE_NONE, WRITE_MODE_PROPOSE)
+PROPOSE_VERBS = frozenset(
+    {
+        "publish",
+        "branch-delete",
+        "proposal-create",
+        "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-acknowledge",
+    }
+)
+
+
+def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """The install's write mode and the raw value it was read from.
+
+    The most restrictive of two sources: the broker's env, and the Slack
+    autonomy dial (`dial_level`), whose Explain is `none`. Unset or empty env
+    is `propose`. A value that is neither mode is `none`: a setting someone
+    wrote to restrict the agent must not lift the restriction because it was
+    misspelt. When the dial is what restricts, the raw value is
+    :data:`WRITE_MODE_DIAL_RAW`, so `write_mode_detail` names the dial rather
+    than the env.
+    """
+    raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
+    value = raw.strip().lower()
+    if not value:
+        mode = WRITE_MODE_PROPOSE
+    else:
+        mode = value if value in WRITE_MODES else WRITE_MODE_NONE
+    if mode == WRITE_MODE_PROPOSE and dial_level(environ) == DIAL_EXPLAIN:
+        return WRITE_MODE_NONE, WRITE_MODE_DIAL_RAW
+    return mode, raw
+
+
+# The Slack autonomy dial's level, the runtime source write_mode() reads beside
+# the env, set through set_dial_level(), so a new level applies with no pod
+# restart. Nothing in the broker calls set_dial_level() yet; the Slack adapter's
+# report is its intended caller. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# gets spec.deployment.env); off, the dial is not a source at all. On, a broker
+# with no level set since it started reads the level it last stored on its
+# state emptyDir (kept across a container restart, not a new Pod), and with none
+# stored, Explain: it fails closed. The dial only ever restricts.
+DIAL_ENV = "KUBEAGENTS_DIAL"
+# On the broker's state emptyDir: it outlives a container restart, not the Pod.
+DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
+# write_mode()'s raw value when the dial, not the env, is what restricts. It
+# starts with a NUL, which no environment value can hold, so an env set to the
+# same visible text is still read (and explained) as a misspelt env.
+WRITE_MODE_DIAL_RAW = "\x00dial:explain"
+DIAL_EXPLAIN = "explain"
+DIAL_PROPOSE = "propose"
+DIAL_AUTOMERGE = "automerge"
+DIAL_LEVELS = (DIAL_EXPLAIN, DIAL_PROPOSE, DIAL_AUTOMERGE)
+_dial_lock = threading.Lock()
+_dial_level: str | None = None
+_dial_reported = False
+
+
+def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if environ is None else environ).get(DIAL_ENV, "").strip().lower() == "on"
+
+
+def _dial_state_path() -> Path:
+    return Path(DIAL_STATE_FILE)
+
+
+def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
+    """The dial's level, or None while `KUBEAGENTS_DIAL` is not `on`."""
+    if not dial_enabled(environ):
+        return None
+    with _dial_lock:
+        if _dial_level is not None:
+            return _dial_level
+    try:
+        stored = _dial_state_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        stored = ""
+    return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
+
+
+def set_dial_level(level: str) -> None:
+    """Record the level the gateway reported; ValueError for anything but a level."""
+    global _dial_level, _dial_reported
+    if level not in DIAL_LEVELS:
+        raise ValueError(f"level must be one of {', '.join(DIAL_LEVELS)}")
+    path = _dial_state_path()
+    with _dial_lock:
+        _dial_level = level
+        _dial_reported = True
+        # Kept on the broker's own volume, so a restarted broker process keeps
+        # it; best effort, because the gateway reports it again within a minute.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(level + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOGGER.warning("could not store the dial level at %s: %s", path, exc)
+
+
+def dial_reported() -> bool:
+    """Whether the gateway has reported the dial's level to this broker process."""
+    with _dial_lock:
+        return _dial_reported
+
+
+def write_mode_detail(raw: str) -> str:
+    """Why `raw` reads as `none` when it is neither mode or the dial restricts, or "" when it is one (or unset)."""
+    if raw == WRITE_MODE_DIAL_RAW:
+        return (
+            f"{DIAL_ENV} is on and the autonomy dial is at Explain, which the broker treats as none; "
+            "with no level set since this broker Pod started it reads Explain"
+        )
+    value = raw.strip().lower()
+    if not value or value in WRITE_MODES:
+        return ""
+    return (
+        f"{WRITE_MODE_ENV} is set to a value that is neither "
+        f"{' nor '.join(WRITE_MODES)}, so the broker treats it as none"
+    )
+
+
 # The verbs the HTTP layer answers for a repository this install does not
 # manage. `capabilities` reports what a forge serves and spends no credential.
 # Every other verb, read or write, is refused at the route first: reads used to
@@ -2727,6 +2950,7 @@ VCS_VERBS = frozenset(
         "identity",
         "branch-view",
         "branch-delete",
+        "revision-contains",
     }
 )
 
@@ -2762,6 +2986,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "identity": broker.identity,
         "branch-view": broker.branch_view,
         "branch-delete": broker.branch_delete,
+        "revision-contains": broker.revision_contains,
     }
 
 
@@ -2777,7 +3002,24 @@ __all__ = [
     "ROLE_SELECTED_VERBS",
     "ROLE_UNREGISTERED",
     "UNGATED_VERBS",
+    "PROPOSE_VERBS",
+    "WRITE_MODE_ENV",
+    "WRITE_MODE_NONE",
+    "WRITE_MODE_PROPOSE",
+    "WRITE_MODES",
     "WRITE_VERBS",
+    "DIAL_AUTOMERGE",
+    "DIAL_ENV",
+    "DIAL_EXPLAIN",
+    "DIAL_LEVELS",
+    "DIAL_PROPOSE",
+    "WRITE_MODE_DIAL_RAW",
+    "dial_enabled",
+    "dial_level",
+    "dial_reported",
+    "set_dial_level",
+    "write_mode",
+    "write_mode_detail",
     "max_bundle_bytes",
     "route_table",
 ]

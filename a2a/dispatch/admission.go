@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,12 +15,13 @@ import (
 )
 
 // Verifier is the one verifier call the dispatcher makes: may the grant at
-// ref run profile at tier for target. It is capability.Client's
+// ref run profile at tier for target, started by trigger (nil for
+// none). It is capability.Client's
 // CheckProfileRun (#3734); a nil error means permitted, an error wrapping
 // ErrVerifierUnreachable means no verifier answered, and anything else is a
 // refusal.
 type Verifier interface {
-	CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error
+	CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope, trigger *capability.Trigger) error
 }
 
 // The task parameters that make a cluster target, and the target shapes the
@@ -42,17 +44,6 @@ var errStopping = errors.New("dispatcher stopping")
 // replaced): not a verdict, so the submission stays queued and is asked
 // about again, until a verdict or its queue timeout ends it.
 var ErrVerifierUnreachable = errors.New("the verifier could not be reached")
-
-// admitted is what an admitted submission's credentials are minted from:
-// the cluster the verifier permitted the task on (nil when the task names
-// none and was checked against the namespace), the target a task credential
-// for the credential proxy confines it to (#3889); and whether the
-// submission asked for a change (lib.TaskParameters.ChangeRequested), which
-// puts the vcs:proposal-create permit on that credential (#3993).
-type admitted struct {
-	cluster         *taskcred.Target
-	changeRequested bool
-}
 
 // refusal is an admission verdict against a submission.
 type refusal struct {
@@ -78,7 +69,7 @@ var errHeldBack = errors.New("held back at admission")
 // listed its pods yet says nothing, so a dispatcher just started refuses
 // nothing on it.
 func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
-	if !d.cfg.unattended(tier) || d.jobRunner(prof, tier) {
+	if !d.cfg.unattendedFor(prof, tier) || d.jobRunner(prof, tier) {
 		return false
 	}
 	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
@@ -93,7 +84,7 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 // at an unattended tier. Placement and the permit refusal both read it, so
 // a task admitted for a permit is one placement puts on a Job.
 func (d *Dispatcher) jobRunner(prof lib.DispatchProfile, tier string) bool {
-	return d.cfg.unattended(tier) && d.jobs != nil && len(prof.JobTemplate) > 0
+	return d.cfg.unattendedFor(prof, tier) && d.jobs != nil && prof.HasJobTemplate()
 }
 
 // carriesPermit reports whether a task's credential-proxy credential would
@@ -118,9 +109,12 @@ func carriesPermit(changeRequested bool, cluster *taskcred.Target) bool {
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
 // once per retry delay, but only while the retry asks for the same ref and
 // target the permit was given for; the cheap checks run every time.
-func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (adm admitted, _ *refusal, _ error) {
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (_ admitted, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
+	if prof.DrainsTier(tier) {
+		return admitted{}, &refusal{ReasonTierWithdrawn, fmt.Sprintf("profile %s no longer runs tier %s; it is draining, so tasks already running at it finish and nothing new starts", prof.Name, tier)}, nil
+	}
 	if !allowsTier(prof, tier) {
 		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
@@ -160,10 +154,19 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if carriesPermit(changeRequested, cluster) && !d.jobRunner(prof, tier) {
 		return admitted{}, &refusal{ReasonChangeNeedsJob, fmt.Sprintf("this change runs in its own Job, and profile %s has no Job runner at tier %s", prof.Name, tier)}, nil
 	}
+	if ref := profileParentRefusal(env, snap, prof, hk.kind, target); ref != nil {
+		return admitted{}, ref, nil
+	}
 	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil {
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+	}
+	// The trigger the submission claims is asked about, not trusted: the
+	// verifier permits only when it is the grant's own (#4685).
+	trigger, err := capability.TriggerFromAuthority(env.Authority)
 	switch {
 	case err != nil:
-		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block's trigger is not well-formed"}, nil
 	case !present:
 		return admitted{}, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
 	case d.verifier == nil:
@@ -174,18 +177,18 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	// it, so a retry can carry another capability or another cluster under
 	// the same key: that is a cache miss, checked afresh, never the old
 	// permit stretched over an unchecked target.
-	asked := permit{ref: ref, target: target, cluster: cluster}
+	asked := permit{ref: ref, target: target, cluster: cluster, trigger: trigger}
+	// changeRequested is read from this delivery every time, never cached
+	// with the permit: it is not the verifier's to answer, and a retry's
+	// newer submission says whether a change is asked for now.
+	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger), changeRequested: changeRequested}
 	d.mu.Lock()
 	p, cached := d.verified[hk]
 	d.mu.Unlock()
-	// Read from this delivery every time, never cached with the permit: it
-	// is not the verifier's to answer, and a retry's newer submission says
-	// whether a change is asked for now.
-	adm = admitted{cluster: cluster, changeRequested: changeRequested}
 	if cached && now.Sub(p.at) <= verifiedFor && p.covers(asked) {
 		return adm, nil, nil
 	}
-	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
+	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target, trigger); err != nil {
 		if ctx.Err() != nil {
 			return admitted{}, nil, errStopping
 		}
@@ -201,19 +204,43 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	return adm, nil, nil
 }
 
+// admitted is what an admitted submission hands on to its holding: the
+// cluster and the trigger its credential-proxy token carries, each nil when
+// the submission names none; and whether the submission asked for a change
+// (lib.TaskParameters.ChangeRequested), which puts the vcs:proposal-create
+// permit on that credential (#3993).
+type admitted struct {
+	cluster         *taskcred.Target
+	trigger         *taskcred.Trigger
+	changeRequested bool
+}
+
+// credentialTrigger is the verifier-checked trigger in the credential's
+// shape, nil for none.
+func credentialTrigger(t *capability.Trigger) *taskcred.Trigger {
+	if t == nil {
+		return nil
+	}
+	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream, Script: t.Script}
+}
+
 // permit is a verifier permit admission reuses: when it was given, and the
-// ref, target and cluster it was given for.
+// ref, target, cluster and trigger it was given for.
 type permit struct {
 	at      time.Time
 	ref     capability.Ref
 	target  capability.Scope
 	cluster *taskcred.Target
+	trigger *capability.Trigger
 }
 
 // covers says p was given for exactly what q asks: the same ref, the same
-// verifier target and the same cluster fields.
+// verifier target, the same cluster fields and the same trigger.
 func (p permit) covers(q permit) bool {
 	if p.ref != q.ref || p.target != q.target || (p.cluster == nil) != (q.cluster == nil) {
+		return false
+	}
+	if (p.trigger == nil) != (q.trigger == nil) || (p.trigger != nil && *p.trigger != *q.trigger) {
 		return false
 	}
 	return p.cluster == nil || *p.cluster == *q.cluster
@@ -258,4 +285,50 @@ func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (
 		return "", nil, false, "the task names no cluster and the dispatcher has no namespace to scope it to"
 	}
 	return capability.Scope(namespaceTarget + namespace), nil, changeRequested, ""
+}
+
+// parentChainSeparator joins a parent's chain in a parent-cycle refusal.
+const parentChainSeparator = " → "
+
+// profileParentRefusal re-checks a child whose parent is an AgentProfile task
+// (#5686): the gateway holds it to these rules at mint, and this holds the
+// child to them even when the gateway that sent it is an older one that
+// never checked, during a roll or after a rollback. The parent is a profile
+// task when the child's `via.session` names a profile this install
+// dispatches; a session's child names its session pod instead. Such a child
+// must carry the parent's scope (the gateway writes it with the parent's
+// chain), its profile must not be on the parent's chain unless the parent
+// heads it and starts its own profile once, and its target must lie inside
+// the parent's scope, where the install's namespace scope holds any target
+// the install admits. nil admits.
+func profileParentRefusal(env *lib.Envelope, snap lib.DispatchConfig, prof lib.DispatchProfile, kind string, target capability.Scope) *refusal {
+	if kind != lib.SubmitKindChild {
+		return nil
+	}
+	via, err := capability.ViaFromAuthority(env.Authority)
+	if err != nil || via == nil || !dispatchesProfile(snap, via.Session) {
+		return nil
+	}
+	if via.Scope == "" {
+		return &refusal{ReasonParentUnchecked, fmt.Sprintf("a child of profile %s's task carries no parent scope, so its chain and scope were never checked", via.Session)}
+	}
+	chain := append(slices.Clone(via.ProfileChain), via.Session)
+	headSelfNest := len(via.ProfileChain) == 0 && prof.Name == via.Session
+	if slices.Contains(chain, prof.Name) && !headSelfNest {
+		return &refusal{ReasonParentCycle, fmt.Sprintf("profile %s is already on its parent's chain (%s)", prof.Name, strings.Join(chain, parentChainSeparator))}
+	}
+	if via.Scope != capability.NamespaceScope(snap.Namespace) && !via.Scope.Contains(target) {
+		return &refusal{ReasonOutsideParentScope, fmt.Sprintf("target %s is outside its parent's scope %s", target, via.Scope)}
+	}
+	return nil
+}
+
+// dispatchesProfile reports whether name is a profile in snap.
+func dispatchesProfile(snap lib.DispatchConfig, name string) bool {
+	for _, p := range snap.Profiles {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }

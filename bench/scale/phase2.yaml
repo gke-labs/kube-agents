@@ -61,7 +61,7 @@ settings:
   # Run the Cluster Agent reconcile when the profiles differ from the fleet, not at its hourly tick.
   trigger_reconcile: true
   cluster_create_parallelism: 8
-  # How long a restarted event watcher may take to report every test cluster up.
+  # How long the event watcher may take to report every test cluster up (at least 180 s).
   watcher_wait_seconds: 600
 
 operations:

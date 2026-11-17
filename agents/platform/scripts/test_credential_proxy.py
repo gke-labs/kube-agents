@@ -32,10 +32,12 @@ from unittest import mock
 
 import yaml
 
+import api_policy
 import credential_proxy
 import credential_proxy_client
 import feedback_broker
 import gke_endpoint
+import no_live_kubectl
 import providers
 import scope_exclude
 import vcs_broker
@@ -133,6 +135,23 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
 _SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class _FakeClock:
@@ -4976,28 +4995,32 @@ class CommandExecutorTest(unittest.TestCase):
         # shared kubeconfig for that cluster. A by-hand or skill-driven fetch
         # that names no endpoint would otherwise move an internal-ip cluster
         # back to its public IP for every brokered kubectl after it.
-        executor = self.fake_gcloud(self.executor())
-        seen = []
-        original = executor._execute
+        # Both endpoint flags: a caller under the kube-api proxy sends no flag
+        # (gke_endpoint.KUBE_PROXY_ENVS), so a DNS-only cluster relies on this too.
+        for flag in ("--internal-ip", "--dns-endpoint"):
+            with self.subTest(flag):
+                executor = self.fake_gcloud(self.executor())
+                seen = []
+                original = executor._execute
 
-        def record(argv, **kwargs):
-            seen.append(argv)
-            return original(argv, **kwargs)
+                def record(argv, _seen=seen, _original=original, **kwargs):
+                    _seen.append(argv)
+                    return _original(argv, **kwargs)
 
-        with (
-            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
-            mock.patch.object(executor, "_execute", record),
-        ):
-            executor.execute(
-                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
-                 "--location=us-central1", "--project=demo-project"],
-            )
+                with (
+                    mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([flag])) as decide,
+                    mock.patch.object(executor, "_execute", record),
+                ):
+                    executor.execute(
+                        ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                         "--location=us-central1", "--project=demo-project"],
+                    )
 
-        fetches = [argv for argv in seen if "get-credentials" in argv]
-        self.assertEqual(1, len(fetches))
-        self.assertEqual("--internal-ip", fetches[0][-1])
-        decide.assert_called_once()
-        self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
+                fetches = [argv for argv in seen if "get-credentials" in argv]
+                self.assertEqual(1, len(fetches))
+                self.assertEqual(flag, fetches[0][-1])
+                decide.assert_called_once()
+                self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
 
     def test_a_callers_fetch_target_is_read_through_gclouds_flag_shapes(self):
         # Every spelling a hand-typed command might carry: a global flag with a
@@ -5805,6 +5828,22 @@ class CommandExecutorTest(unittest.TestCase):
                 self.assertIsNotNone(process.returncode)
                 self.assertLess(time.monotonic() - started, 10)
                 self.assertGreaterEqual(len(asked), 2)
+
+    def test_a_child_that_exits_just_after_closing_its_pipes_is_reaped_at_once(self):
+        # #5540: a child closes its pipes a moment before it can be reaped.
+        # This one closes both, then exits 50 ms later, so the first look
+        # always misses; one look then a PIPES_CLOSED_POLL_SECONDS sleep cost
+        # half a second here, the short reap poll costs about the 50 ms.
+        process = subprocess.Popen(
+            ["sh", "-c", "exec >&- 2>&-; sleep 0.05"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        started = time.monotonic()
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30)
+        elapsed = time.monotonic() - started
+        self.assertEqual(0, process.returncode)
+        self.assertFalse(captured.timed_out)
+        self.assertLess(elapsed, credential_proxy.PIPES_CLOSED_POLL_SECONDS / 2)
 
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
         # With both pipes closed the read loop has nothing to watch, so the
@@ -12237,10 +12276,98 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-claim", "issue-list", "issue-view", "branch-view"},
+             "proposal-commits", "proposal-claim", "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
+
+    def test_write_mode_none_refuses_every_branch_and_proposal_write_before_it_spends(self):
+        refreshed = []
+        broker = self.broker(refresh=lambda provider, repository: refreshed.append(repository))
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
+            credential_proxy, "managed_repositories", side_effect=AssertionError("the managed list was read")
+        ):
+            for verb in sorted(vcs_broker.PROPOSE_VERBS):
+                with self.subTest(verb=verb), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, broker
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("WRITE_MODE_NONE", payload["code"])
+                    self.assertEqual(credential_proxy.RULE_VCS_WRITE_MODE, payload["rule"])
+                    self.assertIn("explain-only (writeMode: none)", payload["error"])
+                    self.assertNotIn("detail", payload)
+                    self.assertTrue(any(credential_proxy.RULE_VCS_WRITE_MODE in line for line in logs.output))
+        self.assertEqual([], refreshed)
+
+    def test_the_dial_at_explain_refuses_a_write_and_names_the_dial(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(setattr, vcs_broker, "_dial_level", None)
+        vcs_broker._dial_level = None
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "", vcs_broker.DIAL_ENV: "on"}), \
+                mock.patch.object(vcs_broker, "DIAL_STATE_FILE", os.path.join(scratch.name, "dial")), \
+                mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            status, payload = self._handler(
+                "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+            self.assertEqual((HTTPStatus.FORBIDDEN, "WRITE_MODE_NONE"), (status, payload["code"]))
+            self.assertIn("autonomy dial is at Explain", payload["detail"])
+            vcs_broker.set_dial_level("propose")
+            status, payload = self._handler(
+                "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+            self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"), "propose reaches the next gate, no restart")
+
+    def test_write_mode_none_keeps_reads_and_issues(self):
+        # Past the write-mode check, these reach the managed-list gate, which
+        # refuses an unregistered repository with its own code.
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset()
+        ):
+            for verb in ("clone", "proposal-view", "issue-create", "issue-comment", "label-ensure"):
+                with self.subTest(verb=verb):
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, self.broker()
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_write_mode_propose_or_unset_lets_a_write_through_to_the_next_gate(self):
+        for value in ("propose", " Propose ", ""):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {vcs_broker.WRITE_MODE_ENV: value}
+            ), mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+                status, payload = self._handler(
+                    "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+                )
+                self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_write_mode_is_read_on_every_request(self):
+        # Proves the broker holds no cached copy. On a pod the env changes only
+        # when the operator rolls the broker, so this is not "at once" there.
+        broker = self.broker()
+        body = {"repository": "https://github.com/acme/infra"}
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}):
+                _, payload = self._handler("/v1/vcs/publish", body, broker)
+                self.assertEqual("WRITE_MODE_NONE", payload["code"])
+            with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "propose"}):
+                _, payload = self._handler("/v1/vcs/publish", body, broker)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_misspelt_write_mode_refuses_and_says_why(self):
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "nope"}), self.assertLogs(
+            credential_proxy.LOGGER, level="WARNING"
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("WRITE_MODE_NONE", payload["code"])
+        self.assertIn("neither none nor propose", payload["detail"])
+        self.assertNotIn("nope", json.dumps(payload))
 
     def test_a_forge_refusal_is_redacted_before_it_crosses_back(self):
         # The forge's own words are what the caller needs, and they are also a
@@ -16340,7 +16467,7 @@ def yaml_value(text):
 # outside the enum fails Envoy's validation, and any other shape fails the
 # load. A UInt32Value takes a JSON number with no fraction or a string
 # spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
-# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# 1.39.1 and re-checked on 1.39.6, --mode validate, on each shape the tests below name). pyyaml's
 # integers are Envoy's: yaml-cpp converts a scalar with the base left to its
 # prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
 # shows.
@@ -16713,7 +16840,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
         # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
         # loader; proto-JSON, given a string that is not an enum value's
-        # name, reads the number it spells. Envoy 1.39.1 loads
+        # name, reads the number it spells. Envoy 1.39.1 and 1.39.6 load
         # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
         # that threshold's count, so the cap has to read it the same way
         # rather than fall to 1024 under a breaker of 4096; `"2"` fails
@@ -16735,7 +16862,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
             self.assertIsNone(credential_proxy._routing_priority(value), value)
 
     def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
-        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # max_connections is a UInt32Value: Envoy 1.39.1 and 1.39.6 refuse to load
         # 4294967296 (`integer out of range`) and loads 4294967295, so the
         # first is not a count and the second is. An integer pyyaml read
         # from the file needs no re-reading: yaml-cpp converts a scalar with
@@ -19195,6 +19322,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual("UPSTREAM_TIMEOUT", payload["code"])
         self.assertLess(time.monotonic() - started, 1.5, "the deadline, not the upstream, ended the wait")
         self.assertTrue(any("api upstream timeout request_id=" in r.getMessage() for r in logs.records))
+        self.assertEqual("failed", self._audits(logs)[-1]["status"])
 
     def test_a_connect_that_hangs_is_502_naming_the_connect_timeout(self):
         # A dropped SYN raises TimeoutError from connect() after the connect
@@ -19214,6 +19342,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(1, len(connect_lines))
         self.assertIn(f"connect_timeout_s={credential_proxy.API_RELAY_CONNECT_TIMEOUT_S}", connect_lines[0])
         self.assertFalse(any("deadline_s=" in r.getMessage() for r in logs.records))
+        self.assertEqual("failed", self._audits(logs)[-1]["status"])
 
     def test_a_trickling_upstream_is_cut_at_the_deadline_not_at_the_end_of_the_body(self):
         # Ten pieces, 0.2 s apart: two seconds of body. With read(n) each
@@ -19262,6 +19391,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("API_RELAY_BAD_QUERY", payload["code"])
         self.assertTrue(any("reason=UnicodeEncodeError" in r.getMessage() for r in logs.records))
+        self.assertEqual("rejected", self._audits(logs)[-1]["status"])
 
     def test_an_upstream_that_closes_short_of_its_content_length_is_502(self):
         # read1 returns b"" on an early EOF without raising for a
@@ -19279,6 +19409,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertTrue(lines[1].startswith("api upstream truncated request_id="), lines[1])
         self.assertIn(f" received=1000 expected={len(body)}", lines[1])
         self.assertFalse(any(line.startswith("api forwarded") for line in lines))
+        self.assertEqual(["started", "failed"], [a["status"] for a in self._audits(logs)])
 
     def test_an_unreachable_upstream_is_502(self):
         # Point the relay at a port nothing listens on.
@@ -19347,6 +19478,170 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertIn("api credential unavailable request_id=", joined)
         self.assertIn("type=RuntimeError", joined)
         self.assertNotIn("/var/run/secrets", joined)
+
+    # -- the tool-execution audit records --------------------------------
+
+    @staticmethod
+    def _audits(logs):
+        """The tool-execution audit mapping of each record that carries one, in order."""
+        mappings = [getattr(record, credential_proxy.AUDIT_EXTRA_KEY, None) for record in logs.records]
+        return [m for m in mappings if m and m.get("event_type") == credential_proxy.TOOL_EXECUTION_AUDIT_EVENT]
+
+    def test_a_forwarded_read_leaves_a_started_and_a_completed_audit_record(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED + "?filter=metric.type%3D%22secret-metric%22")
+        self.assertEqual(200, status)
+        started, completed = self._audits(logs)
+        shared = {
+            "event_type": "tool_execution_audit",
+            "request_id": started["request_id"],
+            "principal": self.CALLER,
+            "tool": "gcp-api",
+            "subcommand": "monitoring",
+            "broker_tier": credential_proxy.BROKER_TIER_STATEFUL,
+            "class": credential_proxy.CLASS_INTERACTIVE,
+            "broker_pod": credential_proxy._broker_pod(),
+        }
+        self.assertEqual({**shared, "status": "started"}, started)
+        self.assertEqual(200, completed.pop("upstream_status"))
+        self.assertGreaterEqual(completed.pop("duration_ms"), 0)
+        self.assertEqual({**shared, "status": "completed"}, completed)
+        self.assertTrue(started["request_id"])
+        # Identifiers and outcomes only: nothing of the path or the query.
+        text = json.dumps(self._audits(logs))
+        self.assertNotIn("kagents-dev", text)
+        self.assertNotIn("secret-metric", text)
+
+    def test_an_upstream_refusal_is_a_completed_record_with_the_upstreams_status(self):
+        self.reply.update(status=403, body=b'{"error":{"code":403}}')
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(403, status)
+        completed = self._audits(logs)[-1]
+        self.assertEqual(("completed", 403), (completed["status"], completed["upstream_status"]))
+
+    def test_every_refusal_is_a_blocked_audit_record_naming_the_rule(self):
+        cases = (
+            ("GET", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/alertPolicies", "gcp.api.path", "monitoring"),
+            ("POST", self.ALLOWED, "gcp.api.method", "monitoring"),
+            ("GET", "/v1/gcp/iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/x:generateAccessToken",
+             "gcp.api.host-refused", "other"),
+            ("GET", "/v1/gcp/evil.example.com/anything", "gcp.api.host", "other"),
+        )
+        for method, path, rule, subcommand in cases:
+            with self.subTest(method=method, path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path, method=method)
+                self.assertEqual(403, status)
+                started, blocked = self._audits(logs)
+                self.assertEqual("started", started["status"])
+                self.assertEqual(("blocked", rule), (blocked["status"], blocked["rule"]))
+                self.assertEqual(started["request_id"], blocked["request_id"])
+                for record in (started, blocked):
+                    self.assertEqual(("gcp-api", subcommand), (record["tool"], record["subcommand"]))
+                    self.assertNotIn("duration_ms", record)
+                    self.assertNotIn("upstream_status", record)
+
+    def test_an_excluded_clusters_check_is_a_blocked_audit_record(self):
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="secret-cluster"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        blocked = self._audits(logs)[-1]
+        self.assertEqual(
+            ("blocked", scope_exclude.RULE_EXCLUDED_CLUSTER, "container"),
+            (blocked["status"], blocked["rule"], blocked["subcommand"]),
+        )
+
+    def test_a_request_not_in_normal_form_is_a_rejected_audit_record(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request("/v1/gcp/monitoring.googleapis.com/v3/projects/../timeSeries")
+        self.assertEqual(400, status)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_each_broker_or_upstream_failure_is_a_failed_audit_record(self):
+        def no_relay():
+            CredentialProxyHandler.api_relay = None
+
+        def no_credential():
+            def failing():
+                raise RuntimeError("no credential")
+
+            self.relay.authorization_header = failing
+
+        def unreachable():
+            spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            self.relay.port = spare.server_address[1]
+            spare.server_close()
+
+        def redirect():
+            self.reply.update(status=302, content_type="text/html", body=b"",
+                              headers={"Location": "https://evil.example/collect"})
+
+        def unprojectable():
+            self.reply.update(body=b"not json")
+
+        cluster_get = self.EXCLUDABLE_GET.format(name="some-cluster")
+        cases = (
+            ("no relay", no_relay, self.ALLOWED, 503, False),
+            ("no credential", no_credential, self.ALLOWED, 503, False),
+            ("unreachable", unreachable, self.ALLOWED, 502, False),
+            ("redirect", redirect, self.ALLOWED, 502, True),
+            ("unprojectable", unprojectable, cluster_get, 502, True),
+        )
+        for name, arrange, path, expected, timed in cases:
+            with self.subTest(name):
+                arrange()
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path)
+                self.assertEqual(expected, status)
+                audits = self._audits(logs)
+                self.assertEqual(["started", "failed"], [a["status"] for a in audits])
+                self.assertEqual(timed, "duration_ms" in audits[-1])
+                self.assertNotIn("upstream_status", audits[-1])
+                # Each case leaves the handler as the next one expects it.
+                CredentialProxyHandler.api_relay = self.relay
+                self.relay.__dict__.pop("authorization_header", None)
+                self.relay.port = self.upstream.server_address[1]
+                self.reply.update(status=200, content_type="application/json; charset=UTF-8",
+                                  body=b'{"timeSeries":[]}', headers={})
+
+    def test_a_response_over_the_cap_is_a_failed_audit_record(self):
+        cap = 4096
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            self.reply.update(body=b"x" * (cap + 1))
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(502, status)
+        self.assertEqual(["started", "failed"], [a["status"] for a in self._audits(logs)])
+
+    def test_an_exec_tier_broker_and_a_pod_bound_caller_are_named_in_the_record(self):
+        self.addCleanup(
+            self._restore, "broker_role", "broker_role" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("broker_role"),
+        )
+        CredentialProxyHandler.broker_role = credential_proxy.EXEC_ROLE
+        CredentialProxyHandler.authenticator._review = lambda token: credential_proxy.Principal(
+            workload=self.CALLER, uid="sa-uid", role=credential_proxy.CALLER_ROLE_SHELL, pod="platform-agent-shell-0",
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        for record in self._audits(logs):
+            self.assertEqual(credential_proxy.BROKER_TIER_EXEC, record["broker_tier"])
+            self.assertEqual("platform-agent-shell-0", record["pod"])
+
+    def test_the_audit_subcommands_are_the_service_words_of_the_routed_hosts(self):
+        self.assertEqual(
+            {route.host for route in api_policy.API_READ_ROUTES},
+            set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS),
+        )
+        # The design doc and the site's observability page list these words: a
+        # new routed host adds one, and both pages then need it.
+        self.assertEqual(
+            {"monitoring", "cloudtrace", "container"}, set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values())
+        )
+        self.assertNotIn(credential_proxy.API_RELAY_AUDIT_TOOL, CommandExecutor.ALLOWED_EXECUTABLES)
 
 
 class ApiRelayAuditLineCannotBeForgedTest(unittest.TestCase):
@@ -20391,6 +20686,67 @@ class TeamsRelayTest(unittest.TestCase):
             )
             self.assertEqual(res, {"id": "act-resp-1"})
 
+    def test_teams_relay_upstream_rejection_carries_the_error_code(self):
+        import io
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token, relay._token_expires_at = "cached", 9999999999.0
+        body = json.dumps({"error": {"code": "BotNotInConversationRoster", "message": "The bot is not part of the conversation roster."}}).encode()
+        err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/v3/x", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", side_effect=err):
+            with self.assertRaises(credential_proxy.TeamsUpstreamError) as caught:
+                relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path="v3/conversations/123/activities", payload={"text": "hi"})
+        self.assertEqual(caught.exception.fields["status"], 403)
+        self.assertEqual(caught.exception.fields["code"], "BotNotInConversationRoster")
+        self.assertIn("BotNotInConversationRoster", str(caught.exception))
+
+    def test_teams_relay_identity_rejection_carries_entras_error_and_description(self):
+        """Entra answers a bad secret with ``error`` / ``error_description`` strings,
+        not Bot Framework's ``error`` object; both shapes reach the 502's fields."""
+        import io
+        relay = TeamsRelay(app_id="app-id-123", app_password="wrong-password")
+        body = json.dumps({"error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided."}).encode()
+        err = urllib.error.HTTPError("https://login.microsoftonline.com/t/oauth2/v2.0/token", 401, "Unauthorized", {}, io.BytesIO(body))
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", side_effect=err):
+            with self.assertRaises(credential_proxy.TeamsUpstreamError) as caught:
+                relay._get_access_token()
+        self.assertEqual(caught.exception.fields["status"], 401)
+        self.assertEqual(caught.exception.fields["code"], "invalid_client")
+        self.assertIn("AADSTS7000215", caught.exception.fields["message"])
+        self.assertEqual(str(caught.exception), "HTTP 401: invalid_client AADSTS7000215: Invalid client secret provided.")
+
+    def test_teams_relay_identity_faults_are_upstream_errors(self):
+        """A non-JSON identity body or a non-numeric expires_in is an upstream
+        fault (502 with its reason logged), not a ValueError the route answers
+        400 and logs nothing for."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        for raw in (
+            b"<html>captive portal</html>",
+            b"[1, 2]",
+            json.dumps({"access_token": "t", "expires_in": "soon"}).encode(),
+        ):
+            resp = mock.MagicMock()
+            resp.read.return_value = raw
+            resp.__enter__.return_value = resp
+            with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", return_value=resp):
+                with self.assertRaises(credential_proxy.TeamsUpstreamError, msg=raw):
+                    relay._get_access_token()
+
+    def test_teams_relay_api_call_replaces_a_lone_surrogate_instead_of_raising(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token, relay._token_expires_at = "cached", 9999999999.0
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({"id": "act-1"}).encode("utf-8")
+        resp.__enter__.return_value = resp
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", return_value=resp) as opened:
+            result = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/123/activities",
+                payload={"type": "message", "text": "ok \ud83d done"},
+            )
+        self.assertEqual(result, {"id": "act-1"})
+        posted = opened.call_args.args[0].data.decode("utf-8")
+        self.assertIn("ok ? done", posted)
+
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
@@ -20414,7 +20770,9 @@ class TeamsRelayTest(unittest.TestCase):
             mock.patch.object(
                 credential_proxy, "is_trusted_teams_service_url", return_value=True
             ),
-            self.assertRaisesRegex(ValueError, "Teams API redirect refused \\(HTTP 302\\)"),
+            self.assertRaisesRegex(
+                credential_proxy.TeamsUpstreamError, "Teams API redirect refused \\(HTTP 302\\)"
+            ),
         ):
             relay.api_call(
                 service_url=f"http://127.0.0.1:{server.server_port}/teams/",

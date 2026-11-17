@@ -35,6 +35,11 @@ from credential_proxy import (  # noqa: E402
 )
 
 
+# Around each client call: the ambient KUBECONFIG is not the test's input, and
+# the shim refuses a file that names no current-context.
+_NO_AMBIENT_KUBECONFIG = mock.patch.dict("os.environ", {"KUBECONFIG": ""})
+
+
 class CredentialProxyPairTest(unittest.TestCase):
     """The real handler, the real client, one TCP socket between them."""
 
@@ -75,7 +80,7 @@ class CredentialProxyPairTest(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         run_dir = cwd or str(CredentialProxyHandler.executor.workspace_dir)
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            with contextlib.chdir(run_dir):
+            with contextlib.chdir(run_dir), _NO_AMBIENT_KUBECONFIG:
                 code = credential_proxy_client.execute(self.endpoint, argv)
         return code, stdout.getvalue(), stderr.getvalue()
 
@@ -127,7 +132,7 @@ class CredentialProxyPairTest(unittest.TestCase):
         self.addCleanup(envoy.shutdown)
 
         stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), _NO_AMBIENT_KUBECONFIG:
             code = credential_proxy_client.execute(
                 f"http://127.0.0.1:{envoy.server_port}", ["kubectl", "get", "pods"]
             )

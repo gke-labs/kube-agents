@@ -298,6 +298,12 @@ export function parseSubject(subject: string): SubjectInfo {
   ) {
     return { plane: "tasks", addressee: t[2], taskId: t[3], dir: t[4] };
   }
+  // A profile task's supervisor subject in its profile form,
+  // a2a.tasks.p.<profile>.<taskId>.supervisor (lib.ProfileSupervisorSubject,
+  // gke-labs/kube-agents#5301): six tokens, the addressee is the profile.
+  if (t[1] === "tasks" && t.length === 6 && t[2] === "p" && t[5] === "supervisor") {
+    return { plane: "tasks", addressee: t[3], taskId: t[4], dir: "supervisor" };
+  }
   if (t[1] === "agents" && t.length === 3) {
     return { plane: "agents", profile: t[2] };
   }

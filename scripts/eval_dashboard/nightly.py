@@ -74,9 +74,10 @@ import math
 import re
 
 try:
-    from eval_dashboard import links, tiers
+    from eval_dashboard import links, slack_estimate, tiers
 except ImportError:  # run as a script from scripts/eval_dashboard/
     import links  # type: ignore[no-redef]
+    import slack_estimate  # type: ignore[no-redef]
     import tiers  # type: ignore[no-redef]
 
 # The report page render.py writes and the digest links to.
@@ -105,7 +106,7 @@ EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while it started this recently: the
 # longest part's budget is 14 hours (oss-test-infra: timeout 840m on the main
-# shards for the gemini-4-argon window, 720m before), plus Prow's
+# shards for the newer agent model's window, 720m before), plus Prow's
 # 5-minute grace and the minutes a pod cut at its deadline takes to end (seen
 # at 12h04m-12h06m on the 720m budget). Past that the build is a pod that
 # died without uploading, which the collector keeps on pending_builds for
@@ -786,7 +787,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     durations = [p["duration_s"] for p in own if p["duration_s"] is not None]
     primary = runs[0]
     previous_primary = (previous.get(PART_MAIN) or next(iter(previous.values()))) if previous else None
-    return {
+    doc = {
         "build": primary.get("build_id") if isinstance(primary.get("build_id"), str) else None,
         "job": primary.get("job") if isinstance(primary.get("job"), str) else None,
         "head_sha": primary.get("head_sha") if isinstance(primary.get("head_sha"), str) else None,
@@ -826,6 +827,9 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         "shape": shape_rollup(shaped),
         "cases": cases,
     }
+    # Estimated end-to-end Slack times, from the Slack lane's overhead that night (slack_estimate).
+    slack_estimate.annotate(doc, day.isoformat() if day else None, data.get("slack_overhead"))
+    return doc
 
 
 def sorted_nightly_runs(data: dict) -> list[dict]:
@@ -873,6 +877,7 @@ def night_reports(data: dict, limit: int = NIGHTS_ON_RECORD, running: list[dict]
         sources.sort(key=lambda source: -source[0])
         previous = {part: nights[at][part] for at, part in sources}
         out.append(joined_night_document(night, data, previous or None, running, borrowed))
+    slack_estimate.average_p95(out, night_date)
     return out
 
 

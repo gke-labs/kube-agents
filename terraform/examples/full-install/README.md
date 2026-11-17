@@ -61,12 +61,6 @@ install without the interview.
   `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
   the gateway spends per period, and `install.sh` sets it from
   `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
-  `platform_agent_mode` (default `"today"`, which passes the
-  chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
-  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
-  which a first install records as `"next"`. Changing it on a running install is a mode switch
-  ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
   `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
   so the CR carries no `storage` field) sets the `PlatformAgent`'s
   `spec.storage.size`, the size of the agent's data volume and the shell
@@ -242,7 +236,10 @@ installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
 `GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
 front door regenerates `terraform.tfvars` from; every front door that applies
 (`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
-names the key to set. Do not rely on a shell
+names the key to set. The minter's KSA (`github_minter_ksa_name`,
+`GITHUB_MINTER_KSA_NAME`) is the other half of its Workload Identity binding:
+`install.sh` names a new install's after its cluster and records it, so two
+installs sharing the namespace don't bind one member. Do not rely on a shell
 `export` or a hand-edited `terraform.tfvars` instead: the export dies with the
 shell and the file is regenerated on every run, and either way the next run
 resolves the name back to the default and plans the GSA's destroy-and-recreate
@@ -316,9 +313,11 @@ install's own and the state is what went missing, a repointed
 could not establish); delete the leftovers if that is what they are (it prints
 the `gcloud` commands); or leave the detector off for this install with
 `ENABLE_DRIFT_DETECTOR=false`. The stockout trio
-(`stockout_pubsub_*`) has the same shape but is still adopted, because
-`enable_stockout_investigator` stays off unless asked for: a second install
-that turns it on names its own three. Renaming a subscription already in state is a
+(`stockout_pubsub_*`) has the same shape and is refused the same way
+(`guard_stockout_adoption`): it names `TF_VAR_stockout_pubsub_topic`,
+`TF_VAR_stockout_pubsub_subscription`, and `TF_VAR_stockout_pubsub_sink`, the
+`terraform import` and `gcloud` delete commands, or
+`ENABLE_STOCKOUT_INVESTIGATOR=false`. Renaming a subscription already in state is a
 different failure, and `guard_pubsub_subscription` refuses it for the Chat,
 drift and stockout subscriptions alike, while the feature's flag is on: `name`
 and `topic` are ForceNew on `google_pubsub_subscription`, so the apply would
@@ -564,7 +563,7 @@ agent Deployment and shell sandbox StatefulSet the operator resolves at reconcil
 time; the fluent-bit logging sidecar follows `third_party_image_registry`); the
 [chart README](../../../charts/kube-agents/README.md) explains how.
 Add `third_party_image_registry` to mirror third-party images (cert-manager,
-LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight); empty leaves them on
 their upstream registries.
 
 `IMAGE_TAG` is not optional here. The first-party images take whatever tag
@@ -828,6 +827,8 @@ For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the 
 
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
 
+With `gitops_forge = "bitbucket"` (Bitbucket Cloud, at `bitbucket.org` only) or `gitops_forge = "bitbucket-datacenter"`, set `gitops_repo_path` to `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center), and, for Data Center, `gitops_host` to the instance's hostname. The instance must serve at the root path on port 443. The CR then declares one forge named after its provider, with the workspace or project key as its namespace and the repository slug as its `gitops` repository, and `credentialsRef` naming `gitops_token_secret_name` (default `bitbucket-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A Data Center instance behind a private CA sets `gitops_ca_secret_name`. A Bitbucket Cloud workspace, project or repository access token cannot name its own account, so set `gitops_identity` to the account UUID it acts as; an API token needs none. A Bitbucket install has no GitHub App, so `github_repo` and `enable_github_minter` stay unset. See [Bitbucket as the GitOps forge](../../../docs/site/src/content/docs/install/bitbucket.md).
+
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
 install.sh collects. Slack needs no GCP resources, so this is
@@ -1073,9 +1074,9 @@ leaves the ingress running, still exporting and still billing.
   (if it stays blank, Chat silently delivers no events). That address is the
   Workspace Add-ons service agent,
   `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
-  the agent's own GSA. Then DM the bot; on
-  first contact, optionally approve the pairing code via
-  `hermes pairing approve google_chat <CODE>` in the gateway pod.
+  the agent's own GSA. Then DM the bot. The A2A gateway has no pairing: it
+  answers the addresses in `google_chat_allowed_users`, or everyone the app is
+  visible to when that list is empty.
 - **Slack:** create the Slack app and its tokens as the site's Slack app setup
   page describes (`docs/site/src/content/docs/install/slack-app.md`), pass the
   tokens as `slack_bot_token` / `slack_app_token`, and set
@@ -1126,7 +1127,7 @@ What each one does that raw Terraform cannot:
 | `deletion_protection = true` cannot be overridden by a destroy alone                                                                               | `tf-destroy` applies it as `false`, then destroys                                                                                                                                                                                                                                                                                                                                              |
 | The helm provider reports a release destroyed when it cannot reach the cluster                                                                     | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched                                                                                                             |
 | A Pub/Sub topic or subscription that already exists makes the create 409                                                                           | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                                                                                                                                   |
-| The stockout topic, subscription and sink survive a partial teardown and 409 the same way                                                          | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                                                                                                                                              |
+| The stockout topic, subscription and sink survive a partial teardown or collide across installs the same way                                       | `tf-apply` refuses instead of importing (`guard_stockout_adoption`): an import cannot tell a leftover from another live install's trio, and two investigators on one subscription split autoscaler alerts across installs                                                                                                                                                                      |
 | The drift trio does too, but the detector is on by default, so every second install in a project hits it                                           | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio; the source sinks a scoped install owns in the listed projects are not probed, and the refusal prints the import for them                                                                                                                                  |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for

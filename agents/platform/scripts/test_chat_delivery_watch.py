@@ -295,6 +295,18 @@ class GradingTest(unittest.TestCase):
         joined = HARD_ERROR + "; delivery to slack:C123 failed: channel_not_found"
         self.assertEqual(cdw.platforms_from(joined), ["slack", "google_chat"])
 
+    def test_a_refusal_for_two_platforms_names_both(self) -> None:
+        # The session server's no-route refusal: one sentence per gateway platform
+        # with no home channel, joined with "; " (session_kv_server.NO_CHAT_ROUTE_JOIN).
+        google_chat = ("composed but not delivered to google_chat (no home channel: set "
+                       "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL)")
+        slack = ("composed but not delivered to slack (no home channel: set "
+                 "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)")
+        joined = f"{google_chat}; {slack}"
+        self.assertEqual(cdw.platforms_from(joined), ["google_chat", "slack"])
+        self.assertEqual(cdw.grade_error(joined), cdw.GRADE_HARD)
+        self.assertEqual(cdw.platforms_from(slack), ["slack"])
+
     def test_the_adapter_still_produces_the_phrases_the_grader_matches(self) -> None:
         # The guard behind the constants above: the phrases are literals here, so
         # this reads the adapter's source and fails if either sentence is reworded.

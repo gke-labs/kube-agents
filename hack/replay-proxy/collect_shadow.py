@@ -46,13 +46,16 @@ Rollout step 2):
   keeps a copy of every line and stored request it fetched. Every
   `--publish-interval` seconds, and once in the last pass, publish_cache.py
   uploads the answers from runs that passed, as graded so far under
-  `--verdicts-dir`, to the shared cache bucket. The cache never goes to the
-  shadow bucket.
+  `--verdicts-dir`, to the shared cache bucket, each record naming the
+  checkout's commit (`--commit`). The cache never goes to the shadow bucket.
 - `replay`, in the replay lane: each pass seeds any proxy pod that has not got
   the cache (a pod that replaced one starts empty) from `--seed-dir`, which
   fetch_cache.py filled, and keeps the lines and stored requests. The last
-  pass writes lane_report.py's report and uploads it under the job's prefix,
-  in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
+  pass copies every pod first, then writes lane_report.py's report before it
+  uploads its lines and stored text, so a deadline that cuts the pass costs
+  those, not the report. The report names the commit replayed and where it
+  came from (`--lane-commit`, `--lane-commit-source`) and goes under the
+  job's prefix, in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
   pod took the cache, so the lane can stop before its cases. A pod being
   deleted is never seeded, though its lines are still collected.
 
@@ -146,6 +149,9 @@ DEFAULT_FINAL_DEADLINE_SECONDS = 60.0
 DEFAULT_DATA_DIR = "/data"
 STAGING_PREFIX = "replay-shadow-"
 SLEEP_SLICE_SECONDS = 1.0
+# After a command is killed, how long its output is still read. A descendant
+# that left its process group can hold the pipes open; it is abandoned then.
+KILLED_DRAIN_SECONDS = 5.0
 KUBECTL_TIMEOUT_SECONDS = 120.0
 GCLOUD_TIMEOUT_SECONDS = 180.0
 # One exec's tar stream is held in memory; one pass copies at most this much,
@@ -182,6 +188,15 @@ ERROR_CLASS_OTHER = "other"
 # downloader that resolved `presubmit/x/../../nightly/` would file it elsewhere.
 BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]\Z")
 BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# A checkout's commit, or empty when git could not say (hack/ci-env.sh passes
+# empty rather than anything else): publish_cache.COMMIT_PATTERN or nothing.
+COMMIT_SHAPE = re.compile(r"^(?:[0-9a-f]{40})?\Z")
+# Where the replay lane's commit came from (hack/ci-env.sh's
+# REPLAY_LANE_COMMIT_SOURCE, which the Prow job exports): the newest recording
+# night's commit, a fallback to main, or empty when the job did not say.
+COMMIT_SOURCE_RECORDING = "recording"
+COMMIT_SOURCE_MAIN = "main"
+COMMIT_SOURCES = ("", COMMIT_SOURCE_RECORDING, COMMIT_SOURCE_MAIN)
 GCLOUD_ENV = {
     # A composite upload writes and deletes temporary objects, which needs a
     # delete grant the presubmit's identity should not hold.
@@ -401,21 +416,37 @@ def default_runner(cmd: Sequence[str], input: Optional[bytes] = None,
     SIGTERM that brings the collector's deadline forward also cuts a command
     already running. `stdin_path` feeds a file instead of `input`, for a stream
     too large to hold in memory (a seeded cache).
+
+    The command runs in a process group of its own, and the kill takes the
+    whole group: `gcloud storage cp` copies in worker processes that inherit
+    the pipes, so killing the command alone left the read after the kill
+    waiting on them for good.
     """
     merged = dict(os.environ)
     merged.update(env or {})
     if stdin_path is not None:
         with open(stdin_path, "rb") as stdin:
-            proc = subprocess.Popen(list(cmd), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
+            proc = subprocess.Popen(list(cmd), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged,
+                                    start_new_session=True)
     else:
         proc = subprocess.Popen(list(cmd), stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=merged, start_new_session=True)
     pending = input
     while True:
         left = remaining()
         if left <= 0:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:  # the group has gone already
+                pass
             proc.kill()
-            proc.communicate()
+            try:
+                proc.communicate(timeout=KILLED_DRAIN_SECONDS)
+            except subprocess.TimeoutExpired:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                proc.wait()
             raise subprocess.TimeoutExpired(list(cmd), 0)
         try:
             # Input goes on the first call only; Popen refuses it on a retry
@@ -488,6 +519,9 @@ class Collector:
         self.publish_thread: Optional[threading.Thread] = None
         # Writes the lane's report into a directory and returns its summary.
         self.lane_report = lane_report
+        # Set once the report has been tried: replay mode's last pass writes it
+        # before its uploads, and run_loop's call after the pass is then a no-op.
+        self.lane_report_tried = False
 
     # --- plumbing ---------------------------------------------------------
 
@@ -824,9 +858,10 @@ class Collector:
         self.publish_thread.start()
 
     def write_lane_report(self) -> None:
-        """Replay mode's last step: the lane's report, into the job's prefix under report/."""
-        if self.lane_report is None:
+        """Replay mode's report, into the job's prefix under report/, written before the last pass's uploads. Tried once."""
+        if self.lane_report is None or self.lane_report_tried:
             return
+        self.lane_report_tried = True
         root = tempfile.mkdtemp(dir=self.staging)
         try:
             try:
@@ -859,10 +894,34 @@ class Collector:
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def _upload_batch(self, root: str, batch: Sequence[Tuple[str, int]], written: Dict[str, int],
+                      emptiable: List[Tuple[str, int]], stats: Dict[str, int]) -> None:
+        """Upload one fetched batch from its staging root, adding what reached the bucket to `emptiable`; removes the root."""
+        try:
+            uploaded = set(self.upload(root, written))
+            for name in uploaded:
+                self.uploaded.add(name)
+                stats["uploaded"] += 1
+                self.totals.uploaded_files += 1
+            # The size the pod's file had is the size uploaded: a
+            # closed file never changes, and an open one is never emptied.
+            emptiable += [(rel, written[object_name(rel)]) for rel, _ in batch
+                          if object_name(rel) in uploaded]
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def collect_pass(self, final: bool = False) -> Dict[str, int]:
-        """One pass over every proxy pod; `final` also takes the open segments."""
+        """One pass over every proxy pod; `final` also takes the open segments.
+
+        Replay mode's last pass copies every pod into the kept copy first,
+        then writes the lane's report from it, and uploads the lines and store
+        only after: the report is what the lane is for, and earlier passes
+        have uploaded most of the rest.
+        """
         stats = {"pods": 0, "listed": 0, "new": 0, "uploaded": 0}
         budget = PASS_MAX_BYTES
+        report_first = final and self.mode == MODE_REPLAY and self.lane_report is not None
+        deferred: List[Tuple[str, List[Tuple[str, Sequence[Tuple[str, int]], Dict[str, int]]], List[Tuple[str, int]]]] = []
         for pod, draining in self.pods():
             if self.cut_short(final):
                 break
@@ -876,6 +935,7 @@ class Collector:
             # Uploaded already, from this pod or another: a blob both pods
             # wrote, or a file whose emptying failed last time.
             emptiable = [(rel, size) for rel, size in files if object_name(rel) in self.uploaded]
+            staged: List[Tuple[str, Sequence[Tuple[str, int]], Dict[str, int]]] = []
             for batch in batches(new, BATCH_MAX_BYTES):
                 if budget <= 0 or self.cut_short(final):
                     break
@@ -884,20 +944,27 @@ class Collector:
                 try:
                     written = self.fetch(pod, batch, root)
                     self.keep(pod, root, written)
-                    uploaded = set(self.upload(root, written))
-                    for name in uploaded:
-                        self.uploaded.add(name)
-                        stats["uploaded"] += 1
-                        self.totals.uploaded_files += 1
-                    # The size the pod's file had is the size uploaded: a
-                    # closed file never changes, and an open one is never emptied.
-                    emptiable += [(rel, written[object_name(rel)]) for rel, _ in batch
-                                  if object_name(rel) in uploaded]
-                finally:
+                except BaseException:
                     shutil.rmtree(root, ignore_errors=True)
+                    raise
+                if report_first:
+                    staged.append((root, batch, written))
+                else:
+                    self._upload_batch(root, batch, written, emptiable, stats)
+            if report_first:
+                deferred.append((pod, staged, emptiable))
+                continue
             self.empty(pod, emptiable)
             if self.mode == MODE_RECORD and self.keep_dir and budget > 0 and not self.cut_short(final):
                 budget -= self.collect_cache(pod, budget, final)
+        if report_first:
+            self.write_lane_report()
+            # Each upload gets what the deadline leaves (run()); one that
+            # cannot start is counted, and its files stay in the pod.
+            for pod, staged, emptiable in deferred:
+                for root, batch, written in staged:
+                    self._upload_batch(root, batch, written, emptiable, stats)
+                self.empty(pod, emptiable)
         self.totals.passes += 1
         self.maybe_publish(final)
         return stats
@@ -942,10 +1009,15 @@ def run_loop(collector: Collector, interval: float, final_deadline: float, paren
             if not manifest_done:
                 manifest_done = bool(manifest())  # type: ignore[misc]
             collector.report(collector.collect_pass(final=final), final=final)
-            if final:
-                collector.write_lane_report()
         except Exception as exc:  # one bad pass is not the end of collection
             collector.fail("pass_crashed", reason=type(exc).__name__)
+        if final:
+            # A no-op when replay mode's last pass wrote it already; here
+            # too when that pass crashed first.
+            try:
+                collector.write_lane_report()
+            except Exception as exc:
+                collector.fail("pass_crashed", reason=type(exc).__name__)
 
     while not stop() and parent_alive(parent_pid):
         one_pass(final=False)
@@ -990,6 +1062,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--job-name", default="", help="record: the Prow job name, written into each record")
     parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
+    parser.add_argument("--commit", default="", type=_shaped(COMMIT_SHAPE, "commit id"),
+                        help="record: the checkout's commit, written into each record")
+    parser.add_argument("--lane-commit", default="", type=_shaped(COMMIT_SHAPE, "commit id"),
+                        help="replay: the commit the lane replayed on, named in the report")
+    parser.add_argument("--lane-commit-source", default="", choices=COMMIT_SOURCES,
+                        help="replay: whether that commit is the recording night's or main")
     parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
     parser.add_argument("--seed-once", action="store_true", help="replay: seed every live proxy pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
@@ -1019,7 +1097,8 @@ def make_publisher(args: argparse.Namespace, collector: "Collector"):
     return publish_cache.Publisher(keep_dir=args.keep_dir, verdicts_dir=args.verdicts_dir,
                                    bucket=args.publish_bucket, build=args.build, run=collector.run,
                                    env=GCLOUD_ENV, emit=collector.emit,
-                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge))
+                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge,
+                                                                     args.commit))
 
 
 def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optional[str]]]:
@@ -1030,7 +1109,8 @@ def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optio
     def report(out_dir: str) -> Optional[str]:
         import lane_report
 
-        return lane_report.write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, out_dir)
+        return lane_report.write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, out_dir,
+                                        commit=args.lane_commit, commit_source=args.lane_commit_source)
 
     return report
 

@@ -10,6 +10,8 @@ namespace    = "kubeagents-system"
 agent_service_account_id         = "kubeagents-platform-gsa"
 github_minter_service_account_id = "kubeagents-github-minter-gsa"
 litellm_service_account_id       = "kubeagents-litellm-gsa"
+# The minter's KSA, the other half of its Workload Identity binding.
+github_minter_ksa_name           = "kubeagents-github-minter"
 
 # GKE database encryption. install.sh's existing-cluster step reads the
 # same two keys, so a create and an adoption encrypt with one key.
@@ -45,10 +47,6 @@ vertex_manage_serving_project = true
 # The daily alert ceilings (ALERT_DAILY_LIMIT_* in install.env), only the
 # keys that are set. A bucket that is not here keeps the image default.
 alert_daily_limits = {}
-
-# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The
-# composition passes the chart nothing for "today", so its CR carries no mode.
-platform_agent_mode = "today"
 
 # The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in
 # install.env). The composition passes the chart nothing for the default.

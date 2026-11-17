@@ -5,6 +5,8 @@ kind: Secret
 metadata:
   name: payments-values
   namespace: demo-shop
+  labels:
+    managed-by: kube-agents-bench
 type: Opaque
 stringData:
   values.yaml: ENC[AES256_GCM,data:Qm9ndXMgZml4dHVyZSBjaXBoZXJ0ZXh0IGZvciBhIGJlbmNoIGNhc2UsIG5vdCBhIHJlYWwgc2VjcmV0Lg==,iv:ZmFrZS1pdi1mb3ItYS1iZW5jaC1maXh0dXJlLW9ubHk=,tag:bm90LWEtcmVhbC1hdXRoLXRhZw==,type:str]

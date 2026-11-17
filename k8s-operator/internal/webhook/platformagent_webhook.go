@@ -78,6 +78,21 @@ const (
 	storageSizeRemovedWarnFmt = "spec.storage.size was removed, so the data volume size goes from %s to the operator default %s. Existing data claims keep their current size, because a PersistentVolumeClaim cannot shrink; only new claims get the default."
 )
 
+// The operator-namespace rule. Every write verb the operator holds on a
+// namespaced kind is in a Role bound in its own namespace and that
+// namespace's profile namespace (docs/designs/operator-namespaced-write-verbs.md),
+// so a PlatformAgent anywhere else fails its first Secret or Deployment write
+// with forbidden and sits Degraded/RBACIncomplete until someone copies the
+// Role and binds it there by hand. A create elsewhere is refused. An update
+// of one that already exists (made while the webhook was off, or before this
+// rule) is allowed with a warning, as validateStorageSize lets a stored value
+// through: the controller's own finalizer and annotation writes pass through
+// this webhook, so a refusal would wedge the object rather than move it.
+const (
+	operatorNamespaceRefusedFmt = "a PlatformAgent must be created in the operator's namespace %[1]q, not %[2]q: the Role that carries the operator's write verbs is bound in %[1]q and its profile namespace only, so an agent in %[2]q cannot be reconciled"
+	operatorNamespaceWarnFmt    = "this PlatformAgent is in namespace %[2]q, not the operator's namespace %[1]q, where the Role that carries the operator's write verbs is bound. It is reconciled only while %[2]q and %[3]q hold a copy of that Role and a RoleBinding to it; a new PlatformAgent outside %[1]q is refused"
+)
+
 // maxStorageSize is the largest spec.storage.size: 64TiB is the largest
 // persistent disk. A larger value is a typo (Ei for Gi, say) that would patch
 // both claims to a size no disk can reach, and a claim cannot shrink back.
@@ -92,12 +107,16 @@ var restrictedServiceAccounts = map[string]struct{}{
 // log is for logging in this package.
 var platformagentlog = logf.Log.WithName("platformagent-resource")
 
-// SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent in the manager.
-func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
+// SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent
+// in the manager. operatorNamespace is the namespace the operator runs in, as
+// main.go reads it from POD_NAMESPACE; PlatformAgentCustomValidator.OperatorNamespace
+// says what it holds the object to and what an empty value means.
+func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager, operatorNamespace string) error {
 	return ctrl.NewWebhookManagedBy(mgr, &agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
 		WithValidator(&PlatformAgentCustomValidator{
-			Client: mgr.GetAPIReader(),
+			Client:            mgr.GetAPIReader(),
+			OperatorNamespace: operatorNamespace,
 		}).
 		Complete()
 }
@@ -129,6 +148,15 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, platformAgen
 			platformAgent.Spec.Harness.Memory.UserProfileEnabled = ptr.To(false)
 		}
 	}
+	// The retired mode. An apply that still says "today" (an install.env or a
+	// manifest from before the removal) is moved, not refused: the object it
+	// writes is the one the operator runs anyway.
+	if platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+		if platformAgent.Spec.Mode != nil {
+			platformagentlog.Info("rewriting the retired spec.mode", "name", platformAgent.Name, "from", *platformAgent.Spec.Mode, "to", agentv1alpha1.PlatformAgentModeNext)
+		}
+		platformAgent.Spec.Mode = ptr.To(agentv1alpha1.PlatformAgentModeNext)
+	}
 
 	return nil
 }
@@ -138,6 +166,14 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, platformAgen
 // PlatformAgentCustomValidator struct to implement admission.Validator.
 type PlatformAgentCustomValidator struct {
 	Client client.Reader
+
+	// OperatorNamespace is the namespace the operator's pods run in, from
+	// POD_NAMESPACE (controller.OperatorNamespaceEnv) as main.go reads it.
+	// A PlatformAgent is admitted in this namespace only, because the Role
+	// that carries the operator's write verbs is bound there and in its
+	// profile namespace and nowhere else. Empty, as under `make run` off the
+	// cluster, skips the rule: there is no namespace to hold the object to.
+	OperatorNamespace string
 }
 
 var _ admission.Validator[*agentv1alpha1.PlatformAgent] = &PlatformAgentCustomValidator{}
@@ -167,6 +203,11 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	var allErrs field.ErrorList
 	var warnings admission.Warnings
 
+	// 0. The agent lives in the operator's namespace, where its write Role is bound.
+	namespaceErrs, namespaceWarnings := v.validateOperatorNamespace(oldObj, platformAgent)
+	allErrs = append(allErrs, namespaceErrs...)
+	warnings = append(warnings, namespaceWarnings...)
+
 	// 1. Enforce 1 PlatformAgent per cluster limit (enforced at cluster level on the Hub/Management cluster)
 	if v.Client != nil {
 		var list agentv1alpha1.PlatformAgentList
@@ -192,7 +233,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		// 2a. Validate sensitive environment variable overrides and forge credential Secret references
 		allErrs = append(allErrs, validateForgeCredentialEnvVars("platform-agent", platformAgent.Spec.Deployment.Env, platformAgent.Spec.Integration, depPath.Child("env"))...)
 		for i, env := range platformAgent.Spec.Deployment.Env {
-			if _, isSensitive := agentv1alpha1.SensitiveEnvVars[env.Name]; isSensitive {
+			if agentv1alpha1.IsSensitiveEnvVar(env.Name) {
 				allErrs = append(allErrs, field.Forbidden(
 					depPath.Child("env").Index(i).Child("name"),
 					fmt.Sprintf("overriding sensitive environment variable %q is forbidden", env.Name),
@@ -353,6 +394,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, storageErrs...)
 	warnings = append(warnings, storageWarnings...)
 
+	// 6. The bus's server count, on an update: an edit asking an existing bus
+	// for another count is refused here as the operator refuses it.
+	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -362,6 +407,58 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return warnings, nil
+}
+
+// validateOperatorNamespace holds a PlatformAgent to v.OperatorNamespace: a
+// create elsewhere is refused on metadata.namespace, naming the operator's
+// namespace and why; an update of an object already stored elsewhere (oldObj
+// not nil) is allowed with a warning naming the two namespaces that need the
+// Role. metadata.namespace is immutable, so an update never moves an object
+// into or out of the namespace. An empty OperatorNamespace (off the cluster)
+// checks nothing.
+func (v *PlatformAgentCustomValidator) validateOperatorNamespace(oldObj, platformAgent *agentv1alpha1.PlatformAgent) (field.ErrorList, admission.Warnings) {
+	if v.OperatorNamespace == "" || platformAgent.Namespace == v.OperatorNamespace {
+		return nil, nil
+	}
+	if oldObj != nil {
+		return nil, admission.Warnings{fmt.Sprintf(operatorNamespaceWarnFmt,
+			v.OperatorNamespace, platformAgent.Namespace, controller.ProfileNamespaceName(platformAgent))}
+	}
+	return field.ErrorList{field.Forbidden(field.NewPath("metadata", "namespace"),
+		fmt.Sprintf(operatorNamespaceRefusedFmt, v.OperatorNamespace, platformAgent.Namespace))}, nil
+}
+
+// validateBusReplicas refuses an update that sets
+// spec.harness.tuning.busReplicas to a count other than the one the existing
+// bus runs, with the operator's own message (controller.BusConversionRefusedMessage):
+// converting a bus empties it until #4225 brings the migration. Best effort:
+// the running count is the stored object's status.busReplicas, which an older
+// CRD prunes, so the operator's refusal on every pass is the enforcement and
+// this only refuses the edit early. An update that leaves the field as it was
+// is let through, so a CR the operator already holds to its count can still
+// be edited otherwise.
+func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
+	if oldObj == nil {
+		return nil
+	}
+	running := oldObj.Status.BusReplicas
+	asked := busReplicasField(platformAgent)
+	if (running != 1 && running != 3) || asked == nil || int32(*asked) == running { // #nosec G115 -- the CRD admits 1 or 3
+		return nil
+	}
+	if previous := busReplicasField(oldObj); previous != nil && *previous == *asked {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
+		controller.BusConversionRefusedMessage(int32(*asked), running)+ // #nosec G115 -- the CRD admits 1 or 3
+			" (The operator holds the bus to its count on every pass; this admission check only refuses the edit early.)")}
+}
+
+func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {
+	if pa.Spec.Harness == nil || pa.Spec.Harness.Tuning == nil {
+		return nil
+	}
+	return pa.Spec.Harness.Tuning.BusReplicas
 }
 
 // validateStorageSize refuses a spec.storage.size of zero or less or above

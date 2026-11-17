@@ -45,7 +45,7 @@ func TestSessionRecordDeletedAfterSessionTTL(t *testing.T) {
 		t.Fatalf("session record missing before reap: %v", err)
 	}
 
-	nc, err := nats.Connect(r.g.cfg.NATSURL)
+	nc, err := connectTest(r.g.cfg.NATSURL)
 	if err != nil {
 		t.Fatalf("nats connect: %v", err)
 	}

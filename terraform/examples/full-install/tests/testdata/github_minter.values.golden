@@ -9,6 +9,7 @@
   "kms":
     "key": "github-token-minter-key"
     "keyring": "github-token-minter-keyring"
+  "ksaName": "kubeagents-github-minter"
   "org": "acme"
   "repo": "infra"
 "global":

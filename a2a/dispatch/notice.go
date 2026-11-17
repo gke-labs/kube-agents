@@ -14,7 +14,11 @@ import (
 // addendum 1 adds the required-parameter check under parameters-invalid).
 // PROVISIONAL until the contract settles them.
 const (
-	ReasonTierNotAllowed    = "tier-not-allowed"
+	ReasonTierNotAllowed = "tier-not-allowed"
+	// ReasonTierWithdrawn refuses a submission queued at a tier its profile
+	// drains (lib.DispatchProfile.DrainingTiers, #3659): the tier left the
+	// profile after the submission was queued.
+	ReasonTierWithdrawn     = "tier-withdrawn"
 	ReasonVerifierRefused   = "verifier-refused"
 	ReasonParametersInvalid = "parameters-invalid"
 	ReasonQueueTimeout      = "queue-timeout"
@@ -26,6 +30,18 @@ const (
 	// a write permit on its credential while its tier has no Job runner: a
 	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
 	ReasonChangeNeedsJob = "change-needs-job"
+	// The re-check of a child whose parent is an AgentProfile task (#5686):
+	// the gateway checks the same at mint, and the dispatcher holds a child
+	// an older gateway sent, or one that breaks either rule, to them.
+	// ReasonParentUnchecked: the child carries no parent scope, so no gateway
+	// checked its chain and scope.
+	ReasonParentUnchecked = "parent-unchecked"
+	// ReasonParentCycle: the child's profile is already on its parent's
+	// chain, the chain head's one self-nest aside.
+	ReasonParentCycle = "parent-cycle"
+	// ReasonOutsideParentScope: the child's target lies outside its parent's
+	// scope.
+	ReasonOutsideParentScope = "outside-parent-scope"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.
@@ -99,5 +115,5 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.bus.Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
 }
