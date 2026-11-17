@@ -14,7 +14,9 @@ through `install.env`), the KSA `kubeagents-platform-agent` as a constant in
 By default the module grants the read-only role set (the composition's
 `permission_set = "read-only"`, also the installer's default). Pass `project_roles = []` to grant
 nothing and manage roles yourself — but note the agent fails every GCP call until an
-equivalent role set exists.
+equivalent role set exists. Pass `manage_iam = false` when an IAM administrator pre-provisions the
+GSA itself, its Workload Identity binding, and its project/scope IAM grants outside Terraform so
+this module neither creates/destroys the GSA nor calls `setIamPolicy`.
 
 There is no admin preset to mirror: the `gke-admin` bundle was removed (see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),

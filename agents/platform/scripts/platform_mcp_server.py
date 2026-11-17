@@ -315,7 +315,8 @@ def get_valid_regions(project_id: str) -> list[str]:
 def validate_location(location: str, project_id: str) -> str:
     """Verify GKE location. Return error message on failure, empty string on success."""
     valid_regions = get_valid_regions(project_id)
-    region_base = "-".join(location.split("-")[:2])
+    head, sep, tail = location.rpartition("-")
+    region_base = head if (sep and len(tail) == 1 and tail.isalpha()) else location
 
     if location not in valid_regions and region_base not in valid_regions:
         err = f"ERROR: Invalid GKE location '{location}' specified.\nPossible valid GKE regions in your project:\n"

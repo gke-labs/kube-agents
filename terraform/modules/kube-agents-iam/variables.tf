@@ -3,6 +3,13 @@ variable "project_id" {
   type        = string
 }
 
+variable "manage_iam" {
+  description = "Whether Terraform creates and manages the agent's GCP service account, its Workload Identity binding, and its project/scope IAM grants. Set false in sovereign or separation-of-duties environments where an IAM administrator pre-provisions those resources outside this state."
+  type        = bool
+  nullable    = false
+  default     = true
+}
+
 variable "service_account_id" {
   description = "IAM Service Account ID for Kube-Agents. Fixed per project, so a second install in the same project must set its own. Passing null selects this default (nullable = false), which lets root modules expose a passthrough variable."
   type        = string
@@ -224,33 +231,34 @@ variable "scope" {
 
   validation {
     condition = alltrue([
-      for project in var.scope.projects : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))
+      for project in var.scope.projects : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))
     ])
-    error_message = "Each scope.projects entry must be a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
+    error_message = "Each scope.projects entry must be a GCP project ID (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
   }
 
   validation {
     condition = alltrue([
-      for selector in concat(var.scope.shared_vpc_hosts, var.scope.metrics_scopes) : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", selector))
+      for selector in concat(var.scope.shared_vpc_hosts, var.scope.metrics_scopes) : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", selector))
     ])
-    error_message = "Each scope.shared_vpc_hosts and scope.metrics_scopes entry is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same fields: the Shared VPC host project, or the scoping project of the Metrics Scope."
+    error_message = "Each scope.shared_vpc_hosts and scope.metrics_scopes entry is a GCP project ID (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same fields: the Shared VPC host project, or the scoping project of the Metrics Scope."
   }
 
   validation {
     condition = alltrue([
       for cluster in var.scope.exclude.clusters :
-      can(regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.project_id))
+      length(cluster.project_id) <= 63
+      && can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]{0,62}$", cluster.project_id))
       && can(regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.location))
       && can(regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.cluster_name))
     ])
-    error_message = "Each scope.exclude.clusters entry names one cluster by project_id, location and cluster_name, each matching ^[a-z0-9][a-z0-9-]*$ and at most 63 characters, as the CRD requires."
+    error_message = "Each scope.exclude.clusters entry names one cluster by project_id, location and cluster_name, each at most 63 characters, as the CRD requires."
   }
 
   validation {
     condition = alltrue([
-      for entry in var.scope.exclude.projects : can(regex("^[a-z0-9*?\\[\\]!-]{1,63}$", entry))
+      for entry in var.scope.exclude.projects : can(regex("^[a-z0-9:*?\\[\\]!-]{1,63}$", entry))
     ])
-    error_message = "Each scope.exclude.projects entry is a project ID or a shell-style glob (lowercase letters, digits, - * ? [ ] !, up to 63 characters), the pattern the CRD accepts for the same field."
+    error_message = "Each scope.exclude.projects entry is a project ID or a shell-style glob (lowercase letters, digits, : - * ? [ ] !, up to 63 characters), the pattern the CRD accepts for the same field."
   }
 
   # The CRD declares the two project lists as sets and the cluster list as a
@@ -294,9 +302,9 @@ variable "scope_container_members" {
     condition = alltrue([
       for name, members in var.scope_container_members :
       can(regex("^(folders|organizations)/[0-9]+$", name))
-      && alltrue([for member in members : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
+      && alltrue([for member in members : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
     ])
-    error_message = "Each scope_container_members key is folders/<numeric id> or organizations/<numeric id>, and each member a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's container_members output as it is."
+    error_message = "Each scope_container_members key is folders/<numeric id> or organizations/<numeric id>, and each member a GCP project ID (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's container_members output as it is."
   }
 }
 
@@ -318,9 +326,9 @@ variable "scope_selector_members" {
   validation {
     condition = alltrue([
       for name, members in var.scope_selector_members :
-      can(regex("^(sharedVpcHosts|metricsScopes)/[a-z][a-z0-9-]{4,28}[a-z0-9]$", name))
-      && alltrue([for member in members : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
+      can(regex("^(sharedVpcHosts|metricsScopes)/([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", name))
+      && alltrue([for member in members : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
     ])
-    error_message = "Each scope_selector_members key is sharedVpcHosts/<project id> or metricsScopes/<project id>, and each member a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's members output as it is."
+    error_message = "Each scope_selector_members key is sharedVpcHosts/<project id> or metricsScopes/<project id>, and each member a GCP project ID (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's members output as it is."
   }
 }

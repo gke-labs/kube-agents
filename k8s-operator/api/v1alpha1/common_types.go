@@ -2147,14 +2147,14 @@ type ScopedServiceAccountPoolSpec struct {
 type ScopedServiceAccount struct {
 	// ProjectID is the project whose clusters this account reads, which need
 	// not be the project the agent runs in.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:Pattern=`^([a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*$`
 	// +kubebuilder:validation:MaxLength=63
 	ProjectID string `json:"projectId"`
 
 	// ServiceAccountEmail is the account scoped to this project. It lives in
 	// the host project, whatever project it reads; Terraform's
 	// `scoped_service_accounts` output is the source of these values.
-	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$`
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{1,30}(\.[a-z][a-z0-9-]{0,15})?\.iam\.gserviceaccount\.com$`
 	ServiceAccountEmail string `json:"serviceAccountEmail"`
 }
 

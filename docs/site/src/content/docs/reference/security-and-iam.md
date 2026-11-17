@@ -94,6 +94,8 @@ The default **read-only** set binds read roles, with one qualification under the
 - `roles/mcp.toolUser` — call the GKE MCP server.
 - `roles/serviceusage.serviceUsageConsumer` — consume API quota for Developer Knowledge MCP queries.
 
+On a custom `universe_domain` (Google Cloud Dedicated or Google Cloud Sovereign Cloud), `full-install` omits `roles/gkehub.viewer`, `roles/cloudtrace.user`, and `roles/mcp.toolUser` from `read-only` automatically because those commercial-only services are absent there.
+
 `roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project. The grants of the scope's read roles, per project or inherited from a declared folder or organisation, extend that to every cluster in the scope. The [scoped service account pool](#the-scoped-service-account-pool) is where that narrowing is designed to land. It is suspended, so today nothing narrows it; the pool section says why. [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope) doesn't narrow the grant either. The credential broker and `kube-proxy` refuse an excluded cluster's Kubernetes API to every caller, but the identity's roles still reach it.
 
 A binding on a folder or organisation named in [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) is inherited by every project beneath it, which is what makes a container worth declaring and also what a grant there reaches.
@@ -336,6 +338,8 @@ What else leaves the cluster, and whether you can turn it off:
 | `raw.githubusercontent.com`                                                                  | LiteLLM, for its model-price table at startup                                                                                                                     | No       | Not fetched with `openai_compatible`, which sets `LITELLM_LOCAL_MODEL_COST_MAP=True`. With other providers a failed fetch falls back to the table in the image.                                                                                                                                               |
 
 The install itself runs from a workstation, not the cluster, and that machine reaches the internet for Terraform providers, the installer's own tools and the cert-manager chart on `charts.jetstack.io` (`SKIP_CERT_MANAGER=true` skips that chart on a cluster that already runs cert-manager).
+
+On a custom `universe_domain`, the installer and Terraform composition refuse any `MODEL_PROVIDER` outside `openai_compatible` and `vertex_ai` unless `--allow-external-model-egress` (`ALLOW_EXTERNAL_MODEL_EGRESS=true`) is granted explicitly.
 
 ### Each A2A session pod is its own bus identity
 

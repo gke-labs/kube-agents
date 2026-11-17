@@ -3,6 +3,14 @@ project_id   = "my-gcp-project"
 cluster_name = "kube-agents"
 location     = "us-central1"
 
+# Optional: Google Cloud Sovereign Cloud / Google Cloud Dedicated universe API
+# domain (defaults to "googleapis.com"), plus explicit VPC / subnetwork names
+# when the project has no 'default' VPC network.
+# universe_domain             = "universe.example.test"
+# vpc_network                 = "platform-net"
+# vpc_subnetwork              = "platform-subnet"
+# allow_external_model_egress = false
+
 # Required: the harness API server key. Generate a strong random value, e.g.
 #   openssl rand -hex 32
 api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
@@ -211,6 +219,12 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # gitops_token_secret_name = "bitbucket-forge-token"
 # gitops_identity          = "{0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e}"
 # gitops_ca_secret_name    = "bitbucket-forge-ca" # Data Center behind a private CA
+# Or self-managed Gitea (gitops_forge = "gitea", with gitops_host and owner/repo).
+# gitops_forge             = "gitea"
+# gitops_host              = "gitea.example.test"
+# gitops_repo_path         = "platform/gitops"
+# gitops_token_secret_name = "gitea-forge-token"
+# gitops_ca_secret_name    = "gitea-forge-ca"
 
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack

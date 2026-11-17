@@ -150,9 +150,9 @@ var refusalVerbs = sets.New(
 )
 
 // validClusterID accepts InClusterID, a kubeconfig context name for GKE
-// (gke_{project}_{location}_{cluster}, where a legacy domain-scoped project is
-// {domain}:{name}, as the installer admits) and one for kind (kind-{name}).
-var validClusterID = regexp.MustCompile(`^(in-cluster|gke_([a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+|kind-[a-z0-9._-]+)\z`)
+// (gke_{project}_{location}_{cluster}, where a partitioned or legacy domain-scoped
+// project is {prefix}:{name}, as the installer admits) and one for kind (kind-{name}).
+var validClusterID = regexp.MustCompile(`^(in-cluster|gke_([a-z0-9]([a-z0-9.-]*[a-z0-9])?:)?[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+|kind-[a-z0-9._-]+)\z`)
 
 // discoverySegment is an API group or version name.
 var discoverySegment = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?\z`)

@@ -11,8 +11,8 @@ variable "shared_vpc_hosts" {
   default     = []
 
   validation {
-    condition     = alltrue([for entry in var.shared_vpc_hosts : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", entry))])
-    error_message = "Each shared_vpc_hosts entry is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
+    condition     = alltrue([for entry in var.shared_vpc_hosts : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", entry))])
+    error_message = "Each shared_vpc_hosts entry is a GCP project ID (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
   }
 }
 
@@ -29,8 +29,8 @@ variable "metrics_scopes" {
   default     = []
 
   validation {
-    condition     = alltrue([for entry in var.metrics_scopes : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", entry))])
-    error_message = "Each metrics_scopes entry is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
+    condition     = alltrue([for entry in var.metrics_scopes : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", entry))])
+    error_message = "Each metrics_scopes entry is a GCP project ID (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
   }
 }
 
@@ -107,8 +107,8 @@ variable "quota_project" {
   # module is in the plan of whether or not a selector is declared, so the
   # CRD's pattern here would refuse every plan and destroy of such an install.
   validation {
-    condition     = can(regex("^([a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.quota_project))
-    error_message = "quota_project is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$, or a legacy domain-scoped domain:name)."
+    condition     = can(regex("^([a-z0-9]([a-z0-9.-]*[a-z0-9])?:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.quota_project))
+    error_message = "quota_project is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$, a partitioned <partition>:<project>, or a legacy domain-scoped domain:name)."
   }
 }
 
@@ -149,5 +149,17 @@ variable "member_cap" {
   validation {
     condition     = var.member_cap >= 1 && var.member_cap <= 5000 && floor(var.member_cap) == var.member_cap
     error_message = "member_cap is a whole number from 1 to 5000, the bounds the CRD puts on spec.scope.maxProjects."
+  }
+}
+
+variable "universe_domain" {
+  description = "Google Cloud API universe domain used for Compute, Monitoring, Resource Manager, and Cloud Asset Inventory plan-time lookups (default: googleapis.com)."
+  type        = string
+  nullable    = false
+  default     = "googleapis.com"
+
+  validation {
+    condition     = trimspace(var.universe_domain) == "" || (length(trimspace(var.universe_domain)) <= 253 && can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", lower(trimspace(var.universe_domain)))))
+    error_message = "universe_domain must be empty or a valid multi-label DNS domain of at most 253 characters (for example, googleapis.com)."
   }
 }

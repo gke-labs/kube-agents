@@ -106,6 +106,36 @@ func TestScopeUndeclared_NamesTheClustersBeyondTheHost(t *testing.T) {
 	}
 }
 
+func TestScopeUndeclared_PartitionedProjectAndSovereignRegion(t *testing.T) {
+	const partitionedProj = "part0:sample-project"
+	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+	agent.Spec.Harness.ProjectID = partitionedProj
+	agent.Spec.Harness.Location = "u-region-north1"
+	hostRef := usageClusterRef{Name: "c", Project: partitionedProj, Location: "u-region-north1"}
+	neighbourRef := usageClusterRef{Name: "workload-a", Project: partitionedProj, Location: "u-region-north1"}
+	otherPartitionedRef := usageClusterRef{Name: "workload-b", Project: "part0:second-project", Location: "u-region-north1"}
+
+	h := scopeHarness(t, agent, hostRef, neighbourRef, otherPartitionedRef)
+	h.poll(5)
+	cond := scopeCondition(t, h)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != scopeUndeclaredReason {
+		t.Fatalf("condition = %+v, want True/%s", cond, scopeUndeclaredReason)
+	}
+	for _, want := range []string{
+		"1 cluster(s) beyond the host cluster c",
+		"workload-a (part0:sample-project/u-region-north1)",
+		"management project part0:sample-project",
+		"spec.scope.projects",
+	} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("message %q lacks %q", cond.Message, want)
+		}
+	}
+	if strings.Contains(cond.Message, "workload-b") || strings.Contains(cond.Message, "part0:second-project") {
+		t.Errorf("message %q should ignore clusters outside management project part0:sample-project", cond.Message)
+	}
+}
+
 // A neighbour that appears while the condition holds rewrites the message, so
 // the names on the CR are the clusters registered now; an unchanged set writes
 // nothing.

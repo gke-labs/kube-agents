@@ -21,10 +21,11 @@ const (
 
 var (
 	excludeNamePart      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}\z`)
+	excludeProjectPart   = regexp.MustCompile(`^(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]{0,62}\z`)
 	excludeProjectNumber = regexp.MustCompile(`^[0-9]+\z`)
 	// A GKE context name, as validClusterID admits it: gke_{project}_{location}_{cluster},
-	// where a legacy domain-scoped project is {domain}:{name}.
-	gkeClusterID = regexp.MustCompile(`^gke_((?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z0-9-]+)_([a-z0-9-]+)_([a-z0-9-]+)\z`)
+	// where a partitioned or legacy domain-scoped project is {prefix}:{name}.
+	gkeClusterID = regexp.MustCompile(`^gke_((?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9-]+)_([a-z0-9-]+)_([a-z0-9-]+)\z`)
 )
 
 type clusterRef struct{ project, location, cluster string }
@@ -101,7 +102,11 @@ func parseExclusions(path string) (map[clusterRef]bool, map[[2]string]bool, erro
 		parts := [3]string{}
 		for i, key := range []string{"projectId", "location", "clusterName"} {
 			value, ok := entry[key].(string)
-			if !ok || !excludeNamePart.MatchString(value) {
+			pattern := excludeNamePart
+			if i == 0 {
+				pattern = excludeProjectPart
+			}
+			if !ok || len(value) > 63 || !pattern.MatchString(value) {
 				return nil, nil, fmt.Errorf("the install's scope file can't be parsed")
 			}
 			parts[i] = value

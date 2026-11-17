@@ -1,6 +1,6 @@
 output "service_account_email" {
-  description = "Email of the created IAM service account"
-  value       = google_service_account.agent.email
+  description = "Email of the created (or, with manage_iam = false, pre-provisioned) IAM service account"
+  value       = local.service_account_email
 }
 
 output "agent_project_roles" {
@@ -24,7 +24,7 @@ output "scoped_service_accounts" {
     comparable with the broker's mapping. The accounts hold no IAM grant; see
     scoped_pool.tf.
   EOT
-  value       = { for key in keys(local.scoped_pool) : key => google_service_account.scoped[key].email }
+  value       = var.manage_iam ? { for key in keys(local.scoped_pool) : key => google_service_account.scoped[key].email } : {}
 }
 
 output "scope_projects" {

@@ -114,8 +114,13 @@ readonly GITLAB_TOKEN_SECRET_KEY="token"
 readonly GITLAB_READ_TOKEN_SECRET_KEY="read-token"
 readonly GITLAB_TOKEN_FIELD_MANAGER="kube-agents-installer"
 readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
+readonly DEFAULT_VPC_NETWORK_NAME="default"
+readonly GITEA_MAX_NAMESPACE_LENGTH=40
+readonly GITEA_MAX_HOST_LENGTH=253
 readonly STOCKOUT_INVESTIGATOR_PROMPT_DESC="GKE Stockout Investigator watches cluster-autoscaler noScaleUp Cloud Logging events for capacity or quota failures, diagnoses the root cause, and opens a GitOps remediation PR or posts diagnostics to your chat channel."
 readonly STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE="No Google Chat or Slack home channel is configured yet, so proactive stockout alerts cannot be delivered immediately (they stay queued in HomeChannelUnset until a home channel is set); defaulting to No."
+readonly STOCKOUT_INVESTIGATOR_MANAGE_IAM_NOTE="MANAGE_IAM=false is set, and the GKE Stockout Investigator requires Terraform-managed Pub/Sub IAM bindings; defaulting to No."
+readonly STOCKOUT_INVESTIGATOR_MANAGE_IAM_MENU_ERR="GKE Stockout Investigator requires MANAGE_IAM=true (it binds Pub/Sub IAM roles); set MANAGE_IAM=true in install.env first."
 readonly STOCKOUT_INVESTIGATOR_PROMPT_LABEL="Enable GKE Stockout Investigator for automated scale-up failure diagnostics?"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
@@ -465,6 +470,14 @@ PARAM_DRY_RUN="${DRY_RUN:-false}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
 PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
+PARAM_UNIVERSE_DOMAIN="${UNIVERSE_DOMAIN:-}"
+PARAM_UNIVERSE_DOMAIN_PASSED="false"
+PARAM_VPC_NETWORK="${VPC_NETWORK:-}"
+PARAM_VPC_NETWORK_PASSED="false"
+PARAM_VPC_SUBNETWORK="${VPC_SUBNETWORK:-}"
+PARAM_VPC_SUBNETWORK_PASSED="false"
+PARAM_ALLOW_EXTERNAL_MODEL_EGRESS="${ALLOW_EXTERNAL_MODEL_EGRESS:-}"
+PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED="false"
 # Only consulted when this run creates the cluster. Against one that already
 # exists the tfvars generator's live probe decides the shape; see
 # write_tfvars_from_state in scripts/installer/installer_common.sh. Empty
@@ -478,6 +491,8 @@ PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
 PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
+PARAM_MANAGE_IAM="${MANAGE_IAM:-}"
+PARAM_MANAGE_IAM_PASSED="false"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
@@ -659,6 +674,7 @@ PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
 # install.env alone and refuses a flag it would otherwise validate and drop.
 SCOPE_FLAG_PASSED="false"
+SOVEREIGN_FLAG_PASSED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
@@ -813,9 +829,17 @@ Flags for AI Agents & Automation:
                                 pre-apply checks, print lifecycle commands, and
                                 exit without applying
   --dry-run                     Validate prerequisites & output config/plan without creating resources
-  --gcp-project-id=ID           Target GCP Project ID
+  --gcp-project-id=ID           Target GCP Project ID (supports sovereign
+                                <partition>:<project-slug> IDs)
   --gcp-region=REGION           Target GCP Region (default: install.defaults.env
                                 DEFAULT_REGION, currently us-central1)
+  --universe-domain=DOMAIN      Cloud universe API domain for Google Cloud Dedicated /
+                                Sovereign Cloud (default: gcloud core/universe_domain,
+                                else googleapis.com)
+  --vpc-network=NAME            VPC network for a cluster this run creates (default:
+                                "default"; required in projects with no default VPC)
+  --vpc-subnetwork=NAME         Subnetwork inside --vpc-network for a cluster this run
+                                creates (optional; defaults to auto-mode subnet)
   --gke-cluster-name=NAME       GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
   --gke-cluster-mode=MODE       Shape of a cluster this run creates: autopilot | standard
@@ -836,6 +860,11 @@ Flags for AI Agents & Automation:
                                 --model-default-name and --litellm-env-secret
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
+  --allow-external-model-egress[=BOOL]
+                                Authorize external SaaS model egress (any provider
+                                other than openai_compatible and vertex_ai) when
+                                --universe-domain is not googleapis.com (default:
+                                false)
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
                                 request that names none, for a self-hosted backend
                                 whose prompt and output share one window
@@ -893,14 +922,17 @@ Flags for AI Agents & Automation:
   --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
   --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
                                 DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
-                                project's full path; on Bitbucket workspace/repo-slug (Cloud) or
-                                PROJECTKEY/repo-slug (Data Center), or the repository's URL
-                                (required, no default, for GitLab and Bitbucket)
-  --gitops-forge=FORGE          Forge holding the GitOps repo: github, gitlab, bitbucket (Bitbucket
-                                Cloud) or bitbucket-datacenter (default: github). For gitlab,
-                                --gitops-repo is the project's full path (group/subgroup/project);
-                                for bitbucket, workspace/repo-slug; for bitbucket-datacenter,
-                                PROJECTKEY/repo-slug. --gitops-org is not used for these
+                                project's full path; on Gitea owner/repo-slug; on Bitbucket
+                                workspace/repo-slug (Cloud) or PROJECTKEY/repo-slug (Data
+                                Center), or the repository's URL (required, no default, for
+                                GitLab, Gitea and Bitbucket)
+  --gitops-forge=FORGE          Forge holding the GitOps repo: github, gitlab, gitea, bitbucket
+                                (Bitbucket Cloud) or bitbucket-datacenter (default: github). For
+                                gitlab, --gitops-repo is the project's full path
+                                (group/subgroup/project); for gitea, owner/repo-slug (with
+                                --gitops-host); for bitbucket, workspace/repo-slug; for
+                                bitbucket-datacenter, PROJECTKEY/repo-slug. --gitops-org is not
+                                used for these
   --gitops-host=HOST            The forge's hostname. With github: a GitHub Enterprise Server
                                 hostname (default: github.com). --gitops-org and --gitops-repo
                                 are then on that host, and the GitHub App must be created
@@ -909,28 +941,32 @@ Flags for AI Agents & Automation:
                                 github.com, githubusercontent.com, ghe.com or another
                                 domain that GitHub operates is refused. With gitlab: a
                                 self-managed GitLab hostname (default: gitlab.com). With
+                                gitea: required, the self-managed Gitea hostname. With
                                 bitbucket: not needed (bitbucket.org only). With
                                 bitbucket-datacenter: required, the instance's hostname; the
                                 instance must serve at the root path on port 443
   --gitops-token-file=PATH      File holding the forge's access token: GitLab (scopes: api,
-                                write_repository), Bitbucket Cloud (an API token with scopes, or an
-                                access token), or Bitbucket Data Center (a project HTTP access
-                                token with Repository write); read into the Kubernetes Secret
-                                after the apply and never stored. Without it the installer
-                                prompts, or, non-interactively, leaves the Secret for you to
-                                create. Alias: --gitlab-token-file
+                                write_repository), Gitea (scopes: write:repository, write:issue,
+                                read:user),
+                                Bitbucket Cloud (an API token with scopes, or an access token),
+                                or Bitbucket Data Center (a project HTTP access token with
+                                Repository write); read into the Kubernetes Secret after the
+                                apply and never stored. Without it the installer prompts, or,
+                                non-interactively, leaves the Secret for you to create.
+                                Alias: --gitlab-token-file
   --gitops-token-secret=NAME    Kubernetes Secret holding the token (default: gitlab-forge-token
-                                for gitlab, bitbucket-forge-token for Bitbucket).
-                                Alias: --gitlab-token-secret
+                                for gitlab, gitea-forge-token for gitea, bitbucket-forge-token
+                                for Bitbucket). Alias: --gitlab-token-secret
   --gitops-identity=ID          Bitbucket only: the account an access token acts as. On
                                 bitbucket, the account UUID; needed for a workspace, project
                                 or repository access token, not for an API token. On
                                 bitbucket-datacenter, rarely needed: the login is read from
                                 the X-AUSERNAME response header
   --gitops-ca-file=PATH         PEM CA that signed the certificate of a self-managed GitLab, a
-                                Bitbucket Data Center or a GitHub Enterprise Server (a private
-                                CA); needs --gitops-host. Read after the apply into Secret
-                                gitlab-forge-ca (GitLab), bitbucket-forge-ca (Bitbucket Data
+                                self-managed Gitea, a Bitbucket Data Center or a GitHub
+                                Enterprise Server (a private CA); needs --gitops-host. Read
+                                after the apply into Secret gitlab-forge-ca (GitLab),
+                                gitea-forge-ca (Gitea), bitbucket-forge-ca (Bitbucket Data
                                 Center) or github-forge-ca (GitHub Enterprise Server). The credential
                                 broker trusts it for that host only. On GitHub Enterprise
                                 Server the token minter trusts it too, for all of its calls,
@@ -944,6 +980,10 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
+  --manage-iam[=true|false]     Whether Terraform manages the agent GSA, Workload Identity
+                                binding, and project/scope IAM grants. Pass --manage-iam=false
+                                (or --no-manage-iam) when pre-provisioned out of band
+                                (default: DEFAULT_MANAGE_IAM, currently true)
   --scope-projects=IDS          GCP projects beyond the install's whose GKE clusters get a
                                 Cluster Agent (space- or comma-separated); the agent's
                                 service account is granted the read roles in each
@@ -1216,6 +1256,14 @@ require_scope_flag_value() {
   exit 1
 }
 
+require_space_flag_value() {
+  local flag="$1" val="${2-}" argc="$3"
+  if [ "$argc" -lt 2 ] || [ -z "$val" ] || [[ "$val" == -* ]]; then
+    print_error "${flag} requires a value."
+    exit 1
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1224,12 +1272,39 @@ parse_args() {
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --gcp-project-id) require_space_flag_value "$1" "${2-}" "$#"; PARAM_PROJECT_ID="$2"; shift 2 ;;
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --gcp-region) require_space_flag_value "$1" "${2-}" "$#"; PARAM_REGION="$2"; shift 2 ;;
+      --universe-domain=*)
+        PARAM_UNIVERSE_DOMAIN="${1#*=}"; PARAM_UNIVERSE_DOMAIN_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_UNIVERSE_DOMAIN"; shift ;;
+      --universe-domain)
+        require_space_flag_value "$1" "${2-}" "$#"
+        PARAM_UNIVERSE_DOMAIN="$2"; PARAM_UNIVERSE_DOMAIN_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        require_defaulted_flag_value "$1" "$PARAM_UNIVERSE_DOMAIN"; shift 2 ;;
+      --vpc-network=*)
+        PARAM_VPC_NETWORK="${1#*=}"; PARAM_VPC_NETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_VPC_NETWORK"; shift ;;
+      --vpc-network)
+        require_space_flag_value "$1" "${2-}" "$#"
+        PARAM_VPC_NETWORK="$2"; PARAM_VPC_NETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        require_defaulted_flag_value "$1" "$PARAM_VPC_NETWORK"; shift 2 ;;
+      --vpc-subnetwork=*)
+        PARAM_VPC_SUBNETWORK="${1#*=}"; PARAM_VPC_SUBNETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_VPC_SUBNETWORK"; shift ;;
+      --vpc-subnetwork)
+        require_space_flag_value "$1" "${2-}" "$#"
+        PARAM_VPC_SUBNETWORK="$2"; PARAM_VPC_SUBNETWORK_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        require_defaulted_flag_value "$1" "$PARAM_VPC_SUBNETWORK"; shift 2 ;;
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gke-cluster-name) require_space_flag_value "$1" "${2-}" "$#"; PARAM_CLUSTER_NAME="$2"; shift 2 ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
+      --allow-external-model-egress|--allow-external-model-egress=*)
+        PARAM_ALLOW_EXTERNAL_MODEL_EGRESS="$(flag_bool_value "$1")"; PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ALLOW_EXTERNAL_MODEL_EGRESS"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --litellm-redaction|--litellm-redaction=*)
         PARAM_LITELLM_REDACTION_ENABLED="$(flag_bool_value "$1")"
@@ -1266,6 +1341,10 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; PARAM_KMS_KEY_GIVEN="true"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
+      --manage-iam|--manage-iam=*)
+        PARAM_MANAGE_IAM="$(flag_bool_value "$1")"; PARAM_MANAGE_IAM_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_MANAGE_IAM"; shift ;;
+      --no-manage-iam) PARAM_MANAGE_IAM="false"; PARAM_MANAGE_IAM_PASSED="true"; SOVEREIGN_FLAG_PASSED="true"; shift ;;
       --scope-projects=*)
         PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
@@ -2121,7 +2200,7 @@ warn_unrecorded_interview_answers() {
     OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
     LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
     USER_PROFILE_ENABLED ENABLE_STOCKOUT_INVESTIGATOR GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
-    GITOPS_IDENTITY)
+    GITOPS_IDENTITY UNIVERSE_DOMAIN ALLOW_EXTERNAL_MODEL_EGRESS VPC_NETWORK VPC_SUBNETWORK)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
@@ -2138,6 +2217,14 @@ warn_unrecorded_interview_answers() {
     if ! install_env_records_key "$file" "$key"; then
       if [ "$switched_to_openai_compatible" = "true" ] && [[ "$key" == OPENAI_COMPATIBLE_* ]]; then
         drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "UNIVERSE_DOMAIN" ] && [ "${PARAM_UNIVERSE_DOMAIN_PASSED:-false}" != "true" ] && is_custom_universe_domain "${UNIVERSE_DOMAIN:-}"; then
+        drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "ALLOW_EXTERNAL_MODEL_EGRESS" ] && [ "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED:-false}" != "true" ] && is_truthy "${ALLOW_EXTERNAL_MODEL_EGRESS:-}"; then
+        drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "VPC_NETWORK" ] && [ "${PARAM_VPC_NETWORK_PASSED:-false}" != "true" ] && [ -n "${VPC_NETWORK:-}" ]; then
+        drifted="${drifted}${drifted:+ }${key}"
+      elif [ "$key" = "VPC_SUBNETWORK" ] && [ "${PARAM_VPC_SUBNETWORK_PASSED:-false}" != "true" ] && [ -n "${VPC_SUBNETWORK:-}" ]; then
+        drifted="${drifted}${drifted:+ }${key}"
       elif [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" != "true" ] && [ "${STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP:-false}" != "true" ]; then
         # An install.env written before this key existed resolves absent
         # ENABLE_STOCKOUT_INVESTIGATOR as false in write_tfvars_from_state,
@@ -2146,6 +2233,18 @@ warn_unrecorded_interview_answers() {
           drifted="${drifted}${drifted:+ }${key}"
         fi
       fi
+      continue
+    fi
+    if [ "$key" = "UNIVERSE_DOMAIN" ] && [ "${PARAM_UNIVERSE_DOMAIN_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "ALLOW_EXTERNAL_MODEL_EGRESS" ] && [ "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "VPC_NETWORK" ] && [ "${PARAM_VPC_NETWORK_PASSED:-false}" = "true" ]; then
+      continue
+    fi
+    if [ "$key" = "VPC_SUBNETWORK" ] && [ "${PARAM_VPC_SUBNETWORK_PASSED:-false}" = "true" ]; then
       continue
     fi
     if [ "$key" = "ENABLE_STOCKOUT_INVESTIGATOR" ] && { [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" = "true" ] || [ "${STOCKOUT_DRIFT_WARNED_IN_BOOTSTRAP:-false}" = "true" ]; }; then
@@ -2202,7 +2301,10 @@ warn_unrecorded_interview_answers() {
         ;;
     esac
   done
-  print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you."
+  case " $drifted " in
+    *" UNIVERSE_DOMAIN "* | *" VPC_NETWORK "* | *" VPC_SUBNETWORK "*) ;;
+    *) print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you." ;;
+  esac
 }
 
 # The one answer checked on every run, TTY or not, and unlike the interview
@@ -2823,6 +2925,46 @@ bootstrap_install_env_file() {
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
       false \
       "every later install.sh, upgrade.sh and --menu run"
+    if [ "${PARAM_UNIVERSE_DOMAIN_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" UNIVERSE_DOMAIN --universe-domain \
+        "${PARAM_UNIVERSE_DOMAIN:-}" \
+        "A later run without it resolves UNIVERSE_DOMAIN from ${destination} (defaulting an unrecorded key to googleapis.com on upgrade.sh and uninstall.sh), which can aim later runs at the wrong cloud universe." \
+        false \
+        "every later install.sh, upgrade.sh and uninstall.sh run"
+    fi
+    if [ "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" ALLOW_EXTERNAL_MODEL_EGRESS --allow-external-model-egress \
+        "${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS:-}" \
+        "A later run without it reads ALLOW_EXTERNAL_MODEL_EGRESS from ${destination}, so upgrade.sh and --menu refuse external model egress unless the file records true." \
+        true \
+        "every later install.sh run"
+    fi
+    if [ "${PARAM_MANAGE_IAM_PASSED:-false}" = "true" ]; then
+      local manage_iam_recorded=""
+      manage_iam_recorded="$(recorded_install_env_value "$destination" MANAGE_IAM 2>/dev/null || true)"
+      if ! is_truthy "${PARAM_MANAGE_IAM:-true}" || { [ -n "$manage_iam_recorded" ] && ! is_truthy "$manage_iam_recorded"; }; then
+        warn_flag_beats_unrecorded_file_value "$destination" MANAGE_IAM --manage-iam \
+          "${PARAM_MANAGE_IAM:-}" \
+          "A later run without it reads MANAGE_IAM from ${destination}, which defaults an unrecorded or blank key to true and tells Terraform to manage IAM resources." \
+          true \
+          "every later install.sh run" \
+          true
+      fi
+    fi
+    if [ "${PARAM_VPC_NETWORK_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" VPC_NETWORK --vpc-network \
+        "${PARAM_VPC_NETWORK:-}" \
+        "A later run without it omits vpc_network from terraform.tfvars unless ${destination} records VPC_NETWORK." \
+        false \
+        "every later install.sh run"
+    fi
+    if [ "${PARAM_VPC_SUBNETWORK_PASSED:-false}" = "true" ]; then
+      warn_flag_beats_unrecorded_file_value "$destination" VPC_SUBNETWORK --vpc-subnetwork \
+        "${PARAM_VPC_SUBNETWORK:-}" \
+        "A later run without it omits vpc_subnetwork from terraform.tfvars unless ${destination} records VPC_SUBNETWORK." \
+        false \
+        "every later install.sh run"
+    fi
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_GKE_BACKUP_PLAN --enable-gke-backup-plan \
       "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" \
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
@@ -3083,6 +3225,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" PROJECT_ID "${PROJECT_ID:-}"
   write_env_var "$tmp" CLUSTER_NAME "${CLUSTER_NAME:-}"
   write_env_var "$tmp" REGION "${REGION:-}"
+  write_env_var "$tmp" UNIVERSE_DOMAIN "${UNIVERSE_DOMAIN:-${DEFAULT_UNIVERSE_DOMAIN:-googleapis.com}}"
+  if [ -n "${VPC_NETWORK:-}" ]; then
+    write_env_var "$tmp" VPC_NETWORK "${VPC_NETWORK}"
+  fi
+  if [ -n "${VPC_SUBNETWORK:-}" ]; then
+    write_env_var "$tmp" VPC_SUBNETWORK "${VPC_SUBNETWORK}"
+  fi
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
   # Only when set: a first install that inherits a size records it, because
   # every later run reads the file alone, and a size missing there would read
@@ -3091,6 +3240,9 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
   fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
+  if is_truthy "${ALLOW_EXTERNAL_MODEL_EGRESS:-}"; then
+    write_env_var "$tmp" ALLOW_EXTERNAL_MODEL_EGRESS "true"
+  fi
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
   write_env_var "$tmp" LITELLM_REDACTION_ENABLED "${LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
@@ -3105,6 +3257,9 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  if [ -n "${MANAGE_IAM:-}" ] && ! is_truthy "$MANAGE_IAM"; then
+    write_env_var "$tmp" MANAGE_IAM "$MANAGE_IAM"
+  fi
   # The daily alert ceilings, recorded even when empty. An empty key keeps the
   # image default, and the line shows where to set the ceiling. A value that
   # was exported only for this run then also applies on the next upgrade.sh.
@@ -3977,10 +4132,11 @@ PROJECT_LIST_LIMIT=5
 # so a numeric answer is unambiguously a menu index.
 is_valid_project_id() {
   local id="${1:-}"
-  # Legacy domain-scoped IDs ("example.com:my-project") keep the same rules on
-  # each side of the colon.
+  # Management-project rule (shared with kube-agents-scope-resolver's
+  # quota_project): accepts both legacy domain-scoped IDs ("example.com:proj")
+  # and sovereign partition-prefixed IDs ("part0:sample-project", "p:proj").
   if [[ "$id" == *:* ]]; then
-    [[ "${id%%:*}" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] || return 1
+    [[ "${id%%:*}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
     id="${id#*:}"
   fi
   [[ "$id" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]
@@ -4052,6 +4208,227 @@ select_gcp_project() {
       print_error "'$answer' is neither a menu number nor a valid GCP project ID (6-30 characters: lowercase letters, digits, hyphens)."
     fi
   done
+}
+
+# Resolves the Google Cloud universe_domain for this run:
+#   1. --universe-domain / UNIVERSE_DOMAIN (PARAM_UNIVERSE_DOMAIN)
+#   2. Active gcloud property core/universe_domain
+#   3. Interactive environment menu (Google Cloud vs Google Cloud Dedicated /
+#      Sovereign Cloud) when neither flag/env nor active custom universe settled it
+#   4. DEFAULT_UNIVERSE_DOMAIN ("googleapis.com")
+select_universe_domain() {
+  local dest_var="$1"
+  local candidate="${PARAM_UNIVERSE_DOMAIN:-}"
+  local gcloud_universe=""
+  gcloud_universe=$(gcloud config get-value core/universe_domain 2>/dev/null || echo "")
+  [ "$gcloud_universe" = "(unset)" ] && gcloud_universe=""
+
+  if [ -z "$candidate" ] && [ -n "$gcloud_universe" ] && is_custom_universe_domain "$gcloud_universe"; then
+    candidate="$gcloud_universe"
+  elif [ -z "$candidate" ] && [ "${PARAM_NON_INTERACTIVE:-false}" != "true" ] && has_controlling_tty; then
+    local env_choice="1"
+    prompt_menu "Select Google Cloud Environment:" \
+      "Google Cloud (${DEFAULT_UNIVERSE_DOMAIN})" \
+      "Google Cloud Dedicated / Sovereign Cloud (custom universe_domain)" \
+      env_choice
+    if [ "$env_choice" = "2" ]; then
+      local default_custom=""
+      while true; do
+        prompt_read "Universe Domain (for example universe.example.test)" candidate "$default_custom"
+        if is_valid_universe_domain "$candidate" && is_custom_universe_domain "$candidate"; then
+          break
+        fi
+        print_error "Enter a custom universe_domain (bare lowercase hostname, not ${DEFAULT_UNIVERSE_DOMAIN})."
+        default_custom=""
+        has_controlling_tty || return 1
+      done
+    else
+      candidate="$DEFAULT_UNIVERSE_DOMAIN"
+    fi
+  elif [ -z "$candidate" ] && [ -n "$gcloud_universe" ]; then
+    candidate="$gcloud_universe"
+  fi
+
+  candidate="${candidate:-$DEFAULT_UNIVERSE_DOMAIN}"
+  if ! is_valid_universe_domain "$candidate"; then
+    print_error "--universe-domain must be '${DEFAULT_UNIVERSE_DOMAIN}' or a bare lowercase domain name (got '${candidate}')."
+    return 1
+  fi
+  printf -v "$dest_var" '%s' "$candidate"
+}
+
+# Resolves the target region or zone. On standard Google Cloud (googleapis.com),
+# preserves the DEFAULT_REGION fallback; on a custom universe_domain, queries
+# regions dynamically via gcloud and never falls back to a commercial region.
+select_gcp_region() {
+  local dest_var="$1" project_id="$2" universe_domain="$3" active_region="${4:-}"
+  [ "$active_region" = "(unset)" ] && active_region=""
+  if [ -n "${PARAM_REGION:-}" ]; then
+    printf -v "$dest_var" '%s' "$PARAM_REGION"
+    return 0
+  fi
+  if ! is_custom_universe_domain "$universe_domain"; then
+    local chosen_region=""
+    prompt_read "Target GCP Region" chosen_region "${active_region:-$DEFAULT_REGION}"
+    printf -v "$dest_var" '%s' "$chosen_region"
+    return 0
+  fi
+
+  local listed_regions="" r_name=""
+  local regions=()
+  listed_regions=$(gcloud compute regions list --project="$project_id" --sort-by=name --format="value(name)" 2>/dev/null || echo "")
+  while IFS= read -r r_name; do
+    [ -n "$r_name" ] && regions+=("$r_name")
+  done <<< "$listed_regions"
+
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    if [ -n "$active_region" ]; then
+      printf -v "$dest_var" '%s' "$active_region"
+      return 0
+    fi
+    if [ "${#regions[@]}" -eq 1 ]; then
+      printf -v "$dest_var" '%s' "${regions[0]}"
+      return 0
+    fi
+    print_error "No region configured for universe '${universe_domain}'. Pass --gcp-region=<region> (or set REGION in install.env)."
+    if [ "${#regions[@]}" -gt 1 ]; then
+      print_info "Available regions in project '${project_id}': ${regions[*]}"
+    fi
+    return 1
+  fi
+
+  if [ "${#regions[@]}" -gt 0 ]; then
+    local reg_opts=() reg_choice="1" idx=0
+    for idx in "${!regions[@]}"; do
+      if [ "${regions[$idx]}" = "$active_region" ]; then
+        reg_opts+=("${regions[$idx]} [active]")
+        reg_choice="$((idx+1))"
+      else
+        reg_opts+=("${regions[$idx]}")
+      fi
+    done
+    reg_opts+=("Type a region or zone manually")
+    prompt_menu "Select target region in '${universe_domain}':" "${reg_opts[@]}" reg_choice
+    if [ "$reg_choice" -le "${#regions[@]}" ]; then
+      printf -v "$dest_var" '%s' "${regions[$((reg_choice-1))]}"
+      return 0
+    fi
+  fi
+
+  local manual_region=""
+  while true; do
+    prompt_read "Target Region (for example u-region-north1)" manual_region "$active_region"
+    if [ -n "$manual_region" ]; then
+      printf -v "$dest_var" '%s' "$manual_region"
+      return 0
+    fi
+    print_error "A region is required for custom universe '${universe_domain}'."
+    active_region=""
+    has_controlling_tty || return 1
+  done
+}
+
+# Validates VPC network/subnetwork flags and, when creating a cluster in a
+# custom universe_domain where no 'default' VPC exists, lists regional subnets
+# interactively or fails fast with clear flag guidance.
+resolve_cluster_vpc_network() {
+  local net_var="$1" subnet_var="$2" project_id="$3" location="$4" universe_domain="$5" creating_cluster="$6"
+  local net="${!net_var:-}" subnet="${!subnet_var:-}"
+
+  if [ -n "$subnet" ] && [ -z "$net" ]; then
+    print_error "--vpc-subnetwork requires --vpc-network (got subnetwork '${subnet}' with no network)."
+    return 1
+  fi
+  if [ -n "$net" ] || [ "$creating_cluster" != "true" ] || ! is_custom_universe_domain "$universe_domain" || [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+    return 0
+  fi
+
+  local default_check="" default_rc=0
+  default_check=$(trap - ERR; gcloud compute networks describe "$DEFAULT_VPC_NETWORK_NAME" --project="$project_id" --format="value(name)" 2>&1) || default_rc=$?
+  if [ "$default_rc" -eq 0 ]; then
+    return 0
+  fi
+  # If Compute Engine API is not yet enabled or cannot be queried, only intervene
+  # when gcloud explicitly reports default VPC was not found.
+  if ! grep -Eq 'was not found|NOT_FOUND|does not exist' <<<"$default_check"; then
+    return 0
+  fi
+
+  local region_only="$location"
+  if [[ "$location" =~ ^(u-)?[a-z]+-[a-z]+[0-9]+-[a-z]$ ]]; then
+    region_only="${location%-[a-z]}"
+  fi
+  local subnet_lines="" s_net="" s_name=""
+  local cand_nets=() cand_subnets=() cand_labels=()
+  subnet_lines=$(trap - ERR; gcloud compute networks subnets list --project="$project_id" --regions="$region_only" --format="value(network.basename(),name)" 2>/dev/null || echo "")
+  while IFS=$'\t' read -r s_net s_name; do
+    if [ -n "$s_net" ] && [ -n "$s_name" ]; then
+      cand_nets+=("$s_net")
+      cand_subnets+=("$s_name")
+      cand_labels+=("${s_net} / ${s_name}")
+    fi
+  done <<< "$subnet_lines"
+
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    print_error "Project '${project_id}' has no 'default' VPC network, so creating a GKE cluster requires --vpc-network (and --vpc-subnetwork for custom-mode VPCs)."
+    if [ "${#cand_labels[@]}" -gt 0 ]; then
+      print_info "Subnetworks found in '${region_only}': ${cand_labels[*]}"
+      print_info "Example: --vpc-network=${cand_nets[0]} --vpc-subnetwork=${cand_subnets[0]}"
+    fi
+    return 1
+  fi
+
+  print_warning "Project '${project_id}' has no 'default' VPC network."
+  if [ "${#cand_labels[@]}" -gt 0 ]; then
+    cand_labels+=("Enter VPC network and subnetwork names manually")
+    local vpc_choice="1"
+    prompt_menu "Select VPC network / subnetwork for the new GKE cluster in '${region_only}':" "${cand_labels[@]}" vpc_choice
+    if [ "$vpc_choice" -le "${#cand_nets[@]}" ]; then
+      printf -v "$net_var" '%s' "${cand_nets[$((vpc_choice-1))]}"
+      printf -v "$subnet_var" '%s' "${cand_subnets[$((vpc_choice-1))]}"
+      return 0
+    fi
+  fi
+
+  while [ -z "$net" ]; do
+    prompt_read "VPC Network name" net ""
+    [ -n "$net" ] || print_error "VPC network name cannot be empty when 'default' VPC is absent."
+    has_controlling_tty || return 1
+  done
+  prompt_read "VPC Subnetwork name (optional for auto-mode VPCs)" subnet ""
+  printf -v "$net_var" '%s' "$net"
+  printf -v "$subnet_var" '%s' "$subnet"
+}
+
+# Enforces the sovereign model-egress gate when universe_domain != googleapis.com
+# and model_provider is an external SaaS API (gemini, anthropic, openai).
+confirm_sovereign_model_egress() {
+  local universe_domain="$1" model_provider="$2" consent_var="$3"
+  local current_consent="${!consent_var:-false}"
+  if ! is_custom_universe_domain "$universe_domain" || ! is_external_saas_model_provider "$model_provider"; then
+    return 0
+  fi
+  if is_truthy "$current_consent"; then
+    print_warning "External SaaS model egress is enabled for provider '${model_provider}' from custom universe '${universe_domain}'; prompts and tool context cross the universe boundary."
+    printf -v "$consent_var" '%s' "true"
+    return 0
+  fi
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    validate_sovereign_model_egress "$universe_domain" "$model_provider" "$current_consent"
+    return $?
+  fi
+  print_warning "Model provider '${model_provider}' sends prompts and cluster telemetry outside universe '${universe_domain}' to an external SaaS endpoint."
+  print_info "To keep inference inside '${universe_domain}', re-select 'OpenAI-compatible server' or 'Google Vertex AI'."
+  local egress_answer=""
+  prompt_read "Allow external model egress to '${model_provider}' outside '${universe_domain}'? (y/N)" egress_answer "n"
+  case "$egress_answer" in
+    [yY] | [yY][eE][sS])
+      printf -v "$consent_var" '%s' "true"
+      return 0
+      ;;
+  esac
+  print_error "External model egress to '${model_provider}' was not approved."
+  return 1
 }
 
 # Auto-install missing CLI tool if possible
@@ -4229,13 +4606,13 @@ print_generate_only_handoff() {
   echo -e "    gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_loc} --purpose=encryption --project=${project_id}"
   echo -e "    gcloud beta services identity create --service=container.googleapis.com --project=${project_id}"
   echo -e "    gcloud kms keys add-iam-policy-binding ${key} --keyring=${keyring} --location=${kms_loc} \\\\"
-  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\" \\\\"
+  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.$(gcp_service_agent_domain "${project_id}")\" \\\\"
   echo -e "      --role=\"roles/cloudkms.cryptoKeyEncrypterDecrypter\" --project=${project_id} --quiet"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --database-encryption-key=${key_resource} --project ${project_id}"
   echo ""
   echo -e "  • ${C_CYAN}Workload Identity Pool (pre-existing Standard cluster):${C_RESET}"
   echo -e "    # Note: Migrating node pools to GKE_METADATA recreates nodes and restarts workloads."
-  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --workload-pool=${project_id}.svc.id.goog"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --workload-pool=$(gcp_workload_identity_pool "${project_id}")"
   echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
   echo ""
   echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
@@ -4379,10 +4756,10 @@ ensure_existing_cluster_cmek() {
     print_error "Cloud KMS key create failed after propagation retries: $k_err"
     return 1
   fi
-  local project_number service_agent
+  local project_number service_agent minted_service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
-  service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
-  gcloud beta services identity create --service=container.googleapis.com --project="$project_id" 2>/dev/null || true
+  minted_service_agent=$(gcloud beta services identity create --service=container.googleapis.com --project="$project_id" --format="value(email)" 2>/dev/null || echo "")
+  service_agent="${minted_service_agent:-service-${project_number}@container-engine-robot.$(gcp_service_agent_domain "$project_id")}"
   retry_kms_create gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
     --member="serviceAccount:${service_agent}" \
     --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet --format=none
@@ -4594,16 +4971,18 @@ ensure_existing_cluster_workload_identity() {
   # curl|bash audience) runs the inherited ERR trap in the subshell even
   # though the outer failure is handled, printing a spurious abort banner
   # and writing a FAILED report mid-run.
+  local expected_pool
+  expected_pool="$(gcp_workload_identity_pool "$project_id")"
   pool=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
     --location="$region" --project="$project_id" \
     --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null) || return 0
-  if [ "$pool" = "${project_id}.svc.id.goog" ]; then
+  if [ "$pool" = "$expected_pool" ]; then
     print_success "Existing cluster '$cluster_name' already has Workload Identity ($pool)."
   else
     print_info "Enabling the Workload Identity pool on existing cluster '$cluster_name'..."
     print_info "Updating the live cluster control plane; this can take several minutes..."
     gcloud container clusters update "$cluster_name" --location "$region" \
-      --project "$project_id" --workload-pool="${project_id}.svc.id.goog" --quiet
+      --project "$project_id" --workload-pool="$expected_pool" --quiet
   fi
 
   # Enabling the pool does not migrate node pools off the legacy GCE metadata
@@ -5385,11 +5764,41 @@ interview_bitbucket_forge() {
   print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
 }
 
+interview_gitea_forge() {
+  if [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ] && [ -z "${GITLAB_TOKEN_SECRET:-}" ]; then
+    PARAM_GITLAB_TOKEN_SECRET="$(default_gitops_token_secret gitea)"
+  fi
+  [[ "$github_repo" == */* ]] || github_repo=""
+  while true; do
+    prompt_read "Gitea hostname (for example gitea.example.test)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
+    [ -n "$PARAM_GITOPS_HOST" ] && PARAM_GITOPS_HOST_FROM_FLAG="true"
+    prompt_read "Gitea repository path (owner/repo)" github_repo "${github_repo}"
+    local secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
+    [ -n "$github_repo" ] && PARAM_GITOPS_REPO_FROM_FLAG="true"
+    prompt_read "Kubernetes Secret to hold the Gitea token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+    [ "$PARAM_GITLAB_TOKEN_SECRET" != "$secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
+    if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+    fi
+    PARAM_GITOPS_REPO="$github_repo"
+    if [ -z "${PARAM_GITOPS_HOST:-}" ]; then
+      print_error "A Gitea install needs the instance's hostname."
+    elif [ -n "$github_repo" ] && validate_gitops_forge_flags && [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+      github_repo="$PARAM_GITOPS_REPO"
+      break
+    fi
+    [ -z "$github_repo" ] && print_error "A Gitea install needs the repository's path (owner/repo)."
+    has_controlling_tty || exit 1
+  done
+  print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
+  print_info "It needs scopes write:repository, write:issue, and read:user on the Gitea account."
+}
+
 # True for a forge whose credential is an access token the administrator puts
 # in a Kubernetes Secret: every forge but github, which uses the GitHub App.
 gitops_forge_uses_token() {
   case "${1:-github}" in
-    gitlab|bitbucket|bitbucket-datacenter) return 0 ;;
+    gitlab|gitea|bitbucket|bitbucket-datacenter) return 0 ;;
   esac
   return 1
 }
@@ -5398,6 +5807,7 @@ gitops_forge_uses_token() {
 gitops_forge_label() {
   case "${1:-github}" in
     gitlab) printf 'GitLab' ;;
+    gitea) printf 'Gitea' ;;
     bitbucket) printf 'Bitbucket Cloud' ;;
     bitbucket-datacenter) printf 'Bitbucket Data Center' ;;
     *) printf 'GitHub' ;;
@@ -5407,6 +5817,7 @@ gitops_forge_label() {
 # The default name of the forge's token Secret, and of its CA Secret.
 default_gitops_token_secret() {
   case "${1:-github}" in
+    gitea) printf '%s' "${DEFAULT_GITEA_TOKEN_SECRET:-gitea-forge-token}" ;;
     bitbucket|bitbucket-datacenter) printf '%s' "${DEFAULT_BITBUCKET_TOKEN_SECRET:-bitbucket-forge-token}" ;;
     *) printf '%s' "${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}" ;;
   esac
@@ -5414,6 +5825,7 @@ default_gitops_token_secret() {
 
 default_gitops_ca_secret() {
   case "${1:-github}" in
+    gitea) printf '%s' "${DEFAULT_GITEA_CA_SECRET:-gitea-forge-ca}" ;;
     bitbucket-datacenter) printf '%s' "${DEFAULT_BITBUCKET_CA_SECRET:-bitbucket-forge-ca}" ;;
     *) printf '%s' "${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}" ;;
   esac
@@ -5423,6 +5835,7 @@ default_gitops_ca_secret() {
 gitops_repo_url() {
   local repo="${GITOPS_REPO:-}"
   case "${GITOPS_FORGE:-github}" in
+    gitea) printf 'https://%s/%s' "${GITOPS_HOST:-}" "$repo" ;;
     bitbucket) printf 'https://bitbucket.org/%s' "$repo" ;;
     bitbucket-datacenter) printf 'https://%s/projects/%s/repos/%s' "${GITOPS_HOST:-}" "${repo%%/*}" "${repo#*/}" ;;
     *) gitlab_repo_url ;;
@@ -5585,13 +5998,117 @@ validate_bitbucket_forge_flags() {
   fi
 }
 
+# The repository path a Gitea forge accepts (`owner/slug`, or its https URL on
+# HOST), printed, or nothing when invalid. Mirrors giteaNamespaceRegex in
+# k8s-operator/api/v1alpha1/gitprovider.go.
+gitea_repo_path() {
+  local repo="$1" host="${2:-}"
+  [[ "$repo" =~ [[:space:]] ]] && return 0
+  repo="${repo%/}"
+  if [[ "$repo" =~ ^https://[^/@]+@ ]]; then
+    repo="https://${repo#https://*@}"
+  fi
+  if [ -n "$host" ]; then
+    case "$repo" in
+      https://"$host"/*) repo="${repo#https://"$host"/}" ;;
+      *://*|*@*:*) return 0 ;;
+    esac
+  else
+    case "$repo" in
+      *://*|*@*:*) return 0 ;;
+    esac
+  fi
+  repo="${repo%.git}"
+  local owner="${repo%%/*}" slug="${repo#*/}"
+  [ "$owner" != "$repo" ] || return 0
+  [[ "$slug" == */* ]] && return 0
+  [ "${#owner}" -le "$GITEA_MAX_NAMESPACE_LENGTH" ] || return 0
+  local lower_owner
+  lower_owner="$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')"
+  case "$lower_owner" in
+    github.com|www.github.com|ssh.github.com|gitlab.com|www.gitlab.com|bitbucket.org|www.bitbucket.org)
+      return 0
+      ;;
+  esac
+  if [ -n "$host" ] && [ "$lower_owner" = "$host" ]; then
+    return 0
+  fi
+  [[ "$owner" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$ ]] || return 0
+  [[ "$slug" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || return 0
+  case "$slug" in .|..|.git|*.git) return 0 ;; esac
+  printf '%s' "${owner}/${slug}"
+}
+
+# Checks the self-managed Gitea inputs: host, owner/repo, token sources and CA.
+validate_gitea_forge_flags() {
+  local host="${PARAM_GITOPS_HOST:-}"
+  if [ -z "$host" ] && [[ "${PARAM_GITOPS_REPO:-}" =~ ^https://([^/@]+@)?([^/]+)/ ]]; then
+    host="${BASH_REMATCH[2]}"
+    PARAM_GITOPS_HOST="$host"
+    [ "${PARAM_GITOPS_REPO_FROM_FLAG:-false}" = "true" ] && PARAM_GITOPS_HOST_FROM_FLAG="true"
+    print_info "Taking the Gitea host '${host}' from --gitops-repo."
+  fi
+  if [ -z "$host" ] && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; }; then
+    print_error "--gitops-forge=gitea needs --gitops-host: the instance's hostname."
+    return 1
+  fi
+  if [ -n "$host" ]; then
+    if [[ "$host" == */* ]] || [[ "$host" == *:* ]]; then
+      print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${host}')."
+      return 1
+    fi
+    if ! [[ "$host" =~ $GITLAB_HOST_RE ]] || [ "${#host}" -gt "$GITEA_MAX_HOST_LENGTH" ]; then
+      print_error "--gitops-host must be a bare lowercase hostname (got '${host}')."
+      return 1
+    fi
+    if [[ "$host" =~ $BITBUCKET_RESERVED_HOST_RE ]] || [[ "$host" =~ $GITHUB_RESERVED_HOST_RE ]] || [[ "$host" =~ (^|\.)gitlab\.com$ ]]; then
+      print_error "'${host}' is a hosted service's domain, not a self-managed Gitea instance."
+      return 1
+    fi
+  fi
+  if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
+    if [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ]; then
+      print_error "--github-app-id and --github-pem-path configure the GitHub token minter, which a Gitea install does not have."
+      return 1
+    fi
+    print_info "Dropping the recorded GitHub App (GITHUB_APP_ID, GITHUB_PEM_PATH): a Gitea install has no token minter."
+    PARAM_GITHUB_APP_ID=""
+    PARAM_GITHUB_PEM_PATH=""
+  fi
+  if [ -z "$host" ]; then
+    :
+  elif [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+    local path
+    path="$(gitea_repo_path "$PARAM_GITOPS_REPO" "$host")"
+    if [ -z "$path" ]; then
+      print_error "--gitops-repo must be owner/repo on ${host} (owner <= ${GITEA_MAX_NAMESPACE_LENGTH} characters), or its https URL on ${host} (got '${PARAM_GITOPS_REPO}')."
+      return 1
+    fi
+    local url="https://${host}/${path}"
+    if [ "${#url}" -gt "$GITLAB_MAX_REPO_URL_LENGTH" ]; then
+      print_error "The GitOps repository's URL is ${#url} characters; the credential broker reads at most ${GITLAB_MAX_REPO_URL_LENGTH}."
+      return 1
+    fi
+    PARAM_GITOPS_REPO="$path"
+  elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    print_error "A Gitea install needs --gitops-repo: the repository's path (owner/repo)."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    print_error "GITOPS_READ_TOKEN_FILE (GITLAB_READ_TOKEN_FILE) is not supported with --gitops-forge=gitea; omit it and include read access on --gitops-token-file."
+    return 1
+  fi
+  validate_gitops_token_inputs || return 1
+  validate_gitops_ca_inputs "$(default_gitops_ca_secret gitea)"
+}
+
 # Checks the forge inputs: the GitLab ones, the GitHub Enterprise Server ones,
 # and that each forge was given none of the other's.
 validate_gitops_forge_flags() {
   case "${PARAM_GITOPS_FORGE:-github}" in
-    github|gitlab|bitbucket|bitbucket-datacenter) ;;
+    github|gitlab|gitea|bitbucket|bitbucket-datacenter) ;;
     *)
-      print_error "--gitops-forge must be github, gitlab, bitbucket or bitbucket-datacenter (got '${PARAM_GITOPS_FORGE}')."
+      print_error "--gitops-forge must be github, gitlab, gitea, bitbucket or bitbucket-datacenter (got '${PARAM_GITOPS_FORGE}')."
       return 1
       ;;
   esac
@@ -5684,6 +6201,10 @@ validate_gitops_forge_flags() {
       ;;
   esac
   case "$forge" in
+    gitea)
+      validate_gitea_forge_flags
+      return
+      ;;
     bitbucket|bitbucket-datacenter)
       validate_bitbucket_forge_flags "$forge"
       return
@@ -5893,7 +6414,7 @@ GITHUB_RESERVED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubassets\
 # switches back to github.com.
 validate_github_forge_flags() {
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
-    print_error "--gitlab-token-file (--gitops-token-file) applies only with --gitops-forge=gitlab, bitbucket or bitbucket-datacenter."
+    print_error "--gitlab-token-file (--gitops-token-file) applies only with --gitops-forge=gitlab, gitea, bitbucket or bitbucket-datacenter."
     return 1
   fi
   if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
@@ -6061,6 +6582,7 @@ ask_gitops_forge() {
   local forge_choice="1"
   [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
   [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+  [ "$PARAM_GITOPS_FORGE" = "gitea" ] && forge_choice="5"
   # What the menu was first shown over. An option 2 attempt the validator
   # refuses puts these back, so the next answer -- option 2 again, github.com
   # or no repository -- starts from here and not from the refused host and
@@ -6077,8 +6599,16 @@ ask_gitops_forge() {
       "GitHub Enterprise Server (a GitHub host that you run)" \
       "GitLab (gitlab.com or self-managed)" \
       "Nowhere yet: install without a GitOps repository (you can connect one later)" \
+      "Gitea (self-managed)" \
       forge_choice
     case "$forge_choice" in
+      5)
+        PARAM_GITOPS_FORGE="gitea"
+        if [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ] && [ -z "${GITLAB_TOKEN_SECRET:-}" ]; then
+          PARAM_GITLAB_TOKEN_SECRET="$(default_gitops_token_secret gitea)"
+        fi
+        return 0
+        ;;
       4)
         # The same install as option 1, with the repository menu declined:
         # github.com, no host, and no CA file.
@@ -6366,6 +6896,7 @@ create_gitlab_token_secret() {
   fi
   local scopes="scopes: api, write_repository"
   case "${GITOPS_FORGE:-gitlab}" in
+    gitea) scopes="an access token with scopes write:repository, write:issue, and read:user" ;;
     bitbucket) scopes="an API token with the read and write repository and pull request scopes, or an access token" ;;
     bitbucket-datacenter) scopes="a project HTTP access token with Repository write" ;;
   esac
@@ -6415,7 +6946,11 @@ create_gitlab_read_token_secret() {
         print_error "Could not remove key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}'. It holds the read token of the forge this install used before. Remove it: kubectl patch secret ${name} -n ${namespace} --type json -p '[{\"op\":\"remove\",\"path\":\"/data/${GITLAB_READ_TOKEN_SECRET_KEY}\"}]'"
         return 1
       fi
-      print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before. Give the ${label} read token with GITOPS_READ_TOKEN_FILE to read private context repositories."
+      if [ "${GITOPS_FORGE:-gitlab}" = "gitea" ]; then
+        print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before."
+      else
+        print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before. Give the ${label} read token with GITOPS_READ_TOKEN_FILE to read private context repositories."
+      fi
     fi
     return 0
   fi
@@ -6561,13 +7096,15 @@ summarize_existing_cluster_mutations() {
     echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_GREEN}Native${C_RESET} (GKE Autopilot)"
     echo -e "    • ${C_CYAN}Node Pool Metadata:${C_RESET} ${C_GREEN}Managed${C_RESET} (GKE Autopilot)"
   else
+    local expected_pool
+    expected_pool="$(gcp_workload_identity_pool "$project_id")"
     pool=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
       --location="$region" --project="$project_id" \
       --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null || echo "")
-    if [ "$pool" = "${project_id}.svc.id.goog" ]; then
+    if [ "$pool" = "$expected_pool" ]; then
       echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_GREEN}Already enabled${C_RESET} ($pool)"
     else
-      echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_YELLOW}Will enable${C_RESET} ${project_id}.svc.id.goog on control plane (non-revertible)"
+      echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_YELLOW}Will enable${C_RESET} ${expected_pool} on control plane (non-revertible)"
     fi
 
     local legacy_pools=() legacy_pool
@@ -6823,6 +7360,7 @@ run_menu_system() {
   # tfvars directly, without passing through the parameter block that resolves
   # this pair on install.sh's own run.
   normalize_memory_vars
+  configure_installer_universe_env "${UNIVERSE_DOMAIN:-$DEFAULT_UNIVERSE_DOMAIN}" || exit 1
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
   local project_number=""
@@ -6841,6 +7379,7 @@ run_menu_system() {
   local openai_compatible_ca_secret_name="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
   local openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
   local litellm_env_secret_name="${LITELLM_ENV_SECRET_NAME:-}"
+  local allow_external_model_egress="${ALLOW_EXTERNAL_MODEL_EGRESS:-}"
   local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
@@ -6883,7 +7422,10 @@ run_menu_system() {
     enable_stockout_investigator="false"
   fi
   local github_org="${GITOPS_ORG:-${GITHUB_ORG:-}}"
-  local github_repo="${GITOPS_REPO:-${GITHUB_REPO:-$DEFAULT_GITOPS_REPO}}"
+  local github_repo="${GITOPS_REPO:-${GITHUB_REPO:-}}"
+  if ! gitops_forge_uses_token "${GITOPS_FORGE:-github}"; then
+    github_repo="${github_repo:-$DEFAULT_GITOPS_REPO}"
+  fi
   local github_app_id="${GITHUB_APP_ID:-}"
   local kms_keyring="${KMS_KEYRING:-}"
   local kms_key="${KMS_KEY:-}"
@@ -6950,7 +7492,7 @@ run_menu_system() {
         esac
         ;;
       3)
-        local m_opt=""
+        local m_opt="" prev_model_provider="$model_provider" prev_model_default_name="$model_default_name"
         prompt_menu "Select AI Model Provider:" \
           "Google Gemini ($(default_model_for_provider gemini))" \
           "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
@@ -7002,6 +7544,11 @@ run_menu_system() {
             prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || continue
             ;;
         esac
+        if ! confirm_sovereign_model_egress "${UNIVERSE_DOMAIN:-$DEFAULT_UNIVERSE_DOMAIN}" "$model_provider" allow_external_model_egress; then
+          model_provider="$prev_model_provider"
+          model_default_name="$prev_model_default_name"
+          continue
+        fi
         ;;
       4)
         local p_opt=""
@@ -7025,6 +7572,8 @@ run_menu_system() {
             if [ "$enable_stockout_investigator" = "true" ]; then
               enable_stockout_investigator="false"
               print_success "GKE Stockout Investigator disabled."
+            elif ! is_truthy "${MANAGE_IAM:-${DEFAULT_MANAGE_IAM:-true}}"; then
+              print_error "$STOCKOUT_INVESTIGATOR_MANAGE_IAM_MENU_ERR"
             else
               enable_stockout_investigator="true"
               print_success "GKE Stockout Investigator enabled!"
@@ -7064,6 +7613,7 @@ run_menu_system() {
           "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
         validate_model_provider_inputs "$model_provider" "$model_default_name" || continue
         validate_litellm_env_secret_name "$litellm_env_secret_name" || continue
+        validate_sovereign_model_egress "${UNIVERSE_DOMAIN:-$DEFAULT_UNIVERSE_DOMAIN}" "$model_provider" "${allow_external_model_egress:-false}" || continue
         # The chat screen's home channel, which the home-channel warning below
         # reads; save_env_var exports it again when it writes install.env.
         export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
@@ -7081,9 +7631,11 @@ run_menu_system() {
         local install_env_before=""
         if [ -f "$INSTALL_ENV_FILE" ]; then
           install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
-          # Armed before the write, so a failed write leaves no copy either.
-          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
-          trap "rm -f $(printf '%q' "$install_env_before")" EXIT
+          # Armed before the write, so a failed write leaves no copy either; if
+          # the write succeeded (-s) and a later step exits via on_error, puts
+          # install.env back as it was before deleting the backup.
+          # shellcheck disable=SC2064 # expand backup/env paths now: the local is gone at exit; \$? stays deferred to exit time.
+          trap "if [ \$? -ne 0 ] && [ -s $(printf '%q' "$install_env_before") ]; then (umask 077; cat $(printf '%q' "$install_env_before") >$(printf '%q' "${INSTALL_ENV_FILE}.tmp")) && mv -f $(printf '%q' "${INSTALL_ENV_FILE}.tmp") $(printf '%q' "$INSTALL_ENV_FILE"); fi; rm -f $(printf '%q' "$install_env_before")" EXIT
           cat "$INSTALL_ENV_FILE" >"$install_env_before"
         fi
 
@@ -7118,6 +7670,9 @@ run_menu_system() {
           save_secret_env_var OPENAI_COMPATIBLE_API_KEY "$openai_compatible_api_key"
         fi
         save_env_var LITELLM_ENV_SECRET_NAME "$litellm_env_secret_name"
+        if [ -n "${allow_external_model_egress:-}" ]; then
+          save_env_var ALLOW_EXTERNAL_MODEL_EGRESS "$allow_external_model_egress"
+        fi
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -7284,21 +7839,27 @@ apply_agent_namespace_override() {
 
 # Prompt whether to enable the GKE Stockout Investigator AgentPlugin during
 # interactive installs. Skips under --non-interactive, without a controlling
-# TTY, or when --enable-stockout-investigator / --enable-stockout was already
-# passed on the CLI. Defaults to yes when an enabled Google Chat or Slack
-# home channel is configured (or follows the loaded install.env / environment
-# setting when already set), and no otherwise.
+# TTY, when --enable-stockout-investigator / --enable-stockout was passed on
+# the CLI, or when MANAGE_IAM=false (unless ENABLE_STOCKOUT_INVESTIGATOR is
+# already truthy, where it defaults to No and refuses Yes). Defaults to yes
+# when MANAGE_IAM=true and an enabled Google Chat or Slack home channel is
+# configured (or follows the loaded install.env / environment setting when
+# already set), and no otherwise.
 prompt_stockout_investigator() {
   local google_chat_on="${1:-false}"
   local google_chat_home="${2:-}"
   local slack_on="${3:-false}"
   local slack_home="${4:-}"
   local project_name="${5:-}"
+  local manage_iam_mode="${6:-true}"
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
     return 0
   fi
   if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_PASSED:-false}" = "true" ]; then
+    return 0
+  fi
+  if ! is_truthy "$manage_iam_mode" && ! is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
     return 0
   fi
 
@@ -7309,7 +7870,9 @@ prompt_stockout_investigator() {
   fi
 
   local default_yes="false"
-  if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" = "true" ]; then
+  if ! is_truthy "$manage_iam_mode"; then
+    default_yes="false"
+  elif [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" = "true" ]; then
     if is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
       default_yes="true"
     fi
@@ -7319,7 +7882,9 @@ prompt_stockout_investigator() {
 
   print_info "$STOCKOUT_INVESTIGATOR_PROMPT_DESC"
   print_info "Provisioning enables the Pub/Sub platform adapter and creates a Cloud Logging sink, Pub/Sub topic, and pull subscription${project_name:+ in ${project_name}}."
-  if [ "$has_home_channel" != "true" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ]; then
+  if ! is_truthy "$manage_iam_mode"; then
+    print_info "$STOCKOUT_INVESTIGATOR_MANAGE_IAM_NOTE"
+  elif [ "$has_home_channel" != "true" ] && [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ]; then
     print_info "$STOCKOUT_INVESTIGATOR_NO_HOME_CHANNEL_NOTE"
   fi
 
@@ -7335,6 +7900,10 @@ prompt_stockout_investigator() {
     normalized_choice="$(printf '%s' "$stockout_choice" | tr '[:upper:]' '[:lower:]')"
     case "$normalized_choice" in
       y | yes)
+        if ! is_truthy "$manage_iam_mode"; then
+          print_error "$STOCKOUT_INVESTIGATOR_MANAGE_IAM_MENU_ERR"
+          continue
+        fi
         if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "true" ]; then
           PARAM_ENABLE_STOCKOUT_INVESTIGATOR="true"
         fi
@@ -7342,7 +7911,7 @@ prompt_stockout_investigator() {
         break
         ;;
       n | no)
-        if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "false" ]; then
+        if [ "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR_SET:-false}" != "true" ] || [ "$default_yes" != "false" ] || is_truthy "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"; then
           PARAM_ENABLE_STOCKOUT_INVESTIGATOR="false"
         fi
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR_INTERACTIVE="true"
@@ -7371,6 +7940,11 @@ main() {
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
+      exit 1
+    fi
+    if [ "$SOVEREIGN_FLAG_PASSED" = "true" ]; then
+      print_error "--menu takes no --universe-domain, --vpc-network, --vpc-subnetwork, --allow-external-model-egress or --manage-iam flag: it reloads install.env and reads those keys from there."
+      print_info "Set UNIVERSE_DOMAIN, VPC_NETWORK, VPC_SUBNETWORK, ALLOW_EXTERNAL_MODEL_EGRESS or MANAGE_IAM in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
     # The chat flags likewise: the menu applies the keys install.env records
@@ -7475,6 +8049,14 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
+  if [ -n "${PARAM_UNIVERSE_DOMAIN:-}" ] && ! is_valid_universe_domain "$PARAM_UNIVERSE_DOMAIN"; then
+    print_error "--universe-domain must be '${DEFAULT_UNIVERSE_DOMAIN}' or a bare lowercase domain name (got '${PARAM_UNIVERSE_DOMAIN}')."
+    exit 1
+  fi
+  if [ -n "${PARAM_VPC_SUBNETWORK:-}" ] && [ -z "${PARAM_VPC_NETWORK:-}" ]; then
+    print_error "--vpc-subnetwork requires --vpc-network (got subnetwork '${PARAM_VPC_SUBNETWORK}' with no network)."
+    exit 1
+  fi
   # An install.env that still assigns PLATFORM_AGENT_MODE is told once that
   # the key is not read; bootstrap_install_env unset the value already.
   note_ignored_platform_agent_mode_key "${INSTALL_ENV_FILE:-}"
@@ -7497,8 +8079,18 @@ main() {
   # applied.
   check_flags_against_install_env || exit 1
 
-  # 3. Google Cloud Authentication Check
+  # 3. Google Cloud Target Universe & Authentication Check
   print_step "3. Verifying Google Cloud Authentication"
+  local universe_domain=""
+  select_universe_domain universe_domain || exit 1
+  if is_custom_universe_domain "$universe_domain"; then
+    export CLOUDSDK_CORE_UNIVERSE_DOMAIN="$universe_domain"
+    export CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE="false"
+    export CLOUDSDK_CONTAINER_USE_APPLICATION_DEFAULT_CREDENTIALS="false"
+  else
+    export CLOUDSDK_CORE_UNIVERSE_DOMAIN="$COMMERCIAL_UNIVERSE_DOMAIN"
+    unset GOOGLE_CLOUD_UNIVERSE_DOMAIN
+  fi
   local active_account=""
   active_account=$(gcloud config get-value account 2>/dev/null || echo "")
 
@@ -7511,13 +8103,20 @@ main() {
     print_warning "gcloud CLI is not authenticated."
     print_info "Launching Google Cloud authentication..."
     gcloud auth login </dev/tty >/dev/tty
-    gcloud auth application-default login </dev/tty >/dev/tty
+    if ! is_custom_universe_domain "$universe_domain"; then
+      gcloud auth application-default login </dev/tty >/dev/tty
+    fi
     active_account=$(gcloud config get-value account 2>/dev/null || echo "")
   fi
+  configure_installer_universe_env "$universe_domain" || exit 1
   print_success "Authenticated as: ${C_BOLD}${active_account:-Google Cloud User}${C_RESET}"
 
   # 4. GCP Project Target Configuration
   print_step "4. Google Cloud Target Configuration"
+  if is_custom_universe_domain "$universe_domain"; then
+    print_success "Selected Universe Domain: ${C_BOLD}${universe_domain}${C_RESET}"
+  fi
+
   local active_proj=""
   if [ "$is_cloud_shell" = "true" ] && [ -n "${DEVSHELL_PROJECT_ID:-}" ]; then
     active_proj="${DEVSHELL_PROJECT_ID}"
@@ -7541,6 +8140,8 @@ main() {
 
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_info "Dry-run: leaving the active gcloud project unchanged (target: ${project_id})."
+  elif is_custom_universe_domain "$universe_domain"; then
+    export CLOUDSDK_CORE_PROJECT="$project_id"
   elif ! gcloud config set project "$project_id" >/dev/null; then
     print_error "Unable to select GCP project '$project_id'. Verify the project ID and your access."
     exit 1
@@ -7559,10 +8160,8 @@ main() {
   # Region Selection
   local active_region=""
   active_region=$(gcloud config get-value compute/region 2>/dev/null || echo "")
-  local region="${PARAM_REGION:-}"
-  if [ -z "$region" ]; then
-    prompt_read "Target GCP Region" region "${active_region:-$DEFAULT_REGION}"
-  fi
+  local region=""
+  select_gcp_region region "$project_id" "$universe_domain" "$active_region" || exit 1
 
   # Checked here as well as after the menu below so a bad --gke-cluster-mode fails
   # before the rest of the interview, not after it.
@@ -7711,6 +8310,9 @@ main() {
   if [ "$ask_cluster_shape" = "true" ]; then
     require_creatable_cluster_mode "$cluster_mode" "$region"
   fi
+  local vpc_network="${PARAM_VPC_NETWORK:-}"
+  local vpc_subnetwork="${PARAM_VPC_SUBNETWORK:-}"
+  resolve_cluster_vpc_network vpc_network vpc_subnetwork "$project_id" "$region" "$universe_domain" "$ask_cluster_shape" || exit 1
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
   # 6. Chat & Messaging Platform Integration
@@ -8114,6 +8716,11 @@ main() {
     print_error "--vertex-manage-serving-project must be either true or false."
     exit 1
   fi
+  local manage_iam="${PARAM_MANAGE_IAM:-$DEFAULT_MANAGE_IAM}"
+  if ! is_bool_spelling "$manage_iam"; then
+    print_error "--manage-iam (MANAGE_IAM) must be true or false (got '${manage_iam}')."
+    exit 1
+  fi
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
@@ -8128,29 +8735,62 @@ main() {
   local openai_compatible_ca_secret_name="${PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
   local openai_compatible_api_key="${PARAM_OPENAI_COMPATIBLE_API_KEY:-}"
   local litellm_env_secret_name="${PARAM_LITELLM_ENV_SECRET_NAME:-}"
+  local allow_external_model_egress="${PARAM_ALLOW_EXTERNAL_MODEL_EGRESS:-$DEFAULT_ALLOW_EXTERNAL_MODEL_EGRESS}"
+  if ! is_bool_spelling "$allow_external_model_egress"; then
+    print_error "ALLOW_EXTERNAL_MODEL_EGRESS='${allow_external_model_egress}' is neither true nor false. Fix it in install.env."
+    exit 1
+  fi
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
     # Every arm below assigns unconditionally, so an unseeded menu would reset
     # the configured provider.
     local model_choice=""
-    case "$model_provider" in
-      gemini) model_choice="1" ;;
-      vertex_ai) model_choice="2" ;;
-      openai) model_choice="3" ;;
-      anthropic) model_choice="4" ;;
-      openai_compatible) model_choice="5" ;;
-      # sap, and any other LiteLLM provider slug.
-      *) model_choice="6" ;;
-    esac
-    prompt_menu "Select Model Provider for the Platform Agent:" \
-      "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
-      "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
-      "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
-      "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
-      "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
-      "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
-      model_choice
+    if is_custom_universe_domain "$universe_domain"; then
+      local sov_choice=""
+      case "$model_provider" in
+        openai_compatible) sov_choice="1" ;;
+        vertex_ai) sov_choice="2" ;;
+        gemini) sov_choice="3" ;;
+        openai) sov_choice="4" ;;
+        anthropic) sov_choice="5" ;;
+        *) sov_choice="6" ;;
+      esac
+      prompt_menu "Select Model Provider for the Platform Agent (${universe_domain}):" \
+        "OpenAI-compatible server (Recommended for Sovereign Cloud: vLLM, TGI, in-universe gateway)" \
+        "Google Vertex AI / Model Garden (in-universe Workload Identity, where available)" \
+        "Google Gemini ($(default_model_for_provider gemini) / external Gemini API egress)" \
+        "OpenAI ($(default_model_for_provider openai) / external OpenAI API egress)" \
+        "Anthropic ($(default_model_for_provider anthropic) / external Anthropic API egress)" \
+        "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
+        sov_choice
+      case "$sov_choice" in
+        1) model_choice="5" ;;
+        2) model_choice="2" ;;
+        3) model_choice="1" ;;
+        4) model_choice="3" ;;
+        5) model_choice="4" ;;
+        *) model_choice="6" ;;
+      esac
+    else
+      case "$model_provider" in
+        gemini) model_choice="1" ;;
+        vertex_ai) model_choice="2" ;;
+        openai) model_choice="3" ;;
+        anthropic) model_choice="4" ;;
+        openai_compatible) model_choice="5" ;;
+        # sap, and any other LiteLLM provider slug.
+        *) model_choice="6" ;;
+      esac
+      prompt_menu "Select Model Provider for the Platform Agent:" \
+        "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
+        "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
+        "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
+        "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+        "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+        "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
+        model_choice
+    fi
 
     # A model the install already pins survives a re-run that leaves the
     # provider alone; changing provider has to take the new provider's default,
@@ -8213,15 +8853,18 @@ main() {
   # anything is built, whatever the provider.
   validate_model_provider_inputs "$model_provider" "$model_default_name" || exit 1
   validate_litellm_env_secret_name "$litellm_env_secret_name" || exit 1
+  confirm_sovereign_model_egress "$universe_domain" "$model_provider" allow_external_model_egress || exit 1
   case "$model_provider" in
     gemini)
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
     vertex_ai)
-      print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}@${project_id}.iam.gserviceaccount.com via Workload Identity."
+      local gsa_domain
+      gsa_domain="$(gcp_gsa_email_domain "$project_id")"
+      print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}@${gsa_domain}.iam.gserviceaccount.com via Workload Identity."
       print_info "Serving ${model_default_name} from projects/${vertex_project_id}/locations/${vertex_location}."
       if [ "$vertex_manage_serving_project" != "true" ]; then
-        print_info "The install will not touch project ${vertex_project_id}. Enable aiplatform.googleapis.com there and grant roles/aiplatform.user to ${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}@${project_id}.iam.gserviceaccount.com yourself; model calls fail until you do."
+        print_info "The install will not touch project ${vertex_project_id}. Enable aiplatform.googleapis.com there and grant roles/aiplatform.user to ${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}@${gsa_domain}.iam.gserviceaccount.com yourself; model calls fail until you do."
         print_info "If an earlier apply of this install created that grant, remove both serving-project resources from Terraform state before continuing, or this apply revokes it — terraform/examples/full-install/README.md names the two addresses."
       fi
       # The literal, not $DEFAULT_VERTEX_LOCATION: this warns about a property
@@ -8307,6 +8950,18 @@ main() {
       # A single name is the GitHub default (or a GitHub repository) the
       # forge question was asked over; a GitLab project has no default path.
       interview_gitlab_forge
+    else
+      validate_gitops_forge_flags || exit 1
+      github_repo="$PARAM_GITOPS_REPO"
+    fi
+  elif [ "$PARAM_GITOPS_FORGE" = "gitea" ]; then
+    github_org=""
+    github_app_id=""
+    github_pem_path=""
+    PARAM_GITHUB_APP_ID=""
+    PARAM_GITHUB_PEM_PATH=""
+    if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+      interview_gitea_forge
     else
       validate_gitops_forge_flags || exit 1
       github_repo="$PARAM_GITOPS_REPO"
@@ -8731,7 +9386,7 @@ main() {
     if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
       PARAM_MEMORY_EXPLICIT="true"
     fi
-    prompt_stockout_investigator "$google_chat_enabled" "$google_chat_home_channel" "$slack_enabled" "$slack_home_channel" "$project_id"
+    prompt_stockout_investigator "$google_chat_enabled" "$google_chat_home_channel" "$slack_enabled" "$slack_home_channel" "$project_id" "$manage_iam"
   fi
 
   # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
@@ -8810,6 +9465,10 @@ main() {
   export CLUSTER_NAME="$cluster_name"
   export CLUSTER_MODE="$cluster_mode"
   export REGION="$region"
+  export UNIVERSE_DOMAIN="$universe_domain"
+  export VPC_NETWORK="$vpc_network"
+  export VPC_SUBNETWORK="$vpc_subnetwork"
+  export ALLOW_EXTERNAL_MODEL_EGRESS="$allow_external_model_egress"
   export ENABLE_GVISOR="$enable_gvisor"
   # The generator emits it into terraform.tfvars, where the gke-cluster
   # module's postcondition reads it, defaulting the line to false itself.
@@ -8844,6 +9503,7 @@ main() {
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
+  export MANAGE_IAM="$manage_iam"
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"
@@ -9066,9 +9726,15 @@ main() {
   draw_separator
   echo -e "${C_RESET}${C_BOLD}Please review your selections before provisioning begins:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Target Project:${C_RESET} ${C_BOLD}${project_id}${C_RESET} (Project Number: ${project_number:-unknown})"
+  if is_custom_universe_domain "$universe_domain"; then
+    echo -e "  • ${C_CYAN}Universe Domain:${C_RESET} ${C_BOLD}${universe_domain}${C_RESET}"
+  fi
   # The generator's answer, not the interview's: on an existing cluster it
   # probed the live shape and the flag had no say.
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  if [ -n "$vpc_network" ]; then
+    echo -e "  • ${C_CYAN}VPC Network:${C_RESET} ${vpc_network}${vpc_subnetwork:+ / ${vpc_subnetwork}}"
+  fi
   if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
     echo -e "  • ${C_CYAN}Existing Cluster Mutations (Adoption):${C_RESET}"
     summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
@@ -9155,7 +9821,7 @@ main() {
         exit "$rc"
       fi
     )
-    if gcloud auth application-default print-access-token >/dev/null 2>&1; then
+    if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ] || gcloud auth application-default print-access-token >/dev/null 2>&1; then
       local np_status=0 missing_apis=""
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then

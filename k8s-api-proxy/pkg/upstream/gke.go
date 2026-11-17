@@ -23,9 +23,9 @@ const (
 )
 
 var (
-	// gkeProject accepts a project ID, optionally domain-scoped (example.com:project), as
+	// gkeProject accepts a project ID, optionally partitioned or domain-scoped (prefix:project), as
 	// k8sapiproxy's cluster ID validation does.
-	gkeProject = regexp.MustCompile(`^([a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z0-9-]+\z`)
+	gkeProject = regexp.MustCompile(`^([a-z0-9]([a-z0-9.-]*[a-z0-9])?:)?[a-z0-9-]+\z`)
 	gkeSegment = regexp.MustCompile(`^[a-z0-9-]+\z`)
 )
 

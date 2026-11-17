@@ -130,7 +130,7 @@ locals {
 }
 
 resource "google_service_account" "scoped" {
-  for_each = local.scoped_pool
+  for_each = var.manage_iam ? local.scoped_pool : {}
 
   # Created in the host project even when the member's project is elsewhere.
   # An account is a principal; where its authority comes from is a separate
@@ -186,7 +186,7 @@ resource "google_service_account" "scoped" {
 # install that declares a scope.
 
 resource "google_service_account_iam_member" "scoped_token_creator" {
-  for_each = local.scoped_pool
+  for_each = var.manage_iam ? local.scoped_pool : {}
 
   # Bound on the pool member as a *resource*, never at project level.
   #
@@ -212,5 +212,5 @@ resource "google_service_account_iam_member" "scoped_token_creator" {
   # without it the pool cannot mint at all.
   service_account_id = google_service_account.scoped[each.key].name
   role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "serviceAccount:${google_service_account.agent.email}"
+  member             = "serviceAccount:${local.service_account_email}"
 }

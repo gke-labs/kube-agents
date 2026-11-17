@@ -61,9 +61,9 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 - **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts. A clone an earlier one-liner left at `$HOME/kube-agents` is moved to the requested release when it is clean (detached at the tag; a branch it was on stays where it was, and untracked files such as `install.env` are kept), and left alone when it has uncommitted changes, where verification then stops the run.
 - **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--gke-cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--gcp-region` with no explicit `--gke-cluster-mode` builds Standard instead of failing; asking for `--gke-cluster-mode=autopilot` at a zone is still an error.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
-- **GitOps Repository**: Asks where the GitOps repository lives (GitHub, a GitHub Enterprise Server, or GitLab; for Bitbucket, pass `--gitops-forge` instead), or **Nowhere yet** to install without one; a later re-run of `install.sh` connects one. Without a repository the agent runs and the scheduled audits run, but an audit opens no ledger issue or pull request ([Each morning: the scheduled audits](#each-morning-the-scheduled-audits)).
+- **GitOps Repository**: Asks where the GitOps repository lives (GitHub, a GitHub Enterprise Server, GitLab, or self-managed Gitea; for Bitbucket, pass `--gitops-forge` instead), or **Nowhere yet** to install without one; a later re-run of `install.sh` connects one. Without a repository the agent runs and the scheduled audits run, but an audit opens no ledger issue or pull request ([Each morning: the scheduled audits](#each-morning-the-scheduled-audits)).
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, selects Vertex AI (no key — Workload Identity), or points the gateway at an OpenAI-compatible server you run (model name, base URL, the egress it needs, and an optional key).
-- **GKE Stockout Investigator**: Prompts on interactive runs to enable automated cluster-autoscaler `noScaleUp` diagnostics, defaulting to Yes when a Google Chat or Slack home channel is configured and No otherwise; non-interactive runs leave it off unless `--enable-stockout-investigator` or `ENABLE_STOCKOUT_INVESTIGATOR=true` is set. Also changeable from the Day-2 Control Panel (`./install.sh --menu`).
+- **GKE Stockout Investigator**: Prompts on interactive runs (when `MANAGE_IAM` is `true`) to enable automated cluster-autoscaler `noScaleUp` diagnostics, defaulting to Yes when a Google Chat or Slack home channel is configured and No otherwise; skipped under `--manage-iam=false`, and non-interactive runs leave it off unless `--enable-stockout-investigator` or `ENABLE_STOCKOUT_INVESTIGATOR=true` is set. Also changeable from the Day-2 Control Panel (`./install.sh --menu`, when `MANAGE_IAM` is `true`).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
 - **Automated Engine Execution**: Generates `terraform/examples/full-install/terraform.tfvars` from the loaded configuration, records that configuration in `install.env` when a first install has none, and launches `lifecycle.sh apply` — a single `terraform apply` that provisions every GCP resource and installs the Helm chart, with the Terraform state kept in a versioned GCS bucket (`<project>-kube-agents-tfstate`).
 
@@ -347,7 +347,7 @@ Rules for the agent:
   the transcript. Either leave out `--gitops-token-file` (the install prints the command that
   creates the Secret, and the operator runs it), or give it a file or a process substitution, as
   above. `--gitlab-token-file` is the same flag under its old name.
-- On an install whose `install.env` records another forge with a token (GitLab, or the other
+- On an install whose `install.env` records another forge with a token (GitLab, Gitea, or the other
   Bitbucket product), give the new token with `--gitops-token-file` or name its Secret with
   `--gitops-token-secret`: the installer refuses to keep the recorded Secret, which holds the old
   forge's token. A run with no terminal is refused like a non-interactive one. When the recorded
@@ -362,6 +362,27 @@ Rules for the agent:
   to chat, and they still open pull requests in the GitOps repository. Tell the operator so.
 - After the install, check the connection with `vcs.py identity`. [Bitbucket as the GitOps forge](docs/site/src/content/docs/install/bitbucket.md)
   gives the commands, the network and certificate rules, and token rotation.
+
+#### GitOps Repository on Gitea
+
+When the GitOps repository lives on a self-managed Gitea instance serving HTTPS on port 443, pass `--gitops-forge=gitea`, `--gitops-host`, and `--gitops-repo="owner/repo"` (plus `--gitops-ca-file` when signed by a private CA; default token Secret `gitea-forge-token`, default CA Secret `gitea-forge-ca`). See [Gitea as the GitOps forge](docs/site/src/content/docs/install/gitea.md) for token scopes and rotation:
+
+```bash
+./install.sh --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only" \
+  --gitops-forge=gitea \
+  --gitops-host="gitea.example.test" \
+  --gitops-repo="platform/gitops" \
+  --gitops-token-file=<(pass show gitea/agent-token | head -n1)
+```
+
+#### Google Cloud Dedicated and Sovereign Cloud
+
+For **Google Cloud Dedicated / Sovereign Cloud** deployments on a custom `universe_domain`, pass `--universe-domain="universe.example.test"` (or run from an active `gcloud` configuration whose `core/universe_domain` is already set), `--gcp-region="<sovereign-region>"`, and `--vpc-network` (plus `--vpc-subnetwork` on custom-mode VPCs) when creating a cluster in a project without a `default` VPC network. Prefer `--model-provider=openai_compatible` or `--model-provider=vertex_ai` to keep model traffic inside the universe; any other model provider requires `--allow-external-model-egress`. When an IAM administrator pre-provisions `kubeagents-platform-gsa` (and `kubeagents-litellm-gsa` for `vertex_ai`), its project/scope roles, and its Workload Identity binding out of band so the deployment identity runs without `setIamPolicy`, pass `--manage-iam=false` (`MANAGE_IAM=false` in `install.env`) onto an existing cluster (or with `TF_VAR_enable_database_encryption=false`), set `ENABLE_DRIFT_DETECTOR=false` in `install.env`, and leave `--enable-stockout-investigator`, `--enable-google-chat`, `--scoped-sa-pool-enabled`, and `--github-app-id` off (Terraform refuses those IAM-binding features at plan time when `manage_iam = false`).
 
 #### AI-Assisted Installation
 
@@ -390,7 +411,7 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`, `sap`, or
    another LiteLLM provider slug),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
-   forge that holds the GitOps repository (GitHub, GitLab, Bitbucket Cloud or Bitbucket Data
+   forge that holds the GitOps repository (GitHub, GitLab, Gitea, Bitbucket Cloud or Bitbucket Data
    Center) and its path:
 
    ```bash
@@ -611,6 +632,12 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   the agent's namespace after the apply, as
   [Bitbucket as the GitOps forge](docs/site/src/content/docs/install/bitbucket.md) shows.
 
+- **GitOps on Gitea**: set `gitops_forge = "gitea"`, `gitops_host` (required), `gitops_repo_path`
+  (`owner/repo`), `gitops_token_secret_name` (default `gitea-forge-token`), and, when behind a
+  private CA, `gitops_ca_secret_name` (default `gitea-forge-ca`). Leave `github_repo` and
+  `enable_github_minter` unset. Create the Secrets in the agent's namespace after the apply, as
+  [Gitea as the GitOps forge](docs/site/src/content/docs/install/gitea.md) shows.
+
 - **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and review prerequisites before applying.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
@@ -791,7 +818,7 @@ The agent can use a GitOps repository on a GitHub Enterprise Server instance: a 
 #### Before you start
 
 - **The cluster's network.** The cluster's pods (the credential broker and the token minter) must reach the instance on TCP port 443 and resolve its hostname. A port other than 443 is not supported. The credential broker's shipped NetworkPolicy limits ingress only, so its egress is open, to private ranges too, and the token minter's NetworkPolicy allows TCP 443 to any address. The agent pod never connects to the instance. If you add a policy that limits egress in the agent's namespace, allow the broker and the minter to reach the instance on 443. An instance on a private network needs a route from the cluster's VPC, such as [Cloud VPN](https://cloud.google.com/network-connectivity/docs/vpn/concepts/overview) or [Cloud Interconnect](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/overview), [firewall rules](https://cloud.google.com/firewall/docs/firewalls) that allow it, and, for a hostname in a private DNS zone, a [Cloud DNS forwarding zone](https://cloud.google.com/dns/docs/zones/forwarding-zones) in the cluster's VPC.
-  - **A new cluster** (the default) is created in the project's `default` VPC network: the installer and the composition have no network or subnetwork setting. If the instance is reachable only from another VPC (the one your VPN or Interconnect attaches to, or a Shared VPC), create the cluster yourself in that VPC, for example with `gcloud container clusters create-auto CLUSTER --region=REGION --network=NETWORK --subnetwork=SUBNETWORK --project=PROJECT_ID`, and install onto it with `--gke-cluster-name=CLUSTER`, as for any existing cluster (see the [composition README](terraform/examples/full-install/README.md#prerequisites)).
+  - **A new cluster** (the default) uses the project's `default` VPC network unless `--vpc-network` (and optional `--vpc-subnetwork`) is passed (`vpc_network` / `vpc_subnetwork` in Terraform). For a Shared VPC, or when you need custom secondary Pod/Service ranges, create the cluster yourself in that VPC, for example with `gcloud container clusters create-auto CLUSTER --region=REGION --network=NETWORK --subnetwork=SUBNETWORK --project=PROJECT_ID`, and install onto it with `--gke-cluster-name=CLUSTER`, as for any existing cluster (see the [composition README](terraform/examples/full-install/README.md#prerequisites)).
     - **Shared VPC:** name the host project's network and subnetwork by their full paths, and set up the host-project IAM and the subnet's secondary ranges for Pods and Services as [GKE with Shared VPC](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc) describes.
     - **The return route:** traffic from the Pods to the instance leaves with the Pod addresses, so the network on the instance's side must route the cluster's Pod range (and node range) back over the VPN or Interconnect.
     - **Database encryption (CMEK):** on a cluster that `install.sh` adopts, it enables CMEK itself before the apply (see [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements)).
@@ -1426,7 +1453,7 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 ```
 
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
-there, so those two need a GitOps repository, on GitHub or on GitLab. On Bitbucket, which has no
+there, so those two need a GitOps repository, on GitHub, GitLab, or Gitea. On Bitbucket, which has no
 issue tracker, the ledger stays in the report store and the fixes are pull requests. With no GitOps repository
 registered, the audits still run: each keeps its findings in the report store on the agent's
 volume, and a run that changed something posts a summary to chat that says no GitOps repository is connected.

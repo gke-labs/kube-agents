@@ -28,6 +28,26 @@ The agent sandbox holds no Gitea tokens or API keys. Git operations in the sandb
 
 ---
 
+## Installer Setup (`install.sh`)
+
+To connect a self-managed HTTPS Gitea repository during installation, pass `--gitops-forge=gitea`, `--gitops-host`, and `--gitops-repo` (`owner/repo`). Add `--gitops-ca-file` when a private CA signed the Gitea certificate:
+
+```bash
+./install.sh \
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --gitops-forge=gitea \
+  --gitops-host="gitea.internal.net" \
+  --gitops-repo="platform-team/gke-fleet-iac" \
+  --gitops-token-file="$HOME/secure/gitea-token" \
+  --gitops-ca-file="$HOME/secure/internal-ca.pem"
+```
+
+The installer writes the token to Secret `gitea-forge-token` and the CA certificate to Secret `gitea-forge-ca`, then records the forge settings in `install.env` so `upgrade.sh` preserves them. For an in-cluster HTTP Service or non-443 port, declare the forge directly on the `PlatformAgent` CR or Helm values as shown below.
+
+---
+
 ## 1. Create the Token Secret
 
 Generate an access token in your Gitea instance (from a dedicated bot/automation account, never a person's own account) with the following Gitea 1.19+ scopes:

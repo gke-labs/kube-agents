@@ -126,6 +126,7 @@ MAX_POOL_BYTES = 1 << 20
 # "cluster\n" -- which then goes into the refusal message, and the refusal
 # message goes into a log line.
 _COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+_PROJECT_COMPONENT = re.compile(r"^(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*\Z")
 # The CRD's `MaxLength=63` on `projectId`. GCP project ids stop at 30 and GKE
 # cluster names at 40, so nothing real is refused by it; what it buys is that
 # every name the refusal below interpolates has a bound, which is what lets
@@ -152,7 +153,7 @@ MAX_NAME_COMPONENT_LENGTH = 63
 # so a newline only arrives via a hand-written pool file, but the invariant
 # this module keeps is that no pattern in it admits one.
 _SERVICE_ACCOUNT = re.compile(
-    r"[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com\Z"
+    r"[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{1,30}(?:\.[a-z][a-z0-9-]{0,15})?\.iam\.gserviceaccount\.com\Z"
 )
 
 # One hour is the ceiling `generateAccessToken` enforces without
@@ -222,7 +223,8 @@ def _name_component(name: str, value: object) -> str:
     nothing; the location and cluster are not part of the key, and are checked
     anyway because the refusal embeds them and the refusal reaches a log line.
     """
-    if not isinstance(value, str) or not _COMPONENT.fullmatch(value):
+    pattern = _PROJECT_COMPONENT if name in ("project", "projectId") else _COMPONENT
+    if not isinstance(value, str) or not pattern.fullmatch(value):
         raise ValueError(f"{name} is not a GKE name component: {value!r}")
     if len(value) > MAX_NAME_COMPONENT_LENGTH:
         # The value is not echoed: it is the thing that is too long.

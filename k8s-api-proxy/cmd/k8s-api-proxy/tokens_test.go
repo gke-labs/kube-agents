@@ -121,13 +121,16 @@ func TestScopedPoolEnabled(t *testing.T) {
 }
 
 func TestParseScopedSAPool(t *testing.T) {
-	valid := `{"version":2,"serviceAccounts":[{"projectId":"proj-a","serviceAccountEmail":"ka-proj-a-1a2b3c4d@host-proj.iam.gserviceaccount.com"}]}`
+	valid := `{"version":2,"serviceAccounts":[{"projectId":"proj-a","serviceAccountEmail":"ka-proj-a-1a2b3c4d@host-proj.iam.gserviceaccount.com"},{"projectId":"part0:sample-project","serviceAccountEmail":"ka-sample-1a2b3c4d@sample-project.part0.iam.gserviceaccount.com"}]}`
 	members, err := parseScopedSAPool([]byte(valid))
 	if err != nil {
 		t.Fatalf("unexpected error on valid pool: %v", err)
 	}
 	if got := members["proj-a"]; got != "ka-proj-a-1a2b3c4d@host-proj.iam.gserviceaccount.com" {
 		t.Fatalf("unexpected member for proj-a: %q", got)
+	}
+	if got := members["part0:sample-project"]; got != "ka-sample-1a2b3c4d@sample-project.part0.iam.gserviceaccount.com" {
+		t.Fatalf("unexpected member for partitioned project: %q", got)
 	}
 
 	invalidCases := []struct {

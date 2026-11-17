@@ -70,9 +70,21 @@ variable "location" {
   type        = string
 
   validation {
-    condition     = can(regex("^[a-z]+-[a-z]+[0-9]+(-[a-z])?$", var.location))
-    error_message = "location must be a region (e.g. us-central1) or a zone (e.g. us-central1-a)."
+    condition     = can(regex("^(u-)?[a-z]+-[a-z]+[0-9]+(-[a-z])?$", var.location))
+    error_message = "location must be a region (e.g. us-central1 or u-region-north1) or a zone (e.g. us-central1-a)."
   }
+}
+
+variable "network" {
+  description = "VPC network name or self_link for a cluster this module creates. Null or empty uses the project's default VPC network. Ignored when create_cluster = false."
+  type        = string
+  default     = null
+}
+
+variable "subnetwork" {
+  description = "Subnetwork name or self_link for a cluster this module creates. Null or empty uses the network's auto-mode subnetwork in location. Ignored when create_cluster = false."
+  type        = string
+  default     = null
 }
 
 variable "deletion_protection" {

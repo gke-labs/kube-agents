@@ -1,3 +1,7 @@
+locals {
+  service_agent_domain = can(regex("^[a-z][a-z0-9-]*:", var.project_id)) ? "${split(":", var.project_id)[0]}-system.iam.gserviceaccount.com" : "iam.gserviceaccount.com"
+}
+
 data "google_project" "this" {
   project_id = var.project_id
 }
@@ -64,7 +68,7 @@ resource "google_pubsub_topic_iam_member" "gsuiteaddons_publisher" {
   project = var.project_id
   topic   = google_pubsub_topic.chat_events.id
   role    = "roles/pubsub.publisher"
-  member  = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
+  member  = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-gsuiteaddons.${local.service_agent_domain}"
 
   depends_on = [google_project_service_identity.gsuiteaddons]
 }

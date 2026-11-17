@@ -318,6 +318,10 @@ class DefaultOnKeysAreRefusableTest(unittest.TestCase):
         # process environment. Provisions nothing either way, so an environment
         # that cannot override it loses no cloud resource by the omission.
         "PERSIST_SECRETS_ON_DISK",
+        # Defaults to true so standard installs keep Terraform-managed GSA and
+        # IAM bindings; false only WITHHOLDS IAM creation for sovereign/external
+        # IAM governance, so an omitted setting never provisions anything extra.
+        "MANAGE_IAM",
     }
 
     def test_every_default_true_boolean_can_be_refused_by_an_environment(self):

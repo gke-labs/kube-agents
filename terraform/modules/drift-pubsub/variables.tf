@@ -26,8 +26,8 @@ variable "source_projects" {
   nullable    = false
 
   validation {
-    condition     = alltrue([for project in var.source_projects : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))])
-    error_message = "source_projects holds GCP project IDs (^[a-z][a-z0-9-]{4,28}[a-z0-9]$); a legacy domain-scoped ID cannot be in an install's scope and is not accepted here."
+    condition     = alltrue([for project in var.source_projects : can(regex("^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))])
+    error_message = "source_projects holds GCP project IDs (^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$); a legacy domain-scoped ID cannot be in an install's scope and is not accepted here."
   }
 }
 

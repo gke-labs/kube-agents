@@ -97,7 +97,7 @@ locals {
   # alone (below), in the same resource.
   scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)
 
-  scope_bindings = merge(
+  scope_bindings = var.manage_iam ? merge(
     {
       for pair in setproduct(sort(tolist(local.scope_bound_projects)), local.scope_roles) :
       "${pair[0]}/${pair[1]}" => { project = pair[0], role = pair[1] }
@@ -106,7 +106,7 @@ locals {
       for host in sort(tolist(local.scope_lookup_only_hosts)) :
       "${host}/${local.scope_shared_vpc_lookup_role}" => { project = host, role = local.scope_shared_vpc_lookup_role }
     },
-  )
+  ) : {}
 
   # The one role a container carries beyond the allowlist: the reconcile's
   # `asset search-all-resources --scope=<container>` needs it on the container
@@ -119,15 +119,15 @@ locals {
   scope_folders       = toset(var.scope.folders)
   scope_organizations = toset(var.scope.organizations)
 
-  scope_folder_bindings = {
+  scope_folder_bindings = var.manage_iam ? {
     for pair in setproduct(sort(tolist(local.scope_folders)), local.scope_container_roles) :
     "${pair[0]}/${pair[1]}" => { folder = pair[0], role = pair[1] }
-  }
+  } : {}
 
-  scope_organization_bindings = {
+  scope_organization_bindings = var.manage_iam ? {
     for pair in setproduct(sort(tolist(local.scope_organizations)), local.scope_container_roles) :
     "${pair[0]}/${pair[1]}" => { organization = pair[0], role = pair[1] }
-  }
+  } : {}
 
   # What the manageability precondition in main.tf counts: any declaration
   # that binds outside the host project.
@@ -266,7 +266,7 @@ resource "google_project_iam_member" "scope_roles" {
 
   project = each.value.project
   role    = each.value.role
-  member  = "serviceAccount:${google_service_account.agent.email}"
+  member  = "serviceAccount:${local.service_account_email}"
 }
 
 resource "google_folder_iam_member" "scope_roles" {
@@ -279,7 +279,7 @@ resource "google_folder_iam_member" "scope_roles" {
 
   folder = "folders/${each.value.folder}"
   role   = each.value.role
-  member = "serviceAccount:${google_service_account.agent.email}"
+  member = "serviceAccount:${local.service_account_email}"
 }
 
 resource "google_organization_iam_member" "scope_roles" {
@@ -292,5 +292,5 @@ resource "google_organization_iam_member" "scope_roles" {
 
   org_id = each.value.organization
   role   = each.value.role
-  member = "serviceAccount:${google_service_account.agent.email}"
+  member = "serviceAccount:${local.service_account_email}"
 }

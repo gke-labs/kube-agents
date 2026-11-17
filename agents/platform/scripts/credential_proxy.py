@@ -11471,7 +11471,7 @@ class CommandExecutor:
             return self._ensure_managed_kubeconfig(target)
         token = self.scoped_pool.token_for(target.project, target.location, target.cluster)
         managed = self._ensure_managed_kubeconfig(target)
-        scoped = self.kubeconfig_dir / f"{target.context_name}.scoped.yaml"
+        scoped = self.kubeconfig_dir / f"{target.context_name.replace(':', '_')}.scoped.yaml"
         document = scoped_sa_pool.kubeconfig_with_token(
             managed.read_text(encoding="utf-8"), token
         )
@@ -11582,7 +11582,7 @@ class CommandExecutor:
         return rewritten, resolved_path
 
     def _managed_kubeconfig(self, target: ClusterTarget) -> Path:
-        return self.kubeconfig_dir / f"{target.context_name}.yaml"
+        return self.kubeconfig_dir / f"{target.context_name.replace(':', '_')}.yaml"
 
     def _endpoint_decision(self, gcloud: str, target: ClusterTarget, timeout_seconds: int | None = None):
         """Decide which endpoint this cluster's credentials must name.

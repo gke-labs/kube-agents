@@ -11420,7 +11420,7 @@ spec:
                                   ProjectID is the project the cluster lives
                                   in.
                                 maxLength: 63
-                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                pattern: ^([a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*$
                                 type: string
                             required:
                               - clusterName
@@ -11440,7 +11440,7 @@ spec:
                             each resolved project ID. A match on the management project is ignored and
                             recorded in the scope snapshot, never applied.
                           items:
-                            pattern: ^[a-z0-9*?\[\]!-]{1,63}$
+                            pattern: ^[a-z0-9:*?\[\]!-]{1,63}$
                             type: string
                           maxItems: 100
                           type: array
@@ -11500,7 +11500,7 @@ spec:
                         previous members and holds the scope prune, and is reported in the
                         snapshot's containers array under metricsScopes/<scope>.
                       items:
-                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        pattern: ^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$
                         type: string
                       maxItems: 100
                       type: array
@@ -11525,7 +11525,7 @@ spec:
                         reported with the reason (denied, api-disabled, unreachable) and its
                         existing profiles are kept.
                       items:
-                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        pattern: ^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$
                         type: string
                       maxItems: 100
                       type: array
@@ -11549,7 +11549,7 @@ spec:
                         the selector's previous members and holds the scope prune, and is reported
                         in the snapshot's containers array under sharedVpcHosts/<host>.
                       items:
-                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        pattern: ^([a-z][a-z0-9-]{0,15}:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$
                         type: string
                       maxItems: 100
                       type: array
@@ -12016,14 +12016,14 @@ spec:
                                   ProjectID is the project whose clusters this account reads, which need
                                   not be the project the agent runs in.
                                 maxLength: 63
-                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                pattern: ^([a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*$
                                 type: string
                               serviceAccountEmail:
                                 description: |-
                                   ServiceAccountEmail is the account scoped to this project. It lives in
                                   the host project, whatever project it reads; Terraform's
                                   `scoped_service_accounts` output is the source of these values.
-                                pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$
+                                pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{1,30}(\.[a-z][a-z0-9-]{0,15})?\.iam\.gserviceaccount\.com$
                                 type: string
                             required:
                               - projectId

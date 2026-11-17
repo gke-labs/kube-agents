@@ -12,6 +12,8 @@ func TestParseGKEClusterID(t *testing.T) {
 		ok   bool
 	}{
 		{"gke_proj_us-central1_c1", gkeCluster{"proj", "us-central1", "c1"}, true},
+		{"gke_p:proj_u-region-north1_c1", gkeCluster{"p:proj", "u-region-north1", "c1"}, true},
+		{"gke_part0:sample-project_u-region-north1_c1", gkeCluster{"part0:sample-project", "u-region-north1", "c1"}, true},
 		{"gke_example.com:proj_us-east4-a_c-1", gkeCluster{"example.com:proj", "us-east4-a", "c-1"}, true},
 		{"gke_proj_us-central1", gkeCluster{}, false},
 		{"gke_proj_us-central1_c1_extra", gkeCluster{}, false},

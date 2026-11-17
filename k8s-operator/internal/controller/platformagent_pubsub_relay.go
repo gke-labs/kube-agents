@@ -63,7 +63,7 @@ const (
 // pulls are then refused by the policy, which the adapter logs with the rule.
 // Validating here as well keeps the rendered variable honest.
 var pubsubSubscriptionPathPattern = regexp.MustCompile(
-	`^projects/((?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z][a-z0-9-]{4,28}[a-z0-9]|[0-9]{1,20})/subscriptions/[A-Za-z][A-Za-z0-9._~+%-]{2,254}$`,
+	`^projects/((?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z][a-z0-9-]{4,28}[a-z0-9]|[0-9]{1,20})/subscriptions/[A-Za-z][A-Za-z0-9._~+%-]{2,254}$`,
 )
 
 // pluginPubsubSubscriptions is the sorted, deduplicated set of fully qualified

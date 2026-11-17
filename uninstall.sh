@@ -136,6 +136,7 @@ PARAM_DRY_RUN="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
+PARAM_UNIVERSE_DOMAIN=""
 # Empty means "whatever the loaded configuration says". The teardown
 # regenerates terraform.tfvars before destroying and namespace is one of its
 # keys, so this is not cosmetic: it names the release being torn down.
@@ -207,6 +208,8 @@ Options:
   --gcp-project-id ID           GCP Target Project ID
   --gke-cluster-name NAME       GKE Target Cluster Name (default: platform-agent-host)
   --gcp-region REGION           GKE GCP Region
+  --universe-domain DOMAIN      Cloud universe API domain (default: googleapis.com,
+                                or the install's UNIVERSE_DOMAIN / gcloud core/universe_domain)
   --agent-namespace NS          Kubernetes namespace the release lives in
                                 (default: the install's own, else kubeagents-system)
   --source-ref REF              Tag or commit SHA of the release that made the install; that
@@ -247,6 +250,8 @@ parse_args() {
       --gke-cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
       --gcp-region) PARAM_REGION="$2"; shift 2 ;;
+      --universe-domain=*) PARAM_UNIVERSE_DOMAIN="${1#*=}"; shift ;;
+      --universe-domain) PARAM_UNIVERSE_DOMAIN="$2"; shift 2 ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
       --source-ref=*) PARAM_SOURCE_REF="${1#*=}"; shift ;;
@@ -383,14 +388,15 @@ resolve_uninstall_env_file() {
 guessed_env_verdict() {
   local env_file="$1" verdict=""
   verdict="$(
-    unset PROJECT_ID CLUSTER_NAME REGION NAMESPACE
+    unset PROJECT_ID CLUSTER_NAME REGION NAMESPACE UNIVERSE_DOMAIN VPC_NETWORK VPC_SUBNETWORK ALLOW_EXTERNAL_MODEL_EGRESS MANAGE_IAM
     set -a
     # shellcheck disable=SC1090
     . "$env_file" >/dev/null 2>&1
     set +a
     if { [ -n "${PROJECT_ID:-}" ] && [ "$PROJECT_ID" != "$PARAM_PROJECT_ID" ]; } ||
       { [ -n "${CLUSTER_NAME:-}" ] && [ "$CLUSTER_NAME" != "$PARAM_CLUSTER_NAME" ]; } ||
-      { [ -n "${REGION:-}" ] && [ "$REGION" != "$PARAM_REGION" ]; }; then
+      { [ -n "${REGION:-}" ] && [ "$REGION" != "$PARAM_REGION" ]; } ||
+      { [ -n "${UNIVERSE_DOMAIN:-}" ] && [ -n "${PARAM_UNIVERSE_DOMAIN:-}" ] && [ "$UNIVERSE_DOMAIN" != "$PARAM_UNIVERSE_DOMAIN" ]; }; then
       echo "differs"
     elif [ -z "${PROJECT_ID:-}" ] || [ -z "${CLUSTER_NAME:-}" ] || [ -z "${REGION:-}" ]; then
       echo "incomplete"
@@ -451,6 +457,17 @@ guessed_env_skip_reason() {
 # point KUBE_AGENTS_INSTALL_ENV at or run from, and dropping the flags aims the
 # run at the other install. The one that works is naming all three
 # coordinates, which makes the local arm skip the guess, so it is said too.
+sanitize_loaded_uninstall_universe_domain() {
+  local env_file="$1"
+  local pattern='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+  if [ -n "${UNIVERSE_DOMAIN:-}" ]; then
+    if [ "${#UNIVERSE_DOMAIN}" -gt 253 ] || ! [[ "$UNIVERSE_DOMAIN" =~ $pattern ]]; then
+      print_warning "UNIVERSE_DOMAIN='${UNIVERSE_DOMAIN}' in ${env_file} is malformed; ignoring it so teardown can proceed."
+      unset UNIVERSE_DOMAIN
+    fi
+  fi
+}
+
 check_uninstall_coordinate_conflicts() {
   local env_file="$1"
   local env_is_a_home_guess="${2:-false}"
@@ -463,6 +480,9 @@ check_uninstall_coordinate_conflicts() {
   fi
   if [ -n "$PARAM_REGION" ] && [ -n "${REGION:-}" ] && [ "$PARAM_REGION" != "$REGION" ]; then
     coordinate_conflicts="${coordinate_conflicts}    --gcp-region=${PARAM_REGION}, but REGION=${REGION}"$'\n'
+  fi
+  if [ -n "$PARAM_UNIVERSE_DOMAIN" ] && [ -n "${UNIVERSE_DOMAIN:-}" ] && [ "$PARAM_UNIVERSE_DOMAIN" != "$UNIVERSE_DOMAIN" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --universe-domain=${PARAM_UNIVERSE_DOMAIN}, but UNIVERSE_DOMAIN=${UNIVERSE_DOMAIN}"$'\n'
   fi
   if [ -n "$coordinate_conflicts" ]; then
     if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -583,7 +603,7 @@ main() {
       fi
     fi
 
-    unset PROJECT_ID CLUSTER_NAME REGION NAMESPACE
+    unset PROJECT_ID CLUSTER_NAME REGION NAMESPACE UNIVERSE_DOMAIN VPC_NETWORK VPC_SUBNETWORK ALLOW_EXTERNAL_MODEL_EGRESS MANAGE_IAM
     if [ -n "$handoff_env_file" ] && [ -f "$handoff_env_file" ]; then
       if ! bash -n "$handoff_env_file" 2>/dev/null; then
         print_error "Install configuration '$handoff_env_file' is not valid shell and could not be loaded."
@@ -594,7 +614,11 @@ main() {
       . "$handoff_env_file"
       set +a
       print_success "Loaded install configuration from: ${handoff_env_file}"
+      sanitize_loaded_uninstall_universe_domain "$handoff_env_file"
       check_uninstall_coordinate_conflicts "$handoff_env_file"
+      if [ -z "${UNIVERSE_DOMAIN:-}" ]; then
+        export UNIVERSE_DOMAIN="${PARAM_UNIVERSE_DOMAIN:-googleapis.com}"
+      fi
       export KUBE_AGENTS_INSTALL_ENV="$handoff_env_file"
     else
       # Silence here is what makes this arm dangerous. Nothing is forwarded, and
@@ -703,6 +727,10 @@ main() {
     if [ -n "$eff_agent_namespace" ] && grep -q -- '--agent-namespace' "${repo_dir}/uninstall.sh"; then
       dispatch_args+=(--agent-namespace="$eff_agent_namespace")
     fi
+    local eff_universe_domain="${PARAM_UNIVERSE_DOMAIN:-${UNIVERSE_DOMAIN:-}}"
+    if [ -n "$eff_universe_domain" ] && grep -q -- '--universe-domain' "${repo_dir}/uninstall.sh"; then
+      dispatch_args+=(--universe-domain="$eff_universe_domain")
+    fi
     print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
     TEMP_REPO_DIR=""
     # ${dispatch_args[@]+...}: empty on an interactive run that forwards no
@@ -765,7 +793,7 @@ main() {
   # only unsets NAMESPACE, so without this an exported REGION or PROJECT_ID in
   # the operator's shell would suppress the guessed-coordinate warning below or
   # trigger a false conflict blaming install.env.
-  unset PROJECT_ID CLUSTER_NAME REGION
+  unset PROJECT_ID CLUSTER_NAME REGION UNIVERSE_DOMAIN VPC_NETWORK VPC_SUBNETWORK ALLOW_EXTERNAL_MODEL_EGRESS MANAGE_IAM
   if load_install_env "$install_env_file"; then
     state_loaded="true"
     print_success "Loaded install configuration from: ${install_env_file}"
@@ -777,9 +805,24 @@ main() {
   # the generator reads. This teardown regenerates tfvars before destroying.
   normalize_memory_vars
 
+  local fallback_universe="${DEFAULT_UNIVERSE_DOMAIN:-${COMMERCIAL_UNIVERSE_DOMAIN:-googleapis.com}}"
+  if [ "$state_loaded" = "true" ]; then
+    sanitize_loaded_uninstall_universe_domain "$install_env_file"
+  fi
+  local recorded_universe_domain="${UNIVERSE_DOMAIN:-}"
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
   local target_region="${PARAM_REGION:-${REGION:-$DEFAULT_REGION}}"
+  local target_universe_domain="${PARAM_UNIVERSE_DOMAIN:-${recorded_universe_domain}}"
+  if [ -z "$target_universe_domain" ] && [ "$state_loaded" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then
+    target_universe_domain="$(gcloud config get-value core/universe_domain 2>/dev/null || true)"
+    [ "$target_universe_domain" = "(unset)" ] && target_universe_domain=""
+  fi
+  target_universe_domain="${target_universe_domain:-$fallback_universe}"
+  if declare -F is_valid_universe_domain >/dev/null && ! is_valid_universe_domain "$target_universe_domain"; then
+    print_error "Invalid universe API domain '${target_universe_domain}'. Pass --universe-domain with a bare lowercase domain."
+    exit 1
+  fi
   # Which of the three nobody actually named. A teardown is allowed to run on
   # defaults -- that is what makes `./uninstall.sh` in a checkout work -- but it
   # is not allowed to be quiet about it: the same three lines are printed
@@ -816,6 +859,7 @@ main() {
     fi
     check_uninstall_coordinate_conflicts "$install_env_file" "$install_env_is_a_home_guess"
   fi
+  export UNIVERSE_DOMAIN="$target_universe_domain"
   if [ -n "$guessed_coordinates" ]; then
     if [ "$state_loaded" = "true" ]; then
       print_warning "Some of what this teardown is aimed at was not recorded in ${install_env_file}:"
@@ -837,6 +881,9 @@ main() {
   export PROJECT_ID="$target_project"
   export CLUSTER_NAME="$target_cluster"
   export REGION="$target_region"
+  if declare -F configure_installer_universe_env >/dev/null; then
+    configure_installer_universe_env "$target_universe_domain" || exit 1
+  fi
   # write_tfvars_from_state writes `namespace` from this, so --agent-namespace
   # has to win over the loaded configuration here the way the three above do.
   if [ -n "$PARAM_AGENT_NAMESPACE" ]; then
@@ -943,6 +990,9 @@ main() {
   # value, and the destroy removes the two serving-project resources in state
   # whichever way the key renders.
   export VERTEX_MANAGE_SERVING_PROJECT=""
+  if [ -n "${MANAGE_IAM:-}" ] && ! is_bool_spelling "$MANAGE_IAM"; then
+    export MANAGE_IAM=""
+  fi
   # The release's upgrade_install switch, likewise: the generator refuses a
   # misspelt value, and the destroy removes the release however it renders.
   export HELM_UPGRADE_INSTALL=""
@@ -990,6 +1040,7 @@ main() {
   # validations; unset, the variable's default passes and terraform destroys
   # what is in state either way.
   unset TF_VAR_agent_ksa_name
+  export VPC_NETWORK="" VPC_SUBNETWORK="" ALLOW_EXTERNAL_MODEL_EGRESS="" KUBE_AGENTS_UNINSTALL_DESTROY="true"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

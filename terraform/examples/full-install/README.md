@@ -10,14 +10,30 @@ install without the interview.
 
 - The required Google APIs (`google_project_service`, never disabled on
   destroy), including the Cloud KMS API for GKE database encryption and the Chat
-  API when Google Chat is enabled.
+  API when Google Chat is enabled. When `universe_domain` is set to a Google
+  Cloud Dedicated / Sovereign Cloud domain (any value other than
+  `"googleapis.com"`), the `google` and `google-beta` providers target that
+  universe, `lifecycle.sh` points the GCS remote-state backend at
+  `https://storage.<universe_domain>/storage/v1/` (replacing `:` with `-` in
+  partitioned project IDs when deriving `<project>-kube-agents-tfstate`),
+  commercial-only APIs and IAM roles are omitted automatically, `vpc_network` /
+  `vpc_subnetwork` wire cluster creation onto custom VPCs when no `default` VPC
+  exists, and any `model_provider` outside `openai_compatible` and `vertex_ai`
+  requires `allow_external_model_egress = true` (set `manage_iam = false` —
+  keeping `enable_drift_detector`, `enable_drift_pubsub`,
+  `enable_stockout_investigator`, `enable_google_chat`, `enable_github_minter`,
+  and `scoped_pool_enabled` `false`, with an existing cluster or
+  `enable_database_encryption = false` — when an IAM administrator
+  pre-provisions the agent GSA and its IAM/Workload Identity bindings outside
+  Terraform).
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
   by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
   (with an optional gVisor node pool; `sizing_profile = "fleet"` or the
   `standard_*` and `gvisor_*` inputs resize both pools, per the module's
   [sizing section](../../modules/gke-cluster/README.md#sizing-the-node-pools))
   — with Workload Identity, Cloud KMS
-  database encryption (CMEK), the Backup for GKE agent enabled, and the
+  database encryption (CMEK), the Backup for GKE agent enabled on `googleapis.com`
+  (omitted in custom universes unless `enable_gke_backup_plan = true`), and the
   `kube-agents-host=true` discovery label applied. Setting
   `create_cluster = false` instead makes the module read an existing cluster:
   it enables none of those, and its postconditions refuse the plan unless the
@@ -752,7 +768,7 @@ project id to email.
 
 ### Backups
 
-`enable_backup_agent` (default `true`) turns on the Backup for GKE addon. It
+`enable_backup_agent` (default `true` on `googleapis.com`, and disabled automatically in custom `universe_domain` environments unless `enable_gke_backup_plan = true`) turns on the Backup for GKE addon. It
 costs nothing on its own. `enable_gke_backup_plan = true` then adds the
 scheduled plan — opt-in, because backups are billed per backed-up pod and per
 GB of snapshot storage.
@@ -823,11 +839,13 @@ with the created topic/subscription — restrict access with
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
-For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the instance's hostname and `github_repo` to `owner/name` on the instance (not a URL: the composition reads a github.com URL only). The composition then declares the `github` forge at that host in `spec.integration.forges`, with the owner as its namespace, and the repository as its `gitops` repository, with no `github` alias; the chart points the token minter at `https://<host>/api/v3`. A host where GitHub runs its own services (`github.com`, `githubusercontent.com`, `ghe.com` and the like) or `gitlab.com` is refused. When a private CA signed the instance's certificate, set `github_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`: the broker trusts it for that host only, and the minter trusts it for all of its calls and reads it when it starts, so restart the minter after the Secret changes (`install.sh --gitops-ca-file` creates the Secret and restarts the minter). The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
+For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the instance's hostname and `github_repo` to `owner/name` on the instance (not a URL: the composition reads a github.com URL only). The composition then declares the `github` forge at that host in `spec.integration.forges`, with the owner as its namespace, and the repository as its `gitops` repository, with no `github` alias; the chart points the token minter at `https://<host>/api/v3`. A host where GitHub runs its own services (`github.com`, `githubusercontent.com`, `ghe.com` and the like) or `gitlab.com` is refused. When a private CA signed the instance's certificate, set `github_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`: the broker trusts it for that host only, and the minter trusts it for all of its calls and reads it when it starts, so restart the minter after the Secret changes (`install.sh --gitops-ca-file` creates the Secret and restarts the minter). The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network unless `vpc_network` (and optional `vpc_subnetwork`) is set: for a Shared VPC or custom secondary Pod/Service ranges, create the cluster in that VPC first and set `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
 
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
 
 With `gitops_forge = "bitbucket"` (Bitbucket Cloud, at `bitbucket.org` only) or `gitops_forge = "bitbucket-datacenter"`, set `gitops_repo_path` to `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center), and, for Data Center, `gitops_host` to the instance's hostname. The instance must serve at the root path on port 443. The CR then declares one forge named after its provider, with the workspace or project key as its namespace and the repository slug as its `gitops` repository, and `credentialsRef` naming `gitops_token_secret_name` (default `bitbucket-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A Data Center instance behind a private CA sets `gitops_ca_secret_name`. A Bitbucket Cloud workspace, project or repository access token cannot name its own account, so set `gitops_identity` to the account UUID it acts as; an API token needs none. A Bitbucket install has no GitHub App, so `github_repo` and `enable_github_minter` stay unset. See [Bitbucket as the GitOps forge](../../../docs/site/src/content/docs/install/bitbucket.md).
+
+With `gitops_forge = "gitea"`, set `gitops_host` to the self-managed Gitea hostname (port 443) and `gitops_repo_path` to `owner/repo-slug`. The CR declares one `gitea` forge with `owner` as its namespace and `repo-slug` as its `gitops` repository, `credentialsRef` naming `gitops_token_secret_name` (default `gitea-forge-token`), and optional `gitops_ca_secret_name` (when signed by a private CA; `install.sh --gitops-ca-file` creates `gitea-forge-ca`). `github_repo` and `enable_github_minter` stay unset. See [Gitea as the GitOps forge](../../../docs/site/src/content/docs/install/gitea.md).
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair

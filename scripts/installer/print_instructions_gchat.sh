@@ -35,7 +35,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 # The Google Workspace Add-ons service agent, which Chat creates in the project and
 # which terraform/modules/chat-pubsub/main.tf grants publisher on the events topic.
-readonly WORKSPACE_ADDONS_SA_DOMAIN="gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
+readonly WORKSPACE_ADDONS_SA_PREFIX="gcp-sa-gsuiteaddons"
 
 load_state
 
@@ -99,7 +99,7 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   echo -e "       - Connection Settings: Select ${C_BOLD}Cloud Pub/Sub${C_RESET}"
   echo -e "       - Pub/Sub Topic Name: ${C_GREEN}projects/${PROJECT_ID}/topics/${CHAT_TOPIC_NAME}${C_RESET}"
   echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
-  sa_display_format="service-${PROJECT_NUMBER:-<PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
+  sa_display_format="service-${PROJECT_NUMBER:-<PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_PREFIX}.$(gcp_service_agent_domain "${PROJECT_ID:-}")"
   echo -e "       - After saving, refresh the page and verify the Workspace Add-ons ${C_BOLD}Service account email${C_RESET} appears under Connection settings"
   echo -e "         ${C_CYAN}(format: ${C_GREEN}${sa_display_format}${C_CYAN}; it is not the agent's ${C_YELLOW}${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}${C_CYAN}).${C_RESET}"
   echo -e "         ${C_CYAN}(This field only exists when \"Build this Chat app as a Workspace add-on\" is checked — the default, locked-on state for new apps).${C_RESET}"
