@@ -96,6 +96,7 @@ type CuratorConfig struct {
 type Curator struct {
 	cfg               CuratorConfig
 	log               *slog.Logger
+	metrics           *curatorMetrics
 	mu                sync.Mutex
 	bankEnsured       bool
 	knownIDsLoaded    bool
@@ -158,10 +159,23 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 	return &Curator{
 		cfg:           cfg,
 		log:           log,
+		metrics:       newCuratorMetrics(cfg.RepoDir),
 		knownIDs:      map[string]bool{},
 		seenEnvelopes: map[string]bool{},
 		queryCache:    map[string]MemoryQueryResponse{},
 	}, nil
+}
+
+// CheckChangedFiles loads the Curator's OKF records, evaluates them against changed,
+// and records the resulting verdict in kubeagents_curator_guard_checks_total.
+func (c *Curator) CheckChangedFiles(changed map[string]*string) (CheckReport, error) {
+	records, err := LoadRecords(c.cfg.RepoDir)
+	if err != nil {
+		return CheckReport{}, err
+	}
+	report := checkChangedFiles(records, changed)
+	c.metrics.recordGuardCheck(report.Verdict)
+	return report, nil
 }
 
 func recordIDFromDoc(doc HindsightDocument) string {
@@ -480,15 +494,15 @@ func (c *Curator) handleAnnotationEnvelope(ctx context.Context, env *lib.Envelop
 	if env == nil || env.Kind != lib.KindTopicUpdate {
 		return
 	}
+	ev, ok := ExtractOutcomeEvent(env)
+	if !ok {
+		return
+	}
 	c.mu.Lock()
 	alreadySeen := c.markSeenLocked(env.EnvelopeID)
 	c.mu.Unlock()
 	if alreadySeen {
-		return
-	}
-
-	ev, ok := ExtractOutcomeEvent(env)
-	if !ok {
+		c.metrics.recordOutcome(ev.Kind, outcomeStatusDuplicate)
 		return
 	}
 	// Security invariant: worker profiles with publish access to the shared
@@ -496,6 +510,7 @@ func (c *Curator) handleAnnotationEnvelope(ctx context.Context, env *lib.Envelop
 	// never privileged lifecycle transitions (approved, modified-merged,
 	// resolved-merged, pr-merged-persists, refused, or retired).
 	if ev.Kind != OutcomeProposed {
+		c.metrics.recordOutcome(ev.Kind, outcomeStatusIgnored)
 		c.log.Warn("curator: rejected privileged outcome transition on shared annotations topic; must use SubjectCuratorOutcomes",
 			"kind", ev.Kind, "record_id", ev.RecordID)
 		return
@@ -528,19 +543,21 @@ func (c *Curator) handleCuratorOutcomeMsg(ctx context.Context, msg *nats.Msg, ex
 	var ev OutcomeEvent
 	var corrID string
 	if env, err := lib.ParseEnvelope(msg.Data); err == nil && env != nil && env.Kind != "" {
+		extracted, ok := ExtractOutcomeEvent(env)
+		if !ok {
+			return
+		}
 		c.mu.Lock()
 		alreadySeen := c.markSeenLocked(env.EnvelopeID)
 		c.mu.Unlock()
 		if alreadySeen {
-			return
-		}
-		extracted, ok := ExtractOutcomeEvent(env)
-		if !ok {
+			c.metrics.recordOutcome(extracted.Kind, outcomeStatusDuplicate)
 			return
 		}
 		// Topic-update envelopes from shared streams may never carry privileged transitions,
 		// blocking JetStream MSG.NEXT replay even from no_ack consumers.
 		if env.Kind == lib.KindTopicUpdate && extracted.Kind != OutcomeProposed {
+			c.metrics.recordOutcome(extracted.Kind, outcomeStatusIgnored)
 			c.log.Warn("curator: rejected topic-update envelope carrying privileged outcome", "kind", extracted.Kind)
 			return
 		}
@@ -909,7 +926,15 @@ func rejectedGovernedSameSubject(oldRec, activeRec Record) bool {
 // updates Hindsight (kube-agents-decisions) via document_id replacement, runs
 // cross-cluster recurrence graduation if applicable, and publishes the updated
 // BlueprintDigest to a2a.topics.shared.blueprint.
-func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlationID string) (OutcomeProcessResult, error) {
+func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlationID string) (res OutcomeProcessResult, err error) {
+	outcomeStatus := outcomeStatusProcessed
+	defer func() {
+		if err != nil {
+			outcomeStatus = outcomeStatusError
+		}
+		c.metrics.recordOutcome(ev.Kind, outcomeStatus)
+	}()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -977,12 +1002,18 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 				// If matched fuzzily (no explicit RecordID) for a new PR, allocate a fresh ID.
 				if existing.Meta.Status == StatusActive {
 					if origRecordID != "" || prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+						if prRef != "" && existing.Meta.Evidence.PullRequest == prRef {
+							outcomeStatus = outcomeStatusDuplicate
+						} else {
+							outcomeStatus = outcomeStatusIgnored
+						}
 						return noopResult(), nil
 					}
 					ev.RecordID = ""
 				} else {
 					// Same PR (or no new PR): idempotent no-op.
 					if prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+						outcomeStatus = outcomeStatusDuplicate
 						return noopResult(), nil
 					}
 					// Attaching a newly opened PR reference to a PR-less proposed record:
@@ -1001,6 +1032,7 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 					// if the caller explicitly named RecordID, refuse to clobber it;
 					// if matched fuzzily by title/rule, allocate a new ID for the new PR.
 					if origRecordID != "" {
+						outcomeStatus = outcomeStatusIgnored
 						return noopResult(), nil
 					}
 					ev.RecordID = ""
@@ -1805,6 +1837,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 			}
 		}
 		graduated = append(graduated, decID)
+		c.metrics.recordGraduations(1)
 	}
 	return graduated, nil
 }
@@ -2019,7 +2052,17 @@ func (c *Curator) handleQueryMsg(ctx context.Context, msg *nats.Msg, expectedSub
 // HandleQuery answers a MemoryQueryRequest against the configured semantic
 // memory backend (Hindsight + local OKF records) with in-memory caching that is
 // automatically invalidated whenever ProcessOutcome updates the store.
-func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) MemoryQueryResponse {
+func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp MemoryQueryResponse) {
+	defer func() {
+		switch {
+		case resp.Error != "":
+			c.metrics.recordQuery(queryStatusError)
+		case len(resp.Results) > 0 || len(resp.Records) > 0 || resp.Outcome != nil:
+			c.metrics.recordQuery(queryStatusHit)
+		default:
+			c.metrics.recordQuery(queryStatusEmpty)
+		}
+	}()
 	switch req.Action {
 	case "propose", "resolve":
 		if req.Outcome == nil {
@@ -2264,7 +2307,7 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		results = []HindsightRecallResult{}
 	}
 
-	resp := MemoryQueryResponse{
+	resp = MemoryQueryResponse{
 		Schema:  MemoryQueryReplySchema,
 		Backend: backend,
 		Bank:    bank,

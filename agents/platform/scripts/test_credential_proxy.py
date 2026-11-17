@@ -22138,5 +22138,96 @@ class ExcludedClusterPathTest(unittest.TestCase):
         self.assertEqual(0, result.exit_code, result.stderr)
 
 
+class DecisionMemoryChecksMetricTest(unittest.TestCase):
+    """`/v1/vcs/publish` records Stage B OKF guard verdicts on ProxyMetrics."""
+
+    PAYLOAD = {
+        "repository": "https://github.com/acme/infra",
+        "branch": "platform-agent/test-change",
+        "target": "main",
+        "baseRevision": "a" * 40,
+        "bundleBase64": "YnVuZGxl",
+    }
+
+    def _run_publish(self, metrics: credential_proxy.ProxyMetrics, publish_side_effect):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/publish"
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:shell", uid="u", groups=(), role=credential_proxy.CALLER_ROLE_SHELL
+        )
+        handler.metrics = metrics
+        handler.max_request_bytes = 1 << 20
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        handler._request_slot = contextlib.nullcontext
+        handler._repository_is_permitted = lambda repository, forge: True
+        encoded = json.dumps(self.PAYLOAD).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.vcs = mock.Mock()
+        forge = mock.Mock()
+        forge.name = "github"
+        handler.vcs.registry.resolve.return_value = (forge, "acme/infra")
+        handler.vcs.publish.side_effect = publish_side_effect
+        with mock.patch.object(vcs_broker, "write_mode", return_value=("propose", "propose")):
+            handler._handle_vcs_post()
+        return handler
+
+    def test_publish_records_allow_warn_block_and_error_verdicts(self):
+        metrics = credential_proxy.ProxyMetrics()
+
+        # 1. Clean publish -> allow
+        self._run_publish(metrics, lambda _p: {"branch": "platform-agent/test-change", "revision": "b" * 40})
+        # 2. Advisory markdown returned -> warn
+        self._run_publish(
+            metrics,
+            lambda _p: {
+                "branch": "platform-agent/test-change",
+                "revision": "b" * 40,
+                "decisionMemoryMarkdown": "### Prior decisions and lessons this change touches\n- warn",
+            },
+        )
+        # 3. Blocked guard -> block
+        self._run_publish(
+            metrics,
+            mock.Mock(
+                side_effect=providers.WorkspaceError(
+                    "DECISION MEMORY GUARD BLOCKED THIS CHANGE",
+                    status=409,
+                    code=vcs_broker.DECISION_MEMORY_BLOCKED,
+                )
+            ),
+        )
+        # 4. Guard check failure -> error
+        self._run_publish(
+            metrics,
+            mock.Mock(
+                side_effect=providers.WorkspaceError(
+                    "could not resolve base branch",
+                    status=502,
+                    code=vcs_broker.DECISION_MEMORY_CHECK_FAILED,
+                )
+            ),
+        )
+        # 5. Non-DM WorkspaceError (for example, NOT_FAST_FORWARD before guard runs) -> not counted
+        self._run_publish(
+            metrics,
+            mock.Mock(
+                side_effect=providers.WorkspaceError(
+                    "not fast-forward",
+                    status=409,
+                    code="NOT_FAST_FORWARD",
+                )
+            ),
+        )
+
+        rendered = metrics.render()
+        for verdict in ("allow", "warn", "block", "error"):
+            self.assertIn(
+                f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{verdict="{verdict}"}} 1',
+                rendered,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

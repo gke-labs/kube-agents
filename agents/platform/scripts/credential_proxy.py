@@ -1238,6 +1238,18 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+DECISION_MEMORY_CHECKS_METRIC = "kubeagents_credential_proxy_decision_memory_checks_total"
+DECISION_MEMORY_VERDICT_LABEL = "verdict"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
+DECISION_MEMORY_VERDICTS = frozenset({
+    DECISION_MEMORY_VERDICT_ALLOW,
+    DECISION_MEMORY_VERDICT_WARN,
+    DECISION_MEMORY_VERDICT_BLOCK,
+    DECISION_MEMORY_VERDICT_ERROR,
+})
 # The one-time claim token minted with each `proposal-create` answer, under
 # CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
 # (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
@@ -12936,6 +12948,7 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str, str], int] = {}
+        self._decision_memory_checks: dict[str, int] = {}
         # The sweep's last reading of each kind, None until the first; a
         # withheld reading leaves the previous one here.
         self._outcomes: vcs_readings.OutcomesReading | None = None
@@ -13054,6 +13067,12 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
+    def record_decision_memory_check(self, verdict: str) -> None:
+        if verdict not in DECISION_MEMORY_VERDICTS:
+            verdict = DECISION_MEMORY_VERDICT_ERROR
+        with self._lock:
+            self._decision_memory_checks[verdict] = self._decision_memory_checks.get(verdict, 0) + 1
+
     def set_readings(
         self,
         outcomes: vcs_readings.OutcomesReading | None,
@@ -13171,6 +13190,7 @@ class ProxyMetrics:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
+            decision_memory_checks = sorted(self._decision_memory_checks.items())
             outcomes = self._outcomes
             details = self._details
             reading_failures = sorted(self._reading_failures.items())
@@ -13293,6 +13313,14 @@ class ProxyMetrics:
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
                 f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {DECISION_MEMORY_CHECKS_METRIC} Stage B OKF decision-memory guard checks evaluated on /v1/vcs/publish, by verdict (allow, warn, block, error).",
+            f"# TYPE {DECISION_MEMORY_CHECKS_METRIC} counter",
+        ]
+        for verdict, count in decision_memory_checks:
+            lines.append(
+                f'{DECISION_MEMORY_CHECKS_METRIC}{{{DECISION_MEMORY_VERDICT_LABEL}="{_escape_label_value(verdict)}"}} {count}'
             )
         # Wall clock, as the readings' `taken_at` is.
         self._render_readings(lines, outcomes, details, reading_failures, time.time())
@@ -16098,6 +16126,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                             return TOOL_STATUS_ERROR
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
+                if verb == "publish" and (
+                    not isinstance(self.vcs, vcs_broker.VcsBroker) or self.vcs.on_decision_memory_check is None
+                ):
+                    dm_verdict = (
+                        DECISION_MEMORY_VERDICT_WARN
+                        if isinstance(result, dict) and result.get("decisionMemoryMarkdown")
+                        else DECISION_MEMORY_VERDICT_ALLOW
+                    )
+                    self.metrics.record_decision_memory_check(dm_verdict)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
@@ -16122,6 +16159,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return TOOL_STATUS_BLOCKED
         except providers.WorkspaceError as exc:
+            if verb == "publish" and (
+                not isinstance(self.vcs, vcs_broker.VcsBroker) or self.vcs.on_decision_memory_check is None
+            ):
+                exc_code = exc.fields.get("code")
+                if exc_code == vcs_broker.DECISION_MEMORY_BLOCKED:
+                    self.metrics.record_decision_memory_check(DECISION_MEMORY_VERDICT_BLOCK)
+                elif exc_code == vcs_broker.DECISION_MEMORY_CHECK_FAILED:
+                    self.metrics.record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             self._json(HTTPStatus(exc.status), _redacted_fields(exc))
             return TOOL_STATUS_ERROR
         except subprocess.CalledProcessError as exc:

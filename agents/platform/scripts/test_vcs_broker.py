@@ -5022,6 +5022,66 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
         self.assertIn("DEC-2026-003", str(caught.exception))
 
+    def test_publish_invokes_on_decision_memory_check_callback(self):
+        self._seed_guard_on_main()
+        verdicts: list[str] = []
+        self.broker.on_decision_memory_check = verdicts.append
+
+        # Clean unrelated file -> allow
+        work_clean, cloned_clean = self.clone_locally("dm-cb-clean")
+        git(work_clean, "checkout", "--quiet", "-b", "platform-agent/dm-cb-clean")
+        (work_clean / "docs.txt").write_text("unrelated\n", encoding="utf-8")
+        git(work_clean, "add", "-A")
+        git(work_clean, "commit", "--quiet", "-m", "unrelated change")
+        self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/dm-cb-clean",
+            "target": "main",
+            "baseRevision": cloned_clean["revision"],
+            "bundleBase64": self.bundle_of(work_clean, "platform-agent/dm-cb-clean", cloned_clean["revision"]),
+        })
+
+        # Consistent guarded file returning markdown -> warn
+        work_warn, cloned_warn = self.clone_locally("dm-cb-warn")
+        git(work_warn, "checkout", "--quiet", "-b", "platform-agent/dm-cb-warn")
+        (work_warn / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n",
+            encoding="utf-8",
+        )
+        git(work_warn, "add", "-A")
+        git(work_warn, "commit", "--quiet", "-m", "compliant memory raise")
+        self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/dm-cb-warn",
+            "target": "main",
+            "baseRevision": cloned_warn["revision"],
+            "bundleBase64": self.bundle_of(work_warn, "platform-agent/dm-cb-warn", cloned_warn["revision"]),
+        })
+
+        # Violating guarded file -> block
+        work_block, cloned_block = self.clone_locally("dm-cb-block")
+        git(work_block, "checkout", "--quiet", "-b", "platform-agent/dm-cb-block")
+        (work_block / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n",
+            encoding="utf-8",
+        )
+        git(work_block, "add", "-A")
+        git(work_block, "commit", "--quiet", "-m", "violating memory drop")
+        with self.assertRaises(WorkspaceError):
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/dm-cb-block",
+                "target": "main",
+                "baseRevision": cloned_block["revision"],
+                "bundleBase64": self.bundle_of(work_block, "platform-agent/dm-cb-block", cloned_block["revision"]),
+            })
+
+        self.assertEqual(verdicts, ["allow", "warn", "block"])
+
 
 if __name__ == "__main__":
     unittest.main()

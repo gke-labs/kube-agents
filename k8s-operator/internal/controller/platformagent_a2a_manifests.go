@@ -7321,7 +7321,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
 	}
 	if a2aCuratorEnabled() {
-		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
+		fences = append(fences, a2aCuratorNetworkPolicyWithOperatorPeer(agent, dnsClusterIPs, r.OperatorNamespace))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for

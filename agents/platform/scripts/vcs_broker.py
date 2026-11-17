@@ -810,8 +810,10 @@ class VcsBroker:
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
         cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
         automerge_switch: Callable[[], str] | None = None,
+        on_decision_memory_check: Callable[[str], None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        self.on_decision_memory_check = on_decision_memory_check
         # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
         # or kubectl read the broker runs on its own behalf, through the same
         # executor and cluster selection a caller's read takes. Only
@@ -1816,6 +1818,8 @@ class VcsBroker:
             )
             policy_branch = _short_ref(policy_branch) if policy_branch else ""
             if not policy_branch:
+                if self.on_decision_memory_check is not None:
+                    self.on_decision_memory_check("error")
                 raise WorkspaceError(
                     f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                     status=502,
@@ -1834,17 +1838,30 @@ class VcsBroker:
                 )
                 policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
                 if not policy_base_rev:
+                    if self.on_decision_memory_check is not None:
+                        self.on_decision_memory_check("error")
                     raise WorkspaceError(
                         f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                         status=502,
                         code=DECISION_MEMORY_CHECK_FAILED,
                     )
-            dm_markdown = self._check_decision_memory_on_publish(
-                git,
-                root,
-                policy_base_rev,
-                tip,
-            )
+            try:
+                dm_markdown = self._check_decision_memory_on_publish(
+                    git,
+                    root,
+                    policy_base_rev,
+                    tip,
+                )
+            except WorkspaceError as dm_exc:
+                if self.on_decision_memory_check is not None:
+                    dm_code = dm_exc.fields.get("code")
+                    if dm_code == DECISION_MEMORY_BLOCKED:
+                        self.on_decision_memory_check("block")
+                    elif dm_code == DECISION_MEMORY_CHECK_FAILED:
+                        self.on_decision_memory_check("error")
+                raise
+            if self.on_decision_memory_check is not None:
+                self.on_decision_memory_check("warn" if dm_markdown else "allow")
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)

@@ -590,14 +590,14 @@ spec:
 	// Publish a new active decision merged in Git and verify that the NATS query cache is invalidated automatically.
 	commitRecordInGit(t, repoDir, Record{
 		Meta: RecordMeta{
-			Type:        RecordTypeDecision,
-			ID:          "DEC-2026-006",
-			Title:       "Checkout PDB minimum available replicas",
-			Status:      StatusActive,
-			Date:        "2026-11-12",
-			Scope:       RecordScope{Paths: []string{"clusters/**/checkout/pdb.yaml"}},
-			Guard:       &RecordGuard{Rule: "Keep checkout PDB minAvailable >= 2.", Severity: "warn"},
-			Evidence:    RecordEvidence{PullRequest: "https://github.com/acme/infra/pull/290 (#290)"},
+			Type:     RecordTypeDecision,
+			ID:       "DEC-2026-006",
+			Title:    "Checkout PDB minimum available replicas",
+			Status:   StatusActive,
+			Date:     "2026-11-12",
+			Scope:    RecordScope{Paths: []string{"clusters/**/checkout/pdb.yaml"}},
+			Guard:    &RecordGuard{Rule: "Keep checkout PDB minAvailable >= 2.", Severity: "warn"},
+			Evidence: RecordEvidence{PullRequest: "https://github.com/acme/infra/pull/290 (#290)"},
 		},
 		Body: "## Context\n\nRequire minAvailable >= 2 on checkout PodDisruptionBudget.\n",
 	})
@@ -2235,7 +2235,7 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	var tarBuf bytes.Buffer
 	tw := tar.NewWriter(&tarBuf)
 	tarFiles := map[string]string{
-		"knowledge/decision/DEC-2026-020-broker.md": "---\ntype: decision\nid: DEC-2026-020\ntitle: Broker-verified active rule\nstatus: active\ndate: \"2026-11-16\"\nscope:\n  paths:\n    - clusters/**\nguard:\n  rule: Keep broker-verified replicas >= 3.\n  severity: block\nsupersedes:\n  - DEC-2026-011\n---\n\n## Context\n\nVerified via broker snapshot.\n",
+		"knowledge/decision/DEC-2026-020-broker.md":  "---\ntype: decision\nid: DEC-2026-020\ntitle: Broker-verified active rule\nstatus: active\ndate: \"2026-11-16\"\nscope:\n  paths:\n    - clusters/**\nguard:\n  rule: Keep broker-verified replicas >= 3.\n  severity: block\nsupersedes:\n  - DEC-2026-011\n---\n\n## Context\n\nVerified via broker snapshot.\n",
 		"knowledge/decision/DEC-2026-021-retired.md": "---\ntype: decision\nid: DEC-2026-021\ntitle: Broker-retired rule\nstatus: retired\ndate: \"2026-11-16\"\nscope:\n  paths:\n    - clusters/**\n---\n\n## Context\n\nRetired in Git.\n",
 	}
 	for name, content := range tarFiles {
@@ -2358,4 +2358,187 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	}
 }
 
+func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
+	ctx := context.Background()
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
 
+	cur1, err := NewCurator(CuratorConfig{
+		RepoDir:             dir1,
+		RepoID:              "acme/gitops",
+		RecurrenceThreshold: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewCurator(cur1): %v", err)
+	}
+	cur2, err := NewCurator(CuratorConfig{
+		RepoDir:             dir2,
+		RepoID:              "acme/other",
+		RecurrenceThreshold: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewCurator(cur2): %v", err)
+	}
+
+	// 1. Outcome processing: processed, duplicate, ignored, and unknown-kind error.
+	propRes, err := cur1.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:        OutcomeProposed,
+		RecordType:  RecordTypeDecision,
+		Title:       "Keep checkout replicas >= 2",
+		Rule:        "Checkout deployment must run at least 2 replicas.",
+		PullRequest: "#101",
+		Scope:       &RecordScope{Paths: []string{"clusters/**/*.yaml"}},
+		Guard: &RecordGuard{
+			Rule:     "Keep checkout replicas >= 2",
+			Severity: "warn",
+			Expect: &GuardExpect{
+				File:  "clusters/**/*.yaml",
+				Path:  "spec.replicas",
+				Op:    ">=",
+				Value: 2,
+			},
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome proposed: %v", err)
+	}
+	// Duplicate proposal for same PR -> status="duplicate".
+	if _, err := cur1.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:        OutcomeProposed,
+		RecordID:    propRes.RecordID,
+		PullRequest: "#101",
+	}, ""); err != nil {
+		t.Fatalf("ProcessOutcome duplicate: %v", err)
+	}
+	// Conflicting PR with explicit RecordID -> status="ignored".
+	if _, err := cur1.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:        OutcomeProposed,
+		RecordID:    propRes.RecordID,
+		PullRequest: "#999",
+	}, ""); err != nil {
+		t.Fatalf("ProcessOutcome ignored: %v", err)
+	}
+	// Unknown outcome kind -> kind="other", status="error".
+	if _, err := cur1.ProcessOutcome(ctx, OutcomeEvent{
+		Kind: OutcomeKind("unexpected-kind"),
+	}, ""); err == nil {
+		t.Fatal("expected error on unknown outcome kind")
+	}
+
+	// 2. Cross-cluster recurrence graduation across 2 clusters -> graduations_total = 1.
+	for _, cluster := range []string{"prod-east", "prod-west"} {
+		if _, err := cur1.ProcessOutcome(ctx, OutcomeEvent{
+			Kind:       OutcomeResolvedMerged,
+			RecordType: RecordTypeLesson,
+			Cluster:    cluster,
+			CheckID:    "oom-memory-floor",
+			Title:      "Raise memory floor in " + cluster,
+			Summary:    "OOM exit 137 fixed by raising memory.",
+			Scope:      &RecordScope{Clusters: []string{cluster}, Paths: []string{"clusters/" + cluster + "/app.yaml"}, Checks: []string{"oom-memory-floor"}},
+		}, ""); err != nil {
+			t.Fatalf("ProcessOutcome resolved-merged (%s): %v", cluster, err)
+		}
+	}
+
+	// 3. Seed an active blocking decision to test block guard verdict as well.
+	activeBlock := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-099",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Block hostNetwork in prod",
+			Date:   "2026-11-17",
+			Scope:  RecordScope{Paths: []string{"clusters/prod/*.yaml"}},
+			Guard: &RecordGuard{
+				Rule:     "hostNetwork must be absent",
+				Severity: "block",
+				Expect: &GuardExpect{
+					File: "clusters/prod/*.yaml",
+					Path: "spec.hostNetwork",
+					Op:   "absent",
+				},
+			},
+		},
+		Body: "## Context\n\nActive blocking rule.\n",
+	}
+	if err := SaveRecord(dir1, &activeBlock); err != nil {
+		t.Fatalf("SaveRecord activeBlock: %v", err)
+	}
+
+	// 4. Queries: hit, empty, and error.
+	if qHit := cur1.HandleQuery(ctx, MemoryQueryRequest{Query: "checkout replicas"}); qHit.Error != "" || len(qHit.Results) == 0 {
+		t.Fatalf("expected query hit, got %+v", qHit)
+	}
+	if qEmpty := cur1.HandleQuery(ctx, MemoryQueryRequest{Query: "nonexistentzzzyyyxxx"}); qEmpty.Error != "" || len(qEmpty.Results) != 0 {
+		t.Fatalf("expected empty query, got %+v", qEmpty)
+	}
+	if qErr := cur1.HandleQuery(ctx, MemoryQueryRequest{Query: "checkout", Tags: []string{"user:alice"}}); qErr.Error == "" {
+		t.Fatalf("expected error on user:* tag, got %+v", qErr)
+	}
+
+	// 5. Guard checks: allow, warn, and block.
+	cleanYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n"
+	if rep, err := cur1.CheckChangedFiles(map[string]*string{"unrelated/readme.txt": &cleanYAML}); err != nil || rep.Verdict != "ok" {
+		t.Fatalf("expected allow verdict, got rep=%+v err=%v", rep, err)
+	}
+	warnYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n  replicas: 1\n"
+	if rep, err := cur1.CheckChangedFiles(map[string]*string{"clusters/staging/checkout.yaml": &warnYAML}); err != nil || rep.Verdict != "warn" {
+		t.Fatalf("expected warn verdict, got rep=%+v err=%v", rep, err)
+	}
+	blockYAML := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: bad\nspec:\n  hostNetwork: true\n  replicas: 2\n"
+	loaded, err := LoadRecords(dir1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep := CheckChangedFiles(loaded, map[string]*string{"clusters/prod/pod.yaml": &blockYAML}); rep.Verdict != "block" {
+		t.Fatalf("expected block verdict from package CheckChangedFiles, got %+v", rep)
+	}
+
+	scrape := func(h http.Handler) string {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /metrics status = %d, want 200", rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	body1 := scrape(cur1.MetricsHandler())
+	for _, want := range []string{
+		`kubeagents_curator_outcomes_total{kind="proposed",status="processed"} 1`,
+		`kubeagents_curator_outcomes_total{kind="proposed",status="duplicate"} 1`,
+		`kubeagents_curator_outcomes_total{kind="proposed",status="ignored"} 1`,
+		`kubeagents_curator_outcomes_total{kind="resolved-merged",status="processed"} 2`,
+		`kubeagents_curator_outcomes_total{kind="other",status="error"} 1`,
+		`kubeagents_curator_records{status="proposed",type="decision"} 2`,
+		`kubeagents_curator_records{status="active",type="decision"} 1`,
+		`kubeagents_curator_records{status="proposed",type="lesson"} 2`,
+		`kubeagents_curator_graduations_total 1`,
+		`kubeagents_curator_queries_total{status="hit"} 1`,
+		`kubeagents_curator_queries_total{status="empty"} 1`,
+		`kubeagents_curator_queries_total{status="error"} 1`,
+		`kubeagents_curator_guard_checks_total{verdict="allow"} 1`,
+		`kubeagents_curator_guard_checks_total{verdict="warn"} 1`,
+		`kubeagents_curator_guard_checks_total{verdict="block"} 1`,
+		`# TYPE process_start_time_seconds gauge`,
+	} {
+		if !strings.Contains(body1, want) {
+			t.Errorf("cur1 /metrics missing %q;\nfull output:\n%s", want, body1)
+		}
+	}
+
+	// Verify cur2's dedicated registry remained isolated at zero.
+	body2 := scrape(cur2.MetricsHandler())
+	for _, wantZero := range []string{
+		`kubeagents_curator_outcomes_total{kind="proposed",status="processed"} 0`,
+		`kubeagents_curator_records{status="proposed",type="decision"} 0`,
+		`kubeagents_curator_graduations_total 0`,
+		`kubeagents_curator_queries_total{status="hit"} 0`,
+		`kubeagents_curator_guard_checks_total{verdict="block"} 0`,
+	} {
+		if !strings.Contains(body2, wantZero) {
+			t.Errorf("cur2 /metrics expected isolated zero %q;\nfull output:\n%s", wantZero, body2)
+		}
+	}
+}
