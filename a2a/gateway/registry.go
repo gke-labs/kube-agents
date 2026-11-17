@@ -314,6 +314,13 @@ type TaskRef struct {
 	// submission's, and a later run's must not route this one's report.
 	// nil on every other task.
 	Delivery *lib.ScheduleDelivery `json:"delivery,omitempty"`
+	// TriggerStream and TriggerOrigin are a schedule trigger's run's
+	// stream and origin, recorded at submit from the validated submission:
+	// a builtin audit's stream is its audit id, by which the relay reads the
+	// run's report from the report store (report_store.go). Empty on every
+	// other task.
+	TriggerStream string `json:"triggerStream,omitempty"`
+	TriggerOrigin string `json:"triggerOrigin,omitempty"`
 	// RelayedSeqs are the stream sequences of this task's most recent
 	// events the relay rendered (at most relayedSeqCap), written with the
 	// render. A redelivered event found here was rendered by a gateway that

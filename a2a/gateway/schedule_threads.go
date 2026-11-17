@@ -101,20 +101,20 @@ func (g *Gateway) postScheduledReport(ctx context.Context, reporter homeReporter
 	switch {
 	case err != nil:
 		g.log.Warn("schedule thread unavailable; posting as a new message", append(logArgs, "err", err)...)
-		post, err = reporter.postHomeReport(ctx, home, "", report.Text)
+		post, err = reporter.postHomeReport(ctx, home, "", report.Text, report.Chat)
 	case thread != nil && thread.ThreadID != "" && thread.ChatID == home:
-		post, err = reporter.postHomeReport(ctx, home, thread.ThreadID, report.Text)
+		post, err = reporter.postHomeReport(ctx, home, thread.ThreadID, report.Text, report.Chat)
 		if err != nil && !errors.Is(err, errPostOutcomeUnknown) && ctx.Err() == nil {
 			// The thread refused (no longer a thread of the channel, or
 			// the platform turned the reply down): once as a new message,
 			// which becomes the day's thread.
 			g.log.Warn("schedule thread refused the reply; opening a new one", append(logArgs, "thread", thread.ThreadID, "err", err)...)
-			if post, err = reporter.postHomeReport(ctx, home, "", report.Text); err == nil {
+			if post, err = reporter.postHomeReport(ctx, home, "", report.Text, report.Chat); err == nil {
 				g.keepDayThread(threads, key, post, rev, logArgs)
 			}
 		}
 	case owned:
-		post, err = reporter.postHomeReport(ctx, home, "", report.Text)
+		post, err = reporter.postHomeReport(ctx, home, "", report.Text, report.Chat)
 		switch {
 		case errors.Is(err, errPostOutcomeUnknown):
 			// It may yet land: the claim stays, and goes stale.
@@ -132,7 +132,7 @@ func (g *Gateway) postScheduledReport(ctx context.Context, reporter homeReporter
 		// A thread in another channel: the home channel changed today. A
 		// new message, kept nowhere, so the day's thread stays as it was.
 		g.log.Info("schedule thread is in another channel; posting as a new message", append(logArgs, "threadChat", thread.ChatID)...)
-		post, err = reporter.postHomeReport(ctx, home, "", report.Text)
+		post, err = reporter.postHomeReport(ctx, home, "", report.Text, report.Chat)
 	}
 	if err != nil {
 		return post, err

@@ -602,9 +602,14 @@ type Config struct {
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
-	KubeProxyURL           string
-	KubeProxyCAConfigMap   string
-	KubeProxyHostContext   string
+	// ReportStoreURL and ReportStoreTokenFile are the credential broker and
+	// the projected a2a-reports token the relay reads a scheduled audit's
+	// report with (report_store.go); either empty reads none.
+	ReportStoreURL       string
+	ReportStoreTokenFile string
+	KubeProxyURL         string
+	KubeProxyCAConfigMap string
+	KubeProxyHostContext string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -812,6 +817,8 @@ func FromEnv() (*Config, error) {
 		SessionClusterView:     os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
 		CredentialProxyURL:     os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
 		CredentialProxyExecURL: os.Getenv("A2A_CREDENTIAL_PROXY_EXEC_URL"),
+		ReportStoreURL:         os.Getenv("A2A_REPORT_STORE_URL"),
+		ReportStoreTokenFile:   os.Getenv("A2A_REPORT_STORE_TOKEN_FILE"),
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),

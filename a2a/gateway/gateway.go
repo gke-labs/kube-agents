@@ -256,6 +256,10 @@ type Gateway struct {
 	// landed in, for a reply there to be answered with it
 	// (schedule_threads.go); nil keeps nothing.
 	reportIncidents reportIncidentWriter
+	// reportStore reads a builtin audit run's report from the report store
+	// through the broker (report_store.go); nil reads nothing, and every
+	// report is the run's result.
+	reportStore reportStoreReader
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -700,6 +704,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Client != nil {
 		g.reportIncidents = busIncidentWriter{client: o.Client}
 	}
+	// A builtin audit run's report, read through the broker's a2a-reports
+	// role when the operator renders it (report_store.go).
+	g.reportStore = newBrokerReportStore(o.Config.ReportStoreURL, o.Config.ReportStoreTokenFile)
 	// The board-health card's Retry and Drop, over the same route
 	// (slack_board.go); the adapter admits the presser by the Home tab's rule.
 	if sink, ok := o.Adapter.(BoardActSink); ok {

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -29,7 +30,7 @@ type threadedReporter struct {
 
 func (f *threadedReporter) homeChannel() string { return "C0HOME" }
 
-func (f *threadedReporter) postHomeReport(_ context.Context, home, thread, text string) (homePost, error) {
+func (f *threadedReporter) postHomeReport(_ context.Context, home, thread, text string, _ json.RawMessage) (homePost, error) {
 	if thread == "" && f.hold != nil {
 		f.started <- struct{}{}
 		<-f.hold
@@ -282,11 +283,11 @@ func TestPostHomeReportRepliesOnlyOnAHomeThread(t *testing.T) {
 	t.Cleanup(func() { close(n.jobs) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	post, err := n.postHomeReport(ctx, testHome, testHome+"/threads/t9", "In the thread.")
+	post, err := n.postHomeReport(ctx, testHome, testHome+"/threads/t9", "In the thread.", nil)
 	if err != nil || post.ThreadID != testHome+"/threads/t9" {
 		t.Fatalf("post = %+v (%v)", post, err)
 	}
-	if _, err := n.postHomeReport(ctx, testHome, "spaces/OTHER/threads/t1", "Elsewhere."); err == nil {
+	if _, err := n.postHomeReport(ctx, testHome, "spaces/OTHER/threads/t1", "Elsewhere.", nil); err == nil {
 		t.Fatal("a thread outside the home space was replied on")
 	}
 	if got := p.all(); len(got) != 1 || got[0].thread != testHome+"/threads/t9" {
@@ -415,11 +416,11 @@ func TestARefusedThreadReplyOpensANewThread(t *testing.T) {
 // time.
 type unknownFirstPost struct{ threadedReporter }
 
-func (u *unknownFirstPost) postHomeReport(ctx context.Context, home, thread, text string) (homePost, error) {
+func (u *unknownFirstPost) postHomeReport(ctx context.Context, home, thread, text string, chat json.RawMessage) (homePost, error) {
 	if thread == "" {
 		return homePost{}, fmt.Errorf("%w: test", errPostOutcomeUnknown)
 	}
-	return u.threadedReporter.postHomeReport(ctx, home, thread, text)
+	return u.threadedReporter.postHomeReport(ctx, home, thread, text, chat)
 }
 
 // TestAFirstPostWithAnUnknownOutcomeKeepsTheClaim: a first post that may

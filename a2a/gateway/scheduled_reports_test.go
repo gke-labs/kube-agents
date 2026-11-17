@@ -22,6 +22,7 @@ type fakeHomeReporter struct {
 	home  string
 	fail  func(call int) bool
 	posts []string
+	chats []json.RawMessage
 }
 
 func (f *fakeHomeReporter) homeChannel() string {
@@ -30,10 +31,11 @@ func (f *fakeHomeReporter) homeChannel() string {
 	return f.home
 }
 
-func (f *fakeHomeReporter) postHomeReport(_ context.Context, home, thread, text string) (homePost, error) {
+func (f *fakeHomeReporter) postHomeReport(_ context.Context, home, thread, text string, chat json.RawMessage) (homePost, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.posts = append(f.posts, text)
+	f.chats = append(f.chats, chat)
 	if f.fail != nil && f.fail(len(f.posts)) {
 		return homePost{}, errors.New("slack answered 503")
 	}
@@ -382,7 +384,7 @@ func TestPostHomeReportGoesThroughTheNotifyWorker(t *testing.T) {
 	n := newTestNotifier(t, p)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := n.postHomeReport(ctx, testHome, "", "Two findings."); err == nil {
+	if _, err := n.postHomeReport(ctx, testHome, "", "Two findings.", nil); err == nil {
 		t.Fatal("a route not started took the post")
 	}
 	if n.homeChannel() != testHome {
@@ -391,7 +393,7 @@ func TestPostHomeReportGoesThroughTheNotifyWorker(t *testing.T) {
 	n.jobs, n.done = make(chan notifyJob, notifyQueueDepth), make(chan struct{})
 	go n.work()
 	t.Cleanup(func() { close(n.jobs) })
-	post, err := n.postHomeReport(ctx, testHome, "", "Two findings.")
+	post, err := n.postHomeReport(ctx, testHome, "", "Two findings.", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +404,7 @@ func TestPostHomeReportGoesThroughTheNotifyWorker(t *testing.T) {
 		t.Fatalf("posts = %+v", got)
 	}
 	p.failAt = 2
-	if _, err := n.postHomeReport(ctx, testHome, "", "Again."); err == nil {
+	if _, err := n.postHomeReport(ctx, testHome, "", "Again.", nil); err == nil {
 		t.Fatal("a failed post answered as posted")
 	}
 	none, err := NewGchatNotifier(p, "", nil)

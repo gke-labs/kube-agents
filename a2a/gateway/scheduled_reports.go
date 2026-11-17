@@ -107,6 +107,8 @@ const (
 	// can't stand in one key token. '_' is in no DNS-1123 name, so a derived
 	// key can't collide with a schedule's own job key.
 	scheduledJobKeyFill = "_"
+	// scheduledSourceStore marks a report read from the report store.
+	scheduledSourceStore = "store"
 )
 
 // ScheduledReport is one finished run's record in SCHEDULED_REPORTS.
@@ -119,7 +121,14 @@ type ScheduledReport struct {
 	State       lib.TaskState `json:"state"`
 	Silent      bool          `json:"silent,omitempty"`
 	Text        string        `json:"text"`
-	Status      string        `json:"status"`
+	// Chat is the run's kube-agents.chat/v1 card from the report store, laid
+	// out by a backend that renders it with Text as its fallback; empty
+	// when the report is the run's result (report_store.go).
+	Chat json.RawMessage `json:"chat,omitempty"`
+	// Source is where the report came from: "store", or empty for the
+	// run's result.
+	Source string `json:"source,omitempty"`
+	Status string `json:"status"`
 	// Where the post landed, once posted.
 	Platform string `json:"platform,omitempty"`
 	ChatID   string `json:"chatId,omitempty"`
@@ -176,9 +185,9 @@ func isScheduleConversation(key string) bool {
 
 // scheduledReportFrom is the seam a run's report comes from: today the
 // task's result text (or, for a run that did not complete, the notice the
-// conversation would have read), clean when it is exactly [SILENT]. The
-// structured kube-agents.report/v1 artifact from the report store plugs in
-// here, ahead of the result text, in a later change.
+// conversation would have read), clean when it is exactly [SILENT]. A
+// builtin audit's completed run reads its kube-agents.report/v1 report from
+// the report store ahead of this (storedReportFor).
 func scheduledReportFrom(state lib.TaskState, result, reason string) (text string, silent bool) {
 	if state != lib.StateCompleted {
 		return terminalNotice(state, reason), false
@@ -208,7 +217,7 @@ type homePost struct {
 // later change.
 type homeReporter interface {
 	homeChannel() string
-	postHomeReport(ctx context.Context, home, thread, text string) (homePost, error)
+	postHomeReport(ctx context.Context, home, thread, text string, chat json.RawMessage) (homePost, error)
 }
 
 // SetHomeReporters points scheduled reports at this term's chat.notify
@@ -273,6 +282,14 @@ func (g *Gateway) deliverScheduledReport(ctx context.Context, rec *SessionRecord
 	report := ScheduledReport{
 		TaskID: taskID, Profile: ref.Addressee, FinishedAt: g.scheduleClock().UTC(),
 		State: s.Status.State, Silent: silent, Text: truncateReport(text),
+	}
+	// A builtin audit's completed run reads its report from the store,
+	// ahead of the result text; anything short of this run's falls back.
+	if s.Status.State == lib.StateCompleted {
+		if stored := g.storedReportFor(ctx, ref, []any{"taskId", taskID, "conversation", rec.Key}); stored != nil {
+			report.Text, report.Silent, report.Chat, report.Source = truncateReport(stored.Text), stored.Silent, stored.Card, scheduledSourceStore
+			silent = stored.Silent
+		}
 	}
 	if ref.Requester != nil {
 		report.TriggerName = ref.Requester.Subject
@@ -579,7 +596,7 @@ func (n *Notifier) homeChannel() string {
 // lands, with where it landed, or with why it did not. Queued behind the
 // route's other requests rather than posted here, since the worker alone
 // owns the route's state.
-func (n *Notifier) postHomeReport(ctx context.Context, home, thread, text string) (homePost, error) {
+func (n *Notifier) postHomeReport(ctx context.Context, home, thread, text string, chat json.RawMessage) (homePost, error) {
 	answers := make(chan lib.NotifyReply, 1)
 	// A thread is held to the home channel and put in the form the poster
 	// takes, as validate does for a chat.notify request's.
@@ -589,7 +606,7 @@ func (n *Notifier) postHomeReport(ctx context.Context, home, thread, text string
 	if thread != "" && n.threadTS != nil {
 		thread = n.threadTS(thread)
 	}
-	job := notifyJob{req: lib.NotifyRequest{Text: text, Thread: thread}, home: home, dropLate: true,
+	job := notifyJob{req: lib.NotifyRequest{Text: text, Thread: thread, Chat: chat}, home: home, dropLate: true,
 		answer: func(r lib.NotifyReply) { answers <- r }}
 	if dl, ok := ctx.Deadline(); ok {
 		job.deadline = dl
