@@ -765,10 +765,9 @@ class FlagSetIsNextTest(unittest.TestCase):
             gated,
             [
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
-                "deployment/${AGENT_DEPLOYMENT_NAME}",
-                # Twice: the operator adds the bridge to the agent pod only
-                # once the bus is provisioned, so the agent rolls a second
-                # time after the Job, and that roll is gated like the first.
+                # Once: the operator renders the bridge in the agent pod from
+                # the first render (#5962), so the agent doesn't roll a second
+                # time after the Job (#5973).
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 # Last, not after the Job its bucket comes from: see the
                 # step header. A verifier still in its crash-loop backoff
@@ -782,8 +781,7 @@ class FlagSetIsNextTest(unittest.TestCase):
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
             'wait_provision_job "the mode upgrade"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
-            '*" ${BRIDGE_SIDECAR_NAME} "*) break ;;',
-            'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
+            'has no ${BRIDGE_SIDECAR_NAME} container after its rollout',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"',
