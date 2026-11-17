@@ -6,6 +6,7 @@ unparseable or unreadable state fails safe), the comma-or-space splitting
 behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 """
 
+import base64
 import datetime
 import json
 import pathlib
@@ -2286,7 +2287,9 @@ class InstallerCommonTest(unittest.TestCase):
             # cluster; the stub answers with the expected gke_<p>_<r>_<c> name
             # and asserts that secret reads explicitly pass --context.
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*) printf "%s" "{recovered_b64}" ;;\n'
+            # One read of the whole Secret (-o json), on this install's context.
+            f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"API_SERVER_KEY\": \"{recovered_b64}\", \"SESSION_KV_SALT\": \"{recovered_b64}\", \"SESSION_KV_API_KEY\": \"{recovered_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -2302,6 +2305,114 @@ class InstallerCommonTest(unittest.TestCase):
             # SESSION_KV_* recover too: an adoption re-install must keep the
             # live salt or every chat identity re-pseudonymises.
             self.assertIn('session_kv_salt    = "recovered-key"', content)
+
+    # ── #6126: a Secret read that fails is not an absent key ────────────────
+
+    _CTX = "gke_test-project_us-central1_test-cluster"
+    _ALL_SECRET_KEYS = ("API_SERVER_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                        "OPENAI_COMPATIBLE_API_KEY", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+                        "SESSION_KV_API_KEY", "SESSION_KV_SALT")
+
+    def _secret_read_stub(self, read_arm, log=None):
+        """kubectl on this install's context; the whole-Secret read runs read_arm."""
+        rec = f'echo "$*" >> "{log}"; ' if log else ""
+        return (
+            "#!/usr/bin/env bash\n"
+            f"{rec}"
+            'case "$*" in\n'
+            f'  *"config current-context"*) printf "{self._CTX}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"-o json"*) {read_arm} ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+
+    def _recover(self, read_arm, env=None, log=None):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; print_error() { echo "ERROR: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"KUBE_AGENTS_REQUIRE_SECRET_ANSWER": "true", "SLACK_BOT_TOKEN": "", **(env or {})},
+                kubectl_script=self._secret_read_stub(read_arm, log),
+            )
+            return proc, (dest.read_text() if dest.exists() else None)
+
+    def test_a_timed_out_secret_read_stops_an_applying_run_rather_than_blank_keys(self):
+        # The ka-today-1 failure: the read failed and SLACK_BOT_TOKEN went out
+        # empty. An applying caller now stops, names what it couldn't recover,
+        # and writes no tfvars for the apply to take.
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded)" >&2; exit 1')
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not read the live 'platform-agent-secrets' Secret", proc.stderr)
+        self.assertIn("SLACK_BOT_TOKEN", proc.stderr)
+        self.assertIn("Client.Timeout exceeded", proc.stderr)
+        self.assertIsNone(tfvars, "tfvars were written after a failed Secret read")
+
+    def test_an_rbac_denied_secret_read_stops_an_applying_run(self):
+        proc, tfvars = self._recover(
+            "echo 'Error from server (Forbidden): secrets \"platform-agent-secrets\" is forbidden: User \"u\" cannot get resource \"secrets\"' >&2; exit 1")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("(Forbidden)", proc.stderr)
+        self.assertIsNone(tfvars)
+
+    def test_a_key_absent_from_a_secret_that_was_read_is_absent(self):
+        # A read that succeeded and lacks the key is a real absence: the run
+        # goes on with it empty, and the keys the Secret holds are recovered.
+        api = base64.b64encode(b"live-api-key").decode()
+        proc, tfvars = self._recover(f"printf '%s' '{{\"data\": {{\"API_SERVER_KEY\": \"{api}\"}}}}'")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn('api_server_key    = "live-api-key"', tfvars)
+        self.assertNotIn("xoxb", tfvars)
+
+    def test_a_secret_that_does_not_exist_has_nothing_to_recover(self):
+        # A first install onto an existing cluster: NotFound is a real answer.
+        proc, tfvars = self._recover(
+            "echo 'Error from server (NotFound): secrets \"platform-agent-secrets\" not found' >&2; exit 1",
+            env={"API_SERVER_KEY": "k"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIsNotNone(tfvars)
+
+    def test_a_caller_that_does_not_apply_warns_and_goes_on(self):
+        # uninstall.sh doesn't opt in: a destroy has no use for the keys.
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1',
+            env={"KUBE_AGENTS_REQUIRE_SECRET_ANSWER": "", "API_SERVER_KEY": "k"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not read the live 'platform-agent-secrets' Secret", proc.stderr)
+
+    def test_no_secret_read_when_the_environment_holds_every_key(self):
+        # An operator whose RBAC can't read Secrets runs by exporting them.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "kubectl.log"
+            log.touch()
+            env = {k: "v" for k in self._ALL_SECRET_KEYS}
+            proc, _ = self._recover('echo "Unable to connect" >&2; exit 1', env=env, log=log)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("get secret", log.read_text())
+
+    def test_allow_empty_secret_keys_lets_named_keys_go_out_empty(self):
+        # The one way to accept writing keys empty on purpose: every key the
+        # failed read left unknown is named.
+        missing = [k for k in self._ALL_SECRET_KEYS if k != "API_SERVER_KEY"]
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1',
+            env={"API_SERVER_KEY": "k", "ALLOW_EMPTY_SECRET_KEYS": ",".join(missing)})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIsNotNone(tfvars)
+        # Naming all but one still stops, and names the one left.
+        proc, _ = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1',
+            env={"API_SERVER_KEY": "k", "ALLOW_EMPTY_SECRET_KEYS": ",".join(m for m in missing if m != "SESSION_KV_SALT")})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SESSION_KV_SALT", proc.stderr)
+
+    def test_a_value_that_is_not_base64_stops_an_applying_run(self):
+        proc, tfvars = self._recover("printf '%s' '{\"data\": {\"SLACK_BOT_TOKEN\": \"not*base64\"}}'",
+                                     env={"API_SERVER_KEY": "k"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not decode", proc.stderr)
+        self.assertIsNone(tfvars)
 
     # ── the adoption fetch: which control-plane endpoint it writes ───────────
 
@@ -2535,7 +2646,8 @@ class InstallerCommonTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.OPENAI_COMPATIBLE_API_KEY}}"*) printf "%s" "{recovered_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"OPENAI_COMPATIBLE_API_KEY\": \"{recovered_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )

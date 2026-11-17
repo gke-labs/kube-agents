@@ -4684,6 +4684,116 @@ is_existing_cluster_network_policy_satisfied() {
 # create_cluster = true — flipping it off would remove the resource from
 # configuration and plan the cluster's destruction (lifecycle.sh guards this
 # too).
+# The credentials install.env may not carry (PERSIST_SECRETS_ON_DISK=false),
+# which write_tfvars_from_state recovers from the live Secret.
+readonly RECOVERED_SECRET_KEYS="API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT"
+
+# recover_secret_keys_from_live_secret CONTEXT exports each RECOVERED_SECRET_KEYS
+# key the environment leaves empty from the live platform agent Secret, and
+# refuses to let a key the live Secret holds be written empty (#6126).
+#
+# One read of the whole Secret, not one per key: a per-key read that failed
+# (a timeout, a dropped connection, an RBAC denial) looked exactly like an
+# absent key, and Terraform then rendered that key empty over the live value.
+# Here only a key missing from a Secret that was read is absent. A Secret that
+# doesn't exist (NotFound: a first install onto an existing cluster) has
+# nothing to recover. Any other failure stops the run, naming the keys it
+# couldn't recover, unless each of them is set in the environment or named in
+# ALLOW_EMPTY_SECRET_KEYS (comma- or space-separated), the one way to accept
+# writing a key empty on purpose.
+#
+# Stopping is for the callers that APPLY, which opt in with
+# KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true beside KUBE_AGENTS_REQUIRE_MEMORY_ANSWER
+# (install.sh and upgrade.sh). A caller that doesn't, uninstall.sh, gets a
+# warning and goes on: a destroy has no use for the keys, and an install has
+# to keep a working way to remove itself.
+#
+# Returns 1 to stop the run; prints why on stderr.
+recover_secret_keys_from_live_secret() {
+  local ctx="$1"
+  local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  local key missing=() allow=" ${ALLOW_EMPTY_SECRET_KEYS//,/ } "
+  for key in $RECOVERED_SECRET_KEYS; do
+    [ -n "${!key:-}" ] || missing+=("$key")
+  done
+  # Every key already in the environment: nothing to read, so an operator
+  # whose RBAC can't read Secrets can still run by exporting the keys.
+  [ "${#missing[@]}" -gt 0 ] || return 0
+
+  local err_file secret_json read_rc=0
+  err_file="$(mktemp)"
+  # trap - ERR: install.sh runs an inherited ERR trap (set -E); a failed read
+  # is handled below, not by the trap. --request-timeout bounds a context
+  # whose cluster black-holes TCP.
+  secret_json="$(trap - ERR; kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "$ns" \
+    --context "$ctx" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+    -o json 2>"$err_file")" || read_rc=$?
+  local read_err
+  read_err="$(head -c 400 "$err_file" | tr '\n' ' ')"
+  rm -f "$err_file"
+
+  if [ "$read_rc" -ne 0 ]; then
+    if printf '%s' "$read_err" | grep -q '(NotFound)'; then
+      return 0
+    fi
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret (${read_err:-exit ${read_rc}}); going on without its keys." >&2
+      return 0
+    fi
+    local unknown=()
+    for key in ${missing[@]+"${missing[@]}"}; do
+      [[ "$allow" == *" ${key} "* ]] || unknown+=("$key")
+    done
+    [ "${#unknown[@]}" -gt 0 ] || return 0
+    print_error "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret in '${ns}' to recover ${unknown[*]-}: ${read_err:-kubectl exited ${read_rc}}" >&2
+    print_error "Going on would write those keys empty over their live values. Re-run once the cluster answers, export the keys yourself, or name the ones to leave empty in ALLOW_EMPTY_SECRET_KEYS." >&2
+    return 1
+  fi
+
+  # KEY<TAB>value lines for the listed keys the Secret holds, decoded here so
+  # a value that isn't base64 fails the read rather than recovering garbage.
+  local decoded
+  if ! decoded="$(trap - ERR; printf '%s' "$secret_json" | python3 -c '
+import base64, json, sys
+keys = sys.argv[1].split()
+data = (json.load(sys.stdin).get("data") or {})
+for k in keys:
+    if k in data:
+        v = base64.b64decode(data[k], validate=True).decode()
+        if "\n" in v or "\t" in v:
+            sys.exit("value of %s holds a tab or newline" % k)
+        print(k + "\t" + v)
+' "${missing[*]-}")"; then
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on without them." >&2
+      return 0
+    fi
+    print_error "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on would write them empty." >&2
+    return 1
+  fi
+
+  local line val live_nonempty=()
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    if [ -n "$val" ]; then
+      export "${key}=${val}"
+      live_nonempty+=("$key")
+      print_info "Recovered ${key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
+    fi
+  done <<<"$decoded"
+
+  # The guard: a key the live Secret holds non-empty may only be replaced by a
+  # non-empty value. Nothing above can leave one empty today; this keeps a
+  # later change from reopening #6126 without a test failing.
+  for key in ${live_nonempty[@]+"${live_nonempty[@]}"}; do
+    if [ -z "${!key:-}" ] && [[ "$allow" != *" ${key} "* ]]; then
+      print_error "${key} is set in the live '${PLATFORM_AGENT_SECRET}' Secret but would be written empty; refusing. Name it in ALLOW_EMPTY_SECRET_KEYS to empty it on purpose." >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
 write_tfvars_from_state() {
   local dest="$1"
   local image_tag="${2:-${IMAGE_TAG:-$IMAGE_TAG_FALLBACK}}"
@@ -4830,29 +4940,11 @@ write_tfvars_from_state() {
   # and uninstall.sh before they generate). A stale context pointing at some
   # other install would otherwise silently donate that environment's
   # credentials to this one.
-  local secret_key secret_val
   local expected_ctx
   expected_ctx="$(gke_context_name)"
   if command -v kubectl >/dev/null 2>&1 &&
     [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
-      [ -z "${!secret_key:-}" ] || continue
-      # Every stage exits 0 on its own (|| true inside the substitution):
-      # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
-      # here — no cluster yet, stale context — must be a silent no-op, not a
-      # trap-and-abort the outer || can never see. --request-timeout bounds
-      # the other stale-context failure mode: a context whose cluster was
-      # just destroyed black-holes TCP instead of refusing, and eight keys
-      # times a hung connect stalls the install for minutes.
-      secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --context "$expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
-        -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
-      if [ -n "$secret_val" ]; then
-        export "${secret_key}=${secret_val}"
-        print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
-      fi
-    done
+    recover_secret_keys_from_live_secret "$expected_ctx" || return 1
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
