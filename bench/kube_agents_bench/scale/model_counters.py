@@ -91,10 +91,9 @@ def requests_by_account(project: str, start: float, end: float) -> dict[str, int
     return out
 
 
-def against_sessions(vertex: dict[str, dict[str, int]], rows: dict[str, dict[str, int]], model: str) -> dict[str, Any]:
-    """The session rows' input and output against Vertex AI's count for the install's model."""
-    ours = {"input": sum(r["input"] + r["cached"] for r in rows.values()),
-            "output": sum(r["output"] for r in rows.values())}
+def against_sessions(vertex: dict[str, dict[str, int]], recorded: dict[str, Any], model: str) -> dict[str, Any]:
+    """The install's own records (input with cached, and output) against Vertex AI's count for its model."""
+    ours = {"input": int(recorded["input"]), "output": int(recorded["output"])}
     theirs = vertex.get(model, {"input": 0, "output": 0})
     ratio = {k: round(ours[k] / theirs[k], 4) if theirs.get(k) else None for k in ours}
     others = {m: v for m, v in vertex.items() if m != model}

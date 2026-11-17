@@ -316,3 +316,50 @@ class MemoryTest(unittest.TestCase):
         rows = {r["capability"]: r for r in at.memory_by_capability(series, empty, 100, 160, base={"agent": at.GIB},
                                                                      caps=CAPS)["rows"]}
         self.assertIn(at.UNATTRIBUTED, rows)
+
+
+class CallsTest(unittest.TestCase):
+    def data(self):
+        data = stores()
+        # w-ghost is a card's worker whose session never reached state.db; its calls are in the span store.
+        data["runs"].append({"task_id": "t1", "profile": "cluster-p-c2-us-central1-f", "started_at": 90.0,
+                             "metadata": json.dumps({"worker_session_id": "w-ghost"})})
+        data["calls"] = [["platform", "cron_compliance-audit_20261111_200909", 2, 3, 300, 200, 30],
+                         ["cluster-p-c2-us-central1-f", "w-ghost", 3, 2, 100, 50, 10],
+                         ["platform", "cron_compliance-audit_20261111_200909", 9, 1, 50, 0, 5]]
+        return data
+
+    def test_tokens_come_from_the_calls_in_their_minute_and_a_ghost_session_joins_through_its_card(self):
+        record = at.attribute(self.data(), 120, 240, caps=CAPS)
+        row = record["capabilities"]["compliance-audit"]
+        # The cron session's minute-2 call and w-ghost's minute-3 calls; the minute-9 call is outside.
+        self.assertEqual((row["input"], row["cached"], row["output"]), (100 + 50, 200 + 50, 40))
+        self.assertEqual(row["calls"], 5)
+        self.assertEqual(row["sessions"], 2)
+        self.assertEqual(record["recorded"], {"input": 400, "output": 40, "source": "calls"})
+
+    def test_memory_follows_the_minute_s_calls(self):
+        series = {"agent": [(120.0, 2 * at.GIB)]}
+        mem = at.memory_by_capability(series, self.data(), 120, 180, base={"agent": at.GIB}, caps=CAPS)
+        rows = {r["capability"]: r for r in mem["rows"]}
+        self.assertAlmostEqual(rows["compliance-audit"]["gib_hours"], 1 / 60, places=4)
+
+    def test_the_read_script_takes_only_model_call_spans(self):
+        import os
+        import sqlite3
+        import subprocess
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            ReadScriptTest().make_stores(root)
+            conn = sqlite3.connect(os.path.join(root, "profiles", "platform", "hermes_otel_live.db"))
+            conn.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, kind TEXT, ts REAL, data TEXT)")
+            usage = {"session.id": "s1", "gen_ai.usage.input_tokens": 100, "gen_ai.usage.cache_read_input_tokens": 80,
+                     "gen_ai.usage.output_tokens": 7}
+            for name in ("api.model-default", "agent"):
+                conn.execute("INSERT INTO events (kind, ts, data) VALUES ('span', 0, ?)",
+                             (json.dumps({"name": name, "start_time_unix_nano": 120 * 10 ** 9, "attributes": usage}),))
+            conn.commit()
+            out = subprocess.run([sys.executable, "-c", at.READ_SCRIPT, root, "0"], capture_output=True, text=True,
+                                 check=True, env={}).stdout
+        self.assertEqual(at.decode(out)["calls"], [["platform", "s1", 2, 1, 100, 80, 7]])

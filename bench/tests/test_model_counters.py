@@ -8,7 +8,7 @@ from kube_agents_bench.scale import model_counters as mc
 
 class AgainstSessionsTest(unittest.TestCase):
     def test_the_install_model_is_compared_and_other_models_are_named(self):
-        rows = {"a": {"input": 10, "cached": 90, "output": 5}}
+        rows = {"input": 100, "output": 5}
         vertex = {"gemini-3.5-flash": {"input": 100, "output": 5}, "gemini-3.1-pro-preview": {"input": 7, "output": 3}}
         check = mc.against_sessions(vertex, rows, "gemini-3.5-flash")
         self.assertEqual(check["ratio"], {"input": 1.0, "output": 1.0})

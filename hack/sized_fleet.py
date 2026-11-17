@@ -544,7 +544,7 @@ def measure_period(stores: dict, project: str, start: float, end: float, litellm
                                                      start, end, base=base),
             usage.setdefault("errors", []), "memory by capability")
     vertex = model_counters.vertex_tokens(project, start, end)
-    usage["vertex"] = model_counters.against_sessions(vertex, usage["capabilities"], INSTALL_MODEL)
+    usage["vertex"] = model_counters.against_sessions(vertex, usage["recorded"], INSTALL_MODEL)
     usage["requests_by_account"] = model_counters.requests_by_account(project, start, end)
     if litellm is None:
         # No LiteLLM counters for an arbitrary period: Vertex AI's own count is the sum check.
