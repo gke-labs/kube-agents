@@ -2337,9 +2337,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
-# pinned tirith (see the a2a-tools stage).
-COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
+# The a2a and curator CLIs, ungated (see the a2a-builder stage for why that is
+# safe), and the pinned tirith (see the a2a-tools stage).
+COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/curator /workspace/bin/tirith /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
@@ -2500,8 +2500,9 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
-# scaffolded into the optional `tse` Hermes profile at runtime when enabled.
+# Copy the GKE Support Agent (tse) profile TEMPLATE (SOUL, config, skills),
+# scaffolded into the optional `tse` Hermes profile at runtime when enabled,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
@@ -2548,7 +2549,7 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 #
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2579,6 +2580,7 @@ assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lo
         agents/cluster/skills=/opt/cluster-template/skills \
         agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
         agents/tse/skills=/opt/tse-template/skills \
+        agents/tse/persona/skills=/opt/tse-template/persona/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
 

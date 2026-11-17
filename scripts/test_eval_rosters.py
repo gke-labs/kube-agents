@@ -889,6 +889,7 @@ API_LANE_EXCLUDED = [
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
     "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
+    "tse-profile-names-the-oom-kill",  # #3842: delegated_to, as above
 ]
 
 
@@ -934,6 +935,22 @@ class ApiLaneExclusionsTest(unittest.TestCase):
             if is_stopped_ask(str(doc.get("prompt") or "")):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
+    def test_every_registered_profile_ask_is_excluded(self):
+        # A [bench:profile ...] ask errors on the api transport (#5945), so an
+        # unlisted one would error there every repetition. Read from the
+        # harness's own module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.profile_hook import is_profile_ask
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_profile_ask(str(doc.get("prompt") or "")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} is a profile ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
     def test_every_registered_reply_under_pushed_report_is_excluded(self):
         # The same rule for the pushed-report replay: it errors on the api

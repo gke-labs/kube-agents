@@ -382,10 +382,10 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 
 // The dispatch config at N=2,500 with the dispatcher's own ceiling switched
 // off (fleetScaleProfileFixtures), so every profile is rendered: one compact
-// profile block per profile with its tiers, parameters and a durable per
-// (tier, kind). Writing it compact brought it under the limit; Job templates,
-// which this fixture's profiles don't carry, are gke-labs/kube-agents#5479's,
-// and the dispatcher's ceiling refuses the profiles they would push past it.
+// profile block per profile with its tiers and parameters, and no durables,
+// which the dispatcher derives (#5479). Job templates, which this fixture's
+// profiles don't carry, are named by hash only, and the dispatcher's ceiling
+// refuses the profiles they would push past it.
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()

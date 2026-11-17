@@ -424,6 +424,18 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
     ),
+    # The audit-report store's operator half (#5619): the env names it
+    # reserves, and the gateway-policy rule.
+    "audit_report_store_operator": Source(
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("auditReportStoreEnvNames", "auditReportStoreIngressRule("),
+    ),
+    # The listener itself, read as text: the suite does not import it (it
+    # needs FastAPI and cryptography).
+    "audit_report_store_listener": Source(
+        "agents/platform/scripts/audit_report_store.py",
+        ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
+    ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("operatorPodNameLabel", "operatorPodNameValue"),

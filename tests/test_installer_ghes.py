@@ -17,7 +17,7 @@ at the instance. These tests hold the installer to that:
   CA when it starts, is restarted.
 
 The Terraform rendering itself is in
-terraform/examples/full-install/tests/github_enterprise.tftest.hcl.
+terraform/examples/full-install/tftests/github_enterprise.tftest.hcl.
 """
 
 import base64
@@ -923,8 +923,11 @@ class GhesSourcingTest(unittest.TestCase):
 class GhesInterviewAndHelpTest(unittest.TestCase):
 
     def test_help_describes_the_ghes_flags(self):
-        proc = subprocess.run(["bash", str(_INSTALL_SH), "--help"], capture_output=True, text=True,
-                              cwd=str(_REPO_ROOT), env=get_isolated_test_env(), timeout=60)
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"], capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+                timeout=60)
         out = proc.stdout
         self.assertIn("GitHub Enterprise Server", out)
         self.assertIn("github-forge-ca", out)

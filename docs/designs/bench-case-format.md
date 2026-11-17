@@ -81,7 +81,22 @@ It cancels the door task (`tasks/cancel`) once a card filed since the send is on
 task still works. No card within `deadline`, or a task that ends before any card, is
 infrastructure, not a pass. The next lane turns the door on for it, so an eval install runs with a
 door a default install doesn't have. The harness writes two entries for any of these cases, `harness_stop_sent` and `harness_cards_stopped`, and the case's
-`tool_called` objectives name them.
+`tool_called` objectives name them. When the door accepted the cancel and the task ended canceled,
+it writes a third, `harness_cancel_reported`: completed only when the canceled task carries a
+`cardStop` result whose stopped cards are exactly the cards the board shows archived (less any the
+result calls settled) and whose text opens `canceled; ` (#5528).
+
+A prompt that starts with `[bench:profile name=<profile> <key>=<value> ...]` sends its ask to that
+AgentProfile as a new top task, with the other fields as the task's parameters, rather than to the
+platform agent ([`bench/kube_agents_bench/profile_hook.py`](../../bench/kube_agents_bench/profile_hook.py),
+#5945). The directive ends at its first `]`, so the ask may follow on the same line, and its values
+take the `{{AGENT_CLUSTER_*}}` and `{{FLEET_CLUSTER_*}}` placeholders. It must open the prompt, and the
+lint refuses one that doesn't. No other `[bench:...]` directive may follow it, because the readers that
+schedule a stopped ask or a replay read only a prompt's first line, so a combined case would run in
+the wrong phase; combining one is a later change.
+It runs only over the inject transport (the door's `profile` and `parameters`); the api transport
+errors on it, so the case needs an entry in `hack/eval/api-lane-exclusions.txt`, which
+`scripts/test_eval_rosters.py` checks.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
