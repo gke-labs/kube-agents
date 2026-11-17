@@ -607,13 +607,15 @@ def check_changed_files(
                 if exp_file and not match_glob(exp_file, fpath):
                     continue
                 bname = Path(fpath).name
-                is_lockfile = (
-                    bname in LOCKFILE_NAMES
-                    or bname.lower().endswith(("-lock.yaml", "-lock.yml", ".lock.yaml", ".lock.yml"))
-                )
                 path_matched = any(match_glob(g, fpath) for g in s_paths)
                 exp_file_specific_matched = bool(
                     exp_file and exp_file not in OVERSIZE_WILDCARD_ALL_GLOBS and match_glob(exp_file, fpath)
+                )
+                is_lockfile = (
+                    bname in LOCKFILE_NAMES
+                    and not fpath.strip("/").startswith("clusters/")
+                    and not path_matched
+                    and not exp_file_specific_matched
                 )
                 res_yaml_matched = bool(
                     s_res
