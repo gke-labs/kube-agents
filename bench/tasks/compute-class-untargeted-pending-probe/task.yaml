@@ -1,0 +1,125 @@
+# Skill-guidance probe for gke-compute-classes: Pods that name no ComputeClass
+# stay Pending on a node pool that carries the compute-class label, and the
+# pool does not grow. On GKE 1.35.8-gke.1796000 the Cluster Autoscaler leaves
+# such Pods out of scale-up for a labelled pool; its NotTriggerScaleUp event
+# then has an empty reason and its visibility log names no rejected or skipped
+# pool, which reads like a capacity problem and is not one. On
+# 1.36.4-gke.2377000 the same Pods scaled the same kind of pool up. The overlay
+# patch on gke-compute-classes (Symptom 13 of its debug reference) carries the
+# sign, the version scope as observed and the repair; main's skill has only
+# "verify manual pools have correct label/taint".
+#
+# The objective is two verdict lines the prompt asks for, so the deterministic
+# check reads two decisions and not prose: a regex over the flat report cannot
+# tell "stockout" said of this cluster from the same word negated. Each verdict
+# is a line with nothing else on it: a verdict with more words after it does
+# not count, for the right verdict or for a wrong one, so a hedged line cannot
+# pass and a sentence that opens with a rejected verdict cannot fail a correct
+# answer. An answer that also has a wrong verdict on a line of its own fails.
+# The cause line alone is not enough: the prompt's facts point away from a
+# stockout, so a careful answer can reach it with no skill text. The second
+# line asks what is known for the version the cluster is about to run. It has
+# three choices so that "nothing is known" has its own answer: only the skill's
+# version scope gives the one that passes. The verifier lowercases the report
+# and drops emphasis and backticks, so the patterns are lowercase;
+# fold_decoration lets a numbered, bolded or quoted verdict line count;
+# bench/tests/test_compute_class_untargeted_pending_verdict.py pins both sides.
+# The prompt's sentence about a hand-off is for the Planning Agent, not for the
+# skill: without it, a card written in the Planning Agent's own words left the
+# two-line instruction out, and the worker's answer had no verdict line.
+# Why the verdicts hold, and the manifest change, are left to the judge, which
+# reads expected_output.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: compute-class-untargeted-pending-probe
+name: Pods that name no ComputeClass stay Pending on a labelled pool on GKE 1.35.8; it is not a stockout, and on 1.36.4 the pool was seen to grow
+
+owner: Fuxiao-Gao
+domain: capacity
+
+prompt: >-
+  Our Standard GKE cluster runs 1.35.8-gke.1796000. Its only node pool, apps,
+  carries the node label cloud.google.com/compute-class=general and no taint,
+  with autoscaling 1 to 10; it has 3 nodes now. A ComputeClass named general
+  lists that pool in one nodepools rule, with node pool auto-creation off. No
+  default ComputeClass is set for the cluster or for any namespace. The
+  Deployment ingest has no nodeSelector and no affinity. Four of its pods have
+  been Pending for 20 minutes with "0/3 nodes are available: 3 Insufficient
+  cpu". Each pending pod has the cluster-autoscaler event NotTriggerScaleUp
+  with the message "Pod didn't trigger scale-up:" and nothing after the colon.
+  In the autoscaler visibility log the pods are under
+  noScaleUp.unhandledPodGroups with no rejectedMigs and no skippedMigs. There
+  is no quota error and no scale.up.error entry. The on-call engineer wants to
+  open a capacity ticket for a zonal stockout, and we upgrade this cluster to
+  1.36.4-gke.2377000 next week. Load the installed gke-compute-classes skill
+  and answer from it before searching documentation. Start your answer with
+  exactly two lines, with nothing else on either line. If you hand this
+  question to another agent, pass these instructions word for word, and keep
+  its two lines at the start of your reply. First: "CAUSE: STOCKOUT" or
+  "CAUSE: PODS-NAME-NO-CLASS". Second, for what your skill records about
+  these same pods on 1.36.4-gke.2377000: "AFTER-UPGRADE:
+  STILL-PENDING-EXPECTED", "AFTER-UPGRADE: SCALE-UP-WAS-SEEN" or
+  "AFTER-UPGRADE: NO-RECORD". Then give the change you would make to ingest.
+  Do not apply anything.
+expected_output: >-
+  CAUSE: PODS-NAME-NO-CLASS. AFTER-UPGRADE: SCALE-UP-WAS-SEEN. This is
+  not a stockout: no scale-up was tried. The pool carries the compute-class
+  label with no taint, the pods name no class, and on 1.35.8-gke.1796000 the
+  autoscaler does not grow a labelled pool for such pods; the empty
+  NotTriggerScaleUp reason with no rejected or skipped pool, while the pool is
+  below its maximum, is the sign. Fix: add nodeSelector
+  cloud.google.com/compute-class: general to ingest's pod template (a required
+  nodeAffinity on that key also works), or set the namespace default class
+  and recreate the pods.
+  On 1.36.4-gke.2377000 the same pods were seen to scale the pool up; other
+  versions were not tested, so fix the workload and do not rely on the
+  upgrade.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-cause-is-the-missing-class-and-the-version-scope-is-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns: ["(?m)^\\W*cause:\\s*pods-name-no-class\\W*$"]
+          forbidden_patterns: ["(?m)^\\W*cause:\\s*stockout\\W*$"]
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns: ["(?m)^\\W*after-upgrade:\\s*scale-up-was-seen\\W*$"]
+          forbidden_patterns:
+            [
+              "(?m)^\\W*after-upgrade:\\s*(?:still-pending-expected|no-record)\\W*$",
+            ]
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]
