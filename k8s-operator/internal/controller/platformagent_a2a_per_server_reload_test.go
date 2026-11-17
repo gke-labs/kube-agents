@@ -302,7 +302,9 @@ func TestAScaleDownsLeftoverServerKeepsTheHold(t *testing.T) {
 			Status:     corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
 		}
 	}
-	state := a2aBusReloadState{requestedAt: asked.Format(time.RFC3339Nano), baselines: map[string]string{sts.Name + "-0": "t0"}}
+	// Both servers have moved, the leftover too: it still blocks, since it is
+	// on its way out and nothing says its config will hold.
+	state := a2aBusReloadState{requestedAt: asked.Format(time.RFC3339Nano), baselines: map[string]string{sts.Name + "-0": "t0", sts.Name + "-2": "t0"}}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace},
 		Data:       map[string][]byte{a2aNATSConfKey: []byte("new")},
@@ -310,7 +312,7 @@ func TestAScaleDownsLeftoverServerKeepsTheHold(t *testing.T) {
 	state.stamp(secret)
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts, secret, pod(0), pod(2)).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(4),
-		busConfigLoadTime: loadTimes(map[string]string{sts.Name + "-0": "t1", sts.Name + "-2": "t0"})}
+		busConfigLoadTime: loadTimes(map[string]string{sts.Name + "-0": "t1", sts.Name + "-2": "t1"})}
 	for _, at := range []time.Duration{time.Minute, a2aBusReloadBound} {
 		plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(at))
 		if err != nil {
