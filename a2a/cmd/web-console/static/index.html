@@ -9770,6 +9770,15 @@
               "feedback summary",
             );
             markSideLocalRow(row, where);
+            fetchEnvironment().then(() => {
+              if (!row.isConnected) return;
+              const refreshed = messageRow(
+                "agent",
+                feedbackContextMarkdown(),
+                "feedback summary",
+              );
+              row.innerHTML = refreshed.innerHTML;
+            });
             return true;
           }
           if (!kindKey) {

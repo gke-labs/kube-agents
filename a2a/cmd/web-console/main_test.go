@@ -1543,23 +1543,32 @@ const FEEDBACK_EMAIL = "kube-agents-feedback@google.com";
 const pending = { centre: null, side: null };
 const calls = [];
 const chatRows = [];
+let environment = "STALE-ENV-BLOCK";
+const environmentFetches = [];
 const $ = id => ({ id, dataset: {} });
 const appendTo = (container, role, text, tag) => {
-  const row = { role, text, tag, container: container.id, dataset: {} };
+  const row = { role, text, tag, container: container.id, dataset: {}, isConnected: true };
   chatRows.push(row);
   return row;
 };
+const messageRow = (role, text, tag) => ({ innerHTML: role + ":" + tag + ":" + text });
 const markSideLocalRow = () => {};
-const feedbackContextMarkdown = () => "ENV-BLOCK";
+const feedbackContextMarkdown = () => environment;
+const fetchEnvironment = () => {
+  const fetch = Promise.resolve().then(() => { environment = "FRESH-ENV-BLOCK"; });
+  environmentFetches.push(fetch);
+  return fetch;
+};
 const postFeedbackDraft = (where, kindKey, title) => calls.push(["draft", kindKey, title]);
 const openFeedback = (kind, title) => calls.push(["form", kind, title]);
 ` + pageJS(t, "findSlashCommand", "handleSlashCommand") + `
 handleSlashCommand("/feedback summary", "centre");
 handleSlashCommand("/feedback summary", "side");
-console.log(JSON.stringify({ row: chatRows.map(r => r.text), where: chatRows.map(r => r.container), calls }));`
-	want := `{"row":["ENV-BLOCK","ENV-BLOCK"],"where":["chat-stream","side-body"],"calls":[]}`
+await Promise.all(environmentFetches);
+console.log(JSON.stringify({ row: chatRows.map(r => r.innerHTML), where: chatRows.map(r => r.container), calls }));`
+	want := `{"row":["agent:feedback summary:FRESH-ENV-BLOCK","agent:feedback summary:FRESH-ENV-BLOCK"],"where":["chat-stream","side-body"],"calls":[]}`
 	if got := runPageJS(t, script); got != want {
-		t.Errorf("/feedback summary printed %s, want the environment block in each pane %s", got, want)
+		t.Errorf("/feedback summary did not refresh the environment block in each pane: got %s, want %s", got, want)
 	}
 }
 
