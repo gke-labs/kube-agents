@@ -7559,7 +7559,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+		if err := r.actOnA2ABusReload(ctx, agent, reload); err != nil {
 			return state, err
 		}
 		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {

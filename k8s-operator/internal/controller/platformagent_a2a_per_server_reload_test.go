@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -124,7 +126,7 @@ func TestAStragglerIsRestartedAloneAndOnlyWithTheOthersReady(t *testing.T) {
 	if config.Annotations[a2aBusReloadRequestedAnnotation] == "" {
 		t.Fatal("the pending record was dropped at the restart; the hold would release")
 	}
-	if err := r.actOnA2ABusReload(context.Background(), agent, sts.Name, plan); err != nil {
+	if err := r.actOnA2ABusReload(context.Background(), agent, plan); err != nil {
 		t.Fatal(err)
 	}
 	for i, want := range []bool{true, false, true} {
@@ -525,7 +527,7 @@ func TestAnOperatorRestartedStragglerReleasesTheHold(t *testing.T) {
 	if !held(config) {
 		t.Fatal("the profile was released before the straggler's restart was confirmed")
 	}
-	if err := r.actOnA2ABusReload(context.Background(), agent, sts.Name, plan); err != nil {
+	if err := r.actOnA2ABusReload(context.Background(), agent, plan); err != nil {
 		t.Fatal(err)
 	}
 	// The StatefulSet recreates it after the write.
@@ -639,7 +641,7 @@ func TestAPodTheStatefulSetDoesntControlHoldsTheReloadAndIsNamed(t *testing.T) {
 	if plan.reloaded {
 		t.Fatal("a pod the StatefulSet doesn't control confirmed the reload")
 	}
-	if err := r.actOnA2ABusReload(context.Background(), agent, sts.Name, plan); err != nil {
+	if err := r.actOnA2ABusReload(context.Background(), agent, plan); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -657,7 +659,7 @@ func TestAPodTheStatefulSetDoesntControlHoldsTheReloadAndIsNamed(t *testing.T) {
 func TestARestartLeavesARecreatedPodAlone(t *testing.T) {
 	r, agent, sts, _ := a2aClusterReloadFixture(t, "new", nil)
 	plan := a2aBusReload{restart: sts.Name + "-1", restartUID: "an-earlier-pod", busUID: sts.UID}
-	if err := r.actOnA2ABusReload(context.Background(), agent, sts.Name, plan); err != nil {
+	if err := r.actOnA2ABusReload(context.Background(), agent, plan); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: sts.Name + "-1"}, &corev1.Pod{}); err != nil {
@@ -1067,5 +1069,29 @@ func TestATLSFoldClearsTheReArmedMarkForTheRestartEvent(t *testing.T) {
 	}
 	if plan.folded {
 		t.Fatal("a server the TLS change folded kept its re-armed mark: its restart would read as the Normal folded restart")
+	}
+}
+
+// TestTheVarzClientFollowsNoRedirect: /varz is read from each bus pod by its
+// IP, and a pod's answer must not steer the operator's GET elsewhere, as
+// a2aBusJszClient's rule has it for /jsz.
+func TestTheVarzClientFollowsNoRedirect(t *testing.T) {
+	reached := false
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer elsewhere.Close()
+	pod := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/varz", http.StatusFound)
+	}))
+	defer pod.Close()
+	resp, err := a2aBusVarzClient.Get(pod.URL + a2aBusVarzPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusFound || reached {
+		t.Fatalf("status %d, followed=%v; want the redirect answered as-is and never followed", resp.StatusCode, reached)
 	}
 }

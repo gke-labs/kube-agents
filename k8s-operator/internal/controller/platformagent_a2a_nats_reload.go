@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -142,8 +143,17 @@ const (
 
 // a2aBusVarzClient reads the bus's monitoring endpoint directly: an
 // HTTP(S)_PROXY in the operator's environment is for its egress, and a
-// Service name sent through it would never be answered.
-var a2aBusVarzClient = &http.Client{Transport: &http.Transport{Proxy: nil}}
+// Service name sent through it would never be answered. Like
+// a2aBusJszClient it follows no redirect: a pod's answer, read by its IP,
+// must not steer the operator's GET elsewhere.
+var a2aBusVarzClient = &http.Client{
+	Transport:     &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// a2aBusVarzMaxBytes caps one /varz read, as a2aBusJszMaxBytes does /jsz: the
+// fields the reload reads are a few hundred bytes.
+const a2aBusVarzMaxBytes = 1 << 20
 
 func a2aNATSReloaderImage() string {
 	if override := os.Getenv(a2aNATSReloaderImageEnvVar); override != "" {
@@ -704,7 +714,7 @@ func a2aBusStragglerToRestart(servers []a2aBusServer, confirmed map[string]bool,
 // record stays until that pod is read too. If the delete fails, the pass
 // returns before the apply. The delete names the pod's UID, and only a pod
 // the live StatefulSet controls is deleted.
-func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, stsName string, plan a2aBusReload) error {
+func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plan a2aBusReload) error {
 	for _, name := range plan.foreign {
 		r.recordEvent(agent, corev1.EventTypeWarning, a2aBusForeignPodReason,
 			fmt.Sprintf("Pod %s holds an A2A bus server's name, but the bus StatefulSet doesn't control it: what config it serves is unknown, so the bus config reload stays unconfirmed (and newly bound profiles held) while it exists.", name))
@@ -812,7 +822,7 @@ func a2aBusReadVarz(ctx context.Context, pod *corev1.Pod) (a2aBusVarz, error) {
 		return a2aBusVarz{}, fmt.Errorf("%s (%s) answered %s", url, pod.Name, resp.Status)
 	}
 	var varz a2aBusVarz
-	if err := json.NewDecoder(resp.Body).Decode(&varz); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, a2aBusVarzMaxBytes)).Decode(&varz); err != nil {
 		return a2aBusVarz{}, fmt.Errorf("decoding %s (%s): %w", url, pod.Name, err)
 	}
 	return varz, nil

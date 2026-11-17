@@ -70,9 +70,9 @@ const (
 	// template, which StatefulSet revisions from that time still carry.
 	a2aConfigProfilesAnnotation = "kubeagents.x-k8s.io/a2a-config-profiles"
 
-	// a2aBusPreviousProfilesAnnotation is on a single server's config Secret
-	// while the server may still run an earlier config: the profiles it is
-	// known to have loaded before this config was written.
+	// a2aBusPreviousProfilesAnnotation is on the bus config Secret, for any
+	// server count, while a server may still run an earlier config: the
+	// profiles known to be loaded before this config was written.
 	a2aBusPreviousProfilesAnnotation = "kubeagents.x-k8s.io/a2a-reload-previous-profiles"
 
 	// a2aBusPreviousUntilHashAnnotation rides beside the previous list: the

@@ -134,7 +134,7 @@ func TestAReloadThatDoesntLandRestartsTheBusPod(t *testing.T) {
 	if plan.restart != sts.Name+a2aNATSPodOrdinalSuffix || config.Annotations[a2aBusReloadRequestedAnnotation] != pending[a2aBusReloadRequestedAnnotation] {
 		t.Fatalf("at the bound: plan = %+v, annotations %v; want a restart and the pending record kept", plan, config.Annotations)
 	}
-	if err := r.actOnA2ABusReload(ctx, agent, sts.Name, plan); err != nil {
+	if err := r.actOnA2ABusReload(ctx, agent, plan); err != nil {
 		t.Fatal(err)
 	}
 	if a2aBusPodExists(t, r, sts) {

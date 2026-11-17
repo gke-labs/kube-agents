@@ -696,8 +696,8 @@ type PlatformAgentReconciler struct {
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
-	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
-	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
+	// busConfigLoadTime stands in for reading a bus server's config_load_time
+	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
 	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
 	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
 	// tests; it wins over busConfigLoadTime, which answers a fixed start.

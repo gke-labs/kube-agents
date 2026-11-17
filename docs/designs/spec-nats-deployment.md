@@ -1262,8 +1262,12 @@ onto the new config: one server per pass, only once every other server has been 
 one server isn't Ready and hasn't confirmed, it goes first, since restarting it costs no
 quorum. A server that can never start (unschedulable, or crash-looping) is deleted once per bound
 while it stays unconfirmed, with a Warning each time, and the profile stays held throughout.
-An upgrade that lands in the middle of a reload folds every server once: the earlier
-operator's record carries no TLS version, which reads as a change. The fresh pod mounts the current Secret, so its creation after the write confirms
+An upgrade that lands in the middle of a reload: on three servers there is nothing in flight
+to carry over, since the earlier operator rolled the bus rather than reloading it and kept no
+reload record. On one server, a reload the earlier operator left pending can't be confirmed in
+place, because its record carries no pod UID or start time, so the server is restarted at that
+operator's original bound, with a `BusConfigReloadFailed` Warning, and the new pod confirms by
+its creation after the write. The fresh pod mounts the current Secret, so its creation after the write confirms
 it, and the pending record stays until it is read. A pod created after the write is given a
 full three minutes from its own creation to come up before it can be restarted. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The

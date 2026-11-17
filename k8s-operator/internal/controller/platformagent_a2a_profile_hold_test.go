@@ -274,10 +274,10 @@ func TestASingleServerHasLoadedTheSecretsListOnceTheReloadLands(t *testing.T) {
 
 // The AgentProfile reconciler reads the CR as stored, never resolved. With
 // no server count recorded (a served CRD that prunes status.busReplicas, or
-// before the first status write) and none asked for, a single server is read
-// by the shape its StatefulSet was rendered for, not as the default three:
-// otherwise every new profile's card would wait on a cluster annotation a
-// single server never carries.
+// before the first status write) and none asked for, a one-server bus is
+// still read by its own pods and revisions, not as the default three: the
+// hold's loaded set comes from the servers that exist, so a new profile's
+// card doesn't wait on servers that were never rendered.
 func TestAnUnrecordedSingleServerIsReadByItsRenderedShape(t *testing.T) {
 	rendered := a2aSingleServerTestAgent()
 	b := newHoldBus(rendered) // a one-server template
@@ -642,9 +642,10 @@ func TestANewlyBoundProfilesCardWaitsForTheBus(t *testing.T) {
 		t.Fatalf("publishes = %v, want the card once the bus has the profile", dir.publishes)
 	}
 
-	// The bus reads as not having it again (a roll onto a revision
-	// recorded before the list, say): the published card stays.
-	rev.Data.Raw = []byte(`{"spec":{"template":{"metadata":{}}}}`)
+	// The bus reads as not having it again (a revision that records an
+	// empty profile list, so the loaded set comes back empty): the
+	// published card stays, read back from the directory.
+	rev.Data.Raw = []byte(`{"spec":{"template":{"metadata":{"annotations":{"` + a2aConfigProfilesAnnotation + `":""}}}}}`)
 	if err := c.Update(context.Background(), rev); err != nil {
 		t.Fatal(err)
 	}
@@ -806,7 +807,7 @@ func TestAReArmedFoldedReloadRestartsAtTheBoundWithoutAWarning(t *testing.T) {
 			if !tc.wantReload && !tc.wantRestart && config.Annotations[a2aBusReloadRearmedAnnotation] == "" {
 				t.Errorf("a still-pending re-armed wait dropped its mark: %v", config.Annotations)
 			}
-			if err := r.actOnA2ABusReload(context.Background(), agent, sts.Name, plan); err != nil {
+			if err := r.actOnA2ABusReload(context.Background(), agent, plan); err != nil {
 				t.Fatal(err)
 			}
 			if tc.wantRestart && a2aBusPodExists(t, r, sts) {
