@@ -67,6 +67,8 @@ class FakeGcloud:
         if verb == ["disks", "list"]:
             if self.refuse == ("disks-list",):
                 return subprocess.CompletedProcess(cmd, 1, "", DISKS_DENIED)
+            if self.refuse == ("disks-list-object",):
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"items": []}), "")
             pattern = next(a for a in cmd if a.startswith("--filter=name ~ ^"))[len("--filter=name ~ ^"):].removesuffix("$")
             items = [
                 {"name": pattern, "region": f"https://www.googleapis.com/compute/v1/projects/p/regions/{z.split(':', 1)[1]}"}
@@ -263,6 +265,18 @@ class ProbeTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             _probe(FakeGcloud(snapshots=NAMES, refuse=("disks-list",)))
         self.assertIn("compute.disks.list", str(raised.exception.code))
+
+    def test_a_disk_list_that_is_not_a_list_stops_the_run(self):
+        # gcloud prints a JSON array on success; any other document is a
+        # read that saw nothing, and neither entry point may report "absent"
+        # or plant on it.
+        for entry in (_probe, _run):
+            with self.subTest(entry=entry.__name__):
+                fake = FakeGcloud(snapshots=NAMES, refuse=("disks-list-object",))
+                with self.assertRaises(SystemExit) as raised:
+                    entry(fake)
+                self.assertIn("something other than a JSON list", str(raised.exception.code))
+                self.assertEqual(fake.calls, [])
 
     def test_a_source_disk_in_another_zone_or_a_region_reads_present(self):
         self.assertEqual(_probe(FakeGcloud(snapshots=NAMES, disk=(OTHER_ZONE,)))[1]["source_disk"], "present")

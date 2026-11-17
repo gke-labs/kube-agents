@@ -171,8 +171,10 @@ def disks_named(project: str, name: str) -> list[tuple[str, str]]:
         items = json.loads(done.stdout or "[]")
     except ValueError as exc:
         sys.exit(f"{LOG_PREFIX}: compute {DISKS} list {name} printed something other than JSON: {exc}")
+    if not isinstance(items, list):
+        sys.exit(f"{LOG_PREFIX}: compute {DISKS} list {name} printed something other than a JSON list")
     found = []
-    for item in items if isinstance(items, list) else []:
+    for item in items:
         item = item if isinstance(item, dict) else {}
         zone = str(item.get(ZONE_FIELD) or "").rstrip("/").rsplit("/", 1)[-1]
         region = str(item.get(REGION_FIELD) or "").rstrip("/").rsplit("/", 1)[-1]
