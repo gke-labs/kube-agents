@@ -2,6 +2,7 @@ Subject: List every reservation affinity in the CRD field reference
 
 Why: The field reference listed only `Specific` and `None` while the same sync recommends `AnyThenFail` in SKILL.md, the debug guide and an asset; the CRD enum is `Specific`, `AnyBestEffort` and `None` on 1.35, and upstream gates `AnyThenFail` at 1.36.0-gke.3204000, so the list names all four with that gate.
 Local-Issue: #2692
+Eval-Case: compute-class-canary-active-migration-pdb-probe
 Upstream-Issue: none filed yet
 Retire-When: when the upstream CRD field reference lists every affinity
 

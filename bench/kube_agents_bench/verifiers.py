@@ -4403,12 +4403,19 @@ def _forge_rate_limit_budget() -> float:
 
 def _forge_rate_limit_wait(headers: Any) -> float:
     """Seconds to wait before reading again under a rate limit: the
-    Retry-After GitHub asks, else until its X-RateLimit-Reset, else the
-    default; at most one slice and what is left of the budget. Zero once the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset when
+    X-RateLimit-Remaining is 0, else the default; at most one slice and what
+    is left of the budget. Zero once the
     budget is spent."""
     get = headers.get if headers is not None else (lambda _key: None)
     wait = _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    # The reset is when the hourly budget comes back, so it is the wait only
+    # when that budget is spent (remaining 0); a secondary limit with budget
+    # left waits the default instead (#6177).
+    spent = str(get(_RATELIMIT_REMAINING_HEADER) or "").strip() == "0"
     for header, offset in ((_RETRY_AFTER_HEADER, None), (_RATELIMIT_RESET_HEADER, time.time())):
+        if header == _RATELIMIT_RESET_HEADER and not spent:
+            continue
         try:
             value = float(get(header))
         except (TypeError, ValueError):
@@ -4446,6 +4453,9 @@ def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
     to the App's permissions; None for any other answer (#6105)."""
     if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
         return None
+    if forges.forge_name() != forges.FORGE_GITHUB:
+        # Only GitHub's evals repositories share one installation's budget.
+        return f"GitLab rate-limited {what} (answered {status}), so this check could not be evaluated"
     return (
         f"GitHub rate-limited {what} (answered {status}); the evals repositories share one App "
         "installation's hourly budget, so this check could not be evaluated"
@@ -4468,6 +4478,14 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     transient, and keeps the check's error plain unless the check drops it as
     not behind the error."""
     global _forge_rate_limit_waited
+    # The token this read sends, not the variable: read_token falls back to
+    # BENCH_GITHUB_TOKEN when the file holds no usable token. Read once,
+    # before any wait: the job renews the file every 40 minutes, and a
+    # renewal during a wait must not make the next pass read this token as
+    # someone else's and stop waiting (#6177).
+    grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
+        forges.FORGE_GITHUB, os.environ
+    )
     while True:
         _last_forge_error_headers.set(None)
         try:
@@ -4479,11 +4497,6 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
             return status, payload
         headers = _last_forge_error_headers.get()
         rate_limited = is_rate_limit_answer(status, payload, headers)
-        # The token this read sent, not the variable: read_token falls back
-        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
-        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
-            forges.FORGE_GITHUB, os.environ
-        )
         if rate_limited and grading_app:
             # The shared installation's budget (#6105): wait for its reset
             # rather than grade a check that never ran.

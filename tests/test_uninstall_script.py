@@ -19,7 +19,6 @@ engine it does not carry.
 """
 
 import json
-import os
 import pathlib
 import re
 import shlex
@@ -29,7 +28,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import UNINSTALL_LOCK_FILE_ENV, create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _UNINSTALL_SH = _REPO_ROOT / "uninstall.sh"
@@ -40,24 +39,9 @@ _INSTALL_DEFAULTS = _REPO_ROOT / "install.defaults.env"
 # run writes, which the uninstall skill names.
 _REPORT_FILE_ENV = "KUBE_AGENTS_UNINSTALL_REPORT_FILE"
 _REPORT_DEFAULT_FILE = "/tmp/kube-agents-uninstall-report.json"
-
-
-def setUpModule():
-    # write_report runs for real in tests here. Its report goes to a file of
-    # this run of the module. The path a real run writes is one fixed file,
-    # which two runs of this module at the same time would share.
-    global _REPORT_DIR, _REPORT_ENV_BEFORE
-    _REPORT_DIR = tempfile.TemporaryDirectory()
-    _REPORT_ENV_BEFORE = os.environ.get(_REPORT_FILE_ENV)
-    os.environ[_REPORT_FILE_ENV] = str(pathlib.Path(_REPORT_DIR.name) / pathlib.Path(_REPORT_DEFAULT_FILE).name)
-
-
-def tearDownModule():
-    if _REPORT_ENV_BEFORE is None:
-        os.environ.pop(_REPORT_FILE_ENV, None)
-    else:
-        os.environ[_REPORT_FILE_ENV] = _REPORT_ENV_BEFORE
-    _REPORT_DIR.cleanup()
+# The file a real run locks. UNINSTALL_LOCK_FILE_ENV, the variable that names another file, is
+# a seam for tests; the shared test environment sets it.
+_LOCK_DEFAULT_FILE = "/tmp/kube-agents-uninstall.lock"
 
 
 class ReportFileTest(unittest.TestCase):
@@ -85,6 +69,43 @@ class ReportFileTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(json.loads(report.read_text())["status"], "PROBE")
+
+
+class LockFileTest(unittest.TestCase):
+    def test_a_real_run_locks_the_same_file_as_before_unless_a_test_names_another(self):
+        """Held by the source: with the variable unset, the script locks the one
+        fixed file, and it names that file in one place."""
+        source = _UNINSTALL_SH.read_text()
+        self.assertEqual(source.count(_LOCK_DEFAULT_FILE), 1, "the script names the lock file in one place")
+        self.assertEqual(
+            source.count(f'\nLOCK_FILE="${{{UNINSTALL_LOCK_FILE_ENV}:-{_LOCK_DEFAULT_FILE}}}"\n'),
+            1,
+            "the script takes the variable, then the same file as before",
+        )
+
+    def test_a_sourced_script_opens_the_lock_file_the_variable_names(self):
+        # Checked before the run: a script that reads another variable would
+        # open the lock file of a real uninstall.
+        self.assertIn(f'\nLOCK_FILE="${{{UNINSTALL_LOCK_FILE_ENV}:-', _UNINSTALL_SH.read_text())
+        # A stand-in flock, because the script skips its lock block where flock
+        # is absent (macOS), and then this would hold nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            flock = bin_dir / "flock"
+            flock.write_text("#!/usr/bin/env bash\nexit 0\n")
+            flock.chmod(flock.stat().st_mode | stat.S_IEXEC)
+            lock = pathlib.Path(tmp) / "uninstall.lock"
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"\necho sourced'],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir), overrides={UNINSTALL_LOCK_FILE_ENV: str(lock)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("sourced", proc.stdout)
+            self.assertTrue(lock.is_file(), "the script did not open the lock file that the variable names")
 
 
 class ResolveStateLocationTest(unittest.TestCase):
@@ -310,8 +331,8 @@ bash -c "exit 3"
             )
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         # The banner proves on_error actually ran and normalised. Without it
-        # this passes vacuously whenever /tmp/kube-agents-uninstall.lock is
-        # held: the lock branch also exits 1, having asserted nothing.
+        # this passes vacuously whenever the script's lock file is held: the
+        # lock branch also exits 1, having asserted nothing.
         self.assertIn("Teardown error encountered", proc.stderr)
         self.assertIn("exit code 1", proc.stderr)
 

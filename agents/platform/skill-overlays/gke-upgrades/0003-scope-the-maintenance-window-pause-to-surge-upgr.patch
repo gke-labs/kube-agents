@@ -2,6 +2,7 @@ Subject: Scope the maintenance-window pause to surge upgrades
 
 Why: SKILL.md says every upgrade pauses when its maintenance window closes, while the troubleshooting reference says blue-green node-pool upgrades run past the window to completion. The patch scopes the pause to surge upgrades.
 Local-Issue: none (#2353)
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Upstream-Issue: none filed yet
 Retire-When: upstream scopes the pause to surge upgrades
 
