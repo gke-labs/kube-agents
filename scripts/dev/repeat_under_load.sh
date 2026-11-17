@@ -19,6 +19,8 @@ readonly DEFAULT_RUNS=10
 readonly DEFAULT_CORES=4
 readonly DEFAULT_LOOPS_PER_CORE=3
 readonly LOG_DIR_TEMPLATE="repeat-under-load.XXXXXX"
+# Where the log directory goes when TMPDIR is unset or empty, as mktemp has it.
+readonly DEFAULT_TMPDIR="/tmp"
 readonly LOAD_PIDS_FILE="load.pids"
 readonly RUN_LOG_PREFIX="run-"
 readonly RUN_LOG_SUFFIX=".log"
@@ -31,6 +33,8 @@ readonly MAX_COUNT_DIGITS=6
 readonly MAX_BUSY_LOOPS=256
 readonly CPUS_ALLOWED_FILE="/proc/self/status"
 readonly CPUS_ALLOWED_KEY="Cpus_allowed_list:"
+# Where there is no allowed list and no nproc (macOS): the sysctl name of the cpu count.
+readonly SYSCTL_CPU_COUNT_KEY="hw.ncpu"
 readonly USAGE_EXIT=2
 # Each loop spins while its parent, the script, is alive, so a script killed outright
 # (SIGKILL, the OOM killer) does not leave loops burning; kill -0 is a builtin, no fork.
@@ -115,11 +119,15 @@ for n in "$runs" "$cores" "$loops_per_core"; do
   [ "$n" -gt 0 ] || { echo "runs, cores and loops per core must be above zero" >&2; usage; }
 done
 
-mapfile -t allowed < <(allowed_cpus)
+# A read loop, not mapfile: macOS's /bin/bash is 3.2, which has none.
+allowed=()
+while IFS= read -r allowed_cpu; do
+  allowed+=("$allowed_cpu")
+done < <(allowed_cpus)
 if [ ${#allowed[@]} -gt 0 ]; then
   available_cores=${#allowed[@]}
 else
-  available_cores=$(nproc 2>/dev/null || echo "$cores")
+  available_cores=$(nproc 2>/dev/null || sysctl -n "$SYSCTL_CPU_COUNT_KEY" 2>/dev/null || echo "$cores")
 fi
 if [ "$cores" -gt "$available_cores" ]; then
   cores=$available_cores
@@ -144,7 +152,11 @@ else
   pinning_note=", $CANNOT_BIND_NOTE $cpu_list"
 fi
 
-log_dir=$(mktemp -d -t "$LOG_DIR_TEMPLATE")
+# The template with its directory, not `-t`: BSD mktemp (macOS) reads `-t` as a prefix
+# under the user's temporary directory, whatever TMPDIR says. A slash at the end of
+# TMPDIR comes off, as GNU `mktemp -t` takes it off, so the path prints with one.
+tmp_root=${TMPDIR:-$DEFAULT_TMPDIR}
+log_dir=$(mktemp -d "${tmp_root%/}/$LOG_DIR_TEMPLATE")
 echo "logs: $log_dir" >&2
 
 # The busy loops die with the script: the EXIT trap ends them, and each ends itself
@@ -225,7 +237,8 @@ failed_runs=()
 for k in $(seq "$runs"); do
   echo "run $k of $runs" >&2
   # An async command in a non-interactive shell inherits SIGINT and SIGQUIT ignored,
-  # which would hide Ctrl-C from the test; the subshell restores them before exec.
+  # which would hide Ctrl-C from the test; the subshell restores them before exec
+  # (bash 3.2 does not restore them there, and the run starts with both ignored).
   (
     trap - INT QUIT
     exec ${run_group[@]+"${run_group[@]}"} ${pin[@]+"${pin[@]}"} "${command[@]}"

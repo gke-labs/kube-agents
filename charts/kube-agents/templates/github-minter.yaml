@@ -35,12 +35,18 @@ the module README, which links the upstream guide for doing it by hand).
 {{- $projectId := required "platformAgent.harness.projectId is required when githubMinter.enabled" .Values.platformAgent.harness.projectId }}
 {{- $location := required "platformAgent.harness.location is required when githubMinter.enabled" .Values.platformAgent.harness.location }}
 {{- $clusterName := required "platformAgent.harness.clusterName is required when githubMinter.enabled" .Values.platformAgent.harness.clusterName }}
+{{- $universeDomain := .Values.platformAgent.harness.universeDomain | default "googleapis.com" }}
 {{- /* KMS rings are regional; a zonal cluster location maps to its region —
        the same derivation as derive_kms_location in
        scripts/installer/installer_common.sh, so chart and installer name
        the same ring. */}}
 {{- $kmsLocation := $m.kms.location | default (regexReplaceAll "-[a-z]$" $location "") }}
-{{- $allowedSa := $m.allowedServiceAccount | default (printf "kubeagents-platform-gsa@%s.iam.gserviceaccount.com" $projectId) }}
+{{- $projParts := splitList ":" $projectId }}
+{{- $gsaDomain := $projectId }}
+{{- if eq (len $projParts) 2 }}
+{{- $gsaDomain = printf "%s.%s" (index $projParts 1) (index $projParts 0) }}
+{{- end }}
+{{- $allowedSa := $m.allowedServiceAccount | default (printf "kubeagents-platform-gsa@%s.iam.gserviceaccount.com" $gsaDomain) }}
 {{- /*
   A GitHub forge at a GitHub Enterprise Server host moves the minter there:
   minty calls the REST API at SOURCE_SYSTEM_API_BASE_URL instead of
@@ -87,7 +93,7 @@ metadata:
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
   annotations:
-    iam.gke.io/gcp-service-account: {{ $m.gsaName }}@{{ $projectId }}.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: {{ $m.gsaName }}@{{ $gsaDomain }}.iam.gserviceaccount.com
 automountServiceAccountToken: false
 ---
 # Three scopes per policy. `platform-agent-scope` is the write token the agent's
@@ -226,7 +232,11 @@ spec:
             - name: CONFIGS_DIR
               value: "/etc/minty"
             - name: ISSUER_ALLOWLIST
-              value: "https://container.googleapis.com/v1/projects/{{ $projectId }}/locations/{{ $location }}/clusters/{{ $clusterName }},https://accounts.google.com"
+              value: "https://container.{{ $universeDomain }}/v1/projects/{{ $projectId }}/locations/{{ $location }}/clusters/{{ $clusterName }},https://accounts.google.com"
+            {{- if ne $universeDomain "googleapis.com" }}
+            - name: GOOGLE_CLOUD_UNIVERSE_DOMAIN
+              value: {{ $universeDomain | quote }}
+            {{- end }}
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:

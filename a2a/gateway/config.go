@@ -66,8 +66,8 @@ const defaultDelegationDepthMax = 3
 const defaultDelegationWidthMax = 1
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
-// accepts: one, until a batch's aggregated wake and its stop are built
-// (#5682). Raising it is what turns fan-out on.
+// accepts: one, until a stop cancels a batch's every child, walking the
+// whole task tree (#5682). Raising it is what turns fan-out on.
 const delegationWidthBuiltMax = 1
 
 // defaultScopeFile is where the operator projects the install's rendered
@@ -131,6 +131,11 @@ const (
 // (people.go); the operator renders it only from
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
+const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+const (
+	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
+	imagePullRefSep  = ","
+)
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
@@ -610,6 +615,8 @@ type Config struct {
 	KubeProxyURL         string
 	KubeProxyCAConfigMap string
 	KubeProxyHostContext string
+	UniverseDomain       string
+	ImagePullRefs        []string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -695,9 +702,9 @@ type Config struct {
 	// concurrency.
 	//
 	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
-	// children can't yet be stopped together, and each would wake the
-	// session on its own, so an operator can't turn fan-out on until its
-	// results and stop are built (delegationWidthBuiltMax). Tests and
+	// results come back in one wake, but a stop doesn't yet cancel every
+	// child of the tree, so an operator can't turn fan-out on until that
+	// stop is built (delegationWidthBuiltMax, #5682). Tests and
 	// embedders that build Config directly may set more, to exercise the
 	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
 	DelegationWidthMax int
@@ -822,6 +829,7 @@ func FromEnv() (*Config, error) {
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		UniverseDomain:         strings.TrimSpace(os.Getenv(envGoogleCloudUniverseDomain)),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:     capability.OptionalFromEnv(),
@@ -837,6 +845,18 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	seenPullRefs := make(map[string]struct{})
+	for _, refName := range strings.Split(os.Getenv(envImagePullRefs), imagePullRefSep) {
+		refName = strings.TrimSpace(refName)
+		if refName == "" {
+			continue
+		}
+		if _, dup := seenPullRefs[refName]; dup {
+			continue
+		}
+		seenPullRefs[refName] = struct{}{}
+		cfg.ImagePullRefs = append(cfg.ImagePullRefs, refName)
+	}
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
@@ -998,7 +1018,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
 	}
 	if wm > delegationWidthBuiltMax {
-		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's results and stop are not built yet (#5682)", widthMax, delegationWidthBuiltMax)
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's tree-wide stop is not built yet (#5682)", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
