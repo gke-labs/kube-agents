@@ -94,8 +94,9 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_BRIDGE_URI",
     "_A2A_DISPATCHER_URI",
     "_PERSONA_CLUSTER_URI",
+    "_PERSONA_TSE_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse")
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
@@ -443,11 +444,13 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             f"operator.extraEnv[10].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
         ]
-        # The cluster profile's images, at this build: its persona and worker.
-        # Unset, the chart would take ghcr at the CI tag.
+        # The cluster and tse profiles' images, at this build: their personas
+        # and worker. Unset, the chart would take ghcr at the CI tag.
         for key, image in (
             ("profiles.cluster.persona", "persona-cluster"),
             ("profiles.cluster.harness", "a2a-worker"),
+            ("profiles.tse.persona", "persona-tse"),
+            ("profiles.tse.harness", "a2a-worker"),
         ):
             expected += [
                 "--set-string",
@@ -462,6 +465,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             f"operator.extraEnv[11].name={go_constant(_A2A_MANIFESTS, 'a2aAgentDoorEnvVar')}",
             "--set-string",
             "operator.extraEnv[11].value=true",
+        ]
+        # The bus's debug logging (#5708), under the name the operator reads,
+        # which turns it on only for "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[12].name={go_constant(_A2A_MANIFESTS, 'a2aNATSDebugEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[12].value=true",
         ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
@@ -620,7 +631,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         # The dispatcher, at the candidate's published image.
         self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
         self.assertEqual(values[11], "operator.extraEnv[11].value=true")
-        self.assertEqual(len(values), 12, values)
+        self.assertEqual(values[12], "operator.extraEnv[12].value=true")
+        self.assertEqual(len(values), 13, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -985,10 +997,11 @@ class TasksBudgetSizingTest(unittest.TestCase):
         assert block is not None
         self.assertIn('--set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
         self.assertIn('--set-string "platformAgent.deployment.env[4].value=false"', block.group(1))
-        # The cluster profile, which a delegation case reads (#5194). Not tse,
-        # whose placeholder persona a dispatched worker can't stage (#3842).
+        # The cluster profile, which a delegation case reads (#5194), and tse,
+        # which the Kanban escalation case reads (#3492), on its own persona
+        # image since #3842.
         self.assertIn('--set "profiles.cluster.enabled=true"', block.group(1))
-        self.assertNotIn("profiles.tse", block.group(1))
+        self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
@@ -1039,7 +1052,7 @@ class TasksBudgetSizingTest(unittest.TestCase):
         # The path is the CRD's: PlatformAgentSpec.Harness -> HarnessSpec.Tuning
         # -> TuningSpec.MaxSessions, as the API package tags them, and the
         # chart renders the values under platformAgent at those paths
-        # (tests/test_chart_platform_agent_mode.py, CiDeployDocumentRenderTest).
+        # (tests/test_chart_platform_agent_no_mode.py, NoModeRenderTest).
         api = text(_API_TYPES)
         self.assertIn('Tuning *TuningSpec `json:"tuning,omitempty"`', api)
         self.assertIn('MaxSessions *int `json:"maxSessions,omitempty"`', api)
@@ -1339,7 +1352,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         # The ordering the wait relies on: the pass rolls the agent
         # Deployment before it creates or sweeps the provision Job, and
         # nothing watches Jobs, so the Failed status arrives on a requeue.
-        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance,"))
+        self.assertLess(controller.index("r.reconcileWorkload(ctx, renderAgent,"), controller.index("r.reconcileA2A(ctx, renderAgent,"))
         self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 
@@ -1960,6 +1973,10 @@ class BridgeImageBuildTest(unittest.TestCase):
         # The cluster persona, from its own directory, as the ghcr workflow builds it.
         uri = f"{_AR_REPO}/persona-cluster:{_TAG}"
         expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster agents/cluster/persona")
+        expected.append(f"docker push {uri}")
+        # The tse persona, the same way (#3842).
+        uri = f"{_AR_REPO}/persona-tse:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse agents/tse/persona")
         expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 

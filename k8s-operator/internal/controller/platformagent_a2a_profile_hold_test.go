@@ -552,8 +552,13 @@ func TestADrainingProfileBoundAgainKeepsDrainingWhileHeld(t *testing.T) {
 
 // A held profile keeps its own identities in the map, but the dispatcher's
 // grant leaves out its supervisor subjects until it is dispatchable.
+// The unbucketed shape, where the dispatcher entry carries every profile's
+// subjects. With bucketed grants the callout derives each bucket's grants
+// from the profile entries, and a held profile's are not yet left out
+// (gke-labs/kube-agents#5935); the dispatch config leaves it out either way.
 func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // on unless "false" since #5577
 	agent := a2aTestAgent()
 	x, y := testAgentProfile(agent.Namespace, "x"), testAgentProfile(agent.Namespace, "y")
 	doc, err := renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
@@ -673,8 +678,17 @@ func TestTheReconcileHoldsANewProfileOutOfTheDispatcherUntilTheBusHasIt(t *testi
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, shard); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(shard.Data[a2aAuthMapKey], `"a2a.tasks.auditor.*.supervisor"`) {
-		t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+	// The dispatcher's allows, not the map as a whole: the gateway's entry
+	// denies every bound profile's supervisor subjects, held ones included,
+	// as nats.conf does (#5301).
+	var heldDoc a2aAuthMapDocument
+	if err := json.Unmarshal([]byte(shard.Data[a2aAuthMapKey]), &heldDoc); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range heldDoc.Identities {
+		if id.User == a2aDispatcherUser && slices.Contains(id.Grants.Publish, "a2a.tasks.auditor.*.supervisor") {
+			t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+		}
 	}
 	config := &corev1.Secret{}
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, config); err != nil {

@@ -183,6 +183,7 @@ one pod's CPU is one limit.
 | `/v1/vcs/<verb>`, `/v1/forge/refresh`, `/v1/github/refresh` | Stateful broker                                               | Keeps one forge-token coalesce cache, so GitHub mints do not multiply by N                                                                                                 |
 | `/v1/chat/*` relays, `/v1/chat/a2a/*` included              | Stateful broker                                               | **Needs one pod:** in-process receipt maps, one Socket Mode connection                                                                                                     |
 | `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                                                                                                                        |
+| `POST /v1/dial`                                             | Stateful broker                                               | **Needs one pod:** the dial's level is held in process and on the Pod's emptyDir, and `/v1/vcs/<verb>` reads it                                                            |
 | `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                                                                                                                      |
 | `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                                                                                                              |
 
@@ -195,9 +196,9 @@ stay on it as a first step, not because they keep state:
   subscription goes to the broker's A2A relay instance, and the legacy instance is not built
   (`platformagent_manifests.go:4587-4597`). The consumer moved to the A2A gateway; the Pub/Sub pull
   and its receipt map did not. So the stateful pod stays in both modes.
-- **Slack leaves the broker only in `next` mode with Slack on and Chat off**
-  (`a2aSlackArmed`, `platformagent_a2a_manifests.go:1398-1399`). With both on, Slack stays on the
-  broker's relay.
+- **Slack leaves the broker whenever Slack is on** (`a2aSlackArmed`,
+  `platformagent_a2a_manifests.go`), Chat on or off: the A2A gateway holds it, and the broker's
+  relay is not rendered.
 - **The watchers keep no broker state.** The event watcher and the drift detector run in the
   gateway pod's `agent-api-auth` sidecar (`platformagent_manifests.go:4154-4161`), and the gateway
   is capped at 1 replica (`supportedGatewayReplicas`, `manifest_helpers.go:84`). The broker only

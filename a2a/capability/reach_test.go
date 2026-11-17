@@ -3,6 +3,7 @@ package capability
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"sync"
@@ -320,7 +321,13 @@ func TestALateAnswerToAnEarlierAskIsUsed(t *testing.T) {
 			return // only the first ask is ever answered, and late
 		}
 		reply := m.Reply
-		time.AfterFunc(slowAnswer, func() { _ = nc.Publish(reply, []byte(`{"allowed":true}`)) })
+		// Echoing the first ask's request id: the late answer is acted on
+		// because every ask of the check carries the same id, not because an
+		// un-echoed reply is tolerated.
+		var req Request
+		_ = json.Unmarshal(m.Data, &req)
+		answer, _ := json.Marshal(Response{Allowed: true, RequestID: req.RequestID})
+		time.AfterFunc(slowAnswer, func() { _ = nc.Publish(reply, answer) })
 	})
 	if err != nil {
 		t.Fatal(err)

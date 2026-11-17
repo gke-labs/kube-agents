@@ -62,16 +62,22 @@ forge shares and Gerrit's unit of review is a single revision.
 from __future__ import annotations
 
 import base64
+import io
+import json
 import logging
 import os
 import re
 import subprocess
+import tarfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import automation_rules
+import automerge_checks
+import automerge_eligibility
 from providers import (
     CliTransport,
     HttpTransport,
@@ -206,6 +212,11 @@ SNAPSHOT_HISTORY = "none"
 MAX_SNAPSHOT_PATHS = 256
 # How often the snapshot clone's size is measured while it runs.
 CLONE_WATCH_SECONDS = 0.5
+#: `revision-contains`'s ancestor: a full or abbreviated SHA-1 commit id (the scratch repository is SHA-1).
+ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,40}$")
+#: git's words, across server versions, for a fetch of a revision the remote does not have.
+MISSING_REVISION_MARKERS = ("not our ref", "couldn't find remote ref", "unadvertised object", "no such remote ref",
+                            "did not send all necessary objects")
 # A path entry, and all of them joined: well under the kernel's limits on one
 # argument (128 KiB) and on a command line, so git always starts.
 MAX_SNAPSHOT_PATH_BYTES = 4096
@@ -422,6 +433,36 @@ def _age_seconds(created: Any, now: datetime) -> float | None:
     if when.tzinfo is None:
         return None
     return (now - when).total_seconds()
+
+
+# A GKE cluster as the fleet audit names it, `<project>/<location>/<name>`,
+# each part as GKE allows it, so none can reach gcloud as a flag.
+_GKE_CLUSTER = re.compile(r"([a-z][a-z0-9-]{4,28}[a-z0-9])/([a-z]+-[a-z]+[0-9]+(?:-[a-z0-9]+)?)/([a-z](?:[-a-z0-9]{0,38}[a-z0-9])?)")
+_KUBERNETES_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
+
+
+def _gke_cluster(name: str) -> tuple[str, str, str] | None:
+    match = _GKE_CLUSTER.fullmatch(name)
+    return (match[1], match[2], match[3]) if match else None
+
+
+def _reserved_labels_on(proposal: Mapping[str, Any]) -> list[str]:
+    """The reserved auto-merge labels a proposal carries, in their own spelling."""
+    names = {str(label).casefold() for label in proposal.get("labels") or []}
+    return [label for label in automerge_eligibility.RESERVED_LABELS if label.casefold() in names]
+
+
+def _automerge_switch() -> str:
+    """The install's KUBEAGENTS_AUTOMERGE in this process; "off" where the
+    switch module is missing or fails."""
+    try:
+        from kubeagents_switches import (
+            switch,
+        )
+
+        return switch("AUTOMERGE")
+    except Exception:
+        return "off"
 
 
 def _login_key(login: str) -> str:
@@ -758,8 +799,18 @@ class VcsBroker:
         mint: Callable[[str, str], str] | None = None,
         repository_role: Callable[[Forge, str], str] | None = None,
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
+        cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
+        automerge_switch: Callable[[], str] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
+        # or kubectl read the broker runs on its own behalf, through the same
+        # executor and cluster selection a caller's read takes. Only
+        # `proposal-practice-label` uses it; None, it labels nothing.
+        self._cluster_read = cluster_read
+        # The install's KUBEAGENTS_AUTOMERGE, read in this process, never
+        # taken from a caller.
+        self._automerge_switch = automerge_switch or _automerge_switch
         # Which list of the broker's ConfigMap names `repo` on `forge`: one of
         # the ROLE_* values, or a raise when the lists cannot be read. Only
         # `snapshot` asks. None answers ROLE_UNREGISTERED for every repository,
@@ -1754,6 +1805,8 @@ class VcsBroker:
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
+        if existing_head:
+            self._drop_practice_label(bound, branch)
         return bound.stamp({"branch": branch, "revision": tip})
 
     def branch_view(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1781,6 +1834,76 @@ class VcsBroker:
         return bound.stamp(
             {"branch": {"name": branch, "exists": bool(revision), "revision": revision or None}}
         )
+
+    def revision_contains(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Whether `revision` contains `ancestor` on the remote: `{"contains": bool}`.
+
+        The post-merge check's question when a GitOps tool applied a commit
+        other than the merge commit: reconcilers track a branch, so a later
+        merge carries this one. git against the remote, like `branch-view`:
+        `revision`'s commits are fetched into a scratch repository, never
+        checked out, and the fetch is stopped at the clone's size ceiling
+        (`CLONE_TOO_LARGE`). `revision` is a full id, since it is what is
+        fetched; `ancestor` may be abbreviated (a forge can report a
+        merge commit by a short id) and is resolved after the fetch. A
+        revision the remote does not have is `REVISION_NOT_FOUND`; an
+        untrusted certificate or a refused credential is answered by its
+        cause, and any other failed fetch is the retryable `FORGE_CALL_FAILED`.
+        A revision that starts with `ancestor` contains it without a fetch.
+        """
+        bound = self._bind(payload)
+        ancestor = payload.get("ancestor")
+        ancestor = ancestor.strip().lower() if isinstance(ancestor, str) else ""
+        if not ANCESTOR_RE.match(ancestor):
+            raise WorkspaceError("ancestor must be a hex revision id of 7 to 40 characters")
+        revision = validate_revision(payload.get("revision"), "revision")
+        if revision.lower().startswith(ancestor):
+            return bound.stamp({"contains": True})
+        bound.ensure()
+        git = bound.git
+        root = self._scratch("contains")
+        try:
+            git(root, "init", "--quiet", "--bare")
+            last, stopped = [0.0], [False]
+
+            def over_ceiling() -> bool:
+                now = time.monotonic()
+                if now - last[0] < CLONE_WATCH_SECONDS:
+                    return False
+                last[0] = now
+                stopped[0] = _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes
+                return stopped[0]
+
+            fetched = git(
+                root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
+                check=False, stop=over_ceiling,
+            )
+            remedy = "The history of this one revision is over it; nothing in the request makes the fetch smaller."
+            if stopped[0]:
+                raise self._clone_too_large(bound.repo, remedy)
+            if fetched.returncode != 0:
+                stderr = fetched.stderr or ""
+                refusal = self._tls_refusal(stderr) or _git_refusal(bound.forge, bound.repo, stderr, "fetch")
+                if refusal is not None:
+                    raise refusal
+                if any(marker in stderr for marker in MISSING_REVISION_MARKERS):
+                    raise WorkspaceError(
+                        f"{bound.repo} has no revision {revision}",
+                        status=404,
+                        code="REVISION_NOT_FOUND",
+                    )
+                raise WorkspaceError(
+                    f"could not fetch {revision} from {bound.repo}: git exited {fetched.returncode}",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            self._enforce_ceiling(root, bound.repo, remedy=remedy)
+            present = git(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
+            full = (present.stdout or "").strip()
+            contains = present.returncode == 0 and bool(full) and self._is_ancestor(git, root, full, revision)
+        finally:
+            self._discard_scratch(root)
+        return bound.stamp({"contains": contains})
 
     def branch_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Delete a spent branch: one whose proposal is done with and whose tip it carried.
@@ -2290,7 +2413,14 @@ class VcsBroker:
         payload: dict[str, Any],
         pinned_target: bool = False,
     ) -> dict[str, Any]:
+        if verb in WRITE_VERBS:
+            refuse_dial_gated_labels(payload)
         bound = self._bind(payload)
+        # The broker's own label is no caller's to write, on any forge, and the
+        # refusal makes no call (`proposal_practice_label` writes it directly).
+        reserved = automerge_eligibility.reserved_label_refusal(verb, payload)
+        if reserved:
+            raise WorkspaceError(reserved, status=403, code="RESERVED_LABEL")
         # Before anything else that could spend a call: a forge with no labels
         # refuses a label field by name, so a filter is not silently ignored
         # and a label write does not look done. Only for a verb the forge
@@ -2448,6 +2578,238 @@ class VcsBroker:
         )
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 
+    def proposal_practice_label(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Judge one proposal as an auto-merge candidate, and label it if it is one.
+
+        Everything is read here, never taken from the caller, which names only
+        the repository and the number. The switch's label
+        (`automerge_eligibility.LABEL_FOR_SWITCH`: `practice`'s, which nothing
+        acts on, or `on`'s, which a customer's pipeline may merge on) goes on
+        when every one of these holds; a reserved label the proposal carries
+        comes off when they do not, or when it is the other switch value's:
+
+        - `KUBEAGENTS_AUTOMERGE` is `practice` or `on` in this process;
+        - the proposal is open and this credential's own;
+        - its diff adds one file and changes nothing else, and that file is,
+          byte for byte, the PodDisruptionBudget the fleet audit generates
+          (`automerge_eligibility.parse_budget`);
+        - the rules file on the proposal's target branch allows the `no-pdb`
+          fix in the environment the cluster's own labels declare
+          (`automation_rules`);
+        - the three safety checks pass on the broker's own read of the
+          workload's namespace (`automerge_checks.judge`).
+
+        Off, it reads nothing and answers so. A failed read is a reason not to
+        label, never an error, except a forge read of the proposal itself.
+        """
+        number = validate_number(payload.get("number"))
+        bound = self._bind(payload)
+        switch = self._automerge_switch()
+        on = switch in automerge_eligibility.LABELLING_SWITCH_VALUES
+        view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": on}) or {}
+        proposal = view.get("proposal") or {}
+        checks: list[dict] = []
+        if on:
+            try:
+                viewer = self._viewer(bound)
+                reason = self._practice_refusal(bound, payload, viewer, proposal, view.get("diff"), checks)
+            except Exception as exc:  # noqa: BLE001 -- a failed read is a reason not to label
+                LOGGER.warning("practice label: a read failed repo=%s number=%s type=%s: %s",
+                               bound.repo, number, type(exc).__name__, str(exc)[:400])
+                reason, checks = "a read the judgement needs failed", []
+        else:
+            # Off reads no cluster and no rules; it only takes back a label an
+            # earlier `practice` or `on` left.
+            reason = "KUBEAGENTS_AUTOMERGE is off"
+        want = automerge_eligibility.LABEL_FOR_SWITCH.get(switch) if reason is None else None
+        if want == automerge_eligibility.AUTOMERGE_LABEL and not dial_allows_automerge():
+            # The dial below Auto-merge holds back the label a pipeline merges
+            # on, and takes a carried one off; `practice`'s label is unaffected.
+            reason, want = "the autonomy dial is below Auto-merge", None
+        carried = _reserved_labels_on(proposal)
+        after: dict[str, Any] | None = None
+        added = False
+        if want is not None and want not in carried:
+            # The judgement took time: label only the head it judged, still open.
+            fresh = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+            if fresh.get("state") != OPEN_PROPOSAL_STATE or fresh.get("sourceRevision") != proposal.get("sourceRevision"):
+                reason, want = "the proposal moved, merged or closed while it was judged", None
+        if want is not None:
+            if want not in carried:
+                bound.forge.label_ensure(
+                    bound.api,
+                    bound.repo,
+                    {
+                        "name": want,
+                        "color": automerge_eligibility.LABEL_COLOR,
+                        "description": automerge_eligibility.LABEL_DESCRIPTIONS[want],
+                    },
+                )
+                bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsAdd": [want]})
+                carried.append(want)
+                added = True
+            # The judgement was of the head read above. A push since then is
+            # a diff nobody judged, so the label comes off again.
+            after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+            if after.get("sourceRevision") != proposal.get("sourceRevision"):
+                reason, want = "the proposal's branch moved while it was judged", None
+        stale = [label for label in carried if label != want]
+        if stale and after is None:
+            # The judgement took time; a pull request that merged meanwhile
+            # keeps its label, which the post-merge step-down reads.
+            after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+        # A label this call just added was never earned by a head that moved,
+        # so it comes off whatever the state; an older one stays on a merge.
+        if stale and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
+            bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
+        LOGGER.info(
+            "practice label repo=%s number=%s switch=%s labelled=%s reason=%s checks=%s",
+            bound.repo, number, switch, reason is None, reason or "eligible",
+            json.dumps(checks, sort_keys=True),
+        )
+        # The caller learns which checks passed, not what the cluster read
+        # said: the details name workloads and budgets on whatever cluster the
+        # budget named, and stay in this log.
+        return bound.stamp(
+            {
+                "labelled": reason is None,
+                "label": want,
+                "switch": switch,
+                "reason": reason or "eligible",
+                "checks": [{"name": c["name"], "passed": c["passed"]} for c in checks],
+            }
+        )
+
+    def _practice_refusal(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        viewer: str,
+        proposal: dict[str, Any],
+        diff: Any,
+        checks: list[dict],
+    ) -> str | None:
+        """Why `proposal_practice_label` does not label, or None; `checks` gets
+        the safety checks once they ran."""
+        if not getattr(bound.forge, "labels", False):
+            return "this forge has no labels"
+        if bound.forge.text_sets_labels:
+            return "on this forge a comment or a description can set a label, so no label is the broker's alone"
+        if proposal.get("state") != OPEN_PROPOSAL_STATE:
+            return "the proposal is not open"
+        if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
+            return "the proposal is not this credential's own"
+        added = automerge_eligibility.added_file_from_diff(diff)
+        budget = automerge_eligibility.parse_budget(added[1]) if added else None
+        if budget is None:
+            return "the proposal does not add exactly one file that is the audit's generated PodDisruptionBudget"
+        if not automerge_eligibility.path_fits(added[0], budget):
+            return f"{added[0]} is not where the budget for {budget.cluster} goes"
+        target = _gke_cluster(budget.cluster)
+        if target is None or not _KUBERNETES_NAME.fullmatch(budget.namespace):
+            return f"the budget names no cluster or namespace this broker reads ({budget.cluster!r}, {budget.namespace!r})"
+        if self._cluster_read is None:
+            return "this broker has no cluster reader"
+        # The rules on the repository's own base, never on a target branch a
+        # caller could have published with a rules file of its own.
+        base = self._practice_base(bound)
+        if not base or proposal.get("target") != base:
+            return f"the proposal does not target the repository's base branch ({base or 'unknown'})"
+        rules = self._practice_rules(payload, base)
+        if rules.status != automation_rules.LOADED:
+            return f"{automation_rules.RULES_FILE} on {base} allows nothing ({rules.status})"
+        project, location, name = target
+        code, out, err = self._cluster_read(
+            ["gcloud", "container", "clusters", "describe", name, "--location", location,
+             "--project", project, "--format=json(resourceLabels)"],
+            "",
+        )
+        # Fixed words to the caller, who wrote the cluster's name: what the
+        # read said would tell it which clusters exist. The log keeps it.
+        if code != 0:
+            LOGGER.info("practice label: cluster labels not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            return "the cluster's labels could not be read"
+        try:
+            labels = (json.loads(out or "{}") or {}).get("resourceLabels") or {}
+        except (json.JSONDecodeError, AttributeError):
+            return "the cluster's labels could not be read"
+        environment = automation_rules.cluster_environment(labels)
+        decision = automation_rules.decide(rules, automerge_eligibility.FIX_TYPE, environment)
+        if not decision.allowed:
+            LOGGER.info("practice label: rules refuse cluster=%s: %s", budget.cluster, decision.reason)
+            return f"{automation_rules.RULES_FILE} does not allow this fix in this cluster's environment"
+        code, out, err = self._cluster_read(
+            ["kubectl", "get", automerge_checks.READ_KINDS, "-n", budget.namespace, "-o", "json"],
+            f"gke_{project}_{location}_{name}",
+        )
+        try:
+            dump = json.loads(out) if code == 0 else None
+        except json.JSONDecodeError:
+            dump = None
+        if not isinstance(dump, dict) or not isinstance(dump.get("items"), list):
+            LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            return "the workload's namespace could not be read"
+        checks += automerge_checks.judge(dump, budget.object, budget.namespace, budget.name, budget.selector)
+        failed = [check["name"] for check in checks if not check["passed"]]
+        return f"safety checks failed: {', '.join(failed)}" if failed else None
+
+    def _practice_base(self, bound: Binding) -> str:
+        """The branch a labelled proposal must target: the repository's pinned
+        base, else the branch the remote calls its default, else ""."""
+        pinned = self._pinned_base(bound.forge, bound.repo)
+        if pinned:
+            return pinned
+        bound.ensure()
+        root = self._scratch("practice")
+        try:
+            bound.git(root, "init", "--quiet")
+            bound.git(root, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
+            return self._default_branch_of_remote(bound.git, root, self._tls_refusal)
+        finally:
+            self._discard_scratch(root)
+
+    def _drop_practice_label(self, bound: Binding, branch: str) -> None:
+        """Take the reserved label off any open proposal from `branch`, after
+        a push to it: the broker judged the diff before the push, not this one.
+        Logged and left on a forge that cannot be asked, rather than failing a
+        publish that has already landed."""
+        if not getattr(bound.forge, "labels", False):
+            return
+        try:
+            listed = bound.forge.proposal_list(bound.api, bound.repo, {"source": branch, "state": OPEN_PROPOSAL_STATE})
+            for proposal in listed.get("proposals") or []:
+                carried = _reserved_labels_on(proposal)
+                if carried:
+                    bound.forge.proposal_update(
+                        bound.api, bound.repo, {"number": proposal["number"], "labelsRemove": carried}
+                    )
+        except Exception as exc:  # noqa: BLE001 -- the push stands either way
+            LOGGER.warning("practice label not dropped after a push repo=%s branch=%s: %s", bound.repo, branch, exc)
+
+    def _practice_rules(self, payload: dict[str, Any], target: str) -> automation_rules.Rules:
+        """The rules file on `target`, as `automation_rules` reads it: absent
+        when the branch has none, refused for anything but one regular file."""
+        try:
+            snap = self.snapshot(
+                {"repository": payload.get("repository"), "ref": target or None, "paths": [automation_rules.RULES_FILE]}
+            )
+        except WorkspaceError as exc:
+            if exc.fields.get("code") == "PATH_NOT_FOUND":
+                return automation_rules.Rules(status=automation_rules.ABSENT)
+            return automation_rules.Rules(status=automation_rules.INVALID, error=f"not read ({exc})")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(base64.b64decode(snap["archiveBase64"]))) as tar:
+                members = [m for m in tar.getmembers() if not m.isdir()]
+                if len(members) != 1 or not members[0].isreg() or members[0].name != automation_rules.RULES_FILE:
+                    return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+                raw = tar.extractfile(members[0]).read(automation_rules.MAX_FILE_BYTES + 1)
+        except (tarfile.TarError, KeyError, ValueError) as exc:
+            return automation_rules.Rules(status=automation_rules.INVALID, error=f"not read ({exc})")
+        try:
+            return automation_rules.parse(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not UTF-8")
+
 
 # The verbs that leave a mark on the forge. Named beside the route table because
 # that is where a new verb gets added, and a verb added to one and not the other
@@ -2469,6 +2831,7 @@ WRITE_VERBS = frozenset(
         "issue-close",
         "label-ensure",
         "branch-delete",
+        "proposal-practice-label",
     }
 )
 
@@ -2479,9 +2842,9 @@ WRITE_VERBS = frozenset(
 # default, is today's behaviour. `none` is explain-only: the broker refuses
 # PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
 # and labels stay open to it, because an issue is how an audit reports.
-# Read on every request through write_mode(), the one place a second source
-# (a runtime setting) can be added. Today its only source is the broker's env,
-# so on a pod a change applies once the operator has rolled the broker.
+# Read on every request through write_mode(), which takes the most restrictive
+# of the broker's env (applies once the operator has rolled the broker) and the
+# Slack autonomy dial (applies at once; see dial_level below).
 WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
 WRITE_MODE_PROPOSE = "propose"
 WRITE_MODE_NONE = "none"
@@ -2495,6 +2858,8 @@ PROPOSE_VERBS = frozenset(
         "proposal-update",
         "proposal-close",
         "proposal-acknowledge",
+        # Writes a proposal's labels, which a pipeline may merge on.
+        "proposal-practice-label",
     }
 )
 
@@ -2502,19 +2867,139 @@ PROPOSE_VERBS = frozenset(
 def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     """The install's write mode and the raw value it was read from.
 
-    Unset or empty is `propose`. A value that is neither mode is `none`: a
-    setting someone wrote to restrict the agent must not lift the restriction
-    because it was misspelt.
+    The most restrictive of two sources: the broker's env, and the Slack
+    autonomy dial (`dial_level`), whose Explain is `none`. Unset or empty env
+    is `propose`. A value that is neither mode is `none`: a setting someone
+    wrote to restrict the agent must not lift the restriction because it was
+    misspelt. When the dial is what restricts, the raw value is
+    :data:`WRITE_MODE_DIAL_RAW`, so `write_mode_detail` names the dial rather
+    than the env.
     """
     raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
     value = raw.strip().lower()
     if not value:
-        return WRITE_MODE_PROPOSE, raw
-    return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+        mode = WRITE_MODE_PROPOSE
+    else:
+        mode = value if value in WRITE_MODES else WRITE_MODE_NONE
+    if mode == WRITE_MODE_PROPOSE and dial_level(environ) == DIAL_EXPLAIN:
+        return WRITE_MODE_NONE, WRITE_MODE_DIAL_RAW
+    return mode, raw
+
+
+# The Slack autonomy dial's level, the runtime source write_mode() reads beside
+# the env, set through set_dial_level(), so a new level applies with no pod
+# restart. The credential proxy's dial route calls it when the Slack adapter
+# reports a level. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# gets spec.deployment.env); off, the dial is not a source at all. On, a broker
+# with no level set since it started reads the level it last stored on its
+# state emptyDir (kept across a container restart, not a new Pod), and with none
+# stored, Explain: it fails closed. The dial only ever restricts.
+DIAL_ENV = "KUBEAGENTS_DIAL"
+# On the broker's state emptyDir: it outlives a container restart, not the Pod.
+DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
+# write_mode()'s raw value when the dial, not the env, is what restricts. It
+# starts with a NUL, which no environment value can hold, so an env set to the
+# same visible text is still read (and explained) as a misspelt env.
+WRITE_MODE_DIAL_RAW = "\x00dial:explain"
+DIAL_EXPLAIN = "explain"
+DIAL_PROPOSE = "propose"
+DIAL_AUTOMERGE = "automerge"
+DIAL_LEVELS = (DIAL_EXPLAIN, DIAL_PROPOSE, DIAL_AUTOMERGE)
+_dial_lock = threading.Lock()
+_dial_level: str | None = None
+_dial_reported = False
+# The label the customer's pipeline merges on (automation_rules.AUTOMERGE_LABEL;
+# a test holds the two equal). Below Auto-merge no write verb may add it.
+DIAL_GATED_LABELS = frozenset({"kube-agents:auto-merge"})
+DIAL_ADDING_LABEL_FIELDS = ("labels", "labelsAdd")
+
+
+def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if environ is None else environ).get(DIAL_ENV, "").strip().lower() == "on"
+
+
+def _dial_state_path() -> Path:
+    return Path(DIAL_STATE_FILE)
+
+
+def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
+    """The dial's level, or None while `KUBEAGENTS_DIAL` is not `on`."""
+    if not dial_enabled(environ):
+        return None
+    with _dial_lock:
+        if _dial_level is not None:
+            return _dial_level
+    try:
+        stored = _dial_state_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        stored = ""
+    return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
+
+
+def set_dial_level(level: str) -> None:
+    """Record the level the gateway reported; ValueError for anything but a level."""
+    global _dial_level, _dial_reported
+    if level not in DIAL_LEVELS:
+        raise ValueError(f"level must be one of {', '.join(DIAL_LEVELS)}")
+    path = _dial_state_path()
+    with _dial_lock:
+        _dial_level = level
+        _dial_reported = True
+        # Kept on the broker's own volume, so a restarted broker process keeps
+        # it; best effort, because the gateway reports it again within a minute.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(level + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOGGER.warning("could not store the dial level at %s: %s", path, exc)
+
+
+def dial_reported() -> bool:
+    """Whether the gateway has reported the dial's level to this broker process."""
+    with _dial_lock:
+        return _dial_reported
+
+
+def dial_allows_automerge(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the dial lets a fix carry the auto-merge label: off, or at Auto-merge."""
+    level = dial_level(environ)
+    return level is None or level == DIAL_AUTOMERGE
+
+
+def refuse_dial_gated_labels(payload: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a write that adds the auto-merge label while the dial is below Auto-merge.
+
+    Compared folded and stripped: a forge matches label names that way, so a
+    spelling that differs only in case is the same label to the pipeline. Each
+    value is also split on commas, because an adapter may join the list with
+    commas and its forge reads that as several labels. Removing it is always
+    allowed, and a read (a list filter) never comes here.
+    """
+    if dial_allows_automerge(environ):
+        return
+    for field in DIAL_ADDING_LABEL_FIELDS:
+        values = payload.get(field)
+        values = [values] if isinstance(values, str) else values if isinstance(values, (list, tuple)) else []
+        names = [part for v in values if isinstance(v, str) for part in v.split(",")]
+        if any(name.strip().casefold() in DIAL_GATED_LABELS for name in names):
+            raise WorkspaceError(
+                "the autonomy dial is not at Auto-merge proven fixes, so no pull request or issue may carry "
+                "the auto-merge label. Leave the label off; an install admin raises the dial on the Slack "
+                "app's Home tab.",
+                status=403,
+                code="DIAL_AUTOMERGE_OFF",
+            )
 
 
 def write_mode_detail(raw: str) -> str:
-    """Why `raw` reads as `none` when it is neither mode, or "" when it is one (or unset)."""
+    """Why `raw` reads as `none` when it is neither mode or the dial restricts, or "" when it is one (or unset)."""
+    if raw == WRITE_MODE_DIAL_RAW:
+        return (
+            f"{DIAL_ENV} is on and the autonomy dial is at Explain, which the broker treats as none; "
+            "with no level set since this broker Pod started it reads Explain"
+        )
     value = raw.strip().lower()
     if not value or value in WRITE_MODES:
         return ""
@@ -2573,6 +3058,8 @@ VCS_VERBS = frozenset(
         "identity",
         "branch-view",
         "branch-delete",
+        "revision-contains",
+        "proposal-practice-label",
     }
 )
 
@@ -2608,6 +3095,8 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "identity": broker.identity,
         "branch-view": broker.branch_view,
         "branch-delete": broker.branch_delete,
+        "revision-contains": broker.revision_contains,
+        "proposal-practice-label": broker.proposal_practice_label,
     }
 
 
@@ -2627,6 +3116,18 @@ __all__ = [
     "WRITE_MODE_PROPOSE",
     "WRITE_MODES",
     "WRITE_VERBS",
+    "DIAL_AUTOMERGE",
+    "DIAL_ENV",
+    "DIAL_EXPLAIN",
+    "DIAL_LEVELS",
+    "DIAL_PROPOSE",
+    "WRITE_MODE_DIAL_RAW",
+    "dial_enabled",
+    "dial_level",
+    "dial_reported",
+    "set_dial_level",
+    "dial_allows_automerge",
+    "refuse_dial_gated_labels",
     "write_mode",
     "write_mode_detail",
     "max_bundle_bytes",

@@ -26,6 +26,9 @@ const (
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
 	ReasonStopped           = "stopped"
+	// ReasonTierEnded ends a held task whose tier an administrator ended
+	// the drain of (lib.DrainingTier.Ending, #5850): canceled, not failed.
+	ReasonTierEnded = "tier-ended"
 	// The re-check of a child whose parent is an AgentProfile task (#5686):
 	// the gateway checks the same at mint, and the dispatcher holds a child
 	// an older gateway sent, or one that breaks either rule, to them.
@@ -111,5 +114,5 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.bus.Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
 }

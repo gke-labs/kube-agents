@@ -34,6 +34,15 @@ routes Service on 6222, authenticated to each other by mutual TLS under the bus 
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 
+**Amended 11/13 (#5708):** with `A2A_NATS_DEBUG=true` in the operator's own environment, the
+bus config carries `debug: true`. CI sets it through `operator.extraEnv`, so a failing run's
+server logs show the meta group's raft votes, terms and peer updates. It is never a CR field
+or a chart value of its own; only the chart's general `operator.extraEnv` reaches it. It is debug and never trace, because trace logs protocol frames and
+payloads and CI logs are public; debug names connections and the public keys they
+authenticated with. CI's failure collector keeps the first 2 MiB of each server's current log file beside the
+tail, since a long debug run can push the bring-up out of the tail. A file the kubelet rotated
+at 10Mi has lost the bring-up, and the head file then says so.
+
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as
 orphans; going back, a standalone server refuses to load an R3 stream. Either way the
@@ -47,6 +56,27 @@ count it runs: a `busReplicas` that asks for another count is held to the runnin
 with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
 refuses the edit with the same message. #4225 lifts that refusal in the same change that
 adds the migration, so no release can convert without it.
+
+**Amended 10/31 (#4225):** the refusal is gone, and a change between one server and three
+starts a migration that keeps the bus's data. The operator runs it as phases on
+`status.busMigration`, reported by the `A2ABusMigrating` condition, and the webhook refuses
+another `busReplicas` change while one runs.
+
+- **Three to one**, in place: the operator's pin Job moves every stream's leader to server 0
+  and scales it to one replica while the bus is still a cluster, then the bus renders one
+  server. Writes keep flowing.
+- **One to three**, by copy: writes are frozen (no workload but the migration reaches the bus; console
+  and web logins drop, and the gateway and bridge cannot publish), the operator's pods
+  snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
+  snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
+  stream, checked against the operator's policy for it before and after, and raises it to
+  three replicas.
+- **A failure** turns the run back: before the shrink, the pinned streams go back to three
+  replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
+  restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
+  A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
+  it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
+  does neither.
 
 **Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
 The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
@@ -362,8 +392,8 @@ The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` 
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
 running across the reconnect. Listing them all in its map entry grows the entry about
 1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
-With `A2A_DISPATCHER_BUCKETED_GRANTS=true` on the operator, the entry narrows on
-`dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+By default (`A2A_DISPATCHER_BUCKETED_GRANTS` on the operator, which only `false` turns off) the
+entry narrows on `dispatcher` instead. It carries only the fixed grants, which are its control connection's,
 and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
 CONNECT password beside the token gets the per-profile grants, draining profiles' included,
 of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
@@ -371,8 +401,11 @@ from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's ow
 password picks a slice of what the token already allows; it is not a credential. A bucket the
 callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
 names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
-profiles. The switch is off by default, and stays off until the dispatcher opens its bucket
-connections. With a dispatcher the
+profiles. The operator renders the same switch onto the dispatcher, which then opens one
+connection per bucket beside its control connection, and is Ready only with all of them up. A
+profile the config adds reconnects only its own bucket. The dispatcher's image has to move with
+the operator's: one from before the bucket connections ignores the switch, binds no durable on
+its control connection, and stays not Ready. With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
@@ -467,8 +500,8 @@ Layout:
   which have no validator - a side left empty beside a populated one renders an explicit
   `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
   ships, still gets no permissions block at all. A principal that must not publish cannot be
-  expressed by omission - there is no deny list in the map
-  - so it has to be left unrendered rather than rendered empty.
+  expressed by omission - the map's deny lists (#5301) only subtract from an allow and never
+  stand in for an empty one - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -484,7 +517,9 @@ Layout:
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
   static render cannot express. The render subtracts each bound or draining profile by name
-  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny), so the gateway cannot
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny; #5301 moves profile
+  supervisors to the six-token `a2a.tasks.p.<profile>.*.supervisor`, which the gateway
+  subscribes to read only and can never publish), so the gateway cannot
   publish directly to a profile's supervisor subject. The deny covers direct publishes
   only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`
@@ -817,7 +852,11 @@ keyed on the agent's own ServiceAccount and carries the blackboard grants and no
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
-janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
+janitor yet. **Amended 11/16 (#5301):** the gateway has an entry too, keyed on its own
+ServiceAccount. Its grants carry deny lists, a shape the map gained for it: the only thing
+keeping its consumer-create wildcard on `TASKS` off the pre-created durables is a publish
+deny naming them. It uses the entry only at `A2A_GATEWAY_BUS_AUTH=token`; its static user
+stays until a release after that flip, so rolling back across it is the flag. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
 operator has one for itself, keyed on the manager's own ServiceAccount: publish on
 `a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic

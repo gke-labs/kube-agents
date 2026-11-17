@@ -458,6 +458,39 @@ readonly SLACK_LANE_APP_TOKEN_SECRET="slack-eval-app-token"
 readonly SLACK_LANE_CHANNEL_SECRET="slack-eval-channel-id"
 readonly SLACK_LANE_TEST_USER_SECRET="slack-eval-test-user-id"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
+
+# The agent gateway runs one replica, so a node drain or an autoscaler
+# consolidation replaces its pod, and the replacement can wait a minute or more
+# for a node (#6040: a ScaleDown took it mid-check on #3554's smoke). The checks
+# that talk to it through a tunnel (step 7's connectivity check and the web
+# console gate) tolerate ONE such replacement each: when an attempt fails and
+# the gateway's Running pod is not the one the check started with, they wait
+# for the Deployment to roll out and retry without spending an attempt. A
+# second replacement, or a replacement that never becomes Ready, fails as
+# before. Accepted edges: a failure that merely coincides with a replacement
+# (a 403, say) fails one retry and one rollout wait later than it would have;
+# `rollout status` can answer before the Deployment reflects the new pod, which
+# wastes the free retry; and under next a Ready pod's bridge may not consume
+# yet. Each costs time or an attempt, never a wrong pass. The availability fix
+# is a second replica (#4206).
+readonly GATEWAY_REPLACEMENT_WAIT_TIMEOUT="600s"
+# A terminating pod keeps phase Running through its grace period, so one with
+# a deletionTimestamp is left out: it is the pod being replaced, not the gateway.
+gateway_pod_uids() {
+  { kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true; } |
+    awk 'NF == 1 { print $1 }' | sort | tr '\n' ' '
+}
+# <uids at the check's start> <check name>. 0 when the pod was replaced and the
+# replacement rolled out (retry without spending an attempt), 1 otherwise.
+await_gateway_replacement() {
+  local started="$1" check="$2" now
+  now="$(gateway_pod_uids)"
+  [ -n "${started}" ] && [ "${now}" != "${started}" ] || return 1
+  echo "the agent gateway pod was replaced during ${check} (#6040); waiting up to ${GATEWAY_REPLACEMENT_WAIT_TIMEOUT} for the replacement, once"
+  kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout="${GATEWAY_REPLACEMENT_WAIT_TIMEOUT}" || return 1
+}
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
 # (credential_proxy_manifests.go).
@@ -565,6 +598,11 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # don't depend on that default.
 readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
 readonly A2A_GATEWAY_ELECTION_ON="true"
+# nats-server debug logging on the bus (k8s-operator a2aNATSDebugEnvVar): on for
+# the lane only, so a failing run's bus logs carry the meta group's raft votes,
+# terms and peer updates (#5708). Debug, never trace: trace logs payloads.
+readonly A2A_NATS_DEBUG_ENV_VAR="A2A_NATS_DEBUG"
+readonly A2A_NATS_DEBUG_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
 # `stop` sent through the inject door stops the conversation's kanban cards,
 # which chat-stop-halts-delegated-remediation grades. The operator renders
@@ -749,6 +787,9 @@ readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
 # context agents/cluster/persona), built beside the A2A images so the lane runs
 # this tree's persona.
 readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
+# The tse AgentProfile's persona image (a2a/Dockerfile.persona-tse, context
+# agents/tse/persona), built the same way (#3842).
+readonly PERSONA_TSE_IMAGE_NAME="persona-tse"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -905,11 +946,10 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the `cluster` AgentProfile, which the profile dispatcher
-# serves (its images are set with the A2A overrides below). Not the optional
-# `tse` one: its chart persona image is a placeholder a dispatched worker can't
-# stage, so the lane leaves it off, and its case parked, until #3842 gives it a
-# real one (#3492 enabled it here for the Kanban scaffold). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile and the optional `tse` one, which
+# the profile dispatcher serves (their images are set with the A2A overrides
+# below). tse also scaffolds `/opt/data/profiles/tse` for the Kanban case
+# (#3492); its persona image is #3842's. Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -922,6 +962,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.cluster.enabled=true"
+    --set "profiles.tse.enabled=true"
   )
 fi
 
@@ -1279,6 +1320,16 @@ gitops_repo_for_project() {
     kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
     kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
     kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
+    kube-agents-evals-41) echo "gke-agentic/kube-agents-evals-41-infra" ;;
+    kube-agents-evals-42) echo "gke-agentic/kube-agents-evals-42-infra" ;;
+    kube-agents-evals-43) echo "gke-agentic/kube-agents-evals-43-infra" ;;
+    kube-agents-evals-44) echo "gke-agentic/kube-agents-evals-44-infra" ;;
+    kube-agents-evals-45) echo "gke-agentic/kube-agents-evals-45-infra" ;;
+    kube-agents-evals-46) echo "gke-agentic/kube-agents-evals-46-infra" ;;
+    kube-agents-evals-47) echo "gke-agentic/kube-agents-evals-47-infra" ;;
+    kube-agents-evals-48) echo "gke-agentic/kube-agents-evals-48-infra" ;;
+    kube-agents-evals-49) echo "gke-agentic/kube-agents-evals-49-infra" ;;
+    kube-agents-evals-50) echo "gke-agentic/kube-agents-evals-50-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -1330,6 +1381,16 @@ gitlab_project_for_project() {
     kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
     kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
     kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
+    kube-agents-evals-41) echo "gke-agentic/kube-agents-evals-41-infra" ;;
+    kube-agents-evals-42) echo "gke-agentic/kube-agents-evals-42-infra" ;;
+    kube-agents-evals-43) echo "gke-agentic/kube-agents-evals-43-infra" ;;
+    kube-agents-evals-44) echo "gke-agentic/kube-agents-evals-44-infra" ;;
+    kube-agents-evals-45) echo "gke-agentic/kube-agents-evals-45-infra" ;;
+    kube-agents-evals-46) echo "gke-agentic/kube-agents-evals-46-infra" ;;
+    kube-agents-evals-47) echo "gke-agentic/kube-agents-evals-47-infra" ;;
+    kube-agents-evals-48) echo "gke-agentic/kube-agents-evals-48-infra" ;;
+    kube-agents-evals-49) echo "gke-agentic/kube-agents-evals-49-infra" ;;
+    kube-agents-evals-50) echo "gke-agentic/kube-agents-evals-50-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -1950,6 +2011,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
   PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
+  PERSONA_TSE_URI="${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1987,15 +2049,22 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
     # The profiles' images. Unset, the chart takes each from ghcr at the agent
     # image's tag, which on this lane is a CI tag ghcr never has, and the
-    # profile's worker never pulls. The cluster profile runs this build's
-    # persona and worker.
+    # profile's worker never pulls. The cluster and tse profiles run this
+    # build's personas and worker.
     --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
     --set-string "profiles.cluster.persona.image.tag=${TAG}"
     --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
     --set-string "profiles.cluster.harness.image.tag=${TAG}"
+    --set-string "profiles.tse.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}"
+    --set-string "profiles.tse.persona.image.tag=${TAG}"
+    --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.tse.harness.image.tag=${TAG}"
     # The A2A door, for the card-wait stopped ask (above).
     --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
     --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
+    # The bus's debug logging, for #5708 (above).
+    --set-string "operator.extraEnv[12].name=${A2A_NATS_DEBUG_ENV_VAR}"
+    --set-string "operator.extraEnv[12].value=${A2A_NATS_DEBUG_ON}"
   )
 fi
 
@@ -2007,7 +2076,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster persona and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -2043,8 +2112,8 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI}"
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
   # --async, `gcloud builds submit` tails the build log from storage and
@@ -2445,6 +2514,56 @@ if ! kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" 
   exit 1
 fi
 
+# The gateway's second roll on a fresh install (#5962). The operator adds the
+# bridge sidecar to the agent pod only once it has recorded the bus
+# provisioned (a2aBridgeInPod), a reconcile or two after the provisioning
+# Job, so the rollout above can pass on the first ReplicaSet and the gateway
+# then restarts under whatever check runs next (the web console's, below).
+# Wait for the template to carry the bridge, then for that rollout, as step
+# 6b does for the mode upgrade. Not a gate: an operator that renders no
+# bridge (one before the A2A stack always rendered) never adds it, and that
+# is not this deploy's failure, so the wait is skipped (no callout
+# Deployment) or ends, and the deploy carries on.
+# Once the operator renders the bridge from the first pass, the template
+# already carries it and this costs one read.
+BRIDGE_ROLL_START=$SECONDS
+bridge_in_template=false
+bridge_polls="${MODE_NEXT_GENERATION_ATTEMPTS}"
+# No callout Deployment means this operator rendered no A2A stack, and so no
+# bridge: skip the wait rather than spend its whole budget. Only a NotFound
+# says that; a read that fails any other way waits, since skipping on a
+# transient API error would bring back the restart this wait is for. (The
+# operator holds the gateway until the callout serves, so by the rollout
+# above an operator that renders the stack has created the callout.)
+callout_read="$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout" -n "${NAMESPACE}" -o name 2>&1)" || {
+  case "${callout_read}" in
+    *NotFound*) bridge_polls=0 ;;
+  esac
+}
+for ((poll = 0; poll < bridge_polls; poll++)); do
+  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true) " in
+    *" ${BRIDGE_SIDECAR_NAME} "*)
+      bridge_in_template=true
+      break
+      ;;
+  esac
+  sleep "${MODE_NEXT_POLL_SECONDS}"
+done
+if [ "${bridge_in_template}" = true ]; then
+  if ! kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout="${MODE_NEXT_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: ${AGENT_DEPLOYMENT_NAME} rollout with the ${BRIDGE_SIDECAR_NAME} sidecar failed"
+    kubectl describe "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" || true
+    kubectl get pods -n "${NAMESPACE}" || true
+    kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
+    exit 1
+  fi
+  echo "✓ ${AGENT_DEPLOYMENT_NAME} rolled out with the ${BRIDGE_SIDECAR_NAME} sidecar ($((SECONDS - BRIDGE_ROLL_START))s after the first rollout)"
+elif [ "${bridge_polls}" -eq 0 ]; then
+  echo "no ${PLATFORM_AGENT_CR_NAME}-a2a-callout Deployment, so this operator renders no A2A stack and no ${BRIDGE_SIDECAR_NAME} sidecar: there is no second roll to wait for"
+else
+  echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} sidecar after $((SECONDS - BRIDGE_ROLL_START))s (bus not provisioned yet?); carrying on without the second-roll wait"
+fi
+
 # The shell sandbox is the other half of the agent: everything the model runs
 # executes there over ssh, so a gateway that is Ready against a StatefulSet
 # stuck on ImagePullBackOff is an install this job must fail rather than pass.
@@ -2581,6 +2700,8 @@ gate_web_console() {
   WEB_CONSOLE_BODY_FILE="$(mktemp)"
   WEB_CONSOLE_DETAIL="no attempt ran"
   rc=1
+  local gateway_uids replacement_seen="false"
+  gateway_uids="$(gateway_pod_uids)"
   : >"${WEB_CONSOLE_PF_LOG}"
   for ((attempt = 1; attempt <= WEB_CONSOLE_GATE_ATTEMPTS; attempt++)); do
     # Kill any previous tunnel and start a fresh one; the log is appended so
@@ -2596,6 +2717,12 @@ gate_web_console() {
     rc=0
     web_console_probe "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" || rc=$?
     [ "${rc}" -eq 0 ] && break
+    if [ "${replacement_seen}" = "false" ] && await_gateway_replacement "${gateway_uids}" "the web console gate (${label})"; then
+      replacement_seen="true"
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; the replacement is up, retrying without spending the attempt"
+      attempt=$((attempt - 1))
+      continue
+    fi
     if [ "${rc}" -ne "${WEB_CONSOLE_PROBE_RETRY}" ]; then
       echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; a fresh tunnel would not change that"
       break
@@ -2687,7 +2814,11 @@ gate_web_console today
 # created, so the refusal #2077 guarded against cannot arise. The bridge
 # enters the agent pod only once the bus is provisioned (BusProvisioned), so
 # the agent Deployment rolls twice: once for the mode upgrade and once, after
-# the Job, for the bridge. The step gates both rolls. Then the step ends on the bridge's own word that it is
+# the Job, for the bridge. The step gates both rolls. On an operator that
+# renders the A2A stack from its first pass whatever the mode, both rolls
+# already happened before step 6's web console check, which waits for the
+# second (#5962), so here the bridge is in the template on the first read and
+# both gates pass at once. Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
 # bridge leaves with the mode, so a flip back to today needs no CR edit for
@@ -3268,6 +3399,8 @@ readonly AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/doc
 readonly PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
 readonly CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
 CONNECTIVITY_OK="false"
+CONNECTIVITY_GATEWAY_UIDS="$(gateway_pod_uids)"
+CONNECTIVITY_REPLACEMENT_SEEN="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
   # Kill any previous tunnel and start a fresh one; the log is appended so a
@@ -3301,6 +3434,12 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
     FAIL_REASON="empty response after port-forward drop"
   else
     FAIL_REASON="unexpected response: ${HEALTH_RESP}"
+  fi
+  if [ "${CONNECTIVITY_REPLACEMENT_SEEN}" = "false" ] && await_gateway_replacement "${CONNECTIVITY_GATEWAY_UIDS}" "the API connectivity check"; then
+    CONNECTIVITY_REPLACEMENT_SEEN="true"
+    echo "connectivity attempt ${attempt}/${CONNECTIVITY_ATTEMPTS} failed: ${FAIL_REASON}; the replacement is up, retrying without spending the attempt"
+    attempt=$((attempt - 1))
+    continue
   fi
   if [ "${attempt}" -lt "${CONNECTIVITY_ATTEMPTS}" ]; then
     echo "connectivity attempt ${attempt}/${CONNECTIVITY_ATTEMPTS} failed: ${FAIL_REASON}; respawning tunnel"

@@ -24,6 +24,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "a2a-gateway",
     "a2a-worker",
     "persona-cluster",
+    "persona-tse",
     "a2a-authcallout",
     "a2a-verifier",
     "a2a-dispatcher",
@@ -481,6 +482,35 @@ exit 0
     return git_path, log_path
 
 
+def create_mock_go_binary(bin_dir, log_file=None, fail_build=False):
+    """Creates a mock go CLI whose `build -o <path>` writes a placeholder binary.
+
+    Each call logs its GOOS/GOARCH/CGO_ENABLED and arguments, so a test can read
+    which platforms were built and with which flags.
+    """
+    bin_path = pathlib.Path(bin_dir)
+    bin_path.mkdir(parents=True, exist_ok=True)
+    go_path = bin_path / "go"
+    log_path = log_file if log_file else (bin_path / "go.log")
+    build_exit = "exit 1" if fail_build else ""
+    content = f"""#!/bin/sh
+echo "GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED GOFLAGS=$GOFLAGS GOTOOLCHAIN=$GOTOOLCHAIN go $@" >> "{log_path}"
+if [ "$1" = "build" ]; then
+  {build_exit}
+  out=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then out="$2"; fi
+    shift
+  done
+  [ -n "$out" ] && printf 'binary %s/%s\\n' "$GOOS" "$GOARCH" > "$out"
+fi
+exit 0
+"""
+    go_path.write_text(content)
+    go_path.chmod(0o755)
+    return go_path
+
+
 def create_mock_syft_binary(bin_dir, log_file=None, fail_on_images=None):
     """Creates a mock syft CLI that writes mock SPDX or CycloneDX JSON."""
     bin_path = pathlib.Path(bin_dir)
@@ -573,23 +603,21 @@ def populate_mock_release_files(repo_dir):
 
 
 
-# ─── spec.mode on the release path (scripts/release/platform_agent_mode.sh) ──
-MOCK_MODE_CONTEXT = f"gke_{MOCK_GCP_PROJECT_ID}_{MOCK_GCP_REGION}_{MOCK_GKE_CLUSTER_NAME}"
+# ─── The A2A readiness gate on the release path (scripts/release/a2a_readiness.sh) ──
+MOCK_GKE_CONTEXT = f"gke_{MOCK_GCP_PROJECT_ID}_{MOCK_GCP_REGION}_{MOCK_GKE_CLUSTER_NAME}"
 MOCK_CR_READY_AT_GENERATION_2 = "2 True 2"
 MOCK_CR_STALE_READY = "2 True 1"
 MOCK_CR_NOT_READY = "2 False 2"
 
 
-def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GENERATION_2,),
-                            containers="", rollout_exit=0, condition_status="True",
-                            installed_mode=""):
-    """A `kubectl` on PATH that records every call and answers the mode gate's reads.
+def write_a2a_readiness_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GENERATION_2,),
+                                     containers="", rollout_exit=0, condition_status="True"):
+    """A `kubectl` on PATH that records every call and answers the A2A readiness gate's reads.
 
     `ready_reads` is what successive reads of the CR's generation and Ready
     condition return, the last one repeating; `condition_status` what a read
     of any other condition's status returns; `containers` the pod template's
-    container names. `installed_mode` is
-    the CR's spec.mode, empty for a CR that carries none. Every other call succeeds silently, `rollout status` with
+    container names. Every other call succeeds silently, `rollout status` with
     `rollout_exit`. Each call is one line of `calls_log`, prefixed `kubectl `.
     """
     bin_dir = pathlib.Path(bin_dir)
@@ -602,8 +630,7 @@ def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GE
     stub.write_text(f"""#!/usr/bin/env bash
 echo "kubectl $*" >> "{calls_log}"
 case "$*" in
-  *"config current-context"*) echo "{MOCK_MODE_CONTEXT}"; exit 0 ;;
-  *"{{.spec.mode}}"*) printf '%s' "{installed_mode}"; exit 0 ;;
+  *"config current-context"*) echo "{MOCK_GKE_CONTEXT}"; exit 0 ;;
   *".metadata.generation"*)
     n="$(cat "{counter}")"
     echo $((n + 1)) > "{counter}"

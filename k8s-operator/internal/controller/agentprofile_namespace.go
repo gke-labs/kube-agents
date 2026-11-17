@@ -88,6 +88,12 @@ func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Namespace + profileNamespaceSuffix
 }
 
+// ProfileNamespaceName is profileNamespaceName for the webhook, which names
+// the namespace in its warning on an agent outside the operator's namespace.
+func ProfileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
+	return profileNamespaceName(agent)
+}
+
 // profileNamespaceOf is the profile namespace for a profile: the one beside
 // its own namespace, which is its agent's. It needs no agent, so a profile
 // deleted after its agent still finds its ServiceAccounts.
@@ -357,8 +363,8 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		if err == nil {
 			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
 				"namespace", profileNamespaceName(agent))
-			// Nothing is written there while it is absent (a flip to today
-			// removes it with its RoleBinding), so its denials must not stand
+			// Nothing is written there while it is absent (its RoleBinding is
+			// absent with it), so its denials must not stand
 			// against this agent; Observe adds it back the pass it returns.
 			r.RBAC.Forget(profileNamespaceName(agent))
 		}

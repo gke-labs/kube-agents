@@ -250,7 +250,7 @@
               "type": "string"
             },
             "serviceAccountAnnotations": {
-              "type": "object"
+              "type": ["object", "null"]
             },
             "projectId": {
               "type": "string"
@@ -385,7 +385,7 @@
           "type": "boolean"
         },
         "podMonitoring": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "redaction": {
           "type": "object",
@@ -786,7 +786,7 @@
           "type": "boolean"
         },
         "podMonitoring": {
-          "type": "boolean"
+          "type": ["boolean", "null"]
         },
         "podDisruptionBudget": {
           "type": "object",
@@ -994,7 +994,7 @@
           "type": "string"
         },
         "mode": {
-          "description": "Deprecated and ignored: every install runs the A2A stack, and the operator ignores a value set here (the chart still renders it; the webhook rewrites today to next). Accepted so a values file that still sets it renders.",
+          "description": "Deprecated and ignored: every install runs the A2A stack, and the chart renders no spec.mode on the PlatformAgent. Accepted so a values file that still sets it renders.",
           "enum": [null, "", "today", "next"]
         },
         "telemetry": {
@@ -1163,6 +1163,11 @@
             },
             "projectId": {
               "type": "string"
+            },
+            "universeDomain": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)?$"
             },
             "hermes": {
               "type": "object",
@@ -1370,6 +1375,40 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 10000
+                },
+                "sessionResources": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "requests": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cpu": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        },
+                        "memory": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        }
+                      }
+                    },
+                    "limits": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cpu": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        },
+                        "memory": {
+                          "type": ["string", "number", "null"],
+                          "pattern": "^[+-]?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+                        }
+                      }
+                    }
+                  }
                 },
                 "busReplicas": {
                   "type": "integer",
@@ -1703,7 +1742,7 @@
               "type": "string"
             },
             "serviceAccountAnnotations": {
-              "type": "object"
+              "type": ["object", "null"]
             },
             "scopedServiceAccountPool": {
               "type": "object",

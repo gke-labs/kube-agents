@@ -110,7 +110,10 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
 //	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
 //	     refuses both
-const a2aIdentityMapSchema = "6"
+//	7 -> adds notAfter (the bus migration's per-run principals)
+//	8 -> adds denyPublish and denySubscribe to grants (the gateway's token
+//	     entry, #5301); a callout from before it refuses them
+const a2aIdentityMapSchema = "8"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -718,6 +721,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 					},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// Two replicas on two nodes, so that the drain the budget
 					// rate-limits is a drain of one of them. Advisory
@@ -866,6 +870,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 		},
 	}
 	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
+	busMigrationFreezeCallout(agent, dep)
 	return dep
 }
 

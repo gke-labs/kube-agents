@@ -69,7 +69,7 @@ var errHeldBack = errors.New("held back at admission")
 // listed its pods yet says nothing, so a dispatcher just started refuses
 // nothing on it.
 func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
-	if !d.cfg.unattendedFor(prof, tier) || (d.jobs != nil && len(prof.JobTemplate) > 0) {
+	if !d.cfg.unattendedFor(prof, tier) || (d.jobs != nil && prof.HasJobTemplate()) {
 		return false
 	}
 	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
@@ -189,7 +189,7 @@ func credentialTrigger(t *capability.Trigger) *taskcred.Trigger {
 	if t == nil {
 		return nil
 	}
-	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream}
+	return &taskcred.Trigger{Name: t.Name, Origin: t.Origin, Stream: t.Stream, Script: t.Script}
 }
 
 // permit is a verifier permit admission reuses: when it was given, and the

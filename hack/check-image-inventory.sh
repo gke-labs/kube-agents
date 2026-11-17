@@ -26,6 +26,14 @@ readonly GOTOOLCHAIN_PIN='ENV GOTOOLCHAIN=local'
 readonly PLUGIN_DIR=agentplugins
 MIRROR=registry.example.invalid/mirror
 
+# The Terraform variable that picks the cert-manager chart version the
+# full-install composition installs, and the two files that set it (check 6).
+readonly CERT_MANAGER_VARIABLE=cert_manager_version
+readonly CERT_MANAGER_VARIABLES_TF=terraform/examples/full-install/variables.tf
+readonly CERT_MANAGER_TFVARS_EXAMPLE=terraform/examples/full-install/terraform.tfvars.example
+# The inventory names every cert-manager image with this prefix.
+readonly CERT_MANAGER_NAME_PREFIX=cert-manager-
+
 # githubMinter.org and githubMinter.repo are required when the minter is
 # enabled. Nothing the render produces depends on their values.
 readonly MINTER_ORG=ci-org
@@ -256,6 +264,7 @@ check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile fil
 # A persona image has the same two-line shape, with the persona directory as
 # its build context and the payload under /files, where profilepod mounts it.
 check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/
+check_literal_from busybox a2a/Dockerfile.persona-tse . /files/
 
 # The calls above name their files, so a third plugin copied from the pair
 # (agentplugins/README.md, "Adding a plugin"), or a second persona image copied
@@ -504,13 +513,13 @@ image_refs() {
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
 # digest (tag@sha256:...), because that is the form images.json pins a tag and
 # a digest together with and what the chart's default render must match byte for
-# byte. Two env vars reach that branch: A2A_NATS_RELOADER_IMAGE and
-# A2A_NATS_EXPORTER_IMAGE, which the default render carries with their digests
-# (the mirrored render drops them, since `make mirror-images` pushes by tag).
-# images.json pins four more entries as tag@digest — hindsight-api,
+# byte. Three env vars reach that branch: A2A_NATS_IMAGE, A2A_NATS_RELOADER_IMAGE
+# and A2A_NATS_EXPORTER_IMAGE, which the default render carries with their
+# digests (the mirrored render drops them, since `make mirror-images` pushes by
+# tag). images.json pins four more entries as tag@digest — hindsight-api,
 # hindsight-postgresql, busybox and, through tags.env, the Hermes base. busybox
-# and the Hermes base are build-time, and the Hindsight pair sits behind
-# hindsight.enabled, which no render below turns on.
+# and the Hermes base are build-time; the Hindsight pair reaches that branch
+# through the hindsight toggle's default render, digests included.
 split_ref() {
   local ref=${1%%@*} digest=""
   case "$1" in
@@ -617,8 +626,7 @@ added_images() {
 # every check with everything still green, which is the original failure
 # wearing a new coat.
 #
-# Adding the next toggle is one call. Hindsight, behind hindsight.enabled, is
-# the one still uncovered.
+# Adding the next toggle is one call.
 check_toggle() {
   local name=$1
   shift
@@ -678,6 +686,13 @@ check_toggle webConsole --set webConsole.enabled=true
 # The cluster agent's AgentProfile (#3658) adds its persona image; its
 # harness, a2a-worker, is already in the default render.
 check_toggle profiles.cluster --set profiles.cluster.enabled=true
+# The GKE Support Agent's AgentProfile (#3842) adds its persona image the
+# same way.
+check_toggle profiles.tse --set profiles.tse.enabled=true
+# The Hindsight memory store adds its API and Postgres images. hindsight.enabled
+# is a tri-state that follows the memory provider when null; true turns the
+# store on whatever the provider says.
+check_toggle hindsight --set hindsight.enabled=true
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by
@@ -737,7 +752,47 @@ while IFS=$'\t' read -r file line image; do
   esac
 done <<<"$integration_refs"
 
+# ---------------------------------------------------------------------------
+# 6. cert-manager. The full-install composition installs the cert-manager
+#    chart at var.cert_manager_version, and the jetstack chart's version is the
+#    tag of every image it pulls. The inventory pins those images by tag for
+#    `make mirror-images`, so the variable's default and every cert-manager
+#    entry must name one version, or a mirrored install asks for tags the
+#    mirror never copied. The tfvars example repeats the default in a comment
+#    that people uncomment, so it is held to the same version.
+# ---------------------------------------------------------------------------
+check_cert_manager_version() {
+  local tf_default example name tag
+  tf_default="$(awk -v var="$CERT_MANAGER_VARIABLE" '
+    $0 ~ "^variable \"" var "\"" { in_block = 1; next }
+    in_block && /^}/ { exit }
+    in_block && match($0, /^[[:space:]]*default[[:space:]]*=[[:space:]]*"[^"]*"/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^[^"]*"/, "", value)
+      sub(/"$/, "", value)
+      print value
+      exit
+    }' "$CERT_MANAGER_VARIABLES_TF")"
+  example="$(sed -E -n "s/^#[[:space:]]*${CERT_MANAGER_VARIABLE}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*\$/\1/p" "$CERT_MANAGER_TFVARS_EXAMPLE" | head -n1)"
+  [ -n "$tf_default" ] || {
+    fail "$CERT_MANAGER_VARIABLES_TF: variable \"$CERT_MANAGER_VARIABLE\" has no quoted default that check 6 can read, so nothing ties the cert-manager chart version to $INVENTORY."
+    return
+  }
+  [ "$example" = "$tf_default" ] ||
+    fail "$CERT_MANAGER_TFVARS_EXAMPLE: the commented $CERT_MANAGER_VARIABLE example is '${example:-<unset>}', but $CERT_MANAGER_VARIABLES_TF defaults it to '$tf_default'."
+  local found=0
+  while IFS=$'\t' read -r name tag; do
+    [ -n "$name" ] || continue
+    found=1
+    [ "$tag" = "$tf_default" ] ||
+      fail "$CERT_MANAGER_VARIABLES_TF: $CERT_MANAGER_VARIABLE defaults to '$tf_default', but $INVENTORY pins '$name' at '$tag'. The cert-manager chart pulls its images at its own version, so a mirror populated from $INVENTORY would lack the tags the install asks for. Move them together."
+  done < <(jq -r --arg p "$CERT_MANAGER_NAME_PREFIX" '.images[] | select(.name | startswith($p)) | "\(.name)\t\(.tag)"' "$INVENTORY")
+  [ "$found" -eq 1 ] ||
+    fail "$INVENTORY has no entry named $CERT_MANAGER_NAME_PREFIX*, so check 6 compares $CERT_MANAGER_VARIABLE to nothing."
+}
+check_cert_manager_version
+
 if [ "$status" -eq 0 ]; then
-  echo "Image inventory check passed: $INVENTORY matches every pin, the Go builder pin matches $GO_MOD, and the chart mirrors cleanly."
+  echo "Image inventory check passed: $INVENTORY matches every pin, the Go builder pin matches $GO_MOD, the chart mirrors cleanly, and $CERT_MANAGER_VARIABLE matches the cert-manager pins."
 fi
 exit "$status"

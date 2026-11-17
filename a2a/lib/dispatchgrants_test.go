@@ -102,6 +102,22 @@ func TestTheBucketCredentialRoundTripsAndRefusesEverythingElse(t *testing.T) {
 	}
 }
 
+// A refused password is whatever the client sent, and the callout logs the
+// refusal's reason, so the reason names the part that was wrong and never the
+// password: not the whole, and not either side of its first slash.
+func TestARefusedBucketPasswordIsNotInTheReason(t *testing.T) {
+	const marker = "s3cr3t-credential"
+	for _, bad := range []string{marker, marker + "/32", "7/" + marker, marker + "/" + marker, "7/32/" + marker} {
+		_, err := ParseDispatcherBucketCredential(bad)
+		if err == nil {
+			t.Fatalf("ParseDispatcherBucketCredential(%q) accepted it", bad)
+		}
+		if strings.Contains(err.Error(), marker) {
+			t.Errorf("ParseDispatcherBucketCredential(%q) names the password in its reason: %v", bad, err)
+		}
+	}
+}
+
 // The profiles of one bucket are the ones that hash there, and every profile
 // lands in exactly one bucket.
 func TestProfilesInBucketPartitionsTheProfiles(t *testing.T) {

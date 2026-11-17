@@ -20,7 +20,7 @@ Load and sizing measurements of the harness at fleet scale, as opposed to answer
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
-- `kube_agents_bench/oobe.py` — the `oobe_audits_started` verifier, in its own module and published the same way: reads the Platform Agent's cron runs on the agent pod for the `oobe` job's first-run audits.
+- `kube_agents_bench/oobe.py` — the `oobe_audits_started` and `oobe_audits_ended` verifiers, in their own module and published the same way: they read the Platform Agent's cron runs on the agent pod for the `oobe` job's first-run audits.
 - `kube_agents_bench/discovery.py` — reads the onboarding discovery sweep off the agent pod for the `bootstrap_fanout` verifier: the sweep's board rows and the Cluster Agent profiles beside them, in one `kubectl exec`.
 - `kube_agents_bench/onboarding.py` — reads the onboarding prioritization stage's `INVENTORY.items.json` off the shell sandbox pod for the `bootstrap_findings` verifier, the raw file's findings block and the hand-off's board state for `bootstrap_handoff`, for `bootstrap_report_read` the archived report there and the delivery job's marker on the agent pod, for `bootstrap_report_criticals` the report and the worker's scores there, for `bootstrap_report_posture` the report there, and for `bootstrap_delivered` the delivery job's run record on the agent pod, through its own exec into each pod.
 - `kube_agents_bench/findings.py` — reads the install's findings queue for the `findings_item_state` verifier: one `kubectl exec` into the agent container that calls the Session KV server's `GET /v1/findings` on the pod's loopback.
@@ -73,7 +73,7 @@ The relay resolves the pod against whichever kubectl context is current, where t
 
 The operator runs the gateway as one replica whatever `spec.deployment.availability.replicas` says, so the relay's first Ready pod is the gateway. If multi-replica gateways return, pass `--pod` too: a pod that does not hold the leader lease never starts the gateway, and its probe counts a refused connection as healthy while leader election is on, so the relay can settle on one with nothing listening.
 
-To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `install.env` before a full `upgrade.sh`, which re-renders the runtime class from it — read [`scripts/installer/README.md`](../scripts/installer/README.md) on what else that apply rewrites before you run it on an install you care about. CI reaches the same place by overriding the chart value directly, which a throwaway cluster can afford: `hack/ci-deploy.sh` pins `runtimeClassName` empty before `hack/ci-eval-pr.sh` runs, and says why.
+To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `install.env` before a full `upgrade.sh`, which re-renders the runtime class from it; on a Standard install that runs the gVisor pool, that upgrade also needs `--allow-node-pool-destroy` — read [`scripts/installer/README.md`](../scripts/installer/README.md) on what else that apply rewrites before you run it on an install you care about. CI reaches the same place by overriding the chart value directly, which a throwaway cluster can afford: `hack/ci-deploy.sh` pins `runtimeClassName` empty before `hack/ci-eval-pr.sh` runs, and says why.
 
 The fold window is the other value `hack/ci-deploy.sh` pins for the eval install. `INCIDENT_WORKLOAD_DEDUP_SECONDS` defaults to an hour, and on a dev install that keeps the default, a case that re-plants one workload and waits for that repetition's own card (`autoops-warning-event-triage`, `autoops-crashloop-config-triage`, `autoops-warning-event-no-action-triage`) folds its second and third repetition into the first's incident, so no card comes and the plant times out. Before running one of those three times back to back, set the window to 150 s as CI does, with the chart key `platformAgent.deployment.incidentWorkloadDedupSeconds: 150` (an `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry in `platformAgent.deployment.env` wins over it); `hack/ci-deploy.sh` says how the number was chosen.
 
@@ -231,15 +231,15 @@ validator check lands with the first stack that needs it:
    (an appended gentler entry fails it), taken from the dry run of rule 5; never a replica count
    on an autoscaled Deployment.
 8. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
-   labels: every Kubernetes object, a node pool's GCE resource labels (`--labels` at create, not
-   only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
+   labels: every Kubernetes object, a GKE cluster's or node pool's GCE resource labels (`--labels`
+   at create, not only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
    labels (a network, a subnetwork, a backend service, a health check, a service attachment)
    carries the description prefix `kube-agents-bench plant`. The sweeps key on these marks and
    on nothing else: `hack/ci-teardown.sh` runs `hack/ci_sweep_bench_plants.sh` at every lease
    start and end against the host cluster's webhook configurations, node readiness rules,
-   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes addresses, subnets,
-   networks and alert policies today; forwarding rules, service attachments, backend services,
-   health checks and clusters wait on a sibling change to that script and its sweeper role.
+   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes clusters, forwarding
+   rules, service attachments, backend services, health checks, addresses, subnets, networks and
+   alert policies every hour.
    `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
    the sweeps never read it. A plant without its mark survives a killed run until someone
    deletes it by hand.

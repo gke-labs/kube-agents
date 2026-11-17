@@ -50,7 +50,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    readyConditionType,
 		Written: "Always",
-		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ShellSandboxKeysMissing`, and `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when. With the A2A gateway's election on, the gateway counts as ready only while its elected leader is, after a 30-second grace from the leader's election; with no current leader (no holder, its pod gone, or a holder that stopped renewing) it counts its ready replicas.",
+		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`ReservedServiceAccountName`, `RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `UniverseDomainMismatch`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ShellSandboxKeysMissing`, and `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what `UniverseDomainMismatch`, `ShellSandboxKeysMissing`, and `A2AProvisionFailed` mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when. With the A2A gateway's election on, the gateway counts as ready only while its elected leader is, after a 30-second grace from the leader's election; with no current leader (no holder, its pod gone, or a holder that stopped renewing) it counts its ready replicas.",
 	},
 	{
 		Type:    degradedConditionType,
@@ -71,7 +71,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    dispatcherCeilingCondition,
 		Written: "While the profile dispatcher is switched on",
-		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 200 profiles that allow `unattended` under Job mode, about 650 at two tiers otherwise.",
+		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 650 profiles at two tiers; the config fills first only for profiles that declare many parameters.",
 	},
 	{
 		Type:    a2aIdentityMapAppliedConditionType,
@@ -126,7 +126,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    kanbanDispatcherFailingCondition,
 		Written: "From the first time the task-board dispatcher fails for a whole poll, or a tick on a board runs past 300 s or fails on a database lock after a busy timeout",
-		Meaning: "`True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, or once a board's tick runs past 300 s or fails on a database lock after waiting a 120 s busy timeout, as on a locked board; a good tick that runs past 300 s can set it for one poll. The message names the board and either the streak with the last error class, or the stuck tick. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted.",
+		Meaning: "`True` with reason `TicksFailing` once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old. `True` with reason `TickStuck` once a board's tick runs past 300 s or fails on a database lock after waiting the busy timeout (120 s by default), as on a locked board; a stuck board takes precedence over a streak, and a good tick that runs past 300 s can set it for one poll. The message names the board and the streak with the last error class, or the stuck tick, and it is written again when the reason changes. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board, and a quick failure of another kind ends a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt drops out after ten minutes too.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,
@@ -135,13 +135,13 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    homeChannelUnsetConditionType,
-		Written: "While the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted)",
-		Meaning: "`status: True`, `Reason: NoHomeChannel`. Proactive posts are refused while conversation replies still arrive. The gateway keeps them for one digest once a channel is set; with Slack on too they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The message says which. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
+		Written: "While the A2A gateway holds a chat backend whose `homeChannel` is empty (Google Chat, Slack, or both; on Slack: and no learned channel is admitted)",
+		Meaning: "`status: True`, `Reason: NoHomeChannel`. Conversation replies still arrive. When the other platform has a home channel, proactive posts go there meanwhile. When no platform has one, the gateway refuses them and keeps them for one digest once a channel is set. The message names each platform. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the A2A stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
 	},
 	{
-		Type:    a2aBusConversionRefusedConditionType,
-		Written: "While `spec.harness.tuning.busReplicas` asks the existing A2A bus for a server count other than the one it runs",
-		Meaning: "`status: True`, `Reason: ConversionNotSupported`. The bus keeps its count, since changing an existing bus's count is not supported yet. Setting the field to the running count, or removing it, clears the condition. Advisory: Ready stays on the bus that runs.",
+		Type:    a2aBusMigratingConditionType,
+		Written: "While a bus migration runs (True), and after one ended without converting the bus (False, `Abandoned`) or stopped for a person (False, `Failed`); absent once one converted the bus, or when none has run",
+		Meaning: "`status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases.",
 	},
 	{
 		Type:    noChatPlatformConditionType,
@@ -176,7 +176,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    credentialProxyExecReadyConditionType,
 		Written: "Only while `credentialProxy.exec.replicas` is above 0 and the agent's name is accepted for the tier",
-		Meaning: "`status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`) leaves it as it stands, count included, until the park clears.",
+		Meaning: "`status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`, `UniverseDomainMismatch`) leaves it as it stands, count included, until the park clears.",
 	},
 	{
 		Type:    sizingCappedByQuotaConditionType,
@@ -187,5 +187,10 @@ var platformAgentConditionDocs = []conditionDoc{
 		Type:    dataVolumeExpansionConditionType,
 		Written: "Only while a data claim is smaller than `spec.storage.size` (or the 50Gi default, raised by `expectedClusterProfiles` for the agent's claim) and its StorageClass cannot expand it",
 		Meaning: "`status: True`, `Reason: StorageClassCannotExpand`. The message names each blocked claim, its current request, the size asked for, and why the class cannot expand it. Not `Degraded`: the agent runs on the smaller volume. Written on whichever status the pass ends on, `Ready` or `Degraded`, and removed once the claims can grow or the size no longer asks for more. After an operator restart it is left as it stands until the next pass reads the claims. Set `allowVolumeExpansion: true` on the class to clear it. The agent's claim, when it is below that size and will not grow (its class cannot expand it, or this PlatformAgent does not control it), also gets one `DataVolumeUndersized` Warning Event per state.",
+	},
+	{
+		Type:    externalModelEgressConditionType,
+		Written: "Only while the resolved Google Cloud universe domain is not `googleapis.com` and `status.inference.provider` is an external SaaS provider (any provider other than `openai_compatible`, `vertex_ai`, `hosted_vllm`, `vllm`, `ollama`, or `custom`)",
+		Meaning: "`status: True`, `Reason: ExternalSaaSProviderInCustomUniverse`. Prompts, cluster telemetry excerpts, and tool results leave the sovereign or partner universe boundary to reach the external model provider. Not `Degraded`: `Ready` is unaffected, since an operator may authorize external model egress deliberately. Switch LiteLLM to an in-universe endpoint (`openai_compatible` or `vertex_ai` with `platformAgent.harness.universeDomain` set on the chart) to clear it.",
 	},
 }

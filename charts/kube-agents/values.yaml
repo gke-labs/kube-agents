@@ -655,11 +655,11 @@ litellm:
   # Moving a live release from operator-managed back to the static copy needs
   # a handoff first (chart README, "Handing litellm-policy back to Helm"):
   # Helm refuses to adopt an object the operator has labelled as its own.
-  # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
-  # helm template/lint cannot catch its absence: a non-GKE install fails at
-  # apply time.
   networkPolicy: true
-  podMonitoring: true
+  # Tri-state, matching platformAgent.podMonitoring: null (default) renders
+  # litellm-monitoring when the cluster serves monitoring.googleapis.com/v1/PodMonitoring
+  # and nothing elsewhere; true forces it on (fails apply without the CRD); false disables.
+  podMonitoring: null
   # Redaction of every request body the gateway forwards to a provider. Off by
   # default: on, the ConfigMap also carries the shared redactor module and the
   # redaction pre-call hook, mounted beside /app/config.yaml, and the hook runs
@@ -904,8 +904,8 @@ hindsight:
   # gateway egress rule selects app: litellm / app: standalone-replay pods in
   # the release namespace).
   networkPolicy: true
-  # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
-  podMonitoring: true
+  # Tri-state, matching litellm.podMonitoring and platformAgent.podMonitoring.
+  podMonitoring: null
   podDisruptionBudget:
     # Renders maxUnavailable: 1 for both store workloads. Deliberately not
     # configurable, same rationale as operator.podDisruptionBudget.
@@ -1008,7 +1008,7 @@ a2aBus:
   images:
     nats:
       repository: docker.io/library/nats
-      tag: "2.10-alpine"
+      tag: "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
     natsBox:
       repository: docker.io/natsio/nats-box
       tag: "0.14.5"
@@ -1035,12 +1035,6 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
-  # Deprecated and ignored. platformAgent.mode once chose between the A2A
-  # stack and the previous one; the operator now runs every install on the
-  # A2A stack and the CRD defaults spec.mode to next. A value set here still
-  # renders spec.mode on the CR, which the webhook rewrites to next. The key
-  # goes in a later release.
-  mode: null
   telemetry:
     # The A2A gateway keeps one hashed key and a last-active time per chat
     # person for 30 days, and serves the people seen in the last 7 and 30 days
@@ -1110,8 +1104,8 @@ platformAgent:
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a
   # cluster without the CRD upgrades without setting anything. true renders
-  # them regardless and fails at apply time where the CRD is absent, the caveat
-  # litellm.podMonitoring carries; false never renders them. helm template
+  # them regardless and fails at apply time where the CRD is absent; false
+  # never renders them. helm template
   # alone has no cluster to ask: pass
   # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
   # default render.
@@ -1188,6 +1182,13 @@ platformAgent:
     clusterName: ""
     location: ""
     projectId: ""
+    # Optional Google Cloud API universe domain (for example, a Google Cloud
+    # Dedicated sovereign domain). Leave empty to auto-detect from the GKE
+    # metadata server on operator-rendered workloads; set explicitly when
+    # chart-rendered litellm (vertex_ai) or githubMinter run in a custom
+    # universe so Helm templates render GOOGLE_CLOUD_UNIVERSE_DOMAIN and the
+    # cluster's OIDC issuer host at install time.
+    universeDomain: ""
     # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
     # own default applies — dashboardEnabled therefore lands `true` unless an
     # install pins it, so set it explicitly when it must not float with the
@@ -1345,12 +1346,27 @@ platformAgent:
       # maxSessions caps the A2A session pods the install runs at once; the
       # operator's default applies when it is unset.
       # maxSessions: 10
+      # sessionResources are the session pods' CPU and memory requests and
+      # limits; only cpu and memory are read. Each key you set to a positive
+      # value replaces its default (requests 150m / 320Mi, limits 2 / 2Gi) and
+      # the rest keep theirs. A request set alone above its default limit
+      # raises the limit to match; otherwise a request above its limit is
+      # lowered to it. A change rolls the gateway, and running session pods
+      # keep their shape until they respawn. The session cap multiplies the
+      # requests. On
+      # Autopilot without Pod bursting, its per-pod minimums (250m / 512Mi)
+      # apply whatever is set lower.
+      # sessionResources:
+      #   requests:
+      #     cpu: 150m
+      #     memory: 384Mi
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
       # cluster that cannot have them (kind, a one-node Standard pool), before the
-      # first install: an existing bus keeps its count, and a different value is
-      # refused rather than converting it.
+      # first install. Changing it on an existing bus migrates the bus between one
+      # server and three, keeping its data; one to three freezes writes for its
+      # window.
       # busReplicas: 3
       # admission is the memory admission the kanban dispatcher applies to its
       # own workers, board-wide: past the budget it refuses a card rather than
@@ -1981,11 +1997,10 @@ platformAgent:
       # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
       # false hides the buttons and keeps nothing.
       answerFeedback: true
-      # "auto" (also empty) or "manual". With Slack on the gateway (Google
-      # Chat not enabled) and homeChannel empty, "auto" lets the
-      # A2A gateway make the channel of the first top-level mention of the
-      # agent the home channel; "manual" leaves homeChannel alone to decide. A
-      # set homeChannel wins under either.
+      # "auto" (also empty) or "manual". With homeChannel empty, "auto" lets
+      # the A2A gateway make the channel of the first top-level mention of
+      # the agent the home channel; "manual" leaves homeChannel alone to
+      # decide. A set homeChannel wins under either.
       homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
@@ -2150,14 +2165,13 @@ profiles:
       skills, returning either a grounded Root Cause Analysis with a proposed
       GitOps fix or a redacted Google Cloud Support Escalation Bundle.
     persona:
-      # Placeholder image reference required by the AgentProfile CRD schema:
-      # tse has no persona image of its own yet (#3842). On a next install the
-      # profile dispatcher (on by default) gives every bound profile a warm
-      # worker, and tse's crash-loops at its persona step until #3842 ships
-      # one; Kanban to tse still works. Leave tse off there, or switch the
-      # dispatcher off (operator.profileDispatcher.enabled: false).
+      # The GKE Support Agent's persona (agents/tse/persona), which a profile
+      # worker pod mounts at /persona. The Hermes `tse` profile the gateway
+      # scaffolds from `/opt/tse-template` does not use it. Under the
+      # dispatcher a tse task takes a cluster target (project, location and
+      # cluster, all required); project-wide questions wait on #5424.
       image:
-        repository: ghcr.io/gke-labs/kube-agents/platform-agent
+        repository: ghcr.io/gke-labs/kube-agents/persona-tse
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
     harness:
       image:
