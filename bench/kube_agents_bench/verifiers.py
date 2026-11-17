@@ -58,6 +58,7 @@ from __future__ import annotations
 import fnmatch
 import http.client
 import json
+import math
 import os
 import re
 import shlex
@@ -246,6 +247,9 @@ _FORGE_RATE_LIMIT_BUDGET_ENV_VAR = "BENCH_FORGE_RATE_LIMIT_WAIT_SEC"
 _FORGE_RATE_LIMIT_BUDGET_SEC = 600.0
 _FORGE_RATE_LIMIT_SLICE_SEC = 300.0
 _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC = 60.0
+# A reset already past (a clock ahead, the old epoch just after the reset) or a
+# Retry-After of 0 still waits this long while budget is left.
+_FORGE_RATE_LIMIT_FLOOR_SEC = 5.0
 _RETRY_AFTER_HEADER = "Retry-After"
 _RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
 _RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
@@ -4384,10 +4388,16 @@ _forge_rate_limit_waited = 0.0
 
 def _forge_rate_limit_budget() -> float:
     raw = os.environ.get(_FORGE_RATE_LIMIT_BUDGET_ENV_VAR, "")
+    if not raw.strip():
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
     try:
-        return max(0.0, float(raw)) if raw.strip() else _FORGE_RATE_LIMIT_BUDGET_SEC
+        budget = float(raw)
     except ValueError:
         return _FORGE_RATE_LIMIT_BUDGET_SEC
+    if not math.isfinite(budget):
+        # inf would wait for ever, one slice at a time.
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    return max(0.0, budget)
 
 
 def _forge_rate_limit_wait(headers: Any) -> float:
@@ -4404,8 +4414,8 @@ def _forge_rate_limit_wait(headers: Any) -> float:
             wait = float(get(_RATELIMIT_RESET_HEADER)) - time.time() + 1
         except (TypeError, ValueError):
             pass
-    left = _forge_rate_limit_budget() - _forge_rate_limit_waited
-    return max(0.0, min(wait, _FORGE_RATE_LIMIT_SLICE_SEC, left))
+    left = max(0.0, _forge_rate_limit_budget() - _forge_rate_limit_waited)
+    return min(max(wait, _FORGE_RATE_LIMIT_FLOOR_SEC), _FORGE_RATE_LIMIT_SLICE_SEC, left)
 
 
 def is_rate_limit_answer(status: int, payload: Any, headers: Any = None) -> bool:

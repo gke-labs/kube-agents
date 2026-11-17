@@ -1245,3 +1245,17 @@ def test_a_rate_limited_listing_is_named_as_the_limit_not_a_permission():
     with pytest.raises(github_writes.GitHubUnreadable) as exc:
         refused.pulls_updated_since("o/r", datetime(2026, 11, 16, tzinfo=timezone.utc))
     assert "pull_requests: read" in str(exc.value)
+
+
+def test_a_rate_limited_branch_listing_raises_instead_of_reading_as_no_grant():
+    """A branch listing answered with a rate limit used to read as "cannot
+    list refs" (None) and let the check carry on blind; it now raises, named
+    as the limit. A permission 403 still reads as None."""
+    limited = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "API rate limit exceeded for installation ID 1."}), 1.0)
+    with pytest.raises(github_writes.GitHubUnreadable) as exc:
+        limited.branches_under("o/r", "fix")
+    assert "rate-limited" in str(exc.value)
+    with pytest.raises(github_writes.GitHubUnreadable):
+        limited.branch_tip_date("o/r", "fix-1")
+    refused = github_writes.GitHubClient("t", lambda url, tok, timeout: (403, {"message": "Resource not accessible by integration"}), 1.0)
+    assert refused.branches_under("o/r", "fix") is None

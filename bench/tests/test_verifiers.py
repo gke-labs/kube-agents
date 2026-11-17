@@ -7229,6 +7229,17 @@ def test_a_local_token_and_a_permission_403_never_wait(monkeypatch, tmp_path):
     assert slept == []
 
 
+def test_a_past_reset_waits_the_floor_and_an_infinite_budget_is_capped(monkeypatch):
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "inf")
+    assert verifiers._forge_rate_limit_budget() == verifiers._FORGE_RATE_LIMIT_BUDGET_SEC
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "0")
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == 0
+
+
 @pytest.mark.parametrize(
     "status, payload, headers, limited",
     [

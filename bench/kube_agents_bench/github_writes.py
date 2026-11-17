@@ -292,6 +292,12 @@ def _read_handled(status: int) -> None:
     verifiers._forge_read_handled(status)
 
 
+def _is_rate_limit(status: int, payload: Any) -> bool:
+    from kube_agents_bench import verifiers  # lazy: verifiers imports this module
+
+    return verifiers.is_rate_limit_answer(status, payload)
+
+
 class GitHubUnreadable(Exception):
     """The API would not answer for the repository: a fault of ours, never a
     grade. The message names what to fix."""
@@ -502,6 +508,10 @@ class GitHubClient:
         status, payload = self.get(
             f"/repos/{repo}/git/matching-refs/heads/{urllib.parse.quote(prefix, safe='/')}"
         )
+        # A rate limit is not "cannot list refs": it raises, named as the
+        # limit, rather than read as a missing grant (#6105).
+        if status == STATUS_FORBIDDEN and _is_rate_limit(status, payload):
+            self._refuse(status, repo, "the branch listing", "contents: read", payload)
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
             _read_handled(status)
             return None
@@ -524,6 +534,10 @@ class GitHubClient:
         status, payload = self.get(
             f"/repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}"
         )
+        # A rate limit is not "cannot list refs": it raises, named as the
+        # limit, rather than read as a missing grant (#6105).
+        if status == STATUS_FORBIDDEN and _is_rate_limit(status, payload):
+            self._refuse(status, repo, f"the branch {branch}", "contents: read", payload)
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
             _read_handled(status)
             return None
@@ -535,15 +549,12 @@ class GitHubClient:
 
     @staticmethod
     def _refuse(status: int, repo: str, what: str, permission: str, payload: Any = None) -> None:
-        from kube_agents_bench import verifiers  # lazy: verifiers imports this module
-
-        if verifiers.is_rate_limit_answer(status, payload):
+        if _is_rate_limit(status, payload):
             # A limit, not a permission: the grading App's installation is
             # shared by every evals repository, so one hourly budget (#6105).
             raise GitHubUnreadable(
-                f"GitHub rate-limited {what} on {repo} (answered {status}) after the grader waited "
-                "out what it could; the evals repositories share one App installation's hourly "
-                "budget, so this check could not be evaluated"
+                f"GitHub rate-limited {what} on {repo} (answered {status}); the evals repositories "
+                "share one App installation's hourly budget, so this check could not be evaluated"
             )
         if status == STATUS_UNAUTHORIZED:
             raise GitHubUnreadable(

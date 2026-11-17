@@ -111,6 +111,10 @@ RETRYABLE_STATUS_FLOOR = 500
 RATE_LIMIT_BUDGET_SECONDS = 900
 RATE_LIMIT_WAIT_SLICE_SECONDS = 300
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60
+# A reset GitHub names as already past (a clock ahead, or the old epoch just
+# after the reset), or a Retry-After of 0, still waits this long while budget
+# is left, rather than reading as a spent budget.
+RATE_LIMIT_FLOOR_SECONDS = 5
 RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
 # What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
 # http.client's own faults for a response cut short, which urllib passes on.
@@ -175,8 +179,8 @@ def limit_wait(exc: urllib.error.HTTPError) -> float:
             wait = float(headers.get(RATELIMIT_RESET_HEADER)) - now() + 1
         except (TypeError, ValueError):
             pass
-    left = RATE_LIMIT_BUDGET_SECONDS - _rate_limit_waited
-    return max(0.0, min(wait, RATE_LIMIT_WAIT_SLICE_SECONDS, left))
+    left = max(0.0, RATE_LIMIT_BUDGET_SECONDS - _rate_limit_waited)
+    return min(max(wait, RATE_LIMIT_FLOOR_SECONDS), RATE_LIMIT_WAIT_SLICE_SECONDS, left)
 
 
 def transient(exc: BaseException) -> bool:
