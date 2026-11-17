@@ -316,6 +316,19 @@ func (l LeaseRecord) Validate() error {
 // so a tuning or profile change applies without a restart.
 const DispatchConfigKey = "dispatch.json"
 
+// ProfileSupervisorFormProfile is DispatchConfig.ProfileSupervisorForm's one
+// value: a profile task's terminal goes on ProfileSupervisorSubject.
+const ProfileSupervisorFormProfile = "profile"
+
+// SupervisorSubjectFor is where a dispatcher under cfg writes profile's task's
+// terminal: the six-token form once cfg says so, else the five-token one.
+func (c DispatchConfig) SupervisorSubjectFor(profile, taskID string) string {
+	if c.ProfileSupervisorForm == ProfileSupervisorFormProfile {
+		return ProfileSupervisorSubject(profile, taskID)
+	}
+	return TaskSupervisorSubject(profile, taskID)
+}
+
 // DispatchConfig is everything the dispatcher reads about the install's
 // profiles: the shared caps and intervals and each bound profile's own
 // limits. The operator writes it; the dispatcher never reads an AgentProfile.
@@ -374,6 +387,13 @@ type DispatchConfig struct {
 	// tombstone at least this long. Zero is from an operator that predates
 	// the field; the dispatcher then uses ProfileSubmitRetention.
 	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
+	// ProfileSupervisorForm is the subject form the dispatcher writes a
+	// profile task's terminal on (#5301): empty for the five-token
+	// TaskSupervisorSubject, ProfileSupervisorFormProfile for the six-token
+	// ProfileSupervisorSubject. The operator sets it only once every reader
+	// that can run watches both forms. A dispatcher from before the field
+	// ignores it and keeps the five-token form, which readers still watch.
+	ProfileSupervisorForm string `json:"profileSupervisorForm,omitempty"`
 	// JobLabels go on every Job the dispatcher creates: the operator's
 	// agent labels, by which a teardown deletes only this install's Jobs,
 	// and DispatchJobLabel. Set when some profile has a Job template
@@ -586,6 +606,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
 	case c.SubmitRetentionSeconds < 0 || c.SubmitRetentionSeconds > int(MaxSubmitRetention/time.Second):
 		return fmt.Errorf("dispatch config: submitRetentionSeconds %d is outside 0 to %d", c.SubmitRetentionSeconds, int(MaxSubmitRetention/time.Second))
+	case c.ProfileSupervisorForm != "" && c.ProfileSupervisorForm != ProfileSupervisorFormProfile:
+		return fmt.Errorf("dispatch config: profileSupervisorForm %q is not %q or empty", c.ProfileSupervisorForm, ProfileSupervisorFormProfile)
 	}
 	for k, v := range c.JobLabels {
 		if !validLabelKey(k) || !labelValue.MatchString(v) {

@@ -114,5 +114,8 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	// The five- or six-token form, as the operator's config says (#5301):
+	// readers watch both, and the operator moves the dispatcher to the
+	// six-token one only once every reader that can run does.
+	return d.busFor(hk.profile).Publish(ctx, d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID), env)
 }
