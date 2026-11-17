@@ -95,8 +95,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    a2aProfileSupervisorFormCondition,
-		Written: "Once, from the first pass that finds every profile-task reader (the A2A gateway, the agent pod and, with its door on, the MCP server) fully rolled out and the bus provisioning Job that adds the gateway relay's third filter complete; never removed",
-		Meaning: "`status: True`, `Reason: SixTokenSupervisorSubject`. The dispatcher writes a profile task's terminal on the six-token supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`) instead of the five-token one, and the gateway relay filters both (#5301). It is a latch: a later upgrade that rolls a reader again keeps the dispatcher on the six-token form rather than moving it back for the length of the roll. Until it is written, the dispatcher writes the five-token form, which every reader watches.",
+		Written: "`True` once, from the first pass that finds every profile-task reader (the A2A gateway, the agent pod and, with its door on, the MCP server) on this release's image and fully rolled out and the bus provisioning Job that adds the gateway relay's third filter complete; never removed. `False` while a reader runs an image other than the one this release renders",
+		Meaning: "`status: True`, `Reason: SixTokenSupervisorSubject`. The dispatcher writes a profile task's terminal on the six-token supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`) instead of the five-token one, and the gateway relay filters both (#5301). It is a latch: a later upgrade that rolls a reader again keeps the dispatcher on the six-token form rather than moving it back for the length of the roll. Until it is written, the dispatcher writes the five-token form, which every reader watches. `status: False`, `Reason: ReaderNotOnReleaseImage`: the reader the message names runs another image (an older release's, or the hermes-bridge of a pinned `spec.deployment.image`), so the install stays on the five-token form; a later release that drops that form keeps it for this install while this holds. A rollout still in flight writes nothing.",
 	},
 	{
 		Type:    busStreamsPresentConditionType,

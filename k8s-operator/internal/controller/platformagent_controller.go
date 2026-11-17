@@ -4814,7 +4814,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// So does the sandbox pin: an old sandbox is a likely cause of the park.
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
-		profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch) &&
+		profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
@@ -4833,7 +4833,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			profileSupervisorFormConditionCurrent(live, a2a.profileSupervisorFormLatch) &&
+			profileSupervisorFormConditionCurrent(live, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
@@ -4852,7 +4852,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, gatewayMsg, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
-	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, now)
+	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setNoChatPlatformCondition(agent, noChatMsg, now)
@@ -5303,7 +5303,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	busProvisionedUnchanged := busProvisionedConditionCurrent(agent, busProvisionedWanted)
 	// The supervisor-form latch (#5301), same shape: computed here so a
 	// settled pass that reaches the switch still writes it.
-	profileSupervisorFormUnchanged := profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch)
+	profileSupervisorFormUnchanged := profileSupervisorFormConditionCurrent(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy)
 	// The verifier term has to be computed here, with the others, rather than
 	// read at the write below: the early return a few lines down is what
 	// decides whether there is a write at all. Left out of the check, the
@@ -5491,7 +5491,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
-	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, now)
+	setProfileSupervisorFormCondition(agent, a2a.profileSupervisorFormLatch, a2a.profileSupervisorFormHeldBy, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)

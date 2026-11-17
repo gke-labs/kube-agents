@@ -7150,6 +7150,10 @@ type a2aProvisionState struct {
 	// is wanted (#5301): the dispatcher writes the six-token form. Written
 	// by the status writers, as BusProvisioned is, so a settled pass saves it.
 	profileSupervisorFormLatch bool
+	// profileSupervisorFormHeldBy names a reader holding the install on the
+	// five-token form because it runs an image other than this operator's
+	// render; the condition says so (ReaderNotOnReleaseImage).
+	profileSupervisorFormHeldBy string
 
 	// busMeta is the JetStream meta group check's finding on a pass that
 	// made it (checkA2ABusMeta), for the A2ABusMetaGroup condition.
@@ -7776,11 +7780,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// How far the move to the six-token profile supervisor subject has got
 	// (#5301, platformagent_a2a_supervisor_form.go): the relay's third
 	// filter in the provision Job, and the dispatcher's switch after it.
-	profileSupervisorFilter, profileSupervisorForm, err := r.a2aProfileSupervisorFormFor(ctx, agent)
+	profileSupervisorFilter, profileSupervisorForm, profileSupervisorHeldBy, err := r.a2aProfileSupervisorFormAndHold(ctx, agent)
 	if err != nil {
 		return state, err
 	}
 	state.profileSupervisorFormLatch = profileSupervisorForm != ""
+	state.profileSupervisorFormHeldBy = profileSupervisorHeldBy
 	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining, profileSupervisorForm)
 	state.dispatcherJobMode = jobMode
 	if err != nil {

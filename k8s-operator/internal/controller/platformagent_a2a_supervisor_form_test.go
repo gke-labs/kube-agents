@@ -96,7 +96,7 @@ func TestTheSupervisorFormMovesInOrderAndLatches(t *testing.T) {
 	// The status writers save the latch (setProfileSupervisorFormCondition;
 	// TestTheSupervisorFormLatchIsPersistedWhenNothingElseChanged); here it
 	// is applied as they would.
-	setProfileSupervisorFormCondition(agent, true, metav1.Now())
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
 	if !meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
 		t.Fatal("the switch didn't latch")
 	}
@@ -209,5 +209,45 @@ func TestTheGateReadsEachReadersImageAndWorkloadKind(t *testing.T) {
 	r = supervisorFormReconciler(t, readerDeployment(agent, readers[0], true), readerDeployment(agent, readers[1], true))
 	if ok, name, err := r.a2aSupervisorReadersOnTemplate(ctx, agent); err != nil || !ok {
 		t.Errorf("MCP door on but MCP not deployed: ok %v blocker %q err %v, want open", ok, name, err)
+	}
+}
+
+// A reader on an image other than this operator's render holds the install on
+// the five-token form, and the condition names it (False,
+// ReaderNotOnReleaseImage) so an admin can see why; a rollout still in flight
+// is no hold. The latch, once True, is never replaced by a hold.
+func TestAReaderOnAnOlderImageHoldsTheInstallAndSaysSo(t *testing.T) {
+	agent := a2aTestAgent()
+	ctx := context.Background()
+	readers := a2aProfileSupervisorReaders(agent)
+	pinned := readerDeployment(agent, readers[1], true)
+	pinned.Spec.Template.Spec.Containers[0].Image = "registry/hermes-bridge:pinned-older"
+	r := supervisorFormReconciler(t, readerDeployment(agent, readers[0], true), pinned)
+	_, form, heldBy, err := r.a2aProfileSupervisorFormAndHold(ctx, agent)
+	if err != nil || form != "" || heldBy != readers[1].name {
+		t.Fatalf("a pinned older bridge: form %q heldBy %q err %v, want held by %q", form, heldBy, err, readers[1].name)
+	}
+	if profileSupervisorFormConditionCurrent(agent, false, heldBy) {
+		t.Fatal("a hold with no condition yet read as current, so it would never be written")
+	}
+	setProfileSupervisorFormCondition(agent, false, heldBy, metav1.Now())
+	c := meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != a2aProfileSupervisorFormHeldReason || !strings.Contains(c.Message, readers[1].name) {
+		t.Fatalf("hold condition = %+v", c)
+	}
+
+	r = supervisorFormReconciler(t, readerDeployment(agent, readers[0], false), readerDeployment(agent, readers[1], true))
+	if _, _, heldBy, _ := r.a2aProfileSupervisorFormAndHold(ctx, agent); heldBy != "" {
+		t.Errorf("a gateway mid-roll was reported as a hold by %q", heldBy)
+	}
+	setProfileSupervisorFormCondition(agent, false, "", metav1.Now())
+	if meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition) != nil {
+		t.Error("the hold condition outlived the hold")
+	}
+
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	setProfileSupervisorFormCondition(agent, false, "anything", metav1.Now())
+	if !meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		t.Error("a hold replaced the latch")
 	}
 }

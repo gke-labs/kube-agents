@@ -113,18 +113,30 @@ func a2aStatefulSetFullyOnTemplate(sts *appsv1.StatefulSet) bool {
 // gate; an install that pins an older agent image, and so an older bridge,
 // stays on the five-token form.
 func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
+	ok, blocker, _, err := r.a2aSupervisorReadersCheck(ctx, agent)
+	return ok, blocker, err
+}
+
+// a2aSupervisorReadersCheck is a2aSupervisorReadersOnTemplate, also saying
+// whether the blocker runs an image other than this operator's render: a
+// standing hold (an older release's reader, a pinned agent image's bridge),
+// unlike a rollout still in flight.
+func (r *PlatformAgentReconciler) a2aSupervisorReadersCheck(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, bool, error) {
 	for _, rd := range a2aProfileSupervisorReaders(agent) {
 		key := client.ObjectKey{Namespace: agent.Namespace, Name: rd.name}
 		dep := &appsv1.Deployment{}
 		err := r.a2aReader().Get(ctx, key, dep)
 		switch {
 		case err == nil:
-			if !templateRunsImage(dep.Spec.Template.Spec, rd.container, rd.image) || !a2aDeploymentFullyOnTemplate(dep) {
-				return false, rd.name, nil
+			if !templateRunsImage(dep.Spec.Template.Spec, rd.container, rd.image) {
+				return false, rd.name, true, nil
+			}
+			if !a2aDeploymentFullyOnTemplate(dep) {
+				return false, rd.name, false, nil
 			}
 			continue
 		case !apierrors.IsNotFound(err):
-			return false, rd.name, err
+			return false, rd.name, false, err
 		}
 		sts := &appsv1.StatefulSet{}
 		if err := r.a2aReader().Get(ctx, key, sts); err != nil {
@@ -132,15 +144,18 @@ func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Con
 				if rd.optional {
 					continue
 				}
-				return false, rd.name, nil
+				return false, rd.name, false, nil
 			}
-			return false, rd.name, err
+			return false, rd.name, false, err
 		}
-		if !templateRunsImage(sts.Spec.Template.Spec, rd.container, rd.image) || !a2aStatefulSetFullyOnTemplate(sts) {
-			return false, rd.name, nil
+		if !templateRunsImage(sts.Spec.Template.Spec, rd.container, rd.image) {
+			return false, rd.name, true, nil
+		}
+		if !a2aStatefulSetFullyOnTemplate(sts) {
+			return false, rd.name, false, nil
 		}
 	}
-	return true, "", nil
+	return true, "", false, nil
 }
 
 // a2aProfileSupervisorFormFor says how far this pass takes the move: whether
@@ -149,15 +164,26 @@ func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Con
 // writers save it (setProfileSupervisorFormCondition), as they save
 // BusProvisioned, so a settled pass that changes nothing else still writes it.
 func (r *PlatformAgentReconciler) a2aProfileSupervisorFormFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (thirdFilter bool, form string, err error) {
+	thirdFilter, form, _, err = r.a2aProfileSupervisorFormAndHold(ctx, agent)
+	return thirdFilter, form, err
+}
+
+// a2aProfileSupervisorFormAndHold is a2aProfileSupervisorFormFor, also naming
+// a reader that holds the install on the five-token form because it runs an
+// image other than this operator's render (heldBy, empty otherwise).
+func (r *PlatformAgentReconciler) a2aProfileSupervisorFormAndHold(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (thirdFilter bool, form, heldBy string, err error) {
 	latched := meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
 	if !latched {
-		ready, _, err := r.a2aSupervisorReadersOnTemplate(ctx, agent)
+		ready, blocker, image, err := r.a2aSupervisorReadersCheck(ctx, agent)
 		if err != nil || !ready {
-			return false, "", err
+			if image {
+				heldBy = blocker
+			}
+			return false, "", heldBy, err
 		}
 	}
 	if latched {
-		return true, a2aProfileSupervisorFormValue, nil
+		return true, a2aProfileSupervisorFormValue, "", nil
 	}
 	// Readers ready: the third filter renders. The switch waits for the
 	// Job that applies it.
@@ -165,34 +191,66 @@ func (r *PlatformAgentReconciler) a2aProfileSupervisorFormFor(ctx context.Contex
 	existing := &batchv1.Job{}
 	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(job), existing); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, "", nil
+			return true, "", "", nil
 		}
-		return true, "", err
+		return true, "", "", err
 	}
 	if existing.Status.Succeeded == 0 {
-		return true, "", nil
+		return true, "", "", nil
 	}
-	return true, a2aProfileSupervisorFormValue, nil
+	return true, a2aProfileSupervisorFormValue, "", nil
+}
+
+// a2aProfileSupervisorFormHeldReason is the condition's False reason: a
+// profile-terminal reader runs an image other than this operator's render, so
+// the install stays on the five-token supervisor subject.
+const a2aProfileSupervisorFormHeldReason = "ReaderNotOnReleaseImage"
+
+func profileSupervisorFormHeldMessage(heldBy string) string {
+	return heldBy + " runs an image other than this operator's release renders (an older release's, or a pinned agent image's hermes-bridge), so profile terminals stay on the five-token supervisor subject; a later release that drops that subject keeps it for this install while this holds"
 }
 
 // profileSupervisorFormConditionCurrent reports whether the CR already carries
-// the latch as wanted. The latch is only ever added, so not wanting it asks
-// for nothing.
-func profileSupervisorFormConditionCurrent(agent *agentv1alpha1.PlatformAgent, want bool) bool {
-	return !want || meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+// the condition as wanted: True once latched (never removed), False naming the
+// reader that holds it on the legacy subject, or absent.
+func profileSupervisorFormConditionCurrent(agent *agentv1alpha1.PlatformAgent, latch bool, heldBy string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	switch {
+	case existing != nil && existing.Status == metav1.ConditionTrue:
+		return true
+	case latch:
+		return false
+	case heldBy != "":
+		return existing != nil && existing.Status == metav1.ConditionFalse && existing.Message == profileSupervisorFormHeldMessage(heldBy)
+	default:
+		return existing == nil
+	}
 }
 
-// setProfileSupervisorFormCondition adds the latch when wanted and absent. It
-// never removes it.
-func setProfileSupervisorFormCondition(agent *agentv1alpha1.PlatformAgent, want bool, now metav1.Time) {
-	if !want || meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
+// setProfileSupervisorFormCondition writes the wanted state: the latch (never
+// removed once True), the hold, or nothing.
+func setProfileSupervisorFormCondition(agent *agentv1alpha1.PlatformAgent, latch bool, heldBy string, now metav1.Time) {
+	if meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
 		return
 	}
-	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
-		Type: a2aProfileSupervisorFormCondition, Status: metav1.ConditionTrue,
-		Reason:             a2aProfileSupervisorFormReason,
-		Message:            "every profile-task reader watches the six-token supervisor subject and the gateway relay filters it, so the dispatcher writes profile terminals there",
-		ObservedGeneration: agent.Generation,
-		LastTransitionTime: now,
-	})
+	switch {
+	case latch:
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type: a2aProfileSupervisorFormCondition, Status: metav1.ConditionTrue,
+			Reason:             a2aProfileSupervisorFormReason,
+			Message:            "every profile-task reader watches the six-token supervisor subject and the gateway relay filters it, so the dispatcher writes profile terminals there",
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	case heldBy != "":
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type: a2aProfileSupervisorFormCondition, Status: metav1.ConditionFalse,
+			Reason:             a2aProfileSupervisorFormHeldReason,
+			Message:            profileSupervisorFormHeldMessage(heldBy),
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	default:
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	}
 }
