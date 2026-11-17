@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -165,11 +166,11 @@ HEALTH_FAILED = "failed"
 ARGO_APPLICATIONS = "applications.argoproj.io"
 FLUX_KUSTOMIZATIONS = "kustomizations.kustomize.toolkit.fluxcd.io"
 FLUX_GIT_REPOSITORIES = "gitrepositories.source.toolkit.fluxcd.io"
-#: Named so a test can show it never counts; not read, since a RootSync names no namespace.
+#: Counted only when its source is the fix's repository and its dir holds a changed file.
 CONFIGSYNC_ROOTSYNCS = "rootsyncs.configsync.gke.io"
 CONFIGSYNC_REPOSYNCS = "reposyncs.configsync.gke.io"
 #: The lists one tick reads per cluster.
-RECONCILER_RESOURCES = (ARGO_APPLICATIONS, FLUX_KUSTOMIZATIONS, FLUX_GIT_REPOSITORIES, CONFIGSYNC_REPOSYNCS)
+RECONCILER_RESOURCES = (ARGO_APPLICATIONS, FLUX_KUSTOMIZATIONS, FLUX_GIT_REPOSITORIES, CONFIGSYNC_ROOTSYNCS, CONFIGSYNC_REPOSYNCS)
 #: An Argo CD Application deploys to the cluster it runs on when its
 #: destination names this server or this name (or none).
 ARGO_IN_CLUSTER = ({"", "https://kubernetes.default.svc"}, {"", "in-cluster"})
@@ -189,12 +190,12 @@ OBSERVED = "observed"
 
 #: Merged records not yet applied, least recently read first.
 HEALTH_SQL = (
-    f"SELECT url, repo, kind, project, location, cluster, namespace, object, merge_commit "
+    f"SELECT url, repo, number, kind, project, location, cluster, namespace, object, merge_commit, changed_paths "
     f"FROM {RECORDS_TABLE} WHERE outcome IS NULL AND merged_at IS NOT NULL "
     "AND merge_commit IS NOT NULL AND health_result IS NULL AND applied_at IS NULL "
     "ORDER BY health_checked_at IS NOT NULL, health_checked_at, merged_at LIMIT ?"
 )
-HEALTH_COLUMNS = ("url", "repo", "kind", "project", "location", "cluster", "namespace", "object", "merge_commit")
+HEALTH_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster", "namespace", "object", "merge_commit", "changed_paths")
 
 
 class ClusterReadError(RuntimeError):
@@ -229,16 +230,135 @@ def forge_contains(repo: str, ancestor: str, revision: str) -> bool | None:
     return contains if isinstance(contains, bool) else None
 
 
-def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[dict]:
-    """The reconciler objects on this cluster that deliver ``repo`` into ``namespace``.
+#: ``paths(repo, number)`` -> the files the pull request changed; None when unknown.
+Paths = Callable[[str, int], "list[str] | None"] | None
+DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$")
+DIFF_RENAME_RE = re.compile(r"^rename (?:from|to) (.+)$")
+DIFF_PATH_RE = re.compile(r'^(?:\+\+\+|---) (?:"([ab]/(?:[^"\\]|\\.)*)"|([ab]/.*?))\t?$')
+
+
+#: How a forge adapter says the diff it returned is not the whole change (GitLab's fallback).
+DIFF_CUT_MARKERS = ("# diff cut short", "# diff may be cut short")
+C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+C_QUOTED_RE = re.compile(r"\\([0-7]{3}|.)")
+
+
+def _unquote(text: str) -> str:
+    """git's C-quoted path body as text: octal escapes are bytes, and raw UTF-8 is left as it is."""
+    def byte(match: re.Match) -> str:
+        code = match.group(1)
+        value = int(code, 8) if len(code) == 3 else C_ESCAPES.get(code)
+        return match.group(0) if value is None else chr(value)
+
+    try:
+        return C_QUOTED_RE.sub(byte, text).encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        # Raw UTF-8 beside the escapes: decode the escapes as bytes one run at a time.
+        out = bytearray()
+        for part in re.split(r"((?:\\(?:[0-7]{3}|.))+)", text):
+            out += C_QUOTED_RE.sub(byte, part).encode("latin-1") if part.startswith("\\") else part.encode("utf-8")
+        return out.decode("utf-8", "replace")
+
+
+def diff_paths(diff: str) -> list[str]:
+    """The files a unified diff changes, old and new names both, in order of appearance.
+
+    Only a file's header is read (from ``diff --git`` to its first ``@@``), so
+    a content line that happens to start ``--- a/`` is not taken for a path:
+    its ``---``/``+++`` names (C-quoted ones unquoted), a rename's names, and
+    the ``diff --git`` names when they hold no space, which covers a binary
+    file or a forge's collapsed entry with no ``---``/``+++`` lines.
+    """
+    found: list[str] = []
+    in_header = False
+
+    def add(path: str) -> None:
+        if path and path not in found:
+            found.append(path)
+
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_header = True
+            simple = DIFF_GIT_RE.match(line)
+            if simple:
+                add(simple.group(1))
+                add(simple.group(2))
+            continue
+        if line.startswith("@@"):
+            in_header = False
+            continue
+        if not in_header:
+            continue
+        match = DIFF_PATH_RE.match(line)
+        if match:
+            add((_unquote(match.group(1)) if match.group(1) is not None else match.group(2))[2:])
+            continue
+        renamed = DIFF_RENAME_RE.match(line)
+        if renamed:
+            name = renamed.group(1)
+            add(_unquote(name[1:-1]) if name.startswith('"') and name.endswith('"') else name)
+    return found
+
+
+def forge_paths(repo: str, number: int) -> list[str] | None:
+    """The files pull request ``number`` changed, from the forge's diff; None when it cannot say."""
+    try:
+        import forge
+
+        answer = forge.call(
+            "proposal-view", {"number": number, "diff": True}, repo, retry_transient=True,
+            timeout_s=VIEW_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 — unknown paths read as unknown, never as none
+        logger.warning("post-merge check: could not read the files of %s#%s: %r", repo, number, exc)
+        return None
+    diff = answer.get("diff") if isinstance(answer, dict) else None
+    if not isinstance(diff, str) or any(marker in diff for marker in DIFF_CUT_MARKERS):
+        # A cut diff lists only some of the files, and kept as the whole list it would
+        # narrow the match to the reconcilers of those files for good.
+        return None
+    return diff_paths(diff) or None
+
+
+def _dir_key(value: object) -> str:
+    """A repository directory as a prefix: no leading ``./`` or ``/``, no trailing ``/``; ``""`` is the root."""
+    text = str(value or "").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.strip("/")
+    return "" if text == "." else text
+
+
+def _holds(directory: object, paths: list[str]) -> bool:
+    """Whether any of ``paths`` lies in ``directory`` (the root holds every path)."""
+    prefix = _dir_key(directory)
+    return not prefix or any(path == prefix or path.startswith(prefix + "/") for path in paths)
+
+
+def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict],
+                    paths: list[str] | Callable[[], list[str] | None] | None = None) -> list[dict]:
+    """The reconciler objects on this cluster that deliver the fix in ``repo`` to ``namespace``.
 
     An Argo CD Application counts when one of its Git sources is ``repo``, it
     deploys to this cluster and its destination namespace is ``namespace``; a
     Flux Kustomization when its GitRepository is ``repo`` and its
     ``targetNamespace`` is ``namespace``; a Config Sync RepoSync in ``namespace``
-    with ``repo`` as its source. A RootSync names no namespace, so it never
-    counts: with nothing targeting the namespace, the fix is observed directly.
-    ``lists`` maps the resource names above to their ``kubectl get -A -o json`` answers.
+    with ``repo`` as its source. With ``paths`` (the files the fix changed),
+    those whose path (the Argo source's ``path``, the Kustomization's
+    ``path``, the RepoSync's ``dir``) holds one of them are preferred; when
+    none does, all of them still count, since a kustomization can reach files
+    outside its own directory. So a path narrows the match and never empties it.
+    The cost: a match that reaches a changed file only through a ``../base``
+    is dropped when another match holds it directly, so the record can read
+    applied once that one has synced.
+
+    A Config Sync RootSync names no namespace: it counts when its source is a
+    git ``repo`` and its ``dir`` holds one of ``paths``. Without ``paths`` no
+    RootSync counts, and with nothing else delivering the fix it is observed
+    directly. ``lists`` maps the resource names above to their ``kubectl get
+    -A -o json`` answers. ``paths`` may be a function, called only when they
+    can change the answer (a RootSync of ``repo``, or more than one namespace
+    match), so a fix delivered by one Application costs no diff read.
     """
     import clean_merges
 
@@ -246,17 +366,16 @@ def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[d
     key = repo_key(repo)
     if not key:
         return []
-    found = []
+    scoped: list[tuple[dict, list[object]]] = []
     for app in lists.get(ARGO_APPLICATIONS, {}).get("items", []):
         spec = app.get("spec") or {}
         destination = spec.get("destination") or {}
         if str(destination.get("server") or "") not in ARGO_IN_CLUSTER[0] or str(destination.get("name") or "") not in ARGO_IN_CLUSTER[1]:
             continue
         sources = ([spec["source"]] if isinstance(spec.get("source"), dict) else []) + list(spec.get("sources") or [])
-        if destination.get("namespace") == namespace and any(
-            repo_key(source.get("repoURL")) == key for source in sources if isinstance(source, dict)
-        ):
-            found.append(app)
+        matching = [source for source in sources if isinstance(source, dict) and repo_key(source.get("repoURL")) == key]
+        if destination.get("namespace") == namespace and matching:
+            scoped.append((app, [source.get("path") for source in matching]))
     repositories = {
         ((r.get("metadata") or {}).get("namespace"), (r.get("metadata") or {}).get("name")): r
         for r in lists.get(FLUX_GIT_REPOSITORIES, {}).get("items", [])
@@ -267,15 +386,28 @@ def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[d
         source = repositories.get((ref.get("namespace") or meta.get("namespace"), ref.get("name")))
         if (ref.get("kind") == "GitRepository" and source and spec.get("targetNamespace") == namespace
                 and repo_key((source.get("spec") or {}).get("url")) == key):
-            found.append(kustomization)
+            scoped.append((kustomization, [spec.get("path")]))
     for sync in lists.get(CONFIGSYNC_REPOSYNCS, {}).get("items", []):
         git = (sync.get("spec") or {}).get("git") or {}
         if (sync.get("metadata") or {}).get("namespace") == namespace and repo_key(git.get("repo")) == key:
-            found.append(sync)
+            scoped.append((sync, [git.get("dir")]))
+    found = [obj for obj, _ in scoped]
+    roots = [
+        sync for sync in lists.get(CONFIGSYNC_ROOTSYNCS, {}).get("items", [])
+        if str((sync.get("spec") or {}).get("sourceType") or "git") == "git"
+        and repo_key(((sync.get("spec") or {}).get("git") or {}).get("repo")) == key
+    ]
+    if callable(paths):
+        paths = paths() if roots or len(scoped) > 1 else None
+    if paths:
+        within = [obj for obj, directories in scoped if any(_holds(d, paths) for d in directories)]
+        found = (within or found) + [
+            sync for sync in roots if _holds(((sync.get("spec") or {}).get("git") or {}).get("dir"), paths)
+        ]
     return found
 
 
-def combined_sync(objects: list[dict], merge_commit: str, contains: Callable[[str, str], "bool | None"] | None = None) -> tuple[str, str]:
+def combined_sync(objects: list[dict], merge_commit: str, contains: Callable[[str, str], bool | None] | None = None) -> tuple[str, str]:
     """``(state, detail)`` over the reconcilers that deliver the fix: applied only when every one is."""
     import reconciler_sync
 
@@ -413,6 +545,7 @@ def watch_health(
     now: datetime | None = None,
     limit: int = READS_PER_TICK,
     contains: Contains = forge_contains,
+    paths: Paths = None,
 ) -> dict[str, list[str]]:
     """Step 3 for each merged record: wait until the fix is applied.
 
@@ -426,9 +559,14 @@ def watch_health(
     (``health_result``, ``health_detail``); any other read failure is kept in
     ``sync_state`` and retried. Every read stamps
     ``health_checked_at``, which orders the next tick, so no record starves the
-    rest. Everything lives on the row, so a restart loses nothing. Returns urls
-    under ``applied``, ``waiting``, ``failed`` and ``unreadable``.
+    rest. Everything lives on the row, so a restart loses nothing. ``paths``
+    (default :func:`forge_paths`) reads the files the pull request changed,
+    only when :func:`reconcilers_for` needs them; a list is kept in
+    ``changed_paths`` and never read again, and an unknown one is said in
+    ``sync_state`` and read again next tick. Returns urls under ``applied``,
+    ``waiting``, ``failed`` and ``unreadable``.
     """
+    paths = paths or forge_paths
     import reconciler_sync
 
     kubectl_json = kubectl_json or SandboxKubectl()
@@ -463,7 +601,20 @@ def watch_health(
                     answers[(repo, ancestor, revision)] = contains(repo, ancestor, revision)
                 return answers[(repo, ancestor, revision)]
 
-            objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists)
+            unknown: list[bool] = []
+
+            def changed(record: dict = record, updates: dict = updates, unknown: list = unknown) -> list[str] | None:
+                # A merged pull request's files never change: read them once and keep them on the row.
+                if record["changed_paths"]:
+                    return json.loads(record["changed_paths"])
+                found = paths(record["repo"], record["number"])
+                if found:
+                    updates["changed_paths"] = json.dumps(found)
+                else:
+                    unknown.append(True)
+                return found
+
+            objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists, changed)
             workload, pods = _read_workload(kubectl_json, record)
             if objects:
                 state, detail = combined_sync(objects, record["merge_commit"], asked)
@@ -478,6 +629,8 @@ def watch_health(
                 applied, direct = observed_directly(kubectl_json, record, workload)
                 state = OBSERVED if applied else reconciler_sync.PENDING
                 detail = f"no reconciler targets {record['namespace'] or 'default'}; {direct}"
+            if unknown:
+                detail = f"files unknown: no RootSync counts and no path narrows the match; {detail}"
             updates["sync_state"] = f"{state}: {detail}"[:500]
             if applied:
                 updates["applied_at"] = stamp

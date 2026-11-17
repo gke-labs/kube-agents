@@ -8880,6 +8880,19 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         self.assertEqual(len(detail["comments"]), 1)
         self.assertEqual(self.client.get("/v1/tasks/no-such-task").status_code, 404)
 
+    def test_init_db_adds_changed_paths_to_an_existing_post_merge_records(self):
+        import sqlite3
+
+        legacy_db = self.root / "legacy_post_merge.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute("CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, number INTEGER)")
+            conn.execute("INSERT INTO post_merge_records VALUES ('u', 'r', 1)")
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(legacy_db)):
+            session_kv_server.init_db()
+            session_kv_server.init_db()
+        with sqlite3.connect(legacy_db) as conn:
+            self.assertEqual(conn.execute("SELECT url, changed_paths FROM post_merge_records").fetchall(), [("u", None)])
+
     def test_init_db_adds_session_id_column_idempotently_to_legacy_ledger(self):
         import sqlite3
 

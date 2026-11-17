@@ -409,7 +409,7 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   health_at TEXT, health_checked_at TEXT,
   human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT,
   outcome_detail TEXT, reported_at TEXT, followup_state TEXT, followup_attempts INTEGER,
-  followup_detail TEXT
+  followup_detail TEXT, changed_paths TEXT
 );
 ```
 
@@ -433,7 +433,11 @@ that it ends with no outcome. Every read stamps `merge_checked_at`. The apply st
 `post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
 recently read first by `health_checked_at`. For a merged record with a `merge_commit` and a cluster it
 can name, it reads the Argo CD Applications, Flux Kustomizations and Config Sync RepoSyncs on that
-cluster that deliver the repository into the record's namespace, asking the broker
+cluster that deliver the repository into the record's namespace, and the git-sourced RootSyncs of the repository
+whose `spec.git.dir` holds a file the pull request changed (read from its diff only when a RootSync
+or more than one namespace match could change the answer, and kept in `changed_paths` once read; a
+path narrows the namespace matches and never empties them, and a diff it cannot read whole is said as
+`files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
