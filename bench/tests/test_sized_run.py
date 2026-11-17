@@ -46,7 +46,7 @@ class VerdictTest(unittest.TestCase):
 
     def green_record(self):
         record = sr.RunRecord(started=0.0, burst_seconds=3900)
-        record.statuses = {"a": "completed", "b": "completed", "c": "completed"}
+        record.burst_statuses = {"a": "completed", "b": "completed", "c": "completed"}
         record.pods_before = {"gw": sr.PodState(0, False)}
         record.pods_after = {"gw": sr.PodState(0, False)}
         record.fleet_check = {"findings": []}
@@ -75,8 +75,8 @@ class VerdictTest(unittest.TestCase):
 
     def test_an_audit_that_did_not_complete_fails_its_check(self):
         record = self.green_record()
-        record.statuses["c"] = "running"
-        del record.statuses["b"]
+        record.burst_statuses["c"] = "running"
+        del record.burst_statuses["b"]
         checks = sr.verdict(record, self.wanted, self.first)["checks"]
         self.assertEqual(checks["every_audit_finishes"]["failures"], ["b: not run", "c: running"])
         self.assertEqual(checks["first_run_flow_ends"]["failures"], ["b: not run"])
@@ -111,6 +111,30 @@ class RunTest(unittest.TestCase):
         self.assertEqual(record.burst_seconds, 3600)
         self.assertTrue(result["green"], result)
 
+    def test_a_burst_window_no_read_reached_is_red_and_says_so(self):
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        def job_statuses(*_args):
+            if now[0] <= sr.BURST_MAX_SECONDS:
+                raise sr.kube.CommandError("gateway exec failed")
+            return {j: "completed" for j in sr.audits()}
+
+        with mock.patch.object(sr.operations, "reset"), \
+                mock.patch.object(sr.operations, "trigger_jobs", return_value=[]), \
+                mock.patch.object(sr.operations, "job_statuses", side_effect=job_statuses), \
+                mock.patch.object(sr.operations, "job_seconds", return_value={}), \
+                mock.patch.object(sr, "pod_states", return_value={}), \
+                mock.patch.object(sr, "log_lines", return_value=[]):
+            _record, result = sr.run(project="p", host_cluster="h", host_context="ctx", namespace="ns",
+                                     check_fleet=lambda: {"findings": []}, soak_seconds=3600,
+                                     clock=lambda: now[0], sleep=sleep)
+        self.assertFalse(result["checks"]["every_audit_finishes"]["passed"])
+        self.assertFalse(result["green"])
+        self.assertTrue(any("burst window" in e for e in result["errors"]), result["errors"])
+
 
 class RemarkTest(unittest.TestCase):
     def test_an_unclaimed_mark_is_made_again_after_ten_minutes(self):
@@ -141,6 +165,13 @@ class VerdictTimingTest(unittest.TestCase):
         record.statuses = {"a": "completed", "b": "completed"}
         checks = sr.verdict(record, self.wanted, self.first)["checks"]
         self.assertEqual(checks["every_audit_finishes"]["failures"], ["b: running"])
+
+    def test_an_unread_burst_window_fails_however_the_soak_read_ends(self):
+        record = self.record()
+        record.statuses = {"a": "completed", "b": "completed"}
+        checks = sr.verdict(record, self.wanted, self.first)["checks"]
+        self.assertEqual(checks["every_audit_finishes"]["failures"], ["a: not run", "b: not run"])
+        self.assertEqual(checks["first_run_flow_ends"]["failures"], ["a: not run"])
 
     def test_a_failed_first_run_audit_still_ends_the_flow(self):
         record = self.record()

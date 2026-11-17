@@ -126,7 +126,9 @@ def verdict(record: RunRecord, wanted: tuple[str, ...], first_run: tuple[str, ..
     crashes += [f"SandboxChanged: {e}" for e in record.sandbox_changed]
     crashes += [f"node OOM kill: {e}" for e in record.node_oom_kills]
 
-    statuses = record.burst_statuses or record.statuses
+    # The burst's statuses alone: an empty dict means no read reached the audits, and every audit
+    # then fails as not run, whatever the read after the soak window found.
+    statuses = record.burst_statuses
 
     def not_in(jobs: tuple[str, ...], accepted: tuple[str, ...]) -> list[str]:
         return [f"{job}: {statuses.get(job, 'not run')}" for job in jobs if statuses.get(job) not in accepted]
@@ -219,6 +221,7 @@ def run(
         record.errors += operations.trigger_jobs(host_context, namespace, PLATFORM_HOME, (job,))
         marks[job] = (clock(), attempts)
 
+    burst_read_failures: list[str] = []
     while True:
         elapsed = clock() - record.started
         while pending and elapsed >= pending[0][0]:
@@ -228,6 +231,7 @@ def run(
         except kube.CommandError as exc:
             if NO_TABLE not in str(exc):
                 LOG.warning("could not read the audits' runs: %s", exc)
+                burst_read_failures.append(str(exc))
         for job in to_remark(marks, record.statuses, clock()):
             mark(job)
         if not pending and burst_over(elapsed, record.statuses, wanted):
@@ -235,6 +239,9 @@ def run(
         sleep(POLL_SECONDS)
     record.burst_seconds = clock() - record.started
     record.burst_statuses = dict(record.statuses)
+    if burst_read_failures:
+        record.errors.append(f"could not read the audits' runs {len(burst_read_failures)} time(s) in the burst "
+                             f"window: {burst_read_failures[-1]}")
     LOG.info("burst window over after %.0fs: %s", record.burst_seconds, record.statuses)
     soak_start = clock()
     snap_burst = _snapshot(install, record.errors)
