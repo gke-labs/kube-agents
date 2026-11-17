@@ -1377,7 +1377,8 @@ func pageSource(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(page)
+	// Checkouts on Windows may carry CRLF; the extractors match LF-only text.
+	return strings.ReplaceAll(string(page), "\r\n", "\n")
 }
 
 // pageJS returns the source of each named top-level function (four-space
@@ -1531,6 +1532,44 @@ console.log(JSON.stringify([
 	handler := pageSnippet(t, `$("feedback-kind-bar").addEventListener("click"`, "\n      });\n")
 	if strings.Contains(handler, `.value = ""`) || strings.Contains(handler, `template = "1"`) {
 		t.Errorf("the feedback kind bar resets the Details body:\n%s", handler)
+	}
+}
+
+// "/feedback summary" prints the environment and usage block in place, as the
+// gateway's "/feedback summary" does in chat, rather than the command help.
+func TestPageFeedbackSummaryPrintsTheEnvironmentBlock(t *testing.T) {
+	script := `const SLASH_COMMANDS = [{ token: "/feedback", local: "feedback" }];
+const FEEDBACK_EMAIL = "kube-agents-feedback@google.com";
+const pending = { centre: null, side: null };
+const calls = [];
+const chatRows = [];
+const $ = id => ({ id, dataset: {} });
+const appendTo = (container, role, text, tag) => {
+  const row = { role, text, tag, container: container.id, dataset: {} };
+  chatRows.push(row);
+  return row;
+};
+const markSideLocalRow = () => {};
+const feedbackContextMarkdown = () => "ENV-BLOCK";
+const postFeedbackDraft = (where, kindKey, title) => calls.push(["draft", kindKey, title]);
+const openFeedback = (kind, title) => calls.push(["form", kind, title]);
+` + pageJS(t, "findSlashCommand", "handleSlashCommand") + `
+handleSlashCommand("/feedback summary", "centre");
+handleSlashCommand("/feedback summary", "side");
+console.log(JSON.stringify({ row: chatRows.map(r => r.text), where: chatRows.map(r => r.container), calls }));`
+	want := `{"row":["ENV-BLOCK","ENV-BLOCK"],"where":["chat-stream","side-body"],"calls":[]}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("/feedback summary printed %s, want the environment block in each pane %s", got, want)
+	}
+}
+
+// The helpers the summary path calls must exist as top-level functions in the
+// real page; the test above stubs them, so this guards against a rename.
+func TestPageFeedbackSummaryHelpersExist(t *testing.T) {
+	for _, name := range []string{"appendTo", "markSideLocalRow", "feedbackContextMarkdown"} {
+		if src := pageJS(t, name); !strings.Contains(src, name) {
+			t.Errorf("index.html does not define %s", name)
+		}
 	}
 }
 
