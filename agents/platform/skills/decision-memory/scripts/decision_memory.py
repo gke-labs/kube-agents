@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -166,29 +167,40 @@ class Record:
 
     @property
     def scope(self) -> Dict[str, List[str]]:
-        s = self.meta.get("scope") or {}
-        return {k: [str(x) for x in (s.get(k) or [])] for k in ("paths", "resources", "clusters", "checks")}
+        raw = self.meta.get("scope")
+        s = raw if isinstance(raw, dict) else {}
+        return {
+            k: [str(x) for x in (s.get(k) if isinstance(s.get(k), list) else [])]
+            for k in ("paths", "resources", "clusters", "checks")
+        }
 
     @property
     def guard(self) -> Dict[str, Any]:
-        return self.meta.get("guard") or {}
+        raw = self.meta.get("guard")
+        return raw if isinstance(raw, dict) else {}
 
     @property
     def evidence(self) -> Dict[str, Any]:
-        return self.meta.get("evidence") or {}
+        raw = self.meta.get("evidence")
+        return raw if isinstance(raw, dict) else {}
 
     def document_id(self, repo_id: str) -> str:
         key = self.id or self.path
         return f"{DOC_PREFIX}{repo_id}:{key}" if repo_id else f"{DOC_PREFIX}{key}"
 
     def tags(self) -> List[str]:
-        tags = [SHARED_TAG, f"kind:{self.type}", f"status:{self.status}", f"id:{self.id}"]
+        tags = [SHARED_TAG, f"kind:{self.type}", f"status:{self.status}"]
+        if self.id:
+            tags.append(f"id:{self.id}")
         s = self.scope
-        tags += [f"cluster:{c}" for c in s["clusters"]]
-        tags += [f"check:{c}" for c in s["checks"]]
-        tags += [f"res:{r}" for r in s["resources"]]
+        tags += [f"cluster:{c}" for c in s["clusters"] if c]
+        tags += [f"check:{c}" for c in s["checks"] if c]
+        tags += [f"res:{r}" for r in s["resources"] if r]
         if self.guard.get("severity"):
             tags.append(f"guard:{self.guard['severity']}")
+        pr = str(self.evidence.get("pull_request") or "")
+        if pr:
+            tags.append(f"pr:{pr}")
         return sorted(set(tags))
 
     def render_for_index(self) -> str:
@@ -206,10 +218,14 @@ class Record:
             lines.append(f"Guard ({self.guard.get('severity', 'warn')}): {self.guard['rule']}")
         if ev.get("pull_request"):
             lines.append(f"Pull request: {ev['pull_request']}")
-        if ev.get("rejected_proposals"):
-            lines.append("Rejected proposals: " + ", ".join(str(x) for x in ev["rejected_proposals"]))
-        if self.meta.get("supersedes"):
-            lines.append("Supersedes: " + ", ".join(self.meta["supersedes"]))
+        rej_props = ev.get("rejected_proposals")
+        if isinstance(rej_props, list) and rej_props:
+            lines.append("Rejected proposals: " + ", ".join(str(x) for x in rej_props))
+        if ev.get("reviewer_reason"):
+            lines.append(f"Reviewer reason: {ev['reviewer_reason']}")
+        sup = self.meta.get("supersedes")
+        if isinstance(sup, list) and sup:
+            lines.append("Supersedes: " + ", ".join(str(x) for x in sup))
         if self.meta.get("superseded_by"):
             lines.append(f"Superseded by: {self.meta['superseded_by']}")
         lines.append("")
@@ -237,11 +253,12 @@ def _normalize_declares_into_meta(meta: Dict[str, Any]) -> None:
     declares = meta.get("declares")
     if not isinstance(declares, list) or not declares:
         return
-    scope = dict(meta.get("scope") or {})
-    paths = [str(x) for x in (scope.get("paths") or [])]
-    resources = [str(x) for x in (scope.get("resources") or [])]
-    clusters = [str(x) for x in (scope.get("clusters") or [])]
-    checks = [str(x) for x in (scope.get("checks") or [])]
+    raw_scope = meta.get("scope")
+    scope = dict(raw_scope) if isinstance(raw_scope, dict) else {}
+    paths = [str(x) for x in (scope.get("paths") if isinstance(scope.get("paths"), list) else [])]
+    resources = [str(x) for x in (scope.get("resources") if isinstance(scope.get("resources"), list) else [])]
+    clusters = [str(x) for x in (scope.get("clusters") if isinstance(scope.get("clusters"), list) else [])]
+    checks = [str(x) for x in (scope.get("checks") if isinstance(scope.get("checks"), list) else [])]
     for item in declares:
         if not isinstance(item, dict):
             continue
@@ -307,16 +324,25 @@ def validate_record(rec: Record) -> List[str]:
         errs.append(f"status must be one of {STATUSES}")
     if not rec.title:
         errs.append("title is required")
+    raw_scope = rec.meta.get("scope")
+    if raw_scope is not None and not isinstance(raw_scope, dict):
+        errs.append("scope must be a mapping")
     s = rec.scope
     if not (s["paths"] or s["resources"] or s["checks"]):
         errs.append("scope needs at least one of paths, resources, checks — an unscoped record can never be matched")
+    raw_guard = rec.meta.get("guard")
+    if raw_guard is not None and not isinstance(raw_guard, dict):
+        errs.append("guard must be a mapping")
     g = rec.guard
     if g:
         if g.get("severity") and g["severity"] not in SEVERITIES:
             errs.append(f"guard.severity must be one of {SEVERITIES}")
         exp = g.get("expect")
-        if exp:
-            if not all(k in exp for k in ("file", "path", "op", "value")):
+        if exp is not None and not isinstance(exp, dict):
+            errs.append("guard.expect must be a mapping")
+        elif exp:
+            req_keys = ("file", "path", "op") if exp.get("op") in ("absent", "present") else ("file", "path", "op", "value")
+            if not all(k in exp for k in req_keys):
                 errs.append("guard.expect needs file, path, op, value")
             else:
                 if exp.get("op") not in VALID_OPS:
@@ -326,6 +352,12 @@ def validate_record(rec: Record) -> List[str]:
                         _path_tokens(str(exp["path"]))
                     except ValueError as exc:
                         errs.append(f"guard.expect.path is invalid: {exc}")
+    raw_ev = rec.meta.get("evidence")
+    if raw_ev is not None and not isinstance(raw_ev, dict):
+        errs.append("evidence must be a mapping")
+    raw_sup = rec.meta.get("supersedes")
+    if raw_sup is not None and not isinstance(raw_sup, list):
+        errs.append("supersedes must be a list")
     if rec.type == "lesson" and rec.status == "active" and not rec.evidence.get("pull_request"):
         errs.append("an active lesson needs evidence.pull_request — it is learned from a merged fix")
     if rec.status == "superseded" and not rec.meta.get("superseded_by"):
@@ -510,33 +542,93 @@ def parse_external_doc_record(text: str, rel_path: str) -> Record:
     return Record(path=rel_path, meta=norm_meta, body=body)
 
 
+_SAFE_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SCP_REMOTE_RE = re.compile(r"^(?:[^/@]+@)?([^/:]+):(.+)$")
+_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+
+
+def _is_safe_repo_segment(seg: str) -> bool:
+    if seg in (".", "..", ".git") or seg.startswith("-"):
+        return False
+    return bool(_SAFE_REPO_SEGMENT_RE.fullmatch(seg))
+
+
+def _trim_git_repo_path(p: str) -> str:
+    p = p.strip("/")
+    if p.endswith(".git"):
+        trimmed = p[:-4]
+        if trimmed and not trimmed.endswith("/"):
+            p = trimmed
+    return p.strip("/")
+
+
+def _workspace_clone_dir_name(repo_url: str) -> str:
+    text = repo_url.strip()
+    if not text or len(text) > 256:
+        return ""
+    host = ""
+    raw_path = ""
+    if "://" in text:
+        parsed = urllib.parse.urlparse(text)
+        if not parsed.hostname:
+            return ""
+        host = parsed.hostname.lower()
+        raw_path = parsed.path or ""
+    else:
+        m = _SCP_REMOTE_RE.match(text)
+        if m:
+            host = m.group(1).lower()
+            raw_path = m.group(2)
+        else:
+            raw_path = text
+    raw_path = _trim_git_repo_path(raw_path)
+    if not host and "/" in raw_path:
+        first, rest = raw_path.split("/", 1)
+        rest = rest.strip("/")
+        first_lower = first.lower()
+        if rest and (
+            first_lower in ("github.com", "gitlab.com", "bitbucket.org")
+            or _HOSTNAME_RE.fullmatch(first_lower)
+        ):
+            host = first_lower
+            raw_path = rest
+    if raw_path.startswith("scm/"):
+        raw_path = raw_path[4:].strip("/")
+    if not raw_path:
+        return ""
+    segments = raw_path.split("/")
+    if len(segments) < 2 or not all(_is_safe_repo_segment(s) for s in segments):
+        return ""
+    if host in ("github.com", "www.github.com", "ssh.github.com"):
+        host = ""
+    if host:
+        return f"{host}/{'/'.join(segments)}".replace("/", "%2F")
+    return "__".join(segments)
+
+
 def _context_repo_clone_dirs(repo_url: str) -> List[str]:
-    cleaned = repo_url.strip()
-    if cleaned.endswith(".git"):
-        cleaned = cleaned[:-4]
-    cleaned = cleaned.rstrip("/")
-    for scheme in ("https://", "http://", "ssh://"):
-        if cleaned.startswith(scheme):
-            cleaned = cleaned[len(scheme):]
-    if "@" in cleaned:
-        cleaned = cleaned.split("@", 1)[1]
-    cleaned = cleaned.replace(":", "/")
-    parts = [p for p in cleaned.split("/") if p]
-    if len(parts) < 3:
+    dir_name = _workspace_clone_dir_name(repo_url)
+    if not dir_name or ".." in dir_name or "/" in dir_name:
         return []
-    dir_name = "__".join(parts[1:])
+    alt_names = [dir_name]
+    ident = _parse_remote_url_identity(repo_url)
+    if ident and "/" in ident:
+        alt = ident.replace("/", "__")
+        if alt not in alt_names:
+            alt_names.append(alt)
     agent_home = Path((os.environ.get("PLATFORM_AGENT_HOME") or "/opt/data").rstrip("/") or "/")
     gitops_root = agent_home / "gitops"
     matches: List[str] = []
-    direct = gitops_root / dir_name
-    if direct.is_dir():
-        matches.append(str(direct))
-    if gitops_root.is_dir():
-        for lease in sorted(gitops_root.iterdir()):
-            if lease.is_dir():
-                cand = lease / dir_name
-                if cand.is_dir():
-                    matches.append(str(cand))
+    for dname in alt_names:
+        direct = gitops_root / dname
+        if direct.is_dir() and str(direct) not in matches:
+            matches.append(str(direct))
+        if gitops_root.is_dir():
+            for lease in sorted(gitops_root.iterdir()):
+                if lease.is_dir():
+                    cand = lease / dname
+                    if cand.is_dir() and str(cand) not in matches:
+                        matches.append(str(cand))
     return matches
 
 
@@ -634,8 +726,8 @@ def _match_glob(pattern: str, target: str) -> bool:
         return bool(tgt)
     if pat == tgt:
         return True
-    pat_segs = [s for s in pat.split("/") if s]
-    tgt_segs = [s for s in tgt.split("/") if s]
+    pat_segs = pat.split("/") if pat else []
+    tgt_segs = tgt.split("/") if tgt else []
 
     def _rec(pi: int, ti: int) -> bool:
         while pi < len(pat_segs):
@@ -714,11 +806,26 @@ def compare(actual: Any, op: str, expected: Any) -> bool:
     return ops.get(op, False)
 
 
+def _doc_resource_ids(doc: Any) -> List[str]:
+    if not isinstance(doc, dict):
+        return []
+    kind = str(doc.get("kind") or "").strip()
+    md = doc.get("metadata")
+    if not kind or not isinstance(md, dict):
+        return []
+    name = str(md.get("name") or "").strip()
+    if not name:
+        return []
+    ns = str(md.get("namespace") or "").strip()
+    with_ns = f"{kind}/{ns}/{name}"
+    if not ns:
+        return [with_ns, f"{kind}/{name}"]
+    return [with_ns]
+
+
 def _doc_resource_id(doc: Any) -> Optional[str]:
-    if isinstance(doc, dict) and doc.get("kind") and isinstance(doc.get("metadata"), dict):
-        md = doc["metadata"]
-        return f"{doc['kind']}/{md.get('namespace', '')}/{md.get('name', '')}"
-    return None
+    ids = _doc_resource_ids(doc)
+    return ids[0] if ids else None
 
 
 def _doc_applicable_to_path(doc: Any, path_expr: str) -> bool:
@@ -739,10 +846,11 @@ def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str],
     """Evaluate a guard over {path: content}. One result per matching document."""
     results = []
     op = expect["op"]
+    path_expr = str(expect["path"])
     for fpath, content in sorted(files.items()):
         if not _match_glob(str(expect["file"]), fpath):
             continue
-        if expect["path"] == "$text":
+        if path_expr == "$text":
             results.append({"file": fpath, "actual": "<text>",
                             "ok": compare(content, op, expect["value"])})
             continue
@@ -757,16 +865,31 @@ def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str],
         if len(docs) > 1 and scope_resources:
             scoped = [
                 d for d in docs
-                if _doc_resource_id(d) and any(_match_glob(g, _doc_resource_id(d) or "") for g in scope_resources)
+                if any(_match_glob(g, rid) for rid in _doc_resource_ids(d) for g in scope_resources)
             ]
             if scoped:
                 docs = scoped
-        elif len(docs) > 1:
-            applicable = [d for d in docs if _doc_applicable_to_path(d, str(expect["path"]))]
+        if len(docs) > 1:
+            applicable = [d for d in docs if _doc_applicable_to_path(d, path_expr)]
             if applicable:
                 docs = applicable
+        if len(docs) > 1:
+            matching_kinds = {
+                str(d.get("kind") or "").strip()
+                for d in docs
+                if isinstance(d, dict)
+                and str(d.get("kind") or "").strip()
+                and yaml_get(d, path_expr) is not None
+            }
+            if matching_kinds:
+                kind_filtered = [
+                    d for d in docs
+                    if isinstance(d, dict) and str(d.get("kind") or "").strip() in matching_kinds
+                ]
+                if kind_filtered:
+                    docs = kind_filtered
         for doc in docs:
-            actual = yaml_get(doc, expect["path"])
+            actual = yaml_get(doc, path_expr)
             if actual is None and op not in ("absent", "present"):
                 results.append({"file": fpath, "actual": None, "ok": False})
                 continue
@@ -780,12 +903,10 @@ def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str],
 # --------------------------------------------------------------------------
 
 def _resources_in(content: str) -> List[str]:
-    out = []
+    out: List[str] = []
     try:
         for d in yaml.safe_load_all(content):
-            rid = _doc_resource_id(d)
-            if rid:
-                out.append(rid)
+            out.extend(_doc_resource_ids(d))
     except yaml.YAMLError:
         pass
     return out
@@ -873,30 +994,67 @@ def _is_fleet_wide_clusters(clusters: List[str]) -> bool:
     return not clusters or clusters == ["*"]
 
 
-def _suppressed_files_by_precedence(records: List[Record], target_files: Iterable[str]) -> Dict[str, set]:
-    """Apply Precedence Rule 4 per file for active records only."""
+def _target_file_matches_narrow_cluster(target_file: str, clusters: List[str]) -> bool:
+    if _is_fleet_wide_clusters(clusters):
+        return True
+    segs = [s for s in target_file.strip("/").split("/") if s]
+    for raw_c in clusters:
+        c = str(raw_c or "").strip()
+        if not c or c == "*":
+            continue
+        for seg in segs:
+            if seg == c or c.endswith("-" + seg):
+                return True
+    return False
+
+
+def _precedence_suppression(
+    records: List[Record], target_files: Iterable[str]
+) -> Tuple[Dict[str, set], Dict[str, Dict[str, List[str]]]]:
     grouped: Dict[Tuple[str, str], List[Record]] = {}
     tfiles = list(target_files)
     for rec in records:
-        if rec.status != "active":
-            continue
         exp = rec.guard.get("expect")
-        if not exp:
+        if not isinstance(exp, dict) or not exp.get("path") or not exp.get("file"):
             continue
+        rec_clusters = rec.scope["clusters"]
         for mf in tfiles:
-            if _match_glob(str(exp["file"]), mf):
-                grouped.setdefault((mf, str(exp["path"])), []).append(rec)
-    suppressed: Dict[str, set] = {}
+            if not _match_glob(str(exp["file"]), mf):
+                continue
+            if not _is_fleet_wide_clusters(rec_clusters) and not _target_file_matches_narrow_cluster(mf, rec_clusters):
+                continue
+            grouped.setdefault((mf, str(exp["path"])), []).append(rec)
+    whole_file: Dict[str, set] = {}
+    excluded_resources: Dict[str, Dict[str, List[str]]] = {}
     for (mf, _path), group in grouped.items():
         if len(group) <= 1:
             continue
-        has_narrow = any(not _is_fleet_wide_clusters(r.scope["clusters"]) for r in group)
-        has_broad = any(_is_fleet_wide_clusters(r.scope["clusters"]) for r in group)
-        if has_narrow and has_broad:
-            for r in group:
-                if _is_fleet_wide_clusters(r.scope["clusters"]):
-                    suppressed.setdefault(r.id, set()).add(mf)
-    return suppressed
+        has_unscoped_active_narrow = False
+        scoped_narrow_resources: List[str] = []
+        has_broad = False
+        for r in group:
+            if _is_fleet_wide_clusters(r.scope["clusters"]):
+                has_broad = True
+            elif r.status == "active":
+                if not r.scope["resources"]:
+                    has_unscoped_active_narrow = True
+                else:
+                    scoped_narrow_resources.extend(r.scope["resources"])
+        if not has_broad or (not has_unscoped_active_narrow and not scoped_narrow_resources):
+            continue
+        for r in group:
+            if not _is_fleet_wide_clusters(r.scope["clusters"]):
+                continue
+            if has_unscoped_active_narrow:
+                whole_file.setdefault(r.id, set()).add(mf)
+            else:
+                excluded_resources.setdefault(r.id, {}).setdefault(mf, []).extend(scoped_narrow_resources)
+    return whole_file, excluded_resources
+
+
+def _suppressed_files_by_precedence(records: List[Record], target_files: Iterable[str]) -> Dict[str, set]:
+    """Apply Precedence Rule 4 per file for active records only."""
+    return _precedence_suppression(records, target_files)[0]
 
 
 def _select_precedence_winners(records: List[Record], target_files: Iterable[str]) -> List[Record]:
@@ -905,6 +1063,31 @@ def _select_precedence_winners(records: List[Record], target_files: Iterable[str
     if not tfiles:
         return list(records)
     return [r for r in records if not (suppressed_map.get(r.id) and set(tfiles).issubset(suppressed_map[r.id]))]
+
+
+def _filter_yaml_content_excluding_resources(
+    content: str, excluded_globs: List[str]
+) -> Tuple[str, bool]:
+    if not excluded_globs:
+        return content, True
+    try:
+        docs = [d for d in yaml.safe_load_all(content) if d is not None]
+    except yaml.YAMLError:
+        return content, True
+    if not docs:
+        return content, True
+    kept: List[str] = []
+    for d in docs:
+        covered = any(
+            _match_glob(g, rid)
+            for rid in _doc_resource_ids(d)
+            for g in excluded_globs
+        )
+        if not covered:
+            kept.append(yaml.safe_dump(d, sort_keys=False, allow_unicode=True).strip())
+    if not kept:
+        return "", False
+    return "\n---\n".join(kept) + "\n", True
 
 
 def match_change(
@@ -917,19 +1100,36 @@ def match_change(
     rec_list = [r for r in records if not r.meta.get("_parse_error")]
     by_id = {r.id: r for r in rec_list}
     active_candidates = [r for r in rec_list if r.status in ("active", "proposed")]
-    suppressed_files = _suppressed_files_by_precedence(active_candidates, changed.keys())
+    whole_suppressed, excluded_resources = _precedence_suppression(active_candidates, changed.keys())
     findings = []
     new_resources = {p: _resources_in(c) for p, c in changed.items() if c}
     for rec in active_candidates:
         s = rec.scope
-        sup_for_rec = suppressed_files.get(rec.id, set())
+        sup_for_rec = whole_suppressed.get(rec.id, set())
+        excl_for_rec = excluded_resources.get(rec.id, {})
+        filtered_content_by_file: Dict[str, str] = {}
         hits = set()
         for p in changed:
             if p in sup_for_rec:
                 continue
-            if any(_match_glob(g, p) for g in s["paths"]):
+            excl_globs = excl_for_rec.get(p, [])
+            file_rids = new_resources.get(p, [])
+            if excl_globs and changed.get(p) is not None:
+                filt, rem = _filter_yaml_content_excluding_resources(str(changed[p]), excl_globs)
+                if not rem:
+                    continue
+                filtered_content_by_file[p] = filt
+                file_rids = _resources_in(filt)
+            if (
+                not _is_fleet_wide_clusters(s["clusters"])
+                and s["paths"]
+                and p.strip("/").startswith("clusters/")
+                and not _target_file_matches_narrow_cluster(p, s["clusters"])
+            ):
+                pass
+            elif any(_match_glob(g, p) for g in s["paths"]):
                 hits.add(p)
-            for r in new_resources.get(p, []):
+            for r in file_rids:
                 if any(_match_glob(g, r) for g in s["resources"]):
                     hits.add(p)
         if not hits:
@@ -938,7 +1138,11 @@ def match_change(
         detail = []
         exp = rec.guard.get("expect")
         if exp:
-            files = {p: c for p, c in changed.items() if c is not None and p in hits}
+            files = {
+                p: filtered_content_by_file.get(p, str(c))
+                for p, c in changed.items()
+                if c is not None and p in hits
+            }
             detail = evaluate_guard(exp, files, s["resources"])
             deleted = [p for p in hits if changed.get(p) is None and _match_glob(str(exp["file"]), p)]
             if any(not d["ok"] for d in detail) or deleted:
@@ -951,7 +1155,9 @@ def match_change(
             severity = "warn" if (raw_sev == "block" and rec.status == "proposed") else raw_sev
         else:
             severity = "info"
-        superseded_records = [by_id[oid].summary() for oid in (rec.meta.get("supersedes") or []) if oid in by_id]
+        raw_sup = rec.meta.get("supersedes")
+        sup_ids = [str(x) for x in raw_sup] if isinstance(raw_sup, list) else []
+        superseded_records = [by_id[oid].summary() for oid in sup_ids if oid in by_id]
         findings.append({**rec.summary(), "verdict": verdict, "severity": severity,
                          "files": sorted(hits), "guard_results": detail,
                          "superseded_records": superseded_records})
@@ -1022,13 +1228,14 @@ def _ensure_scripts_on_path() -> None:
 
 def _resolve_sandbox_git_repo(repo: Path) -> Path:
     vcs_root = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", DEFAULT_VCS_ROOT))
-    if str(repo).startswith(str(vcs_root)):
+    if str(repo).startswith(str(vcs_root)) or str(repo) not in (".", "/opt/data"):
         return repo
     try:
         _ensure_scripts_on_path()
         import sandbox_exec  # type: ignore
+        quoted_root = shlex.quote(str(vcs_root))
         res = sandbox_exec.run(
-            ["/bin/sh", "-c", f"ls -d {vcs_root}/* 2>/dev/null | head -n 1"],
+            ["/bin/sh", "-c", f"ls -d {quoted_root}/* 2>/dev/null | head -n 1"],
             check=False,
         )
         cand = (res.stdout or "").strip()
@@ -1192,7 +1399,7 @@ class Hindsight:
             "strategy": RECORD_STRATEGY,
         }
         if rec.meta.get("date"):
-            item["timestamp"] = f"{rec.meta['date']}T00:00:00Z"
+            item["timestamp"] = f"{str(rec.meta['date'])[:10]}T00:00:00Z"
         self._req("POST", "/memories", {"items": [item], "async": False})
 
     def documents(self) -> List[Dict[str, Any]]:
@@ -1362,7 +1569,9 @@ def cmd_validate(a) -> Dict[str, Any]:
             problems[rec.path] = errs
     known = set(ids)
     for rec in records:
-        for ref in list(rec.meta.get("supersedes") or []) + ([rec.meta["superseded_by"]] if rec.meta.get("superseded_by") else []):
+        raw_sup = rec.meta.get("supersedes")
+        sup_refs = [str(x) for x in raw_sup] if isinstance(raw_sup, list) else []
+        for ref in sup_refs + ([str(rec.meta["superseded_by"])] if rec.meta.get("superseded_by") else []):
             if ref not in known:
                 problems.setdefault(rec.path, []).append(f"references unknown record {ref}")
     return {"records": len(records), "ok": not problems, "problems": problems}
@@ -1472,11 +1681,11 @@ def cmd_check(a) -> Dict[str, Any]:
     changed = _load_changed(a, target_repo)
     findings = match_change(records, changed)
     semantic: List[Dict[str, Any]] = []
-    if a.hindsight_url and a.semantic:
+    if (a.hindsight_url or os.environ.get("NATS_URL")) and a.semantic:
         query = a.semantic if isinstance(a.semantic, str) and a.semantic != "auto" else \
             "Changes to: " + ", ".join(sorted(changed))
         try:
-            semantic = semantic_related(Hindsight(a.hindsight_url, a.bank), query,
+            semantic = semantic_related(Hindsight(a.hindsight_url or "http://localhost:8888", a.bank), query,
                                         exclude=[f["id"] for f in findings])[: a.semantic_limit]
         except (urllib.error.URLError, OSError) as e:
             semantic = [{"id": None, "text": f"semantic search unreachable: {e}", "document_id": None}]
@@ -1498,7 +1707,7 @@ def _format_citation(rec_summary: Dict[str, Any]) -> str:
 
 
 def _why_single_path(repo: Path, target: str, records: List[Record], limit: int) -> Dict[str, Any]:
-    content = (repo / target).read_text(encoding="utf-8", errors="replace") if (repo / target).exists() else None
+    content = (repo / target).read_text(encoding="utf-8", errors="replace") if (repo / target).is_file() else None
     resources = _resources_in(content) if content else []
     governing = []
     for rec in records:
@@ -1804,12 +2013,22 @@ def cmd_from_outcome(a) -> Dict[str, Any]:
         "resolution": o.get("resolution"),
         "incident": o.get("incident"),
     }.items() if v}
-    body_lines = [
-        "## What happened", "", root_cause, "",
-        "## What fixed it", "", fix_text, "",
-        "## How we know it worked", "", ver_text, "",
-        "## Prevent it next time", "", prev_text,
-    ]
+    if record_type == "decision":
+        ctx_text = str((synth or {}).get("context") or o.get("context") or root_cause).strip()
+        dec_text = str((synth or {}).get("decision") or o.get("decision") or fix_text or reviewer_reason).strip()
+        cons_text = str((synth or {}).get("consequences") or o.get("consequences") or prev_text).strip()
+        body_lines = [
+            "## Context", "", ctx_text, "",
+            "## Decision", "", dec_text, "",
+            "## Consequences", "", cons_text,
+        ]
+    else:
+        body_lines = [
+            "## What happened", "", root_cause, "",
+            "## What fixed it", "", fix_text, "",
+            "## How we know it worked", "", ver_text, "",
+            "## Prevent it next time", "", prev_text,
+        ]
     if outcome_kind == "modified-merged":
         mod_note = reviewer_reason or "Reviewer modified the proposal before merging."
         body_lines.extend(["", "## Reviewer Modification Before Merge", "", mod_note])
@@ -1889,7 +2108,8 @@ def cmd_dream(a) -> Dict[str, Any]:
             continue
         report["verified"].append(rec.id)
     for rec in records:
-        for old in rec.meta.get("supersedes") or []:
+        raw_sup = rec.meta.get("supersedes")
+        for old in (raw_sup if isinstance(raw_sup, list) else []):
             o = by_id.get(old)
             if o and (o.status != "superseded" or o.meta.get("superseded_by") != rec.id):
                 report["supersession"].append({"id": old, "superseded_by": rec.id, "current_status": o.status})
@@ -1902,12 +2122,16 @@ def cmd_dream(a) -> Dict[str, Any]:
     guarded: Dict[Tuple[str, str], List[Record]] = {}
     for rec in records:
         exp = rec.guard.get("expect")
-        if rec.status == "active" and exp:
+        if rec.status == "active" and isinstance(exp, dict) and exp.get("file") and exp.get("path"):
             guarded.setdefault((exp["file"], exp["path"]), []).append(rec)
     for (fglob, fpath), recs in sorted(guarded.items()):
         exps = {(r.guard["expect"]["op"], str(r.guard["expect"]["value"])) for r in recs}
         if len(recs) > 1 and len(exps) > 1:
-            linked = any(o.id in (r.meta.get("supersedes") or []) for r in recs for o in recs)
+            linked = any(
+                o.id in (r.meta.get("supersedes") if isinstance(r.meta.get("supersedes"), list) else [])
+                for r in recs
+                for o in recs
+            )
             if not linked:
                 newest = max(recs, key=lambda r: str(r.meta.get("date", "")))
                 report["conflicts"].append({
@@ -2154,7 +2378,10 @@ def _normalize_proposal(raw: Dict[str, Any], by_pr: Dict[int, Dict[str, Any]],
         p["created_at"] = p["created"]
     if not p.get("html_url") and p.get("url"):
         p["html_url"] = p["url"]
-    cinfo = by_pr.get(num) or by_sha.get(str(p.get("merge_commit_sha") or p.get("sourceRevision") or ""))
+    raw_sha = str(p.get("merge_commit_sha") or p.get("mergeCommit") or p.get("sourceRevision") or "")
+    if raw_sha and not p.get("merge_commit_sha"):
+        p["merge_commit_sha"] = raw_sha
+    cinfo = by_pr.get(num) or by_sha.get(raw_sha)
     if cinfo:
         if not p.get("merge_commit_sha"):
             p["merge_commit_sha"] = cinfo["sha"]
@@ -2163,8 +2390,21 @@ def _normalize_proposal(raw: Dict[str, Any], by_pr: Dict[int, Dict[str, Any]],
     if not p.get("_files") and p.get("diff"):
         p["_files"] = _files_from_diff(str(p.get("diff") or ""))
     if not p.get("_comments") and p.get("comments"):
-        p["_comments"] = [{"user": c.get("author") or c.get("user"), "body": c.get("body", "")}
-                          for c in (p.get("comments") or [])]
+        norm_comments = []
+        for c in (p.get("comments") or []):
+            if not isinstance(c, dict):
+                continue
+            entry: Dict[str, Any] = {
+                "user": c.get("author") or c.get("user"),
+                "body": c.get("body", ""),
+                "bot": bool(c.get("bot", False)),
+            }
+            if "can_write" in c:
+                entry["can_write"] = c["can_write"]
+            elif "canWrite" in c:
+                entry["can_write"] = c["canWrite"]
+            norm_comments.append(entry)
+        p["_comments"] = norm_comments
     return p
 
 
@@ -2214,6 +2454,25 @@ def _vcs_fetch_all(repo: Path, repo_spec: str) -> Tuple[List[Dict[str, Any]], Li
 
     by_pr, by_sha = _git_commit_index(repo)
     re_eval_noise = re.compile(r"eval-spend|probe:|\[withdrawn-eval-probe\]", re.I)
+    author_can_write: Dict[Tuple[str, bool], bool] = {}
+
+    def _check_author_write(author: str, is_bot: bool) -> bool:
+        clean_author = author.strip()
+        if not clean_author or is_bot:
+            return False
+        cache_key = (clean_author.lower(), bool(is_bot))
+        if cache_key not in author_can_write:
+            try:
+                payload: Dict[str, Any] = {"login": clean_author}
+                if is_bot:
+                    payload["bot"] = True
+                id_resp = vc.forge("identity", payload, repository=repo_spec)
+                ident = (id_resp.get("identity") or {}) if isinstance(id_resp, dict) else {}
+                author_can_write[cache_key] = ident.get("canWrite") is True
+            except Exception:
+                author_can_write[cache_key] = False
+        return author_can_write[cache_key]
+
     normalized_prs: List[Dict[str, Any]] = []
     for raw_pr in prs:
         pr = _normalize_proposal(raw_pr, by_pr, by_sha)
@@ -2226,7 +2485,20 @@ def _vcs_fetch_all(repo: Path, repo_spec: str) -> Tuple[List[Dict[str, Any]], Li
                     {"number": int(pr["number"]), "comments": True, "diff": True, "limit": 100},
                     repository=repo_spec,
                 )
-                pr["_comments"] = view.get("comments") or []
+                raw_comments = view.get("comments") or []
+                verified_comments: List[Dict[str, Any]] = []
+                for c in raw_comments:
+                    if not isinstance(c, dict):
+                        continue
+                    c_copy = dict(c)
+                    author = str(c_copy.get("author") or c_copy.get("user") or "").strip()
+                    is_bot = bool(c_copy.get("bot", False))
+                    if "can_write" not in c_copy and "canWrite" not in c_copy:
+                        c_copy["can_write"] = _check_author_write(author, is_bot)
+                    elif "canWrite" in c_copy and "can_write" not in c_copy:
+                        c_copy["can_write"] = c_copy["canWrite"]
+                    verified_comments.append(c_copy)
+                pr["_comments"] = verified_comments
                 if not pr.get("_files") and view.get("diff"):
                     pr["_files"] = _files_from_diff(view["diff"])
             except Exception:
@@ -2430,7 +2702,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                     f"Supersedes earlier PR #{old_rev_pr} ({old_pr_obj.get('title', '')}).",
                 ])
             rec_body = "\n".join(rec_body_lines)
-            rel = f"knowledge/decisions/{rid}-{slug(rec_title)}.md"
+            rel = f"{_record_dir_for(repo, 'decision')}/{rid}-{slug(rec_title)}.md"
             if a.write:
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                 (repo / rel).write_text(render_record(meta, rec_body))
@@ -2516,7 +2788,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 body.strip(),
             ])
             rec_body = "\n".join(rec_body_lines)
-            rel = f"knowledge/decisions/{rid}-{slug(meta['title'])}.md"
+            rel = f"{_record_dir_for(repo, 'decision')}/{rid}-{slug(meta['title'])}.md"
             if a.write:
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                 (repo / rel).write_text(render_record(meta, rec_body))
@@ -2586,7 +2858,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             if (synth or {}).get("prevention"):
                 rec_body_lines.extend(["", "## Prevent it next time", "", str(synth["prevention"]).strip()])
             rec_body = "\n".join(rec_body_lines)
-            rel = f"knowledge/lessons/{rid}-{slug(title)}.md"
+            rel = f"{_record_dir_for(repo, 'lesson')}/{rid}-{slug(rec_title)}.md"
             if a.write:
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                 (repo / rel).write_text(render_record(meta, rec_body))
@@ -2658,7 +2930,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                         "",
                         str(synth.get("consequences") or "").strip(),
                     ])
-                    rel = f"knowledge/decisions/{rid}-{slug(rec_title)}.md"
+                    rel = f"{_record_dir_for(repo, 'decision')}/{rid}-{slug(rec_title)}.md"
                     triage_counts["decision"] += 1
                 else:
                     rec_body = "\n".join([
@@ -2675,7 +2947,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                         "",
                         str(synth.get("prevention") or "").strip(),
                     ])
-                    rel = f"knowledge/lessons/{rid}-{slug(rec_title)}.md"
+                    rel = f"{_record_dir_for(repo, 'lesson')}/{rid}-{slug(rec_title)}.md"
                     triage_counts["revert-lesson"] += 1
                 if a.write:
                     (repo / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -2691,7 +2963,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 for c in (pr.get("_comments") or [])
                 if isinstance(c, dict)
                 and not c.get("bot")
-                and c.get("can_write", True) is True
+                and (c.get("can_write") is True or c.get("canWrite") is True)
             ]
             comments_text = "\n\n".join(valid_comments).strip()
             cited_ids = sorted(set(re.findall(r"\b(?:DEC|LES)-\d{4}-\d{3,}\b", comments_text + "\n" + body)))
@@ -2760,7 +3032,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                         "",
                         str(synth.get("prevention") or "").strip(),
                     ])
-                    rel = f"knowledge/lessons/{rid}-{slug(rec_title)}.md"
+                    rel = f"{_record_dir_for(repo, 'lesson')}/{rid}-{slug(rec_title)}.md"
                     if a.write:
                         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                         (repo / rel).write_text(render_record(meta, rec_body))
@@ -2895,7 +3167,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "from-outcome": cmd_from_outcome, "dream": cmd_dream, "bootstrap": cmd_bootstrap}
     result = handlers[a.cmd](a)
     if a.cmd == "dream" and a.apply:
-        result["applied"] = apply_edits(Path(a.repo), result["proposed_edits"])
+        result["applied"] = apply_edits(_resolve_repo_dir(a.repo), result["proposed_edits"])
     if a.cmd == "check" and a.markdown:
         print(result["markdown"])
     else:

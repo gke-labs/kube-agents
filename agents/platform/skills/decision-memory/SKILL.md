@@ -78,7 +78,7 @@ Pass `--repo <local-clone-path>` (or `--repo <owner>/<repo>` when a working copy
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> why clusters/prod-eu/payments/quota.yaml
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> validate
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> check --base origin/main --semantic --markdown
-python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> from-outcome outcome.json
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> from-outcome outcome.json --write
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> dream
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> bootstrap --since 2y --write [--strict-block] [--extra-repo <read-only-adr-clone>]
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> index [--extra-repo <read-only-adr-clone>]

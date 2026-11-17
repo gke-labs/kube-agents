@@ -4684,6 +4684,131 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         })
         self.assertIn("LES-2026-001", ans.get("decisionMemoryMarkdown", ""))
 
+    def test_publish_blocks_oversize_padded_file_under_block_guard(self):
+        manifest_dir = self.seed / "clusters" / "prod"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        image: checkout:1.0\n",
+            encoding="utf-8",
+        )
+        rec_dir = self.seed / "knowledge" / "decisions"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / "DEC-2026-001-no-hostnetwork.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-001\n"
+            "title: Forbid hostNetwork in prod\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/*.yaml\n"
+            "guard:\n"
+            "  rule: hostNetwork must be absent.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.hostNetwork\n"
+            "    op: absent\n"
+            "---\n\nNever enable hostNetwork in prod.\n",
+            encoding="utf-8",
+        )
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "seed absent guard")
+        git(self.seed, "push", "--quiet", "origin", "main")
+
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/pad-evade")
+        padding = "# " + ("A" * 1020) + "\n"
+        oversize_yaml = (
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      hostNetwork: true\n      containers:\n      - name: checkout\n"
+            "        image: checkout:1.0\n"
+            + (padding * 4200)
+        )
+        self.assertGreater(len(oversize_yaml.encode("utf-8")), vcs_broker.DM_MAX_GUARD_FILE_BYTES)
+        (work / "clusters" / "prod" / "checkout.yaml").write_text(oversize_yaml, encoding="utf-8")
+        git(work, "add", "-A")
+        git(work, "commit", "--quiet", "-m", "add hostNetwork with >4MiB comment padding")
+        bundle = self.bundle_of(work, "platform-agent/pad-evade", cloned["revision"])
+
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/pad-evade",
+                "target": "main",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle,
+            })
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("DEC-2026-001", str(caught.exception))
+
+    def test_publish_refuses_when_policy_base_branch_cannot_be_resolved_or_fetched(self):
+        self._seed_guard_on_main()
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/no-policy-branch")
+        (work / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n",
+            encoding="utf-8",
+        )
+        git(work, "add", "-A")
+        git(work, "commit", "--quiet", "-m", "valid change")
+        bundle = self.bundle_of(work, "platform-agent/no-policy-branch", cloned["revision"])
+
+        with mock.patch.object(self.broker, "_default_branch_of_remote", return_value=""):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.broker.publish({
+                    "repository": self.REPOSITORY,
+                    "branch": "platform-agent/no-policy-branch",
+                    "target": "main",
+                    "baseRevision": cloned["revision"],
+                    "bundleBase64": bundle,
+                })
+        self.assertEqual(caught.exception.status, 502)
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_CHECK_FAILED")
+
+        with mock.patch.object(self.broker, "_default_branch_of_remote", return_value="nonexistent-policy-branch"):
+            with self.assertRaises(WorkspaceError) as caught2:
+                self.broker.publish({
+                    "repository": self.REPOSITORY,
+                    "branch": "platform-agent/no-policy-branch",
+                    "target": "main",
+                    "baseRevision": cloned["revision"],
+                    "bundleBase64": bundle,
+                })
+        self.assertEqual(caught2.exception.status, 502)
+        self.assertEqual(caught2.exception.fields.get("code"), "DECISION_MEMORY_CHECK_FAILED")
+
+    def test_publish_succeeds_with_non_ascii_paths_and_evaluates_guards(self):
+        self._seed_guard_on_main()
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/unicode-path")
+        (work / "docs").mkdir(parents=True, exist_ok=True)
+        (work / "docs" / "café.md").write_text("# Café notes\n", encoding="utf-8")
+        (work / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n",
+            encoding="utf-8",
+        )
+        git(work, "add", "-A")
+        git(work, "commit", "--quiet", "-m", "touch non-ascii path and raise memory")
+        bundle = self.bundle_of(work, "platform-agent/unicode-path", cloned["revision"])
+
+        ans = self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/unicode-path",
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": bundle,
+        })
+        self.assertIn("LES-2026-001", ans.get("decisionMemoryMarkdown", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

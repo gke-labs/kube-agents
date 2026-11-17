@@ -50,6 +50,9 @@ func TestBuildA2ACuratorDeploymentIsCredentialFreeAndHardened(t *testing.T) {
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
 		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.AutomountServiceAccountToken)
 	}
+	if pod.DNSConfig == nil || len(pod.DNSConfig.Options) != 1 || pod.DNSConfig.Options[0].Name != "ndots" || pod.DNSConfig.Options[0].Value == nil || *pod.DNSConfig.Options[0].Value != "3" {
+		t.Errorf("DNSConfig = %+v, want ndots=3 from brokerCallerPodDNSConfig()", pod.DNSConfig)
+	}
 	for _, vol := range pod.Volumes {
 		if vol.Secret != nil {
 			t.Errorf("curator pod mounts Secret volume %q (%s); curator must hold zero Secrets", vol.Name, vol.Secret.SecretName)

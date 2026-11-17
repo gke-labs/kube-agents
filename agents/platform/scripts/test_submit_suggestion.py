@@ -2361,6 +2361,12 @@ class DecisionMemoryGuardTest(unittest.TestCase):
         self.assertIn("DECISION MEMORY GUARD BLOCKED THIS CHANGE", str(caught.exception))
         self.assertIn("LES-2026-001", str(caught.exception))
 
+        # Also verify force=True when the entire knowledge/ directory is removed in the working tree
+        shutil.rmtree(self.repo / "knowledge")
+        with self.assertRaises(PermissionError) as caught_force:
+            submit_suggestion._check_decision_memory(session, "main", force=True)
+        self.assertIn("LES-2026-001", str(caught_force.exception))
+
     def test_consistent_change_passes_guard(self):
         git(self.repo, "checkout", "--quiet", "-b", "platform-agent/raise-mem")
         (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
