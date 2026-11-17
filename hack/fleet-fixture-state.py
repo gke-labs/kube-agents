@@ -57,16 +57,39 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-world-open firewall rule and its VM) is published as `<role>.confirmed`
-alone, and its subjects are read with `gcloud compute instances list` or
-`gcloud compute firewall-rules list` in the project. `serial_contains` reads
+world-open firewall rule and its VM, the peered jumbo-frame network) is
+published as `<role>.confirmed` alone, and its subjects are read with
+`gcloud compute instances list`, `gcloud compute firewall-rules list` or
+`gcloud compute networks list` in the project. `serial_contains` reads
 an instance subject's serial port 1 output as well, with `gcloud compute
 instances get-serial-port-output`: the startup-fail VM's failure line is
 printed at boot only, and the buffer that holds it rotates within weeks.
 
+A `repository/<path>` subject is a file in the pool project's GitOps
+repository (`gke-agentic/<project>-infra`), the one place a fixture lives
+that is neither on a cluster nor in the project: the declared-intent note
+the declared-* roles rest on. Its one op, `as_seeded`, holds the file's git
+blob sha to the one provisioning seeds, read through the pool verifier
+(scripts/verify_ci_pool_project.py, `gitops_seeded_file_state`), which owns
+the seeded content and the repository read; one contents read per path per
+pass serves every role on it. Forty registered projects carried the
+five-item note after a sixth declaration landed, and the cases on it graded
+`fail` on a correct report because this script read the node pools only
+(#5827). A note that is not the seeded one, or is missing from a repository
+that answers, is drift; a repository the credential cannot see (gh and the
+API answer 404 for that too) or a transient leaves the role not checked. A
+pass with no credential at all does not make the assertion: the role rests
+on what the identity can read and the report's `unasserted` list names the
+subject, so the hourly scan, which holds no credential for the pool
+repositories by design, still reads the roles healthy and can still end an
+incident on them. The presubmit and the nightly read the note with their
+grading token (hack/ci-eval-pr.sh, scan_lease_fixtures). Only an operator's
+replace clears a note drift, so it never holds a `--wait`.
+
 What it never does: mutate anything (every read is `kubectl get -o json`,
-`gcloud container clusters describe`, `gcloud compute ... list` or `gcloud
-compute instances get-serial-port-output`), address a cluster it discovered itself
+`gcloud container clusters describe`, `gcloud compute ... list`, `gcloud
+compute instances get-serial-port-output` or a GET of the contents API),
+address a cluster it discovered itself
 (the runner recorded each slot's cluster and location in `.fleet-context`), or
 kill the job. Weather -- an unreachable API server, a refused describe -- leaves
 the role "not checked" with a warning and no drift file; only positive
@@ -93,7 +116,8 @@ With `--report PATH` the same verdicts are written as JSON, one entry per
 catalog role: `converged`, `drifted` or `unchecked` with the lines above as
 `detail`, `unpublished` for a role the runner did not publish (no kubeconfig,
 or for a project-scoped role no `.confirmed` list), and `no_state` for one
-that declares no assertions.
+that declares no assertions; beside them, `unasserted` lists the subjects the
+pass had no credential to read, with their roles and the reason.
 
 Exit 0 whenever the fleet was looked at, whatever it found; 1 on a repository
 bug (unreadable catalog, malformed `state` entry, missing directory).
@@ -102,6 +126,7 @@ bug (unreadable catalog, malformed `state` entry, missing directory).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -111,6 +136,12 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# The pool verifier, which owns what provisioning seeds into a pool
+# repository and the read of it; loaded on the first repository subject only,
+# so a catalog with none never pays for it (see _verifier).
+VERIFIER_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "verify_ci_pool_project.py"
+VERIFIER_MODULE_NAME = "verify_ci_pool_project"
 
 # Files the runner (hack/fleet-kubeconfigs.sh) writes and this script reads or
 # writes beside them. `.drift` is this script's own output, one file per
@@ -128,13 +159,31 @@ MARKER_FILE = ".kube-agents-fleet-kubeconfigs"
 # carry control-plane defects that no in-cluster object shows.
 CLUSTER_SUBJECT = "cluster"
 
+# `repository/<path>`: a file in the pool project's GitOps repository, read
+# through the verifier. The path is relative, slash-separated, with no `..`
+# step and none of the shell's characters; and it must be one provisioning
+# seeds (the verifier's GITOPS_SEEDED_FILES), or the assertion has nothing to
+# hold the file to. scripts/test_eval_rosters.py reads REPOSITORY_SUBJECT to
+# learn which roles the scan guards in the pool repository, and
+# bench/kube_agents_bench/fixture_drift.py matches drift lines on it.
+REPOSITORY_SUBJECT = "repository"
+# Every step starts with a letter or digit, so `..`, a hidden file and a
+# leading slash are refused by shape.
+REPOSITORY_SUBJECT_RE = re.compile(
+    rf"{REPOSITORY_SUBJECT}/(?P<path>[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*)"
+)
+# How much of a blob sha a drift line shows: git's own short form.
+BLOB_SHA_SHORT = 8
+
 # A project-scoped role (`cluster_slot: null`) is a Compute Engine object no
 # cluster carries. Its subjects are `<kind>/<name-prefix>*`, read with
 # `gcloud compute <collection> list` in the project, and this is the kind to
 # collection map. The runner's probe grammar (hack/fleet-kubeconfigs.sh,
-# PROJECT_PROBE) accepts the same two kinds.
-PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules"}
-PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
+# PROJECT_PROBE) accepts the same three kinds. A network's listing carries
+# its `peerings`, which is how the declared-mtu-peering role reads both
+# halves of its peering, one list per network.
+PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}
+PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
@@ -206,19 +255,28 @@ OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
 # buffer of about 1 MiB, so a line the guest prints at boot only is there
 # until later output pushes it out.
 OP_SERIAL_CONTAINS = "serial_contains"
+# `as_seeded` reads a `repository/<path>` subject whole and takes no value:
+# the file's blob sha is the one provisioning seeds at that path (the
+# verifier's gitops_seeded_blob_sha). No object (a 404 from a repository that
+# answers) fails it: a missing note files the posture as a finding as a stale
+# one does.
+OP_AS_SEEDED = "as_seeded"
 # Ops a `--wait` cannot see converge, so their drift does not hold the pass:
-# the clock clears an age, in hours, and only a reboot of the VM (the next
-# reconcile's reset) puts a rotated line back on a serial console.
-OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS})
+# the clock clears an age, in hours, only a reboot of the VM (the next
+# reconcile's reset) puts a rotated line back on a serial console, and only
+# an operator's replace puts the seeded file back.
+OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS, OP_AS_SEEDED})
 OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS})
 # Ops whose `value` must be a number; anything else is a catalog bug.
 OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
 # Ops whose `value` must be a non-empty string.
 OPS_WITH_STRING_VALUE = frozenset({OP_SERIAL_CONTAINS})
-OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD})
+OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD, OP_AS_SEEDED})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
 # Ops that read the subject's objects whole and therefore take no path.
-OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE, OP_SERIAL_CONTAINS})
+OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE, OP_SERIAL_CONTAINS, OP_AS_SEEDED})
+# The repository subject's only op, and that op's only subject.
+REPOSITORY_ONLY_OPS = frozenset({OP_AS_SEEDED})
 # Ops whose subject must be a project-scoped `instance/<prefix>*`.
 INSTANCE_SUBJECT_ONLY_OPS = frozenset({OP_SERIAL_CONTAINS})
 INSTANCE_KIND = "instance"
@@ -291,6 +349,14 @@ SUMMARY_FORMAT = (
     "{drifted} drifted, {unchecked} not checked (project {project})"
 )
 
+# The warning for a subject the pass had no credential to read, one per
+# subject. scripts/verify_ci_pool_project.py (FLEET_STATE_UNASSERTED_MARK)
+# recognises it on the script's stderr; a test holds the two together.
+UNASSERTED_WARNING = (
+    "{subject} was not asserted in {project} (no credential to read it with: {reason}); "
+    "roles {roles} are judged on their other assertions"
+)
+
 # `--report` verdicts, one per catalog role. The first three are the summary
 # line's three counts; the last two are roles the summary does not count.
 REPORT_SCHEMA_VERSION = 1
@@ -312,8 +378,42 @@ class Unreadable(Exception):
     """The subject could not be read this pass; nothing is known about it."""
 
 
+class Unasserted(Exception):
+    """The pass has nothing to read the subject with, so the assertion was
+    not made: a repository subject with no GitHub credential at all. Not a
+    failed read -- the role is judged on what this identity can read, and the
+    report names what it left out -- because the hourly scan holds no such
+    credential by design, and a role it could never read as healthy would
+    hold every incident on it open and the digest's clean line out of reach."""
+
+
 def _warn(message: str) -> None:
     print(f"WARNING: {message}", file=sys.stderr)
+
+
+_VERIFIER = None
+
+
+def _verifier():
+    """scripts/verify_ci_pool_project.py as a module, loaded once: the one
+    copy of what provisioning seeds into a pool repository (GITOPS_SEEDED_FILES,
+    gitops_seeded_blob_sha), the read of it (gitops_seeded_file_state) and
+    the repair it prints (gitops_seeded_file_repair)."""
+    global _VERIFIER
+    if _VERIFIER is None:
+        spec = importlib.util.spec_from_file_location(VERIFIER_MODULE_NAME, VERIFIER_SCRIPT)
+        if spec is None or spec.loader is None:
+            raise CatalogError(f"cannot load the pool verifier at {VERIFIER_SCRIPT}, which a repository subject reads through")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _VERIFIER = module
+    return _VERIFIER
+
+
+def repository_path(subject: str) -> str | None:
+    """The path a `repository/<path>` subject names; None for any other subject."""
+    match = REPOSITORY_SUBJECT_RE.fullmatch(str(subject))
+    return match.group("path") if match else None
 
 
 # --- Catalog ------------------------------------------------------------------
@@ -391,7 +491,18 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
             if not isinstance(entry, dict):
                 raise CatalogError(f"{where} is not a mapping")
             subject = entry.get("subject")
-            if project_scoped:
+            in_repository = repository_path(subject) if isinstance(subject, str) else None
+            if in_repository is not None:
+                # A seeded file in the pool repository, on a cluster role or a
+                # project-scoped one alike (the repository is the project's):
+                # the verifier must know what provisioning puts there, or
+                # there is nothing to hold it to.
+                if in_repository not in _verifier().GITOPS_SEEDED_FILES:
+                    raise CatalogError(
+                        f"{where} names {in_repository!r}, which provisioning does not seed "
+                        f"(the verifier's GITOPS_SEEDED_FILES: {sorted(_verifier().GITOPS_SEEDED_FILES)})"
+                    )
+            elif project_scoped:
                 # Only the Compute Engine shape: a project-scoped role has no
                 # cluster to describe and no kubeconfig to read objects with.
                 if not isinstance(subject, str) or not PROJECT_SUBJECT_RE.fullmatch(subject):
@@ -403,6 +514,8 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
             op = entry.get("op")
             if op not in OPS:
                 raise CatalogError(f"{where} names unknown op {op!r} (known: {sorted(OPS)})")
+            if (op in REPOSITORY_ONLY_OPS) != (in_repository is not None):
+                raise CatalogError(f"{where}: a `{REPOSITORY_SUBJECT}/<path>` subject takes op {OP_AS_SEEDED!r} and nothing else does")
             if op in CLUSTER_ONLY_OPS and subject != CLUSTER_SUBJECT:
                 raise CatalogError(f"{where}: op {op!r} applies to the cluster subject only")
             if op in NODE_SELECTOR_ONLY_OPS and not str(subject).startswith(f"{NODE_KIND}?"):
@@ -425,7 +538,7 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 if op not in OPS_WITHOUT_PATH:
                     raise CatalogError(f"{where}: op {op!r} needs a path")
                 steps = None
-            elif op in NODE_SELECTOR_ONLY_OPS or op in INSTANCE_SUBJECT_ONLY_OPS:
+            elif op in NODE_SELECTOR_ONLY_OPS or op in INSTANCE_SUBJECT_ONLY_OPS or op in REPOSITORY_ONLY_OPS:
                 raise CatalogError(f"{where}: op {op!r} reads the objects whole and takes no path")
             elif isinstance(path, str):
                 steps = parse_path(path)
@@ -569,6 +682,24 @@ def read_serial(project: str, name: str, zone: str) -> str:
     if not out.strip():
         raise Unreadable(f"get-serial-port-output {name} returned no output")
     return out
+
+
+def read_repository(project: str, path: str) -> list[dict]:
+    """The file a `repository/<path>` subject names in `project`'s GitOps
+    repository, as `[{"sha": <blob sha>}]`; `[]` when the repository answered
+    and the path is not there (an observation the assertion fails on). The
+    verifier does the read and tells a missing file from a repository this
+    credential cannot see; with no credential at all the read is not made
+    (Unasserted); anything else it could not settle is Unreadable."""
+    verifier = _verifier()
+    state, detail = verifier.gitops_seeded_file_state(project, path)
+    if state == verifier.GITHUB_PATH_PRESENT:
+        return [{"sha": detail}]
+    if state == verifier.GITHUB_PATH_ABSENT:
+        return []
+    if state == verifier.GITHUB_PATH_NO_CREDENTIAL:
+        raise Unasserted(detail)
+    raise Unreadable(f"{path} in the pool repository: {detail}")
 
 
 def read_cluster(project: str, name: str, location: str) -> dict:
@@ -744,7 +875,7 @@ def _describe(values: list) -> str:
     return f"observed {shown}"
 
 
-def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None, serial_for=None) -> str | None:
+def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None, serial_for=None, seeded_for=None) -> str | None:
     """None when the assertion holds; otherwise one line saying what was seen.
 
     `channel_default` is a callable returning the channel default version for
@@ -755,7 +886,10 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
     `pods_by_node` is a callable returning {node name: [pod, ...]} for every
     bound pod in the cluster, used by `node_cpu_spare_ge` only, lazy for the
     same reason. `serial_for` is a callable returning one listed instance's
-    serial port 1 output, used by `serial_contains` only.
+    serial port 1 output, used by `serial_contains` only. `seeded_for` is a
+    callable returning (the blob sha provisioning seeds at a repository path,
+    a callable from the live file's sha to the repair to name), used by
+    `as_seeded` only.
     """
     op, expected = entry["op"], entry["value"]
     label = " ".join(part for part in (entry["subject"], entry["path"], op) if part)
@@ -867,6 +1001,18 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
             # Only positive evidence is drift: a console nobody read may hold it.
             raise Unreadable("; ".join(failed))
         return f"{label}: not in the serial port {SERIAL_PORT} output of {', '.join(searched)}"
+    elif op == OP_AS_SEEDED:
+        if seeded_for is None:  # pragma: no cover - check_role always supplies it
+            raise CatalogError(f"op {op!r} needs the seeded-file reader")
+        seeded, repair_for = seeded_for(repository_path(entry["subject"]))
+        observed = [str(obj.get("sha") or "") for obj in objects if isinstance(obj, dict)]
+        if len(observed) == 1 and observed[0] == seeded:
+            return None
+        if observed:
+            seen = f"observed blob {observed[0][:BLOB_SHA_SHORT]}, seeded blob {seeded[:BLOB_SHA_SHORT]}"
+        else:
+            seen = _describe([])
+        return f"{label}: {seen}; {repair_for(observed[0] if observed else '')}"
     else:  # pragma: no cover - load_assertions rejects unknown ops
         raise CatalogError(f"unknown op {op!r}")
     return None if ok else f"{label}: {_describe(values)}"
@@ -892,9 +1038,23 @@ class Reader:
         self._channels: dict[tuple[str, str], dict | None | Unreadable] = {}
         self._pods: dict[Path, dict[str, list]] = {}
         self._serial: dict[tuple[str, str], str | Unreadable] = {}
+        # One contents read per seeded path per pass, whichever way it went:
+        # the declared-* roles share the note.
+        self._repository: dict[str, list | Unreadable | Unasserted] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
+        path = repository_path(subject)
+        if path is not None:
+            if path not in self._repository:
+                try:
+                    self._repository[path] = read_repository(self.project, path)
+                except (Unreadable, Unasserted) as exc:
+                    self._repository[path] = exc
+            cached = self._repository[path]
+            if isinstance(cached, (Unreadable, Unasserted)):
+                raise cached
+            return cached
         if spec["cluster_slot"] is None:
             return read_compute(self.project, subject)
         if subject == CLUSTER_SUBJECT:
@@ -959,6 +1119,16 @@ class Reader:
             raise cached
         return cached
 
+    def seeded_for(self, path: str):
+        """(the blob sha provisioning seeds at `path`, a callable giving the
+        repair to name for this project once the live file's sha is known)."""
+        verifier = _verifier()
+
+        def repair(sha: str) -> str:
+            return verifier.gitops_seeded_file_repair(self.project, path, sha)
+
+        return verifier.gitops_seeded_blob_sha(path), repair
+
     def pods_by_node_for(self, role: str):
         """The cluster's bound pods grouped by node, read once per role per pass."""
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -976,19 +1146,22 @@ class Reader:
         return lookup
 
 
-def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str], bool]:
-    """(drift lines, unreadable lines, worth waiting for) for one role in one pass.
+def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str], list[tuple[str, str]], bool]:
+    """(drift lines, unreadable lines, unasserted (subject, reason) pairs,
+    worth waiting for) for one role in one pass.
 
     Objects are read once per distinct subject, so two assertions on the same
     pod list cost one kubectl. An assertion whose subject could not be read
     lands in the second list; the caller decides what that means once it
-    knows whether anything else in the role was positively out of shape. The
-    flag is true when some failed assertion could converge within a wait,
-    which an age gate and a rotated serial console cannot
-    (`OPS_A_WAIT_CANNOT_CLEAR`).
+    knows whether anything else in the role was positively out of shape. One
+    the pass had nothing to read with (Unasserted) lands in the third, and
+    says nothing about the role's verdict. The flag is true when some failed
+    assertion could converge within a wait, which an age gate, a rotated
+    serial console and a seeded file cannot (`OPS_A_WAIT_CANNOT_CLEAR`).
     """
     drift: list[str] = []
     unreadable: list[str] = []
+    unasserted: list[tuple[str, str]] = []
     settling = False
     cache: dict[str, list] = {}
     for entry in spec["state"]:
@@ -996,9 +1169,12 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
         if subject not in cache:
             try:
                 cache[subject] = reader.objects_for(role, spec, subject)
-            except Unreadable as exc:
+            except (Unreadable, Unasserted) as exc:
                 cache[subject] = exc
         objects = cache[subject]
+        if isinstance(objects, Unasserted):
+            unasserted.append((subject, str(objects)))
+            continue
         if isinstance(objects, Unreadable):
             unreadable.append(f"{subject}: {objects}")
             continue
@@ -1010,6 +1186,7 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
                 channel_valid=reader.channel_valid_for(spec),
                 pods_by_node=reader.pods_by_node_for(role),
                 serial_for=reader.serial_for,
+                seeded_for=reader.seeded_for,
             )
         except Unreadable as exc:
             unreadable.append(f"{subject}: {exc}")
@@ -1017,7 +1194,7 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
         if problem:
             drift.append(problem + (f" (why: {entry['why']})" if entry["why"] else ""))
             settling = settling or entry["op"] not in OPS_A_WAIT_CANNOT_CLEAR
-    return drift, unreadable, settling
+    return drift, unreadable, unasserted, settling
 
 
 def published(directory: Path, role: str, spec: dict) -> bool:
@@ -1056,12 +1233,17 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
     converged: list[str] = []
     last: dict[str, tuple[list[str], list[str]]] = {}
     settling: dict[str, bool] = {}
+    # {subject: (reason, roles)} for the assertions this pass had nothing to
+    # read with, kept out of every verdict and named once in the report.
+    unasserted: dict[str, tuple[str, set[str]]] = {}
     deadline = time.monotonic() + max(wait, 0.0)
     while True:
         reader = Reader(directory, project, context)
         for role in sorted(pending):
-            drift, unreadable, settling[role] = check_role(reader, role, pending[role])
+            drift, unreadable, left_out, settling[role] = check_role(reader, role, pending[role])
             last[role] = (drift, unreadable)
+            for subject, reason in left_out:
+                unasserted.setdefault(subject, (reason, set()))[1].add(role)
             if not drift and not unreadable:
                 converged.append(role)
                 # Idempotent across re-runs: a role that has converged since a
@@ -1119,6 +1301,12 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
                 f"fixture role '{role}' could not be checked in {project}; nothing is "
                 f"known about its state: " + "; ".join(unreadable)
             )
+    left_out = [
+        {"subject": subject, "roles": sorted(role_set), "reason": reason}
+        for subject, (reason, role_set) in sorted(unasserted.items())
+    ]
+    for entry in left_out:
+        _warn(UNASSERTED_WARNING.format(subject=entry["subject"], project=project, reason=entry["reason"], roles=", ".join(entry["roles"])))
     print(
         SUMMARY_FORMAT.format(
             converged=len(converged), drifted=drifted, unchecked=unchecked, project=project
@@ -1126,15 +1314,17 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         file=sys.stderr,
     )
     if report is not None:
-        write_report(report, project, roles, verdicts, converged=len(converged), drifted=drifted, unchecked=unchecked)
+        write_report(report, project, roles, verdicts, left_out, converged=len(converged), drifted=drifted, unchecked=unchecked)
     return EXIT_OK
 
 
-def write_report(path: Path, project: str, roles: dict[str, dict], verdicts: dict[str, tuple[str, list[str]]], **counts: int) -> None:
+def write_report(path: Path, project: str, roles: dict[str, dict], verdicts: dict[str, tuple[str, list[str]]], unasserted: list[dict], **counts: int) -> None:
     """Every catalog role's verdict as JSON, for a caller that runs this
     script per project and must not parse its warnings. A role the runner
     published no kubeconfig for is `unpublished` (the runner already said
-    why on its own stderr); one with no `state` list is `no_state`."""
+    why on its own stderr); one with no `state` list is `no_state`.
+    `unasserted` lists the subjects the pass had nothing to read with, each
+    with the roles it sits on and the reason, outside every verdict."""
     entries = {}
     for role, spec in sorted(roles.items()):
         if role in verdicts:
@@ -1149,6 +1339,7 @@ def write_report(path: Path, project: str, roles: dict[str, dict], verdicts: dic
         "project": project,
         "roles": entries,
         "summary": dict(counts),
+        "unasserted": unasserted,
     }
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 

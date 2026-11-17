@@ -1,0 +1,24 @@
+# One image: the Hermes bridge sidecar, built FROM a platform-agent image that is
+# already in the registry. dev_rebuild_agent.sh submits it after its agent build.
+# It is the `a2a-bridge` step of deploy/docker/cloudbuild-ci.yaml, alone:
+# deploy/docker/cloudbuild.yaml builds one --target of deploy/docker/Dockerfile,
+# and the bridge has a Dockerfile of its own in the a2a module.
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_BRIDGE_URI"
+      - "--build-arg"
+      - "PLATFORM_AGENT_IMAGE=$_PLATFORM_URI"
+      - "-f"
+      - "a2a/Dockerfile.hermes-bridge"
+      - "a2a"
+timeout: 1800s
+images:
+  - "$_BRIDGE_URI"
+substitutions:
+  _BRIDGE_URI: ""
+  _PLATFORM_URI: ""

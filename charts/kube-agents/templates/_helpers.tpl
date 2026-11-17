@@ -2485,6 +2485,28 @@ these have passed.
 ^(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$
 {{- end }}
 
+{{- /* kube-agents.sessionResourcesCheck refuses a session-pod resources value the operator
+       cannot read (#2371). The CRD's quantity pattern also admits a decimal exponent (1e.5),
+       which the API server stores and resource.ParseQuantity then refuses on every decode of
+       the PlatformAgent. A sign is allowed, since the resolver treats zero and negative as
+       unset, and requests aren't compared with limits, since the resolver reconciles them.
+       values.schema.json holds the names to cpu and memory. Renders nothing; call it before
+       reading the values. Args: resources, prefix (the values path, for the message). */ -}}
+{{- define "kube-agents.sessionResourcesCheck" -}}
+{{- $prefix := .prefix -}}
+{{- $quantityPattern := include "kube-agents.quantityPattern" . -}}
+{{- range $side, $quantities := pick (.resources | default dict) "requests" "limits" -}}
+{{- range $name, $quantity := $quantities | default dict -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- if not (regexMatch $quantityPattern (trimPrefix "-" (trimPrefix "+" $raw))) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "kube-agents.containerResourcesCheck" -}}
 {{- $resources := .resources | default dict -}}
 {{- $prefix := .prefix -}}

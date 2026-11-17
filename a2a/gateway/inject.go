@@ -340,6 +340,16 @@ type injectRequest struct {
 	// the turn's task is submitted with a change requested. Anything else
 	// is refused.
 	Intent string `json:"intent,omitempty"`
+	// Profile, when set, addresses the turn to that AgentProfile as a new
+	// top task, as the console's frame can (#5945): the turn takes the one
+	// shared profile path every door takes (handleInbound), with its card,
+	// tier, parameter and scope checks. Held to a subject token's shape here,
+	// since it becomes one. Empty sends the turn as any other.
+	Profile string `json:"profile,omitempty"`
+	// Parameters are the profile task's parameters (its target's project,
+	// location and cluster, and any the profile declares), checked where the
+	// turn is routed (resolveProfile). Only with Profile: platform takes none.
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // injectResponse is the POST /inject reply.
@@ -1413,6 +1423,14 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		injectError(w, http.StatusBadRequest, injectConfirmOffError)
 		return
 	}
+	if req.Profile != "" && !lib.ValidSubjectToken(req.Profile) {
+		injectError(w, http.StatusBadRequest, "profile is not an agent profile's name")
+		return
+	}
+	if req.Profile == "" && len(req.Parameters) > 0 {
+		injectError(w, http.StatusBadRequest, "parameters go with a profile; platform takes none")
+		return
+	}
 
 	a.handlerMu.RLock()
 	handler := a.handler
@@ -1484,6 +1502,8 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		MessageID:    messageID,
 		Text:         req.Text,
 		Intent:       req.Intent,
+		Profile:      req.Profile,
+		Parameters:   req.Parameters,
 		// Stamped rather than inferred: this door can be armed beside a real
 		// backend, and the authority block has to name the door the message
 		// came through rather than the backend the process was configured

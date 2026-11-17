@@ -84,7 +84,7 @@ var (
 	// value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
 	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
-	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
+	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t*_]*([=:])[ \t]*)`) // a * or _ left as text may precede the separator (#6182)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
 	// credentials, a DSN or private material (ENCRYPTION_KEY, STRIPE_KEY,
@@ -1716,7 +1716,8 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 		key := s[pos+loc[4] : pos+loc[5]]
 		closeQuote := s[pos+loc[6] : pos+loc[7]]
 		sep := s[pos+loc[10]]
-		hadPreSepSpace := loc[10] > loc[8]
+		// Only a blank counts here, not a mark the separator group allows.
+		hadPreSepSpace := strings.ContainsAny(s[pos+loc[8]:pos+loc[10]], " \t")
 		hadPostSepSpace := loc[9] > loc[11]
 		pos = matchEnd
 		if !inlineSecretKey(key) {
@@ -2529,13 +2530,18 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	return prefix == "" || prefix == "-"
 }
 
+// inlineKVLaterKeyPattern is inlineKVSecretPattern without marks before the
+// separator. A later key that ends a value is looked for with it, so a
+// passphrase holding "secret*:" stays one value.
+var inlineKVLaterKeyPattern = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
+
 func hasLaterInlineKVAssignment(lineRest string) bool {
 	ws := strings.IndexAny(lineRest, " \t")
 	if ws < 0 {
 		return false
 	}
 	afterFirstToken := strings.TrimLeft(lineRest[ws:], " \t")
-	if loc := inlineKVSecretPattern.FindStringSubmatchIndex(afterFirstToken); loc != nil {
+	if loc := inlineKVLaterKeyPattern.FindStringSubmatchIndex(afterFirstToken); loc != nil {
 		return inlineSecretKey(afterFirstToken[loc[4]:loc[5]])
 	}
 	return false

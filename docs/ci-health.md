@@ -1550,7 +1550,15 @@ status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
 slot), a rollout the next reconcile finishes; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). `summary` counts projects, projects checked (at least one role
+read failed). One assertion this job never makes: the five `declared-*` roles
+assert the pool repository's declared-intent note, and the job holds no
+credential for the pool repositories by design, so the state script leaves
+that assertion out, judges those roles on their cluster assertions (healthy,
+as before) and names the subject in its own `--report`'s `unasserted` list,
+which this document does not carry; the note is judged at lease time by the
+presubmit and the nightly, never here, and a stale note surfaces as
+`fixture-drift:<role>` on their runs, with the replace command's printer in
+the drift line. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
 document's `scanned_at` and its `{project: [drifted roles]}` map, carried so
 the adjudicator can ask "drifted last scan too?" from one file.
@@ -1560,9 +1568,9 @@ read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
-firewall-rules list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm` and
-`world-open-ingress`, which have no cluster slot; the account holds
+firewall-rules list`, `gcloud compute networks list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress` and
+`declared-mtu-peering`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
@@ -1651,7 +1659,10 @@ so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` 
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
 to retest after, and a `version-laggard` line reading `not_ahead_of_channel` with "newer than
 every", a master ahead of its channel, clears when REGULAR ships a newer patch of the minor `seeded_b_pin.py` holds, or sooner when seeded-b is
-re-created under a lease; one ordinary drift line beside them keeps the re-apply advice, the
+re-created under a lease, and a `declared-*` line reading `as_seeded`, the pool repository's
+declared-intent note not the one provisioning seeds (reachable from a hand-published document
+only, since this job reads no repository), clears when the pool owner runs the command the drift
+line names, which prints the replace command; one ordinary drift line beside them keeps the re-apply advice, the
 issue lists both as exceptions, and a hand run of `hack/fleet_reconcile.py --drifted` skips a
 project whose only drift is these) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies

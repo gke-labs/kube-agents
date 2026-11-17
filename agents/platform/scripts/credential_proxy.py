@@ -725,7 +725,8 @@ MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
 PINNED_BASE_REF_PREFIX = "refs/heads/"
 PINNED_BASE_REFUSED_PREFIXES = ("refs/heads/", "heads/")
 
-# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
+# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>` (and `POST`
+# for a read the policy names with a body check). The route
 # prefix itself is API_RELAY_PREFIX, imported above from the client module so
 # the two sides cannot spell it differently. `api_policy` decides what may be
 # relayed; these bound how. docs/designs/gcp-api-relay.md argues each value.
@@ -767,8 +768,17 @@ API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token",
 # two. Every header the caller sent is dropped.
 API_RELAY_ACCEPT = "application/json"
 API_RELAY_UPSTREAM_PORT = 443
-# The method the MCP relay forwards with. The Cloud API relay never sends it.
+# The method the MCP relay forwards with, and the Cloud API relay for a route
+# with a body check (api_policy.API_BODY_METHOD).
 API_RELAY_POST = "POST"
+# The body of a relayed POST read (api_policy.API_BODY_METHOD routes). The cap is
+# the broker's own: a Logging `entries:list` body is a resource name, a filter
+# and a page token, a few kilobytes as `gcloud` sends it. The broker forwards its
+# own re-serialisation of the body the policy passed, as JSON.
+API_RELAY_MAX_BODY_BYTES = 16 * 1024
+API_RELAY_BODY_CONTENT_TYPE = "application/json"
+API_RELAY_BAD_BODY = "API_RELAY_BAD_BODY"
+API_RELAY_BODY_TOO_LARGE = "API_RELAY_BODY_TOO_LARGE"
 
 # The remote MCP relay, `POST /v1/mcp/<server>`. `mcp_policy` decides what is
 # relayed; it shares the Cloud API relay's credential, connect timeout,
@@ -1461,6 +1471,9 @@ SHELL_KUBECTL_REFUSAL_HINT = (
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
+# The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
+DIAL_PATH = "/v1/dial"
+DIAL_MAX_REQUEST_BYTES = 1024
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -2682,6 +2695,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The MCP pod reaches this family and no other; which verbs within it is
     # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
     ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
+    # The autonomy dial's level (vcs_broker.dial_level), reported from the agent
+    # pod after an install admin's pick. The chat role alone: the agent pod holds
+    # that token and the sandbox the model drives does not, so no command the
+    # model runs can move the dial, in either direction.
+    (DIAL_PATH, (CALLER_ROLE_CHAT,)),
 )
 
 # The failure kind a 5xx on a route family counts under, keyed by the family
@@ -2795,6 +2813,80 @@ def required_roles(path: str) -> tuple[str, ...]:
     return ()
 
 
+# The audit-report store (#5619, docs/designs/scheduling-on-profiles.md §1).
+AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
+# One path segment each. An audit id is a DNS-1123 label. A store key is the
+# file store's repository directory as one URL segment (`owner%2Fname`, a
+# non-GitHub path escaped again); `_report_store_key_is_plain` refuses one that
+# decodes to an empty, `.` or `..` part or a control character, in any escaping.
+# A run is the ring's `%Y%m%dT%H%M%S.%fZ` stamp
+# (audit_report.REPORT_STAMP_FORMAT). The routes validate each segment again.
+_REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
+_REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
+_REPORT_STREAM = f"{AUDIT_REPORTS_PREFIX}/{_REPORT_AUDIT_ID}/{_REPORT_STORE_KEY}"
+# How deep a store key is unescaped before it is refused: it is escaped at most
+# twice (a non-GitHub path inside the key), so a fixed point past this is hostile.
+REPORT_STORE_KEY_MAX_UNESCAPES = 4
+# The code points a decoded store key may not hold: C0 controls and DEL.
+REPORT_STORE_KEY_LOWEST_PRINTABLE = 0x20
+REPORT_STORE_KEY_DEL = 0x7F
+# Parts a decoded store key may not have when split on "/".
+REPORT_STORE_KEY_REFUSED_PARTS = frozenset({"", ".", ".."})
+# The store key's index in a split audit-report path:
+# ["", "v1", "audit-reports", <audit id>, <store key>, ...]. The list route has none.
+REPORT_STORE_KEY_SEGMENT = 4
+
+# Every (method, path) a report credential reaches, and nothing else: a default-
+# deny allowlist. A report credential (task_credential.REPORT_TIER) names no
+# target, so it confines nothing, and on any route that confines by target
+# (/v1/exec, the relays) it would read as a task with no cluster. So it is
+# refused on every route not listed here, by ``report_credential_permits``,
+# before any route runs; a route added to the broker later is refused to it
+# until it is added here by name. Matched whole against the raw request path:
+# no query string, no trailing slash, no extra segment.
+REPORT_CREDENTIAL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # The streams the store holds, for report_status and report_query.
+    ("GET", re.compile(AUDIT_REPORTS_PREFIX)),
+    ("GET", re.compile(f"{_REPORT_STREAM}/latest")),
+    ("GET", re.compile(f"{_REPORT_STREAM}/runs")),
+    ("GET", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    # finish's writes: the ring entry, then latest as its copy, and dropping a
+    # latest that no longer describes the ledger.
+    ("PUT", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    ("PUT", re.compile(f"{_REPORT_STREAM}/latest")),
+    ("DELETE", re.compile(f"{_REPORT_STREAM}/latest")),
+)
+
+
+def _report_store_key_is_plain(key: str) -> bool:
+    """False for a store key that decodes, at any depth, to a traversal or a control character.
+
+    Decoded until it stops changing (a key is escaped at most twice), then
+    split on `/`: no part may be empty, `.` or `..`, and nothing may be below
+    U+0020 or be U+007F.
+    """
+    decoded = key
+    for _ in range(REPORT_STORE_KEY_MAX_UNESCAPES):
+        step = urllib.parse.unquote(decoded)
+        if step == decoded:
+            break
+        decoded = step
+    else:
+        return False
+    if any(ord(ch) < REPORT_STORE_KEY_LOWEST_PRINTABLE or ord(ch) == REPORT_STORE_KEY_DEL for ch in decoded):
+        return False
+    return all(part not in REPORT_STORE_KEY_REFUSED_PARTS for part in decoded.split("/"))
+
+
+def report_credential_permits(method: str, path: str) -> bool:
+    """Whether a report credential may make this request (REPORT_CREDENTIAL_ROUTES)."""
+    if not any(method == allowed and pattern.fullmatch(path) for allowed, pattern in REPORT_CREDENTIAL_ROUTES):
+        return False
+    segments = path.split("/")
+    return len(segments) <= REPORT_STORE_KEY_SEGMENT or _report_store_key_is_plain(segments[REPORT_STORE_KEY_SEGMENT])
+
+
 def exec_pod_serves(method: str, path: str) -> bool:
     """Whether an exec pod serves ``method`` on ``path``.
 
@@ -2802,8 +2894,9 @@ def exec_pod_serves(method: str, path: str) -> bool:
     tier: the command route, the Cloud API relay's reads, the admission route
     and the readiness probe. The metrics listener is a server of its own and
     does not pass through here. Everything else is the stateful broker's.
-    A POST to the Cloud API relay passes too: the relay refuses it by policy
-    and writes the audit line, as the stateful broker does (do_POST).
+    A POST to the Cloud API relay passes too: the relay forwards the one read
+    its policy names with a body check, refuses every other by policy, and
+    writes the audit line, as the stateful broker does (do_POST).
     """
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
@@ -4402,7 +4495,8 @@ class Principal:
     handler, or the operator's rendering has to change again.
     ``caller`` stays None until then for every role but one: a profile
     caller's verified task credential (#3889) fills it with the task and the
-    credential's jti, and ``task`` and ``task_target`` with its claims. That
+    credential's jti, and ``task`` and ``task_target`` with its claims
+    (``task_target`` is None for a report credential, #5619). That
     credential arrives in a request header (TASK_CREDENTIAL_HEADER), never the
     body, and is bound to the pod the TokenReview attested before anything
     reads it (ProfileTaskGate). What must hold is that none of these fields is
@@ -4779,6 +4873,8 @@ TASK_CREDENTIAL_MAX_LIFETIME_ENV = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 # refusals are task_confinement.RULE_TASK_TARGET, except a local-only-shaped
 # command the read-only policy refuses, which carries a denylist or policy rule.
 RULE_TASK_CREDENTIAL = "caller.task-credential"
+# A report credential on a route outside REPORT_CREDENTIAL_ROUTES.
+RULE_REPORT_CREDENTIAL_ROUTE = "caller.report-credential-route"
 
 
 class TaskCredentialRefused(Exception):
@@ -4826,7 +4922,9 @@ class ProfileTaskGate:
 
         Raises TaskCredentialRefused for a credential that is present and
         fails: one that doesn't verify, is bound to another pod, UID, profile
-        or tier, or names a target that isn't a GKE cluster.
+        or tier, or names a target that isn't a GKE cluster. A report
+        credential (no target) is admitted with no ``task_target``; the
+        handler holds it to REPORT_CREDENTIAL_ROUTES.
         """
         if token is None or not token.strip():
             return principal
@@ -4847,6 +4945,8 @@ class ProfileTaskGate:
             )
         except verifier.TaskCredentialError as exc:
             raise TaskCredentialRefused(f"{exc} (jti {claims.jti})") from exc
+        if claims.report_only:
+            return replace(principal, caller=f"task {claims.task} jti {claims.jti}", task=claims, task_target=None)
         target = task_confinement.target_from_claims(
             claims.target.project, claims.target.location, claims.target.cluster
         )
@@ -5861,9 +5961,10 @@ class GoogleApiRelay:
         `OSError` and `http.client.HTTPException` through for the handler to
         answer 502; redirects are not followed, the 3xx comes back as a status.
 
-        `body` and `headers` are the MCP relay's: a POST of a body the broker
-        re-serialised itself, with the extra headers it chose. The Cloud API
-        relay passes neither, and its request is byte-for-byte what it was.
+        `body` and `headers` are for a POST of a body the broker re-serialised
+        itself, with the extra headers it chose: the MCP relay's message, and
+        the Cloud API relay's read with a body. A Cloud API `GET` passes
+        neither, and its request is byte-for-byte what it was.
         """
         deadline = time.monotonic() + API_RELAY_DEADLINE_S
         connection = self.connection(host)
@@ -12057,6 +12158,21 @@ def assert_disjoint_roots(tree_root: Path, agent_workspace_root: Path, purpose: 
         )
 
 
+def _cluster_read(executor: CommandExecutor, argv: list[str], context: str) -> tuple[int, str, str]:
+    """`(exit code, stdout, stderr)` of one read the broker runs for itself.
+
+    A refusal or a failure to start is an answer with a non-zero code, so the
+    caller reads it as "not read" rather than as an error of its own.
+    """
+    try:
+        result = executor.execute(argv, kubeconfig_context=context or None)
+    except (ValueError, RuntimeError, OSError) as error:
+        return 1, "", str(error)
+    if result.truncated or result.timed_out:
+        return 1, "", "the read was cut short"
+    return result.exit_code, result.stdout, result.stderr
+
+
 def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
@@ -12093,6 +12209,10 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
+        # The reads `proposal-practice-label` makes for itself: a gcloud
+        # describe and a namespaced kubectl get, through the same executor,
+        # kubeconfig selection and output cap as a caller's.
+        cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -13336,12 +13456,14 @@ def mcp_relay_decision(
 
     A profile worker (#3658) reaches the relay only inside a task: a warm pod
     between tasks holds no task credential, so it gets no reads. With one, it
-    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    is held to mcp_policy.PROFILE_SERVER_TOOLS; a report credential counts as
+    none. Everyone else gets the table.
     """
     if principal is None or principal.role != CALLER_ROLE_PROFILE:
         return mcp_policy.evaluate(server_name, message), None
     offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
-    if principal.task is None:
+    # A report credential confines nothing, so it is no task here (#5619).
+    if principal.task is None or getattr(principal.task, "report_only", False):
         return (
             command_policy.Decision(
                 allowed=False,
@@ -13548,7 +13670,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         is admitted with no task, and task_confinement gives it local-only
         commands; one with a credential that fails is refused whole, so a
         stale or foreign credential is loud rather than quietly downgraded.
-        The token is never logged; a bound one is, by jti, in ``caller``.
+        The token is never logged; a bound one is, by jti, in ``caller``. A
+        report credential is admitted and then held to REPORT_CREDENTIAL_ROUTES:
+        anything else is answered 403 with ``caller.report-credential-route``.
         """
         values = self.headers.get_all(TASK_CREDENTIAL_HEADER) or []
         try:
@@ -13576,6 +13700,26 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_TASK_CREDENTIAL,
                     "message": f"The task credential was refused: {exc}.",
+                },
+            )
+            return False
+        task = self.principal.task
+        if task is not None and getattr(task, "report_only", False) and not report_credential_permits(self.command, self.path):
+            # Default deny (REPORT_CREDENTIAL_ROUTES): a credential with no
+            # target never reaches a route that confines by one.
+            LOGGER.warning(
+                "refused a report credential outside the audit-report routes method=%s path=%s principal=%s",
+                _sanitize_for_logging(self.command),
+                _sanitize_for_logging(self.path),
+                _sanitize_for_logging(self.principal.describe(), max_length=PRINCIPAL_LOG_LENGTH),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_REPORT_CREDENTIAL_ROUTE,
+                    "message": "A report credential names no cluster and reaches only the audit-report routes.",
                 },
             )
             return False
@@ -13853,9 +13997,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self._exec_pod_refuses("POST", principal):
             return
         if self.path.startswith(API_RELAY_PREFIX):
-            # Reaches the relay so that the refusal is the policy's
+            # Reaches the relay so that a refusal is the policy's
             # `gcp.api.method`, named in the audit line, rather than a 404
-            # that reads as "no such route". The body is never read.
+            # that reads as "no such route". The body is read only for a
+            # route the policy allowed with a body check.
             self._handle_api_relay()
             return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
@@ -13896,6 +14041,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         if self.path == feedback_broker.ROUTE:
             self._handle_feedback_post()
+            return
+        if self.path == DIAL_PATH:
+            self._handle_dial_post(principal)
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -14635,11 +14783,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
 
+        Also `POST /v1/gcp/<host>/<path>` for a read the policy names with a
+        body check (Logging `entries:list`): the body is read only after the
+        policy allowed the host and the path, held to API_RELAY_MAX_BODY_BYTES,
+        parsed, checked by `api_policy.evaluate_body`, and forwarded as the
+        broker's own re-serialisation, never as the caller's bytes.
+
         The second shape the broker speaks, beside the argv of `/v1/exec`. The
         caller is already authenticated and its role checked against
         ROUTE_ROLES by `_authenticated`; what happens here, in order, is the
         normal-form check on the caller's text, the `api_policy` decision, the
-        upstream request with exactly the broker's two headers, and the
+        upstream request with exactly the broker's two headers (and its own
+        `Content-Type` on a read with a body), and the
         passthrough of the upstream's status, `Content-Type` and body (a 2xx body
         cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
@@ -14653,13 +14808,22 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         """
         principal = self.principal
         request_id = str(uuid.uuid4())
-        if self.command != api_policy.API_READ_METHOD:
-            # A POST is refused below without its body being read, and closing
-            # on unread bytes sends a reset that can swallow the 403. Same
-            # bounded drain the agent API proxy uses for its pre-auth 401.
-            drain_request_body(self, self.max_request_bytes)
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
+        problem = api_relay_target_problem(host, path, parts.query)
+        decision = (
+            None
+            if problem is not None
+            else api_policy.evaluate(
+                self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
+            )
+        )
+        has_body = decision is not None and decision.allowed and api_policy.carries_body(decision.rule_id)
+        if self.command != api_policy.API_READ_METHOD and not has_body:
+            # Every other POST is refused below without its body being read, and
+            # closing on unread bytes sends a reset that can swallow the 403. Same
+            # bounded drain the agent API proxy uses for its pre-auth 401.
+            drain_request_body(self, self.max_request_bytes)
         # Same width as the exec line, for the same reason: this value is the
         # TokenReview's, and a truncated identity names the wrong ServiceAccount.
         principal_label = _sanitize_for_logging(
@@ -14686,7 +14850,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             _sanitize_for_logging(path, max_length=API_RELAY_PATH_LOG_LENGTH),
             extra=audit(AUDIT_STATUS_STARTED),
         )
-        problem = api_relay_target_problem(host, path, parts.query)
         if problem is not None:
             code, reason = problem
             LOGGER.warning(
@@ -14697,9 +14860,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         # From here on `host` has passed api_policy.HOST_SHAPE, so the lines
         # below log it as-is; `path` is never logged again.
-        decision = api_policy.evaluate(
-            self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
-        )
         if not decision.allowed:
             LOGGER.warning(
                 "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
@@ -14715,6 +14875,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        forwarded_body: bytes | None = None
+        if has_body:
+            forwarded_body = self._api_relay_body(request_id, decision.rule_id, audit)
+            if forwarded_body is None:
+                return
         if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
@@ -14747,7 +14912,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         query = strip_credential_query_keys(parts.query)
         target = f"/{path}?{query}" if query else f"/{path}"
         started = time.monotonic()
-        upstream = self._relay_fetch("api", request_id, host, target, authorization, audit)
+        upstream = self._relay_fetch(
+            "api", request_id, host, target, authorization, audit,
+            **(
+                {"body": forwarded_body, "headers": (("Content-Type", API_RELAY_BODY_CONTENT_TYPE),)}
+                if forwarded_body is not None
+                else {}
+            ),
+        )
         if upstream is None:
             return
         duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
@@ -14831,6 +15003,83 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(upstream.body)))
         self._end_headers()
         self.wfile.write(upstream.body)
+
+    def _api_relay_body(
+        self, request_id: str, rule_id: str, audit: Callable[..., dict[str, Any]]
+    ) -> bytes | None:
+        """The body the broker forwards for the allowed route `rule_id`, or None after answering.
+
+        The caller's body is read up to API_RELAY_MAX_BODY_BYTES, parsed as JSON
+        and held to the route's body check. What is returned is the broker's own
+        serialisation of the object that passed, so a duplicate key, a comment
+        or any byte the parser dropped never reaches the upstream.
+        """
+        # The length `parse_request` framed the request with: None when it cannot
+        # be framed (a Transfer-Encoding, a length that is not a number, two
+        # lengths that disagree), which is never read as a body here.
+        length = getattr(self, "_body_length", None)
+        refusal: tuple[HTTPStatus, str, str] | None = None
+        parsed: Any = None
+        if length is None:
+            # Nothing to drain: a body with no usable length cannot be read to
+            # its end, and the server closes the connection after the answer.
+            refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body has no usable Content-Length")
+        elif length > API_RELAY_MAX_BODY_BYTES:
+            drain_request_body(self, self.max_request_bytes)
+            refusal = (
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                API_RELAY_BODY_TOO_LARGE,
+                f"the request body is longer than {API_RELAY_MAX_BODY_BYTES} bytes",
+            )
+        else:
+            try:
+                raw = self.rfile.read(length)
+            except OSError:
+                # The body stalled past the request's read deadline, or the peer
+                # reset. The connection is the server's to close; the audit trail
+                # still gets this request's verdict.
+                LOGGER.warning(
+                    "api rejected request_id=%s code=%s reason=%s",
+                    request_id, API_RELAY_BAD_BODY, "the request body did not arrive",
+                    extra=audit(AUDIT_STATUS_REJECTED),
+                )
+                raise
+            if len(raw) < length:
+                # The peer closed its side before the length it announced: what
+                # arrived is not the request, even where it parses.
+                refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body did not arrive")
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, RecursionError):
+                    # UnicodeDecodeError is a ValueError; a body nested past the
+                    # parser's depth is a RecursionError.
+                    refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body is not JSON")
+        if refusal is not None:
+            status, code, reason = refusal
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason,
+                extra=audit(AUDIT_STATUS_REJECTED),
+            )
+            self._json(status, {"error": reason, "code": code})
+            return None
+        decision = api_policy.evaluate_body(rule_id, parsed)
+        if not decision.allowed:
+            LOGGER.warning(
+                "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=decision.rule_id),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return None
+        return json.dumps(parsed, separators=(",", ":")).encode()
 
     def _handle_mcp_relay(self) -> None:
         """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.
@@ -15476,6 +15725,52 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         finally:
             if connection is not None:
                 connection.close()
+
+    def _handle_dial_post(self, principal: Principal | None) -> None:
+        """`POST /v1/dial` — the agent pod reports the autonomy dial's level.
+
+        The body is `{"level": "explain" | "propose" | "automerge"}`. With
+        `KUBEAGENTS_DIAL` not `on` the dial is no source and nothing is stored
+        (409 DIAL_OFF), so a stale report cannot outlive the switch.
+
+        The chat role, named: ROUTE_ROLES admits a principal with no role
+        everywhere (a broker no operator has given a second audience), and on
+        such a broker the sandbox's token would carry no role either. A dial the
+        model could move is no dial, so that caller is refused here.
+        """
+        if getattr(principal, "role", "") != CALLER_ROLE_CHAT:
+            LOGGER.warning(
+                "refused a dial report from role=%s", _sanitize_for_logging(getattr(principal, "role", "") or "none")
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "only the agent pod's chat role may report the dial", "code": "CALLER_ROLE_FORBIDDEN"},
+            )
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0 or content_length > DIAL_MAX_REQUEST_BYTES:
+                raise ValueError("invalid request size")
+            payload = json.loads(self.rfile.read(content_length))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            level = payload.get("level")
+            if not isinstance(level, str) or level not in vcs_broker.DIAL_LEVELS:
+                raise ValueError(f"level must be one of {', '.join(vcs_broker.DIAL_LEVELS)}")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if not vcs_broker.dial_enabled():
+            self._json(HTTPStatus.CONFLICT, {"error": "KUBEAGENTS_DIAL is not on", "code": "DIAL_OFF"})
+            return
+        before = vcs_broker.dial_level()
+        vcs_broker.set_dial_level(level)
+        if before != level:
+            LOGGER.info("dial level set from=%s to=%s", before, level)
+        self._json(
+            HTTPStatus.OK,
+            {"level": level, "writeMode": vcs_broker.write_mode()[0], "automerge": vcs_broker.dial_allows_automerge()},
+        )
 
     def _handle_forge_refresh(self, provider: str = "") -> None:
         """`POST /v1/forge/refresh` — make a credential current before it is spent.

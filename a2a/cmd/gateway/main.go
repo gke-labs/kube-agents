@@ -194,7 +194,11 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// mint validates every grant against the tier table.
 	capability.StartTierFile(ctx, os.Getenv, log)
 
-	natsOpts := gatewayNATSOptions(cfg)
+	natsOpts, err := gatewayNATSOptions(cfg)
+	if err != nil {
+		log.Error("nats auth", "err", err)
+		return err
+	}
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
@@ -383,19 +387,28 @@ func gatewayElection(cfg *gateway.Config, log *slog.Logger) (gateway.Election, e
 	}, nil
 }
 
+// gatewayInboxOwner is the gateway user's inbox owner, _INBOX.gateway: the
+// static user's name and the callout map entry's user alike.
+const gatewayInboxOwner = "gateway"
+
 // gatewayNATSOptions is how the gateway's user dials, the gateway's own
-// connection and the feedback export's alike.
-func gatewayNATSOptions(cfg *gateway.Config) []nats.Option {
+// connection and the feedback export's alike: as the static user, or on
+// A2A_GATEWAY_BUS_AUTH=token with its ServiceAccount token, which the
+// callout mints as the same user with the same inbox (#5301).
+func gatewayNATSOptions(cfg *gateway.Config) ([]nats.Option, error) {
+	if cfg.BusAuth == gateway.BusAuthToken {
+		return lib.KSATokenNATSOptions(cfg.BusTokenFile, gatewayInboxOwner)
+	}
 	natsOpts := []nats.Option{
 		// The gateway user may only subscribe under its own inbox prefix
 		// (per-user _INBOX prefixes, deployment spec); the JS API replies
 		// every publish and consume depends on land there.
-		nats.CustomInboxPrefix("_INBOX.gateway"),
+		nats.CustomInboxPrefix("_INBOX." + gatewayInboxOwner),
 	}
 	if cfg.NATSUser != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
 	}
-	return natsOpts
+	return natsOpts, nil
 }
 
 // chatNotifiers builds one chat.notify route per real backend adapter, in
