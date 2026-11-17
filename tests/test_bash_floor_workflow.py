@@ -5,7 +5,6 @@ the files whose change starts it. People keep both lists by hand. These tests ho
 the tree, so that a new installer test file is not left out of the job in silence.
 """
 
-import fnmatch
 import pathlib
 import unittest
 
@@ -63,14 +62,15 @@ class BashFloorFileListsTest(unittest.TestCase):
         job_files = _job_files(workflow)
         paths = _triggers(workflow)["pull_request"]["paths"]
         self.assertEqual(len(job_files), len(set(job_files)), "a file is in INSTALLER_TEST_FILES two times")
+        self.assertEqual(
+            [], [entry for entry in paths if entry.startswith("!")], "a ! entry of paths can take a listed file out"
+        )
         for file in job_files:
             with self.subTest(file=file):
                 self.assertTrue((_REPO_ROOT / file).is_file(), "INSTALLER_TEST_FILES names a file that does not exist")
-                # An entry of `paths` is a file or a pattern.
-                self.assertTrue(
-                    any(fnmatch.fnmatchcase(file, pattern) for pattern in paths),
-                    f"no entry of paths matches {file}: a change to it does not start the job",
-                )
+                # The file itself, as text. This test does not read the patterns of `paths`:
+                # GitHub Actions has its own rules for `*`, `**` and `!`.
+                self.assertIn(file, paths, "list the file itself in paths; a pattern that covers it is not read here")
 
     def test_the_push_trigger_has_the_same_paths_as_the_pull_request_trigger(self):
         triggers = _triggers(_workflow())
