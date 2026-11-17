@@ -646,12 +646,20 @@ func TestABatchCutShortByARestartFinishesOnRedelivery(t *testing.T) {
 	if strings.Join(texts, ",") != "one,two,three" || platformSubmissions(t, r2) != 3 {
 		t.Fatalf("children = %v, want each entry once", texts)
 	}
-	rec, _ = r2.g.reg.Get(ctx, conv)
-	for i, k := range childrenOf(rec, origin.TaskID) {
-		if k.BatchIndex != i+1 {
-			t.Fatalf("child %d has batch index %d", i, k.BatchIndex)
+	// Poll rather than read once: the record is written after the batch's
+	// submissions go out (#6175). All three children must be there.
+	waitForRecord(t, r2, conv, "each child's batch index on the record", func(rec *SessionRecord) bool {
+		kids := childrenOf(rec, origin.TaskID)
+		if len(kids) != 3 {
+			return false
 		}
-	}
+		for i, k := range kids {
+			if k.BatchIndex != i+1 {
+				return false
+			}
+		}
+		return true
+	})
 	// Repeated once more, the request is whole and mints nothing.
 	if err := exec.PublishArtifact(ctx, art); err != nil {
 		t.Fatal(err)
@@ -1015,11 +1023,13 @@ func TestAWithdrawnBatchLeavesAChildThatAlreadyEndedAlone(t *testing.T) {
 	if n := strings.Count(r2.logs.String(), "task terminal") - strings.Count(strings.ReplaceAll(r2.logs.String(), first.TaskID, ""), "task terminal"); n > 1 {
 		t.Fatalf("child %s has %d terminal lines, want 1", first.TaskID, n)
 	}
-	rec, _ := r2.g.reg.Get(ctx, conv)
-	pref, _ := rec.TaskRefFor(origin.TaskID)
-	if len(pref.Children) != 0 {
-		t.Fatalf("the parent still links %v after the withdrawal", pref.Children)
-	}
+	// The withdrawal's record write may land after the end it waited on, so
+	// poll; the parent's entry must still be there, since a missing one has
+	// no children either (#6175).
+	waitForRecord(t, r2, conv, "the withdrawal to unlink the parent's children", func(rec *SessionRecord) bool {
+		pref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && len(pref.Children) == 0
+	})
 }
 
 // TestTheHistoryCapKeepsAWithdrawnBatchsKeptChild: a withdrawn batch
