@@ -88,6 +88,12 @@ func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Namespace + profileNamespaceSuffix
 }
 
+// ProfileNamespaceName is profileNamespaceName for the webhook, which names
+// the namespace in its warning on an agent outside the operator's namespace.
+func ProfileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
+	return profileNamespaceName(agent)
+}
+
 // profileNamespaceOf is the profile namespace for a profile: the one beside
 // its own namespace, which is its agent's. It needs no agent, so a profile
 // deleted after its agent still finds its ServiceAccounts.
