@@ -108,18 +108,17 @@ is wide; the design is
 
 ## Tests
 
-`tests/*.tftest.hcl` plan the module against a mocked `google` provider and assert which bindings a
+`tftests/*.tftest.hcl` plan the module against a mocked `google` provider and assert which bindings a
 declaration plans (the intersected allowlist per project, the scoping project and a lookup-only host
 included, nothing in the management project) and which declarations the preconditions refuse,
 the whole-set cap's counting among them; which accounts the scoped service account pool derives
 from a declaration, keyed on the project, a container's listed members among them and bound
 nowhere else, the `scoped_pool_max_accounts` refusal and the refusal of an armed pool beside a
 container `scope_container_members` has no entry for
-(`tests/scoped_pool.tftest.hcl`); the role set is read from the module's own `scope_roles`
+(`tftests/scoped_pool.tftest.hcl`); the role set is read from the module's own `scope_roles`
 rather than spelled out. `make terraform-test` runs them, as the `validate` job in `validate.yml`
-does on every pull request; the suites need Terraform 1.11 or newer (`mock_provider` from 1.7,
-`override_during` from 1.11), above the floor the module declares for
-an install. The repository's `tests/test_scope_iam.py` pins what a plan cannot see, the allowlist
+does on every pull request; the suites need the Terraform the Makefile's
+`TERRAFORM_TEST_MIN_VERSION` names, above the floor the module declares for an install. The repository's `tests/test_scope_iam.py` pins what a plan cannot see, the allowlist
 against the default role list and the cap against the reconcile's constant among it.
 
 ## Usage

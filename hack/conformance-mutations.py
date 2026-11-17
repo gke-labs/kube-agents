@@ -94,6 +94,16 @@ MUTATIONS: list[Mutation] = [
         "forge read no task target confines",
     ),
     Mutation(
+        "A3-report-credential-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
+         "        if False:\n"),
+        "test_A3_a_report_credential_reaches_the_audit_report_routes_alone",
+        "let a report credential reach every route, since a fleet audit only "
+        "ever calls the store -- until its model output calls /v1/exec with "
+        "no target to confine it",
+    ),
+    Mutation(
         "A3-profile-reaches-gke-mcp",
         "agents/platform/scripts/mcp_policy.py",
         ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
@@ -107,7 +117,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-mcp-without-task",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if principal.task is None:\n        return (\n",
+        ("    if principal.task is None or getattr(principal.task, \"report_only\", False):\n        return (\n",
          "    if False:\n        return (\n"),
         "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
         "let a warm profile pod between tasks read through the MCP relay "

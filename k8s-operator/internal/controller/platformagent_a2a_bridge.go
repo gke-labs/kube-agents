@@ -192,8 +192,19 @@ func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
 // bridge in the pod template a pass after the provisioning Job and so rolled
 // the agent Deployment a second time on every fresh install (#5962). The TASKS
 // budget counts the bridge from the first render too (a2aBridgeSidecars).
+//
+// One exception, from the bus migration (#4488): a run given up has the
+// provision Job recreate, empty, the streams it did not put back, so the
+// bridge leaves the pod until the bus is provisioned again and comes back to
+// the recreated streams, rather than hold the ones the run gave up on. A run
+// in progress keeps the bridge: the streams come through it. The record goes
+// when the stack is torn down, so a later bring-up is a first render again.
 func a2aBridgeInPod(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aBridgeRendered(agent)
+	if !a2aBridgeRendered(agent) {
+		return false
+	}
+	run := agent.Status.BusMigration
+	return !(run != nil && run.GivenUp && !busProvisioned(agent))
 }
 
 // a2aRenderedBridgeSettings is the part of the rendered bridge's environment
