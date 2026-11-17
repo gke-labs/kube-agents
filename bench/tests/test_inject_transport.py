@@ -1013,12 +1013,10 @@ def test_a_task_inside_the_grace_is_still_waited_for(stub_gateway: _StubGatewayS
     stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
     stub_gateway.executor_states = ["", "", "working"]
     stub_gateway.probe_age_seconds = 0
-
-    def finish() -> None:
-        time.sleep(0.4)
-        stub_gateway.entries = completed_transcript(stub_gateway.task_id, "late but fine")
-
-    threading.Thread(target=finish, daemon=True).start()
+    # Finish only after every scripted state was read, so the run reaches the
+    # in-grace reads however slow the runner is.
+    stub_gateway.finish_after_active_reads = len(stub_gateway.executor_states)
+    stub_gateway.on_finish = completed_transcript(stub_gateway.task_id, "late but fine")[2:]
     result = KubeAgentsHarness().run("patience")
 
     assert result.output == "late but fine"
