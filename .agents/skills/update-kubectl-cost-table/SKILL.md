@@ -25,7 +25,8 @@ The table is written only by `scripts/dev/profile_kubectl_costs.py`, never by ha
 # Key and tiers
 
 - Key: `get <kinds> <cluster|namespace|object> <json|table>`.
-  - Kinds are canonical plurals, sorted. - `cluster` means `-A`, or kinds that are all cluster-scoped. Only `cluster` keys are charged:
+  - Kinds are canonical plurals, sorted.
+  - `cluster` means `-A`, or kinds that are all cluster-scoped. Only `cluster` keys are charged:
     one namespace and named objects run unchanged, so the profiler does not measure them.
   - `json` covers every output that decodes full objects: `-o json`, `yaml`, `jsonpath`,
     `custom-columns`, `go-template`, `name`. `table` is the server-built table.

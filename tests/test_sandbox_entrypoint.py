@@ -887,10 +887,6 @@ class SandboxEntrypointKubeconfigLockTest(_SandboxEntrypointHarness):
         self.assertTrue(lock.exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SandboxEntrypointKubectlAdmissionTest(unittest.TestCase):
     """The block that writes the kubectl admission's inputs and state, lifted out of the shipped
     entrypoint and run with its /run paths pointed at a temporary directory. It sits past the
@@ -940,3 +936,7 @@ class SandboxEntrypointKubectlAdmissionTest(unittest.TestCase):
         for name in ("ledger.lock", "events.log"):
             with self.subTest(file=name):
                 self.assertEqual(stat.S_IMODE((state / name).stat().st_mode), 0o666)
+
+
+if __name__ == "__main__":
+    unittest.main()

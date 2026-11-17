@@ -32,8 +32,8 @@ long as kubectl does.
 
 The admission is advisory: a session can run `/usr/local/libexec/kubectl` directly, and
 the memory guard (`shell-memory-guard`) is the boundary that holds either way. Any error
-in this admission runs the command unchanged. A lock it cannot take is not an error: the
-command waits as if it found no room, and is refused with exit 75.
+in this admission runs the command unchanged. A lock it cannot take within
+`LOCK_WAIT_SECONDS` is not an error: the command is refused with exit 75.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ SHELL_FLOOR_BYTES = 256 * MIB
 HEAVY_FORMATS = ("json", "yaml", "jsonpath", "custom-columns", "go-template", "template", "name")
 # A command that reads objects takes a slot for as long as it runs: a burst of commands each
 # under the guard's size floor, all growing at once, outruns any per-process rule. The shell
-# takes one read's capacity / SLOT_BYTES of them at once, and at least MIN_SLOTS.
+# takes one read's capacity / (SLOT_BYTES + WAITER_BYTES) of them at once, and at least MIN_SLOTS.
 SLOT_BYTES = 96 * MIB
 MIN_SLOTS = 4
 # Every waiting command is a live process holding memory the guard never stops (each is far
@@ -83,17 +83,17 @@ MIN_SLOTS = 4
 # pair of slot and place in the queue is charged SLOT_BYTES + WAITER_BYTES of the one read's
 # capacity. Past that, a command is refused at once, before it takes the lock.
 WAITER_BYTES = 16 * MIB
+# The verbs whose list the cost table charges.
+LISTING_VERBS = ("get", "describe")
 # Only verbs that decode objects take a slot. Local verbs read none, and a session holds a
 # stream (`exec`, `attach`, `logs -f`, `rollout status`, `wait`) open as long as it likes, so a
 # slot there would let a few open streams refuse every other session's reads.
-# The verbs whose list the cost table charges.
-LISTING_VERBS = ("get", "describe")
 SLOTTED_VERBS = ("get", "describe", "events", "top", "logs", "diff", "apply", "delete", "api-resources")
 FOLLOW_FLAGS = ("-f", "--follow")
 ADMIT_WAIT_SECONDS = 30.0
 ADMIT_POLL_SECONDS = 0.5
-# How long to try for the ledger lock before running the command unchanged: a session
-# that holds the lock must not stall every other session's reads.
+# How long to wait for the ledger lock before the command is refused with exit 75: a
+# session that holds the lock must not stall every other session's reads.
 LOCK_WAIT_SECONDS = 5.0
 REFUSED_NOW = 3
 REFUSED_BUSY = 75  # EX_TEMPFAIL

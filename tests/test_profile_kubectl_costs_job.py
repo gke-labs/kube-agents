@@ -3,6 +3,7 @@ Job's grammar, a failed poll is "not yet", and a table not yet copied keeps its 
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -37,6 +38,7 @@ exit 0
 class JobScriptTest(unittest.TestCase):
     def run_script(self, logs_mode):
         tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         stub = tmp / "kubectl"
         stub.write_text(STUB)
         stub.chmod(0o755)
