@@ -59,6 +59,7 @@ import contextvars
 import copy
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -595,6 +596,21 @@ MANUAL_REMEDIATION_KIND = "manual"
 # Remediation block never come from different runs.
 CARRIED_FINDING_FIELDS = ("title", "impact")
 CARRIED_REMEDIATION_FIELDS = ("recommendation", "remediation")
+# The checks whose remediation gives a flag a value that only the cluster's
+# owner can supply, and those flags. The drift SOP forbids a copied range for
+# authorized networks, so a literal one in a carried command is one a run
+# copied. The compliance SOP also leaves `public-control-plane`'s list to a
+# human; that check has no row, so its carried range is not judged.
+OWNER_SUPPLIED_FLAGS: dict[str, tuple[str, ...]] = {
+    "authorized-networks": ("--master-authorized-networks",),
+}
+# What marks a command argument that is not one part of a cluster target: a
+# placeholder or a shell variable that the reader fills in, or a resource path
+# (`projects/p/locations/l/clusters/c`), which holds all three parts.
+COMMAND_UNCOMPARED_MARKS = ("<", "$", "{", "…", "/")
+# The names of the carry rules, as the run log prints them.
+CARRY_RULE_OTHER_CLUSTER = "a command for another cluster"
+CARRY_RULE_OWNER_VALUE = "a literal value where the SOP leaves the value to the owner"
 
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
@@ -8157,6 +8173,9 @@ def _remediation_may_carry(before: object, now: object) -> bool:
     that wrote the other parts runs again after the carry, so a copied note
     gets the text two times, or keeps a statement that is not true for this
     run.
+
+    Not when the previous remediation does not pass the rules that
+    `validate_findings` has for a new one: a known `kind`, a string `note`.
     """
     if not isinstance(before, dict) or not isinstance(now, dict):
         return False
@@ -8164,7 +8183,105 @@ def _remediation_may_carry(before: object, now: object) -> bool:
         return False
     if before.get("kind") == MANUAL_REMEDIATION_KIND and now.get("kind") != MANUAL_REMEDIATION_KIND:
         return False
+    if before.get("kind") not in REMEDIATION_KINDS or not isinstance(before.get("note", ""), str):
+        return False
     return not (_harness_wrote_note(before) or _harness_wrote_note(now))
+
+
+def _command_names_another_cluster(finding: dict, command: str) -> bool:
+    """Whether a `clusters update` `command` is for a cluster other than `finding`'s.
+
+    The finding's `cluster` is `project/location/name`. Each part the command
+    gives as a literal must agree. False where there is nothing to compare: a
+    `cluster` of another shape (`project/<id>`), a command `_parse_update_target`
+    cannot read, a placeholder, a shell variable or a resource path
+    (`COMMAND_UNCOMPARED_MARKS`), a project given by number.
+    """
+    parts = str(finding.get("cluster") or "").split("/")
+    if len(parts) != CLUSTER_TARGET_SEGMENTS or not command.startswith(CLUSTERS_UPDATE_PREFIX):
+        return False
+    target = _parse_update_target(command)
+    if target is None:
+        return False
+    name, location, project = target
+    if project.isdigit():
+        project = ""
+    project_id, cluster_location, cluster_name = parts
+    return any(
+        given
+        and not any(mark in given for mark in COMMAND_UNCOMPARED_MARKS)
+        and given.lower() != want.lower()
+        for given, want in (
+            (name, cluster_name),
+            (location, cluster_location),
+            (project, project_id),
+        )
+    )
+
+
+def _is_literal_network(value: str) -> bool:
+    try:
+        ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def _command_gives_owner_value(finding: dict, command: str) -> bool:
+    """Whether `command` gives a literal range to a flag in `OWNER_SUPPLIED_FLAGS`
+    for `finding`'s check. False for a command `shlex` cannot read."""
+    flags = OWNER_SUPPLIED_FLAGS.get(str(finding.get("check") or ""), ())
+    if not flags:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    for index, token in enumerate(argv):
+        key, sep, value = token.partition("=")
+        if key not in flags:
+            continue
+        if not sep and index + 1 < len(argv):
+            value = argv[index + 1]
+        if any(_is_literal_network(item) for item in value.split(",")):
+            return True
+    return False
+
+
+# One row per rule on a carried remediation: its name in the run log, and
+# whether one gcloud command fails it for a finding. A rule answers False
+# where it cannot tell, so a command it cannot read is never refused.
+CARRY_RULES: tuple[tuple[str, Callable[[dict, str], bool]], ...] = (
+    (CARRY_RULE_OTHER_CLUSTER, _command_names_another_cluster),
+    (CARRY_RULE_OWNER_VALUE, _command_gives_owner_value),
+)
+
+
+def _carry_rule_failed(finding: dict, source: dict) -> str:
+    """The first `CARRY_RULES` rule that `source`'s `recommendation` and
+    `remediation` fail for `finding`, or `""`.
+
+    Every field that publishes a command is read: the note, the note before
+    the route-note cut, which the carry puts back, and the Recommendation and
+    confirm lines.
+    """
+    remediation = source.get("remediation")
+    recommendation = source.get("recommendation")
+    texts: list[object] = []
+    if isinstance(remediation, dict):
+        texts += [remediation.get(field) for field in ("note", ROUTE_UNCUT_NOTE_FIELD)]
+    if isinstance(recommendation, dict):
+        texts += [recommendation.get(field) for field in COMMAND_BEARING_RECOMMENDATION_FIELDS]
+    commands = [
+        command
+        for text in texts
+        if isinstance(text, str)
+        for command, _line in _gcloud_commands(text)
+    ]
+    for name, fails in CARRY_RULES:
+        if any(fails(finding, command) for command in commands):
+            return name
+    return ""
 
 
 def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> list[str]:
@@ -8188,6 +8305,12 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
     same way before the comparison. A change in severity stops the carry: the
     collector calculates severity, so a new severity is a new observation,
     and the old impact can give the old reason.
+
+    Evidence says nothing about the remediation, so a wrong one would stay
+    for as long as the evidence does. The previous `recommendation` and
+    `remediation` are not kept when they fail a `CARRY_RULES` rule and this
+    run's pass it. When this run's fail too, the previous ones stay: new words
+    that are also wrong are no reason to change the text.
 
     The copied text did not go through `validate_findings` in this run, so
     `normalise_finding_commands` runs on it again.
@@ -8213,7 +8336,11 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
             continue
         fields = list(CARRIED_FINDING_FIELDS)
         if _remediation_may_carry(before.get("remediation"), finding.get("remediation")):
-            fields.extend(CARRIED_REMEDIATION_FIELDS)
+            failed = _carry_rule_failed(finding, before)
+            if failed and not _carry_rule_failed(finding, finding):
+                log(f"{fid}: the previous run's remediation is not carried forward ({failed}).")
+            else:
+                fields.extend(CARRIED_REMEDIATION_FIELDS)
         changed = False
         for field in fields:
             if field in before and before[field] != finding.get(field):

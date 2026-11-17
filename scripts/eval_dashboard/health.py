@@ -732,6 +732,10 @@ FIXTURE_NO_REAPPLY_REMEDY = {
         "{roles} reads a master ahead of its release channel, which seeded_b_pin.py holds until the channel ships a newer patch of that minor;"
         " retest once a scan reads it healthy, or sooner re-create seeded-b under a lease (bench/tf/fleet/README.md)."
     ),
+    fixture_state.OP_AS_SEEDED: (
+        "{roles} reads the pool repository's declared-intent note as not the one provisioning seeds;"
+        " the drift line names the command that prints its replacement (`gitops_note_seed_command` in scripts/verify_ci_pool_project.py); run it, then retest."
+    ),
 }
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"

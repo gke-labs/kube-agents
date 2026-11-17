@@ -1,6 +1,6 @@
 # The profile namespace and the operator's grant in it, for a kustomize
 # install. The chart renders the same three objects (profiles-namespace.yaml
-# and the second Role and RoleBinding in operator-rbac.yaml) under mode next.
+# and the second Role and RoleBinding in operator-rbac.yaml) on every install with a platform agent.
 # Profile worker pods run in <install namespace>-profiles, and the operator
 # writes there (ConfigMaps, ServiceAccounts, Deployments, Roles, the quota,
 # the fence, the dispatcher's params) under the namespaced Role document of

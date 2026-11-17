@@ -423,6 +423,7 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     KUBEAGENTS_RESOLVED_SCOPE_FILE=/etc/kube-agents-resolved/resolved-scope.json
     RECONCILE_PROJECT=
+    KUBEAGENTS_DIAL_ADMINS=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
     STALL_WATCH_MIN_AGE_MINUTES=
@@ -1111,6 +1112,7 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.x-k8s.io/component: shell-sandbox
     spec:
       automountServiceAccountToken: false
       containers:
