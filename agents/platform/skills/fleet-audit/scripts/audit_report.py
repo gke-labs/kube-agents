@@ -2975,17 +2975,17 @@ ENVELOPE_STARTED_KEY = "started_at"
 # The chat-ready report `finish` stores in the envelope for the A2A gateway's
 # relay, which posts it in place of the run's final message (#5618,
 # scheduling-on-profiles.md §1 item 2): the same words the chat record holds,
-# whether the run was quiet, and the card where one is built from the text
-# alone. The gateway reads it through the broker and trusts only the broker's
-# writer stamp beside the envelope, never this object, for whose run it is.
+# and whether the run was quiet. No `card` yet: its builder
+# (slack_audit_report) is not in the sandbox a profile run uses (#6162). The
+# gateway reads it through the broker and trusts only the broker's writer
+# stamp beside the envelope, never this object, for whose run it is.
 ENVELOPE_REPORT_KEY = "report"
 ENVELOPE_REPORT_SCHEMA = "kube-agents.report/v1"
-# Bounds on what the report adds to the envelope, measured as `write_report`
-# writes it, against the store's 1 MiB cap (the findings `document` is the
-# envelope's unbounded part): the gateway cuts the text at the same 24 KiB and
-# drops a card over 32 KiB, so nothing past these would reach a channel.
+# The bound on what the report adds to the envelope, measured as
+# `write_report` writes it, against the store's 1 MiB cap (the findings
+# `document` is the envelope's unbounded part): the gateway cuts the text at
+# the same 24 KiB, so nothing past it would reach a channel.
 ENVELOPE_REPORT_TEXT_MAX = 24 * 1024
-ENVELOPE_REPORT_CARD_MAX = 32 * 1024
 # `report_envelope`'s default for `started_at`: read the run start when the
 # envelope is built. `_finish` passes the start it read before its checks.
 RUN_START_UNREAD = object()
@@ -5055,31 +5055,6 @@ def _clip_as_written(text: str, limit: int) -> str:
     return text[:low]
 
 
-def _summary_chat_card(text: str) -> dict | None:
-    """The `kube-agents.chat/v1` card of a no-ledger summary, or None.
-
-    `slack_audit_report.chat_from_summary` builds it from the text alone, as
-    the cron relay does for the same report; a ledger report's card needs the
-    fetched issue and is left to the text. Optional: anything that keeps the
-    card from building, or one over ENVELOPE_REPORT_CARD_MAX, leaves the text.
-    """
-    try:
-        import slack_audit_report  # on sys.path only with the platform scripts
-
-        built = slack_audit_report.chat_from_summary(text)
-    except Exception as exc:  # noqa: BLE001 -- the card is optional; the text stands
-        log(f"WARNING: no chat card for the stored report: {exc}")
-        return None
-    if built is None or not isinstance(built[0], dict):
-        return None
-    card = _redact_document(built[0])
-    # Measured as `write_report` writes it (ASCII escapes, indented), so the
-    # cap is what the card costs on disk.
-    if len(json.dumps(card, indent=2)) > ENVELOPE_REPORT_CARD_MAX:
-        return None
-    return card
-
-
 def attach_chat_report(envelope: dict, render: Callable[[], str], silent: bool) -> str | None:
     """Set the envelope's `report` from `render()`'s text, and return that text. Best-effort.
 
@@ -5108,16 +5083,11 @@ def envelope_chat_report(text: str, silent: bool) -> dict:
     repository; `silent` is `finish`'s quiet verdict for it (`silent_ok`).
     The body's redaction backstop is applied, as to the envelope's document.
     """
-    text = _encodable(text)
-    report: dict = {
+    return {
         "schema": ENVELOPE_REPORT_SCHEMA,
-        "text": _clip_as_written(redact_secrets(text), ENVELOPE_REPORT_TEXT_MAX),
+        "text": _clip_as_written(redact_secrets(_encodable(text)), ENVELOPE_REPORT_TEXT_MAX),
         "silent": bool(silent),
     }
-    card = _summary_chat_card(text)
-    if card is not None:
-        report["card"] = card
-    return report
 
 
 def render_chat_report(

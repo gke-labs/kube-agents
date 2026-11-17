@@ -33072,8 +33072,8 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(report["schema"], "kube-agents.report/v1")
         self.assertEqual(report["text"], out["summary"])
         self.assertFalse(report["silent"])
-        # A no-ledger summary has its card, the one the cron relay lays out.
-        self.assertEqual(report["card"]["schema"], "kube-agents.chat/v1")
+        # No card until its builder reaches the sandbox (#6162).
+        self.assertNotIn("card", report)
 
     def test_a_lone_surrogate_in_the_findings_still_stores_the_run(self):
         """A broken emoji escape (`"\\ud83d"`) survives json.loads; the report must not fail `finish`."""
@@ -33638,7 +33638,6 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(
             (report["schema"], report["text"], report["silent"]), ("kube-agents.report/v1", text, False)
         )
-        # A ledger card needs the fetched issue; the text stands alone.
         self.assertNotIn("card", report)
 
     def test_a_chat_text_that_fails_to_render_still_lands_the_store_write(self):
@@ -39006,23 +39005,6 @@ class TestEnvelopeChatReport(unittest.TestCase):
         report = audit_report.envelope_chat_report(f"Token {secret} leaked.", True)
         self.assertNotIn(secret, report["text"])
         self.assertTrue(report["silent"])
-
-    def test_a_card_over_its_cap_is_left_out(self):
-        fake = type(sys)("slack_audit_report")
-        fake.chat_from_summary = lambda text: ({"schema": "kube-agents.chat/v1", "title": "x" * audit_report.ENVELOPE_REPORT_CARD_MAX}, text)
-        with patch.dict(sys.modules, {"slack_audit_report": fake}):
-            self.assertNotIn("card", audit_report.envelope_chat_report("t", False))
-
-    def test_a_card_that_fails_to_build_leaves_the_text(self):
-        fake = type(sys)("slack_audit_report")
-
-        def boom(text):
-            raise ValueError("no card")
-
-        fake.chat_from_summary = boom
-        with patch.dict(sys.modules, {"slack_audit_report": fake}):
-            report = audit_report.envelope_chat_report("Two findings.", False)
-        self.assertEqual((report["text"], "card" in report), ("Two findings.", False))
 
     def test_a_lone_surrogate_does_not_fail_the_report(self):
         """A broken emoji escape in the findings has no UTF-8 form: it becomes "?"."""
