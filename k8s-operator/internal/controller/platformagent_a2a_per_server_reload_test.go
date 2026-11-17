@@ -970,3 +970,102 @@ func TestATLSWriteJustBeforeTheConfigFoldsThroughTheSyncWindow(t *testing.T) {
 		t.Fatal("a move after the window didn't confirm the reload")
 	}
 }
+
+// A replacement created after the write, Ready long enough for the others'
+// check but with no /varz answer yet, still gets its own bound: the main
+// straggler pick passes over it, as the lone-down pick does.
+func TestAYoungReadyReplacementWithNoVarzIsNotRestarted(t *testing.T) {
+	written := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	now := written.Add(5 * time.Minute)
+	ready := func(name string, created time.Time) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: metav1.NewTime(created)},
+			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+				Type: corev1.PodReady, Status: corev1.ConditionTrue,
+				LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+			}}},
+		}
+	}
+	servers := []a2aBusServer{
+		// Server 0: the operator's replacement, two minutes old, Ready a
+		// minute, unconfirmed (its /varz doesn't answer yet).
+		{name: "nats-0", pod: ready("nats-0", now.Add(-2*time.Minute))},
+		{name: "nats-1", pod: ready("nats-1", written.Add(-time.Hour))},
+		{name: "nats-2", pod: ready("nats-2", written.Add(-time.Hour))},
+	}
+	confirmed := map[string]bool{"nats-1": true, "nats-2": true}
+	if s, ok := a2aBusStragglerToRestart(servers, confirmed, written, true, now); ok {
+		t.Fatalf("restarted %s, a replacement still inside its own bound", s.name)
+	}
+	// Past its own bound it is restarted: the grace is bounded.
+	if _, ok := a2aBusStragglerToRestart(servers, confirmed, written, true, now.Add(a2aBusReloadBound)); !ok {
+		t.Fatal("a replacement past its own bound wasn't restarted")
+	}
+}
+
+// The one server down has no pod at all (NotFound): there is nothing to
+// restart, and the pick neither restarts nor panics on the missing pod.
+func TestALoneDownServerWithNoPodIsNotRestarted(t *testing.T) {
+	written := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	now := written.Add(5 * time.Minute)
+	ready := &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(written.Add(-time.Hour)),
+	}}}}
+	servers := []a2aBusServer{
+		{name: "nats-0", pod: ready},
+		{name: "nats-1"}, // no pod
+		{name: "nats-2", pod: ready},
+	}
+	confirmed := map[string]bool{"nats-0": true, "nats-2": true}
+	if s, ok := a2aBusStragglerToRestart(servers, confirmed, written, true, now); ok {
+		t.Fatalf("restarted %q, a server with no pod", s.name)
+	}
+}
+
+// A TLS change folds a re-armed server, which clears its re-armed mark: if it
+// then never moves, its restart past the bound is the failure Warning, not
+// the Normal "folded" restart a re-armed server gets.
+func TestATLSFoldClearsTheReArmedMarkForTheRestartEvent(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	agent := a2aSingleServerTestAgent()
+	name := a2aNATSName(agent) + a2aNATSPodOrdinalSuffix
+	state := a2aBusReloadState{
+		requestedAt: asked.Format(time.RFC3339Nano), watched: "a-stale-version",
+		servers: map[string]a2aBusServerRecord{name: {UID: "", Start: t0, Loaded: t0}},
+		rearmed: map[string]bool{name: true},
+	}
+	pending := &corev1.Secret{}
+	state.stamp(pending, a2aNATSName(agent))
+	r, agent, sts, _ := a2aReloadFixture(t, "new", pending.Annotations)
+	pod := &corev1.Pod{}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: name}, pod); err != nil {
+		t.Fatal(err)
+	}
+	state.servers[name] = a2aBusServerRecord{UID: pod.UID, Start: t0, Loaded: t0}
+	pending = &corev1.Secret{}
+	state.stamp(pending, a2aNATSName(agent))
+	live := &corev1.Secret{}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, live); err != nil {
+		t.Fatal(err)
+	}
+	live.Annotations = pending.Annotations
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return asked, true }
+	// Readable, and it hasn't moved: unconfirmed, past the bound.
+	r.busVarz = varzOf(map[string]a2aBusVarz{name: {Start: t0, Loaded: t0}})
+	plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(a2aBusReloadBound+time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.restart != name {
+		t.Fatalf("plan = %+v, want %s restarted past the bound", plan, name)
+	}
+	if plan.folded {
+		t.Fatal("a server the TLS change folded kept its re-armed mark: its restart would read as the Normal folded restart")
+	}
+}
