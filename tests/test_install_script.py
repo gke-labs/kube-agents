@@ -48,6 +48,10 @@ _PRINT_NO_CHAT_SH = _REPO_ROOT / "scripts" / "installer" / "print_instructions_n
 # the subshell rule.
 _FRONT_DOORS = (_INSTALL_SH, _REPO_ROOT / "upgrade.sh", _REPO_ROOT / "uninstall.sh")
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+# Where main() generates terraform.tfvars when it is handed this checkout, and
+# the two names its generator writes there.
+_CHECKOUT_COMPOSE_DIR = _REPO_ROOT / "terraform" / "examples" / "full-install"
+_GENERATED_TFVARS_NAMES = ("terraform.tfvars", "terraform.tfvars.tmp")
 
 # install.sh sources the shared helpers from the acquired workspace partway
 # through main(), so a validator that leans on one is unreachable from a bare
@@ -109,6 +113,35 @@ def tearDownModule():
 class TestNoLiveGcloud(unittest.TestCase):
     def test_no_test_in_this_module_can_run_the_real_gcloud(self):
         no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
+
+
+def _checkout_generated_tfvars():
+    """The generated tfvars of the checkout's Terraform composition: name, time and size.
+
+    For a test that hands main() the real checkout as its repository: take
+    this before the run and give it to _assert_checkout_tfvars_untouched
+    after it. main() sources scripts/installer/installer_common.sh from the
+    repository after a driver's stubs are defined, so a stub of a function
+    that file defines does not hold. write_tfvars_from_state is one: the real
+    one then writes terraform.tfvars into the composition directory, which in
+    a developer's clone holds the generated file of a real install. A stub of
+    tf_compose_dir holds, because install.sh defines it and is not sourced
+    again: point it at a temporary directory.
+    """
+    found = {}
+    for name in _GENERATED_TFVARS_NAMES:
+        try:
+            status = (_CHECKOUT_COMPOSE_DIR / name).stat()
+        except FileNotFoundError:
+            continue
+        found[name] = (status.st_mtime_ns, status.st_size)
+    return found
+
+
+def _assert_checkout_tfvars_untouched(test, before):
+    test.assertEqual(
+        before, _checkout_generated_tfvars(), f"the run wrote tfvars into the checkout's {_CHECKOUT_COMPOSE_DIR.name}"
+    )
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -12520,12 +12553,19 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             # default kubeconfig must not be what answers.
             kubeconfig = pathlib.Path(tmp) / "kubeconfig"
             kubeconfig.touch()
+            # The run generates terraform.tfvars; it must land here and not in
+            # the checkout (see _checkout_generated_tfvars). The stubs below of
+            # write_tfvars_from_state and check_service_account_ownership do
+            # not hold: main() sources the file that defines the real ones.
+            tf_dir = pathlib.Path(tmp) / "full-install"
+            tf_dir.mkdir()
             driver = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 "command() { return 0; }\n"
                 "require_min_gcloud_version() { return 0; }\n"
                 "require_min_terraform_version() { return 0; }\n"
                 f'acquire_source_repo() {{ printf -v "$1" "%s" "{_REPO_ROOT}"; }}\n'
+                f'tf_compose_dir() {{ echo "{tf_dir}"; }}\n'
                 "gcloud() {\n"
                 '  case "$*" in\n'
                 '    *"config get-value account"*) echo "user@example.com" ;;\n'
@@ -12543,6 +12583,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 'write_json_report() { echo "REPORT=$1"; }\n'
                 "main --dry-run -y --gcp-project-id=test-proj --gke-cluster-name=test-cluster --gcp-region=us-central1\n"
             )
+            tfvars_before = _checkout_generated_tfvars()
             proc = subprocess.run(
                 ["bash", "-c", driver],
                 capture_output=True,
@@ -12554,6 +12595,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("REPORT=DRY_RUN_SUCCESS", proc.stdout)
+            _assert_checkout_tfvars_untouched(self, tfvars_before)
 
     def test_every_toggle_refuses_an_empty_value_against_a_seed(self):
         """`--enable-slack=` with SLACK_ENABLED=true recorded is the bad case.
@@ -13623,6 +13665,7 @@ run_menu_system "{repo_tmp}"
                     kubeconfig = pathlib.Path(kc_dir) / "kubeconfig"
                     kubeconfig.touch()
                     flag = "--enable-stockout-investigator" if enabled else ""
+                    tfvars_before = _checkout_generated_tfvars()
                     proc = self._run_bash(
                         f"""
 command() {{ return 0; }}
@@ -13651,6 +13694,7 @@ main --dry-run -y --gcp-project-id=test-proj --gke-cluster-name=test-cluster --g
                         source_common=False,
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    _assert_checkout_tfvars_untouched(self, tfvars_before)
                     self.assertIn("GKE Stockout Investigator:", proc.stdout)
                     self.assertIn(expected, proc.stdout)
 

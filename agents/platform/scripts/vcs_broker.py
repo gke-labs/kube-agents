@@ -2365,6 +2365,8 @@ class VcsBroker:
         payload: dict[str, Any],
         pinned_target: bool = False,
     ) -> dict[str, Any]:
+        if verb in WRITE_VERBS:
+            refuse_dial_gated_labels(payload)
         bound = self._bind(payload)
         # Before anything else that could spend a call: a forge with no labels
         # refuses a label field by name, so a filter is not silently ignored
@@ -2598,8 +2600,8 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
 
 # The Slack autonomy dial's level, the runtime source write_mode() reads beside
 # the env, set through set_dial_level(), so a new level applies with no pod
-# restart. Nothing in the broker calls set_dial_level() yet; the Slack adapter's
-# report is its intended caller. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# restart. The credential proxy's dial route calls it when the Slack adapter
+# reports a level. Only while `KUBEAGENTS_DIAL` is `on` (the broker
 # gets spec.deployment.env); off, the dial is not a source at all. On, a broker
 # with no level set since it started reads the level it last stored on its
 # state emptyDir (kept across a container restart, not a new Pod), and with none
@@ -2618,6 +2620,10 @@ DIAL_LEVELS = (DIAL_EXPLAIN, DIAL_PROPOSE, DIAL_AUTOMERGE)
 _dial_lock = threading.Lock()
 _dial_level: str | None = None
 _dial_reported = False
+# The label the customer's pipeline merges on (automation_rules.AUTOMERGE_LABEL;
+# a test holds the two equal). Below Auto-merge no write verb may add it.
+DIAL_GATED_LABELS = frozenset({"kube-agents:auto-merge"})
+DIAL_ADDING_LABEL_FIELDS = ("labels", "labelsAdd")
 
 
 def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -2666,6 +2672,37 @@ def dial_reported() -> bool:
     """Whether the gateway has reported the dial's level to this broker process."""
     with _dial_lock:
         return _dial_reported
+
+
+def dial_allows_automerge(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the dial lets a fix carry the auto-merge label: off, or at Auto-merge."""
+    level = dial_level(environ)
+    return level is None or level == DIAL_AUTOMERGE
+
+
+def refuse_dial_gated_labels(payload: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a write that adds the auto-merge label while the dial is below Auto-merge.
+
+    Compared folded and stripped: a forge matches label names that way, so a
+    spelling that differs only in case is the same label to the pipeline. Each
+    value is also split on commas, because an adapter may join the list with
+    commas and its forge reads that as several labels. Removing it is always
+    allowed, and a read (a list filter) never comes here.
+    """
+    if dial_allows_automerge(environ):
+        return
+    for field in DIAL_ADDING_LABEL_FIELDS:
+        values = payload.get(field)
+        values = [values] if isinstance(values, str) else values if isinstance(values, (list, tuple)) else []
+        names = [part for v in values if isinstance(v, str) for part in v.split(",")]
+        if any(name.strip().casefold() in DIAL_GATED_LABELS for name in names):
+            raise WorkspaceError(
+                "the autonomy dial is not at Auto-merge proven fixes, so no pull request or issue may carry "
+                "the auto-merge label. Leave the label off; an install admin raises the dial on the Slack "
+                "app's Home tab.",
+                status=403,
+                code="DIAL_AUTOMERGE_OFF",
+            )
 
 
 def write_mode_detail(raw: str) -> str:
@@ -2799,6 +2836,8 @@ __all__ = [
     "dial_level",
     "dial_reported",
     "set_dial_level",
+    "dial_allows_automerge",
+    "refuse_dial_gated_labels",
     "write_mode",
     "write_mode_detail",
     "max_bundle_bytes",
