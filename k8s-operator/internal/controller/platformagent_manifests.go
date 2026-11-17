@@ -1231,9 +1231,8 @@ const (
 
 	// kubeagentsModeEnvKey is the managed .env key an agent image from before
 	// the removal of spec.mode today reads to learn which stack it runs, and
-	// kubeagentsModeValue the one answer. The agent image's runtime_mode.py
-	// still reads it; the pin goes once no supported agent image predates the
-	// removal.
+	// kubeagentsModeValue the one answer. Nothing in the current image reads
+	// it; the pin goes once no supported agent image predates the removal.
 	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
 	kubeagentsModeValue  = agentv1alpha1.PlatformAgentModeNext
 )
@@ -5052,6 +5051,12 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	// is what enforces the base, and the agent and the shell sandbox get no
 	// copy they could be mistaken for the authority over.
 	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
+	// The install's tier table (#6091), for the report-credential rule to key
+	// on a tier's mode rather than its name. Declared in the managed set, so
+	// mergeCredentialProxyEnv reserves the name: a CR must not point the
+	// broker at a tier table the operator did not render.
+	_, _, tiersEnv := a2aTiersVolumeAndMount(agent)
+	envVars = append(envVars, tiersEnv)
 	// The Pub/Sub platform relay's subscription set, from the AgentPlugin
 	// configs (platformagent_pubsub_relay.go). Absent when no plugin configures
 	// a Pub/Sub platform, and the broker refuses every relayed Pub/Sub call.
