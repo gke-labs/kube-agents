@@ -257,6 +257,13 @@ class Shapes(Harness):
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
         self.assertIn("hard failure", self.gh.bodies()[0].split("\n")[1])
 
+    def test_a_run_of_infra_forge_repetitions_only_gets_no_comment(self):
+        # No verdict line recorded (no eval_outcome), nothing graded, nothing blocked: not a red.
+        tasks = [task(name, "ggg") for name in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [])
+
     def test_hard_failure(self):
         # FAILURE with every gate case passing: an absolute check tripped.
         tasks = [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HELD_OUT, "fff")]

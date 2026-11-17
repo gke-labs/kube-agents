@@ -964,11 +964,14 @@ def storm_cause(rep: dict) -> str:
 
 
 class Task:
-    __slots__ = ("ceilings", "fails", "fixtures", "forges", "name", "passes", "storm_causes", "storms")
+    __slots__ = ("ceilings", "fails", "fixtures", "forges", "name", "passes", "safeguards", "storm_causes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
         self.passes = self.fails = self.storms = self.ceilings = self.fixtures = self.forges = 0
+        # The forge reps that are rung-2 blocks (FORGE_SAFEGUARD_MARKER), not
+        # `infra` ones: each reds the run without being graded.
+        self.safeguards = 0
         # Each storm repetition's own words, counted (storm_cause).
         self.storm_causes: Counter = Counter()
         reps = task.get("reps")
@@ -991,6 +994,8 @@ class Task:
                 self.fixtures += 1
             elif kind == REP_FORGE:
                 self.forges += 1
+                if str(rep.get("result") or "").lower() != REP_RESULT_INFRA:
+                    self.safeguards += 1
             else:
                 self.fails += 1
 
@@ -1077,6 +1082,11 @@ class Run:
     @property
     def forge_reps(self) -> int:
         return sum(task.forges for task in self.tasks)
+
+    @property
+    def safeguard_reps(self) -> int:
+        """The forge reps that red the run: rung-2 safeguard blocks."""
+        return sum(task.safeguards for task in self.tasks)
 
     @property
     def total_reps(self) -> int:

@@ -494,20 +494,27 @@ def ceiling_reps(run: dict) -> int:
     return _run_facts(run)["ceiling"]
 
 
-def safeguard_blocked(run: dict) -> bool:
-    """A red run whose every non-pass, non-infra repetition is one the scorer
-    kept on rung 2 only for an errored catastrophic safeguard under a forge
-    outage (FORGE_SAFEGUARD_MARKER). Any other red repetition -- a tripped
-    safeguard, a failed check -- is a red the forge does not explain."""
-    red = [
-        str(rep.get("reason") or "")
-        for task in run_tasks(run)
-        for rep in task_reps(task)
-        if str(rep.get("result") or "").lower() not in ("pass", "infra")
-    ]
-    return str(run.get("result") or "").upper() == RUN_FAILURE and bool(red) and all(
-        reason.startswith(FORGE_SAFEGUARD_MARKER) for reason in red
-    )
+def _is_safeguard(rep: dict) -> bool:
+    """A rung-2 block the scorer marked with FORGE_SAFEGUARD_MARKER."""
+    return str(rep.get("result") or "").lower() != "infra" and str(rep.get("reason") or "").startswith(FORGE_SAFEGUARD_MARKER)
+
+
+def safeguard_blocked(run: dict, held_out: frozenset = frozenset()) -> bool:
+    """A red run with a safeguard block (FORGE_SAFEGUARD_MARKER) and no other
+    repetition that could red it: every non-pass, non-infra repetition of an
+    admitted case is a safeguard block. A held-out case's graded fail never
+    blocks, so it is left out (`held_out`: those case names); its safeguard
+    block still reds the run, since rung 2 is admission-blind."""
+    if str(run.get("result") or "").upper() != RUN_FAILURE:
+        return False
+    blocks = 0
+    for task in run_tasks(run):
+        for rep in task_reps(task):
+            if _is_safeguard(rep):
+                blocks += 1
+            elif str(rep.get("result") or "").lower() not in ("pass", "infra") and str(task.get("name")) not in held_out:
+                return False
+    return blocks > 0
 
 
 def forge_reps(run: dict) -> int:
@@ -641,8 +648,10 @@ def reason_rep(task: dict) -> dict | None:
     with a reason, else the first rep of any kind with one; None when no
     rep carries a reason."""
     graded = [r for r in task_reps(task) if rep_kind(r) == "fail" and r.get("reason")]
+    # A safeguard block reds the case, so it is shown before a storm rep's words.
+    blocked = [r for r in task_reps(task) if _is_safeguard(r)]
     other = [r for r in task_reps(task) if r.get("reason")]
-    for rep in graded + other:
+    for rep in graded + blocked + other:
         return rep
     return None
 
@@ -947,6 +956,7 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
     """(headline, lede, verdict) for a run that recorded tasks."""
     gate = [c for c in cases if c["admitted"] and c["outcome"] in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED)]
     held = [c for c in cases if not c["admitted"]]
+    held_names = frozenset(c["case"] for c in held)
     held_failed = [c for c in held if c["outcome"] == OUTCOME_FAILED]
     failed = [c for c in gate if c["outcome"] == OUTCOME_FAILED]
     n = len(gate)
@@ -963,7 +973,7 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
                 "The cases were not run; the fixture's drift is the infra owner's, not a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
-        if ungraded and safeguard_blocked(run):
+        if ungraded and safeguard_blocked(run, held_names):
             return FORGE_RED_HEADLINE, FORGE_RED_LEDE + (FORGE_OUTAGE_NOTE if incident else "") + held_note, VERDICT_RED
         if ungraded and all(c["cls"] == CLS_FORGE for c in ungraded):
             return (
@@ -999,7 +1009,7 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
             "The gate counted it green, so nothing here blocks the PR. The failures are listed for the record." + held_note,
             VERDICT_GREEN,
         )
-    if not failed and safeguard_blocked(run):
+    if not failed and safeguard_blocked(run, held_names):
         return FORGE_RED_HEADLINE, FORGE_RED_LEDE_GRADED + (FORGE_OUTAGE_NOTE if incident else "") + held_note, VERDICT_RED
     if not failed and str(run.get("result") or "").upper() == RUN_FAILURE:
         # Red without a collapsed gate case: an absolute rule tripped (a

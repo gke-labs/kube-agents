@@ -296,6 +296,17 @@ class RepAndOutcomeTest(unittest.TestCase):
         row = case(classify_run(straddle, [straddle], health_at=STORM), sorted(ADMITTED)[0])
         self.assertEqual((row["outcome"], row["cls"], row["do"]), (classify.OUTCOME_PARTIAL, classify.CLS_FORGE, classify.DO_FORGE))
         self.assertIn("KUBE_AGENTS_FORGE_SAFEGUARD", row["reason"])
+        names = sorted(ADMITTED)
+        # A held-out case's graded fail never blocks, so it does not hide the safeguard's red; the held note shows.
+        held_fail = run(6, 6, T0, tasks=[task(n, "ppp") for n in names[1:]] + [task(names[0], "ppb"), task(HOLD_OUT, "fff")], result="FAILURE")
+        verdict = classify_run(held_fail, [held_fail], health_at=STORM)
+        self.assertEqual(verdict["headline"], classify.FORGE_RED_HEADLINE)
+        self.assertIn("held-out case", verdict["lede"])
+        # An admitted graded fail beside the block is a red the forge does not explain.
+        own_fail = run(7, 7, T0, tasks=[task(n, "ppp") for n in names[2:]] + [task(names[0], "ppb"), task(names[1], "fff")], result="FAILURE")
+        self.assertNotEqual(classify_run(own_fail, [own_fail], health_at=STORM)["headline"], classify.FORGE_RED_HEADLINE)
+        # The row shows the safeguard block's reason, not an earlier storm rep's.
+        self.assertIn("KUBE_AGENTS_FORGE_SAFEGUARD", classify.first_reason(task("y", "ibb")))
         # Nothing graded, a safeguard block beside a ceiling case: still red, whatever the neighbour lost to.
         names = sorted(ADMITTED)
         beside_ceiling = run(5, 5, T0, tasks=[task(names[0], "bbb")] + [task(n, "ccc") for n in names[1:]], result="FAILURE")
