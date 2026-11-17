@@ -84,7 +84,9 @@ the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
 ([Nightly bugs](#nightly-bugs)), keeps an issue open for the owner of each
 domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)), renders the weekly health email beside
-`data.json` ([The weekly health email](#the-weekly-health-email)), and appends
+`data.json` ([The weekly health email](#the-weekly-health-email)), once a week
+cross-checks the Slack lane's overhead against `autopush` and `staging`
+([The Slack cross-check](#the-slack-cross-check)), and appends
 `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
@@ -1084,6 +1086,14 @@ with two identities:
 | Infra                                                                      | `infra_owner`                               |
 | Case needs rework, low confidence, or no verdict                           | the filer's rule (case owner, domain owner) |
 
+A suspected pull request also has to have merged between the issue's last
+green night and its first red one (the same nights that bound the commit
+window, by UTC date, the green one a day early to cover a build that started
+just before midnight). One that merged outside them, or an issue with no green
+night on record, routes by the filer's rule: with no green night the commit
+window is the 80 commits before the first red night, which can reach back
+weeks.
+
 The first login GitHub accepts is assigned, the rule's logins behind it; a
 person without access to the issues repository is not assignable there, and
 the issue falls to the rule. The job then posts one comment on the issue with
@@ -1474,6 +1484,40 @@ renders against any downloaded pair (it reads the issues with `gh`), and
 `python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
 prints the message body it would post.
 
+## The Slack cross-check
+
+The Slack lane's overhead is measured on a quiet CI channel, so the nightly
+pages' estimated Slack times are a floor. Once a week the tick checks that
+floor against real traffic: `scripts/eval_dashboard/slack_crosscheck.py`
+reads the A2A gateway's Slack histograms (delivery lag, a post's time, time
+to first ack) on `autopush` and `staging`'s host clusters over the last seven
+days, from each environment's Managed Service for Prometheus, and sets them
+beside the lane's nightly values for the same days in `data.json`. It is
+published as `slack-crosscheck.json` beside `data.json`: `lane` (`nights` and
+the four values), `environments.<name>` (`project`, the four values,
+`deliveries` and each value's `ratio` to the lane's, or `error`), `complete`,
+`window_days` and `generated_at`. The lane's quantiles are the mean of its
+nightly quantiles, not pooled ones. A metric an environment does not serve
+yet reads as `null`. A complete run within the last seven days skips with one
+log line.
+
+It reads as the publisher, which needs `roles/monitoring.viewer` on the two
+environments' projects, `kube-agents-autopush` (autopush) and
+`kube-agents-gkedemos` (staging):
+
+```bash
+for p in kube-agents-autopush kube-agents-gkedemos; do
+  gcloud projects add-iam-policy-binding "$p" --role=roles/monitoring.viewer \
+    --member=serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
+done
+```
+
+An environment whose project refuses the read is skipped with one log line
+naming the role, and any other failure is logged and recorded as its `error`.
+A run that reads no environment publishes nothing; one that reads only some
+publishes with `complete: false`, which does not count as the week's run, so
+each tick reads again and a grant takes effect on the next one.
+
 ## The seeded-fleet scan
 
 Presence probes passed on 2026-09-07 while every slot-a fixture sat Pending on
@@ -1485,7 +1529,7 @@ the top of every hour (`0 * * * *`, a second cron in the same workflow; the
 `github.event.schedule` guards send each run to one job) it runs
 `scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
 temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
-`hack/fleet-fixture-state.py --wait 0 --report`, eight projects at a time, and
+`hack/fleet-fixture-state.py --wait 0 --report`, ten projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
 and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
@@ -1516,9 +1560,9 @@ read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
-firewall-rules list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm` and
-`world-open-ingress`, which have no cluster slot; the account holds
+firewall-rules list`, `gcloud compute networks list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress` and
+`declared-mtu-peering`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
@@ -1638,7 +1682,7 @@ the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 `verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,gemini_api_key,token_minter_kms --report`
-against every pool project, eight at a time, and publishes
+against every pool project, ten at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
 `forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project with provider `gemini` in their eval-model pair (`docs/ci-pool-projects.md` 5.10); a lane whose pair names `vertex_ai` does not read the key. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
@@ -1760,7 +1804,7 @@ mean "retest" by that word, and this one has nothing to retest for.
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
 past which it starts no check and cuts every command short, so a stall costs the reads it
 hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
-scan's own ceiling (1620 s: five waves of eight projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
+scan's own ceiling (1620 s: five waves of ten projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
 laptop as whoever is logged in.

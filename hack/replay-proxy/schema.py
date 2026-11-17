@@ -112,6 +112,11 @@ UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
 # the key drops: served to a run whose list lacked it, it would act on a file
 # that run was never shown.
 UNSTORABLE_NAMES_DROPPED_FILE = "names_dropped_similar_file"
+# The answer talks about a queue or a slot (`queued`, `frees up`, `slot`, `in
+# use`) after a kanban_create result whose `queued` the key drops: served to a
+# run whose card had a free slot, it would tell the user of a wait that run
+# does not have.
+UNSTORABLE_TALKS_ABOUT_DROPPED_QUEUE = "talks_about_dropped_queue"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"

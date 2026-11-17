@@ -377,6 +377,12 @@ readonly EVAL_FENCE_DECIDED_EXIT=3
 readonly EVAL_FENCE_ATTEMPTS=3
 readonly EVAL_FENCE_POD_WAIT_SECONDS=300
 readonly EVAL_FENCE_GATEWAY_AWAY_LATCH=".gateway-away"
+# The bound on the replay lane's one clear of the live arm's cards (fence_live_cards
+# with `arm`, from run_replay_lane_live_arm). Every card the arm's repetitions filed,
+# finished ones included, can be tens of archives, more than the per-unit bound covers;
+# nothing else runs while it does, and the helper still ends inside its budget, before
+# the replayed units file theirs.
+readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -428,8 +434,13 @@ readonly EVAL_SCOPE_RECONCILE_ATTEMPTS=5
 readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
 readonly EVAL_SCOPE_READ_ATTEMPTS=3
 # What a unit's lock deadline allows past its delegation timeout, for the
-# stack, the verifier and the state writes around the run.
-readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
+# stack, the verifier and the state writes around the run: 600 s, plus the
+# GitHub rate-limit waits the unit may spend while it holds the lock (#6105),
+# the pull-request reset's (hack/ci_reset_agent_pulls.py
+# RATE_LIMIT_BUDGET_SECONDS, 900) and the grader's
+# (bench/kube_agents_bench/verifiers.py _FORGE_RATE_LIMIT_BUDGET_SEC, 600).
+# scripts/test_ci_eval_agent_pulls_reset.py keeps it at least that sum.
+readonly UNIT_LOCK_ALLOWANCE_SECONDS=2100
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
 # applied: oobe-first-run-audits' own_wait plus its chain_wait
 # (bench/tf/prebuilt/oobe-first-run-audits/main.tf). The stack runs one wait
@@ -2399,8 +2410,15 @@ wait_platform_runs() { # <label> <space-separated audit ids>
 # fence that could not run to its verdict after its attempts notes the unit
 # under FENCE_UNFENCED_DIR, and run_one_unit records it as infrastructure
 # instead of launching it (#5508).
-fence_live_cards() { # <label> [<task-name> <rep>]
-  local label="$1" name="${2:-}" rep="${3:-}" ns ctx out rc=0 pod attempt
+#
+# With `arm` as the fourth argument (run_replay_lane_live_arm, no unit named), it
+# archives every card the replay lane's live arm filed, finished ones included, so
+# the replayed arm does not read the live arm's answers off the board;
+# hack/ci_fence_cards.py says which cards that leaves alone. Bounded by
+# EVAL_ARM_CLEAR_TIMEOUT_SECONDS; a clear that fails only warns.
+fence_live_cards() { # <label> [<task-name> <rep> [arm]]
+  local label="$1" name="${2:-}" rep="${3:-}" scope="${4:-live}" ns ctx out rc=0 pod attempt limit="${EVAL_FENCE_TIMEOUT_SECONDS}"
+  [ "${scope}" != "arm" ] || limit="${EVAL_ARM_CLEAR_TIMEOUT_SECONDS}"
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || [ -z "${EVAL_FANOUT_STARTED_EPOCH:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
@@ -2413,7 +2431,7 @@ fence_live_cards() { # <label> [<task-name> <rep>]
       echo "WARNING: Card fence (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
       return 0 ;;
   esac
-  local bound=(timeout --foreground "${EVAL_FENCE_TIMEOUT_SECONDS}")
+  local bound=(timeout --foreground "${limit}")
   command -v timeout >/dev/null 2>&1 || bound=()
   # Each attempt first waits for a Ready gateway pod and execs into that pod, as the
   # scheduled-audits exec does: a gateway preempted or rolled mid-phase (#5508) has no
@@ -2436,7 +2454,7 @@ fence_live_cards() { # <label> [<task-name> <rep>]
     out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "${pod}" \
       -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
       "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
-      "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
+      "$((limit - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" "${scope}" \
       < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
     if [ "${rc}" -eq 0 ]; then
       echo "Card fence (${label}): ${out}"
@@ -2446,17 +2464,25 @@ fence_live_cards() { # <label> [<task-name> <rep>]
     if [ "${rc}" -eq "${EVAL_FENCE_DECIDED_EXIT}" ]; then
       # The helper ran and says what it could not archive: the fence did its work,
       # and the unit launches as it did before the fence existed.
-      echo "WARNING: Card fence (${label}): ${out}; a card still live may open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+      if [ "${scope}" = "arm" ]; then
+        echo "WARNING: Card fence (${label}): ${out}; the replayed arm may read the cards named on the board" >&2
+      else
+        echo "WARNING: Card fence (${label}): ${out}; a card still live may open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+      fi
       [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
       return 0
     fi
-    [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
+    [ "${rc}" -eq 124 ] && out="timed out after ${limit}s${out:+; ${out}}"
     echo "WARNING: Card fence (${label}): kubectl exec into ${pod} exited ${rc} on attempt ${attempt} of ${attempts} (${out})" >&2
     [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
   done
   # Not launched into a window the fence did not clear: run_one_unit records the
   # unit as infrastructure from this note (#4425, #5508). A caller that named no
   # unit gets the warning alone.
+  if [ "${scope}" = "arm" ]; then
+    echo "WARNING: Card fence (${label}): could not run after ${attempts} attempt(s) (${out}); the replayed arm may read the live arm's cards on the board" >&2
+    return 0
+  fi
   echo "WARNING: Card fence (${label}): could not run after ${attempts} attempt(s) (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it, so the unit is not launched (#4425, #5508)" >&2
   if [ -n "${name}" ] && [ -n "${rep}" ] && [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
     mkdir -p "${FENCE_UNFENCED_DIR}" 2>/dev/null || true
@@ -3569,6 +3595,11 @@ run_replay_lane_live_arm() {
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
     launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
     wait
+    # The replayed arm must not read the live arm's answers off the board (replay
+    # lane build 2122208205344870400 read a finished live-arm card). Since
+    # EVAL_FANOUT_STARTED_EPOCH, set right before this is called. A failed clear
+    # only warns.
+    fence_live_cards "replay lane live arm" "" "" arm
   fi
   seed_replay_lane_cache || exit 1
   write_replay_lane_arms "$(date -u +%s)"
