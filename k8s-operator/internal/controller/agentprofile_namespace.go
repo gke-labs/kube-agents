@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"slices"
 	"strings"
 	"time"
 
@@ -207,9 +206,10 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
 	pools := interactiveProfileTiers(profiles)
 	jobs := resolveProfileCeiling(agent)
-	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
-		return unattendedTierOf(&p) != ""
-	}) {
+	// Under Job mode every profile has Job templates (its unattended tasks',
+	// and at every tier its permit-carrying ones', #5646), so the Job pods'
+	// budget doubles whenever any profile is bound.
+	if dispatcherJobPolicyRendered() && len(profiles) > 0 {
 		jobs *= 2
 	}
 	return map[corev1.ResourceName]int64{

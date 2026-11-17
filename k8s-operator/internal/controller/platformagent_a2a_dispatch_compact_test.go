@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -42,12 +41,12 @@ func TestTheDispatchConfigIsWrittenCompactWithNoDerivedFields(t *testing.T) {
 	if _, ok := doc.Profiles[0]["durables"]; ok {
 		t.Error("the entry lists its durables; the dispatcher derives them")
 	}
-	var ref map[string]string
+	var ref map[string]any
 	if err := json.Unmarshal(doc.Profiles[0]["jobTemplateRef"], &ref); err != nil {
 		t.Fatalf("jobTemplateRef: %v", err)
 	}
-	if _, ok := ref["name"]; ok || ref["hash"] == "" {
-		t.Errorf("jobTemplateRef %v; want the hash alone", ref)
+	if _, ok := ref["name"]; ok || ref["hash"] == "" || ref["perTier"] != true || len(ref) != 2 {
+		t.Errorf("jobTemplateRef %v; want the hash alone, per tier", ref)
 	}
 	// The operator still knows the durables it creates and grants.
 	if _, durables := dispatcherGrantNames(agent, profiles, nil); len(durables) != 4 {
@@ -260,7 +259,7 @@ func TestTheDispatchConfigMeasureIsTheWrittenShape(t *testing.T) {
 				estimate += n
 			}
 			for _, imageVolumes := range []bool{true, false} {
-				var templates map[string]*corev1.PodTemplateSpec
+				var templates map[string]profileJobTemplates
 				if tc.jobMode {
 					templates = dispatchJobTemplates(agent, profiles, imageVolumes)
 				}

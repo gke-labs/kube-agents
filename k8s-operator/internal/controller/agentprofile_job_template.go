@@ -52,9 +52,21 @@ import (
 // templates run as, so a Job running as any other is denied. Only the
 // operator writes DispatchJobTemplates.
 const (
-	// dispatchJobTemplatePrefix names a profile's DispatchJobTemplate:
-	// kube-agents-dispatch-job-profile-<profile>.
+	// dispatchJobTemplatePrefix names a profile's DispatchJobTemplate for its
+	// unattended-mode tier: kube-agents-dispatch-job-profile-<profile>.
 	dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
+	// dispatchJobTierTemplatePrefix names a profile's DispatchJobTemplate for
+	// any other tier, where permit-carrying tasks run in their own one-pod
+	// Job (#5646): kube-agents-dispatch-job-tier-<profile>-<tier>. Its own
+	// prefix, so no tier's param is another profile's unattended-mode one.
+	// lib.DispatchJobTierTemplateName must stay the same.
+	dispatchJobTierTemplatePrefix = "kube-agents-dispatch-job-tier-"
+	// dispatchJobParamProfileAnnotation and dispatchJobParamTierAnnotation
+	// say which (profile, tier) a param holds the template of, so the
+	// operator never parses it out of the name. Annotations, not labels: the
+	// policy requires every param label on every Job.
+	dispatchJobParamProfileAnnotation = "kubeagents.x-k8s.io/dispatch-profile"
+	dispatchJobParamTierAnnotation    = "kubeagents.x-k8s.io/dispatch-tier"
 	// dispatchJobIndexName is the index DispatchJobTemplate, which the policy tells
 	// apart by this name. The templates' prefix keeps a profile named
 	// "index" from taking it.
@@ -77,17 +89,24 @@ func profileWorkerPodSpecForJob(agent *agentv1alpha1.PlatformAgent, p *agentv1al
 }
 
 // buildProfileJobTemplate is the pod template a profile's unattended Jobs
-// run: the one-shot worker pod, whose restartPolicy is Never (a Job's pod
-// must not restart, and a PodTemplate defaults it to Always, which would
-// break the policy's exact comparison), with the worker labels for the
-// profile's unattended tier.
+// run: buildProfileJobTemplateAt its one unattended-mode tier
+// (unattendedTierOf): unattended itself, or a Tier resource whose mode is
+// unattended (#3659).
 func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool) *corev1.PodTemplateSpec {
-	// The profile's one unattended-mode tier (unattendedTierOf): unattended
-	// itself, or a Tier resource whose mode is unattended (#3659).
 	tier := unattendedTierOf(p)
 	if tier == "" {
 		tier = agentv1alpha1.AgentProfileTierUnattended
 	}
+	return buildProfileJobTemplateAt(agent, p, tier, imageVolumes)
+}
+
+// buildProfileJobTemplateAt is the pod template a profile's Jobs at tier
+// run: the one-shot worker pod under the (profile, tier)'s ServiceAccount,
+// whose restartPolicy is Never (a Job's pod must not restart, and a
+// PodTemplate defaults it to Always, which would break the policy's exact
+// comparison), with the worker labels for that tier. At a tier that isn't
+// unattended only permit-carrying tasks run on it (#5646).
+func buildProfileJobTemplateAt(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, tier string, imageVolumes bool) *corev1.PodTemplateSpec {
 	spec := profileWorkerPodSpecForJob(agent, p, tier, imageVolumes)
 	settleForPlatformMutation(&spec, p)
 	return &corev1.PodTemplateSpec{
@@ -193,23 +212,21 @@ const (
 	reasonProfileJobResources = "ProfileJobResourcesOutsideAutopilotRatio"
 )
 
-// autopilotRatioProblem says why a profile that allows the unattended tier
-// would have its Jobs refused on GKE Autopilot, or "": its worker's requests
-// break Autopilot's memory-per-vCPU bounds, so Autopilot raises one of them on
-// the Job and the Job no longer equals its template (found live). Checked
-// whatever the cluster: the operator can't tell an Autopilot cluster apart,
-// and the condition says where it matters.
+// autopilotRatioProblem says why a profile would have its Jobs refused on
+// GKE Autopilot, or "": its worker's requests break Autopilot's
+// memory-per-vCPU bounds, so Autopilot raises one of them on the Job and the
+// Job no longer equals its template (found live). Every profile has Jobs
+// under Job mode: its unattended tasks, and at any tier its permit-carrying
+// ones (#5646). Checked whatever the cluster: the operator can't tell an
+// Autopilot cluster apart, and the condition says where it matters.
 func autopilotRatioProblem(p *agentv1alpha1.AgentProfile) string {
-	if unattendedTierOf(p) == "" {
-		return ""
-	}
 	cpu := p.Spec.Resources.Requests.CPU.AsApproximateFloat64()
 	gib := p.Spec.Resources.Requests.Memory.AsApproximateFloat64() / (1 << 30)
 	if cpu <= 0 {
 		return ""
 	}
 	if ratio := gib / cpu; ratio < autopilotMinGiBPerCPU || ratio > autopilotMaxGiBPerCPU {
-		return fmt.Sprintf("resources.requests (cpu %s, memory %s) are %.2f GiB per vCPU, outside GKE Autopilot's %.1f to %.1f: on Autopilot the profile's unattended Jobs are refused (Autopilot raises a request, and the Job no longer equals its template)",
+		return fmt.Sprintf("resources.requests (cpu %s, memory %s) are %.2f GiB per vCPU, outside GKE Autopilot's %.1f to %.1f: on Autopilot the profile's Jobs are refused (Autopilot raises a request, and the Job no longer equals its template)",
 			p.Spec.Resources.Requests.CPU.String(), p.Spec.Resources.Requests.Memory.String(), ratio, autopilotMinGiBPerCPU, autopilotMaxGiBPerCPU)
 	}
 	return ""
@@ -229,23 +246,78 @@ func dispatcherJobPolicyRendered() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv(a2aDispatcherJobPolicyEnvVar)), "true")
 }
 
-// dispatchJobTemplates is the Job template of each profile the dispatch
-// config admits that allows the unattended tier, by profile name. A profile
-// whose worker would never schedule (profileWorkerToolsProblem) gets none,
-// as it gets no pool; dispatchJobToolsProblems says why.
-func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]*corev1.PodTemplateSpec {
+// profileJobTemplates are one profile's Job templates, by the name of the
+// param (DispatchJobTemplate) each goes in: one per live tier with an
+// identity (#5646). The tier is the template's agentProfileTierLabel.
+type profileJobTemplates map[string]*corev1.PodTemplateSpec
+
+// dispatchJobParamName is the param that holds p's template at tier: the
+// profile's own name for its unattended-mode tier, which a dispatcher from
+// before per-tier templates reads, and the tier's for any other.
+func dispatchJobParamName(p *agentv1alpha1.AgentProfile, tier string) string {
+	if tier == unattendedTierOf(p) {
+		return dispatchJobTemplatePrefix + p.Name
+	}
+	return dispatchJobTierTemplatePrefix + p.Name + "-" + tier
+}
+
+// dispatchJobTemplates is each profile's Job templates, by profile name: one
+// for every live tier the profile has an identity at, for every profile the
+// dispatch config admits. The unattended-mode tier's runs its unattended
+// tasks; every tier's, that one's included, runs the permit-carrying tasks
+// admitted at it, each in its own one-pod Job (#5646). A draining tier has
+// none, so no new Job starts there (#5638). A profile whose worker would
+// never schedule (profileWorkerToolsProblem) gets none, as it gets no pool;
+// dispatchJobToolsProblems says why. Neither does a profile one of whose
+// params' names another profile's would also take (a profile "a" at tier
+// "b-c" and a profile "a-b" at tier "c"): the policy holds a Job to the
+// param by its ServiceAccount, so a shared name would leave one of them
+// running from the other's template.
+func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]profileJobTemplates {
 	if !dispatcherJobPolicyRendered() {
 		return nil
 	}
-	out := map[string]*corev1.PodTemplateSpec{}
+	out := map[string]profileJobTemplates{}
+	owner := map[string]string{}
+	clash := map[string]bool{}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
-		if resolved[p.Name].refused != nil || unattendedTierOf(p) == "" ||
-			profileWorkerToolsProblem(p, imageVolumes) != "" {
+		res := resolved[p.Name]
+		if res.refused != nil || profileWorkerToolsProblem(p, imageVolumes) != "" {
 			continue
 		}
-		out[p.Name] = buildProfileJobTemplate(agent, p, imageVolumes)
+		set := profileJobTemplates{}
+		for _, tier := range dispatchJobTiersOf(p, res) {
+			name := dispatchJobParamName(p, tier)
+			if prev, ok := owner[name]; ok && prev != p.Name {
+				clash[prev], clash[p.Name] = true, true
+			}
+			owner[name] = p.Name
+			set[name] = buildProfileJobTemplateAt(agent, p, tier, imageVolumes)
+		}
+		if len(set) > 0 {
+			out[p.Name] = set
+		}
+	}
+	for name := range clash {
+		delete(out, name)
+	}
+	return out
+}
+
+// dispatchJobTiersOf is the tiers p gets a Job template at: its live tiers
+// that have an identity, in allowedTiers order.
+func dispatchJobTiersOf(p *agentv1alpha1.AgentProfile, res agentProfileResolution) []string {
+	has := map[string]bool{}
+	for _, id := range res.identities {
+		has[id.tier] = true
+	}
+	var out []string
+	for _, tier := range liveTiersOf(p) {
+		if has[tier] {
+			out = append(out, tier)
+		}
 	}
 	return out
 }
@@ -261,7 +333,7 @@ func dispatchJobToolsProblems(agent *agentv1alpha1.PlatformAgent, profiles []age
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
-		if resolved[p.Name].refused != nil || unattendedTierOf(p) == "" {
+		if resolved[p.Name].refused != nil {
 			continue
 		}
 		if problem := profileWorkerToolsProblem(p, imageVolumes); problem != "" {
@@ -286,9 +358,11 @@ func dispatchJobParamLabels(agent *agentv1alpha1.PlatformAgent) map[string]strin
 	return labels
 }
 
-// buildDispatchJobTemplate is profile's param: its Job template, defaulted
-// as the API server defaults a pod template (defaultedJobTemplate).
-func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string, rendered, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
+// buildDispatchJobTemplate is the param name: one (profile, tier)'s Job
+// template, defaulted as the API server defaults a pod template
+// (defaultedJobTemplate), stamped with hash, its profile's
+// dispatchJobTemplatesHash.
+func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, name, hash string, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
 	raw, err := json.Marshal(defaulted)
 	if err != nil {
 		return nil, err
@@ -296,8 +370,12 @@ func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string
 	return &agentv1alpha1.DispatchJobTemplate{
 		TypeMeta: metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: dispatchJobTemplatePrefix + profile, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent),
-			Annotations: map[string]string{dispatchJobTemplateHashAnnotation: dispatchJobTemplateHash(rendered)},
+			Name: name, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent),
+			Annotations: map[string]string{
+				dispatchJobTemplateHashAnnotation: hash,
+				dispatchJobParamProfileAnnotation: defaulted.Labels[agentProfileNameLabel],
+				dispatchJobParamTierAnnotation:    defaulted.Labels[agentProfileTierLabel],
+			},
 		},
 		Spec: agentv1alpha1.DispatchJobTemplateSpec{Template: &runtime.RawExtension{Raw: raw}},
 	}, nil
@@ -317,13 +395,26 @@ const dispatchJobTemplateHashAnnotation = "kubeagents.x-k8s.io/dispatch-template
 // enough for an annotation a person reads.
 const dispatchJobTemplateHashLength = 16
 
-// dispatchJobTemplateHash is a profile's rendered (not defaulted) template's
-// hash. The param and the config's reference both carry it, from the one
-// rendering, so a param the config has moved past doesn't match. Defaulting
-// is the API server's and is left out: it is the same object the policy
-// holds either way.
-func dispatchJobTemplateHash(rendered *corev1.PodTemplateSpec) string {
-	raw, err := json.Marshal(rendered)
+// dispatchJobTemplatesHash is one hash over all of a profile's renderings
+// (not defaulted), each by its param's name, stamped on every one of its
+// params and named by its config entry. One per profile, however many tiers
+// (#5646): a change to any tier's template moves them all, and the config
+// entry stays as wide as with one template.
+func dispatchJobTemplatesHash(templates profileJobTemplates) string {
+	names := make([]string, 0, len(templates))
+	for name := range templates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	type rendering struct {
+		Param    string                  `json:"param"`
+		Template *corev1.PodTemplateSpec `json:"template"`
+	}
+	all := make([]rendering, 0, len(names))
+	for _, name := range names {
+		all = append(all, rendering{name, templates[name]})
+	}
+	raw, err := json.Marshal(all)
 	if err != nil {
 		return ""
 	}
@@ -332,22 +423,31 @@ func dispatchJobTemplateHash(rendered *corev1.PodTemplateSpec) string {
 }
 
 // dispatchJobTemplateRef is the dispatch config's reference to a profile's
-// param, or nil when it has no template.
-func dispatchJobTemplateRef(profile string, rendered *corev1.PodTemplateSpec) *a2aDispatchJobTemplateRef {
-	if rendered == nil {
+// params, or nil when it has none: their one hash, per tier.
+func dispatchJobTemplateRef(profile string, templates profileJobTemplates) *a2aDispatchJobTemplateRef {
+	if len(templates) == 0 {
 		return nil
 	}
-	return &a2aDispatchJobTemplateRef{Name: dispatchJobTemplatePrefix + profile, Hash: dispatchJobTemplateHash(rendered)}
+	return &a2aDispatchJobTemplateRef{Name: dispatchJobTemplatePrefix + profile, Hash: dispatchJobTemplatesHash(templates), PerTier: true}
 }
 
 // buildDispatchJobIndex is the index param: the ServiceAccounts the
-// templates run as.
-func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[string]*corev1.PodTemplateSpec) *agentv1alpha1.DispatchJobTemplate {
+// templates run as, every tier's.
+func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[string]profileJobTemplates) *agentv1alpha1.DispatchJobTemplate {
 	var accounts []string
-	for _, t := range templates {
-		accounts = append(accounts, t.Spec.ServiceAccountName)
+	for _, set := range templates {
+		for _, t := range set {
+			accounts = append(accounts, t.Spec.ServiceAccountName)
+		}
 	}
 	return buildDispatchJobIndexFor(agent, accounts)
+}
+
+// isDispatchJobTemplateParam is whether name is a template param's (not the
+// index): a profile's own, or a tier's (#5646).
+func isDispatchJobTemplateParam(name string) bool {
+	return name != dispatchJobIndexName &&
+		(strings.HasPrefix(name, dispatchJobTemplatePrefix) || strings.HasPrefix(name, dispatchJobTierTemplatePrefix))
 }
 
 // buildDispatchJobIndexFor is the index listing accounts.
@@ -381,12 +481,12 @@ func dispatchJobParamTemplate(param *agentv1alpha1.DispatchJobTemplate) (corev1.
 // contents, so the param holds the defaulted form. Run every reconcile, so
 // it follows the API server's defaults across upgrades. The operator's only
 // podtemplate verb is create, for this.
-func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, profile string, tmpl *corev1.PodTemplateSpec) (*corev1.PodTemplateSpec, error) {
+func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, param string, tmpl *corev1.PodTemplateSpec) (*corev1.PodTemplateSpec, error) {
 	// A generated name: nothing is stored, and no PodTemplate of a fixed
 	// name, the operator's or anyone's, can make the create collide.
-	dry := &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{GenerateName: dispatchJobTemplatePrefix + profile + "-", Namespace: ns}, Template: *tmpl.DeepCopy()}
+	dry := &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{GenerateName: param + "-", Namespace: ns}, Template: *tmpl.DeepCopy()}
 	if err := r.Create(ctx, dry, client.DryRunAll); err != nil {
-		return nil, fmt.Errorf("default the Job template of profile %s (a dry-run PodTemplate): %w", profile, err)
+		return nil, fmt.Errorf("default the Job template %s (a dry-run PodTemplate): %w", param, err)
 	}
 	return &dry.Template, nil
 }
@@ -442,53 +542,58 @@ func (e errForeignDispatchJobParam) Error() string {
 // and holds it to that account's template only if the template is there, so
 // at no step may the index list an account without its template, nor name
 // one whose template now runs as another. So:
-//  1. the index narrows to the accounts the same profile's template runs as
+//  1. the index narrows to the accounts the same param's template runs as
 //     both now and after this pass;
 //  2. the templates are written;
 //  3. the index lists the accounts they now run as;
 //  4. the templates no longer wanted are deleted.
 //
-// A DispatchJobTemplate under a param's name without this agent's labels
-// stops the pass with an error.
-func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context, agent *agentv1alpha1.PlatformAgent, templates map[string]*corev1.PodTemplateSpec) error {
+// A param is keyed by its name, which follows from its (profile, tier)
+// (dispatchJobParamName). A DispatchJobTemplate under a param's name without
+// this agent's labels stops the pass with an error.
+func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context, agent *agentv1alpha1.PlatformAgent, templates map[string]profileJobTemplates) error {
 	ns := profileNamespaceName(agent)
 	var existing agentv1alpha1.DispatchJobTemplateList
 	if err := r.a2aReader().List(ctx, &existing, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
 		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
 	}
-	want := map[string]bool{}
-	for _, t := range templates {
-		want[t.Spec.ServiceAccountName] = true
+	want := map[string]*corev1.PodTemplateSpec{}
+	hashes := map[string]string{}
+	for _, set := range templates {
+		hash := dispatchJobTemplatesHash(set)
+		for name, t := range set {
+			want[name], hashes[name] = t, hash
+		}
 	}
 	var both []string
 	for i := range existing.Items {
 		pt := &existing.Items[i]
-		profile, ok := strings.CutPrefix(pt.Name, dispatchJobTemplatePrefix)
-		if !ok || pt.Name == dispatchJobIndexName || !agentLabelsMark(pt, agent) {
+		if !isDispatchJobTemplateParam(pt.Name) || !agentLabelsMark(pt, agent) {
 			continue
 		}
-		// Kept only where the same profile keeps the account: one moving to
-		// another profile would otherwise be listed while the template that
-		// ran as it is rewritten before its new owner's is written.
+		// Kept only where the same param keeps the account: one moving to
+		// another (profile, tier) would otherwise be listed while the
+		// template that ran as it is rewritten before its new owner's is
+		// written.
 		held, ok := dispatchJobParamTemplate(pt)
-		if sa := held.Spec.ServiceAccountName; ok && templates[profile] != nil && templates[profile].Spec.ServiceAccountName == sa {
+		if sa := held.Spec.ServiceAccountName; ok && want[pt.Name] != nil && want[pt.Name].Spec.ServiceAccountName == sa {
 			both = append(both, sa)
 		}
 	}
 	if err := r.applyDispatchJobParam(ctx, agent, buildDispatchJobIndexFor(agent, both)); err != nil {
 		return err
 	}
-	names := make([]string, 0, len(templates))
-	for name := range templates {
+	names := make([]string, 0, len(want))
+	for name := range want {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		defaulted, err := r.defaultedJobTemplate(ctx, ns, name, templates[name])
+		defaulted, err := r.defaultedJobTemplate(ctx, ns, name, want[name])
 		if err != nil {
 			return err
 		}
-		param, err := buildDispatchJobTemplate(agent, name, templates[name], defaulted)
+		param, err := buildDispatchJobTemplate(agent, name, hashes[name], defaulted)
 		if err != nil {
 			return err
 		}
@@ -501,8 +606,7 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 	}
 	for i := range existing.Items {
 		pt := &existing.Items[i]
-		profile, ok := strings.CutPrefix(pt.Name, dispatchJobTemplatePrefix)
-		if !ok || pt.Name == dispatchJobIndexName || templates[profile] != nil || !agentLabelsMark(pt, agent) {
+		if !isDispatchJobTemplateParam(pt.Name) || want[pt.Name] != nil || !agentLabelsMark(pt, agent) {
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, pt)); err != nil {

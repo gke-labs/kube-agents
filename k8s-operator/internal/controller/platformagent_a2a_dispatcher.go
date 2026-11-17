@@ -606,6 +606,9 @@ type a2aDispatchJobTemplateRef struct {
 	// dispatcher derives (lib.DispatchJobTemplateName).
 	Name string `json:"-"`
 	Hash string `json:"hash"`
+	// PerTier is lib.DispatchJobTemplateRef's (#5646): the profile has a
+	// template at each live tier, all under Hash.
+	PerTier bool `json:"perTier,omitempty"`
 }
 
 type a2aDispatchProfile struct {
@@ -624,12 +627,12 @@ type a2aDispatchProfile struct {
 	// derives the same set from tiers and drainingTiers, pinned by the
 	// shared fixture a2a/lib/testdata/rendered-dispatch-durables.json.
 	Durables []a2aDispatchDurable `json:"-"`
-	// JobTemplateRef names the DispatchJobTemplate the dispatcher stamps the
-	// profile's unattended Jobs from, and the rendering it holds
-	// (lib.DispatchProfile.JobTemplateRef), set only for a profile allowing
-	// the unattended tier (agentprofile_job_template.go). The template
-	// itself isn't copied in: a two-tier profile's would be most of the
-	// config's bytes, and the param already holds it.
+	// JobTemplateRef names the renderings of the DispatchJobTemplates the
+	// dispatcher stamps the profile's Jobs from (lib.DispatchProfile.JobTemplateRef),
+	// one per live tier under Job mode (agentprofile_job_template.go): its
+	// unattended tasks', and at every tier its permit-carrying tasks' (#5646).
+	// The templates themselves aren't copied in: a two-tier profile's would
+	// be most of the config's bytes, and the params already hold them.
 	JobTemplateRef *a2aDispatchJobTemplateRef `json:"jobTemplateRef,omitempty"`
 	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
 	// has left the install, which is listed with no durables until then.
@@ -703,11 +706,11 @@ func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles 
 }
 
 // desiredDispatchConfigWith is desiredDispatchConfigDraining with each
-// unattended profile's Job template, by profile name (dispatchJobTemplates).
+// profile's Job templates, by profile name (dispatchJobTemplates).
 // Only a live profile takes one: a draining profile is listed as
 // drainingDispatchProfiles built it, with no durables and no template, since
 // nothing new is dispatched for it.
-func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
+func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]profileJobTemplates, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
 	cfg := dispatchConfigHeader(agent)
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
@@ -760,8 +763,8 @@ func dispatchConfigHeader(agent *agentv1alpha1.PlatformAgent) a2aDispatchConfig 
 }
 
 // dispatchProfileEntry is one live profile's entry in the dispatch config,
-// with its Job template when it has one.
-func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, jobTemplate *corev1.PodTemplateSpec) a2aDispatchProfile {
+// with its Job templates when it has them.
+func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, jobTemplates profileJobTemplates) a2aDispatchProfile {
 	unattendedTier := unattendedTierOf(p)
 	if unattendedTier == agentv1alpha1.AgentProfileTierUnattended {
 		unattendedTier = "" // the built-in, which the dispatcher knows
@@ -774,7 +777,7 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 		QueueTimeoutSeconds:   int(p.QueueTimeout()),
 		ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
 		Durables:              []a2aDispatchDurable{},
-		JobTemplateRef:        dispatchJobTemplateRef(p.Name, jobTemplate),
+		JobTemplateRef:        dispatchJobTemplateRef(p.Name, jobTemplates),
 	}
 	for _, param := range p.Spec.Parameters {
 		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
@@ -922,7 +925,7 @@ func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []ag
 
 // buildA2ADispatchConfigMapWith is buildA2ADispatchConfigMap with the
 // profiles' Job templates.
-func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
+func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]profileJobTemplates, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
 	cfg, err := desiredDispatchConfigWith(agent, profiles, jobTemplates, draining)
 	if err != nil {
 		return nil, err

@@ -101,7 +101,7 @@ func TestTheIndexIsSentWithoutATemplate(t *testing.T) {
 	// A template param sends no serviceAccounts key: a null is refused as
 	// not an array (found live too).
 	tmpl := &corev1.PodTemplateSpec{Spec: corev1.PodSpec{ServiceAccountName: "agentprofile-tse-unattended"}}
-	param, err := buildDispatchJobTemplate(a2aTestAgent(), "tse", tmpl, tmpl)
+	param, err := buildDispatchJobTemplate(a2aTestAgent(), dispatchJobTemplatePrefix+"tse", "0123456789abcdef", tmpl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,12 +126,14 @@ func indexAccounts(p *agentv1alpha1.DispatchJobTemplate) []string {
 	return *p.Spec.ServiceAccounts
 }
 
-// One rendering reaches both readers: the template in the dispatch config
-// is the one in the admission policy's param, byte for byte, so the Jobs
-// the dispatcher stamps from the config are the ones the policy admits. The
-// index lists the template's account; a read-only profile gets neither. A
-// second pass finds its own params and rewrites them rather than refusing
-// them as foreign.
+// One rendering reaches both readers: each template the operator renders is
+// the one in the admission policy's param, byte for byte, so the Jobs the
+// dispatcher stamps from the params the config names are the ones the policy
+// admits. Every profile has one per live tier (#5646): the unattended-mode
+// tier's in the profile's own param, any other tier's in the tier's. The
+// config's one hash is on every one of them, and the index lists every
+// template's account. A second pass finds its own params and rewrites them
+// rather than refusing them as foreign.
 func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	agent := a2aTestAgent()
 	r, c := jobTemplateTestReconciler(t, agent)
@@ -152,78 +154,88 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	var ref *a2aDispatchJobTemplateRef
+	refs := map[string]*a2aDispatchJobTemplateRef{}
 	for _, p := range cfg.Profiles {
-		switch {
-		case p.Name == "tse":
-			ref = p.JobTemplateRef
-		case p.JobTemplateRef != nil:
-			t.Errorf("profile %s, which doesn't allow the unattended tier, has a Job template", p.Name)
+		refs[p.Name] = p.JobTemplateRef
+	}
+	for _, name := range []string{"tse", "reader"} {
+		// The written ref carries the hash alone (#5479), per tier; the
+		// dispatcher derives each param's name.
+		if ref := refs[name]; ref == nil || ref.Name != "" || ref.Hash == "" || !ref.PerTier {
+			t.Errorf("profile %s's ref is %+v, want a hash alone, per tier", name, ref)
 		}
 	}
-	if ref == nil {
-		t.Fatal("the unattended profile names no Job template in the dispatch config")
-	}
-	// The written ref carries the hash alone (#5479); the dispatcher derives
-	// the param's name, which the operator still knows in memory.
-	if ref.Name != "" || ref.Hash == "" {
-		t.Errorf("the config's ref is %+v, want the hash alone", ref)
-	}
-	mem, _ := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
-	for _, p := range mem.Profiles {
-		if p.Name == "tse" && (p.JobTemplateRef == nil || p.JobTemplateRef.Name != dispatchJobTemplatePrefix+"tse") {
-			t.Errorf("the operator's own ref %+v doesn't name the policy's param", p.JobTemplateRef)
-		}
-	}
-	inConfig := dispatchJobTemplates(agent, profiles, false)["tse"]
 	if strings.Contains(cm.Data[a2aDispatchConfigKey], "containers") {
-		t.Error("the dispatch config carries a pod template; it should name the param instead")
+		t.Error("the dispatch config carries a pod template; it should name the params instead")
 	}
-
-	var param agentv1alpha1.DispatchJobTemplate
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &param); err != nil {
-		t.Fatalf("the policy's param for tse: %v", err)
+	rendered := dispatchJobTemplates(agent, profiles, false)
+	params := map[string]struct{ profile, tier string }{
+		dispatchJobTemplatePrefix + "tse":                  {"tse", agentv1alpha1.AgentProfileTierUnattended},
+		dispatchJobTierTemplatePrefix + "tse-read":         {"tse", agentv1alpha1.AgentProfileTierRead},
+		dispatchJobTierTemplatePrefix + "reader-read":      {"reader", agentv1alpha1.AgentProfileTierRead},
 	}
-	held, ok := dispatchJobParamTemplate(&param)
-	if !ok {
-		t.Fatalf("the param holds no template: %s", param.Spec.Template.Raw)
-	}
-	if got := param.Annotations[dispatchJobTemplateHashAnnotation]; got == "" || got != ref.Hash {
-		t.Errorf("the param carries rendering %q, the config names %q: the dispatcher would hold every task", got, ref.Hash)
-	}
-	// The fake client's dry run doesn't default, so the param equals the
-	// config's template here; on a real API server it is that, defaulted.
-	if !apiequality.Semantic.DeepEqual(held, *inConfig) {
-		t.Errorf("the param's template differs from the dispatch config's:\nparam  %+v\nconfig %+v", held, *inConfig)
-	}
-	if held.Spec.RestartPolicy != corev1.RestartPolicyNever {
-		t.Errorf("restartPolicy %q: a PodTemplate defaults it to Always, which a Job pod refuses", held.Spec.RestartPolicy)
-	}
-	// The Job's worker serves its one task and exits, rather than wait for
-	// a next one that never comes until the task deadline.
-	if got := envOf(held.Spec.Containers[0])["PROFILE_WORKER_ONE_SHOT"]; got != "1" {
-		t.Errorf("the Job's worker has PROFILE_WORKER_ONE_SHOT %q, want 1: a pool worker would outlive its task", got)
+	var accounts []string
+	for name, want := range params {
+		var param agentv1alpha1.DispatchJobTemplate
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: name}, &param); err != nil {
+			t.Fatalf("the policy's param %s: %v", name, err)
+		}
+		held, ok := dispatchJobParamTemplate(&param)
+		if !ok {
+			t.Fatalf("%s holds no template: %s", name, param.Spec.Template.Raw)
+		}
+		if got := param.Annotations[dispatchJobTemplateHashAnnotation]; got == "" || got != refs[want.profile].Hash {
+			t.Errorf("%s carries rendering %q, the config names %q: the dispatcher would hold every task", name, got, refs[want.profile].Hash)
+		}
+		if param.Annotations[dispatchJobParamProfileAnnotation] != want.profile || param.Annotations[dispatchJobParamTierAnnotation] != want.tier {
+			t.Errorf("%s is annotated %v, want profile %s tier %s", name, param.Annotations, want.profile, want.tier)
+		}
+		inConfig := rendered[want.profile][name]
+		if inConfig == nil {
+			t.Fatalf("%s isn't a rendered template", name)
+		}
+		// The fake client's dry run doesn't default, so the param equals the
+		// rendering here; on a real API server it is that, defaulted.
+		if !apiequality.Semantic.DeepEqual(held, *inConfig) {
+			t.Errorf("%s differs from the rendering:\nparam  %+v\nconfig %+v", name, held, *inConfig)
+		}
+		if held.Labels[agentProfileTierLabel] != want.tier || held.Spec.ServiceAccountName != agentProfileServiceAccountName(&profiles[slices.IndexFunc(profiles, func(p agentv1alpha1.AgentProfile) bool { return p.Name == want.profile })], want.tier) {
+			t.Errorf("%s runs as %s at tier %s, want the (%s, %s) ServiceAccount", name, held.Spec.ServiceAccountName, held.Labels[agentProfileTierLabel], want.profile, want.tier)
+		}
+		if held.Spec.RestartPolicy != corev1.RestartPolicyNever {
+			t.Errorf("%s: restartPolicy %q: a PodTemplate defaults it to Always, which a Job pod refuses", name, held.Spec.RestartPolicy)
+		}
+		// The Job's worker serves its one task and exits, rather than wait
+		// for a next one that never comes until the task deadline.
+		if got := envOf(held.Spec.Containers[0])["PROFILE_WORKER_ONE_SHOT"]; got != "1" {
+			t.Errorf("%s: the Job's worker has PROFILE_WORKER_ONE_SHOT %q, want 1: a pool worker would outlive its task", name, got)
+		}
+		for k, v := range dispatchJobParamLabels(agent) {
+			if param.Labels[k] != v {
+				t.Errorf("%s: label %s=%q, want %q (the binding selects params by these)", name, k, param.Labels[k], v)
+			}
+		}
+		accounts = append(accounts, held.Spec.ServiceAccountName)
 	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "reader"}, &agentv1alpha1.DispatchJobTemplate{}); !apierrors.IsNotFound(err) {
-		t.Errorf("a read-only profile has a Job template param: %v", err)
+		t.Errorf("a read-only profile has an unattended-mode param: %v", err)
 	}
 	var index agentv1alpha1.DispatchJobTemplate
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 		t.Fatalf("the policy's index: %v", err)
 	}
-	if got, want := strings.Join(indexAccounts(&index), ","), inConfig.Spec.ServiceAccountName; got != want || want == "" {
-		t.Errorf("the index lists %q, want the template's account %q", got, want)
+	slices.Sort(accounts)
+	if got := indexAccounts(&index); !slices.Equal(got, accounts) {
+		t.Errorf("the index lists %q, want every template's account %q", got, accounts)
 	}
-	for _, pt := range []*agentv1alpha1.DispatchJobTemplate{&param, &index} {
-		for k, v := range dispatchJobParamLabels(agent) {
-			if pt.Labels[k] != v {
-				t.Errorf("%s: label %s=%q, want %q (the binding selects params by these)", pt.Name, k, pt.Labels[k], v)
-			}
+	for k, v := range dispatchJobParamLabels(agent) {
+		if index.Labels[k] != v {
+			t.Errorf("the index: label %s=%q, want %q (the binding selects params by these)", k, index.Labels[k], v)
 		}
 	}
 
 	// The profile drops the unattended tier: its param goes, and the index
-	// stops listing its account.
+	// stops listing its account. Its read tier keeps its own.
 	profiles[0].Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
 		t.Fatalf("drop the tier: %v / %v", err, profileErr)
@@ -231,11 +243,14 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &agentv1alpha1.DispatchJobTemplate{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the param outlived the profile's unattended tier: %v", err)
 	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTierTemplatePrefix + "tse-read"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Errorf("the read tier's param went with the unattended tier: %v", err)
+	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 		t.Fatal(err)
 	}
-	if got := indexAccounts(&index); len(got) != 0 {
-		t.Errorf("the index still lists %q", got)
+	if got := indexAccounts(&index); slices.Contains(got, agentProfileServiceAccountName(&profiles[0], agentv1alpha1.AgentProfileTierUnattended)) || len(got) != 2 {
+		t.Errorf("the index lists %q, want the two read tiers' accounts", got)
 	}
 }
 
@@ -359,8 +374,9 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 // (TestTheRenderedJobConfigBuildsAJob). The param's template is the
 // rendering itself; on an API server it is that, defaulted.
 const (
-	dispatchJobConfigFixturePath = "../../../a2a/dispatch/testdata/rendered-dispatch-config-jobs.json"
-	dispatchJobParamFixturePath  = "../../../a2a/dispatch/testdata/rendered-dispatch-job-template.json"
+	dispatchJobConfigFixturePath    = "../../../a2a/dispatch/testdata/rendered-dispatch-config-jobs.json"
+	dispatchJobParamFixturePath     = "../../../a2a/dispatch/testdata/rendered-dispatch-job-template.json"
+	dispatchJobReadParamFixturePath = "../../../a2a/dispatch/testdata/rendered-dispatch-job-template-read.json"
 )
 
 func TestRenderedDispatchJobFixture(t *testing.T) {
@@ -374,15 +390,23 @@ func TestRenderedDispatchJobFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, dispatchJobConfigFixturePath, cm.Data[a2aDispatchConfigKey])
-	param, err := buildDispatchJobTemplate(agent, "tse", templates["tse"], templates["tse"])
-	if err != nil {
-		t.Fatal(err)
+	// The unattended-mode tier's param, under the profile's own name, and
+	// the read tier's, where its permit-carrying tasks run (#5646).
+	hash := dispatchJobTemplatesHash(templates["tse"])
+	for path, name := range map[string]string{
+		dispatchJobParamFixturePath:     dispatchJobTemplatePrefix + "tse",
+		dispatchJobReadParamFixturePath: dispatchJobTierTemplatePrefix + "tse-read",
+	} {
+		param, err := buildDispatchJobTemplate(agent, name, hash, templates["tse"][name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.MarshalIndent(param, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkFixture(t, path, string(raw)+"\n")
 	}
-	raw, err := json.MarshalIndent(param, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkFixture(t, dispatchJobParamFixturePath, string(raw)+"\n")
 }
 
 // An unattended profile that leaves the install drains with no Job
@@ -461,7 +485,7 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 		}
 		running := map[string]bool{}
 		for _, pt := range all.Items {
-			if strings.HasPrefix(pt.Name, dispatchJobTemplatePrefix) {
+			if isDispatchJobTemplateParam(pt.Name) {
 				if held, ok := dispatchJobParamTemplate(&pt); ok {
 					running[held.Spec.ServiceAccountName] = true
 				}
@@ -508,8 +532,10 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 		// Settled, the index lists exactly the accounts the templates run
 		// as, so every unattended profile's Jobs are admitted.
 		var want []string
-		for _, tmpl := range dispatchJobTemplates(agent, profiles, false) {
-			want = append(want, tmpl.Spec.ServiceAccountName)
+		for _, set := range dispatchJobTemplates(agent, profiles, false) {
+			for _, tmpl := range set {
+				want = append(want, tmpl.Spec.ServiceAccountName)
+			}
 		}
 		sort.Strings(want)
 		var index agentv1alpha1.DispatchJobTemplate
@@ -797,8 +823,9 @@ func TestTheJobTemplateSettlesWhatAutopilotFillsIn(t *testing.T) {
 	}
 }
 
-// A profile that allows the unattended tier and whose requests break GKE
-// Autopilot's memory-per-vCPU bounds would have its Jobs refused on Autopilot
+// A profile whose requests break GKE Autopilot's memory-per-vCPU bounds
+// would have its Jobs refused on Autopilot, a read-only one's permit-carrying
+// Jobs included (#5646)
 // (found live: Autopilot raised 250m/4Gi to 616m). The operator says so
 // before the first task: False JobResourcesFit on the profile, and a Warning
 // Event on the PlatformAgent.
@@ -820,7 +847,9 @@ func TestAProfileOutsideAutopilotsRatioIsFlagged(t *testing.T) {
 		"too much memory (250m, 4Gi)":    {with("250m", "4Gi"), true},
 		"too little memory (2, 1Gi)":     {with("2", "1Gi"), true},
 		"at the upper bound (1, 6.5Gi)":  {with("1", "6656Mi"), false},
-		"read only, no Jobs (250m, 4Gi)": {with("250m", "4Gi", agentv1alpha1.AgentProfileTierRead), false},
+		// Read only, its permit-carrying tasks still run as Jobs (#5646).
+		"read only (250m, 4Gi)": {with("250m", "4Gi", agentv1alpha1.AgentProfileTierRead), true},
+		"read only, within (250m, 512Mi)": {with("250m", "512Mi", agentv1alpha1.AgentProfileTierRead), false},
 	} {
 		if got := autopilotRatioProblem(&c.p) != ""; got != c.flag {
 			t.Errorf("%s: flagged %v, want %v", name, got, c.flag)
