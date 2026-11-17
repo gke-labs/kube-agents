@@ -727,3 +727,47 @@ func TestAStartingReplacementIsNotRestartedAgain(t *testing.T) {
 		})
 	}
 }
+
+// The lone server that isn't Ready, unconfirmed, is restarted first when
+// every other server is Ready (no quorum lost); with a second server down
+// too, nothing is restarted.
+func TestTheLoneDownStragglerIsRestartedFirst(t *testing.T) {
+	asked := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		notReady []int
+		want     string
+	}{
+		{"server 1 Pending, the others Ready", []int{1}, "-1"},
+		{"servers 1 and 2 down", []int{1, 2}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := buildA2ANATSStatefulSet(a2aTestAgentWithBusReplicas(3), "h1")
+			state := a2aBusReloadState{requestedAt: asked.Format(time.RFC3339Nano), servers: map[string]a2aBusServerRecord{}}
+			for i := range 3 {
+				state.servers[base.Name+"-"+strconv.Itoa(i)] = a2aBusServerRecord{UID: types.UID("pod-uid-" + strconv.Itoa(i)), Start: t0, Loaded: t0}
+			}
+			pending := &corev1.Secret{}
+			state.stamp(pending, base.Name)
+			r, agent, sts, _ := a2aClusterReloadFixture(t, "new", pending.Annotations, tc.notReady...)
+			r.busConfigWrittenAt = func(*corev1.Secret) (time.Time, bool) { return asked.Add(time.Second), true }
+			// Server 0 Ready but unconfirmed; server 1 Pending (no /varz);
+			// server 2 confirmed.
+			r.busVarz = varzOf(map[string]a2aBusVarz{
+				sts.Name + "-0": {Start: t0, Loaded: t0},
+				sts.Name + "-2": {Start: t0, Loaded: t1},
+			}, sts.Name+"-1")
+			plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "new"), sts.DeepCopy(), asked.Add(a2aBusReloadBound))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			if tc.want != "" {
+				want = sts.Name + tc.want
+			}
+			if plan.restart != want {
+				t.Fatalf("restart = %q, want %q", plan.restart, want)
+			}
+		})
+	}
+}

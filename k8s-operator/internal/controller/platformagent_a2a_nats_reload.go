@@ -572,6 +572,22 @@ func a2aBusStragglerToRestart(servers []a2aBusServer, confirmed map[string]bool,
 			return a2aBusServer{}, false
 		}
 	}
+	// Exactly one server not (long enough) Ready, and every other one is:
+	// restarting that one costs no quorum, so it goes first when it hasn't
+	// confirmed. Otherwise no server is restarted while another is down.
+	var down []a2aBusServer
+	for _, s := range servers {
+		if !s.serving() || !a2aBusReadyFor(s.pod, a2aBusReadyBeforeRestart, now) {
+			down = append(down, s)
+		}
+	}
+	if len(down) == 1 {
+		s := down[0]
+		if s.serving() && !confirmed[s.name] && !a2aBusYoungReplacement(s.pod, writtenAt, known, now) {
+			return s, true
+		}
+		return a2aBusServer{}, false
+	}
 	for i, s := range servers {
 		if confirmed[s.name] || !s.serving() || a2aBusYoungReplacement(s.pod, writtenAt, known, now) {
 			continue
