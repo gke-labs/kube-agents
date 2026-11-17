@@ -13936,6 +13936,65 @@ class RouteRolesTableTest(unittest.TestCase):
             )
 
 
+class DialRouteTest(unittest.TestCase):
+    """`POST /v1/dial`: the agent pod's chat role reports the dial's level; nobody else may."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(setattr, vcs_broker, "_dial_level", None)
+        self.addCleanup(setattr, vcs_broker, "_dial_reported", False)
+        vcs_broker._dial_level = None
+        for patcher in (
+            mock.patch.dict(os.environ, {vcs_broker.DIAL_ENV: "on", vcs_broker.WRITE_MODE_ENV: ""}),
+            mock.patch.object(vcs_broker, "DIAL_STATE_FILE", os.path.join(scratch.name, "dial")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _post(self, body, role=credential_proxy.CALLER_ROLE_CHAT):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        encoded = body if isinstance(body, bytes) else json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.path = credential_proxy.DIAL_PATH
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        principal = credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role)
+        handler._handle_dial_post(principal)
+        return replies[0]
+
+    def test_the_route_is_the_chat_roles_alone(self):
+        self.assertIn((credential_proxy.DIAL_PATH, (credential_proxy.CALLER_ROLE_CHAT,)), credential_proxy.ROUTE_ROLES)
+
+    def test_a_report_applies_to_the_next_write_at_once(self):
+        status, payload = self._post({"level": "explain"})
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual({"level": "explain", "writeMode": "none", "automerge": False}, payload)
+        self.assertEqual("none", vcs_broker.write_mode()[0])
+        status, payload = self._post({"level": "automerge"})
+        self.assertEqual((HTTPStatus.OK, "propose", True), (status, payload["writeMode"], payload["automerge"]))
+
+    def test_any_role_but_chat_is_refused_even_with_no_role(self):
+        for role in ("", credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP):
+            with self.subTest(role=role), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, payload = self._post({"level": "propose"}, role=role)
+                self.assertEqual((HTTPStatus.FORBIDDEN, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        self.assertEqual("explain", vcs_broker.dial_level())
+
+    def test_a_bad_body_is_refused_and_stores_nothing(self):
+        for body in ({"level": "none"}, {"level": 1}, ["explain"], b"{", b"x" * 2048):
+            with self.subTest(body=body):
+                self.assertEqual(HTTPStatus.BAD_REQUEST, self._post(body)[0])
+        self.assertIsNone(vcs_broker._dial_level)
+
+    def test_with_the_switch_off_nothing_is_stored(self):
+        with mock.patch.dict(os.environ, {vcs_broker.DIAL_ENV: "off"}):
+            status, payload = self._post({"level": "explain"})
+        self.assertEqual((HTTPStatus.CONFLICT, "DIAL_OFF"), (status, payload["code"]))
+        self.assertIsNone(vcs_broker._dial_level)
+
+
 class RolePermitsTest(unittest.TestCase):
     """The 403 that keeps each caller on its own routes."""
 
