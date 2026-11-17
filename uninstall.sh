@@ -705,7 +705,10 @@ main() {
     fi
     print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
     TEMP_REPO_DIR=""
-    exec bash "${repo_dir}/uninstall.sh" "${dispatch_args[@]}"
+    # ${dispatch_args[@]+...}: empty on an interactive run that forwards no
+    # coordinates, and bash 3.2 (macOS's /bin/bash) treats an empty array
+    # expansion as unbound under `set -u`.
+    exec bash "${repo_dir}/uninstall.sh" ${dispatch_args[@]+"${dispatch_args[@]}"}
   elif [ -f "${script_dir}/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
     repo_dir="$script_dir"
   elif [ -f "$(pwd)/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
@@ -943,9 +946,6 @@ main() {
   # The release's upgrade_install switch, likewise: the generator refuses a
   # misspelt value, and the destroy removes the release however it renders.
   export HELM_UPGRADE_INSTALL=""
-  # The mode, likewise: the generator refuses a value outside the CRD's enum,
-  # and the destroy removes the release whichever mode it renders.
-  export PLATFORM_AGENT_MODE=""
   # The Slack home channel policy, likewise: the generator refuses a value
   # outside the CRD's enum, and the destroy removes the release whatever it says.
   export SLACK_HOME_CHANNEL_POLICY=""

@@ -480,6 +480,28 @@ SIMILAR_FILES_KEY = "similar_files"
 # content is written `...\nINVENTORY.md`, with a word character before it.
 DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
 DROPPED_FILE_AFTER = r"(?![\w-]|\.\w)"
+# The front door's kanban_create result carries `"queued": true, "queue":
+# {"running": N, "limit": M}` when the new card's class has no free dispatcher
+# slot at that moment, and neither key otherwise; being queued doesn't change the
+# card's status, and only a `ready` card can carry the fields
+# (deploy/docker/patches/kanban_priority.py `queue_fields`, empty inside a
+# worker). Whether a slot was free is what else was running, so the key drops
+# both (without_queue_fields): only from a JSON object holding `task_id` and
+# `subscribed`, in a tool message answering a kanban_create call, found by its
+# tool_call_id. The fields are machine-readable only: the thread hears about
+# the wait from the dispatcher's `queued` event, and in 9,780 front-door
+# answers after a create (4,281 queued) none mentioned a queue. `running` and
+# `limit` count like a dropped queued event's payload
+# (Mapping.answer_repeats_dropped_count). When the dropped `queued` was set, an
+# answer talking about a queue or a slot (QUEUE_WORDS_RE, QUEUE_SLOT_WORDS_RE)
+# is not saved either (Mapping.answer_talks_about_dropped_queue): served to a
+# run that had a free slot, it would tell the user of a wait that is not
+# happening, with or without a number.
+KANBAN_CREATE_TOOL = "kanban_create"
+KANBAN_CREATE_RESULT_KEYS = ("task_id", "subscribed")
+QUEUED_FIELD = "queued"
+QUEUE_FIELD = "queue"
+QUEUE_SLOT_WORDS_RE = re.compile(r"\bslots?\b|board is full|in use|waiting for a worker", re.I)
 
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
@@ -717,6 +739,36 @@ def without_similar_files(text: str) -> Tuple[str, List[str]]:
     return json.dumps(parsed, ensure_ascii=False), files
 
 
+def without_queue_fields(text: str) -> Tuple[str, bool, Any]:
+    """A kanban_create result without its `queued` and `queue`, whether it was queued, and the dropped `queue`.
+
+    Any other text comes back as it is, unqueued. Returns `text` itself when it
+    holds neither key and has no appended notice. Queued means a `queued` that is present and not `false`,
+    or a `queue` block at all: queue_fields writes only `true`, and anything
+    else it might write is read as a wait. A result Hermes appended a notice to
+    is written in canonical form and the notice kept, as without_similar_files does.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text, False, None
+        tail = text.lstrip()[end:]
+    if not (isinstance(parsed, dict) and all(k in parsed for k in KANBAN_CREATE_RESULT_KEYS)):
+        return text, False, None
+    held = QUEUED_FIELD in parsed or QUEUE_FIELD in parsed
+    queued_value = parsed.pop(QUEUED_FIELD, None)
+    queue = parsed.pop(QUEUE_FIELD, None)
+    queued = (queued_value is not None and queued_value is not False) or queue is not None
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail, queued, queue
+    if not held:
+        return text, False, None
+    return json.dumps(parsed, ensure_ascii=False), queued, queue
+
+
 @dataclass
 class Mapping:
     """Value <-> placeholder, numbered per class by first appearance."""
@@ -755,6 +807,9 @@ class Mapping:
     # `similar_files` (without_similar_files), which an answer must not name.
     proposal_numbers: set = field(default_factory=set)
     dropped_files: set = field(default_factory=set)
+    # Whether a kanban_create result the key dropped `queued` from was queued
+    # (without_queue_fields), which an answer must not talk about.
+    create_queued: bool = False
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -783,7 +838,7 @@ class Mapping:
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
                        set(self.comment_numbers), set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
                        set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex),
-                       set(self.proposal_numbers), set(self.dropped_files))
+                       set(self.proposal_numbers), set(self.dropped_files), self.create_queued)
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -942,6 +997,11 @@ class Mapping:
         """
         return any(re.search(DROPPED_FILE_BEFORE + re.escape(name) + DROPPED_FILE_AFTER, text) for name in self.dropped_files)
 
+    def answer_talks_about_dropped_queue(self, text: str) -> bool:
+        """Whether an answer talks about a queue or a slot after a kanban_create result whose dropped `queued` was set."""
+        return self.create_queued and (QUEUE_WORDS_RE.search(text) is not None
+                                       or QUEUE_SLOT_WORDS_RE.search(text) is not None)
+
     @staticmethod
     def has_timestamp(text: str) -> bool:
         """Whether a normalized answer still holds a timestamp: one the request did not hold verbatim."""
@@ -1042,6 +1102,8 @@ class Normalizer:
         self.time_indexes: Dict[str, TimeIndex] = {}
         # The tool_call ids of the skill_view calls walked so far (walk_message).
         self.skill_view_calls: Set[str] = set()
+        # The tool_call ids of the kanban_create calls walked so far (walk_message).
+        self.kanban_create_calls: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
     #
@@ -1073,15 +1135,18 @@ class Normalizer:
         An assistant message's read_file and skill_view calls are noted, so the
         tool message answering one is walked without a not-found's
         `similar_files` (without_similar_files), or with its file listings
-        sorted (sorted_skill_listings).
+        sorted (sorted_skill_listings); and its kanban_create calls, so the
+        result answering one is walked without `queued` and `queue`
+        (without_queue_fields).
         """
         outer = self.in_answer
         self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
         if self.in_answer:
             self.note_read_file_calls(message)
             self.note_skill_view_calls(message)
+            self.note_kanban_create_calls(message)
         try:
-            return self.walk(self.similar_files_dropped(self.skill_listings_sorted(message)))
+            return self.walk(self.queue_fields_dropped(self.similar_files_dropped(self.skill_listings_sorted(message))))
         finally:
             self.in_answer = outer
 
@@ -1121,6 +1186,29 @@ class Normalizer:
                 and isinstance(message.get(CONTENT_FIELD), str)):
             return message
         content = sorted_skill_listings(message[CONTENT_FIELD])
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
+    def note_kanban_create_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == KANBAN_CREATE_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.kanban_create_calls.add(call[ID_KEY])
+
+    def queue_fields_dropped(self, message: Any) -> Any:
+        """`message`, without its content's `queued` and `queue` when it is a noted kanban_create call's result.
+
+        A dropped `queue`'s counts are noted as a dropped queued event's are
+        (note_counts), and a queued result marks the mapping (Mapping.create_queued).
+        """
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.kanban_create_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content, queued, queue = without_queue_fields(message[CONTENT_FIELD])
+        self.note_counts(queue)
+        self.mapping.create_queued = self.mapping.create_queued or queued
         return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
 
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:

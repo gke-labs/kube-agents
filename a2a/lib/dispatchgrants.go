@@ -5,6 +5,8 @@ import (
 	"hash/fnv"
 	"strconv"
 	"strings"
+
+	"github.com/nats-io/nats.go"
 )
 
 // The dispatcher's per-profile grants, split across connections (#5381).
@@ -137,4 +139,27 @@ func ProfilesInBucket(profiles []DispatcherGrantProfile, bucket int) []Dispatche
 		}
 	}
 	return out
+}
+
+// DispatcherBucketUser is the NATS user a dispatcher bucket connection is
+// issued: the dispatcher's user, then -b<bucket>. The callout spells the same
+// name (dispatcherBucketUser), and the inbox follows it.
+func DispatcherBucketUser(user string, bucket int) string {
+	return user + "-b" + strconv.Itoa(bucket)
+}
+
+// DispatcherBucketNATSOptions authenticates one dispatcher bucket connection:
+// the pod's bus token (re-read on every reconnect, as KSATokenNATSOptions
+// does), the bucket credential as the CONNECT password, and the bucket user's
+// inbox. The callout grants that connection the per-profile subjects of the
+// profiles in the bucket (#5381).
+func DispatcherBucketNATSOptions(path, user string, bucket int) ([]nats.Option, error) {
+	if bucket < 0 || bucket >= DispatcherBuckets {
+		return nil, fmt.Errorf("dispatcher bucket %d is not one of 0..%d", bucket, DispatcherBuckets-1)
+	}
+	opts, err := KSATokenNATSOptions(path, DispatcherBucketUser(user, bucket))
+	if err != nil {
+		return nil, err
+	}
+	return append(opts, nats.UserInfo("", DispatcherBucketCredential(bucket))), nil
 }

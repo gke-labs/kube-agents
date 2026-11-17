@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,13 +66,16 @@ const (
 	// prefix and its verifier caller name. The binary spells the same string.
 	a2aDispatcherUser = "dispatcher"
 
-	// a2aDispatcherBucketedGrantsEnvVar turns on the dispatcher's bucketed
-	// grants (#5381). With it on, the dispatcher's map entry carries only its
-	// control connection's fixed grants and the draining profiles' names, and
-	// the callout derives each bucket connection's per-profile grants from
-	// the profile entries. Off by default. Turning it on needs a dispatcher
-	// that opens its bucket connections (#5381's second PR): an older one
-	// loses every profile grant.
+	// a2aDispatcherBucketedGrantsEnvVar switches the dispatcher's bucketed
+	// grants (#5381). On (the default), the dispatcher's map entry carries
+	// only its control connection's fixed grants and the draining profiles'
+	// names, the callout derives each bucket connection's per-profile grants
+	// from the profile entries, and the operator renders the same switch onto
+	// the dispatcher, which opens its bucket connections. "false" restores
+	// the single connection with every grant in the map. The dispatcher's
+	// image must move with the operator's: one from before the bucket
+	// connections ignores the switch, binds no durable on its control
+	// connection, and stays not Ready, which is loud, not silent.
 	a2aDispatcherBucketedGrantsEnvVar = "A2A_DISPATCHER_BUCKETED_GRANTS"
 
 	// a2aNarrowingDispatcher is the callout's NarrowingDispatcher, and
@@ -122,10 +126,10 @@ func a2aDispatcherReleaseImage() string {
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 // a2aDispatcherBucketedGrants reports whether the dispatcher's entry narrows
-// on "dispatcher" (A2A_DISPATCHER_BUCKETED_GRANTS=true). Only the exact
-// string turns it on.
+// on "dispatcher": on unless A2A_DISPATCHER_BUCKETED_GRANTS is exactly
+// "false". Any other value, unset included, is on.
 func a2aDispatcherBucketedGrants() bool {
-	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) == "true"
+	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) != "false"
 }
 
 // dispatcherMapEntry is the dispatcher's identity-map entry. With bucketed
@@ -342,6 +346,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// The API token is for its two watches: the dispatch
 					// ConfigMap and the worker pods (its Roles). The bus
@@ -373,6 +378,10 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							{Name: "DISPATCH_CONFIGMAP", Value: a2aDispatchConfigName(agent)},
 							{Name: a2aTaskSigningSeedFileEnvVar, Value: a2aTaskSigningSeedMountPath + "/" + a2aTaskSigningSeedFile},
 							a2aTaskCredentialMaxLifetimeEnv(agent),
+							// The same switch as the dispatcher's map entry,
+							// so the process opens its bucket connections
+							// exactly when the callout splits its grants.
+							{Name: a2aDispatcherBucketedGrantsEnvVar, Value: strconv.FormatBool(a2aDispatcherBucketedGrants())},
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
 							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},
@@ -590,6 +599,12 @@ type a2aDispatchConfig struct {
 	JobLabels map[string]string `json:"jobLabels,omitempty"`
 }
 
+// a2aDispatchJobTemplateRef is lib.DispatchJobTemplateRef.
+type a2aDispatchJobTemplateRef struct {
+	Name string `json:"name"`
+	Hash string `json:"hash"`
+}
+
 type a2aDispatchProfile struct {
 	Name  string   `json:"name"`
 	Tiers []string `json:"tiers"`
@@ -603,10 +618,13 @@ type a2aDispatchProfile struct {
 	// Scripts is lib.DispatchProfile's: the profile's spec.scripts (#5622).
 	Scripts  []a2aDispatchScript  `json:"scripts,omitempty"`
 	Durables []a2aDispatchDurable `json:"durables"`
-	// JobTemplate is the pod template the dispatcher stamps the profile's
-	// unattended Jobs from (lib.DispatchProfile.JobTemplate), set only for a
-	// profile allowing the unattended tier (agentprofile_job_template.go).
-	JobTemplate *corev1.PodTemplateSpec `json:"jobTemplate,omitempty"`
+	// JobTemplateRef names the DispatchJobTemplate the dispatcher stamps the
+	// profile's unattended Jobs from, and the rendering it holds
+	// (lib.DispatchProfile.JobTemplateRef), set only for a profile allowing
+	// the unattended tier (agentprofile_job_template.go). The template
+	// itself isn't copied in: a two-tier profile's would be most of the
+	// config's bytes, and the param already holds it.
+	JobTemplateRef *a2aDispatchJobTemplateRef `json:"jobTemplateRef,omitempty"`
 	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
 	// has left the install, which is listed with no durables until then.
 	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
@@ -757,7 +775,7 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 		QueueTimeoutSeconds:   int(p.QueueTimeout()),
 		ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
 		Durables:              []a2aDispatchDurable{},
-		JobTemplate:           jobTemplate,
+		JobTemplateRef:        dispatchJobTemplateRef(p.Name, jobTemplate),
 	}
 	for _, param := range p.Spec.Parameters {
 		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})

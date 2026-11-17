@@ -47,18 +47,8 @@ on:
       timeout_minutes:
         description: "Job timeout"
         required: false
-        default: 95
+        default: 125
         type: number
-      # The PlatformAgent's spec.mode the environment was deployed with, the
-      # same input deploy-environment.yml takes. `next` adds a readiness gate
-      # for what that mode renders (platform_agent_mode.sh), whose worst case
-      # a caller passing it adds to timeout_minutes;
-      # SiblingGatewayRolloutGatesTest models it. `today` adds nothing.
-      mode:
-        description: "The PlatformAgent's spec.mode the environment runs: today or next"
-        required: false
-        default: "today"
-        type: string
 
 env:
   # Cap @actions/cache's wait on one cache segment so a restore the service
@@ -77,12 +67,13 @@ jobs:
     concurrency:
       group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
-    # Up to 74 of the default 95 minutes can go before the first test runs: ~5m
-    # of runner setup and adapter build, then wait_for_gke_readiness.sh's
-    # litellm (420s) and gateway (1500s) gates paid twice each (64m) plus
-    # confirm_agent_image.sh's 300s verification loop (5m), leaving ~21m for the
-    # RC suites. Lower this and the job timeout fires before the suites finish,
-    # reporting a broken deploy rather than a slow one. Held by
+    # Up to 104 of the default 125 minutes can go before the first test runs:
+    # ~5m of runner setup and adapter build, then wait_for_gke_readiness.sh's
+    # litellm (420s) and gateway (1500s) gates paid twice each (64m), its A2A
+    # readiness gate (a2a_readiness.sh, one 30m budget) and
+    # confirm_agent_image.sh's 300s verification loop (5m), leaving ~21m for
+    # the RC suites. Lower this and the job timeout fires before the suites
+    # finish, reporting a broken deploy rather than a slow one. Held by
     # SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
     timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions:
@@ -91,25 +82,6 @@ jobs:
     env:
       CLOUDSDK_PYTHON: "/usr/bin/python3"
     steps:
-      # First, and unconditional: a GitHub expression compares strings
-      # case-insensitively, so an `if:` on the input would let `TODAY` through
-      # to the candidate's exact-match check after the setup below. Exactly '',
-      # `today` and `next` pass; '' is today, as it is to the scripts. The
-      # steps only `next` needs read this step's `next` output.
-      - name: Check the PlatformAgent mode
-        id: mode
-        env:
-          MODE: ${{ inputs.mode }}
-        run: |
-          case "${MODE}" in
-            "" | today) echo "next=false" >> "${GITHUB_OUTPUT}" ;;
-            next) echo "next=true" >> "${GITHUB_OUTPUT}" ;;
-            *)
-              echo "::error title=Not a PlatformAgent mode::mode is '${MODE}'. The PlatformAgent's spec.mode takes exactly today or next, lowercase; pass one of those, or leave the input unset for today."
-              exit 1
-              ;;
-          esac
-
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,26 +116,10 @@ jobs:
           location: ${{ vars.GCP_REGION }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      # The readiness script is the candidate's, and one older than
-      # platform_agent_mode.sh ignores PLATFORM_AGENT_MODE, so `next` would
-      # run the suites without its gate. Skipped unless the mode check passed
-      # `next`.
-      - name: Confirm the candidate can gate the mode
-        if: steps.mode.outputs.next == 'true'
-        env:
-          MODE: ${{ inputs.mode }}
-        run: |
-          if [ ! -f scripts/release/platform_agent_mode.sh ]; then
-            echo "::error title=This candidate predates the mode input::The commit under test has no scripts/release/platform_agent_mode.sh, so its readiness script would ignore mode '${MODE}'. Run it at or after the commit that added that file, or with mode today."
-            exit 1
-          fi
-
       - name: Connect to GKE & Wait for Pod Readiness
         env:
           AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
           COMMIT_SHA: ${{ inputs.commit_sha }}
-          # Refused by the script unless today or next; cleared for today.
-          PLATFORM_AGENT_MODE: ${{ inputs.mode }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
@@ -187,16 +143,11 @@ jobs:
           # owner/repo against GITHUB_ORG.
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
-        # gchat_agent_test.py's wait for the reply. `next` gets 300s, as
-        # autopush-next-e2e-gchat.yml does, because its readiness gate does not
-        # cover the first turn's cold start. Exported only for `next`: the test
-        # is the candidate's, and one older than the next leg reads an empty
-        # value as int(''), so `today` must not see the key at all.
-        run: |
-          if [ "${{ steps.mode.outputs.next == 'true' }}" = true ]; then
-            export TEST_TIMEOUT_SEC=300
-          fi
-          ./scripts/release/execute_e2e_tests.sh
+          # gchat_agent_test.py's wait for the reply: 300s, as
+          # autopush-next-e2e-gchat.yml gives it, because the readiness gate
+          # does not cover the first turn's cold start.
+          TEST_TIMEOUT_SEC: "300"
+        run: ./scripts/release/execute_e2e_tests.sh
 
       # The script exits non-zero when any suite in the list failed, so the step
       # goes red-but-tolerated and the job summary names which one. E2E_SUITE is
@@ -222,11 +173,6 @@ jobs:
           E2E_SLACK_BOT_USER_ID: ${{ vars.E2E_SLACK_BOT_USER_ID }}
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
-        # 300s for `next` and nothing for `today`, as the blocking gate does.
-        # The Slack suite reads E2E_SLACK_MODE for what the answer must look like.
-        run: |
-          if [ "${{ steps.mode.outputs.next == 'true' }}" = true ]; then
-            export TEST_TIMEOUT_SEC=300
-            export E2E_SLACK_MODE=next
-          fi
-          ./scripts/release/run_optional_e2e_suites.sh
+          # 300s, as the blocking gate gives it.
+          TEST_TIMEOUT_SEC: "300"
+        run: ./scripts/release/run_optional_e2e_suites.sh

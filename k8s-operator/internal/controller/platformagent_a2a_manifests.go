@@ -170,9 +170,13 @@ const (
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
 	// on every running next install, rolling the NATS pod and minting a new
-	// provision Job for the same image.
+	// provision Job for the same image. Pinned by exact version and the
+	// digest of its multi-arch OCI index, like the reloader and the exporter:
+	// a floating tag would let two installs a day apart run different servers.
+	// A bump changes this string, images.json and the docs table together,
+	// and rolls every running bus once.
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
-	defaultA2ANATSImage     = "nats:2.10-alpine"
+	defaultA2ANATSImage     = "nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"
@@ -296,7 +300,9 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
+	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep    = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -320,6 +326,18 @@ const (
 	// It is read the same way a2aStrictEventsWriter is: anything but an
 	// explicit "true" is off, so a typo leaves the door shut.
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
+
+	// a2aNATSDebugEnvVar turns on nats-server's debug logging on the bus, for
+	// CI only (#5708): hack/ci-deploy.sh sets it through operator.extraEnv, so
+	// a failing run's server logs carry the meta group's raft votes, terms and
+	// peer updates. It is never a CR field or a chart value, so an install
+	// can't turn it on by accident (only operator.extraEnv reaches it). Debug, never trace: trace logs protocol
+	// frames, payloads and CONNECT included, and CI logs are public. Debug
+	// names connections and the public keys they authenticated with, nothing
+	// secret. Anything but an explicit "true" is off. It reaches the operator
+	// only through the chart's operator.extraEnv, which takes any variable, so
+	// turning it on is a deliberate act.
+	a2aNATSDebugEnvVar = "A2A_NATS_DEBUG"
 
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
 	// cluster view: session pods route kubectl through <agent>-kube-proxy
@@ -608,7 +626,8 @@ const (
 	a2aProvisionJobNameHashLength = 8
 
 	// a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
-	// token, the one chat backend the gateway can be given today without a door.
+	// token, the backend the gateway falls back to when the CR arms neither
+	// Chat nor Slack (buildA2AGatewayDeployment).
 	a2aDiscordBotSecretName = "discord-bot"
 	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
 
@@ -655,12 +674,15 @@ const (
 	// The home space the gateway's chat.notify route posts to
 	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
 	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
-	// The agent container's half of the same route: which platform name
-	// the agent-side callers route through `a2a notify` instead of
+	// The agent container's half of the same route: which platform names,
+	// comma-separated, the agent-side callers route through `a2a notify` instead of
 	// `hermes send` (agents/platform/scripts/chat_notify.py).
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
 	a2aNotifyPlatformSlack  = "slack"
+	// The agent reads A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS as
+	// comma-separated lists of the platform names above.
+	a2aNotifyPlatformSeparator = ","
 	// The Slack home channel the same route posts to on a Slack-armed
 	// gateway, from slack.homeChannel.
 	a2aSlackHomeChannelEnvVar = "A2A_SLACK_HOME_CHANNEL"
@@ -683,8 +705,8 @@ const (
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
 	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
-	// gateway_platforms) reads it too, as a comma-separated list, to name the
-	// platforms whose home channel is missing when it refuses a report.
+	// routed_platforms) reads it too, as a comma-separated list: the home-post
+	// fallback when no armed route has a home channel.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
@@ -1445,6 +1467,18 @@ func a2aCardStop() string {
 	return "false"
 }
 
+// renderA2ANATSDebug is the bus's debug line, present only while the
+// operator's environment asks for it (a2aNATSDebugEnvVar).
+func renderA2ANATSDebug() string {
+	if os.Getenv(a2aNATSDebugEnvVar) != "true" {
+		return ""
+	}
+	return `# CI only (A2A_NATS_DEBUG on the operator): raft votes, terms and peer
+# updates in the log, for #5708. Debug, never trace.
+debug: true
+`
+}
+
 // a2aInjectBackendEnabled reports whether the operator was deployed with the
 // eval flag. Anything but an explicit "true" is off, for the reason
 // a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
@@ -1533,32 +1567,48 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
 }
 
-// a2aGchatHomeRouted says the agent routes its home posts (alerts, drift
-// and scheduled reports) to the gateway's Chat backend: the home channel is
-// a space name, or it is empty and Slack is not enabled, so the posts have
-// nowhere else to go and the gateway keeps the refused ones for the digest
-// it posts once a channel is set (a2a/gateway/notify_refused.go). With Slack
-// enabled beside an unset Chat home the posts keep going to Slack through
-// its Hermes platform (legacySlackConsumer) rather than into the keep. A
-// malformed home channel routes nothing: the gateway refuses it at start.
-func a2aGchatHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
-	if !a2aChatArmed(agent) {
-		return false
+// a2aNotifyPlatforms is every platform whose chat.notify route the gateway
+// arms, Chat first: the platforms a kanban card's report and onboarding's
+// first report can go back to (A2A_NOTIFY_CONVERSATIONS).
+func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
+	var platforms []string
+	if a2aGchatNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformGchat)
 	}
-	if a2aGchatHomeSpace(agent) != "" {
-		return true
+	if a2aSlackNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformSlack)
 	}
-	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" && !slackEnabled(agent)
+	return platforms
 }
 
-// a2aSlackHomeRouted is Slack's half of a2aGchatHomeRouted. Slack holds the
-// gateway only when Chat is not enabled (a2aSlackArmed), so an unset home
-// channel always routes: Slack is the install's one chat platform.
-func a2aSlackHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
-	if !a2aSlackArmed(agent) {
-		return false
+// a2aNotifyHomePlatforms is every armed platform whose home channel the CR
+// sets, Chat first (A2A_NOTIFY_PLATFORM), and empty when none is. It reads
+// CR fields only, so a learned channel rolls no pod: the agent adds Slack
+// from the projected file, and sends home posts to every armed route when no
+// platform has a home (agents/platform/scripts/chat_notify.py,
+// routed_platforms).
+func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
+	var platforms []string
+	if a2aGchatHasHome(agent) {
+		platforms = append(platforms, a2aNotifyPlatformGchat)
 	}
-	return a2aSlackHomeChannel(agent) != "" || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == ""
+	if a2aSlackNotifyArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+		platforms = append(platforms, a2aNotifyPlatformSlack)
+	}
+	return platforms
+}
+
+// a2aGchatHasHome is whether Chat's chat.notify route is armed with a home
+// channel to post to.
+func a2aGchatHasHome(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aGchatNotifyArmed(agent) && a2aGchatHomeSpace(agent) != ""
+}
+
+// a2aSlackHasHome is whether Slack's chat.notify route is armed with a home
+// channel to post to, from the CR or the admitted record. Only the status
+// reads it; the pod template never reads the record (a2aNotifyHomePlatforms).
+func a2aSlackHasHome(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) bool {
+	return a2aSlackNotifyArmed(agent) && a2aSlackHomeEffective(agent, rec) != ""
 }
 
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
@@ -1602,35 +1652,24 @@ func a2aChatArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return googleChatEnabled(agent)
 }
 
-// a2aSlackArmed reports whether this install's Slack is consumed by the next
+// a2aSlackArmed reports whether this install's Slack is consumed by the A2A
 // stack: the gateway's Slack backend, on the token pair the CR's
 // spec.integration.slack refs name. It is a2aChatArmed's rule for the same
 // reason: a Slack app's events are spread across every Socket Mode
-// connection it has open, so two consumers on one app split its messages,
-// and the legacy path already opens one (the credential broker's SlackRelay,
-// armed by the same refs). Exactly one consumer holds the app.
-//
-// One exception, because the gateway runs one real backend per process
-// (a2a/gateway/config.go, FromEnv): when Chat is armed it holds the gateway,
-// as it holds it over the discord-bot Secret, and Slack stays on the legacy
-// consumer rather than reaching nobody.
+// connection it has open, so two consumers on one app split its messages.
+// The gateway is the one consumer: it runs every armed chat backend in one
+// process (a2a/gateway/config.go, FromEnv), so with both enabled the one
+// gateway pod carries Slack beside Chat, and nothing renders the Hermes
+// slack platform or a broker Slack relay (the Hermes Slack path went with
+// spec.mode today).
 //
 // The CR alone decides, by decision (2026-10-06): the token Secret is not
 // read, so a multi-workspace bot token (the broker's comma-separated list,
-// which the gateway cannot use) is armed anyway. Such installs keep Slack on
-// the Hermes path by enabling Google Chat beside it; the spec's Slack section
-// and the Slack app page say so.
+// which the gateway cannot use) is armed anyway. The gateway serves one
+// Slack workspace; the installer refuses the apply when it can see such a
+// token, and the spec's Slack section and the Slack app page say so.
 func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
-	return slackEnabled(agent) && !a2aChatArmed(agent)
-}
-
-// legacySlackConsumer is the complement: the broker's Slack relay pair, the
-// Hermes slack platform and its relay env render exactly when Slack is
-// enabled and the next stack is not taking it. Every legacy Slack render
-// site asks this rather than the enabled flag, so the two Socket Mode
-// consumers cannot both render.
-func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
-	return slackEnabled(agent) && !a2aSlackArmed(agent)
+	return slackEnabled(agent)
 }
 
 // teamsEnabled is the enabled test for Teams, which only Hermes serves: the
@@ -1644,14 +1683,13 @@ func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // peopleReadingEnabled reports whether the usage poller reads the A2A
-// gateway's people reading for the install: only
-// while no chat platform it enables is served through Hermes, since the
-// gateway counts only the people who write through it, and a count beside a
-// Hermes-served platform would say nobody wrote while that platform's users
-// were writing. Google Chat is always on the A2A gateway, so only Slack on
-// Hermes and Teams count.
+// gateway's people reading for the install: only while no chat platform it
+// enables is served through Hermes, since the gateway counts only the
+// people who write through it, and a count beside a Hermes-served platform
+// would say nobody wrote while that platform's users were writing. Google
+// Chat and Slack are always on the A2A gateway, so only Teams counts.
 func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return !legacySlackConsumer(agent) && !teamsEnabled(agent)
+	return !teamsEnabled(agent)
 }
 
 // slackEnabled is the enabled test the Slack render sites make, in one place.
@@ -2446,7 +2484,7 @@ http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 # For the reloader in the same pod, which signals this PID when the mounted
 # config changes.
 pid_file: "` + a2aNATSPIDFile + `"
-` + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
+` + renderA2ANATSDebug() + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -3009,6 +3047,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					Annotations: map[string]string{a2aConfigHashAnnotation: confHash},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 					AutomountServiceAccountToken: ptr.To(false),
 					// The reloader signals nats-server by PID.
 					ShareProcessNamespace: ptr.To(true),
@@ -3430,8 +3469,8 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// whose own fence keeps them to the bus, LiteLLM and
 					// DNS (agentprofile_namespace.go).
 					profileNamespacePeer(agent),
-					// The MCP server, under its flag (a2aMCPNATSPeers).
-				}, append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...)...),
+					// The MCP server and OKF curator, under their flags.
+				}, append(append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...), a2aCuratorNATSPeers(agent)...)...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -4241,7 +4280,8 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
+					RestartPolicy:    corev1.RestartPolicyNever,
 					// Its own ServiceAccount, holding no RBAC at all: the
 					// token exists to authenticate to the bus, not to talk to
 					// the API server. Automount stays off and the bus token is
@@ -6354,6 +6394,9 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 // ServiceAccount holds a verb on it. No DefaultMode: the pod runs as uid 1000
 // with no fsGroup, and a 0400 Secret file would be root's and unreadable.
 //
+// A gateway that also carries Chat reads the same Secret: the Chat backend
+// reads no principal map.
+//
 // Every other gateway keeps the volume it had before Slack could arm one: the
 // principal-map ConfigMap, Discord's test table, which never maps a real
 // principal. The eval door's map is its own ConfigMap at its own path and is
@@ -6395,13 +6438,14 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-chatops-gateway.md). Which chat backend it starts on is
+// docs/designs/spec-chatops-gateway.md). Which chat backends it starts are
 // the install's: the Google Chat env and relay token when a2aChatArmed, the
-// Slack token pair from the CR's refs when a2aSlackArmed, the optional
-// discord-bot Secret reference otherwise, and the inject door under its own
-// flag beside any of them. The console door is always armed
-// (a2aConsoleDoorEnvVar), so a gateway with none of those configured starts
-// on the console door alone: every next install renders it at one replica.
+// Slack token pair from the CR's refs when a2aSlackArmed, both together when
+// both are armed, the optional discord-bot Secret reference when neither is,
+// and the inject door under its own flag beside any of them. The console door
+// is always armed (a2aConsoleDoorEnvVar), so a gateway with none of those
+// configured starts on the console door alone: every install renders it
+// at one replica.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	leaseEnv := a2aGatewayLeaseEnv(agent)
@@ -6487,31 +6531,35 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if credentialProxyExecTierEnabled(agent) {
 			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aCredentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 		}
+		if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+		}
 	}
 
-	// The Google Chat backend, applied the same way: three slices, empty
-	// when the install does not arm it, so every other render is
-	// byte-identical to what it was. What arms it is a2aChatArmed; what it
-	// renders is the env the gateway's FromEnv reads for the gchat adapter,
-	// the projected token the adapter presents to the broker's relay, and
-	// NOT the Discord reference: the gateway refuses two real backends, so
-	// an install with both a discord-bot Secret and Chat enabled under next
-	// gets the one its CR names.
-	backendEnv := []corev1.EnvVar{
-		// Created by hand at install time (the bot token is operator input,
-		// never repo content); the reference is optional so the pod
-		// schedules before it.
-		{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
-			Key:                  a2aDiscordBotTokenKey,
-			Optional:             ptr.To(true),
-		}}},
+	// The chat backends. The Discord reference is the default for a gateway
+	// the CR arms no chat backend on: when the CR names Chat or Slack, a
+	// discord-bot Secret left in the namespace does not start a third
+	// backend the CR never asked for. Chat (a2aChatArmed) renders the env the
+	// gateway's FromEnv reads for the gchat adapter and the projected token
+	// the adapter presents to the broker's relay, in slices that stay empty
+	// when it is not armed, so every other render is byte-identical to what
+	// it was.
+	var backendEnv []corev1.EnvVar
+	if !a2aSlackArmed(agent) && !a2aChatArmed(agent) {
+		backendEnv = []corev1.EnvVar{
+			// Created by hand at install time (the bot token is operator
+			// input, never repo content); the reference is optional so the
+			// pod schedules before it.
+			{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
+				Key:                  a2aDiscordBotTokenKey,
+				Optional:             ptr.To(true),
+			}}},
+		}
 	}
-	// The Slack backend takes the Discord reference's place on the same
-	// terms: the CR names it (a2aSlackArmed), so a discord-bot Secret left in
-	// the namespace cannot make the gateway refuse two backends. The pair is
-	// read through the CR's own refs, the ones the legacy broker reads, which
-	// is why the legacy consumer is off whenever this is on.
+	// The Slack backend, beside Chat's when both are armed. The pair is read
+	// through the CR's own refs, the ones the legacy broker reads, which is
+	// why the legacy consumer is off whenever this is on.
 	if a2aSlackArmed(agent) {
 		slack := agent.Spec.Integration.Slack
 		backendEnv = []corev1.EnvVar{
@@ -6562,8 +6610,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
 	// The home-channel projection, read by the notify route and the learner
-	// (a2a/gateway/slack_home_channel.go), on a Slack gateway only: a Chat
-	// gateway's home is the CR's, and its template stays as it was.
+	// (a2a/gateway/slack_home_channel.go), whenever Slack is armed, Chat
+	// beside it or not: Chat's home is the CR's and reads no file, so a
+	// Chat-only gateway's template stays as it was.
 	var homeVolumes []corev1.Volume
 	var homeMounts []corev1.VolumeMount
 	if a2aSlackArmed(agent) {
@@ -6574,7 +6623,6 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
 		allowed := a2aAllowlist(gchat.AllowedUsers)
-		backendEnv = nil
 		chatEnv = []corev1.EnvVar{
 			// The relay is the broker; the gateway pod holds no cloud credential.
 			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
@@ -6597,8 +6645,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}
 		// Proactive posts land here (the chat.notify route). Unset leaves
 		// the route serving a kanban card's report back to its conversation
-		// only: proactive posts have nowhere to go, as on today with no home
-		// channel.
+		// only: proactive posts have nowhere to go.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}
@@ -6622,8 +6669,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	}
 
 	// The container env, in the order it has always had: the bus, the
-	// Discord reference (when not displaced by Chat), the gateway's own
-	// settings, then the Chat backend's and the inject door's additions.
+	// Discord reference or the Slack backend, the gateway's own settings,
+	// then the Chat backend's and the inject door's additions.
 	env := []corev1.EnvVar{
 		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 		a2aNATSCAFileEnvVar(),
@@ -6763,6 +6810,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
+	if len(pullRefs) > 0 {
+		refNames := make([]string, 0, len(pullRefs))
+		for _, ref := range pullRefs {
+			refNames = append(refNames, ref.Name)
+		}
+		env = append(env, corev1.EnvVar{
+			Name:  a2aImagePullRefsEnvVar,
+			Value: strings.Join(refNames, a2aImagePullRefsSep),
+		})
+	}
 
 	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -6781,6 +6839,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: pullRefs,
 					// ndots:3, see brokerCallerPodDNSConfig.
 					DNSConfig: brokerCallerPodDNSConfig(),
 					// The gateway runs as its own ServiceAccount with the
@@ -7040,6 +7099,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	if a2aMCPDoorEnabled() {
 		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
+	}
+	if a2aCuratorEnabled() {
+		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -7385,6 +7447,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		state.mcpNotRendered = a2aMCPIdentityUnownedReason
+	}
+
+	// The OKF memory curator, under A2A_CURATOR, after the fences and ahead of
+	// the gateway hold.
+	if err := r.reconcileA2ACurator(ctx, agent, state.busHeld); err != nil {
+		return state, err
 	}
 
 	// The scope publisher: its static objects, its Job on schedule, and the
@@ -8611,13 +8679,6 @@ type a2aTeardownEntry struct {
 // shard at or past this pass's count.
 func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
 	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
-}
-
-// deleteA2AAuthMapShards removes every identity-map object, the unsharded
-// legacy one and every shard. Only tests call it since the flip-to-today
-// teardown went; CR deletion leaves the objects to their owner reference.
-func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
 }
 
 // deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns

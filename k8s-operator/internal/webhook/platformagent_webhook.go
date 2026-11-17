@@ -201,7 +201,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		// 2a. Validate sensitive environment variable overrides and forge credential Secret references
 		allErrs = append(allErrs, validateForgeCredentialEnvVars("platform-agent", platformAgent.Spec.Deployment.Env, platformAgent.Spec.Integration, depPath.Child("env"))...)
 		for i, env := range platformAgent.Spec.Deployment.Env {
-			if _, isSensitive := agentv1alpha1.SensitiveEnvVars[env.Name]; isSensitive {
+			if agentv1alpha1.IsSensitiveEnvVar(env.Name) {
 				allErrs = append(allErrs, field.Forbidden(
 					depPath.Child("env").Index(i).Child("name"),
 					fmt.Sprintf("overriding sensitive environment variable %q is forbidden", env.Name),

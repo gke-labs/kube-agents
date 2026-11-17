@@ -60,6 +60,9 @@ func ceilingProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.
 // dispatcher serves the rest, with every shard under the budget
 // (gke-labs/kube-agents#5381).
 func TestTheDispatcherCeiling(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := authMapTestAgent()
@@ -154,6 +157,9 @@ func TestTheDispatcherProfileSharesAddUp(t *testing.T) {
 // breaking ties, so a pass never reshuffles which; deleting an older profile
 // readmits the oldest refused one.
 func TestTheCeilingRefusesTheNewestProfiles(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := authMapTestAgent()
@@ -242,6 +248,9 @@ func TestTheDispatcherCeilingWarnsOncePerTransition(t *testing.T) {
 // draining profiles' grants can push the entry past the budget, and then the
 // dispatcher step tears it down rather than leave it without a map entry.
 func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withDispatcher(t)
 	agent := a2aTestAgent()
 	scheme := setupScheme()
@@ -317,6 +326,9 @@ func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T)
 // AgentProfile controller has to cut without it too, or the profile at the
 // boundary is rendered by one and refused by the other.
 func TestBothControllersCutAtTheSameProfile(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	withDispatcher(t)
 	agent := a2aTestAgent()
@@ -358,6 +370,23 @@ func twoTierProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.
 	start := metav1.Now()
 	for i := range profiles {
 		profiles[i].CreationTimestamp = metav1.NewTime(start.Add(time.Duration(i) * time.Second))
+	}
+	return profiles
+}
+
+// parameterHeavyProfiles is twoTierProfiles with each profile declaring the
+// most parameters it can, at the longest names. A parameter costs the
+// dispatch config bytes and the dispatcher's identity entry nothing, so the
+// config's limit cuts before the identity's. Since #5485 a Job template is a
+// reference in the config, not the template itself, so Job mode alone no
+// longer reaches that limit first.
+func parameterHeavyProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.AgentProfile {
+	profiles := twoTierProfiles(agent, n)
+	for i := range profiles {
+		for j := 0; j < 16; j++ {
+			name := fmt.Sprintf("p%02d_%s", j, strings.Repeat("x", 59))
+			profiles[i].Spec.Parameters = append(profiles[i].Spec.Parameters, agentv1alpha1.AgentProfileParameter{Name: name})
+		}
 	}
 	return profiles
 }
@@ -404,20 +433,25 @@ func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 	}
 }
 
-// Under Job mode each profile that allows unattended carries its Job
-// template in the dispatch config, so the config's limit comes before the
-// identity's: the cut refuses the newest at the ConfigMap's limit, names
-// #5479, and what the operator writes fits in one ConfigMap.
+// When the dispatch config fills before the identity entry does (here,
+// profiles heavy with parameters, under Job mode), the cut refuses the newest
+// at the ConfigMap's limit, names #5479, and what the operator writes fits in
+// one ConfigMap. Job mode alone no longer gets there first: since #5485 the
+// config carries a reference to each Job template, not the template
+// (TestJobModeAloneNoLongerFillsTheConfig).
 func TestUnderJobModeTheConfigLimitCutsFirst(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
-	profiles := twoTierProfiles(agent, 400)
+	profiles := parameterHeavyProfiles(agent, 700)
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	refused := a2aDispatcherCeilingRefused(agent, profiles)
 	if len(refused) == 0 {
-		t.Fatal("400 two-tier profiles under Job mode fit; the fixture no longer crosses the config limit")
+		t.Fatal("700 parameter-heavy profiles under Job mode fit; the fixture no longer crosses the config limit")
+	}
+	if r := resolved[refused[0]].refused; r == nil || !strings.Contains(r.Error(), "ConfigMap") {
+		t.Fatalf("the first refusal isn't the config's: %v", r)
 	}
 	fit := len(profiles) - len(refused)
 	msg := resolved[refused[0]].refused.Error()
@@ -469,7 +503,8 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
 	agent := a2aTestAgent()
-	profiles := twoTierProfiles(agent, 400)
+	profiles := parameterHeavyProfiles(agent, 700)
+	profiles = profiles[:len(profiles)-len(a2aDispatcherCeilingRefused(agent, profiles))]
 	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 	var draining []a2aDispatchProfile
 	for i := 0; i < 600; i++ {
@@ -528,6 +563,9 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 // The cut is cached by what decides it, a profile's spec among it, so a spec
 // change moves the cut even where nothing bumps the generation.
 func TestTheCutFollowsAProfileSpecChange(t *testing.T) {
+	// The identity ceiling is the unbucketed entry's; with bucketed grants,
+	// #5381's default, the entry doesn't grow (TestBucketedGrantsLiftTheIdentityCeiling).
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	agent := a2aTestAgent()
@@ -562,5 +600,27 @@ func TestTheDispatchersServiceAccountIsReserved(t *testing.T) {
 	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: sa}
 	if msg := ReservedServiceAccountOverride(agent); msg == "" {
 		t.Errorf("an override naming %q is not refused", sa)
+	}
+}
+
+// Since #5485 the dispatch config carries a reference to each unattended
+// profile's Job template (its DispatchJobTemplate), not the template, so Job
+// mode alone no longer fills the config before the identity entry: 400
+// two-tier unattended profiles fit the config.
+func TestJobModeAloneNoLongerFillsTheConfig(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	profiles := twoTierProfiles(agent, 400)
+	if refused := a2aDispatcherCeilingRefused(agent, profiles); len(refused) != 0 {
+		t.Errorf("%d of 400 two-tier profiles under Job mode were refused", len(refused))
+	}
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false, a2aTaskSigningKeyPlaceholder), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(cm.Data[a2aDispatchConfigKey]); n > a2aDispatchConfigProfileBudget {
+		t.Errorf("400 profiles' dispatch config is %d bytes, over the %d budget", n, a2aDispatchConfigProfileBudget)
 	}
 }

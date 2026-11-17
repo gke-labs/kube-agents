@@ -53,7 +53,44 @@ const (
 	a2aNATSCASuffix      = "-ca"
 
 	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
+
+	// DefaultUniverseDomain is Google Cloud's commercial API universe domain.
+	DefaultUniverseDomain = "googleapis.com"
+	// MaxUniverseDomainLength is the DNS hostname length cap enforced on
+	// Google Cloud universe domain values across spec, metadata, and env inputs.
+	MaxUniverseDomainLength = 253
+	// GoogleCloudUniverseDomainEnv is the Google Cloud client-library
+	// environment variable naming the active API universe domain.
+	GoogleCloudUniverseDomainEnv = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+	// CloudSDKUniverseDomainEnv is the Google Cloud SDK environment variable
+	// naming the active core/universe_domain property.
+	CloudSDKUniverseDomainEnv = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+	// KubeProxyUniverseDomainEnv is the k8s-api-proxy environment variable
+	// naming the active Google Cloud universe domain.
+	KubeProxyUniverseDomainEnv = "KUBE_PROXY_UNIVERSE_DOMAIN"
+	// CloudSDKEndpointOverridesEnvPrefix is the prefix for gcloud per-service
+	// API endpoint overrides (CLOUDSDK_API_ENDPOINT_OVERRIDES_<SERVICE>).
+	CloudSDKEndpointOverridesEnvPrefix = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
 )
+
+var universeDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// NormalizeUniverseDomain trims whitespace and a single trailing DNS dot,
+// lowercases the candidate, and validates it as a multi-label DNS hostname of
+// at most MaxUniverseDomainLength bytes.
+func NormalizeUniverseDomain(raw string) (string, bool) {
+	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if candidate == "" || len(candidate) > MaxUniverseDomainLength || !universeDomainRegex.MatchString(candidate) {
+		return "", false
+	}
+	return candidate, true
+}
+
+// IsValidUniverseDomain reports whether raw is already a canonical lower-case
+// multi-label DNS hostname within MaxUniverseDomainLength.
+func IsValidUniverseDomain(raw string) bool {
+	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw)
+}
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
 // PlatformAgent, and the stem of A2ACredsSecretName.
@@ -176,15 +213,16 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
-	// the gateway's chat.notify route. It holds the routed platforms,
-	// comma-separated; the operator renders one name, exactly when the next
-	// stack holds the chat backend. An override either way leaves posts going
-	// to a platform that is not there.
+	// the gateway's chat.notify route. It holds every platform whose route is
+	// armed under the next stack with a home channel set on the CR,
+	// comma-separated, Chat first; the agent adds a learned Slack channel and
+	// sends home posts to every armed route when no platform has a home. An
+	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
-	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route. It holds
-	// the gateway's platforms, comma-separated; the cron relay names each in
-	// its refusal when no home channel is set.
+	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,
+	// comma-separated. The kanban notifier reports back on it to the gateway
+	// conversation a card was filed in, and the agent sends home posts to
+	// every armed route when no platform has a home channel.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS":     {},
 	"KUBE_AGENTS_ENABLED_PROFILES": {},
@@ -197,6 +235,23 @@ var SensitiveEnvVars = map[string]struct{}{
 	"NATS_USER":         {},
 	"NATS_PASSWORD":     {},
 	"VCS_FORGES_CONFIG": {},
+	// Universe-domain variables decide which Google API host receives the
+	// credential proxy's cloud-platform access token and which universe the
+	// watchers and relays address. Only spec.harness.universeDomain (or the
+	// operator's metadata-server detection) may set them; a spec.deployment.env
+	// entry would redirect Google tokens outside the install's universe.
+	GoogleCloudUniverseDomainEnv: {},
+	CloudSDKUniverseDomainEnv:    {},
+	KubeProxyUniverseDomainEnv:   {},
+}
+
+// IsSensitiveEnvVar reports whether name is reserved in SensitiveEnvVars or
+// carries a reserved Cloud SDK endpoint-override prefix.
+func IsSensitiveEnvVar(name string) bool {
+	if _, ok := SensitiveEnvVars[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(name, CloudSDKEndpointOverridesEnvPrefix)
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -435,6 +490,21 @@ type HarnessSpec struct {
 	// localhost:8080. See buildCredentialProxyEnv.
 	// +required
 	ProjectID string `json:"projectId,omitempty"`
+
+	// UniverseDomain is the Google Cloud API universe domain for this install
+	// (for example, "googleapis.com" on standard Google Cloud, or a custom API
+	// domain on Google Cloud Dedicated / Sovereign Cloud). When omitted, the
+	// operator probes the GKE metadata server
+	// (/computeMetadata/v1/universe/universe-domain) and falls back to
+	// "googleapis.com" outside GCE/GKE. One PlatformAgent spans a single
+	// universe domain: when set and the host metadata server reports a
+	// different universe domain, the operator refuses the mismatch and marks
+	// the CR Degraded with reason UniverseDomainMismatch rather than sending
+	// tokens across universe boundaries.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`
+	// +optional
+	UniverseDomain string `json:"universeDomain,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
@@ -2845,6 +2915,21 @@ type AgentStatus struct {
 	// +optional
 	Inference *InferenceStatus `json:"inference,omitempty"`
 
+	// ResolvedUniverseDomain is the Google Cloud API universe domain the
+	// operator resolved for this install from spec.harness.universeDomain or
+	// from the GKE metadata server (/computeMetadata/v1/universe/universe-domain).
+	// Written by the Ready status update; absent before a pass reaches it, when
+	// spec.harness.universeDomain is unset and the metadata server did not
+	// answer (for example on kind), and while the served CRD predates the field.
+	// +optional
+	ResolvedUniverseDomain string `json:"resolvedUniverseDomain,omitempty"`
+
+	// UniverseDomainSource reports how ResolvedUniverseDomain was determined
+	// ("Spec" when spec.harness.universeDomain is set, "Discovered" when read
+	// from the GKE metadata server). Absent alongside ResolvedUniverseDomain.
+	// +optional
+	UniverseDomainSource string `json:"universeDomainSource,omitempty"`
+
 	// ProfileSubmitMaxAgeSeconds is the live PROFILE_SUBMITS stream's max age,
 	// in seconds, when the A2A provision Job last found it longer than this
 	// operator creates the stream with (0 when the stream has no age limit).
@@ -3160,13 +3245,13 @@ type AgentUsageStatus struct {
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
-	// wrote on the chat platform it serves within the last 7 days:
+	// wrote on the chat platforms it serves within the last 7 days:
 	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
 	// across gateway pods. A reading, not an accumulation: it falls as a
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
-	// chat platform the install enables is served through Hermes (Google Chat
-	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// chat platform the install enables is served through Hermes (Microsoft
+	// Teams), and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional
