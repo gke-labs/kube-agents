@@ -315,8 +315,7 @@ class FakeHost:
         self.context, self.namespace = "c", "n"
         self.stop = threading.Event()
 
-    def check(self):
-        cli.Host.check(self)
+    check = cli.Host.check  # taken before a test replaces cli.Host
 
     def platform_agent(self):
         return {"spec": {"deployment": {"credentialProxy": {"resources": {"limits": {"memory": "8G"}}}}}}
@@ -339,7 +338,9 @@ class FakeRecorder:
 REPORTS = []
 
 
-def run_scenario(monkeypatch, tmp_path, host, lost=False, start=None, seconds="0"):
+def fake_install(monkeypatch, host, lost=False):
+    """Puts ``host``, a recorder that records nothing, a report kept in REPORTS and a lease (lost when
+    ``lost``) in place of the real ones, for a scenario run."""
     import contextlib
     import threading
     monkeypatch.setattr(cli, "Host", lambda args: host)
@@ -355,6 +356,10 @@ def run_scenario(monkeypatch, tmp_path, host, lost=False, start=None, seconds="0
 
     monkeypatch.setattr(cli, "lease", fake_lease)
     monkeypatch.setattr(cli, "KILL_POLL_SECONDS", 0)
+
+
+def run_scenario(monkeypatch, tmp_path, host, lost=False, start=None, seconds="0"):
+    fake_install(monkeypatch, host, lost)
     args = cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--watch", "proxy", "--seconds", seconds])
     cli.scenario(args, "credentialProxy", "envoy-credential-proxy", "app=x", start or (lambda h, b, l: None))
     return host.patches
@@ -534,3 +539,133 @@ def test_create_cluster_gives_gcloud_its_own_kubeconfig(monkeypatch, tmp_path):
     cli.create_cluster(cli.Fleet(args), "oom-01", 100, events_only=False)
     create_env = next(env for cmd, env in envs if "create" in cmd and "clusters" in cmd)
     assert create_env["KUBECONFIG"].endswith("create-oom-01.kubeconfig")
+
+
+def test_host_kubectl_pins_the_install_context_and_namespace(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "")
+    host = cli.Host(cli.parse(["--host-context", "ctx", "--namespace", "ns", "--out", str(tmp_path), "proxy"]))
+    host.kubectl("get", "pods")
+    host.patch([{"op": "remove", "path": "/spec/x"}])
+    assert [cmd[:5] for cmd in calls] == [["kubectl", "--context", "ctx", "-n", "ns"]] * 2
+
+
+def test_sampler_execs_in_the_install_context(monkeypatch, tmp_path):
+    class Proc:
+        def __init__(self):
+            self.stdout = iter(())
+
+        def wait(self):
+            return 0
+
+    class Host:
+        context, namespace = "ctx", "ns"
+
+        def running_pod(self, selector):
+            return "platform-agent-shell-0"
+
+    recorder = cli.Recorder(Host(), tmp_path, cli.SHELL_SELECTOR, cli.SHELL_CONTAINER)
+    argvs = []
+
+    def popen(argv, **kw):
+        argvs.append(argv)
+        recorder.stop.set()
+        return Proc()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    recorder.sample()
+    assert argvs[0][:9] == ["kubectl", "--context", "ctx", "-n", "ns", "exec", "platform-agent-shell-0", "-c", "shell"]
+
+
+@pytest.mark.parametrize("command", ["proxy", "watcher"])
+def test_a_scenario_refuses_to_start_without_a_host_context(tmp_path, capsys, command):
+    with pytest.raises(SystemExit):
+        cli.parse(["--out", str(tmp_path), command])
+    assert "--host-context is required" in capsys.readouterr().err
+
+
+def test_fleet_names_lists_only_the_labelled_clusters_of_the_prefix(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "oom-02\noom-01\n")
+    fleet = cli.Fleet(cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "delete"]))
+    assert fleet.names() == ["oom-01", "oom-02"]
+    listing = calls[0]
+    assert listing[listing.index("--filter") + 1] == "resourceLabels.purpose=oom-repro AND name~^oom-"
+
+
+def test_a_refused_lease_starts_nothing_and_releases_nothing(monkeypatch):
+    import subprocess as sp
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(argv)
+        return sp.CompletedProcess(argv, 1 if "acquire" in argv else 0, "", "held by another session")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit, match="held by another session"):
+        with cli.lease(FakeHost(), "note"):
+            pytest.fail("the scenario ran without the lease")
+    assert [argv for argv in calls if "release" in argv] == []
+
+
+def test_two_failed_renewals_in_a_row_mark_the_lease_lost(monkeypatch):
+    import subprocess as sp
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(argv)
+        return sp.CompletedProcess(argv, 1 if "renew" in argv else 0, "", "renew refused")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "SECONDS_PER_MINUTE", 0.001)  # a renewal every 20 ms
+    with cli.lease(FakeHost(), "note") as lost:
+        assert lost.wait(10)
+    assert sum("renew" in argv for argv in calls) == 2
+
+
+def test_watcher_runc_removes_the_runtime_class_and_puts_it_back(monkeypatch, tmp_path):
+    limits = cli.DEFAULT_LIMITS["agentAPIAuth"]
+    gateway = {"metadata": {"name": "platform-agent-gateway-1"}, "status": {"phase": "Running"},
+               "spec": {"initContainers": [{"name": cli.WATCHER_CONTAINER, "resources": {"limits": limits}}]}}
+
+    class GvisorHost(FakeHost):
+        listings = [[]]  # no gateway pod before the run, so the pod the new limits rolled is not restarted
+
+        def platform_agent(self):
+            return {"spec": {"deployment": {"availability": {"runtimeClassName": "gvisor"}}}}
+
+        def pods(self, selector):
+            return self.listings.pop(0) if self.listings else [gateway]
+
+    host = GvisorHost()
+    fake_install(monkeypatch, host)
+    cli.watcher(cli.parse(["--host-context", "c", "--out", str(tmp_path), "watcher", "--runc", "--seconds", "0"]))
+    assert host.patches[1:] == [[{"op": "remove", "path": "/spec/deployment/availability/runtimeClassName"}],
+                                [{"op": "add", "path": "/spec/deployment/availability/runtimeClassName",
+                                  "value": "gvisor"}]]
+
+
+def test_poll_records_each_kill_of_one_pod_and_only_in_the_watched_container(monkeypatch, tmp_path):
+    def shell_pod(restarts):
+        oom = {"terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": f"2026-11-04T16:0{restarts}:00Z"}}
+        p = pod("platform-agent-shell-0", containers=[{"name": "shell", "restartCount": restarts, "lastState": oom},
+                                                      {"name": "sidecar", "restartCount": 7, "lastState": oom}])
+        p["metadata"]["uid"] = "uid-1"
+        return p
+
+    class Host:
+        listings = [[shell_pod(1)], [shell_pod(1)], [shell_pod(2)]]
+
+        def pods(self, selector):
+            if not self.listings:
+                recorder.stop.set()
+                return []
+            return self.listings.pop(0)
+
+        def kubectl(self, *args, check=True):
+            return ""
+
+    monkeypatch.setattr(cli, "KILL_POLL_SECONDS", 0)
+    recorder = cli.Recorder(Host(), tmp_path, cli.SHELL_SELECTOR, cli.SHELL_CONTAINER)
+    recorder.poll()
+    assert [(k["container"], k["restarts"]) for k in recorder.events] == [("shell", 1), ("shell", 2)]
