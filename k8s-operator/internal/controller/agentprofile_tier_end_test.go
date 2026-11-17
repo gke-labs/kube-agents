@@ -383,3 +383,32 @@ func TestTheProfilePassComesBackAtItsDrainEnd(t *testing.T) {
 		})
 	}
 }
+
+// A lever that names no tier (",", or empty) is removed with a Warning,
+// rather than staying on the profile saying nothing; and it never counts as
+// pending, so the pass doesn't come back every endTierDrainRecheck for it.
+func TestALeverNamingNoTierIsRemoved(t *testing.T) {
+	scheme := setupScheme()
+	for _, value := range []string{",", "", " , "} {
+		p := testAgentProfile("kubeagents-system", "tse", func(*agentv1alpha1.AgentProfile) {}, withEndTierDrain(value))
+		if len(endTierDrainRequested(&p)) != 0 {
+			t.Fatalf("%q names a tier", value)
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&p).Build()
+		rec := record.NewFakeRecorder(10)
+		r := &AgentProfileReconciler{Client: cl, Scheme: scheme, Recorder: rec}
+		if err := r.consumeEndTierDrain(context.Background(), &p, tierVerdict{}); err != nil {
+			t.Fatal(err)
+		}
+		var stored agentv1alpha1.AgentProfile
+		if err := cl.Get(context.Background(), client.ObjectKeyFromObject(&p), &stored); err != nil {
+			t.Fatal(err)
+		}
+		if _, set := stored.Annotations[endTierDrainAnnotation]; set {
+			t.Errorf("%q: the annotation is still on the profile", value)
+		}
+		if len(rec.Events) != 1 || !strings.Contains(<-rec.Events, "names no tier") {
+			t.Errorf("%q: want one Warning naming no tier", value)
+		}
+	}
+}

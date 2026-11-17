@@ -278,6 +278,9 @@ func liveTiersOf(p *agentv1alpha1.AgentProfile) []string {
 func (r *AgentProfileReconciler) consumeEndTierDrain(ctx context.Context, p *agentv1alpha1.AgentProfile, v tierVerdict) error {
 	requested := endTierDrainRequested(p)
 	if len(requested) == 0 {
+		if _, set := p.Annotations[endTierDrainAnnotation]; set {
+			return r.stripEmptyEndTierDrain(ctx, p)
+		}
 		return nil
 	}
 	var keep, consumed, live, notDraining []string
@@ -323,6 +326,26 @@ func (r *AgentProfileReconciler) consumeEndTierDrain(ctx context.Context, p *age
 			r.Recorder.Eventf(p, corev1.EventTypeWarning, "EndTierDrainIgnored",
 				"%s lists tier(s) %s, which this profile isn't draining (or whose drain has already ended); removed from the annotation. It ends one tier's drain on a profile that still runs another tier; a profile left with no tier drains whole and isn't covered", endTierDrainAnnotation, strings.Join(notDraining, ", "))
 		}
+	}
+	return nil
+}
+
+// stripEmptyEndTierDrain removes an endTierDrainAnnotation that names no
+// tier (empty, or only commas), with a Warning: left alone it would stay on
+// the profile and say nothing.
+func (r *AgentProfileReconciler) stripEmptyEndTierDrain(ctx context.Context, p *agentv1alpha1.AgentProfile) error {
+	base := p.DeepCopy()
+	delete(p.Annotations, endTierDrainAnnotation)
+	if err := r.Patch(ctx, p, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		if apierrors.IsConflict(err) {
+			*p = *base
+			return nil
+		}
+		return fmt.Errorf("remove the empty %s annotation: %w", endTierDrainAnnotation, err)
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(p, corev1.EventTypeWarning, "EndTierDrainIgnored",
+			"%s names no tier; removed, nothing ended", endTierDrainAnnotation)
 	}
 	return nil
 }

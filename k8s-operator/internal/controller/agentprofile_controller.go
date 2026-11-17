@@ -250,7 +250,7 @@ func (r *AgentProfileReconciler) reconcile(ctx context.Context, req ctrl.Request
 	if err := r.consumeEndTierDrain(ctx, &profile, verdict); err != nil {
 		return ctrl.Result{}, err
 	}
-	pass.leverPending = profile.Annotations[endTierDrainAnnotation] != ""
+	pass.leverPending = len(endTierDrainRequested(&profile)) > 0
 	bound, err := withoutForeignServiceAccounts(ctx, r.Client, renderable)
 	if err != nil {
 		return ctrl.Result{}, err

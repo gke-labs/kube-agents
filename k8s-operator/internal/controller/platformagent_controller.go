@@ -1571,6 +1571,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
+		// And a tier drain's end (#5850), which nothing watched marks.
+		if a2aState.drainEndRequeue > 0 {
+			requeue = min(requeue, a2aState.drainEndRequeue)
+		}
 		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
