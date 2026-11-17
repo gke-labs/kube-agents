@@ -734,6 +734,10 @@ const (
 	// The broker's side of the same backend.
 	a2aGoogleChatSubscriptionEnvVar      = "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME"
 	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
+	// credentialProxyA2AChatCallersEnvVar binds the a2a-chat role to the A2A
+	// gateway's ServiceAccount in the broker (#6090), rendered beside the
+	// audience above and only with it.
+	credentialProxyA2AChatCallersEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS" // #nosec G101 -- Environment variable name, not a credential
 
 	// The A2AGateway condition. Older operators published it while a next
 	// install's gateway ran nothing for want of a chat backend: withheld

@@ -65,6 +65,46 @@ class Mutation:
 MUTATIONS: list[Mutation] = [
     # ---- A. Authority ---------------------------------------------------
     Mutation(
+        "A3-a2a-chat-any-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:\n",
+         "        if False:\n"),
+        "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
+        "leave the a2a-chat audience to decide, since only the A2A gateway's pod "
+        "projects it -- until any allowed caller that projects that audience "
+        "holds the A2A gateway's role on its Chat event routes",
+    ),
+    Mutation(
+        "A3-a2a-chat-gateway-any-audience",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:\n",
+         "        if False:\n"),
+        "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
+        "let the A2A gateway's account present any audience, since its pod "
+        "projects only the a2a-chat one -- until a pod running as that account "
+        "projects the shell audience and holds the shell role",
+    ),
+    Mutation(
+        "A3-a2a-chat-binding-not-rendered",
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("\t\t\t\t\tcorev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},\n",
+         ""),
+        "test_A3_the_operator_binds_the_a2a_chat_role_to_the_a2a_gateway",
+        "drop the binding from the render, since the broker still confers the "
+        "role from the audience -- every install then runs unbound, as an older "
+        "operator's does",
+    ),
+    Mutation(
+        "A3-a2a-chat-callers-env-renamed",
+        "agents/platform/scripts/credential_proxy.py",
+        ('A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"\n',
+         'A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLER"\n'),
+        "test_A3_the_operator_binds_the_a2a_chat_role_to_the_a2a_gateway",
+        "rename the broker's env constant, since its own tests read the same "
+        "constant -- the operator's render is then read by nothing and the "
+        "binding silently drops",
+    ),
+    Mutation(
         "A3-profile-context-unchecked",
         "agents/platform/scripts/task_confinement.py",
         ("    for value in contexts:\n        if value != target.context_name:\n",

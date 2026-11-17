@@ -334,6 +334,13 @@ SOURCES: dict[str, Source] = {
     # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
     # can compare them, and a NetworkPolicy that selects nothing is
     # indistinguishable from one that is working.
+    # The broker's a2a-chat caller binding (#6090): the env name the operator
+    # renders, which the Python broker reads under its own constant. Two
+    # modules, so only this suite can see the two names drift apart.
+    "a2a_chat_callers_env_go": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("credentialProxyA2AChatCallersEnvVar =",),
+    ),
     "a2a_session_fence": Source(
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),

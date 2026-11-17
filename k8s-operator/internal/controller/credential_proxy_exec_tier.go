@@ -173,6 +173,7 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// a subscription change must not roll every exec replica.
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
+	credentialProxyA2AChatCallersEnvVar:  true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

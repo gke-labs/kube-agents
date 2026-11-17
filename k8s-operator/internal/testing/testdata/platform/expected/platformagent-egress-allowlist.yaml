@@ -1522,6 +1522,8 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-a2a-chat
+            - name: CREDENTIAL_PROXY_A2A_CHAT_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: AUDIT_REPORT_STORE_URL
               value: http://platformagent-report-store.kubeagents-system.svc:8700
             - name: AUDIT_REPORT_STORE_TOKEN_FILE

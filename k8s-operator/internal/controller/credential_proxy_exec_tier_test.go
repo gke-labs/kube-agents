@@ -219,6 +219,7 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 		corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "sub"},
 		corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: "a2a-sub"},
 		corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: "aud"},
+		corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: "system:serviceaccount:ns:a2a-gateway"},
 	)
 	bc.EnvFrom = append(bc.EnvFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "plugin"}}})
 	broker.Spec.Template.Annotations[secretEnvHashAnnotation] = "digest"
@@ -257,7 +258,7 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 			t.Errorf("exec pod reads %s from a Secret", e.Name)
 		}
 	}
-	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar} {
+	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar, credentialProxyA2AChatCallersEnvVar} {
 		if _, ok := env[name]; ok {
 			t.Errorf("exec pod carries %s", name)
 		}
