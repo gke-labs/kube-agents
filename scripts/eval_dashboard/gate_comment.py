@@ -319,10 +319,18 @@ def build_url(run: health.Run) -> str:
 
 
 def is_red(run: health.Run) -> bool:
-    """FAILURE, with tasks, and at least one graded repetition: not aborted,
-    not a setup death, not a suite the storm emptied, and not a run the
-    suite itself said it could not evaluate (module docstring)."""
-    return run.result == health.RUN_FAILURE and run.full and any(task.graded for task in run.tasks) and not run.not_evaluated
+    """FAILURE, with tasks, and at least one graded or forge repetition: not
+    aborted, not a setup death, not a suite the storm emptied, and not a run
+    the suite itself said it could not evaluate (module docstring). A forge
+    repetition counts because a safeguard-blocked one (rung 2,
+    FORGE_SAFEGUARD_MARKER) reds the run without being graded; a run of
+    `infra` forge repetitions only is not evaluated and stays out."""
+    return (
+        run.result == health.RUN_FAILURE
+        and run.full
+        and (any(task.graded for task in run.tasks) or run.forge_reps > 0)
+        and not run.not_evaluated
+    )
 
 
 def is_commented_on(run: health.Run) -> bool:

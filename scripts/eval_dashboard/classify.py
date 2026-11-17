@@ -325,8 +325,8 @@ FORGE_RED_LEDE = (
 )
 # The same red beside cases that were graded and passed: those grades stand.
 FORGE_RED_LEDE_GRADED = (
-    "The cases graded here passed; the rest errored on a forge read (usually the GitHub App's hourly rate limit), so the"
-    " safeguard could not rule out a forbidden write and the run stays red. Retest once the limit has reset."
+    "What was graded here passed; the repetitions that errored on a forge read (usually the GitHub App's hourly rate"
+    " limit) left the safeguard unable to rule out a forbidden write, so the run stays red. Retest once the limit has reset."
 )
 FORGE_OUTAGE_NOTE = " A forge outage is declared right now."
 DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
@@ -411,18 +411,23 @@ def rep_kind(rep: dict) -> str:
 
 
 def rep_counts(task: dict) -> dict:
-    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0, "fixture": 0, "forge": 0}
+    """Reps by kind; `safeguard` counts the forge reps that are rung-2 blocks
+    (FORGE_SAFEGUARD_MARKER) rather than `infra` ones, within `forge`."""
+    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0, "fixture": 0, "forge": 0, "safeguard": 0}
     for rep in task_reps(task):
         kind = rep_kind(rep)
         counts["infra" if kind == REP_STORM else kind] += 1
+        if kind == REP_FORGE and str(rep.get("result") or "").lower() != "infra":
+            counts["safeguard"] += 1
     return counts
 
 
 def outcome_of(counts: dict) -> str | None:
     """passed (every graded rep passed), partial, failed (every graded rep
     failed), infra (nothing graded: storm, ceiling, fixture or forge reps only),
-    None (no reps at all)."""
-    if counts["pass"] and counts["fail"]:
+    None (no reps at all). A safeguard-blocked forge rep beside passes is
+    partial: the scorer blocks the case on any rung-2 rep, so it is not a pass."""
+    if counts["pass"] and (counts["fail"] or counts.get("safeguard")):
         return OUTCOME_PARTIAL
     if counts["fail"]:
         return OUTCOME_FAILED
@@ -912,6 +917,11 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         elif run_storm or condition == CONDITION_STORM:
             cls = CLS_STORM
             do = DO_STORM
+    elif outcome == OUTCOME_PARTIAL and counts["safeguard"] and not counts["fail"]:
+        # Passes beside a safeguard-blocked forge rep: the block is the
+        # forge's, and it reds the case.
+        cls = CLS_FORGE
+        do = DO_FORGE
     return {
         "case": name,
         "outcome": outcome,

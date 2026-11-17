@@ -36,6 +36,7 @@ REP = {
     "e": {"result": "fail", "reason": EMPTY},
     "i": {"result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE"},
     "g": {"result": "infra", "reason": "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"},
+    "b": {"result": "fail", "reason": "KUBE_AGENTS_FORGE_SAFEGUARD: checks errored rather than ran: ['writes'] -- writes: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied the pull-request list"},
     "c": {"result": "infra", "reason": "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result"},
 }
 
@@ -247,6 +248,14 @@ class Shapes(Harness):
         self.assertNotIn("agent-kanban-smoke", box)
         self.assertIn("· [Incident brief →]", box)
         self.assertNotIn("Reason", self.gh.bodies()[0])
+
+    def test_a_run_every_case_of_which_the_safeguard_blocked_is_still_commented_on(self):
+        # Nothing graded, but the rung-2 blocks red the run and the suite marks it red, not not-evaluated.
+        tasks = [task(name, "bbb") for name in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        self.assertIn("hard failure", self.gh.bodies()[0].split("\n")[1])
 
     def test_hard_failure(self):
         # FAILURE with every gate case passing: an absolute check tripped.

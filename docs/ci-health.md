@@ -720,7 +720,7 @@ could not read GitHub and, while the forge-outage condition is declared,
 ties the run to it. The health bot counts these repetitions as forge, not fail.
 The scorer writes that marker only when the forge alone explains the block (no
 failed check, no parse error, coverage present, a real run), so an unmarked
-block stays a fail. Six forge repetitions across two pull requests in two hours
+block stays a fail. A case with passes beside a marked block is partial, not passed, since the scorer blocks the case, and the gate comment still comments on a run whose every case is blocked. Six forge repetitions across two pull requests in two hours
 are the forge-outage condition: DEGRADED under its own name, its own
 message and advice, which names the GitHub App's rate limit.
 
