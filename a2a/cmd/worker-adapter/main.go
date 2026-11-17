@@ -137,7 +137,7 @@ const (
 
 	// The env names that tell the harness how to reach the model.
 	modelBaseURLEnv   = "ANTHROPIC_BASE_URL"
-	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"
+	modelAPIKeyEnv    = "ANTHROPIC_API_KEY"    // #nosec G101 -- env name, not a credential
 	modelAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN" // #nosec G101 -- env name, not a credential
 	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
