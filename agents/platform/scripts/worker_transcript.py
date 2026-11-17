@@ -669,9 +669,11 @@ TOKEN_PRINTER_PATHS = {
 # file and code on standard input are not read.
 PYTHON_BINARY_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?)$")
 PYTHON_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?c")
-_ENVIRONMENT_LITERAL_KEY = r"""\[\s*(?:'[^']*'|"[^"]*")\s*\]"""
+_ENVIRONMENT_LITERAL = r"""(?:'[^']*'|"[^"]*")"""
+_ENVIRONMENT_LITERAL_KEY = r"\[\s*" + _ENVIRONMENT_LITERAL + r"\s*\]"
+# A method that reads or sets one variable: its first argument is a whole literal, closed by `,` or `)`.
 _PYTHON_ENVIRONMENT_ONE_VARIABLE = (
-    r"(?!\s*(?:" + _ENVIRONMENT_LITERAL_KEY + r"""|\.(?:get|setdefault|pop)\s*\(\s*['"]|\.(?:update|keys)\s*\())"""
+    r"(?!\s*(?:" + _ENVIRONMENT_LITERAL_KEY + r"|\.(?:get|setdefault|pop)\s*\(\s*" + _ENVIRONMENT_LITERAL + r"\s*[,)]|\.(?:update|keys)\s*\())"
 )
 PYTHON_ENVIRONMENT_RE = re.compile(r"""(?:(?<!\w)os|__import__\(\s*['"]os['"]\s*\))\.environb?\b""" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
 # `from os import environ` makes the bare name the environment.

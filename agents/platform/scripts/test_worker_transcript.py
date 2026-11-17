@@ -1761,6 +1761,8 @@ class TestSecretReadDetector(unittest.TestCase):
         "python3 -c 'import os; print([os.environ[\"\" + k] for k in os.environ.keys()])'",
         "node -e 'Object.keys(process.env).forEach(k => console.log(process.env[\"\" + k]))'",
         "python3 -c 'import os\nfor k in sorted(os.environ.keys()): print(k, os.environ.get(k))'",
+        "python3 -c 'import os; print([os.environ.get(\"\" + k) for k in os.environ.keys()])'",
+        "python3 -c 'import os; print([os.environ.pop(\"\" + k) for k in list(os.environ)])'",
         # the name imported from `os`
         "python3 -c 'from os import environ; print(environ)'",
         "python3 -c 'from os import path, environ\nprint(dict(environ))'",
