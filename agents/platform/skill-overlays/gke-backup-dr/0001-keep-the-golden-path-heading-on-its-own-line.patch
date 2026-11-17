@@ -2,6 +2,7 @@ Subject: Keep the Golden Path heading on its own line
 
 Why: upstream fuses the end of best practice 5 into the next heading (the sentence stops at "Service**," and "## Golden Path Backup Defaults" follows on the same line), so the heading does not render and the sentence never says why the distinction matters. The patch restores the clause the previous upstream version ended it with.
 Local-Issue: none (#2359)
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Upstream-Issue: none filed yet
 Retire-When: upstream puts the Golden Path heading on its own line
 
