@@ -700,3 +700,63 @@ func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
 		t.Errorf("a key/value table leaked: %q", got)
 	}
 }
+
+// TestScrubInlineSecretsAMarkBeforeTheSeparator: a * or _ that markdown
+// normalising leaves as text between a key and its separator doesn't stop
+// the key matching (#6182). Synthetic values only.
+func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
+	for _, in := range []string{
+		// #6182's shapes: a stray mark pairs with one of the label's, and
+		// the label's other mark stays before the colon.
+		"Note * *password*: quietpasture",
+		"- *password* * : quietpasture",
+		"1234. * *password*: quietpasture",
+		"a * b *password*: quietpasture",
+		// A mark left before the separator some other way.
+		"password*: quietpasture",
+		"- password*: quietpasture",
+		"*password * : quietpasture",
+		"token _= quietpasture",
+		"password\t*: quietpasture",
+		// A bullet before a label whose own mark stays before the separator.
+		"* password *: quietpasture",
+		"* token *= quietpasture",
+		"- * password *: quietpasture",
+		// Bullet lines wrapped in or ending with marks: redacted whole.
+		"* password: correct quietpasture battery staple *",
+		"* **Passphrase**: *correct quietpasture battery staple*",
+	} {
+		if got := scrubInlineSecrets(in); strings.Contains(got, "quietpasture") {
+			t.Errorf("scrubInlineSecrets(%q) = %q: the value is not redacted", in, got)
+		}
+	}
+	// Shapes the markdown pass handles through its pairing, as at main.
+	for in, want := range map[string]string{
+		"*password*: quietpasture":             "*password*: [redacted]",
+		"* password*: quietpasture":            "* password*: [redacted]",
+		"**Token:** quietpasture":              "**Token:** [redacted]",
+		"Note password: ** quietpasture ** ok": "Note password: ** [redacted] ** ok",
+		"export DB_PASSWORD=* quietpasture *":  "export DB_PASSWORD=* [redacted] *",
+		`{"password": * quietpasture *}`:       `{"password": * [redacted] *}`,
+		`"password": * *quietpasture*`:         `"password": * *[redacted]`,
+		"Note _ _PASSWORD was quietpasture.":   "Note _ _PASSWORD was [redacted].",
+		"password: quietpasture*":              "password: [redacted]",
+		"password: *quietpasture":              "password: [redacted]",
+		"password: quietpasture **":            "password: [redacted]",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The wider separator changes nothing else: a later "key*:" inside a
+	// passphrase doesn't split it, and a mark isn't a blank before "=".
+	for in, want := range map[string]string{
+		"password: correct horse secret*: staple":  "password: [redacted]",
+		"password: correct horse token * : staple": "password: [redacted]",
+		"PASSWORD*= HOST=db.example":               "PASSWORD*= HOST=db.example",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
