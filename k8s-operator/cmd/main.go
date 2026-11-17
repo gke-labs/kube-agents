@@ -254,6 +254,20 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		// Step down on shutdown rather than holding the lease until it
+		// expires, so the next pod takes over in seconds, not after the
+		// lease duration (#6217 measured ~45 s from a helm upgrade to the
+		// new pod's first reconcile). controller-runtime releases the lease
+		// after the leader-elected runnables have stopped, or once its
+		// graceful-shutdown timeout (default 30 s) runs out. The pod's
+		// terminationGracePeriodSeconds is 10, so a stop slower than that
+		// is killed first and the lease simply expires, as without this
+		// option: a release never races a reconcile that is still running.
+		// It is safe only because main returns as soon as mgr.Start does:
+		// the Start call is main's last statement, its error branch only
+		// logs and exits, and main has no defer or go statement that could
+		// act after it (manager_wiring_test.go).
+		LeaderElectionReleaseOnCancel: true,
 		// What this process holds in memory; controller.ManagerCacheOptions
 		// says what is in the cache, what is kept out of it, and why.
 		Cache:  controller.ManagerCacheOptions(),

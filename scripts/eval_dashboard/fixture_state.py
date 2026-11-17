@@ -144,6 +144,11 @@ SCOPE_SELECTED = "selected"
 # hack/fleet_reconcile.py --drifted read these.
 OP_AGE_GATE = "age_hours_ge"
 OP_AHEAD_OF_CHANNEL = "not_ahead_of_channel"
+# A seeded file in the pool's GitOps repository (the scan's `repository/<path>`
+# subject) is out of shape until an operator replaces it; the fleet stack
+# never writes that repository. The hourly scan holds no credential to read
+# it, so such a line reaches a published document only from a hand run.
+OP_AS_SEEDED = "as_seeded"
 # An age-gate line that read one timestamp; the age is negative when the
 # scanning host's clock lags the cluster's createTime. An unparseable one ends
 # "not one RFC 3339 timestamp" instead, and no clock clears that.
@@ -151,6 +156,9 @@ AGE_GATE_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AGE_GATE} (?P<hours>\d+(?:\.\d+)?)
 # A master-ahead line, the one shape of that op meaning the channel offers
 # nothing as new; an unset channel or an unreadable version is other drift.
 AHEAD_OF_CHANNEL_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AHEAD_OF_CHANNEL}: observed "[^"]+", newer than every ')
+# A seeded-file line: `repository/<path> as_seeded: observed blob <sha>, seeded
+# blob <sha>; <repair>` or `...: observed nothing; <repair>`.
+AS_SEEDED_LINE_RE = re.compile(rf"^\S+ {OP_AS_SEEDED}: observed ")
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -434,12 +442,14 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
 
 
 def no_reapply_op(line: str) -> str | None:
-    """OP_AGE_GATE or OP_AHEAD_OF_CHANNEL for a drift line no re-apply
-    clears; None for every other line."""
+    """OP_AGE_GATE, OP_AHEAD_OF_CHANNEL or OP_AS_SEEDED for a drift line no
+    re-apply clears; None for every other line."""
     if AGE_GATE_LINE_RE.match(line):
         return OP_AGE_GATE
     if AHEAD_OF_CHANNEL_LINE_RE.match(line):
         return OP_AHEAD_OF_CHANNEL
+    if AS_SEEDED_LINE_RE.match(line):
+        return OP_AS_SEEDED
     return None
 
 

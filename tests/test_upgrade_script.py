@@ -3248,7 +3248,7 @@ class UpgradeRunsAreSerialisedTest(unittest.TestCase):
             with self.subTest(script=name):
                 text = (_REPO_ROOT / name).read_text()
                 match = re.search(
-                    r'LOCK_FILE="(?:\$\{KUBE_AGENTS_LOCK_FILE:-)?([^"}]+)\}?"', text
+                    r'LOCK_FILE="(?:\$\{KUBE_AGENTS_(?:UNINSTALL_)?LOCK_FILE:-)?([^"}]+)\}?"', text
                 )
                 self.assertIsNotNone(match, f"{name} takes no lock ({len(text)} chars read)")
                 self.assertIn("flock -n 200", text, f"{name}'s lock waits instead of reporting")
