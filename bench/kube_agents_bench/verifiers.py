@@ -4403,8 +4403,9 @@ def _forge_rate_limit_budget() -> float:
 
 def _forge_rate_limit_wait(headers: Any) -> float:
     """Seconds to wait before reading again under a rate limit: the
-    Retry-After GitHub asks, else until its X-RateLimit-Reset, else the
-    default; at most one slice and what is left of the budget. Zero once the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset when
+    X-RateLimit-Remaining is 0, else the default; at most one slice and what
+    is left of the budget. Zero once the
     budget is spent."""
     get = headers.get if headers is not None else (lambda _key: None)
     wait = _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
