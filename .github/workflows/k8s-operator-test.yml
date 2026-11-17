@@ -54,6 +54,9 @@ on:
       # goes red on a change it did not make (#6249).
       # tests/test_operator_tests_cover_what_they_read.py holds this.
       - "charts/kube-agents/**"
+      # The dispatch fixture tests read these rendered fixtures the same way.
+      - "a2a/lib/testdata/**"
+      - "a2a/dispatch/testdata/**"
       - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
 
@@ -104,6 +107,8 @@ jobs:
               - "k8s-operator/**"
               - "a2a/authcallout/testdata/**"
               - "charts/kube-agents/**"
+              - "a2a/lib/testdata/**"
+              - "a2a/dispatch/testdata/**"
               - ".github/workflows/k8s-operator-test.yml"
 
       - name: Set up Go
