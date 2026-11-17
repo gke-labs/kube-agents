@@ -189,8 +189,9 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
         )
         self.assertEqual(["Ingress", "Egress"], spec["policyTypes"])
 
-        # Ingress: trusted gateway and credential-proxy pods (blocking shell-sandbox
-        # StatefulSet pods, kube-proxy, and session/worker pods) plus gke-gmp-system on TCP 8888.
+        # Ingress: trusted gateway and curator pods (blocking shell-sandbox,
+        # credential-proxy, credential-proxy-exec-tier, kube-proxy, and session/worker
+        # pods) plus gke-gmp-system on TCP 8888.
         self.assertEqual(
             [
                 {
@@ -203,22 +204,27 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
                                 },
                                 "matchExpressions": [
                                     {
-                                        "key": "statefulset.kubernetes.io/pod-name",
-                                        "operator": "DoesNotExist",
-                                    },
-                                    {
                                         "key": "kubeagents.x-k8s.io/component",
                                         "operator": "NotIn",
-                                        "values": ["kube-proxy"],
+                                        "values": [
+                                            "kube-proxy",
+                                            "credential-proxy",
+                                            "credential-proxy-exec-tier",
+                                            "shell-sandbox",
+                                        ],
                                     },
                                 ],
                             }
                         },
                         {
                             "podSelector": {
-                                "matchLabels": {
-                                    "kubeagents.x-k8s.io/a2a-component": "gateway",
-                                }
+                                "matchExpressions": [
+                                    {
+                                        "key": "kubeagents.x-k8s.io/a2a-component",
+                                        "operator": "In",
+                                        "values": ["gateway", "curator"],
+                                    }
+                                ]
                             }
                         },
                     ],
@@ -311,6 +317,78 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
             with self.subTest(policy=name):
                 self.assertEqual(policy["spec"], chart_policies[name]["spec"])
                 self.assertEqual(policy["metadata"]["labels"], chart_policies[name]["metadata"]["labels"])
+
+    def test_hindsight_api_ingress_selectors_admit_only_gateways_and_curator(self):
+        """Evaluate the podSelector rules against every operator-rendered pod label set."""
+        peers = self.kustomize[_HINDSIGHT_API_POLICY]["spec"]["ingress"][0]["from"]
+
+        def _matches_selector(sel, pod_labels):
+            for k, v in (sel.get("matchLabels") or {}).items():
+                if pod_labels.get(k) != v:
+                    return False
+            for expr in sel.get("matchExpressions") or ():
+                key, op, vals = expr["key"], expr["operator"], expr.get("values") or []
+                if op == "In" and pod_labels.get(key) not in vals:
+                    return False
+                if op == "NotIn" and key in pod_labels and pod_labels[key] in vals:
+                    return False
+                if op == "DoesNotExist" and key in pod_labels:
+                    return False
+                if op == "Exists" and key not in pod_labels:
+                    return False
+            return True
+
+        def _admitted(pod_labels):
+            return any(_matches_selector(p["podSelector"], pod_labels) for p in peers)
+
+        common = {
+            "app.kubernetes.io/name": "platform-agent",
+            "app.kubernetes.io/part-of": "kube-agents",
+            "app.kubernetes.io/instance": "kubeagents-system-platform-agent",
+            "app.kubernetes.io/managed-by": "platformagent-controller",
+        }
+        a2a_common = {**common, "app.kubernetes.io/part-of": "a2a-next"}
+
+        admitted_workloads = {
+            "gateway-deployment": {**common, "app": "platform-agent-gateway", "kubeagents.x-k8s.io/gateway-leader": "true"},
+            "gateway-statefulset": {**common, "app": "platform-agent-gateway", "statefulset.kubernetes.io/pod-name": "platform-agent-gateway-0"},
+            "a2a-gateway": {**a2a_common, "app": "platform-agent-a2a-gateway", "kubeagents.x-k8s.io/a2a-component": "gateway"},
+            "curator": {**a2a_common, "app": "platform-agent-curator", "kubeagents.x-k8s.io/a2a-component": "curator", "kubeagents.x-k8s.io/component": "curator"},
+        }
+        for name, labels in admitted_workloads.items():
+            with self.subTest(admitted=name):
+                self.assertTrue(_admitted(labels), f"{name} should be admitted: {labels}")
+
+        rejected_workloads = {
+            "shell-sandbox": {
+                **common,
+                "app": "platform-agent-shell",
+                "kubeagents.x-k8s.io/component": "shell-sandbox",
+                "statefulset.kubernetes.io/pod-name": "platform-agent-shell-0",
+            },
+            "credential-proxy": {
+                **common,
+                "app": "platform-agent-credential-proxy",
+                "kubeagents.x-k8s.io/component": "credential-proxy",
+                "kubeagents.x-k8s.io/has-credential-proxy": "true",
+            },
+            "credential-proxy-exec-tier": {
+                **common,
+                "app": "platform-agent-credential-proxy-exec-tier",
+                "kubeagents.x-k8s.io/component": "credential-proxy-exec-tier",
+            },
+            "kube-proxy": {
+                **common,
+                "app": "platform-agent-kube-proxy",
+                "kubeagents.x-k8s.io/component": "kube-proxy",
+            },
+            "a2a-session": {**a2a_common, "kubeagents.x-k8s.io/a2a-component": "session"},
+            "agentprofile-worker": {**a2a_common, "kubeagents.x-k8s.io/a2a-component": "agentprofile-worker"},
+            "a2a-dispatcher": {**a2a_common, "kubeagents.x-k8s.io/a2a-component": "dispatcher"},
+        }
+        for name, labels in rejected_workloads.items():
+            with self.subTest(rejected=name):
+                self.assertFalse(_admitted(labels), f"{name} should be rejected: {labels}")
 
     def test_chart_schema_bounds_additional_egress_as_the_crd_does(self):
         """The chart's additionalEgress accepts what the CR's does, no more.

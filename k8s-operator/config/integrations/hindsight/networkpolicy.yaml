@@ -1,6 +1,6 @@
-# Confines hindsight-api's ingress to the trusted gateway and credential-proxy
-# pods in the same namespace (blocking direct HTTP access from the shell sandbox
-# StatefulSet, kube-proxy, and session/worker pods) plus the GKE Managed
+# Confines hindsight-api's ingress to the trusted gateway and curator
+# pods in the same namespace (blocking direct HTTP access from the shell sandbox,
+# credential-proxy, kube-proxy, and session/worker pods) plus the GKE Managed
 # Prometheus collector namespace on TCP 8888, and its egress to cluster DNS,
 # hindsight-postgresql on TCP 5432,
 # and the in-cluster inference gateway (LiteLLM or standalone-replay) on TCP
@@ -29,15 +29,20 @@ spec:
               app.kubernetes.io/name: platform-agent
               app.kubernetes.io/part-of: kube-agents
             matchExpressions:
-              - key: statefulset.kubernetes.io/pod-name
-                operator: DoesNotExist
               - key: kubeagents.x-k8s.io/component
                 operator: NotIn
                 values:
                   - kube-proxy
+                  - credential-proxy
+                  - credential-proxy-exec-tier
+                  - shell-sandbox
         - podSelector:
-            matchLabels:
-              kubeagents.x-k8s.io/a2a-component: gateway
+            matchExpressions:
+              - key: kubeagents.x-k8s.io/a2a-component
+                operator: In
+                values:
+                  - gateway
+                  - curator
       ports:
         - port: 8888
           protocol: TCP

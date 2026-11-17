@@ -63,11 +63,11 @@ RECALL_PREAMBLE = (
 NO_MATCH_GUIDANCE = (
     "The store was reachable and answered: this query matched nothing. That is "
     "not the same as the record not existing. Recall is a semantic search that "
-    "returns top matches within the queried scope and lookback window, so a "
-    "record phrased differently, held under a scope not searched here, or "
-    "outside `since_hours` will not surface. Do not report that something does "
-    "not exist on the strength of this result — report that the search did not "
-    "surface it, and try an exact identifier, different wording, or a wider scope."
+    "returns top matches over the consolidated layer, so a record phrased "
+    "differently, held under a scope not searched here, or retained but not yet "
+    "consolidated will not surface. Do not report that something does not exist "
+    "on the strength of this result — report that the search did not surface it, "
+    "and try an exact identifier, different wording, or a wider scope."
 )
 UNREACHABLE_GUIDANCE = (
     "Memory could not be reached, so nothing was searched. This is a failure of "

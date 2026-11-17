@@ -46,6 +46,8 @@ DEFAULT_CURATOR_BIN = "/usr/local/bin/curator"
 NATS_URL_ENV = "NATS_URL"
 CURATOR_RECALL_TIMEOUT_SECONDS = 4
 DEFAULT_DECISION_RECALL_MAX_RESULTS = 4
+MAX_CURATOR_QUERY_CHARS = 500
+SINCE_HOURS_RECALL_TYPES = ("observation", "world", "experience")
 OKF_DOC_PREFIX = "okf:"
 OKF_ID_PREFIXES = (
     "DEC-",
@@ -225,7 +227,13 @@ def retain(provider: MemoryProvider, item: Dict[str, Any]) -> None:
     )
 
 
-def recall(provider: MemoryProvider, query: str, tags: List[str]) -> List[Any]:
+def recall(
+    provider: MemoryProvider,
+    query: str,
+    tags: List[str],
+    *,
+    types: Optional[List[str]] = None,
+) -> List[Any]:
     """Search one scope and return the raw results.
 
     Written against the client rather than delegated to ``hindsight_recall``
@@ -244,9 +252,9 @@ def recall(provider: MemoryProvider, query: str, tags: List[str]) -> List[Any]:
         "tags": tags,
         "tags_match": TAGS_MATCH,
     }
-    types = getattr(provider, "_recall_types", None)
-    if types:
-        kwargs["types"] = list(types)
+    resolved_types = types if types is not None else getattr(provider, "_recall_types", None)
+    if resolved_types:
+        kwargs["types"] = list(resolved_types)
     response = provider._run_hindsight_operation(lambda client: client.arecall(**kwargs))
     return list(getattr(response, "results", None) or [])
 
@@ -313,15 +321,16 @@ def recall_decisions(
     installed so unit tests and environments without the NATS bus are
     unaffected.
     """
-    q = str(query or "").strip()
+    q = str(query or "").strip()[:MAX_CURATOR_QUERY_CHARS]
     if not q or not os.environ.get(NATS_URL_ENV, "").strip():
         return []
     curator_bin = _resolve_curator_bin()
     if not curator_bin:
         return []
+    limit = max(1, int(max_results))
     try:
         proc = subprocess.run(
-            [curator_bin, "recall", "--query", q],
+            [curator_bin, "recall", "--max-results", str(limit), "--", q],
             capture_output=True,
             text=True,
             timeout=CURATOR_RECALL_TIMEOUT_SECONDS,

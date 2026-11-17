@@ -412,15 +412,20 @@ spec:
               app.kubernetes.io/name: platform-agent
               app.kubernetes.io/part-of: kube-agents
             matchExpressions:
-              - key: statefulset.kubernetes.io/pod-name
-                operator: DoesNotExist
               - key: kubeagents.x-k8s.io/component
                 operator: NotIn
                 values:
                   - kube-proxy
+                  - credential-proxy
+                  - credential-proxy-exec-tier
+                  - shell-sandbox
         - podSelector:
-            matchLabels:
-              kubeagents.x-k8s.io/a2a-component: gateway
+            matchExpressions:
+              - key: kubeagents.x-k8s.io/a2a-component
+                operator: In
+                values:
+                  - gateway
+                  - curator
       ports:
         - port: 8888
           protocol: TCP

@@ -184,7 +184,7 @@ class TestRecallReporting(unittest.TestCase):
 
     def test_recall_decisions_extracts_okf_id_and_status_from_document_id_and_tags(self):
         """Hindsight recall results with UUID ids preserve OKF record IDs and status headers,
-        and leading-dash queries travel safely via --query.
+        and leading-dash or overlong queries travel safely via --max-results and --.
         """
         fake_stdout = json.dumps(
             {
@@ -215,14 +215,58 @@ class TestRecallReporting(unittest.TestCase):
              patch.object(memory_client, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              patch("subprocess.run", side_effect=fake_run):
             hits = memory_client.recall_decisions("-n kubeagents-system pod crash")
+            long_query = "--flag-injection " + ("x" * 700)
+            memory_client.recall_decisions(long_query, max_results=3)
 
         self.assertEqual(
-            seen_cmds,
-            [["/usr/local/bin/curator", "recall", "--query", "-n kubeagents-system pod crash"]],
+            seen_cmds[0],
+            ["/usr/local/bin/curator", "recall", "--max-results", "4", "--", "-n kubeagents-system pod crash"],
         )
+        self.assertEqual(
+            seen_cmds[1][:5],
+            ["/usr/local/bin/curator", "recall", "--max-results", "3", "--"],
+        )
+        self.assertEqual(len(seen_cmds[1][5]), memory_client.MAX_CURATOR_QUERY_CHARS)
         self.assertEqual(len(hits), 2)
         self.assertIn("[DEC-2026-004] [STATUS: REJECTED — do not enforce as active policy]", hits[0])
         self.assertIn("[LES-2026-011] [STATUS: PROPOSED — awaiting pull request review; not yet active policy]", hits[1])
+
+    def test_since_hours_rejects_booleans_and_nonpositive_values_and_widens_types_per_call(self):
+        """Boolean values (`True`/`False`) and non-positive integers are rejected,
+        oversized values clamp to MAX_SINCE_HOURS, and `since_hours` widens recall
+        `types` per call without altering normal observation-only recalls.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        p, calls = provider(results=[SimpleNamespace(text="Recent handoff", mentioned_at=recent_ts)])
+
+        for bad in (True, False, 0, -5, "abc"):
+            res = json.loads(
+                p.handle_tool_call("memory_recall", {"query": "handoff", "since_hours": bad})
+            )
+            self.assertIn("error", res, f"expected error for since_hours={bad!r}, got {res}")
+            self.assertIn("since_hours", res["error"], res)
+
+        # Normal recall keeps observation-only types.
+        normal = json.loads(p.handle_tool_call("memory_recall", {"query": "handoff"}))
+        self.assertEqual(normal["searched"]["layer"], ["observation"])
+        self.assertEqual(calls["recall"]["types"], ["observation"])
+
+        # Windowed recall widens types to include raw world/experience units and clamps upper bound.
+        windowed = json.loads(
+            p.handle_tool_call("memory_recall", {"query": "handoff", "since_hours": 999999})
+        )
+        self.assertEqual(windowed["status"], "found", windowed)
+        self.assertEqual(windowed["searched"]["since_hours"], 8760, windowed)
+        self.assertEqual(
+            windowed["searched"]["layer"],
+            ["observation", "world", "experience"],
+        )
+        self.assertEqual(
+            calls["recall"]["types"],
+            ["observation", "world", "experience"],
+        )
 
 
 if __name__ == "__main__":

@@ -300,13 +300,23 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         self.assertIn("session:sess-42", retained["items"][0]["tags"], retained)
         self.assertEqual(retained["items"][0]["observation_scopes"], [[HANDOFF_TAG, "session:sess-42"]])
 
-        # 2. Unattributed group thread (unattended=False, _user_tag=''): kind='handoff' also works without scope='shared'.
+        # 2. Unattributed group thread or identity-less DM (unattended=False, _user_tag=''):
+        # implicit kind='handoff' without scope='shared' is refused, and explicit scope='shared' succeeds.
         p_group, retained_group = provider(unattended=False)
         p_group._session_id = "thread-9"
-        r_group = json.loads(
+        r_group_implicit = json.loads(
             p_group.handle_tool_call(
                 "memory_retain",
                 {"content": "Group incident handoff note.", "kind": "handoff"},
+            )
+        )
+        self.assertIn("error", r_group_implicit, r_group_implicit)
+        self.assertFalse(retained_group, retained_group)
+
+        r_group = json.loads(
+            p_group.handle_tool_call(
+                "memory_retain",
+                {"content": "Group incident handoff note.", "kind": "handoff", "scope": "shared"},
             )
         )
         self.assertEqual(r_group.get("kind"), "handoff", r_group)

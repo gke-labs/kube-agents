@@ -2,5 +2,5 @@
   "mode": "local_external",
   "memory_mode": "hybrid",
   "recall_budget": "mid",
-  "recall_types": ["observation", "world", "experience"]
+  "recall_types": ["observation"]
 }

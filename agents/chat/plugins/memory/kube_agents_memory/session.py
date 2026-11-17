@@ -77,6 +77,7 @@ INTERACTIVE_PLATFORMS = frozenset({"google_chat", "slack", "discord", "telegram"
 DECISIONS_SECTION_HEADING = "## Architecture Decisions & Operational Lessons\n"
 SESSION_TAG_PREFIX = "session:"
 RETAIN_KINDS = ("fact", "handoff")
+MAX_SINCE_HOURS = 8760
 ITEM_TIMESTAMP_FIELDS = ("mentioned_at", "created_at", "timestamp", "occurred_start", "date")
 
 
@@ -433,19 +434,17 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 )
             explicit_scope = str(args.get("scope") or "").strip().lower()
             if kind == "handoff":
-                if self._user_tag and explicit_scope != "shared":
+                if not self._unattended and explicit_scope != "shared":
                     return tool_error(
                         "Handoff checkpoints are visible across shared sessions. "
-                        "In a personal DM, pass scope='shared' explicitly only when "
+                        "In an interactive session, pass scope='shared' explicitly only when "
                         "the checkpoint contains no private user information."
                     )
                 if explicit_scope and explicit_scope != "shared":
                     return tool_error(
                         "kind='handoff' checkpoints must use scope='shared'."
                     )
-                default_scope = "shared"
-            else:
-                default_scope = "shared" if self._unattended else "personal"
+            default_scope = "shared" if self._unattended else "personal"
         scope = str(args.get("scope") or default_scope).strip().lower()
         if scope not in SCOPES or (is_write and scope == "both"):
             return tool_error(
@@ -523,13 +522,20 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         if tool_name == "memory_recall":
             raw_since = args.get("since_hours")
             since_hours: Optional[int] = None
-            if raw_since is not None and str(raw_since).strip() != "":
+            if raw_since is not None and (isinstance(raw_since, bool) or str(raw_since).strip() != ""):
+                if isinstance(raw_since, bool):
+                    return tool_error(
+                        f"Invalid since_hours {raw_since!r} for memory_recall: must be a positive integer."
+                    )
                 try:
                     since_hours = int(raw_since)
                 except (TypeError, ValueError):
-                    return tool_error(f"Invalid since_hours {raw_since!r} for memory_recall.")
+                    return tool_error(
+                        f"Invalid since_hours {raw_since!r} for memory_recall: must be a positive integer."
+                    )
                 if since_hours <= 0:
                     return tool_error("since_hours must be a positive integer.")
+                since_hours = min(since_hours, MAX_SINCE_HOURS)
             return self._recall(query, scope, tags, since_hours=since_hours)
         return self._reflect(query, scope, tags)
 
@@ -541,6 +547,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         tags: List[str],
         *,
         since_hours: Optional[int] = None,
+        recall_types: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Describe the search that was run, whatever its outcome.
 
@@ -555,7 +562,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             "tags": list(tags),
         }
         if tool_name == "memory_recall":
-            types = getattr(self._hindsight, "_recall_types", None)
+            types = recall_types if recall_types is not None else getattr(self._hindsight, "_recall_types", None)
             if types:
                 envelope["layer"] = list(types)
             if since_hours is not None:
@@ -570,9 +577,19 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         *,
         since_hours: Optional[int] = None,
     ) -> str:
-        searched = self._searched("memory_recall", query, scope, tags, since_hours=since_hours)
+        recall_types: Optional[List[str]] = (
+            list(client.SINCE_HOURS_RECALL_TYPES) if since_hours is not None else None
+        )
+        searched = self._searched(
+            "memory_recall",
+            query,
+            scope,
+            tags,
+            since_hours=since_hours,
+            recall_types=recall_types,
+        )
         try:
-            results = list(client.recall(self._hindsight, query, tags))
+            results = list(client.recall(self._hindsight, query, tags, types=recall_types))
         except Exception as e:
             logger.warning("%s: recall failed (scope=%s): %s", PROVIDER_NAME, scope, e)
             return tool_error(

@@ -55,9 +55,9 @@ no password in it. What keeps the database private is a ClusterIP service with n
 route in from outside the cluster, and — on clusters that enforce it —
 [`networkpolicy.yaml`](networkpolicy.yaml), which lets only the Hindsight API pod
 reach port 5432 and confines `hindsight-api` itself on port 8888 to trusted
-gateway and credential-proxy pods in the same namespace (excluding shell-sandbox
-StatefulSet pods, `kube-proxy`, and session/worker pods) plus Managed Prometheus,
-and egress to cluster DNS, `hindsight-postgresql`,
+gateway and curator pods in the same namespace (excluding shell-sandbox,
+`credential-proxy`, `credential-proxy-exec-tier`, `kube-proxy`, and session/worker
+pods) plus Managed Prometheus, and egress to cluster DNS, `hindsight-postgresql`,
 and the inference gateway. A password would add an install step (generate it, keep
 two keys in agreement, rotate it) to protect an in-cluster database from pods that
 are already trusted with the memories it holds.
