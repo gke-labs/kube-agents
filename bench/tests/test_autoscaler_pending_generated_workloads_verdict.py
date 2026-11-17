@@ -3,7 +3,9 @@
 The objective passes when the "FIX-SETS:" line holds the namespace default
 class label key, in either of its two forms. The line binds the label to the
 fix: the label named anywhere else in the answer, as a thing to compare or for
-another namespace, does not pass. ``report_contains`` lowercases the report,
+another namespace, does not pass, and neither does a fix line that negates the
+label, hedges it, names another fix beside it, or holds a longer made-up key.
+``report_contains`` lowercases the report,
 drops emphasis and backticks, and folds a list marker at the start of a line
 before the pattern runs.
 """
@@ -48,6 +50,7 @@ def test_a_fix_line_with_the_namespace_label_passes():
         f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: the label {LABEL}-non-daemonset on the Namespace manifest",
         f"{COMMAND}\n\n{BODY}\n\n- FIX-SETS: {LABEL}: general",
         f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: metadata.labels[\"{LABEL}\"] of the Namespace",
+        f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: {LABEL}.",
     ):
         assert _passes(report), report
 
@@ -65,6 +68,12 @@ def test_the_label_outside_the_fix_line_or_another_fix_fails():
         # The right fix in prose and no fix line.
         f"{COMMAND}\n\nLabel the Namespace with {LABEL}: general.",
         f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: a default class for the namespace",
+        # The label on the fix line, but negated, hedged, beside another fix, or not whole.
+        f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: spec.template.spec.nodeSelector (not {LABEL})",
+        f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: do not use {LABEL}; upgrade to 1.36.4",
+        f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: {LABEL}?",
+        f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: {LABEL} or spec.template.spec.nodeSelector",
+        f"{COMMAND}\n\n{BODY}\n\nFIX-SETS: {LABEL}-daemonset",
         "",
     ):
         assert not _passes(report), report

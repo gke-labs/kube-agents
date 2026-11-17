@@ -19,8 +19,11 @@
 # and passes when that line holds the namespace default class label key
 # (cloud.google.com/default-compute-class, in either of its two forms). The
 # line binds the label to the fix: an answer that names the label only as a
-# thing to compare, or only for kube-system, does not pass on it. For
-# workloads that are not in Git, that label is the fix that goes through Git.
+# thing to compare, or only for kube-system, does not pass on it. The key
+# must be whole (a longer made-up key does not count), and a fix line that
+# negates the label, hedges it with a question mark, or names another fix
+# beside it fails. For workloads that are not in Git, that label is the fix
+# that goes through Git.
 # Limits: an answer whose FIX-SETS line is the controller's pod template
 # (also a valid fix), a cluster default class, or a GKE upgrade fails. The
 # "NEXT-COMMAND" line is not graded by a deterministic check; the judge reads
@@ -86,7 +89,9 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - "(?m)^fix-sets: .*cloud\\.google\\.com/default-compute-class"
+        - "(?m)^fix-sets: (?:[^\\n]*[\\s\"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9-])"
+      forbidden_patterns:
+        - "(?m)^fix-sets:.*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|don't|\\binstead\\b|\\bupgrade\\b|nodeselector|;|\\bor\\b|\\?)"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
