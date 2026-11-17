@@ -10,6 +10,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 - **Google Cloud SDK** (`gcloud`) — **576.0.0 or newer**, [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`. The installer sets Managed OpenTelemetry with `--managed-otel-scope`, which reached GA in gcloud 576.0.0 (2026-07-14); on an older SDK the flag exists only on the alpha and beta tracks. The installer checks this before it touches any cloud resource — `gcloud components update` if it complains.
 - **`gke-gcloud-auth-plugin`** — required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin` or your OS package manager). Pre-flighted by the installer (`install.sh`).
 - **Terraform** — **1.5 or newer, below 2.0** (the configurations pin `~> 1.5`, which `terraform init` enforces; run from a checkout or release archive, the installer also checks for 1.5.0 before it touches any cloud resource). The install engine is the [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) composition; the installer (`install.sh`) pre-flights `terraform` and offers to install it from HashiCorp's tap (Homebrew) or apt repository. It is equally the _teardown_ engine, and `./uninstall.sh` installs nothing on your behalf — with an install to tear down and no terraform, it refuses with exit 1, so a machine that has only ever run the installer's auto-install cannot tear the install down. (Against a target with no Terraform state there is nothing to destroy, so it exits 3 without needing terraform at all.)
+  - A machine that cannot reach the Terraform registry needs a provider mirror: [Terraform providers on a restricted network](/kube-agents/deploy/release-versioning/#terraform-providers-on-a-restricted-network).
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The installer points it at the GKE cluster it creates.
 - **Docker or Podman** — required for manual deployments that build images (`make -C k8s-operator docker-build`, Method 2) and the local development workflow (`make dev-rebuild-agent`, Method 3). Not required for stock installs (Methods 0 & 1).
 - **Go** (`1.27+`) — required for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Importing a GitHub App private key (`.pem`) during GitOps installation also needs Go on the host machine, but only `1.21+`: that path builds the Minty CLI, not the operator. Not required if the Cloud KMS key is pre-provisioned, GitOps is not enabled, or the GitOps repository is on GitLab, Gitea or Bitbucket.
@@ -148,10 +149,10 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 
 | Profile | Pods | CPU requests | Memory requests | CPU limits | Memory limits | Ephemeral storage requests / limits | Claims | `requests.storage` | Session quota `pods` |
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
-| GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
-| One NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
-| Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
+| GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 228Gi | 39 |
+| GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 228Gi | 39 |
+| One NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 148Gi | 37 |
+| Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 236Gi | 45 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -168,6 +169,7 @@ The A2A stack, per pod:
 | Bus provisioning Job | 1 | 50m | 64Mi | 200m | 256Mi | 128Mi / 128Mi | At install, again whenever its spec changes, and about daily |
 | `hermes-bridge` container | in the agent pod | 250m | 512Mi | 1 | 1Gi | — | Under the default `api` executor; `A2A_BRIDGE_EXECUTOR=cli` raises it to 1 CPU and 4Gi memory (limits 3 and 8Gi), and `A2A_BRIDGE_RESOURCES` overrides either |
 | MCP server | 1 | 100m | 128Mi | 500m | 256Mi | — | With the operator's `A2A_MCP_DOOR=true` |
+| OKF memory curator | 1 | 50m | 64Mi | 500m | 256Mi | 128Mi / 128Mi | With the operator's `A2A_CURATOR=true` |
 | Scope publisher Job | 1 | 50m | 192Mi | 500m | 512Mi | — | One pod at a time, every 15 minutes, where `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope |
 | `a2a-worker` session pod | up to `maxSessions` | 250m | 512Mi | 2 | 2Gi | 1088Mi / 1088Mi | One per `delegate:` from chat and per conversation moved to `/session` |
 

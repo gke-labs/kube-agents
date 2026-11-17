@@ -250,6 +250,29 @@ class LifecyclePlanTest(unittest.TestCase):
                 self.assertIn(branch, guarded, guarded)
         self.assertEqual([name for name, called in guarded.items() if called], ["apply"])
 
+    def test_apply_guards_the_stockout_trio_before_terraform_runs(self):
+        """Like the drift trio, the stockout trio is never adopted by name, so
+        guard_stockout_adoption must run ahead of terraform apply."""
+        apply_branch = _executable_lines(
+            re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                      re.MULTILINE | re.DOTALL).group(1))
+        self.assertIn("guard_stockout_adoption", apply_branch)
+        self.assertLess(apply_branch.index("guard_stockout_adoption"),
+                        apply_branch.index("terraform apply"))
+
+    def test_the_stockout_guard_is_in_no_branch_but_apply(self):
+        """Only apply creates resources, so plan and destroy must not run guard_stockout_adoption."""
+        dispatch = self.text[self.text.index('case "${1:-}" in'):]
+        branches = re.split(r"^  (\w[\w-]*)\)$", dispatch, flags=re.MULTILINE)
+        guarded = {
+            branches[i]: "guard_stockout_adoption" in _executable_lines(branches[i + 1])
+            for i in range(1, len(branches) - 1, 2)
+        }
+        for branch in ("apply", "plan", "destroy"):
+            with self.subTest(branch=branch):
+                self.assertIn(branch, guarded, guarded)
+        self.assertEqual([name for name, called in guarded.items() if called], ["apply"])
+
     def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
         """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""
         destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,

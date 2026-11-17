@@ -325,8 +325,8 @@ func TestBuildSystemPVC(t *testing.T) {
 		t.Errorf("expected PVC name system-metadata, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "1Gi" {
-		t.Errorf("expected storage request 1Gi, got %s", storageReq.String())
+	if storageReq.String() != "4Gi" {
+		t.Errorf("expected storage request 4Gi, got %s", storageReq.String())
 	}
 }
 
