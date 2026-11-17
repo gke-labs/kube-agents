@@ -408,7 +408,7 @@ func (k *KubeJobs) deleteLegacy(ctx context.Context, profile, tier, kind, taskID
 	if err != nil {
 		return err
 	}
-	// TODO(#TBD-legacy-delete): remove deleteLegacy a release after #5646.
+	// TODO(#6166): remove deleteLegacy a release after #5646.
 	a := old.Annotations
 	if a[jobProfileAnnotation] != profile || a[jobTierAnnotation] != tier || a[jobTaskAnnotation] != taskID {
 		return nil
