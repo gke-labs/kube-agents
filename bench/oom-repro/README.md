@@ -8,8 +8,8 @@ large fleet from KWOK (Kubernetes WithOut Kubelet) nodes. A KWOK node is a real 
 real GKE cluster, but no virtual machine runs it. The fleet therefore costs little, and the agent
 reads it as it reads a large fleet.
 
-On the builds that the table below names, the test reproduces three failures at the operator's
-default memory limits:
+A build is the kube-agents code at one commit of `main`. On the builds that the table below names,
+the test reproduces three failures at the operator's default memory limits:
 
 - The sandbox shell runs the agents' terminals, scripts and `kubectl`. It is OOMKilled when an
   audit lists every Pod of two large clusters at the same time.
@@ -18,37 +18,38 @@ default memory limits:
 - The event watcher sends cluster Events to the agent. It is OOMKilled at start-up when it reads
   the Events of several large clusters at the same time.
 
-Later builds change how the audit and the event watcher read these lists. The test has not run
-against those changes.
+Later builds change how the audit and the event watcher read these lists. No result in this
+directory comes from those builds.
 
 No CI job runs this test, and the nightly evaluation does not include it. You run it by hand
 against an install and a GCP project of your own.
 
 ## What it reproduces
 
-| Container (default limit)                                      | Build                                            | Trigger                                                                                       | Share of memory at the kill                                                                         | Tickets                    |
-| -------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------- |
-| `shell` (2 CPU, 2 GiB)                                         | with the Kubernetes API proxy, before `a2c9ad52` | `compliance-audit` and the agents' own reads list every Pod of two large clusters             | `kubectl get … -A` lists 94 to 98 %, other 2 to 6 %                                                 | #2045                      |
-| `envoy-credential-proxy` (2 CPU, 2 GiB)                        | before the Kubernetes API proxy                  | `compliance-audit` lists `deploy,sts,ds,cronjob,pod -A -o json` on two large clusters at once | `kubectl` children 91 %, the credential broker (`credential_proxy.py`) 4 %, Envoy 4 %, `hermes` 1 % | #2045, #2324, #2652, #4315 |
-| `agent-api-auth`, the event watcher's container (1 CPU, 2 GiB) | `fb56483b`                                       | start-up reads four clusters of 400,000 Events each                                           | `k8s-event-watcher` 97 %, the API authenticator (`credential_proxy.py` in that role) 3 %            | #2648, #4512               |
+| Container (default limit)                                      | Build                                       | Trigger                                                                                       | Share of memory at the kill                                                                         | Tickets                    |
+| -------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------- |
+| `shell` (2 CPU, 2 GiB)                                         | `b3d78bc8`, with the Kubernetes API proxy   | `compliance-audit` and other `kubectl get pods -A` reads list every Pod of two large clusters | `kubectl get … -A` lists 94 to 98 %, everything else 2 to 6 %                                       | #2045                      |
+| `envoy-credential-proxy` (2 CPU, 2 GiB)                        | `fb56483b`, before the Kubernetes API proxy | `compliance-audit` lists `deploy,sts,ds,cronjob,pod -A -o json` on two large clusters at once | `kubectl` children 91 %, the credential broker (`credential_proxy.py`) 4 %, Envoy 4 %, `hermes` 1 % | #2045, #2324, #2652, #4315 |
+| `agent-api-auth`, the event watcher's container (1 CPU, 2 GiB) | `fb56483b`                                  | start-up reads four clusters of 400,000 Events each                                           | `k8s-event-watcher` 97 %, the API authenticator (`credential_proxy.py` in that role) 3 %            | #2648, #4512               |
 
 The shares are of the summed RSS (resident memory) of the container's processes in the killed
 pod's last sample. The harness's reports:
 
 - [`evidence/proxy-shell-main-b3d78bc8.md`](evidence/proxy-shell-main-b3d78bc8.md): the shell, on
-  `main` commit `b3d78bc8` (2026-11-04). OOMKilled 3 times in about 2.5 minutes: twice with `kubectl get pods -A` holding 94 and 98 % of
+  `main` commit `b3d78bc8` (committed 2026-11-04). OOMKilled 3 times in about 2.5 minutes: twice with `kubectl get pods -A` holding 94 and 98 % of
   the memory, once with a `kubectl get deploy,sts,ds,cronjob,pod -A` dump at 96 %, the
   compliance-audit collector's (its `collect.py` was in the same sample).
   In a run outside the harness on the same build the shell went into `CrashLoopBackOff`. Every agent's terminal runs in the shell, so each kill ends all of them.
 - [`evidence/proxy-main-fb56483b.md`](evidence/proxy-main-fb56483b.md): the credential proxy, on
-  `main` commit `fb56483b` (2026-11-03), before the Kubernetes API proxy. OOMKilled once, and no second kill
-  followed in the 20 minutes of the run; the proxy's log showed its resource watermark gate answering
-  further calls with `429` and `503`. This report and the next come from an earlier revision of the
+  `main` commit `fb56483b` (committed 2026-11-03), before the Kubernetes API proxy. OOMKilled once.
+  From the run's log, which the evidence file does not keep: no second kill followed in the 20
+  minutes of the run, and the proxy's resource watermark gate answered further calls with `429` and
+  `503`. This report and the next come from an earlier revision of the
   harness, which did not yet write the `Samples:` line.
 - [`evidence/watcher-main-fb56483b.md`](evidence/watcher-main-fb56483b.md): the event watcher, on
   `fb56483b`. OOMKilled 3 times in about 2 minutes, during its initial Event lists.
 
-Two later commits on `main` change these triggers. From `c77c32e0`, the event watcher lists Events
+Later commits on `main` change how these lists are read. From `c77c32e0`, the event watcher lists Events
 in pages of 500 on a control plane without a watch-list stream. From `a2c9ad52`, the
 compliance-audit collector reads each kind in pages of 500, not in one
 `deploy,sts,ds,cronjob,pod -A -o json` list. The harness has not run `watcher` on a build with the
@@ -56,10 +57,10 @@ first, or `proxy` on a build with the second.
 
 The evidence fleet had two full clusters of about 2,900 KWOK nodes and 80,000 Pods each and two
 Events-only clusters, first built by hand for this test and then grown to
-`--nodes 3000 --namespaces 300` with the cluster prefix `kwok-`; they carry the `purpose=oom-repro` label, so the harness finds
-them. This harness builds a fleet of that shape with
+`--nodes 3000 --namespaces 300` with the cluster prefix `kwok-`; they carry the `purpose=oom-repro` label and names of the form
+`kwok-NN`, so the harness finds them. This harness builds a fleet of that shape with
 `--prefix kwok- --nodes 3000 --namespaces 300 fleet create --clusters 2`, then
-`--prefix kwok- fleet create --clusters 2 --first 3 --events-only`. The Pods-ready wait ended at about 80,000 of 90,000 per cluster, and more Pods turned ready afterwards (86,000 to
+`--prefix kwok- --namespaces 300 fleet create --clusters 2 --first 3 --events-only`. The Pods-ready wait ended at about 80,000 of 90,000 per cluster, and more Pods turned ready afterwards (86,000 to
 89,000 at the shell run). The global options are not saved between commands: give
 `--prefix` to `fleet create`, `events` and `fleet delete`, and the fleet's sizes (`--nodes`,
 `--namespaces`, `--deployments`) to `fleet create` and `events`. `proxy` and `watcher` use none of
@@ -67,8 +68,7 @@ them. The commands under "Run it" build the default
 fleet of 1,500 nodes and 45,000 Pods per cluster.
 
 To raise a limit the tests reach, see the fleet sizing page
-([`fleet-sizing.md`](../../docs/site/src/content/docs/deploy/fleet-sizing.md)): the shell's limits
-come from `spec.harness.experimental.shellSandbox.resources`.
+([`fleet-sizing.md`](../../docs/site/src/content/docs/deploy/fleet-sizing.md)).
 
 ## What you need
 
@@ -104,8 +104,9 @@ carries them. Then it starts the trigger and waits for `--kills` OOMKills of tha
 `--seconds`. At the end it puts the container's resources (and the runtime class) back as they were
 and writes `report.md`: the samples it took, the kills, and for each kill the share of each process
 class in the killed pod's last sample. The sampler's own memory is reported beside the shares, not
-in them. Each sample keeps the command line of each process over 4 MiB, so a credential passed as an
-argument is written under `--out`; the default `oom-repro-out` is git-ignored. A run with no samples writes its report and then ends with an error, so a run that watched
+in them. The samples keep the command line of each process over 4 MiB, and
+`platformagent-before.json` keeps the whole spec, `spec.deployment.env` included, so a credential in either is
+written under `--out`; the default `oom-repro-out` is git-ignored. A run with no samples writes its report and then ends with an error, so a run that watched
 nothing is not read as zero kills. Two failed renewals of the
 lease in a row stop the scenario, which then restores. Ctrl-C, `SIGTERM`, `SIGHUP` and a failed trigger also
 restore, and still write the report. If a run is killed some other way, restore the spec from `platformagent-before.json`. The
