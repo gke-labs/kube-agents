@@ -323,15 +323,18 @@ func (r *PlatformAgentReconciler) a2aBusServers(ctx context.Context, sts *appsv1
 	return out, nil
 }
 
-// a2aBusConfigWrittenAt is when the live config Secret was last written, by
-// the API server's clock: the latest managedFields entry. Any write moves it,
-// so it is never earlier than the config write a pending reload waits on,
-// which is the safe side: a pod created after it read that config at start.
-// No entry, no time, and no pod is taken as started on the config.
+// a2aBusConfigWrittenAt is when the operator last wrote the live config
+// Secret, by the API server's clock: its own field manager's managedFields
+// entry (fieldOwner), not another manager's (a later kubectl annotate, say,
+// would otherwise move it). The operator's own later writes (a re-armed
+// record) can only move it later than the config write a pending reload
+// waits on, which is the safe side: a pod created after it read that config
+// at start. No entry of the operator's, no time, and no pod is taken as
+// started on the config.
 func a2aBusConfigWrittenAt(live *corev1.Secret) (time.Time, bool) {
 	var latest time.Time
 	for _, f := range live.ManagedFields {
-		if f.Time != nil && f.Time.After(latest) {
+		if f.Manager == fieldOwner && f.Time != nil && f.Time.After(latest) {
 			latest = f.Time.Time
 		}
 	}

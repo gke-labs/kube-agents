@@ -665,15 +665,24 @@ func TestARestartLeavesARecreatedPodAlone(t *testing.T) {
 	}
 }
 
-// The write time is the API server's: the latest managedFields entry, and
-// none without one.
+// The write time is the API server's, from the operator's own field manager:
+// a later kubectl annotate doesn't move it, and with no entry of the
+// operator's there is none.
 func TestTheConfigWriteTimeIsTheLatestManagedFieldsEntry(t *testing.T) {
 	a, b := time.Date(2026, 11, 17, 8, 0, 0, 0, time.UTC), time.Date(2026, 11, 17, 8, 5, 0, 0, time.UTC)
 	s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{ManagedFields: []metav1.ManagedFieldsEntry{
-		{Manager: "x", Time: &metav1.Time{Time: b}}, {Manager: "y", Time: &metav1.Time{Time: a}}, {Manager: "z"},
+		{Manager: fieldOwner, Operation: metav1.ManagedFieldsOperationApply, Time: &metav1.Time{Time: a}},
+		{Manager: "kubectl-annotate", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{Time: b}},
+		{Manager: fieldOwner},
 	}}}
-	if got, ok := a2aBusConfigWrittenAt(s); !ok || !got.Equal(b) {
-		t.Fatalf("written at %v (%v), want %v", got, ok, b)
+	if got, ok := a2aBusConfigWrittenAt(s); !ok || !got.Equal(a) {
+		t.Fatalf("written at %v (%v), want the operator's own write %v", got, ok, a)
+	}
+	other := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{ManagedFields: []metav1.ManagedFieldsEntry{
+		{Manager: "kubectl-annotate", Time: &metav1.Time{Time: b}},
+	}}}
+	if _, ok := a2aBusConfigWrittenAt(other); ok {
+		t.Fatal("another manager's entry gave a write time")
 	}
 	if _, ok := a2aBusConfigWrittenAt(&corev1.Secret{}); ok {
 		t.Fatal("a Secret with no managedFields gave a write time")
