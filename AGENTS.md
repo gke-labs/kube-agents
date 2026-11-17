@@ -289,7 +289,7 @@ reviewer, not another edit.
 with its commit named, or the finding is factually wrong against `main` (not a stale checkout) and
 you have said why. Resolve a `kube-agents-bot` finding you decline or defer once your reply gives
 the reason (and any follow-up issue) and **Self-Review** names it, and the description thread once
-the body is edited: an open thread hides the PR from its reviewer
+the body is edited: an open thread counts as the author's unfinished work and blocks the merge
 ([why](docs/pull-request-workflow.md#who-owns-an-open-pull-request)). Unresolve it if a reviewer
 asks for the fix. A person's thread is different: a judgment call, a declined ask, or an unanswered
 rebuttal stays open with a reply; resolving does not end a disagreement. Reply first:
