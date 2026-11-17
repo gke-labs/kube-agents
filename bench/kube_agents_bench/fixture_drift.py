@@ -103,7 +103,8 @@ ROLES_KEY = "fixture_roles"
 NO_DETAIL = "no detail recorded"
 #: How much of a role's first drift line the reason carries. The reason is
 #: printed on every repetition's grading line; the whole detail is in the
-#: report, which the job keeps as an artifact.
+#: report, which the job keeps as an artifact. A repository line is exempt:
+#: it ends in the command that prints the repair (``_lead_line``).
 DETAIL_MAX_CHARS = 200
 # How old the published hourly scan may be and still count: the same three
 # missed scans health.py's FIXTURE_STATE_MAX_AGE refuses past (a test pins the
@@ -208,10 +209,18 @@ def _check_roles(node: Any, found: set[str]) -> None:
         _check_roles(child, found)
 
 
-def _first_line(detail: list[str]) -> str:
+def _lead_line(detail: list[str]) -> str:
+    """The one line of a role's drift the reason carries: a repository line
+    when the role has one, whole, since it ends in the command that prints
+    the repair and a cut would lose it; otherwise the first line, cut to
+    DETAIL_MAX_CHARS. The rest is counted, and is in the scan report."""
     if not detail:
         return NO_DETAIL
-    line = detail[0] if len(detail[0]) <= DETAIL_MAX_CHARS else detail[0][: DETAIL_MAX_CHARS - len(ELLIPSIS)] + ELLIPSIS
+    repository = [line for line in detail if line.startswith(f"{REPOSITORY_SUBJECT}/")]
+    if repository:
+        line = repository[0]
+    else:
+        line = detail[0] if len(detail[0]) <= DETAIL_MAX_CHARS else detail[0][: DETAIL_MAX_CHARS - len(ELLIPSIS)] + ELLIPSIS
     return line + (f" (+{len(detail) - 1} more in the scan report)" if len(detail) > 1 else "")
 
 
@@ -239,7 +248,7 @@ def drift_reason(roles: set[str], scan: LeaseScan) -> str | None:
     hits = sorted(roles & set(scan.drifted))
     if not hits:
         return None
-    clauses = [f"{label(role)}: {_first_line(scan.drifted[role])}" for role in hits]
+    clauses = [f"{label(role)}: {_lead_line(scan.drifted[role])}" for role in hits]
     return (
         " | ".join(clauses)
         + f" (seeded-fleet scan of {scan.project} at lease time; the case was not run against a fixture"

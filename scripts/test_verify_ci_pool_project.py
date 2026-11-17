@@ -2356,6 +2356,32 @@ class GitopsSeededFileStateTest(unittest.TestCase):
         with which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=self._http_error(422)):
             self.assertEqual(checker.GITHUB_PATH_FAILED, checker.gitops_seeded_file_state(self._PROJECT, self._PATH)[0])
 
+    def test_a_credential_with_a_line_break_is_refused_before_any_request_and_never_echoed(self):
+        # http.client refuses a header value with a line break by quoting the
+        # whole value; a credential file with a second line would otherwise
+        # put the credential in the scan's report. Refused up front, and the
+        # refusal names nothing of it.
+        first, second = "ghs_firstline0123", "ghs_secondline4567"
+        for shape in (f"{first}\n{second}", f"{first}\r{second}", f"{first} {second}", f"{first}\t{second}"):
+            with self.subTest(shape=shape):
+                which, env = self._without_gh(token=shape)
+                with which, env, mock.patch.object(checker.urllib.request, "urlopen") as opened:
+                    state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+                self.assertEqual(checker.GITHUB_PATH_UNREAD, state)
+                self.assertNotIn(first, reason)
+                self.assertNotIn(second, reason)
+                self.assertIn(checker.GITOPS_READ_TOKEN_ENV, reason)
+                opened.assert_not_called()
+        # And should http.client ever refuse a header anyway, its message is
+        # not repeated.
+        which, env = self._without_gh()
+        refusal = ValueError(f"Invalid header value b'Bearer {first}\\n{second}'")
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=refusal):
+            state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_UNREAD, state)
+        self.assertNotIn(second, reason)
+        self.assertIn("malformed", reason)
+
     def test_without_gh_and_without_a_token_nothing_is_read(self):
         which, env = self._without_gh(token="")
         with which, env, mock.patch.object(checker.urllib.request, "urlopen") as opened:

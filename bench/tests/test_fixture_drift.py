@@ -328,6 +328,22 @@ def test_a_drift_read_in_the_pool_repository_is_excused_without_the_hourly_scan(
     assert note_marks(note_drifted, tmp_path, published(tmp_path, now=(), before=())) == ["stockout-declared-intent-no-finding"]
 
 
+def test_a_repository_line_leads_the_reason_whole_when_a_cluster_line_comes_first(tmp_path):
+    # The catalog lists the note assertion last on each declared-* role, so a
+    # role out of shape in the cluster and in the repository at once puts a
+    # cluster line first; the reason still carries the repository line, with
+    # the command that prints the repair, and counts the rest.
+    cluster_line = 'poddisruptionbudget? absent: observed {"metadata": {"name": "added"}} (why: a PodDisruptionBudget anyone adds removes the posture)'
+    long_note = NOTE_DETAIL.replace("python3 -c '...'", "python3 -c '" + "x" * (fixture_drift.DETAIL_MAX_CHARS) + "'")
+    scan = LeaseScan(project=PROJECT, drifted={"declared-single-zone-pool": [cluster_line, long_note]})
+    reason = fixture_drift.drift_reason({"declared-single-zone-pool"}, scan)
+    assert long_note in reason, reason
+    assert "(+1 more in the scan report)" in reason
+    assert fixture_drift.ELLIPSIS not in reason.split(" (seeded-fleet scan")[0]
+    # A role with cluster lines alone keeps the old shape
+    # (test_a_long_drift_detail_is_cut_to_its_first_line).
+
+
 def test_a_repository_drift_is_excused_when_another_role_drifted_and_the_hourly_scan_is_unusable(tmp_path, capsys):
     # The published document decides the cluster drift alone; missing or
     # stale, it withholds that one and leaves the repository drift excused.

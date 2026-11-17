@@ -121,6 +121,13 @@ GITHUB_JSON_MEDIA_TYPE = "application/vnd.github+json"
 GITHUB_READ_USER_AGENT = "kube-agents-verify-ci-pool-project"
 GITHUB_UNREAD_STATUSES = frozenset({401, 403, 408, 429, 500, 502, 503, 504})
 HTTP_NOT_FOUND = 404
+# What a bearer credential this script puts in a header may look like: one
+# line of printable ASCII. A value with a line break or a control character
+# (a credential file with a second line, a header file cut another way)
+# would make http.client refuse the header with the whole value in its
+# message, and that message would land in a report; such a value is refused
+# before any request, and never echoed.
+BEARER_CREDENTIAL_LINE_RE = re.compile(r"[!-~]+")
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
 GITOPS_REPO_ORG = "gke-agentic"
 GITOPS_REPO_SUFFIX = "-infra"
@@ -3070,10 +3077,13 @@ def _github_api_state_with_token(api_path: str, token: str) -> tuple[str, str]:
         return GITHUB_PATH_FAILED, f"HTTP {exc.code} from {api_path}"
     except UnicodeDecodeError as exc:
         return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except ValueError:
+        # http.client refusing a header, or a response that was not HTTP: its
+        # message can quote a header value whole, so it is not repeated.
+        return GITHUB_PATH_UNREAD, f"the request to {api_path} could not be made: a header or the response was malformed"
+    except (urllib.error.URLError, OSError) as exc:
         # URLError for a refused or unresolved connection, OSError (TimeoutError
-        # among them) for one that stalled, ValueError for a response that
-        # was not HTTP at all: no answer, so nothing is known.
+        # among them) for one that stalled: no answer, so nothing is known.
         return GITHUB_PATH_UNREAD, f"no answer from {api_path}: {exc}"
 
 
@@ -3108,6 +3118,13 @@ def gitops_seeded_file_state(project_id: str, path: str) -> tuple[str, str]:
     if shutil.which("gh"):
         read = _gh_api_state
     elif token:
+        if not BEARER_CREDENTIAL_LINE_RE.fullmatch(token):
+            # Refused before any request, and never echoed: see BEARER_CREDENTIAL_LINE_RE.
+            return GITHUB_PATH_UNREAD, (
+                f"the credential in {GITOPS_READ_TOKEN_ENV} is not one line of printable characters "
+                "(a line break or a control character inside it), so nothing was read with it"
+            )
+
         def read(api_path: str) -> tuple[str, str]:
             return _github_api_state_with_token(api_path, token)
     else:
