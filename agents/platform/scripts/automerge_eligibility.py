@@ -42,7 +42,7 @@ LABEL_DESCRIPTIONS = {
     AUTOMERGE_LABEL: "kube-agents judged this fix safe to merge without a review",
 }
 #: The payload fields that write a proposal's or an issue's labels. A filter
-#: (`excludeLabels`) only reads, and may name the label.
+#: (`excludeLabels`, and `labels` on a list verb) only reads, and may name the label.
 LABEL_WRITE_FIELDS = ("labels", "labelsAdd", "labelsRemove")
 #: The fix type the rules file names (`automation_rules.KNOWN_FIX_TYPES`).
 FIX_TYPE = "no-pdb"
@@ -102,6 +102,8 @@ def reserved_label_refusal(verb: str, payload: Any) -> str | None:
     reserved = {label.casefold() for label in RESERVED_LABELS}
     named = [payload.get("name")] if verb == "label-ensure" else []
     for field in LABEL_WRITE_FIELDS:
+        if field == "labels" and verb.endswith("-list"):
+            continue
         value = payload.get(field)
         named += value if isinstance(value, list) else [value]
     # Split on commas too: a forge that takes labels as one comma-joined

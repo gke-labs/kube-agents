@@ -17787,10 +17787,7 @@ def carries_practice_label(pr: dict | None) -> bool:
     refresh then asks the broker again even with no section to write, so a
     label from an earlier `practice` or `on`, or from a group that has since
     changed, comes off."""
-    return any(
-        str((label or {}).get("name") or "").casefold() in PRACTICE_LABELS
-        for label in (pr or {}).get("labels") or []
-    )
+    return any(name.casefold() in PRACTICE_LABELS for name in pr_labels(pr))
 
 
 def request_practice_label(repo: str, number: int | str) -> None:

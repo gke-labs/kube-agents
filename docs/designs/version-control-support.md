@@ -920,7 +920,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
-| `proposal-practice-label`            | `{repository, number}`                                               | `{labelled, switch, reason, checks?}`                                                    |
+| `proposal-practice-label`            | `{repository, number}`                                               | `{labelled, label, switch, reason, checks}`                                              |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |
 | `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`                 |

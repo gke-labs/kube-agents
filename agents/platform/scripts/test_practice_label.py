@@ -83,6 +83,8 @@ class ReservedLabelTest(unittest.TestCase):
         for verb, payload in (
             ("proposal-update", {"labelsAdd": ["agent:audit"]}),
             ("proposal-list", {"excludeLabels": [ae.PRACTICE_LABEL]}),
+            ("proposal-list", {"labels": [ae.AUTOMERGE_LABEL]}),
+            ("issue-list", {"labels": [ae.PRACTICE_LABEL]}),
             ("proposal-view", {"name": ae.PRACTICE_LABEL}),
             ("label-ensure", {"name": "agent:audit"}),
         ):
@@ -249,6 +251,12 @@ class PracticeLabelTest(unittest.TestCase):
 
     def test_a_forge_whose_comments_set_labels_is_never_labelled(self):
         with mock.patch.object(FakeForge, "text_sets_labels", True, create=True):
+            answer, calls = self.run_verb()
+        self.assertFalse(answer["labelled"])
+        self.assertEqual((self.writes(calls), self.reads), ([], []))
+
+    def test_a_forge_without_labels_reads_no_cluster(self):
+        with mock.patch.object(FakeForge, "labels", False):
             answer, calls = self.run_verb()
         self.assertFalse(answer["labelled"])
         self.assertEqual((self.writes(calls), self.reads), ([], []))

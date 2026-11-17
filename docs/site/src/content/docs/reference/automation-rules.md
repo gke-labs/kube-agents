@@ -105,12 +105,15 @@ With the switch `practice` or `on`, each time the fleet audit opens or refreshes
 
 A pull request that carries a label and no longer qualifies loses it the next time the audit
 refreshes it, which includes after the switch is turned back to `off`. A change of switch value swaps
-one label for the other. A push to its branch normally takes the label off at once. The broker reads
-all of this itself. No request from the agent can add, remove or create either label, so neither
-rests on anything the agent reports. The pull request's body shows the same safety checks under
-**Safety checks**.
+one label for the other. The broker reads all of this itself, and no request from the agent can add,
+remove or create either label. The pull request's body shows the same safety checks under **Safety
+checks**.
 
-The labels are never applied on GitLab, where a `/label` line in a comment or a description sets a
+A push kube-agents makes to the branch takes the label off at once. A push made any other way keeps
+it until the next refresh, so a pipeline that merges on the label should also require that every
+commit on the pull request is kube-agents' own.
+
+The labels are applied only on GitHub and Gitea. Bitbucket has no labels, and on GitLab a `/label` line in a comment or a description sets a
 label, so no label there is kube-agents' alone. Under `practice` the label is the whole effect:
 compare the pull requests that carry it with the ones your team merged. Under `on` your pipeline may
 merge a pull request that carries `kube-agents:auto-merge`. kube-agents merges nothing in either

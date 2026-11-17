@@ -2666,6 +2666,8 @@ class VcsBroker:
     ) -> str | None:
         """Why `proposal_practice_label` does not label, or None; `checks` gets
         the safety checks once they ran."""
+        if not getattr(bound.forge, "labels", False):
+            return "this forge has no labels"
         if bound.forge.text_sets_labels:
             return "on this forge a comment or a description can set a label, so no label is the broker's alone"
         if proposal.get("state") != OPEN_PROPOSAL_STATE:
