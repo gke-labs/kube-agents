@@ -39,11 +39,13 @@ Who wrote each run: the broker stamps every PUT of a ring entry with the
 X-Report-Writer header (REPORT_WRITER_HEADER), `shell` for the platform
 shell or `builtin-schedule:<audit>:<task>` for a profile task writing a
 builtin schedule's stream, from the caller it verified; a caller's own header
-never reaches here. The listener refuses a PUT of a ring entry without one
-that is well formed for the path's audit (400), and keeps it beside the
+never reaches here. The listener refuses a PUT of a ring entry whose header
+is not well formed for the path's audit (400), and keeps it beside the
 envelope as `runs/<stamp>.writer` (REPORT_WRITER_SUFFIX): a small JSON
 object holding the writer and the SHA-256 of the exact envelope bytes it
-describes. PUT latest copies the matched ring entry's sidecar to
+describes. A PUT with no header at all (a broker from before this change:
+the broker and this listener roll independently) is written with no
+sidecar, any old one dropped, so it reads back unstamped. PUT latest copies the matched ring entry's sidecar to
 `latest.writer` (the bytes are identical, so is the hash). GET latest and GET
 runs/<stamp> answer the stored writer in the same header only when the
 sidecar's hash is that of the bytes being returned, so a sidecar can never
@@ -567,14 +569,16 @@ def _refuse_a_future_stamp(stamp: str) -> None:
         raise Refused(400, "the run is stamped in the future")
 
 
-def _validated_writer(writer: str | None, audit_id: str) -> str:
-    """The writer header of a PUT of a ring entry, as the sidecar's bytes. 400 unless well formed.
+def _validated_writer(writer: str | None, audit_id: str) -> str | None:
+    """The writer header of a PUT of a ring entry, None when absent. 400 unless well formed.
 
     `shell`, or `builtin-schedule:<audit>:<task>` with <audit> the path's own:
-    a builtin schedule's task writes its own audit's stream and no other.
+    a builtin schedule's task writes its own audit's stream and no other. No
+    header is a broker from before the stamp (the two roll independently):
+    accepted, and the run is stored unstamped.
     """
     if writer is None:
-        raise Refused(400, f"a run is written with an {REPORT_WRITER_HEADER} header")
+        return None
     match = REPORT_WRITER_RE.match(writer)
     if match is None:
         raise Refused(400, f"the {REPORT_WRITER_HEADER} header is not a writer")
@@ -596,14 +600,15 @@ def _bound_writer(dir_fd: int, name: str, data: bytes) -> str | None:
     hash is not that of `data`: a sidecar describing another envelope (a
     concurrent write, or a listener without sidecars rewriting the envelope
     after a rollback) is never passed on. A symlink or a non-regular file at
-    the name is a 409, as for an envelope.
+    the name is never followed or read, and is no writer: the envelope's read
+    goes on, unstamped.
     """
     try:
         raw = _read_at(dir_fd, name)
     except Refused as exc:
-        if exc.status == 404:
-            return None
-        raise
+        if exc.status != 404:
+            LOGGER.warning("ignored a report writer sidecar that could not be read (%d): %s", exc.status, _sanitize(name))
+        return None
     try:
         sidecar = json.loads(raw.decode("ascii"))
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -971,7 +976,7 @@ def _handle_store(
             return 204, None, None
         if method == "DELETE":
             try:
-                with _DirChain(root, store, create=False) as chain:
+                with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
                     _drop_at(chain.fd, REPORT_WRITER_LATEST_NAME)
                     os.unlink(REPORT_LATEST_NAME, dir_fd=chain.fd)
             except (_Missing, FileNotFoundError):
@@ -995,7 +1000,7 @@ def _handle_store(
         _refuse_a_future_stamp(stamp)
         stamp_writer = _validated_writer(writer, audit_id)
         data = _validated_body(body)
-        sidecar = _writer_sidecar(stamp_writer, data)
+        sidecar = _writer_sidecar(stamp_writer, data) if stamp_writer is not None else None
         with _DirChain(root, store, create=True) as chain, _locked(chain.fd):
             runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=True)
             try:
@@ -1003,7 +1008,8 @@ def _handle_store(
                 # entry with no writer, never with the one it replaced.
                 _drop_at(runs_fd, stamp + REPORT_WRITER_SUFFIX)
                 _write_at(runs_fd, f"{stamp}.json", data)
-                _write_at(runs_fd, stamp + REPORT_WRITER_SUFFIX, sidecar)
+                if sidecar is not None:
+                    _write_at(runs_fd, stamp + REPORT_WRITER_SUFFIX, sidecar)
                 try:
                     _prune(runs_fd)
                 except Exception as exc:  # noqa: BLE001 - the entry is written; a long ring costs disk only

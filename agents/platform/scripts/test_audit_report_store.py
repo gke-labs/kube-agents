@@ -1103,7 +1103,7 @@ class WriterTests(StoreTestCase):
         self.assertNotIn(store.REPORT_WRITER_HEADER, listed.headers)
 
     def test_a_missing_or_malformed_writer_is_400_and_writes_nothing(self) -> None:
-        for writer in (None, "", "Shell", "shellx", "profile", "builtin-schedule", "builtin-schedule:compliance-audit",
+        for writer in ("", "Shell", "shellx", "profile", "builtin-schedule", "builtin-schedule:compliance-audit",
                        "builtin-schedule:compliance-audit:", "builtin-schedule::task-1",
                        "builtin-schedule:compliance-audit:Task-1", "builtin-schedule:compliance-audit:task_1",
                        "builtin-schedule:compliance-audit:a:b", "builtin-schedule:compliance-audit:" + "a" * 64,
@@ -1113,6 +1113,20 @@ class WriterTests(StoreTestCase):
                 self.assertEqual(400, response.status_code, response.text)
         self.assertFalse(any(self.root.rglob("*.json")))
         self.assertFalse(any(self.root.rglob("*.writer")))
+
+    def test_an_unstamped_put_is_written_with_no_sidecar(self) -> None:
+        # A broker from before the stamp sends none; the two roll independently.
+        self.put(STAMP_1, "shell")
+        response, body = self.put(STAMP_1, None, {"unstamped": 1})
+        self.assertEqual(204, response.status_code)
+        self.assertEqual(body, (self.runs / f"{STAMP_1}.json").read_bytes())
+        self.assertFalse((self.runs / f"{STAMP_1}.writer").exists())
+        got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+        self.assertEqual(body, got.content)
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertFalse((self.store_dir / "latest.writer").exists())
+        self.assertNotIn(store.REPORT_WRITER_HEADER, self.call("GET", f"{STREAM}/latest").headers)
 
     def test_two_writer_headers_are_400(self) -> None:
         response = self.client.request(
@@ -1254,25 +1268,51 @@ class WriterTests(StoreTestCase):
         self.assertEqual(sorted(f"{s}.json" for s in kept), sorted(p.name for p in self.runs.glob("*.json")))
         self.assertEqual(sorted(f"{s}.writer" for s in kept), sorted(p.name for p in self.runs.glob("*.writer")))
 
-    def test_a_symlinked_sidecar_is_refused(self) -> None:
+    def test_a_symlinked_sidecar_is_no_writer(self) -> None:
         _, body = self.put(STAMP_1, "shell")
         outside = self.tmp / "outside.writer"
         outside.write_text(json.dumps(self.sidecar(self.BUILTIN, body)))
         sidecar = self.runs / f"{STAMP_1}.writer"
         sidecar.unlink()
         sidecar.symlink_to(outside)
-        self.assertEqual(409, self.call("GET", f"{STREAM}/runs/{STAMP_1}").status_code)
-        self.assertEqual(409, self.call("PUT", f"{STREAM}/latest", body).status_code)
-        self.assertFalse((self.store_dir / "latest.json").exists())
-        # latest.writer as a symlink: refused on read, never followed.
-        (self.store_dir / "latest.json").write_bytes(body)
+        # Never followed: the envelope reads, unstamped.
+        got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+        self.assertEqual((200, body), (got.status_code, got.content))
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        # PUT latest copies no writer from it.
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertFalse((self.store_dir / "latest.writer").exists())
+        # latest.writer as a symlink: no writer on read, never followed.
         (self.store_dir / "latest.writer").symlink_to(outside)
-        self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
-        # A rewrite replaces the link itself and leaves its target alone.
+        got = self.call("GET", f"{STREAM}/latest")
+        self.assertEqual((200, body), (got.status_code, got.content))
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        # A directory at the sidecar's name is no writer either.
+        sidecar.unlink()
+        sidecar.mkdir()
+        got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
+        self.assertEqual(200, got.status_code)
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        sidecar.rmdir()
+        # A rewrite replaces a linked sidecar itself and leaves its target alone.
+        (self.runs / f"{STAMP_1}.writer").symlink_to(outside)
         self.assertEqual(204, self.put(STAMP_1, "shell")[0].status_code)
         self.assertFalse(sidecar.is_symlink())
         self.assertEqual(self.sidecar(self.BUILTIN, body), json.loads(outside.read_text()))
 
+    def test_delete_latest_holds_the_store_lock(self) -> None:
+        _, body = self.put(STAMP_1, "shell")
+        self.call("PUT", f"{STREAM}/latest", body)
+        held = []
+        real = store._locked
+
+        def recording(dir_fd):
+            held.append(dir_fd)
+            return real(dir_fd)
+
+        with mock.patch.object(store, "_locked", side_effect=recording):
+            self.assertEqual(204, self.call("DELETE", f"{STREAM}/latest").status_code)
+        self.assertEqual(1, len(held))
 
 if __name__ == "__main__":
     unittest.main()
