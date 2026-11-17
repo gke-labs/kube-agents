@@ -134,7 +134,7 @@ class _StandInGate:
 class RoutesTestCase(unittest.TestCase):
     ATTRIBUTES = (
         "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "profile_gate",
-        "report_store", "report_profiles", "broker_role",
+        "report_store", "report_profiles", "broker_role", "metrics",
     )
 
     def setUp(self):
@@ -156,6 +156,7 @@ class RoutesTestCase(unittest.TestCase):
         self.state_dir = self.tmp / "gitops"
         self.state_dir.mkdir()
         self.addCleanup(setattr, credential_proxy, "_managed_repository_cache", None)
+        self.addCleanup(setattr, credential_proxy, "_managed_repository_name_cache", None)
         self.set_gitops(MANAGED, GITOPS)
         patcher = mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.state_dir / "managed_repos")})
         patcher.start()
@@ -214,6 +215,7 @@ class RoutesTestCase(unittest.TestCase):
     def set_gitops(self, managed, gitops):
         # managed_repositories() caches for 30 s; a state change here is read at once.
         credential_proxy._managed_repository_cache = None
+        credential_proxy._managed_repository_name_cache = None
         (self.state_dir / "managed_repos").write_text(json.dumps(managed), encoding="utf-8")
         path = self.state_dir / "gitops_repo"
         if gitops is None:
@@ -510,9 +512,10 @@ class RefusalTest(RoutesTestCase):
                             self.request("PUT", f"{NO_FORGE_STREAM}/latest", token=REPORT["token"]), BODY)
 
     def test_unreadable_state_refuses_writes_and_not_reads(self):
-        for target in ("gitops_workspace.get_managed_repo_keys", "gitops_workspace.gitops_repo_key_text"):
+        for target in ("gitops_workspace.get_managed_repos", "gitops_workspace.gitops_repo_key_text"):
             with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
                 credential_proxy._managed_repository_cache = None
+                credential_proxy._managed_repository_name_cache = None
                 for principal, token in ((self.profile, REPORT["token"]), (self.shell, None)):
                     self.authenticator.principal = principal
                     for path in (f"{STREAM}/latest", f"{NO_FORGE_STREAM}/latest"):
@@ -608,6 +611,40 @@ class ListenerFaultTest(RoutesTestCase):
         self.assertEqual(504, status, answer)
         self.assertEqual("AUDIT_REPORT_STORE_TIMEOUT", answer["code"])
         self.assertLess(time.monotonic() - started, 4.0)
+
+    def test_a_store_fault_on_a_write_counts_as_a_broker_failure(self):
+        # PUT and DELETE are counted methods on the store's paths; the 501 a
+        # PUT or DELETE gets anywhere else is the unsupported-method answer,
+        # not a failure, even on a relay family that counts every 5xx.
+        from test_credential_proxy_metrics import _parse, _series
+
+        CredentialProxyHandler.metrics = credential_proxy.ProxyMetrics()
+        family = "kubeagents_broker_execution_failures_total"
+
+        def count():
+            return _series(_parse(CredentialProxyHandler.metrics.render()), family, kind="other_failed", tool="none")
+
+        def settle(expected):
+            # Recorded as the response is written: poll briefly before reading.
+            deadline = time.monotonic() + 2.0
+            while count() != expected and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(expected, count())
+
+        self.authenticator.principal = self.shell
+        self.store.answer = (401, b'{"error":"no"}')
+        status, answer = self.request("PUT", f"{STREAM}/latest")
+        self.assertEqual(502, status, answer)
+        settle(1)
+        for method in ("PUT", "DELETE"):
+            for elsewhere in (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "/v1/exec"):
+                with self.subTest(method=method, path=elsewhere):
+                    self.assertEqual(501, self.request(method, elsewhere)[0])
+        self.assertEqual(
+            {}, {k: v for k, v in _parse(CredentialProxyHandler.metrics.render()).get(family, {}).items()
+                 if dict(k).get("kind") != "other_failed"},
+        )
+        settle(1)
 
     def test_the_default_deadline(self):
         self.assertEqual(15.0, credential_proxy.ReportStoreRelay("http", "h", 1, "t").deadline)
@@ -873,9 +910,11 @@ class PublishKeyTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(setattr, credential_proxy, "_managed_repository_cache", None)
+        self.addCleanup(setattr, credential_proxy, "_managed_repository_name_cache", None)
 
     def state(self, managed, gitops=None, github_host=None):
         credential_proxy._managed_repository_cache = None
+        credential_proxy._managed_repository_name_cache = None
         (self.tmp / "managed_repos").write_text(json.dumps(managed), encoding="utf-8")
         for name, value in (("gitops_repo", gitops), ("github_host", github_host)):
             (self.tmp / name).unlink(missing_ok=True)
@@ -891,6 +930,15 @@ class PublishKeyTest(unittest.TestCase):
         "none": ([], None, None, None),
         "GHES, mixed case": ([{"type": "github", "url": "https://ghe.example.com/Acme/GitOps"}], None, "ghe.example.com",
                              "ghe.example.com%2Facme%252Fgitops"),
+        # Entries audit_report's reader (get_managed_repos) skips, beside one
+        # it serves: the script publishes to the served one, so the broker
+        # must not count the skipped one (managed_repositories() keeps both).
+        "one served, one unserved type, no gitops": (
+            [TERRAFORM, {"type": "GitLab", "url": "https://gitlab.example.com/acme/infra"}], None, None,
+            "acme%2Fterraform"),
+        "one served, one ported non-Gitea URL, no gitops": (
+            [TERRAFORM, {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/infra"}], None, None,
+            "acme%2Fterraform"),
         "GitLab, two, gitops set": ([{"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}, TERRAFORM],
                                     {"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}, None,
                                     "gitlab.example.com%2Fplatform%252Finfra%252Fgitops"),
@@ -928,20 +976,42 @@ class PublishKeyTest(unittest.TestCase):
             credential_proxy.report_install_store_keys()[1],
         )
 
+    def test_an_entry_audit_report_skips_is_never_registered(self):
+        for name, skipped in (
+            ("unserved type", {"type": "GitLab", "url": "https://gitlab.example.com/acme/infra"}),
+            ("ported non-Gitea URL", {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/infra"}),
+        ):
+            with self.subTest(name):
+                self.state([self.TERRAFORM, skipped])
+                registered = credential_proxy.report_install_store_keys()[1]
+                self.assertEqual(frozenset({"acme%2Fterraform"}), registered)
+                self.assertFalse(any("gitlab.example.com" in key for key in registered))
+
+    def test_the_names_are_cached_as_managed_repositories_is(self):
+        self.state([self.TERRAFORM], GITOPS)
+        self.assertEqual("acme%2Fterraform", credential_proxy.report_publish_store_key())
+        # A list edit inside the window is not read; once the cache is dropped
+        # (or expires) it is.
+        (self.tmp / "managed_repos").write_text(json.dumps([GITOPS, self.TERRAFORM]), encoding="utf-8")
+        self.assertEqual("acme%2Fterraform", credential_proxy.report_publish_store_key())
+        credential_proxy._managed_repository_name_cache = None
+        self.assertEqual(GITOPS_KEY, credential_proxy.report_publish_store_key())
+
     def test_unreadable_state_raises(self):
         self.state([GITOPS, self.TERRAFORM], GITOPS)
-        for target in ("gitops_workspace.get_managed_repo_keys", "gitops_workspace.gitops_repo_key_text"):
+        for target in ("gitops_workspace.get_managed_repos", "gitops_workspace.gitops_repo_key_text"):
             with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
                 credential_proxy._managed_repository_cache = None
+                credential_proxy._managed_repository_name_cache = None
                 with self.assertRaises(credential_proxy.ReportStoreUnavailable):
                     credential_proxy.report_publish_store_key()
 
     def test_the_pure_rule(self):
         rule = credential_proxy.report_publish_store_key_for
         self.assertIsNone(rule([], "acme/gitops"))
-        self.assertEqual("acme%2Fterraform", rule(["github:github.com/acme/terraform"], None))
-        self.assertIsNone(rule(["github:github.com/acme/gitops", "github:github.com/acme/terraform"], None))
-        self.assertEqual(GITOPS_KEY, rule(["github:github.com/acme/gitops", "github:github.com/acme/terraform"], "acme/gitops"))
+        self.assertEqual("acme%2Fterraform", rule(["acme/terraform"], None))
+        self.assertIsNone(rule(["acme/gitops", "acme/terraform"], None))
+        self.assertEqual(GITOPS_KEY, rule(["acme/gitops", "acme/terraform"], "acme/gitops"))
 
 
 class ConfigurationTest(unittest.TestCase):

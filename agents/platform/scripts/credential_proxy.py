@@ -1319,9 +1319,15 @@ BROKER_FAILURE_KINDS = frozenset({
     BROKER_FAILURE_CHAT_PULL_FAILED,
     BROKER_FAILURE_OTHER_FAILED,
 })
-# The methods the broker serves. The base class answers any other with a 501
-# of its own before authentication, which is no relay's failure.
-BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST"})
+# The methods the broker serves: GET and POST, and PUT and DELETE on the
+# audit-report store's writes (#5619), whose listener faults (502), timeouts
+# (504) and relayed 500s are the broker's failures like any other route's.
+# The base class answers any other method with a 501 of its own before
+# authentication, and so does _serve_audit_report_write for a PUT or DELETE
+# off the store's paths; neither is a relay's failure
+# (_broker_failure_counted).
+BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+BROKER_FAILURE_STORE_ONLY_METHODS = frozenset({"PUT", "DELETE"})
 BROKER_FAILURE_STATUS_CODES = frozenset({
     str(int(HTTPStatus.INTERNAL_SERVER_ERROR)),
     str(int(HTTPStatus.BAD_GATEWAY)),
@@ -2760,6 +2766,19 @@ def _broker_failure_kind(family: str, status_code: str) -> str | None:
     return kind if status_code in BROKER_FAILURE_STATUS_CODES else None
 
 
+def _broker_failure_counted(method: str, path: str) -> bool:
+    """Whether a response to ``method`` on ``path`` can count as a broker failure.
+
+    PUT and DELETE are served on the audit-report store's paths alone; on any
+    other path they get the unsupported-method 501 before authentication,
+    which on a relay family (whose bound is the whole 5xx class) would
+    otherwise count as the relay failing.
+    """
+    if method not in BROKER_FAILURE_COUNTED_METHODS:
+        return False
+    return method not in BROKER_FAILURE_STORE_ONLY_METHODS or is_audit_report_path(path)
+
+
 def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
     """Refuse a ``ROUTE_ROLES`` that cannot enforce what it appears to say.
 
@@ -3036,8 +3055,8 @@ def report_write_permitted(
     REPORT_NO_FORGE_STORE_KEY.
 
     - The shell may write any stream, to the install's key or to the key of any
-      repository in ``registered_keys`` (managed_repos as the broker reads it,
-      never the request): what `finish --repo` writes to the file store today.
+      repository in ``registered_keys`` (managed_repos as audit_report reads
+      it, gitops_workspace.get_managed_repos; never the request): what `finish --repo` writes to the file store today.
     - A profile caller needs all of: a task credential whose profile is in
       ``allowlist``; a trigger of origin builtin, named ``schedule/<stream>``,
       whose stream is ``audit_id`` (so only that schedule's grant writes that
@@ -3091,28 +3110,31 @@ class ReportStoreCredentialRefused(ReportStoreFault):
     """The listener refused the broker's own store token (401 or 403): a 502, never the caller's."""
 
 
-def report_publish_store_key_for(managed_keys: Sequence[str], gitops_repo: str | None) -> str | None:
+def report_publish_store_key_for(managed: Sequence[str], gitops_repo: str | None) -> str | None:
     """The store key audit_report's `finish` publishes to, for these inputs; None for no_forge.
 
     A mirror of audit_report.resolve_repo's install-level rule (the explicit
-    `--repo`, workspace and lease steps are a run's own, not the install's):
+    `--repo`, workspace and lease steps are a run's own, not the install's),
+    on the same inputs it reads:
 
     - no managed repository: None (`finish` keeps its report under no_forge);
-    - exactly one: that repository, whatever its role (the operator renders
-      `gitops_repo` only when a repository has role gitops);
+    - exactly one: that repository, whatever its role (resolve_repo does not
+      read `gitops_repo` then);
     - more than one: ``gitops_repo`` when it is set and registered, else None
-      (`finish` writes its no-repository-chosen envelope under no_forge).
+      (NoGitOpsRepo: `finish` writes its no-repository-chosen envelope under
+      no_forge).
 
-    ``managed_keys`` are managed_repositories()'s `provider:host/path` keys;
-    ``gitops_repo`` is gitops_workspace.get_gitops_repo's name, which that
-    function only returns for a registered repository. Raises
-    ReportStoreUnavailable for a name no store key can be made of.
+    ``managed`` is gitops_workspace.get_managed_repos()'s list, as resolve_repo
+    reads it, entries the script skips (a type this image serves no forge for,
+    a non-Gitea URL with a port) already gone; ``gitops_repo`` is
+    gitops_workspace.get_gitops_repo(managed)'s name, which that function only
+    returns for a name in ``managed``. Raises ReportStoreUnavailable for a name
+    no store key can be made of.
     """
-    keys = sorted(set(managed_keys))
-    if not keys:
+    if not managed:
         return None
-    if len(keys) == 1:
-        repo: str | None = keys[0].split(":", 1)[-1]
+    if len(managed) == 1:
+        repo: str | None = managed[0]
     else:
         repo = gitops_repo or None
         if repo is None:
@@ -3123,9 +3145,9 @@ def report_publish_store_key_for(managed_keys: Sequence[str], gitops_repo: str |
     return key
 
 
-def report_registered_store_keys(managed_keys: Sequence[str]) -> frozenset[str]:
-    """The store keys of every managed repository (managed_repositories()'s keys)."""
-    keys = (report_store_key(key.split(":", 1)[-1]) for key in managed_keys)
+def report_registered_store_keys(managed: Sequence[str]) -> frozenset[str]:
+    """The store keys of every managed repository, as get_managed_repos() names them."""
+    keys = (report_store_key(name) for name in managed)
     return frozenset(key for key in keys if key)
 
 
@@ -3140,28 +3162,35 @@ def report_publish_store_key() -> str | None:
     return _report_publish_store_key_and_managed()[0]
 
 
-def _report_publish_store_key_and_managed() -> tuple[str | None, frozenset[str]]:
-    """report_publish_store_key, with the managed keys it read.
+def _report_publish_store_key_and_managed() -> tuple[str | None, tuple[str, ...]]:
+    """report_publish_store_key, with the managed repository names it read.
 
-    Known window: managed_repos comes through managed_repositories(), cached
-    for MANAGED_REPOSITORY_CACHE_SECONDS, while gitops_repo is read fresh, so
-    for up to that long after a ConfigMap edit the two can disagree (a new
-    gitops_repo against the old list's count). In that window a write can be
-    checked against a key neither state alone gives, no_forge included; the
-    key is still a repository one of the two states registers, or no_forge; the
-    kubelet's own mount refresh is a lag of the same order.
+    The names come from gitops_workspace.get_managed_repos(), the reader
+    audit_report.resolve_repo uses, not from managed_repositories()'s keys:
+    the script's reader skips entries the keys keep (a type no forge in this
+    image serves, a non-Gitea URL with a port), and the two counts must not
+    differ, or the broker would answer no_forge for an install whose script
+    publishes to its one served repository. The read is cached as
+    managed_repositories() is (managed_repository_names()).
 
-    Read per call: managed_repos through managed_repositories() (its cache and
-    refresh, the list the broker's forge gates read), and with more than one
-    repository the gitops_repo key from the gitops-state ConfigMap the broker
-    mounts at /etc/gitops (GITOPS_STATE_PATH names its managed_repos file).
-    Raises ReportStoreUnavailable when either cannot be read: a write is then
-    refused, rather than checked against a guess.
+    Known window: the names are cached for MANAGED_REPOSITORY_CACHE_SECONDS,
+    while gitops_repo is read fresh, so for up to that long after a ConfigMap
+    edit the two can disagree (a new gitops_repo against the old list's
+    count). In that window a write can be checked against a key neither state
+    alone gives, no_forge included; the key is still a repository one of the
+    two states registers, or no_forge; the kubelet's own mount refresh is a lag
+    of the same order.
+
+    With more than one repository, the gitops_repo key from the gitops-state
+    ConfigMap the broker mounts at /etc/gitops (GITOPS_STATE_PATH names its
+    managed_repos file), resolved by get_gitops_repo(managed) as resolve_repo
+    resolves it. Raises ReportStoreUnavailable when either cannot be read: a
+    write is then refused, rather than checked against a guess.
     """
     import gitops_workspace
 
     try:
-        managed = managed_repositories()
+        managed = managed_repository_names()
     except Exception as exc:  # noqa: BLE001 - every failure is the one answer
         raise ReportStoreUnavailable(f"managed_repos could not be read ({type(exc).__name__})") from None
     gitops_repo = None
@@ -3170,7 +3199,7 @@ def _report_publish_store_key_and_managed() -> tuple[str | None, frozenset[str]]
             text = gitops_workspace.gitops_repo_key_text()
         except Exception as exc:  # noqa: BLE001 - every failure is the one answer
             raise ReportStoreUnavailable(f"the gitops_repo key could not be read ({type(exc).__name__})") from None
-        gitops_repo = gitops_workspace.get_gitops_repo() if text else None
+        gitops_repo = gitops_workspace.get_gitops_repo(list(managed)) if text else None
     return report_publish_store_key_for(managed, gitops_repo), managed
 
 
@@ -3422,6 +3451,31 @@ def managed_repositories() -> frozenset[str]:
     moment an operator most needs to tell them apart.
     """
     return _cached_repository_slugs("_managed_repository_cache", "get_managed_repo_keys")
+
+
+_managed_repository_name_cache: tuple[float, tuple[str, ...]] | None = None
+
+
+def managed_repository_names() -> tuple[str, ...]:
+    """gitops_workspace.get_managed_repos()'s names, in its order, cached as managed_repositories() is.
+
+    The list audit_report.resolve_repo reads to choose where `finish`
+    publishes, for the audit-report write rule. Not managed_repositories():
+    that reader keeps entries this one skips. Raises when the list cannot be
+    read, as managed_repositories() does; tests reset the cache by assigning
+    `None` to `_managed_repository_name_cache`.
+    """
+    now = time.monotonic()
+    with _managed_repository_lock:
+        cached = _managed_repository_name_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    import gitops_workspace
+
+    names = tuple(gitops_workspace.get_managed_repos())
+    with _managed_repository_lock:
+        globals()["_managed_repository_name_cache"] = (now + MANAGED_REPOSITORY_CACHE_SECONDS, names)
+    return names
 
 
 def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str]:
@@ -17191,7 +17245,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # The same hook counts the broker's failures, by the route's family
         # and the status (_broker_failure_kind).
         kind = _broker_failure_kind(family, status_code)
-        if kind is not None and getattr(self, "command", "") in BROKER_FAILURE_COUNTED_METHODS:
+        if kind is not None and _broker_failure_counted(getattr(self, "command", ""), getattr(self, "path", "")):
             self.metrics.record_failure(kind)
         super().log_request(code, size)
 
