@@ -1772,16 +1772,30 @@ class VcsBroker:
                 or self._default_branch_of_remote(git, root, self._tls_refusal)
             )
             policy_branch = _short_ref(policy_branch) if policy_branch else ""
-            if not policy_branch or policy_branch == target:
+            if not policy_branch:
+                raise WorkspaceError(
+                    f"could not resolve base branch for Decision Memory guard on {bound.repo}",
+                    status=502,
+                    code=DECISION_MEMORY_CHECK_FAILED,
+                )
+            if policy_branch == target:
                 policy_base_rev = remote_target
             else:
                 fetched_policy = git(
                     root, "fetch", "--quiet", "--no-tags", "origin", policy_branch, check=False,
                 )
-                if fetched_policy.returncode == 0:
-                    policy_base_rev = git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
-                else:
-                    policy_base_rev = remote_target
+                rev_base = (
+                    git(root, "rev-parse", "FETCH_HEAD", check=False)
+                    if fetched_policy.returncode == 0
+                    else fetched_policy
+                )
+                policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
+                if not policy_base_rev:
+                    raise WorkspaceError(
+                        f"could not resolve base branch for Decision Memory guard on {bound.repo}",
+                        status=502,
+                        code=DECISION_MEMORY_CHECK_FAILED,
+                    )
             dm_markdown = self._check_decision_memory_on_publish(
                 git,
                 root,
@@ -1805,6 +1819,8 @@ class VcsBroker:
         paths: list[str],
         out_dir: Path | None,
         scratch_dir: Path,
+        *,
+        oversize_out: set[str] | None = None,
     ) -> dict[str, str]:
         """Extract `paths` at `rev` with `git archive` without repository checkout.
 
@@ -1849,6 +1865,9 @@ class VcsBroker:
                         except WorkspaceError:
                             continue
                         if member.size > DM_MAX_GUARD_FILE_BYTES:
+                            if oversize_out is not None:
+                                oversize_out.add(rel)
+                                continue
                             if out_dir is not None:
                                 dest = out_dir / rel
                                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1882,25 +1901,31 @@ class VcsBroker:
         subprocesses, and zero sandbox-supplied override flags.
         """
         tree_ls = git(
-            root, "--literal-pathspecs", "ls-tree", "-r", "--name-only", policy_base_rev, "--",
+            root, "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", policy_base_rev, "--",
             "knowledge", ".kube-agents/intent.yaml", check=False,
         )
         base_knowledge_files = [
-            validate_path(line.strip())
-            for line in (tree_ls.stdout or "").splitlines()
-            if line.strip() and line.strip().endswith((".md", ".yaml", ".yml"))
+            validate_path(entry)
+            for entry in (tree_ls.stdout or "").split("\0")
+            if entry and entry.endswith((".md", ".yaml", ".yml"))
         ]
         if not base_knowledge_files:
             return ""
 
         diff_ns = git(
-            root, "diff", "--no-renames", "--name-status", f"{policy_base_rev}...{tip}", check=False,
+            root, "diff", "--no-renames", "--name-status", "-z", f"{policy_base_rev}...{tip}", check=False,
         )
         changed_paths: list[tuple[str, str]] = []
-        for line in (diff_ns.stdout or "").splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                changed_paths.append((parts[0].strip(), parts[-1].strip()))
+        tokens = [t for t in (diff_ns.stdout or "").split("\0") if t]
+        idx = 0
+        while idx + 1 < len(tokens):
+            status = tokens[idx].strip()
+            if status.startswith(("R", "C")) and idx + 2 < len(tokens):
+                changed_paths.append((status, tokens[idx + 2]))
+                idx += 3
+            else:
+                changed_paths.append((status, tokens[idx + 1]))
+                idx += 2
         if not changed_paths:
             return ""
 
@@ -1933,11 +1958,10 @@ class VcsBroker:
                         except WorkspaceError:
                             continue
                         extra_ls = git(
-                            root, "--literal-pathspecs", "ls-tree", "-r", "--name-only",
+                            root, "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only",
                             policy_base_rev, "--", safe_prefix, check=False,
                         )
-                        for erel in (extra_ls.stdout or "").splitlines():
-                            erel = erel.strip()
+                        for erel in (extra_ls.stdout or "").split("\0"):
                             if not erel or not erel.endswith((".md", ".yaml", ".yml")):
                                 continue
                             try:
@@ -1960,9 +1984,13 @@ class VcsBroker:
                 else:
                     non_deleted.append(rel)
 
+            oversize_files: set[str] = set()
             extracted_head = self._extract_revision_paths_to_dir(
-                git, root, tip, non_deleted, None, check_dir,
+                git, root, tip, non_deleted, None, check_dir, oversize_out=oversize_files,
             )
+            for rel in non_deleted:
+                if rel not in extracted_head:
+                    oversize_files.add(rel)
             changed_map: dict[str, str | None] = {}
             for rel in rel_args:
                 if rel in deleted_set:
@@ -1971,7 +1999,9 @@ class VcsBroker:
                     changed_map[rel] = extracted_head.get(rel)
 
             try:
-                out = okf_guard.check_changed_files(k_root, changed_map)
+                out = okf_guard.check_changed_files(
+                    k_root, changed_map, oversize_files=oversize_files
+                )
             except ValueError as exc:
                 raise WorkspaceError(
                     f"Decision Memory guard check failed against base branch: {exc}",

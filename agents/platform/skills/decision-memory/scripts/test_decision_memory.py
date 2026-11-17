@@ -114,7 +114,8 @@ class Repo:
 
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name)
+        self.path = Path(self.tmp.name) / "repo"
+        self.path.mkdir()
         sh(self.path, "init", "-q", "-b", "main")
         sh(self.path, "config", "user.email", "t@example.com")
         sh(self.path, "config", "user.name", "t")
@@ -344,8 +345,13 @@ class WhyAndOutcomeTests(unittest.TestCase):
                 "_comments": [
                     {
                         "user": "reviewer",
+                        "can_write": True,
                         "body": "Rejected: lowering memory violates LES-2026-001.",
-                    }
+                    },
+                    {
+                        "user": "stranger",
+                        "body": "Drive-by comment citing DEC-2026-001 without write access.",
+                    },
                 ],
             }
         ]
@@ -1089,6 +1095,215 @@ class LLMSynthesisTests(unittest.TestCase):
             self.assertIn("BP-0002", by_id)
             self.assertEqual(by_id["RUN-0004"].type, "runbook")
             self.assertEqual(by_id["BP-0002"].type, "cluster-blueprint")
+
+    def test_precedence_narrow_cluster_and_resource_scope_preserve_fleet_block(self):
+        fleet_rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-030.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-030",
+                "title": "Fleet memory floor 256Mi",
+                "status": "active",
+                "scope": {"paths": ["clusters/*/payments/checkout.yaml"], "clusters": ["*"]},
+                "guard": {
+                    "rule": "Keep checkout >= 256Mi",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/*/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "256Mi",
+                    },
+                },
+            },
+            body="",
+        )
+        staging_wild_rec = dm.Record(
+            path="knowledge/lessons/LES-2026-031.md",
+            meta={
+                "type": "lesson",
+                "id": "LES-2026-031",
+                "title": "Staging memory floor 128Mi",
+                "status": "active",
+                "scope": {"paths": ["clusters/*/payments/checkout.yaml"], "clusters": ["staging"]},
+                "guard": {
+                    "rule": "Keep staging checkout >= 128Mi",
+                    "severity": "warn",
+                    "expect": {
+                        "file": "clusters/*/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "128Mi",
+                    },
+                },
+                "evidence": {"pull_request": "#31"},
+            },
+            body="",
+        )
+        # On prod-eu, staging_wild_rec must neither suppress fleet_rec nor match prod-eu itself
+        prod_findings = dm.match_change(
+            [fleet_rec, staging_wild_rec],
+            {"clusters/prod-eu/payments/checkout.yaml": DEPLOY.format(mem="64Mi")},
+        )
+        self.assertEqual([(f["id"], f["verdict"], f["severity"]) for f in prod_findings], [("DEC-2026-030", "violates", "block")])
+
+        # Resource-scoped narrow record in a multi-document file only suppresses its own resource
+        narrow_canary_rec = dm.Record(
+            path="knowledge/lessons/LES-2026-032.md",
+            meta={
+                "type": "lesson",
+                "id": "LES-2026-032",
+                "title": "Canary in prod-eu allowed at 128Mi",
+                "status": "active",
+                "scope": {
+                    "paths": ["clusters/prod-eu/payments/checkout.yaml"],
+                    "resources": ["Deployment/payments/canary"],
+                    "clusters": ["prod-eu"],
+                },
+                "guard": {
+                    "rule": "Canary >= 128Mi",
+                    "severity": "warn",
+                    "expect": {
+                        "file": "clusters/prod-eu/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "128Mi",
+                    },
+                },
+                "evidence": {"pull_request": "#32"},
+            },
+            body="",
+        )
+        canary_doc = DEPLOY.format(mem="128Mi").replace("name: checkout", "name: canary")
+        checkout_low_doc = DEPLOY.format(mem="64Mi")
+        multi_yaml = canary_doc + "---\n" + checkout_low_doc
+        multi_findings = {
+            f["id"]: f
+            for f in dm.match_change(
+                [fleet_rec, narrow_canary_rec],
+                {"clusters/prod-eu/payments/checkout.yaml": multi_yaml},
+            )
+        }
+        self.assertEqual(multi_findings["DEC-2026-030"]["verdict"], "violates")
+        self.assertEqual(multi_findings["DEC-2026-030"]["severity"], "block")
+        self.assertEqual(multi_findings["LES-2026-032"]["verdict"], "consistent")
+
+    def test_multi_doc_non_podspec_guard_and_omitted_namespace_matching(self):
+        svc_and_dep = (
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: checkout\nspec:\n  ports:\n  - port: 80\n---\n"
+            + DEPLOY.format(mem="256Mi").replace("  namespace: payments\n", "")
+        )
+        replica_rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-040.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-040",
+                "title": "Keep checkout replicas >= 2",
+                "status": "active",
+                "scope": {"resources": ["Deployment/*/checkout"]},
+                "guard": {
+                    "rule": "Keep replicas >= 2",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/*/payments/checkout.yaml",
+                        "path": "spec.replicas",
+                        "op": ">=",
+                        "value": 2,
+                    },
+                },
+            },
+            body="",
+        )
+        findings = dm.match_change([replica_rec], {"clusters/prod-eu/payments/checkout.yaml": svc_and_dep})
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["verdict"], "consistent")
+
+        # Unscoped multi-doc with non-PodSpec path (`spec.replicas`) also narrows to Deployment
+        unscoped_res_rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-041.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-041",
+                "title": "Keep replicas >= 2",
+                "status": "active",
+                "scope": {"paths": ["clusters/*/payments/checkout.yaml"]},
+                "guard": {
+                    "rule": "Keep replicas >= 2",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/*/payments/checkout.yaml",
+                        "path": "spec.replicas",
+                        "op": ">=",
+                        "value": 2,
+                    },
+                },
+            },
+            body="",
+        )
+        findings2 = dm.match_change([unscoped_res_rec], {"clusters/prod-eu/payments/checkout.yaml": svc_and_dep})
+        self.assertEqual(len(findings2), 1)
+        self.assertEqual(findings2[0]["verdict"], "consistent")
+
+    def test_validate_non_mapping_fields_and_why_directory_and_decision_outcome(self):
+        # 1. Non-mapping scope/guard/evidence and string supersedes report validation errors cleanly
+        bad_rec = dm.parse_record(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-050\n"
+            "title: Bad types\n"
+            "status: active\n"
+            "scope: clusters/prod/*\n"
+            "guard: invalid\n"
+            "evidence: invalid\n"
+            "supersedes: DEC-2026-001\n"
+            "---\n\nBody.\n",
+            "knowledge/lessons/LES-2026-050.md",
+        )
+        errs = dm.validate_record(bad_rec)
+        self.assertTrue(any("scope must be a mapping" in e for e in errs))
+        self.assertTrue(any("guard must be a mapping" in e for e in errs))
+        self.assertTrue(any("evidence must be a mapping" in e for e in errs))
+        self.assertTrue(any("supersedes must be a list" in e for e in errs))
+
+        # 2. `why` on a directory path does not raise IsADirectoryError
+        rc_why, out_why = self.r.run("why", "clusters/prod-eu/payments")
+        self.assertEqual(rc_why, 0)
+        self.assertIn("history", out_why)
+
+        # 3. `from-outcome` with type=decision renders Context / Decision / Consequences headings
+        FakeLLM.responses.append({
+            "title": "Standardize checkout PDB minAvailable",
+            "context": "Single-replica maintenance windows dropped checkout availability.",
+            "decision": "Require minAvailable: 2 on checkout PodDisruptionBudget.",
+            "consequences": "Node drains keep at least two replicas serving.",
+        })
+        dec_outcome = {
+            "type": "decision",
+            "pull_request": "https://github.com/acme/gitops/pull/55",
+            "title": "raw decision title",
+            "merged_at": "2026-10-20T10:00:00Z",
+            "files": ["clusters/prod-eu/payments/checkout.yaml"],
+        }
+        f_dec = self.r.path.parent / "outcome_decision.json"
+        f_dec.write_text(json.dumps(dec_outcome))
+        rc_dec, out_dec = self.r.run("from-outcome", str(f_dec), "--llm-url", self.llm_url, "--write")
+        self.assertEqual(rc_dec, 0)
+        self.assertTrue(out_dec["id"].startswith("DEC-"))
+        self.assertIn("## Context", out_dec["content"])
+        self.assertIn("## Decision", out_dec["content"])
+        self.assertIn("## Consequences", out_dec["content"])
+        self.assertIn("Require minAvailable: 2", out_dec["content"])
+
+        # 4. Tags, render_for_index, and workspaceCloneDirName parity with Go
+        self.assertEqual(
+            dm._workspace_clone_dir_name("https://gitlab.example.com:8443/acme/runbooks.git"),
+            "gitlab.example.com%2Facme%2Frunbooks",
+        )
+        self.assertEqual(
+            dm._workspace_clone_dir_name("https://bitbucket.example.com/scm/proj/runbooks.git"),
+            "bitbucket.example.com%2Fproj%2Frunbooks",
+        )
+        self.assertEqual(dm._workspace_clone_dir_name("acme/runbooks"), "acme__runbooks")
 
 
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")

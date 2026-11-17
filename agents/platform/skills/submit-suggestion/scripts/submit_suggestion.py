@@ -628,10 +628,12 @@ def _check_decision_memory(
     base: str,
     repo: str | None = None,
     copy_key: str | None = None,
+    *,
+    force: bool = False,
 ) -> dict | None:
     """Run Decision Memory check on the staged/committed change before publishing."""
     return vcs_client._check_decision_memory(
-        session, base, repo=repo, copy_key=copy_key, log_fn=log
+        session, base, repo=repo, copy_key=copy_key, force=force, log_fn=log
     )
 
 

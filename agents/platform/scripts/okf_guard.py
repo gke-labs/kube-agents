@@ -57,8 +57,8 @@ def match_glob(pattern: str, target: str) -> bool:
         return bool(tgt)
     if pat == tgt:
         return True
-    pat_segs = [s for s in pat.split("/") if s]
-    tgt_segs = [s for s in tgt.split("/") if s]
+    pat_segs = pat.split("/") if pat else []
+    tgt_segs = tgt.split("/") if tgt else []
 
     def _rec(pi: int, ti: int) -> bool:
         while pi < len(pat_segs):
@@ -135,11 +135,26 @@ def compare_values(actual: Any, op: str, expected: Any) -> bool:
     return {">=": aq >= eq, ">": aq > eq, "<=": aq <= eq, "<": aq < eq}.get(op, False)
 
 
+def _doc_resource_ids(doc: Any) -> List[str]:
+    if not isinstance(doc, dict):
+        return []
+    kind = str(doc.get("kind") or "").strip()
+    md = doc.get("metadata")
+    if not kind or not isinstance(md, dict):
+        return []
+    name = str(md.get("name") or "").strip()
+    if not name:
+        return []
+    ns = str(md.get("namespace") or "").strip()
+    with_ns = f"{kind}/{ns}/{name}"
+    if not ns:
+        return [with_ns, f"{kind}/{name}"]
+    return [with_ns]
+
+
 def _doc_resource_id(doc: Any) -> Optional[str]:
-    if isinstance(doc, dict) and doc.get("kind") and isinstance(doc.get("metadata"), dict):
-        md = doc["metadata"]
-        return f"{doc['kind']}/{md.get('namespace', '')}/{md.get('name', '')}"
-    return None
+    ids = _doc_resource_ids(doc)
+    return ids[0] if ids else None
 
 
 def _doc_applicable_to_path(doc: Any, path_expr: str) -> bool:
@@ -186,15 +201,34 @@ def evaluate_guard(
             scoped = [
                 d
                 for d in docs
-                if _doc_resource_id(d)
-                and any(match_glob(g, _doc_resource_id(d) or "") for g in scope_resources)
+                if any(
+                    match_glob(g, rid)
+                    for rid in _doc_resource_ids(d)
+                    for g in scope_resources
+                )
             ]
             if scoped:
                 docs = scoped
-        elif len(docs) > 1:
+        if len(docs) > 1:
             applicable = [d for d in docs if _doc_applicable_to_path(d, path_expr)]
             if applicable:
                 docs = applicable
+        if len(docs) > 1:
+            matching_kinds = {
+                str(d.get("kind") or "").strip()
+                for d in docs
+                if isinstance(d, dict)
+                and str(d.get("kind") or "").strip()
+                and yaml_get(d, path_expr) is not None
+            }
+            if matching_kinds:
+                kind_filtered = [
+                    d
+                    for d in docs
+                    if isinstance(d, dict) and str(d.get("kind") or "").strip() in matching_kinds
+                ]
+                if kind_filtered:
+                    docs = kind_filtered
         for doc in docs:
             actual = yaml_get(doc, path_expr)
             if actual is None and op not in ("absent", "present"):
@@ -212,11 +246,12 @@ def _normalize_declares(meta: Dict[str, Any]) -> None:
     declares = meta.get("declares")
     if not isinstance(declares, list) or not declares:
         return
-    scope = dict(meta.get("scope") or {})
-    paths = [str(x) for x in (scope.get("paths") or [])]
-    resources = [str(x) for x in (scope.get("resources") or [])]
-    clusters = [str(x) for x in (scope.get("clusters") or [])]
-    checks = [str(x) for x in (scope.get("checks") or [])]
+    raw_scope = meta.get("scope")
+    scope = dict(raw_scope) if isinstance(raw_scope, dict) else {}
+    paths = [str(x) for x in (scope.get("paths") if isinstance(scope.get("paths"), list) else [])]
+    resources = [str(x) for x in (scope.get("resources") if isinstance(scope.get("resources"), list) else [])]
+    clusters = [str(x) for x in (scope.get("clusters") if isinstance(scope.get("clusters"), list) else [])]
+    checks = [str(x) for x in (scope.get("checks") if isinstance(scope.get("checks"), list) else [])]
     for item in declares:
         if not isinstance(item, dict):
             continue
@@ -328,15 +363,27 @@ def _validate_meta(meta: Dict[str, Any]) -> List[str]:
         errs.append(f"invalid status {status!r}")
     if not str(meta.get("title") or "").strip():
         errs.append("title is required")
-    sc = meta.get("scope") or {}
-    if not any(sc.get(k) for k in ("paths", "resources", "checks")):
+    raw_sc = meta.get("scope")
+    if raw_sc is not None and not isinstance(raw_sc, dict):
+        errs.append("scope must be a mapping")
+        sc: Dict[str, Any] = {}
+    else:
+        sc = raw_sc or {}
+    if not any(isinstance(sc.get(k), list) and sc.get(k) for k in ("paths", "resources", "checks")):
         errs.append("scope is empty")
-    guard = meta.get("guard") or {}
+    raw_guard = meta.get("guard")
+    if raw_guard is not None and not isinstance(raw_guard, dict):
+        errs.append("guard must be a mapping")
+        guard: Dict[str, Any] = {}
+    else:
+        guard = raw_guard or {}
     if guard:
         if guard.get("severity") and guard["severity"] not in SEVERITIES:
             errs.append(f"invalid guard.severity {guard['severity']!r}")
         exp = guard.get("expect")
-        if exp:
+        if exp is not None and not isinstance(exp, dict):
+            errs.append("guard.expect must be a mapping")
+        elif exp:
             req_keys = ("file", "path", "op") if exp.get("op") in ("absent", "present") else ("file", "path", "op", "value")
             if not all(k in exp for k in req_keys):
                 errs.append("incomplete guard.expect")
@@ -347,8 +394,17 @@ def _validate_meta(meta: Dict[str, Any]) -> List[str]:
                     path_tokens(str(exp["path"]))
                 except ValueError as exc:
                     errs.append(str(exc))
-    if rtype == "lesson" and status == "active" and not (meta.get("evidence") or {}).get("pull_request"):
+    raw_ev = meta.get("evidence")
+    if raw_ev is not None and not isinstance(raw_ev, dict):
+        errs.append("evidence must be a mapping")
+        ev_dict: Dict[str, Any] = {}
+    else:
+        ev_dict = raw_ev or {}
+    if rtype == "lesson" and status == "active" and not ev_dict.get("pull_request"):
         errs.append("active lesson requires evidence.pull_request")
+    raw_sup = meta.get("supersedes")
+    if raw_sup is not None and not isinstance(raw_sup, list):
+        errs.append("supersedes must be a list")
     if status == "superseded" and not meta.get("superseded_by"):
         errs.append("superseded record requires superseded_by")
     return errs
@@ -358,27 +414,95 @@ def _is_fleet_wide(clusters: List[str]) -> bool:
     return not clusters or clusters == ["*"]
 
 
-def _suppressed_files(records: List[Dict[str, Any]], target_files: List[str]) -> Dict[str, set]:
+def _target_file_matches_narrow_cluster(target_file: str, clusters: List[str]) -> bool:
+    if _is_fleet_wide(clusters):
+        return True
+    segs = [s for s in target_file.strip("/").split("/") if s]
+    for raw_c in clusters:
+        c = str(raw_c or "").strip()
+        if not c or c == "*":
+            continue
+        for seg in segs:
+            if seg == c or c.endswith("-" + seg):
+                return True
+    return False
+
+
+def _precedence_suppression(
+    records: List[Dict[str, Any]], target_files: List[str]
+) -> Tuple[Dict[str, set], Dict[str, Dict[str, List[str]]]]:
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    clusters_of = lambda r: [str(x) for x in ((r["meta"].get("scope") or {}).get("clusters") or [])]
+    resources_of = lambda r: [str(x) for x in ((r["meta"].get("scope") or {}).get("resources") or [])]
     for rec in records:
-        if str(rec["meta"].get("status") or "active") != "active":
-            continue
         exp = (rec["meta"].get("guard") or {}).get("expect")
-        if not exp:
+        if not isinstance(exp, dict) or not exp.get("path") or not exp.get("file"):
             continue
+        rec_clusters = clusters_of(rec)
         for mf in target_files:
-            if match_glob(str(exp["file"]), mf):
-                grouped.setdefault((mf, str(exp["path"])), []).append(rec)
-    suppressed: Dict[str, set] = {}
+            if not match_glob(str(exp["file"]), mf):
+                continue
+            if not _is_fleet_wide(rec_clusters) and not _target_file_matches_narrow_cluster(mf, rec_clusters):
+                continue
+            grouped.setdefault((mf, str(exp["path"])), []).append(rec)
+    whole_file: Dict[str, set] = {}
+    excluded_resources: Dict[str, Dict[str, List[str]]] = {}
     for (mf, _yp), group in grouped.items():
         if len(group) <= 1:
             continue
-        clusters_of = lambda r: [str(x) for x in ((r["meta"].get("scope") or {}).get("clusters") or [])]
-        if any(not _is_fleet_wide(clusters_of(r)) for r in group) and any(_is_fleet_wide(clusters_of(r)) for r in group):
-            for r in group:
-                if _is_fleet_wide(clusters_of(r)):
-                    suppressed.setdefault(str(r["meta"]["id"]), set()).add(mf)
-    return suppressed
+        has_unscoped_active_narrow = False
+        scoped_narrow_resources: List[str] = []
+        has_broad = False
+        for r in group:
+            r_clusters = clusters_of(r)
+            if _is_fleet_wide(r_clusters):
+                has_broad = True
+            elif str(r["meta"].get("status") or "active") == "active":
+                r_res = resources_of(r)
+                if not r_res:
+                    has_unscoped_active_narrow = True
+                else:
+                    scoped_narrow_resources.extend(r_res)
+        if not has_broad or (not has_unscoped_active_narrow and not scoped_narrow_resources):
+            continue
+        for r in group:
+            if not _is_fleet_wide(clusters_of(r)):
+                continue
+            rid = str(r["meta"]["id"])
+            if has_unscoped_active_narrow:
+                whole_file.setdefault(rid, set()).add(mf)
+            else:
+                excluded_resources.setdefault(rid, {}).setdefault(mf, []).extend(scoped_narrow_resources)
+    return whole_file, excluded_resources
+
+
+def _suppressed_files(records: List[Dict[str, Any]], target_files: List[str]) -> Dict[str, set]:
+    return _precedence_suppression(records, target_files)[0]
+
+
+def _filter_yaml_content_excluding_resources(
+    content: str, excluded_globs: List[str]
+) -> Tuple[str, bool]:
+    if not excluded_globs:
+        return content, True
+    try:
+        docs = [d for d in yaml.safe_load_all(content) if d is not None]
+    except yaml.YAMLError:
+        return content, True
+    if not docs:
+        return content, True
+    kept: List[str] = []
+    for d in docs:
+        covered = any(
+            match_glob(g, rid)
+            for rid in _doc_resource_ids(d)
+            for g in excluded_globs
+        )
+        if not covered:
+            kept.append(yaml.safe_dump(d, sort_keys=False, allow_unicode=True).strip())
+    if not kept:
+        return "", False
+    return "\n---\n".join(kept) + "\n", True
 
 
 def render_markdown(findings: List[Dict[str, Any]]) -> str:
@@ -411,19 +535,27 @@ def render_markdown(findings: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def check_changed_files(knowledge_root: Path, changed: Dict[str, Optional[str]]) -> Dict[str, Any]:
+def check_changed_files(
+    knowledge_root: Path,
+    changed: Dict[str, Optional[str]],
+    oversize_files: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
     records, active_errors = load_okf_records(knowledge_root)
     if active_errors:
         raise ValueError("; ".join(active_errors))
+    oversize_set = set(oversize_files or ())
     candidates = [r for r in records if str(r["meta"].get("status") or "active") in ("active", "proposed")]
-    suppressed = _suppressed_files(candidates, sorted(changed))
+    whole_suppressed, excluded_resources = _precedence_suppression(
+        candidates, [p for p in sorted(changed) if p not in oversize_set]
+    )
     new_resources: Dict[str, List[str]] = {}
     for fpath, content in changed.items():
         if content:
             try:
-                new_resources[fpath] = [
-                    rid for d in yaml.safe_load_all(content) if (rid := _doc_resource_id(d))
-                ]
+                rids: List[str] = []
+                for d in yaml.safe_load_all(content):
+                    rids.extend(_doc_resource_ids(d))
+                new_resources[fpath] = rids
             except yaml.YAMLError:
                 new_resources[fpath] = []
 
@@ -435,31 +567,81 @@ def check_changed_files(knowledge_root: Path, changed: Dict[str, Optional[str]])
         sc = meta.get("scope") or {}
         s_paths = [str(x) for x in (sc.get("paths") or [])]
         s_res = [str(x) for x in (sc.get("resources") or [])]
-        sup_for_rec = suppressed.get(rid, set())
+        s_clusters = [str(x) for x in (sc.get("clusters") or [])]
+        guard = meta.get("guard") or {}
+        exp = guard.get("expect") if isinstance(guard, dict) else None
+        sup_for_rec = whole_suppressed.get(rid, set())
+        excl_for_rec = excluded_resources.get(rid, {})
+        filtered_content_by_file: Dict[str, str] = {}
         hits = set()
         for fpath in changed:
+            if fpath in oversize_set:
+                if (
+                    not _is_fleet_wide(s_clusters)
+                    and fpath.strip("/").startswith("clusters/")
+                    and not _target_file_matches_narrow_cluster(fpath, s_clusters)
+                ):
+                    continue
+                if (
+                    any(match_glob(g, fpath) for g in s_paths)
+                    or (isinstance(exp, dict) and exp.get("file") and match_glob(str(exp["file"]), fpath))
+                    or (s_res and fpath.lower().endswith((".yaml", ".yml")))
+                ):
+                    hits.add(fpath)
+                continue
             if fpath in sup_for_rec:
                 continue
-            if any(match_glob(g, fpath) for g in s_paths):
+            excl_globs = excl_for_rec.get(fpath, [])
+            file_rids = new_resources.get(fpath, [])
+            if excl_globs and changed.get(fpath) is not None:
+                filt, rem = _filter_yaml_content_excluding_resources(str(changed[fpath]), excl_globs)
+                if not rem:
+                    continue
+                filtered_content_by_file[fpath] = filt
+                try:
+                    file_rids = []
+                    for d in yaml.safe_load_all(filt):
+                        file_rids.extend(_doc_resource_ids(d))
+                except yaml.YAMLError:
+                    file_rids = []
+            if (
+                not _is_fleet_wide(s_clusters)
+                and s_paths
+                and fpath.strip("/").startswith("clusters/")
+                and not _target_file_matches_narrow_cluster(fpath, s_clusters)
+            ):
+                pass
+            elif any(match_glob(g, fpath) for g in s_paths):
                 hits.add(fpath)
-            for res_id in new_resources.get(fpath, []):
+            for res_id in file_rids:
                 if any(match_glob(g, res_id) for g in s_res):
                     hits.add(fpath)
         if not hits:
             continue
         verdict = "related"
         detail: List[Dict[str, Any]] = []
-        guard = meta.get("guard") or {}
-        exp = guard.get("expect")
+        oversize_hits = [p for p in sorted(hits) if p in oversize_set]
         if exp:
-            present_files = {p: c for p, c in changed.items() if c is not None and p in hits}
+            present_files = {
+                p: filtered_content_by_file.get(p, str(c))
+                for p, c in changed.items()
+                if c is not None and p in hits and p not in oversize_set
+            }
             detail = evaluate_guard(exp, present_files, s_res)
-            deleted = [p for p in sorted(hits) if changed.get(p) is None and match_glob(str(exp["file"]), p)]
-            if any(not d["ok"] for d in detail) or deleted:
+            deleted = [
+                p
+                for p in sorted(hits)
+                if p not in oversize_set and changed.get(p) is None and match_glob(str(exp["file"]), p)
+            ]
+            if any(not d["ok"] for d in detail) or deleted or oversize_hits:
                 verdict = "violates"
                 detail += [{"file": p, "actual": None, "ok": False, "deleted": True} for p in deleted]
+                detail += [{"file": p, "actual": "<oversize>", "ok": False, "oversize": True} for p in oversize_hits]
             elif detail:
                 verdict = "consistent"
+        elif oversize_hits and guard:
+            verdict = "violates"
+            detail += [{"file": p, "actual": "<oversize>", "ok": False, "oversize": True} for p in oversize_hits]
         if verdict == "violates":
             raw_sev = str(guard.get("severity") or "warn")
             severity = "warn" if (raw_sev == "block" and status == "proposed") else raw_sev

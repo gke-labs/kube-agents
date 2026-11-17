@@ -1479,11 +1479,16 @@ def _check_decision_memory(
     repo: str | None = None,
     copy_key: str | None = None,
     *,
+    force: bool = False,
     log_fn=None,
 ) -> dict | None:
     """Run Decision Memory check on the committed change before publishing."""
     ws = Path(session["path"])
-    if not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS) and not (ws / ".kube-agents" / "intent.yaml").is_file():
+    if (
+        not force
+        and not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS)
+        and not (ws / ".kube-agents" / "intent.yaml").is_file()
+    ):
         return None
     dm_script = _find_decision_memory_script()
     if dm_script is None:
@@ -1660,7 +1665,7 @@ def publish(
         )
         has_base_dm = bool((probe.stdout or "").strip())
     if has_base_dm or any((ws_path / rel).is_dir() for rel in DECISION_MEMORY_DIRS):
-        _check_decision_memory(session, base_rev)
+        _check_decision_memory(session, base_rev, force=has_base_dm)
 
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
     bundle_file = Path(name)

@@ -203,6 +203,7 @@ func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           name,
 					AutomountServiceAccountToken: ptr.To(false),
+					DNSConfig:                    brokerCallerPodDNSConfig(),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
 						RunAsUser:      ptr.To(a2aConsoleRunAsUser),
