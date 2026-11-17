@@ -166,6 +166,7 @@ type sessionTrace struct {
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
 	sessionCards         map[string]string // worker sessionID -> cardID
 	cardTitles           map[string]string // cardID -> short cluster/card title
+	filedCards           map[string]bool   // cardID -> made by this task's kanban_create, title or not
 	claimedSessions      map[string]bool   // worker sessionID claimed by this task
 	reportedSettledCards map[string]bool   // cardID -> KindSubtask step already emitted for this task
 }
@@ -201,6 +202,7 @@ func (a *activityState) initSessionTraceLocked() {
 	if a.trace.sessionCards == nil {
 		a.trace.sessionCards = make(map[string]string)
 		a.trace.cardTitles = make(map[string]string)
+		a.trace.filedCards = make(map[string]bool)
 		a.trace.claimedSessions = make(map[string]bool)
 		a.trace.plannedTitles = make(map[string]string)
 		a.trace.reportedSettledCards = make(map[string]bool)
@@ -293,6 +295,7 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
+		a.trace.filedCards[createdCardID] = true
 		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
 			a.trace.cardTitles[createdCardID] = short
 		}
@@ -503,7 +506,7 @@ func (a *activityState) hasCardID(cardID string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.trace.cardTitles[cardID] != ""
+	return a.trace.filedCards[cardID] || a.trace.cardTitles[cardID] != ""
 }
 
 // buildAPIRequestSteps reads one post_api_request delivery into the step
@@ -1859,12 +1862,18 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 }
 
 var (
-	// envNameValuePattern is a Kubernetes env entry, a name followed by a
-	// literal value sibling, in YAML (- name: X, then value: y on the next
-	// line), JSON or a flow mapping; envValueNamePattern is the same with
-	// the value first (JSON or a flow mapping). valueFrom is not a value.
-	envNameValuePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:,[ \t]*(?:\r?\n[ \t]*)?|\r?\n[ \t]*)["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
-	envValueNamePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
+	// envNameValueFlowPattern is a Kubernetes env entry, a name followed by
+	// a literal value sibling, in JSON or a flow mapping (a comma between),
+	// an unquoted value ending at , } or ]; envNameValueBlockPattern is the
+	// same in block YAML (- name: X, then value: y on the next line, a
+	// comment after the name allowed), an unquoted value running to its
+	// line's end, comment and all, for envUnquotedValue to cut;
+	// envValueNamePattern is the flow one with the value first. valueFrom
+	// is not a value. Each value match ends within its own line or at a
+	// flow separator, so a scan of one long line stays linear.
+	envNameValueFlowPattern  = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
+	envNameValueBlockPattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:[ \t]+#[^\r\n]*)?\r?\n[ \t]*["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\r\n]*[^\r\n \t])`)
+	envValueNamePattern      = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
 )
 
 // scrubEnvNameValuePairs redacts the literal value of a Kubernetes env
@@ -1880,8 +1889,12 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
 			name := s[m[2*nameG]:m[2*nameG+1]]
 			lo, hi := m[2*valueG], m[2*valueG+1]
+			var decoded string
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
+				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
+			} else if hi = lo + envUnquotedValue(s[lo:hi]); hi <= lo {
+				continue
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
 				lo += sloc[1] // the scheme word stays, as under a key
@@ -1893,12 +1906,33 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			spans = append(spans, [2]int{lo, hi})
 			if keyClearlyNamesSecret(name) {
 				sink.emit(v)
+				// A quoted value is also tracked as its escapes read
+				// (a JSON or YAML "\"" is the value's own quote).
+				if decoded != "" && decoded != s[lo:hi] && lo == m[2*valueG]+1 {
+					sink.emit(decoded)
+				}
 			}
 		}
 	}
-	pair(envNameValuePattern, 1, 2)
+	pair(envNameValueFlowPattern, 1, 2)
+	pair(envNameValueBlockPattern, 1, 2)
 	pair(envValueNamePattern, 2, 1)
 	return redactSpans(s, spans)
+}
+
+// envUnquotedValue is the length of an unquoted env value with a trailing
+// comment (a # after a blank, or one opening the value) and the blanks
+// before it taken off.
+func envUnquotedValue(v string) int {
+	if strings.HasPrefix(v, "#") {
+		return 0
+	}
+	for _, c := range []string{" #", "\t#"} {
+		if i := strings.Index(v, c); i >= 0 {
+			v = v[:i]
+		}
+	}
+	return len(strings.TrimRight(v, " \t"))
 }
 
 // scrubMarkdownTables redacts the value cells of a markdown table that
@@ -1913,10 +1947,40 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 // and redacted where it stands. Only a key whose class is strong counts
 // (tableSecretKeyClass); a bare credential noun heads a column of names as
 // often as of values, so under one a value must be token-shaped.
+//
+// Rows are split twice, once with a pipe inside a paired code span read as
+// cell content and once at every pipe, and the spans of both are redacted:
+// backticks that pair across cells can merge columns, so neither split
+// alone decides which cell is under which header.
 func scrubMarkdownTables(s string, sink secretSink) string {
 	if !strings.Contains(s, "|") {
 		return s
 	}
+	spans := append(markdownTableSpans(s, sink, true), markdownTableSpans(s, sink, false)...)
+	return redactSpans(s, mergeSpans(spans))
+}
+
+// mergeSpans is spans with every overlapping pair joined, so redactSpans
+// skips none of a span's bytes.
+func mergeSpans(spans [][2]int) [][2]int {
+	if len(spans) < 2 {
+		return spans
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	out := [][2]int{spans[0]}
+	for _, sp := range spans[1:] {
+		if last := &out[len(out)-1]; sp[0] < last[1] {
+			last[1] = max(last[1], sp[1])
+			continue
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// markdownTableSpans is the value-cell spans scrubMarkdownTables redacts,
+// with rows split as markdownTableCells does under codeAware.
+func markdownTableSpans(s string, sink secretSink, codeAware bool) [][2]int {
 	var spans [][2]int
 	type row struct{ cells [][2]int }
 	var block []row
@@ -2003,7 +2067,7 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 		} else {
 			lineEnd += lineStart
 		}
-		if cells := markdownTableCells(s, lineStart, lineEnd); cells != nil {
+		if cells := markdownTableCells(s, lineStart, lineEnd, codeAware); cells != nil {
 			block = append(block, row{cells})
 		} else {
 			flush()
@@ -2011,25 +2075,38 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 		lineStart = lineEnd + 1
 	}
 	flush()
-	return redactSpans(s, spans)
+	return spans
 }
 
 // markdownTableCells is the content span of each cell of a table row (a
 // line that opens with a pipe and holds another), trimmed of spaces, or nil
 // for a line that is not one. A pipe escaped with a backslash is content.
-func markdownTableCells(s string, lo, hi int) [][2]int {
+func markdownTableCells(s string, lo, hi int, codeAware bool) [][2]int {
 	line := strings.TrimRight(s[lo:hi], "\r")
 	trimmed := strings.TrimLeft(line, " \t")
 	if !strings.HasPrefix(trimmed, "|") || strings.Count(trimmed, "|") < 2 {
 		return nil
 	}
+	// Under codeAware, a pipe inside a paired code span is the cell's
+	// content: the answer is published as written, so a value it pushes
+	// past is still there.
+	var inSpan []bool
+	if codeAware {
+		inSpan = make([]bool, len(line))
+		for _, c := range markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil) {
+			for i := c[0]; i < c[1]; i++ {
+				inSpan[i] = true
+			}
+		}
+	}
+	inCode := func(i int) bool { return inSpan != nil && inSpan[i] }
 	var pipes []int
 	for i := 0; i < len(line); i++ {
 		if line[i] == '\\' {
 			i++
 			continue
 		}
-		if line[i] == '|' {
+		if line[i] == '|' && !inCode(i) {
 			pipes = append(pipes, lo+i)
 		}
 	}
@@ -2207,10 +2284,40 @@ func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 // normalised away for the test and kept around the marker, or none.
 func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sink secretSink) [][2]int {
 	text := s[cell[0]:cell[1]]
-	n, idx := normalizeMarkdown(text)
-	lo := len(n) - len(strings.TrimLeft(n, " \t"))
-	hi := len(strings.TrimRight(n, " \t"))
-	if hi <= lo || strings.Contains(n, redactedValue) || !classValueRedacted(class, n[lo:hi], false) {
+	n, idx, code := normalizeMarkdownSpans(text)
+	cellLo := len(n) - len(strings.TrimLeft(n, " \t"))
+	cellHi := len(strings.TrimRight(n, " \t"))
+	if cellHi <= cellLo || strings.Contains(n, redactedValue) {
+		return nil
+	}
+	// As under a key: an auth-scheme word stays, and a code-spanned value
+	// is bounded by its backticks. Both the span and the whole cell are
+	// candidates, and the first that reads as a value is redacted: the span
+	// first when a blank or the cell's end follows it (a note after it),
+	// the whole cell first when text runs on straight after it.
+	valueLo := cellLo
+	if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(n[cellLo:cellHi]); sloc != nil {
+		valueLo += sloc[1]
+	}
+	cands := [][2]int{{valueLo, cellHi}, {cellLo, cellHi}}
+	if end, ok := codeSpanEnd(code, valueLo); ok {
+		span := [2]int{valueLo, end}
+		// Another code span after it in the cell: the value is not the
+		// first span alone.
+		if len(code) == 1 && (end >= cellHi || n[end] == ' ' || n[end] == '\t') {
+			cands = [][2]int{span, {cellLo, cellHi}}
+		} else {
+			cands = [][2]int{{cellLo, cellHi}, span}
+		}
+	}
+	lo, hi := 0, 0
+	for _, c := range cands {
+		if c[1] > c[0] && classValueRedacted(class, n[c[0]:c[1]], false) {
+			lo, hi = c[0], c[1]
+			break
+		}
+	}
+	if hi <= lo {
 		return nil
 	}
 	if idx != nil {
@@ -2373,7 +2480,8 @@ func markdownParenKept(content, after string) bool {
 // code. A run of backticks opens a code span the next run of the same
 // length closes; what is inside one is literal. Outside them, a run of * or
 // _ not inside a word is dropped when a later run of the same mark and
-// length closes it.
+// length closes it. A list bullet (one * then a blank, at the line's start
+// after indentation) is not a run: it neither opens nor closes emphasis.
 func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) [][2]int {
 	inCode := func(int) bool { return false }
 	first := len(code)
@@ -2431,9 +2539,10 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) []
 		c     byte
 	}
 	var open []run
+	bullet := listBulletAt(s, lo, hi)
 	for i := lo; i < hi; {
 		c := s[i]
-		if c != '*' && c != '_' || inCode(i) {
+		if c != '*' && c != '_' || inCode(i) || i == bullet {
 			i++
 			continue
 		}
@@ -2462,6 +2571,19 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) []
 		open = open[:k]
 	}
 	return code
+}
+
+// listBulletAt is where s[lo:hi] (one line) has a * list bullet: one *
+// followed by a blank, after the line's indentation. -1 when it has none.
+func listBulletAt(s string, lo, hi int) int {
+	p := lo
+	for p < hi && (s[p] == ' ' || s[p] == '\t') {
+		p++
+	}
+	if p+1 < hi && s[p] == '*' && (s[p+1] == ' ' || s[p+1] == '\t') {
+		return p
+	}
+	return -1
 }
 
 func isWordByte(c byte) bool {
@@ -2525,9 +2647,13 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	if nl := strings.LastIndexByte(s[:matchStart], '\n'); nl >= 0 {
 		lineStart = nl + 1
 	}
-	prefix := strings.TrimLeft(s[lineStart:matchStart], " \t")
-	return prefix == "" || prefix == "-"
+	return lineMarkersPattern.MatchString(s[lineStart:matchStart])
 }
+
+// lineMarkersPattern is what may stand before a line-leading key: blanks
+// and markdown line markers (a -, * or + bullet, an ordered-list number, a
+// task box, a blockquote's >), stacked or not.
+var lineMarkersPattern = regexp.MustCompile(`^[ \t]*(?:(?:[-*+>]|[0-9]{1,3}[.)]|\[[ xX]\])[ \t]*)*$`)
 
 func hasLaterInlineKVAssignment(lineRest string) bool {
 	ws := strings.IndexAny(lineRest, " \t")
