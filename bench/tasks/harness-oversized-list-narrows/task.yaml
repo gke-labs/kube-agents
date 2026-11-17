@@ -61,10 +61,11 @@ verification_spec:
       path: 'status.containerStatuses[?(@.name=="shell")].lastState.terminated'
       op: absent
   # Two different counts above 100,000 (the prompt's threshold itself does not
-  # count; a sentence may end on a number), one per large cluster: an answer from a read
-  # the shell could hold. Exact figures are left to the judge, since whether the
-  # agent counts system namespaces is a reading of the question, not of the
-  # change.
+  # count; a sentence may end on a number; one count written with and without its
+  # comma is one count; a number inside a name such as pod-123456 is not a count),
+  # one per large cluster: an answer from a read the shell could hold. Exact
+  # figures are left to the judge, since whether the agent counts system
+  # namespaces is a reading of the question, not of the change.
   - name: the-answer-gives-two-counts-above-100000
     role: objective
     mode: assert
@@ -72,5 +73,5 @@ verification_spec:
       type: report_contains
       required_patterns:
         [
-          '(?s)(?<![\d,.])(?!100,?000(?!,?\d))(1\d\d,?\d{3})(?!,\d|\.\d|\d).*?(?<![\d,.])(?!\1(?!,\d|\.\d|\d))(?!100,?000(?!,?\d))1\d\d,?\d{3}(?!,\d|\.\d|\d)',
+          '(?s)(?<![\w,.-])(?!100,?000(?!,?\d))(1\d\d),?(\d{3})(?!,\d|\.\d|\d).*?(?<![\w,.-])(?!\1,?\2(?!,\d|\.\d|\d))(?!100,?000(?!,?\d))1\d\d,?\d{3}(?!,\d|\.\d|\d)',
         ]
