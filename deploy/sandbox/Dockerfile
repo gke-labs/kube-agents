@@ -645,6 +645,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   post_merge_stepdown.py opens the revert and the rules-file pull request for an
 #                          auto-merged fix still broken after merge; imports
 #                          automation_rules, kubeagents_switches and vcs_client
+#   automerge_switch.py    the autonomy dial's per-kind switch: the rules-file pull
+#                          request that turns auto-merge on or off for a kind of
+#                          fix in one repository; imports automation_rules,
+#                          post_merge_stepdown, kubeagents_switches and vcs_client
 #   post_merge_offer.py    opens the draft rules-file pull request that offers
 #                          auto-merge for a kind of fix; imports post_merge_stepdown,
 #                          repo_ref and clean_merges, whose thresholds it states
@@ -738,6 +742,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/automation_rules.py \
      agents/platform/scripts/post_merge_stepdown.py \
+     agents/platform/scripts/automerge_switch.py \
      agents/platform/scripts/post_merge_offer.py \
      agents/platform/scripts/clean_merges.py \
      agents/platform/scripts/collector_run.py \
