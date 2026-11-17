@@ -66,7 +66,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    dispatcherJobModeCondition,
 		Written: "While the operator runs the profile dispatcher (on by default; `operator.profileDispatcher.enabled`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
-		Meaning: "Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
+		Meaning: "Whether the dispatcher runs profile tasks as Jobs: unattended ones, and permit-carrying ones at any tier. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
 	},
 	{
 		Type:    dispatcherCeilingCondition,

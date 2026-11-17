@@ -372,9 +372,13 @@ leave open:
   `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. When the submission's
   `taskParameters.changeRequested` is true, the `proxyToken` also carries
   `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
-  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod: one
-  whose tier has no Job runner is refused at admission (`change-needs-job`), and the permit is
-  minted only for a task on a Job (#5646). Otherwise it carries no `permits` key at all, never an empty list, so its
+  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod, at
+  whatever tier it was admitted at and of either kind (a confirmed chain's children and wakes
+  inherit the flag, so each of them runs on a Job too): one whose tier has no Job runner is
+  refused at admission (`change-needs-job`), and the permit is minted only for a task on a Job
+  (#5646). Under Job mode every profile has a Job template at each of its live tiers for
+  this, so the refusal is what an install without Job mode, or a profile without a
+  template, gets. Otherwise it carries no `permits` key at all, never an empty list, so its
   claims are those of a token minted before the claim existed. The `taskCredential` never
   carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
@@ -505,13 +509,31 @@ leave open:
   it serves that one task and exits. A Job that never comes up, fails or doesn't take the task
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
-  re-adopts the task.
-  The dispatch config doesn't carry the Job's pod template. It carries the hash of the rendering
-  of the profile's own `DispatchJobTemplate` in the profile namespace, the param the Job
-  admission policy holds each Job to (`jobTemplateRef`). The param's name is derived from the
-  profile's (#5479). The dispatcher reads that
-  object when it launches the Job, with `get` alone on those objects, and uses it only while
-  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
+  re-adopts the task; the lease record says the task ran on a Job (`onJob`), so the Job of a
+  task re-adopted at any tier goes when it ends. A Job's name is a hash of the task's whole
+  key, its kind included, and a Job pod already holding a task is never offered another.
+  A read-tier task with no permit stays on the warm pool, and a Job an earlier pass launched
+  for it, while its submission (replaced under the same subject) still carried a permit,
+  goes first. Isolating the credential this way leaves the task's bus traffic where it was:
+  the Job's pod shares the bus with every other worker (#3889).
+  The dispatch config doesn't carry the Job's pod template. It carries one hash for the
+  renderings of the profile's `DispatchJobTemplate`s in the profile namespace, the params the
+  Job admission policy holds each Job to (`jobTemplateRef`), and `perTier: true` (#5646):
+  the profile has one per live tier, each under its tier's ServiceAccount. The
+  unattended-mode tier's param is the profile's own, `kube-agents-dispatch-job-profile-<profile>`,
+  and any other tier's is `kube-agents-dispatch-job-tier-<profile>-<tier>`, where only
+  permit-carrying tasks run. The dispatcher derives each name from the task's (profile,
+  tier), never from the config (#5479), and holds the template's own profile and tier labels
+  to the task's. It reads that object when it launches the Job, with `get` alone on those
+  objects, and uses it only while the object's `kubeagents.x-k8s.io/dispatch-template-hash`
+  annotation matches. The one hash covers every tier's rendering, so a change to any of them
+  moves it on every param of the profile, and the config's entry stays one hash wide however
+  many tiers the profile has. A reference without `perTier` is the unattended-mode tier's
+  template alone, as an operator from before #5646 sends it. The admission policy is
+  unchanged: it holds a Job to the template of the ServiceAccount it runs as, and those are
+  unique per (profile, tier). It reads every param on each Job, so admitting one takes
+  longer as params grow: about 1.3s at 2,500 one-tier profiles and 2.5s at 2,500 two-tier
+  ones, measured in envtest, against a Job's cold start of 30 to 90s. Any mismatch, a
   missing param, or one with no containers keeps that profile's task queued, shows on the
   dispatcher's health as a Job admission error, and leaves every other profile alone. The
   operator writes params before the config, so the usual transient is a param ahead of the
