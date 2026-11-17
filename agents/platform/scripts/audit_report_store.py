@@ -41,10 +41,14 @@ shell or `builtin-schedule:<audit>:<task>` for a profile task writing a
 builtin schedule's stream, from the caller it verified; a caller's own header
 never reaches here. The listener refuses a PUT of a ring entry without one
 that is well formed for the path's audit (400), and keeps it beside the
-envelope as `runs/<stamp>.writer` (REPORT_WRITER_SUFFIX). PUT latest copies
-the matched ring entry's writer to `latest.writer`. GET latest and GET
-runs/<stamp> answer the stored writer in the same header, absent when there is
-none (an envelope written before this, or by the file store directly). The
+envelope as `runs/<stamp>.writer` (REPORT_WRITER_SUFFIX): a small JSON
+object holding the writer and the SHA-256 of the exact envelope bytes it
+describes. PUT latest copies the matched ring entry's sidecar to
+`latest.writer` (the bytes are identical, so is the hash). GET latest and GET
+runs/<stamp> answer the stored writer in the same header only when the
+sidecar's hash is that of the bytes being returned, so a sidecar can never
+vouch for another envelope; otherwise, or with no sidecar (an envelope written
+before this, or by the file store directly), there is no header. The
 envelope's bytes are never changed.
 
 The path is read from the raw request path, not the decoded one, because the
@@ -58,6 +62,7 @@ import binascii
 import contextlib
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -562,7 +567,7 @@ def _refuse_a_future_stamp(stamp: str) -> None:
         raise Refused(400, "the run is stamped in the future")
 
 
-def _validated_writer(writer: str | None, audit_id: str) -> bytes:
+def _validated_writer(writer: str | None, audit_id: str) -> str:
     """The writer header of a PUT of a ring entry, as the sidecar's bytes. 400 unless well formed.
 
     `shell`, or `builtin-schedule:<audit>:<task>` with <audit> the path's own:
@@ -575,32 +580,42 @@ def _validated_writer(writer: str | None, audit_id: str) -> bytes:
         raise Refused(400, f"the {REPORT_WRITER_HEADER} header is not a writer")
     if match.group("audit") is not None and match.group("audit") != audit_id:
         raise Refused(400, f"the {REPORT_WRITER_HEADER} header names another audit")
-    return writer.encode("ascii")
+    return writer
 
 
-def _stored_writer(dir_fd: int, name: str) -> tuple[str | None, int | None]:
-    """A sidecar's writer and mtime (ns), or (None, None) when there is none.
+def _writer_sidecar(writer: str, data: bytes) -> bytes:
+    """The sidecar for `writer` over the envelope `data`: the writer and the envelope's SHA-256."""
+    return json.dumps({"writer": writer, "sha256": hashlib.sha256(data).hexdigest()}, sort_keys=True).encode("ascii")
 
-    A symlink or a non-regular file at the name is a 409, as for an envelope.
-    A sidecar that is not a well-formed writer is no writer: it is not passed on.
+
+def _bound_writer(dir_fd: int, name: str, data: bytes) -> str | None:
+    """The writer the sidecar `name` records for exactly the envelope `data`, or None.
+
+    None when there is no sidecar, when it is not a sidecar (not the JSON
+    object _writer_sidecar writes, or a writer that is not one), and when its
+    hash is not that of `data`: a sidecar describing another envelope (a
+    concurrent write, or a listener without sidecars rewriting the envelope
+    after a rollback) is never passed on. A symlink or a non-regular file at
+    the name is a 409, as for an envelope.
     """
     try:
-        data = _read_at(dir_fd, name)
-        mtime = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mtime_ns
+        raw = _read_at(dir_fd, name)
     except Refused as exc:
         if exc.status == 404:
-            return None, None
+            return None
         raise
-    except FileNotFoundError:
-        return None, None
     try:
-        text = data.decode("ascii")
-    except UnicodeDecodeError:
-        text = ""
-    if not REPORT_WRITER_RE.match(text):
-        LOGGER.warning("ignored a report writer sidecar that is not a writer: %s", _sanitize(name))
-        return None, None
-    return text, mtime
+        sidecar = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        sidecar = None
+    writer = sidecar.get("writer") if isinstance(sidecar, dict) else None
+    digest = sidecar.get("sha256") if isinstance(sidecar, dict) else None
+    if not isinstance(writer, str) or not REPORT_WRITER_RE.match(writer) or not isinstance(digest, str):
+        LOGGER.warning("ignored a report writer sidecar that is not one: %s", _sanitize(name))
+        return None
+    if not secrets.compare_digest(digest, hashlib.sha256(data).hexdigest()):
+        return None
+    return writer
 
 
 def _drop_at(dir_fd: int, name: str) -> None:
@@ -923,21 +938,11 @@ def _handle_store(
 ) -> tuple[int, bytes | list | None, str | None]:
     if rest == ["latest"]:
         if method == "GET":
-            with _DirChain(root, store, create=False) as chain:
+            # Under the store's lock, so a write does not land between the
+            # two reads; the hash binding is what makes a pair never mismatched.
+            with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
                 data = _read_at(chain.fd, REPORT_LATEST_NAME)
-                stored, written = _stored_writer(chain.fd, REPORT_WRITER_LATEST_NAME)
-                # latest.writer is written after latest.json, so it is never
-                # the older of the two; one that is describes a latest.json
-                # written since by a listener that keeps no sidecar (a
-                # rollback), and is not passed on.
-                if stored is not None:
-                    try:
-                        latest_mtime = os.stat(REPORT_LATEST_NAME, dir_fd=chain.fd, follow_symlinks=False).st_mtime_ns
-                    except FileNotFoundError:
-                        latest_mtime = None
-                    if latest_mtime is None or written < latest_mtime:
-                        stored = None
-                return 200, data, stored
+                return 200, data, _bound_writer(chain.fd, REPORT_WRITER_LATEST_NAME, data)
         if method == "PUT":
             data = _validated_body(body)
             try:
@@ -953,7 +958,8 @@ def _handle_store(
                     entry = _ring_match(runs_fd, data)
                     if entry is None:
                         raise Refused(409, "latest must be a copy of a run in the ring")
-                    copied, _ = _stored_writer(runs_fd, entry[: -len(".json")] + REPORT_WRITER_SUFFIX)
+                    # Byte-identical to the entry, so the entry's sidecar binds it too.
+                    copied = _bound_writer(runs_fd, entry[: -len(".json")] + REPORT_WRITER_SUFFIX, data)
                 finally:
                     os.close(runs_fd)
                 # The old writer goes first, so a failure below leaves latest
@@ -961,7 +967,7 @@ def _handle_store(
                 _drop_at(chain.fd, REPORT_WRITER_LATEST_NAME)
                 _write_at(chain.fd, REPORT_LATEST_NAME, data)
                 if copied is not None:
-                    _write_at(chain.fd, REPORT_WRITER_LATEST_NAME, copied.encode("ascii"))
+                    _write_at(chain.fd, REPORT_WRITER_LATEST_NAME, _writer_sidecar(copied, data))
             return 204, None, None
         if method == "DELETE":
             try:
@@ -978,14 +984,18 @@ def _handle_store(
         return 200, [entry[: -len(".json")] for entry in reversed(_ring_of(root, store))], None
     stamp = _validate_stamp(rest[1])
     if method == "GET":
-        with _DirChain(root, store + [REPORT_RUNS_DIR], create=False) as runs:
-            data = _read_at(runs.fd, f"{stamp}.json")
-            stored, _ = _stored_writer(runs.fd, stamp + REPORT_WRITER_SUFFIX)
-            return 200, data, stored
+        with _DirChain(root, store, create=False) as chain, _locked(chain.fd):
+            runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=False)
+            try:
+                data = _read_at(runs_fd, f"{stamp}.json")
+                return 200, data, _bound_writer(runs_fd, stamp + REPORT_WRITER_SUFFIX, data)
+            finally:
+                os.close(runs_fd)
     if method == "PUT":
         _refuse_a_future_stamp(stamp)
-        sidecar = _validated_writer(writer, audit_id)
+        stamp_writer = _validated_writer(writer, audit_id)
         data = _validated_body(body)
+        sidecar = _writer_sidecar(stamp_writer, data)
         with _DirChain(root, store, create=True) as chain, _locked(chain.fd):
             runs_fd = _open_child_dir(chain.fd, REPORT_RUNS_DIR, create=True)
             try:
