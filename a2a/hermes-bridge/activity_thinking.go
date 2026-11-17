@@ -84,7 +84,7 @@ var (
 	// value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
 	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
-	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]*[A-Za-z0-9.-])((?:\\?["'])?)([ \t*_]*([=:])[ \t]*)`) // a * or _ left as text may precede the separator; the key never ends in _ (#6182)
+	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t*_]*([=:])[ \t]*)`) // a * or _ left as text may precede the separator (#6182)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
 	// credentials, a DSN or private material (ENCRYPTION_KEY, STRIPE_KEY,

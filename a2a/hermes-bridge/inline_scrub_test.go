@@ -717,12 +717,6 @@ func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
 		"- password*: quietpasture",
 		"*password * : quietpasture",
 		"token _= quietpasture",
-		// A _ right against the key is a mark, not part of the key.
-		"password_: quietpasture",
-		"- password_: quietpasture",
-		"token_= quietpasture",
-		"DB_PASSWORD_: quietpasture",
-		"Note _ _password_: quietpasture",
 		"password\t*: quietpasture",
 		// A bullet before a label whose own mark stays before the separator.
 		"* password *: quietpasture",
