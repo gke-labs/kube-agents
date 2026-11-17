@@ -1020,7 +1020,7 @@ An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the
 `teams` backend consume the credential broker's Teams queue for every `PlatformAgent` whose
 `integration.teams` is enabled, in place of the Planning Agent's Teams adapter: replies render as
 Adaptive Cards, the gateway's `chat.notify` route posts proactive alerts and reports into
-`integration.teams.homeChannel`, the agent's delivery resolver names Teams (a cron job that names `deliver: teams` was written for the Planning Agent path; use `deliver: chat` on an armed install), and the broker admits the gateway on its Teams routes only on this switch. Off by default,
+`integration.teams.homeChannel`, the agent's delivery resolver names Teams for the roster's scheduled reports (a Hermes cron job that names `deliver: teams` or `deliver: chat` by hand does not reach Teams there: the Hermes scheduler has no Teams platform on an armed install), and the broker admits the gateway on its Teams routes only on this switch. Off by default,
 so an operator upgrade moves no Teams install on its own. `docs/chatops/microsoft-teams.md` in the
 repository has the details.
 
