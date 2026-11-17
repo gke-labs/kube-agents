@@ -114,7 +114,10 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 	}
 	rec.MarkCanceled(ref.ID)
 	rec.setCancelUnsent(ref.ID, err != nil)
-	rec.setStopPending(ref.ID, true)
+	// Pending is set only once the cancel is on the bus, as withdrawBatch and
+	// resendUnsentCancels do: a task whose cancel never went out must not be
+	// retired by the heal's no-first-event check while it can still run.
+	rec.setStopPending(ref.ID, err == nil)
 	if quiet {
 		rec.markQuietCancel(ref.ID)
 	}

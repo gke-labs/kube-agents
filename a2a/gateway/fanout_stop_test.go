@@ -253,6 +253,38 @@ func TestAStopWhoseChildCancelFailsHoldsUntilResent(t *testing.T) {
 	}
 }
 
+// TestAFailedCancelLeavesTheChildNotStopPending: a stopped child whose cancel
+// couldn't be published is marked canceled and CancelUnsent, but not
+// StopPending. StopPending is what lets the heal end a task with nothing on
+// its stream past FirstEventGrace as never started; a child that never got
+// its cancel may still run (a profile child queued at the dispatcher
+// publishes nothing), so only a cancel that reached the bus may mark it, as
+// resendUnsentCancels and withdrawBatch do.
+func TestAFailedCancelLeavesTheChildNotStopPending(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := startStopRig(t, nil)
+	ctx := context.Background()
+	conv := "discord:g1/t-stop-tree-unsent-pending"
+	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	narrowTasksStream(t, r.url, f.session)
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "the children marked canceled, their cancels unsent", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		for _, k := range f.kids {
+			if ref, _ := rec.TaskRefFor(k.ID); !ref.Canceled || !ref.CancelUnsent {
+				return false
+			}
+		}
+		return true
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	for _, k := range f.kids {
+		if ref, _ := rec.TaskRefFor(k.ID); ref.StopPending {
+			t.Fatalf("child %s is StopPending though its cancel never went out", k.ID)
+		}
+	}
+}
+
 // TestAStoppedFanOutReleasesTheConversation: a fan-out of three is stopped,
 // two children confirm and one never starts. The one that never started
 // holds the batch until the heal ends it past FirstEventGrace; then the

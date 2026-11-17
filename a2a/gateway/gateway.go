@@ -1452,6 +1452,15 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			if last, ok := rec.chainLast(root); ok {
 				msg.TaskID = last.ID
 			}
+		} else if ok && isChatStopPress(msg, backend) && activeRef.ID != "" &&
+			root.rootID() == activeRef.rootID() && g.liveNode(ctx, rec, root) {
+			// Google Chat's Stop button on a fan-out child's line: once the
+			// delegating turn's line has closed, the children's lines carry the
+			// only Stop buttons. A press on a child still live in the running
+			// tree is a stop of that tree, so it takes the active task's stop
+			// path (stopTree). A press on a child that has ended stays a stale
+			// button below.
+			msg.TaskID = active.TaskID
 		}
 	}
 	// Google Chat's Stop button with the card stop armed: a press on the
