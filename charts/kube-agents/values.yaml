@@ -1055,7 +1055,9 @@ agentSandbox:
 # reads the env var before anything on the CR, so the pin applies to every
 # PlatformAgent in the cluster. An `upgrade.sh --upgrade-mode=harness` or a
 # Terraform `full` upgrade moves the agent's tag but not these pins, so a
-# pinned tag is moved by hand. An operator.extraEnv entry with the same name
+# pinned tag is moved by hand; that run's image read-back
+# (scripts/confirm_agent_image.sh) leaves a container on a pin out of its
+# verdict. An operator.extraEnv entry with the same name
 # still wins. The broker's per-CR sizing is
 # platformAgent.deployment.credentialProxy below.
 credentialProxy:
