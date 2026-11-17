@@ -12262,13 +12262,14 @@ class DomainScopedFlagsTest(unittest.TestCase):
         """The A2A gateway authenticates one bot token, with Google Chat or without,
         so a list fails there with nothing in the PlatformAgent's status. The help
         text is where a caller choosing the tokens reads the flag."""
-        proc = subprocess.run(
-            ["bash", str(_INSTALL_SH), "--help"],
-            capture_output=True,
-            text=True,
-            env=get_isolated_test_env(),
-            cwd=str(_REPO_ROOT),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+                cwd=str(_REPO_ROOT),
+            )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         help_text = " ".join((proc.stdout + proc.stderr).split())
         self.assertIn(
@@ -13268,10 +13269,12 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                     self.assertIn(f"set {key}= (empty) in install.env", out)
 
     def test_the_flags_are_in_the_help_text(self):
-        proc = subprocess.run(
-            ["bash", str(_INSTALL_SH), "--help"],
-            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+            )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
                      "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",
