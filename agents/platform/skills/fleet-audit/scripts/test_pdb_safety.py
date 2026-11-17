@@ -365,7 +365,6 @@ class PracticeLabelRequestTest(unittest.TestCase):
             ([no_pdb], [], True),
             ([other], [{"name": "kube-agents:auto-merge"}], True),
             ([other], [], False),
-            ([], [{"name": "kube-agents:would-auto-merge"}], True),
         ):
             with self.subTest(findings=findings, labels=labels), \
                     mock.patch.object(audit_report, "forge_has_labels", return_value=True), \
@@ -373,9 +372,21 @@ class PracticeLabelRequestTest(unittest.TestCase):
                     mock.patch.object(audit_report, "sync_remediation_labels"), \
                     mock.patch.object(audit_report, "request_practice_label") as request:
                 pr = {"number": 9, "state": "OPEN", "labels": labels}
-                by_finding = {f["id"]: pr for f in findings} or {"no-pdb.manual": pr}
-                audit_report.sync_open_remediation_labels("acme/infra", "a", findings, by_finding)
+                audit_report.sync_open_remediation_labels("acme/infra", "a", findings, {f["id"]: pr for f in findings})
                 self.assertEqual(request.call_args_list, [mock.call("acme/infra", "9")] if asked else [])
+
+    def test_a_labelled_fix_whose_finding_stayed_manual_is_asked_from_the_listing(self):
+        finding = {"id": "no-pdb.f-1", "check": "no-pdb", "severity": "medium", "remediation": {"kind": "manual"}}
+        pr = {"number": 9, "state": "OPEN", "headRefName": "platform-agent/x",
+              "labels": [{"name": "kube-agents:auto-merge"}]}
+        by_finding, _ = audit_report.reconcile_remediation_prs("a", [finding], [pr])
+        self.assertFalse(any(by_finding.values()))
+        for listed, asked in ((None, []), ([pr], [mock.call("acme/infra", "9")])):
+            with self.subTest(listed=listed), \
+                    mock.patch.object(audit_report, "forge_has_labels", return_value=True), \
+                    mock.patch.object(audit_report, "request_practice_label") as request:
+                audit_report.sync_open_remediation_labels("acme/infra", "a", [finding], by_finding, listed)
+                self.assertEqual(request.call_args_list, asked)
 
     def test_the_label_names_are_the_brokers(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))

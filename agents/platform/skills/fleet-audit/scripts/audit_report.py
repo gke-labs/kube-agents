@@ -17119,6 +17119,7 @@ def sync_open_remediation_labels(
     audit_id: str,
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
+    listed: list[dict] | None = None,
 ) -> None:
     """Re-assert the labels on every open remediation pull request this run saw.
 
@@ -17175,8 +17176,10 @@ def sync_open_remediation_labels(
         ):
             request_practice_label(repo, number)
     # A labelled fix whose finding is not a manifest group this run (left
-    # `manual`, or not re-planned) is asked about too, so its label can come off.
-    for pr in pr_by_finding.values():
+    # `manual`, or not re-planned) has no entry in `pr_by_finding`, so the
+    # run's listing (`listed`) is walked for it: the broker re-judges it and
+    # takes the label off itself.
+    for pr in listed or []:
         number = str((pr or {}).get("number", "") or "")
         if number and number not in seen and str(pr.get("state", "")).upper() == "OPEN" and carries_practice_label(pr):
             seen.add(number)
@@ -23463,11 +23466,8 @@ def handle_remediate(args: argparse.Namespace) -> None:
     if issue_number is None and on_forge:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
-    pr_by_finding, _ = reconcile_remediation_prs(
-        audit_id,
-        findings,
-        remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id),
-    )
+    listed = remediation_prs if remediation_prs is not None else list_remediation_prs(repo, audit_id)
+    pr_by_finding, _ = reconcile_remediation_prs(audit_id, findings, listed)
     # Routed through the same gate as every other promotion, so an explicit
     # request cannot force-push over a pull request someone is reviewing.
     #
@@ -23507,7 +23507,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"{fid} already has an open remediation pull request "
             f"({pr.get('url') or '#' + str(pr.get('number', '?'))}); not replacing it."
         )
-    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, listed)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         revival = (
@@ -24712,7 +24712,7 @@ def _finish_store_ledger(
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation {noun}; not replacing it.")
     if findings and listing_refusal is None:
-        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, remediation_prs)
         comment_on_merged_but_persisting(repo, audit_id, findings, claimed, now, noun=noun)
 
     # Retiring a fix asserts that its finding no longer reproduces: not over a
@@ -26886,7 +26886,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
-    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding, remediation_prs)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         log(
