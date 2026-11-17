@@ -222,6 +222,46 @@ MUTATIONS: list[Mutation] = [
         "pod has no store token, and its pods' tokens are not the broker's",
     ),
     Mutation(
+        "A3-report-writer-shell-for-every-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role == CALLER_ROLE_SHELL:\n        return REPORT_WRITER_SHELL\n",
+         "    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE):\n        return REPORT_WRITER_SHELL\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every permitted write `shell`, since the broker already decided "
+        "the caller may write -- a profile task's run then reads as the shell's, "
+        "and the A2A relay cannot tell which task wrote it",
+    ),
+    Mutation(
+        "A3-report-writer-task-is-the-profile",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        task_id = getattr(task, \"task\", None)\n",
+         "        task_id = getattr(task, \"profile\", None)\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp the profile instead of the task, as the allowlist names profiles "
+        "-- every task of the profile then wrote every run, and the relay cannot "
+        "hold a report to the task that asked for it",
+    ),
+    Mutation(
+        "A3-report-writer-caller-header-kept",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if caller_headers is not None:\n            del caller_headers[REPORT_WRITER_HEADER]\n",
+         "        if caller_headers is not None:\n            pass\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "leave the caller's header in place, since the relay builds its own "
+        "headers -- until a change forwards the request's headers and a caller "
+        "names its own writer",
+    ),
+    Mutation(
+        "A3-report-writer-on-every-write",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            if rule is None and method == \"PUT\" and report_route_kind(path) == REPORT_ROUTE_RUN:\n",
+         "            if rule is None:\n"),
+        "test_A3_the_broker_stamps_the_report_writer_from_the_verified_caller",
+        "stamp every write, latest and DELETE included -- the listener copies "
+        "latest's writer from the matched run, and a stamp sent there is one it "
+        "must then be trusted to ignore",
+    ),
+    Mutation(
         "A3-report-no-role-is-shell",
         "agents/platform/scripts/credential_proxy.py",
         ("    if role == CALLER_ROLE_SHELL:\n        pass\n",
