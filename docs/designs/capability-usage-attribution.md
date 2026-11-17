@@ -32,17 +32,18 @@ Ten questions define success for this design and the sized test fleet design tog
 numbered C1 to C10 in both. This design owns the seven below; the sized test fleet design owns C5,
 C6 and C7 (container headroom, every audit finishing with no crash, and the time to a new install's
 first reports). A criterion is met when the report answers it for M on 7 nights in a row and for L
-on 4 weeks in a row, from runs the two checks under The report mark sound.
+on 4 weeks in a row, from runs that the sized test fleet's verdict marks sound and the two checks
+under The report also mark sound.
 
-| #   | Question                                                           | The report shows                                                                                                                                                                                            |
-| --- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C1  | What does kube-agents cost a month on an S, M or L fleet?          | For each size: the monthly model-token cost and memory cost from the monthly estimate, beside the test fleet's own infrastructure cost from the run's cost record, kept apart.                              |
-| C2  | What does each capability cost, a run and a month, at each size?   | The table for each capability: memory and tokens a run, the cost of each unit of work it starts, the month, and the cost a cluster, with a row for each size.                                               |
-| C3  | Which five capabilities use most of the memory and the tokens?     | The overview tables for each size and window: the five largest, Other, the platform base and Unattributed, adding up to 100 %.                                                                              |
-| C4  | How does a new install's first hours compare with a normal day?    | The burst window's and the soak window's totals and rates an hour, side by side for each size, and the first-run flow's one-time cost.                                                                      |
-| C8  | Which capability grows faster than the fleet?                      | The flag on each capability whose cost a cluster rises by more than 20 % from M to L, with both figures.                                                                                                    |
-| C9  | What does one chat question cost, and how long does the user wait? | For each scripted chat question and size: its tokens and cost, and its opening turn's time (`turn1_s`) and the full answer's time (`latency`), as the eval harness records them.                            |
-| C10 | How much model quota does each size need at its peak?              | For each size and window: the highest token rate over any one minute (input, cached input and output tokens a minute), the install's and each of the five largest capabilities', and the requests a minute. |
+| #   | Question                                                           | The report shows                                                                                                                                                                                                                                                                                    |
+| --- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | What does kube-agents cost a month on an S, M or L fleet?          | For each size: the monthly model-token cost and memory cost from the monthly estimate, with the rows it marks (events and units at the test fleet's rate, chat at the scripted rate, audits as first runs), beside the test fleet's own infrastructure cost from the run's cost record, kept apart. |
+| C2  | What does each capability cost, a run and a month, at each size?   | The table for each capability: memory and tokens a run, the cost of each unit of work it starts, the month, and the cost a cluster, with a row for each size.                                                                                                                                       |
+| C3  | Which five capabilities use most of the memory and the tokens?     | The overview tables for each size and window: the five largest, Other, the platform base and platform services (memory only), and Unattributed, adding up to 100 %.                                                                                                                                 |
+| C4  | How does a new install's first hours compare with a normal day?    | The burst window's and the soak window's totals and rates an hour, side by side for each size, and the first-run flow's one-time cost.                                                                                                                                                              |
+| C8  | Which capability grows faster than the fleet?                      | The flag on each capability whose cost a cluster rises by more than 20 % from M to L, with both figures.                                                                                                                                                                                            |
+| C9  | What does one chat question cost, and how long does the user wait? | For each scripted chat question and size: its tokens and cost, and its opening turn's time (`turn1_s`) and the full answer's time (`latency`), as the eval harness records them.                                                                                                                    |
+| C10 | How much model quota does each size need at its peak?              | For each size and window: the highest token rate over any one minute (input, cached input and output tokens a minute), the install's and each of the five largest capabilities', and the requests a minute.                                                                                         |
 
 ## Questions the report answers
 
@@ -58,20 +59,22 @@ For each fleet size and each window:
    size.
 
 Questions 1 to 3 have an overview table whose rows are the five largest capabilities, Other, the
-platform base and Unattributed; the rows add up to 100 % of the measured total. Question 4 has a
+platform base and platform services (memory only), and Unattributed; the rows add up to 100 % of
+the measured total. Question 4 has a
 table for every capability, so a capability that is too small for the overview is not hidden in
 Other.
 
 ## Terms
 
-| Term           | Meaning                                                                                                                                                   |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Capability     | A named job of the agent. The list is fixed, below.                                                                                                       |
-| Capability tag | The capability's name, carried on a model call (as request metadata) and on a process (as an environment variable).                                       |
-| Platform base  | Each install container's idle memory, measured once at the start of the run before any capability runs, and held fixed for the run. A row of its own.     |
-| Unattributed   | Memory or tokens that no tag and no rule below assigns to a capability. A row of its own. A tagging gap shows here; the target is below 5 % of the total. |
-| Memory-time    | Memory used, integrated over time, in GiB-hours. It drives cost. The peak drives the container limit.                                                     |
-| Input tokens   | Prompt tokens not read from the model's cache. Cached input tokens are counted apart, so no token is counted twice.                                       |
+| Term              | Meaning                                                                                                                                                                                                                                                                        |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Capability        | A named job of the agent. The list is fixed, below.                                                                                                                                                                                                                            |
+| Capability tag    | The capability's name, carried on a model call (as request metadata) and on a process (as an environment variable).                                                                                                                                                            |
+| Platform base     | Each install container's idle memory, measured once at the start of the run before any capability runs, and held fixed for the run. A row of its own.                                                                                                                          |
+| Platform services | The memory above the platform base of the containers that carry no capability tag and that no rule below divides: the operator, the token minter, the web console, the A2A bus, the event watcher's `agent-api-auth` container and the log forwarder. A memory row of its own. |
+| Unattributed      | Memory or tokens that no tag and no rule below assigns to a capability, the platform base or platform services. A row of its own. A tagging gap shows here; the target is below 5 % of the total.                                                                              |
+| Memory-time       | Memory used, integrated over time, in GiB-hours. It drives cost. The peak drives the container limit.                                                                                                                                                                          |
+| Input tokens      | Prompt tokens not read from the model's cache. Cached input tokens are counted apart, so no token is counted twice.                                                                                                                                                            |
 
 ## The capability list
 
@@ -82,12 +85,13 @@ The two rosters are `agents/platform/cron/jobs.json`, the Platform Agent's audit
 `agents/chat/defaults/cron/jobs.json`, the Chat Agent's jobs: `profile-cron-tick`, which ticks the
 other profiles' rosters every minute, `cluster-agent-reconcile`, the inventory jobs and `oobe`.
 
-Beyond the rosters, five rows:
+Beyond the rosters, six rows:
 
 | Capability      | Started by                                                                                                                       |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | First-run flow  | The `oobe` job's inventory scan and its cards, before the first-run audits start. Each first-run audit is its audit's row.       |
 | Incident triage | A session the event watcher opens.                                                                                               |
+| GitOps drift    | An inject the drift detector raises for an out-of-band change, and the work it starts.                                           |
 | Chat            | A chat turn. Which skills a turn loaded is read after the run from the session record and reported inside this row.              |
 | Memory service  | The Hindsight memory service's own model calls and memory, when the install enables it.                                          |
 | Session Pods    | The Pods that `delegate` and `/session` start under `spec.mode: next`, each under the capability of the session that started it. |
@@ -103,9 +107,9 @@ forward:
   (`agents/platform/scripts/stall_watch.py`) hands each new stall episode to that route as a
   `controller-stall` inject; the server posts the alert and starts a Planning Agent turn, which
   files one card to the cluster's Cluster Agent, which runs `gke-stall-detection`. Each inject
-  carries its origin's tag (`stall-watch`, `incident-triage` for the event watcher, the drift
-  detector's id), and the turn and the card it starts inherit it. So the stall watch's row holds
-  its sweeps and every investigation they start.
+  carries its origin's tag (`stall-watch`, `incident-triage` for the event watcher, `gitops-drift`
+  for the drift detector), and the turn and the card it starts inherit it. So the stall watch's row
+  holds its sweeps and every investigation they start.
 - **Any other card** carries the tag of the session that created it.
 
 ## Tokens
@@ -128,7 +132,25 @@ The first implementation step needs no runtime change. Hermes stores token count
 row in each profile's `state.db`: `input_tokens`, `output_tokens`, `cache_read_tokens`,
 `cache_write_tokens` and `reasoning_tokens`, which `bench/kube_agents_bench/worker_trajectory.py`
 already reads. A cron session's id names its job (`cron_<job>_<date>_<time>`), and the row has a
-`source` column, so the report joins each session to its capability after the run. Model calls made
+`source` column, so the report joins each session to its capability after the run. A card's worker
+session joins to its card through the card's run: by `task_runs.metadata.worker_session_id` where
+the run records it, else by the worker's opening prompt, `work kanban task <id>`, as
+`bench/kube_agents_bench/worker_trajectory.py` maps it. The card then takes its capability from the
+first rule below that applies:
+
+1. A card whose idempotency key starts with `bootstrap-`, as the first-run flow's script files
+   them, counts under First-run flow.
+2. A card that names a roster job's id counts under that job.
+3. A card that another card's worker filed counts under that card, through
+   `kanban_worker_children` on the board. So an audit's fan-out of Cluster Agent cards counts
+   under the audit.
+4. Any other card takes the capability of the session that filed it (`tasks.session_id`).
+5. A top-level card whose filing session left no record, as in a pruned profile, falls back to
+   its origin stamp in `kanban_task_origins`: `chat` counts under Chat and `event` under Incident
+   triage. The stamp `event` also covers the stall watch's injects, so this fallback cannot tell
+   the two apart.
+
+A subagent's session takes its parent session's capability. Model calls made
 outside a Hermes session, such as the memory service's, land in Unattributed in this form. The
 first nightly runs measure this form against LiteLLM's own totals; the per-call tag follows if
 Unattributed is above 5 %.
@@ -138,8 +160,12 @@ Unattributed is above 5 %.
 Memory is sampled every 15 seconds in each install container. The containers are every container
 of every Pod in the install's namespace: the gateway Pod, the shell sandbox, the credential broker,
 the kube-proxy, LiteLLM, the event watcher, the A2A bus, the operator, the token minter, the web
-console when enabled, and the session Pods. A container that serves no single capability (the
-operator, the minter, the console, the A2A bus) contributes only platform base and Unattributed.
+console when enabled, and the session Pods. A container that carries no capability tag and that no
+rule below divides contributes only platform base and platform services: the operator, the minter,
+the console, the A2A bus, the event watcher's `agent-api-auth` container and the log forwarder
+(`fluent-bit`). So their growth under load is not read as a tagging gap. Across the scale runs in
+`bench/scale/harness-limits.json`, `agent-api-auth` ranged from 114 to 342 MiB and `fluent-bit`
+from 40 to 91 MiB, while the bus stayed between 7 and 12 MiB and the operator between 26 and 35.
 
 The container total comes from Cloud Monitoring, the series the runner already reads:
 `kubernetes.io/container/memory/used_bytes` with `memory_type=non-evictable`. Within a container,
@@ -186,15 +212,20 @@ proportion, so their sum does not equal the container's figure. Each sample fits
    target is Unattributed.
 
 Unattributed memory is therefore the scaled size of what no tag explains, and it is not spread over
-the tagged capabilities.
+the tagged capabilities. A platform service's container skips the fit: its whole target is platform
+services.
 
 **Where the samplers run.** In the shell sandbox, the root memory guard proposed for the sandbox
 (`deploy/sandbox/shell-memory-guard.py`) walks `/proc` every 15 seconds and writes one log line
 with each tag's memory. This is a new walk beside the guard's own, not a reuse: the guard reads
-process sizes only near its watermark. In the gateway Pod, the sampler runs inside the
-`platform-agent` container itself, beside the existing cgroup memory sample of the gateway's
-lifecycle ledger (`deploy/docker/patches/apply_cgroup_memory_sample.py`). A separate container
-would need `shareProcessNamespace`, which the operator leaves unset on purpose.
+process sizes only near its watermark. In the gateway Pod, the sampler is a thread of the gateway
+process in the `platform-agent` container, beside the existing cgroup memory sample of the
+gateway's lifecycle ledger (`deploy/docker/patches/apply_cgroup_memory_sample.py`). Neither sampler
+starts a process to take a sample. The gateway Pod runs under gVisor, where a process start costs
+far more than on the node, so a sampler that started one every 15 seconds would fall behind and
+change the figures it records. Each sampler records its own CPU time, from the thread's CPU clock,
+and the size of the state it keeps, so the report shows what the measurement costs. A separate
+container would need `shareProcessNamespace`, which the operator leaves unset on purpose.
 
 **Tags are data, and environments hold secrets.** A sampler reads `/proc/<pid>/environ` and takes
 the one key `KUBE_AGENTS_CAPABILITY`; it never logs or keeps any other variable. It caches the tag
@@ -234,6 +265,7 @@ weekday job about 21.7.
   row as a scripted load.
 - **The first-run flow:** once an install, a line of its own, outside the monthly total.
 - **The platform base:** its memory, times 730 hours.
+- **Platform services:** their memory-time an hour in the soak window, times 730 hours.
 
 The cost of each row:
 
@@ -253,7 +285,8 @@ capability included, with the tokens, the memory-time, the estimated share, the 
 units counted, and the cost. A Markdown report from the records has three parts.
 
 **The overview.** For each size and window, a memory table and a token table, each with the five
-largest capabilities, Other, the platform base and Unattributed, adding up to 100 %, and a table of
+largest capabilities, Other, the platform base and platform services (memory only), and
+Unattributed, adding up to 100 %, and a table of
 the monthly estimate and its cost.
 
 **A table for each capability.** One table a capability, with a row for each size. Its columns:
@@ -307,11 +340,15 @@ Each item is its own pull request, after this design merges and the sized test f
 1. **Tokens from the session records.** `bench/kube_agents_bench/scale/attribution.py` joins each
    profile's sessions to their capabilities and checks the sum against LiteLLM's counters. No
    runtime change. A session that an inject started is joined through the inject's record, which
-   names its kind (`controller-stall`, an event, a drift), to the capability that raised it.
+   names its kind (`controller-stall`, an event, a drift), to the capability that raised it; a
+   card's worker session through its card to the session that filed it. A sampler reads LiteLLM's
+   token and request counters every 15 seconds for the peak rate (C10); `collect.py` reads only
+   the token counters today, and only before and after a window.
 2. **The process tags and samplers.** The Session KV server's tag on each inject-started turn and
    its card; `KUBE_AGENTS_CAPABILITY` at each separate process's start,
-   carried over SSH and checked against the list; the shell sampler and the gateway sampler; the
-   broker's and kube-proxy's tag on each request log line.
+   carried over SSH and checked against the list; the shell sampler, which needs the proposed shell
+   memory guard first, and the gateway sampler; the broker's and kube-proxy's tag on each request
+   log line.
 3. **The memory report.** The fit to the container figures, the shared-process estimate, the two
    checks, the monthly estimate and the cost, with unit tests on recorded samples. Its shared-process
    estimate uses equal shares among live sessions, which needs only the session records.
