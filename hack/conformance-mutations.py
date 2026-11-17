@@ -94,6 +94,16 @@ MUTATIONS: list[Mutation] = [
         "forge read no task target confines",
     ),
     Mutation(
+        "A3-report-credential-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
+         "        if False:\n"),
+        "test_A3_a_report_credential_reaches_the_audit_report_routes_alone",
+        "let a report credential reach every route, since a fleet audit only "
+        "ever calls the store -- until its model output calls /v1/exec with "
+        "no target to confine it",
+    ),
+    Mutation(
         "A3-profile-reaches-gke-mcp",
         "agents/platform/scripts/mcp_policy.py",
         ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
@@ -107,7 +117,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-mcp-without-task",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if principal.task is None:\n        return (\n",
+        ("    if principal.task is None or getattr(principal.task, \"report_only\", False):\n        return (\n",
          "    if False:\n        return (\n"),
         "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
         "let a warm profile pod between tasks read through the MCP relay "
@@ -2328,6 +2338,64 @@ Mutation(
         "gateway pod carries with another value, the half-done label migration: "
         "the fence still names the Deployment, selects no pod, and the API "
         "server reports that as success",
+    ),
+    Mutation(
+        "C1-report-store-admits-every-pod",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    - from:\n        - podSelector:\n            matchLabels:\n"
+         "              app: platformagent-credential-proxy\n"
+         "              kubeagents.x-k8s.io/component: credential-proxy\n"
+         "      ports:\n        - port: 8700\n",
+         "    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8700\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "admit every pod in the namespace to the report store, since the "
+        "listener checks the broker's token anyway -- the sandbox and every "
+        "session pod then reach the fleet-audit memory on the pod network",
+    ),
+    Mutation(
+        "C1-report-store-range-takes-in-8700",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      ports:\n        - port: 8700\n          protocol: TCP\n",
+         "      ports:\n        - port: 8700\n          protocol: TCP\n"
+         "    - ports:\n        - endPort: 65535\n          port: 1\n          protocol: TCP\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "add the keep-everything-else-open rule with one range, 1-65535, "
+        "instead of two that step over 8700 -- added to the gateway policy's "
+        "allowlist, it opens the store and every other port to every source",
+    ),
+    Mutation(
+        "C1-report-store-separate-policy",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n",
+         "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n"
+         "  name: platformagent-report-store\n  namespace: kubeagents-system\nspec:\n"
+         "  podSelector:\n    matchLabels:\n      app: platformagent-gateway\n"
+         "  policyTypes:\n    - Ingress\n"
+         "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"),
+        "test_C1_only_the_broker_reaches_the_audit_report_store_listener",
+        "render the store's rule as a policy of its own, easier to read -- until "
+        "an operator rollback leaves it behind and it alone isolates the gateway "
+        "pod to the broker",
+    ),
+    Mutation(
+        "C1-report-store-pod-prefix-unreserved",
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("\tauditReportStoreAllowedSubjectEnv,\n\tauditReportStoreAllowedPodPrefixEnv,\n",
+         "\tauditReportStoreAllowedSubjectEnv,\n"),
+        "test_C1_the_report_store_listener_reads_only_reserved_env",
+        "leave the pod-prefix name off the reserved list since only the "
+        "operator renders it -- a CR then sets it to the exec tier's prefix and "
+        "every exec pod's token passes as the broker",
+    ),
+    Mutation(
+        "C1-report-store-api-server-from-env",
+        "agents/platform/scripts/audit_report_store.py",
+        ("    base = api_server.rstrip(\"/\")\n",
+         "    base = (os.environ.get(\"AUDIT_REPORT_STORE_API_SERVER\") or api_server).rstrip(\"/\")\n"),
+        "test_C1_the_report_store_listener_reads_only_reserved_env",
+        "let an install point the JWKS fetch at a proxy -- a CR then points it at "
+        "a server of its own, hands it the pod's token, and signs broker tokens",
     ),
     Mutation(
         "C1-session-pod-gets-a-second-token",

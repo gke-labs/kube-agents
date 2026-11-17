@@ -3755,7 +3755,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
-	// of its own, once the bus is provisioned (a2aBridgeInPod). It takes the executor environment every task-executing
+	// of its own, from the first render (a2aBridgeInPod). It takes the executor environment every task-executing
 	// sidecar gets, like a declared bridge does. See platformagent_a2a_bridge.go.
 	if a2aBridgeInPod(agent) {
 		for _, c := range containers {
@@ -4558,16 +4558,20 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		// Starts three of the image's four peer services — the API authenticator,
-		// the k8s-event-watcher, and the drift-detector where it is enabled. See
+		// Starts the image's peer services for this pod: the API authenticator,
+		// the k8s-event-watcher, the drift-detector where it is enabled, and the
+		// audit-report store listener (on the pod IP, port 8700, behind the
+		// gateway policy and its own token check). See
 		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
-		Ports: []corev1.ContainerPort{
+		Ports: append([]corev1.ContainerPort{
 			{Name: "proxy-api", ContainerPort: 8643},
 			// The watcher's /metrics, for the chart's PodMonitoring (see eventWatcherMetricsPort).
 			{Name: eventWatcherMetricsPortName, ContainerPort: eventWatcherMetricsPort},
-		},
+			// And the audit-report store listener's, which the Service
+			// <agent>-report-store targets by name.
+		}, auditReportStoreSidecarPorts(agent)...),
 		// TCP, not the HTTP probe the credential proxy uses. Every path on this
 		// listener requires the bearer key, so an unauthenticated GET is a 401
 		// whether the pod is healthy or not, and there is no /healthz to ask
@@ -4666,6 +4670,10 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
 		)
 	}
+	// The audit-report store listener's switch and subject
+	// (audit_report_store.go). This container runs it: the PVC and the pod's
+	// API-audience token, which the listener reads the JWKS with, are here.
+	envVars = append(envVars, auditReportStoreSidecarEnv(agent)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
@@ -5231,6 +5239,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		agentv1alpha1.CloudSDKUniverseDomainEnv,
 		agentv1alpha1.KubeProxyUniverseDomainEnv,
 	} {
+		reserved[name] = struct{}{}
+	}
+	// The audit-report store's names (auditReportStoreEnvNames).
+	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
 
@@ -7145,6 +7157,13 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			Port:     ptr.To(intstr.FromInt32(dashboardPort)),
 		})
 	}
+
+	// The audit-report store listener on agent-api-auth: the broker's pods
+	// alone, to its port (auditReportStoreIngressRule). Here rather than in a
+	// policy of its own, so a rollback to an operator that renders this policy
+	// without it drops it, and spec.networkPolicy.enabled false takes it with
+	// the policy.
+	ingressRules = append(ingressRules, auditReportStoreIngressRule(agent))
 
 	// The managed-Prometheus collector, scraping the event watcher's metrics
 	// port on the agent-api-auth sidecar. A rule of its own rather than a port
