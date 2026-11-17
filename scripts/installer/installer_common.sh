@@ -4729,7 +4729,7 @@ recover_secret_keys_from_live_secret() {
   if [ "$read_rc" -ne 0 ]; then
     # This Secret's own 404 only: kubectl prints (NotFound) for any 404,
     # including a proxy or gateway in front of the API server.
-    if printf '%s' "$read_err" | grep -qF "secrets \"${PLATFORM_AGENT_SECRET}\" not found"; then
+    if [[ "$read_err" == *"secrets \"${PLATFORM_AGENT_SECRET}\" not found"* ]]; then
       return 0
     fi
     if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
