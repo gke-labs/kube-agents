@@ -607,11 +607,13 @@ SECRET_READ_COMMAND_RE = re.compile(
 # Where the rule cannot read, it decides on less. Text with an unclosed quote
 # is read line by line; one such line, such text of many lines, a long
 # substitution and a line of many substitutions withhold when a dump starts a
-# line or a command, or a token printer stands anywhere (`UNSPLIT_LINE_RE`). A
-# command that costs more than
-# `MAX_READ_STEPS` to walk withholds when any of its words names a dump word
-# or `gcloud`, and a call past its read budget (`MAX_READ_CHARS_FACTOR`)
-# withholds.
+# line or a command, or when a `gcloud` token printer, another tool's name
+# with its printer path, or a language's environment name stands anywhere
+# (`UNSPLIT_LINE_RE`, `UNSPLIT_PRINTER_RES`). A command that costs more than
+# `MAX_READ_STEPS` to walk withholds when any of its words names a dump word,
+# `gcloud`, another tool with a token printer or an interpreter
+# (`WALK_LIMIT_COMMAND_WORDS`), and a call past its read budget
+# (`MAX_READ_CHARS_FACTOR`) withholds.
 #
 # `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
 # but the ones named here, which print no token, and a flag right behind
@@ -650,33 +652,45 @@ TOKEN_PRINTER_PATHS = {
     "oc": (("create", "token"),),
 }
 # Another language's print of its whole environment, as inline code
-# (`python3 -c '...os.environ...'`, `node -e '...process.env...'`), also
-# behind a tool that runs the interpreter (`uv run python -c ...`). Served,
-# because they print no value of the whole: a read of one variable by a
-# literal name (`os.environ["HOME"]`, `process.env.HOME`), a method that
-# reads or sets one (`.get(`, `.setdefault(`, `.pop(`, `.update(`), `.keys()`
-# and `Object.keys(...)`, a membership test of a literal name
-# (`"X" in os.environ`), and the environment handed on or taken apart
-# (`env=os.environ`, `env={**os.environ, ...}`, `{env: process.env}`,
-# `const { NAME } = process.env`). A subscript by a variable withholds
-# (`os.environ[k]` in a loop over the names). A code file and code on
-# standard input are not read.
+# (`python3 -c '...os.environ...'`, `node -e '...process.env...'`, the code
+# behind the flag or in one word with it), also behind a tool that runs the
+# interpreter (`uv run python -c ...`). Served, because they print no value
+# of the whole: a read of one variable by a whole literal name
+# (`os.environ["HOME"]`, `os.environ.get("HOME")`, `process.env.HOME`),
+# `.update(`, `.keys()` and `Object.keys(...)`, a membership test of a
+# literal name (`"X" in os.environ`), the environment as a call's `env`
+# argument (`run(..., env=os.environ)`, `env={**os.environ, ...}`), a
+# destructuring of named variables (`const { NAME } = process.env`), and the
+# import itself (`from os import environ`). A subscript or a `.get(` by a
+# variable withholds (`os.environ[k]` in a loop over the names), and so does
+# an assignment of the whole to a variable (`env = os.environ.copy()`): the
+# rule cannot follow the variable to a print, so it decides closed. A code
+# file and code on standard input are not read.
 PYTHON_BINARY_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?)$")
-PYTHON_CODE_FLAG = "c"
-PYTHON_ENVIRONMENT_RE = re.compile(
-    r"""(?:(?<!\w)os|__import__\(\s*['"]os['"]\s*\))\.environb?\b(?!\s*(?:\[\s*['"]|\.(?:get|setdefault|pop|update|keys)\s*\())"""
+PYTHON_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?c")
+_ENVIRONMENT_LITERAL_KEY = r"""\[\s*(?:'[^']*'|"[^"]*")\s*\]"""
+_PYTHON_ENVIRONMENT_ONE_VARIABLE = (
+    r"(?!\s*(?:" + _ENVIRONMENT_LITERAL_KEY + r"""|\.(?:get|setdefault|pop)\s*\(\s*['"]|\.(?:update|keys)\s*\())"""
 )
-PYTHON_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\benv\s*=\s*(?:\{\*\*|dict\()?|['"]\s+(?:not\s+)?in\s+)$""")
+PYTHON_ENVIRONMENT_RE = re.compile(r"""(?:(?<!\w)os|__import__\(\s*['"]os['"]\s*\))\.environb?\b""" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
+# `from os import environ` makes the bare name the environment.
+PYTHON_ENVIRONMENT_IMPORT_RE = re.compile(r"\bfrom\s+os\s+import\b[^;\n]*\benvironb?\b")
+PYTHON_IMPORTED_ENVIRONMENT_RE = re.compile(r"(?<![\w.])environb?\b" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
+PYTHON_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(
+    r"""(?:[(,]\s*env\s*=\s*(?:\{\*\*|dict\()?|['"]\s+(?:not\s+)?in\s+|\bimport\s+(?:\w+\s*,\s*)*)$"""
+)
 NODE_BINARIES = frozenset(("node", "nodejs"))
-NODE_CODE_FLAGS = ("e", "p")
+NODE_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?[ep]")
 NODE_CODE_LONG_FLAGS = frozenset(("--eval", "--print"))
-NODE_ENVIRONMENT_RE = re.compile(r"""(?<!\w)process\.env\b(?!\s*(?:\.[A-Za-z_$]|\[\s*['"]))""")
-NODE_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\benv\s*:\s*|\}\s*=\s*|Object\.keys\(|['"]\s+in\s+)$""")
+NODE_ENVIRONMENT_RE = re.compile(r"(?<!\w)process\.env\b(?!\s*(?:\.[A-Za-z_$]|" + _ENVIRONMENT_LITERAL_KEY + r"))")
+NODE_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\{[^{}.]*\}\s*=\s*|Object\.keys\(|['"]\s+in\s+)$""")
 # How much text ahead of the environment's name the served forms are read in.
 CODE_LOOKBACK_CHARS = 32
-# Tools that run a command in a project's environment (`uv run python ...`,
-# `npx node ...`): any later word that names a command may be it.
-PACKAGE_RUNNER_WORDS = frozenset(("uv", "poetry", "pipenv", "npx"))
+# Tools that run a command in a project's environment. `npx` runs its
+# operand; `uv`, `poetry` and `pipenv` run one behind `run`, as `docker`
+# does (`uv venv env` names a folder).
+PACKAGE_RUNNER_WORDS = frozenset(("npx",))
+PACKAGE_RUN_VERB_WORDS = frozenset(("uv", "poetry", "pipenv"))
 # The environment: `env` with no command behind its options, and `printenv`,
 # `export`, `declare`, `typeset` or `readonly` with no name, print all of it;
 # bare `set` prints every variable. With a name, `printenv` and a declaring
@@ -743,11 +757,13 @@ EVAL_WORD_JOIN = " "
 # host env`); ahead of the `--` a later word that names a command still
 # counts, since the `--` may be the inner command's (`ssh host printenv --
 # NAME`).
-REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl"))
+REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl")) | PACKAGE_RUN_VERB_WORDS
 REMOTE_COMMAND_VERBS = frozenset(("exec", "run"))
 OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock")) | PACKAGE_RUNNER_WORDS
 OPERAND_AND_COMMAND_WIDTH = 2
-REMOTE_NAMED_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | SHELL_BINARIES | NODE_BINARIES | frozenset(TOKEN_PRINTER_PATHS)
+# A walk past its step limit withholds on one of these words, or an interpreter's name, anywhere on the command.
+WALK_LIMIT_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | NODE_BINARIES | frozenset(TOKEN_PRINTER_PATHS)
+REMOTE_NAMED_COMMAND_WORDS = WALK_LIMIT_COMMAND_WORDS | SHELL_BINARIES
 # A word that may be an argument names a command by its bare name or by a path into a `bin` directory.
 BINARY_DIRECTORY_SUFFIX = "bin"
 FIND_BINARY = "find"
@@ -836,10 +852,21 @@ _UNSPLIT_DUMP = (
     + SET_BUILTIN
     + r"[ \t]*)"
 )
+# Another tool's printer there: the tool's name as a word, and its path's
+# words together, each anywhere in the text (two searches, each linear).
+UNSPLIT_PRINTER_RES = tuple(
+    (
+        re.compile(rf"(?<![\w-]){re.escape(tool)}(?![\w-])"),
+        re.compile(r"(?<![\w-])" + r"\s+".join(re.escape(word) for word in path) + r"(?![\w-])"),
+    )
+    for tool, paths in sorted(TOKEN_PRINTER_PATHS.items())
+    for path in paths
+)
 UNSPLIT_LINE_RE = re.compile(
     r"(?:^|[\n;&|])[ \t]*" + _UNSPLIT_DUMP + r"(?=[\n;|&<>#]|$)"
     r"|\$\([ \t]*" + _UNSPLIT_DUMP + r"(?=[;|&<>)])"
     r"|(?<![\w-])(?:" + "|".join(sorted(GCLOUD_TOKEN_PRINTERS)) + r")(?![\w-])"
+    r"|(?<!\w)os\.environ|(?<!\w)process\.env\b"
 )
 
 
@@ -1987,17 +2014,36 @@ def _code_prints_environment(code: str, environment_re: "re.Pattern[str]", serve
     return False
 
 
+def _python_code_prints_environment(code: str) -> bool:
+    """Whether inline Python code uses its whole environment, under `os.environ` or under the name it imports from `os`."""
+    if _code_prints_environment(code, PYTHON_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE):
+        return True
+    return bool(PYTHON_ENVIRONMENT_IMPORT_RE.search(code)) and _code_prints_environment(
+        code, PYTHON_IMPORTED_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE
+    )
+
+
+def _inline_codes(rest: Sequence[str], flag_re: "re.Pattern[str]", long_flags: frozenset) -> List[str]:
+    """The words after an interpreter that may be its inline code; none when no word is a code flag.
+
+    Every word may be the code, and so may the text behind a code flag in one
+    word with it (`-c'print(1)'` is the word `-cprint(1)`).
+    """
+    flags = [flag_re.match(word) for word in rest]
+    if not any(flags) and not any(word.partition(EQUALS_SEPARATOR)[0] in long_flags for word in rest):
+        return []
+    return [*rest, *(word[flag.end() :] for word, flag in zip(rest, flags) if flag)]
+
+
 def _interpreter_prints_environment(base: str, rest: Sequence[str]) -> bool:
     """Whether an interpreter's inline code, among the words after it, prints its whole environment."""
     if PYTHON_BINARY_RE.match(base):
-        if any(_is_flag_cluster_with(word, PYTHON_CODE_FLAG) for word in rest):
-            return any(_code_prints_environment(word, PYTHON_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE) for word in rest)
-    elif base in NODE_BINARIES:
-        if any(
-            word.partition(EQUALS_SEPARATOR)[0] in NODE_CODE_LONG_FLAGS or any(_is_flag_cluster_with(word, flag) for flag in NODE_CODE_FLAGS)
-            for word in rest
-        ):
-            return any(_code_prints_environment(word, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE) for word in rest)
+        return any(_python_code_prints_environment(code) for code in _inline_codes(rest, PYTHON_CODE_FLAG_RE, frozenset()))
+    if base in NODE_BINARIES:
+        return any(
+            _code_prints_environment(code, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE)
+            for code in _inline_codes(rest, NODE_CODE_FLAG_RE, NODE_CODE_LONG_FLAGS)
+        )
     return False
 
 
@@ -2055,7 +2101,7 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
             continue
         steps += len(words) - start
         if steps > MAX_READ_STEPS:
-            return any(_is_named_word(word, TOKEN_OR_ENVIRONMENT_COMMAND_WORDS) for word in words)
+            return any(_is_named_word(word, WALK_LIMIT_COMMAND_WORDS) or PYTHON_BINARY_RE.match(_base_word(word)) for word in words)
         behind = start + 1
         rest = words[behind:]
         if base in TOKEN_PRINTER_PATHS and _runs_token_printer(TOKEN_PRINTER_PATHS[base], words, behind):
@@ -2246,6 +2292,13 @@ def _substitution_texts(text: str) -> Optional[List[str]]:
     return texts
 
 
+def _unsplit_text_prints(text: str) -> bool:
+    """Whether text the rule cannot read as words holds a dump, a token printer or an environment name (see `UNSPLIT_LINE_RE`)."""
+    if UNSPLIT_LINE_RE.search(text):
+        return True
+    return any(tool_re.search(text) and path_re.search(text) for tool_re, path_re in UNSPLIT_PRINTER_RES)
+
+
 def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) -> bool:
     """Whether a shell line, read as words and operators, holds a command that prints a token or the environment."""
     budget[0] -= len(text) + READ_COST_CHARS
@@ -2265,7 +2318,7 @@ def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
         lines = [line for line in text.split(LINE_BREAK) if _holds_print_fragment(line)] if LINE_BREAK in text else []
         if lines and len(lines) <= MAX_READ_LINES:
             return any(_text_prints_token_or_environment(line, depth, budget) for line in lines)
-        return bool(UNSPLIT_LINE_RE.search(text))
+        return _unsplit_text_prints(text)
     segment: List[str] = []
     here_strings: List[str] = []
     foreign = False
@@ -2325,10 +2378,10 @@ def _text_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
     # A `$(...)` runs inside double quotes too, where the line's words do not show it.
     substitutions = _substitution_texts(text)
     if substitutions is None:
-        return bool(UNSPLIT_LINE_RE.search(text))
+        return _unsplit_text_prints(text)
     for inner in substitutions:
         if len(inner) > MAX_READ_SUBSTITUTION_CHARS:
-            if UNSPLIT_LINE_RE.search(inner):
+            if _unsplit_text_prints(inner):
                 return True
         elif _line_prints_token_or_environment(inner, depth, budget):
             return True
