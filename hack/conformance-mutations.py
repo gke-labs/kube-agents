@@ -71,8 +71,7 @@ MUTATIONS: list[Mutation] = [
          "        if False:\n"),
         "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
         "leave the a2a-chat audience to decide, since only the A2A gateway's pod "
-        "projects it -- until any allowed caller that projects that audience "
-        "holds the A2A gateway's role on its Chat event routes",
+        "projects it -- the role is then bound to no identity at all",
     ),
     Mutation(
         "A3-a2a-chat-gateway-any-audience",
@@ -81,8 +80,8 @@ MUTATIONS: list[Mutation] = [
          "        if False:\n"),
         "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
         "let the A2A gateway's account present any audience, since its pod "
-        "projects only the a2a-chat one -- until a pod running as that account "
-        "projects the shell audience and holds the shell role",
+        "projects only the a2a-chat one -- the binding then holds in one "
+        "direction only",
     ),
     Mutation(
         "A3-a2a-chat-binding-not-rendered",
@@ -102,7 +101,7 @@ MUTATIONS: list[Mutation] = [
         "test_A3_the_exec_tier_keeps_the_a2a_chat_binding",
         "leave the a2a-chat binding off the exec tier beside its audience, since "
         "that tier runs no Chat relay -- the A2A gateway stays an allowed caller "
-        "there and may present the shell audience to /v1/exec",
+        "there with no binding to hold it",
     ),
     Mutation(
         "A3-a2a-chat-callers-env-renamed",

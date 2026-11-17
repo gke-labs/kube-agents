@@ -265,8 +265,8 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 	}
 	// The A2A gateway stays an allowed caller on the exec tier while Chat is
 	// armed, so the binding that holds it to the a2a-chat audience (which
-	// this tier never confers) must come along, or the gateway's account
-	// could present the shell audience here (#6090).
+	// this tier never confers) comes along: here it refuses the gateway's
+	// identity every audience (#6090).
 	if got := env[credentialProxyA2AChatCallersEnvVar].Value; got != "system:serviceaccount:ns:a2a-gateway" {
 		t.Errorf("exec pod %s = %q, want the A2A gateway's binding carried over", credentialProxyA2AChatCallersEnvVar, got)
 	}

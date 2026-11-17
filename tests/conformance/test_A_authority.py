@@ -2102,8 +2102,8 @@ class A3TheA2AChatRoleIsTheA2AGatewaysAlone(unittest.TestCase):
 
     def test_A3_the_exec_tier_keeps_the_a2a_chat_binding(self) -> None:
         # The exec tier inherits the broker's allowed callers, the A2A gateway
-        # among them while Chat is armed. Without the binding there, that
-        # account may present the shell audience to /v1/exec.
+        # among them while Chat is armed, so it carries the binding too and
+        # refuses the gateway's identity every audience.
         self.assertNotRegex(
             h.text("exec_tier_env_go"),
             r"credentialProxyA2AChatCallersEnvVar:\s*true",
