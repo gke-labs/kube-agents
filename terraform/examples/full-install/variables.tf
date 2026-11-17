@@ -1048,7 +1048,7 @@ variable "drift_pubsub_source_sink_writer_identity_overrides" {
   nullable    = false
 
   validation {
-    condition     = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" || (can(tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))) && alltrue([for project, member in tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides)) : member == "" || can(regex("^serviceAccount:.+@.+$", member))]))
+    condition     = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" || try(alltrue([for project, member in tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides)) : member == "" || can(regex("^serviceAccount:.+@.+$", member))]), false)
     error_message = "drift_pubsub_source_sink_writer_identity_overrides is a JSON object of project ID to principal, each principal carrying the \"serviceAccount:\" prefix (or empty for no override), or an empty string."
   }
 }

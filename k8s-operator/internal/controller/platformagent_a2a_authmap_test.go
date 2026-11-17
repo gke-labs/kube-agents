@@ -22,15 +22,16 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
-	"time"
 )
 
 // calloutFixturePath is the rendered map the a2a module's callout parses in its
@@ -86,10 +87,18 @@ func TestRenderedAuthMapCarriesEveryCalloutPrincipalAndNoStaticOne(t *testing.T)
 	// A static principal in the map would be served by BOTH the callout and
 	// the config's auth_users exemption, and which one answered would depend
 	// on how the client happened to connect.
+	//
+	// The gateway is the one exception, for the window between its token
+	// entry landing and its static user going (#5301): the two are keyed
+	// apart, by password and by ServiceAccount token, and the gateway's
+	// A2A_GATEWAY_BUS_AUTH picks which it presents (gatewayCalloutEntry).
 	for _, id := range staticIdentities(agent) {
-		if got[id.user] {
+		if got[id.user] && id.user != a2aGatewayUser {
 			t.Errorf("static principal %q is in the callout map; it is authenticated by nats.conf and must not be in both", id.user)
 		}
+	}
+	if !got[a2aGatewayUser] {
+		t.Errorf("the gateway's token entry is missing from the map; a gateway on A2A_GATEWAY_BUS_AUTH=token would be refused at connect")
 	}
 
 	if doc.Version != version {
@@ -433,6 +442,39 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"7": {"account", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"8": {"account", "denyPublish", "denySubscribe", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+}
+
+// The schema constant is the newest version the table records, and each
+// version's keys include every key of the one before it: a map shape is only
+// ever extended. Two pull requests that each claim the next number for
+// different fields meet here (or as a duplicate map key) rather than in a
+// callout that refuses the merged map.
+func TestTheIdentityMapSchemaTableOnlyGrows(t *testing.T) {
+	var versions []int
+	for v := range a2aIdentityMapSchemaKeys {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("schema version %q is not a number", v)
+		}
+		versions = append(versions, n)
+	}
+	slices.Sort(versions)
+	if got := strconv.Itoa(versions[len(versions)-1]); got != a2aIdentityMapSchema {
+		t.Errorf("a2aIdentityMapSchema is %q, but the newest version recorded is %s", a2aIdentityMapSchema, got)
+	}
+	for i := 1; i < len(versions); i++ {
+		prev, cur := a2aIdentityMapSchemaKeys[strconv.Itoa(versions[i-1])], a2aIdentityMapSchemaKeys[strconv.Itoa(versions[i])]
+		for _, k := range prev {
+			if !slices.Contains(cur, k) {
+				t.Errorf("schema %d drops %q, which %d had", versions[i], k, versions[i-1])
+			}
+		}
+		if len(cur) <= len(prev) {
+			t.Errorf("schema %d adds no key over %d", versions[i], versions[i-1])
+		}
+	}
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -460,6 +502,12 @@ func a2aJSONKeys(v any, into map[string]bool) {
 // read it.
 func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
 	agent := a2aTestAgent()
+	// With a three-to-one run in its pin phase, so the per-run principal and
+	// its notAfter are rendered too; the run does not freeze, so the profile
+	// below is still in the map.
+	agent.Status.BusReplicas = 3
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
 
 	// With a profile that has topics, and the dispatcher's bucketed entry
 	// with a draining profile, so every key the renderer can emit is
@@ -522,5 +570,52 @@ func TestTheSchemaAnnotationIsOnThePodTemplateNotTheDeployment(t *testing.T) {
 	}
 	if len(dep.Spec.Template.ObjectMeta.Annotations) == 0 {
 		t.Fatal("the callout pod template carries no annotations at all, so no schema change can roll it")
+	}
+}
+
+// The gateway's map entry and its static user deny the same subjects (#5301):
+// the entry is live the moment it renders, so a token for the gateway's
+// ServiceAccount must be refused wherever the password is, the bound and
+// draining profiles' five-token supervisor subjects above all.
+func TestTheGatewaysMapEntryDeniesWhatItsStaticUserDenies(t *testing.T) {
+	agent := a2aTestAgent()
+	withDispatcher(t)
+	auditor := testAgentProfile(agent.Namespace, "auditor")
+	draining := []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 1800,
+		Durables: []a2aDispatchDurable{}, DrainingUntil: time.Date(2026, 11, 6, 12, 45, 0, 0, time.UTC)}}
+	profiles := []agentv1alpha1.AgentProfile{auditor}
+	doc, err := renderA2AAuthMapDraining(agent, profiles, draining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deny []string
+	for _, id := range doc.Identities {
+		if id.User == a2aGatewayUser {
+			deny = id.Grants.DenyPublish
+		}
+	}
+	for _, want := range []string{"a2a.tasks.auditor.*.supervisor", "a2a.tasks.gone.*.supervisor"} {
+		if !slices.Contains(deny, want) {
+			t.Errorf("the gateway's map entry does not deny %q; a token for its ServiceAccount could forge that profile's terminals", want)
+		}
+	}
+
+	names, _ := dispatcherGrantNames(agent, profiles, draining)
+	conf := renderA2AStaticUsers(agent, func(string) string { return "pw" }, a2aAccountControl, names)
+	start := strings.Index(conf, "user: "+a2aGatewayUser+"\n")
+	if start < 0 {
+		t.Fatal("no static gateway block in the render")
+	}
+	block := conf[start:]
+	if end := strings.Index(block, "\n"+a2aUserBlockIndent+"}"); end >= 0 {
+		block = block[:end]
+	}
+	for _, subject := range deny {
+		if !strings.Contains(block, `"`+subject+`"`) {
+			t.Errorf("the map entry denies %q and the static gateway does not", subject)
+		}
+	}
+	if got, want := strings.Count(block, `"`), 0; got == want {
+		t.Fatal("the static gateway block quotes no subjects; the comparison is vacuous")
 	}
 }

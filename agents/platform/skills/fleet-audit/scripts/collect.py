@@ -7,7 +7,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
+twenty-five-check roster (§3.1–§3.25 of `governance/obtainability_audit_sop.md`),
 `compliance-audit`'s eighteen-check roster (§2.1–§2.18 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
@@ -222,6 +222,35 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # the broker path.
 PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 PLATFORM_SCRIPT_DIR_DEPTH = 3
+
+# §3.25 `hpa-aggressive-scaledown`: autoscaling/v2 `behavior.scaleDown`
+# defaults and thresholds. Kubernetes defaults `stabilizationWindowSeconds` to
+# 300, `selectPolicy` to `Max`, and `policies` to 100% per 15 seconds; only an
+# explicit stabilization window below 60 seconds exposes the workload to immediate
+# post-burst contraction. A `Percent` policy at or above 50 removes at least
+# half the running replicas in one period.
+HPA_AGGRESSIVE_SCALEDOWN_SLUG = "hpa-aggressive-scaledown"
+CHECK_KIND_CLUSTER = "cluster"
+SEVERITY_MAJOR = "major"
+# S2, the label GKE stamps on the add-ons it manages; shared by HPA, Service
+# and compliance checks whose objects do not pass through `normalize_workloads`.
+_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
+DEFAULT_HPA_SCALEDOWN_STABILIZATION_SECONDS = 300
+HPA_AGGRESSIVE_SCALEDOWN_MAX_STABILIZATION_SECONDS = 60
+DEFAULT_HPA_SCALEDOWN_SELECT_POLICY = "Max"
+HPA_SELECT_POLICY_DISABLED = "Disabled"
+HPA_SELECT_POLICY_MIN = "Min"
+HPA_POLICY_TYPE_PERCENT = "Percent"
+DEFAULT_HPA_SCALEDOWN_PERCENT_VALUE = 100
+DEFAULT_HPA_SCALEDOWN_PERIOD_SECONDS = 15
+HPA_AGGRESSIVE_SCALEDOWN_PERCENT_FLOOR = 50
+HPA_HIT_COMMA_JOIN = ", "
+IMPACT_HPA_AGGRESSIVE_SCALEDOWN = (
+    "When traffic subsides after a burst, the autoscaler removes a large share "
+    "of running pods in a single period with little or no stabilization window "
+    "while the containers receive SIGTERM immediately with no preStop wait, "
+    "dropping connections in flight and flapping capacity on brief load dips."
+)
 
 
 def _platform_script_dirs() -> tuple[str, ...]:
@@ -1329,9 +1358,10 @@ def hpas_by_namespace(dump: dict) -> dict[str, list[dict]]:
 def _hpa_is_owned(hpa: dict) -> bool:
     """An HPA carrying `ownerReferences`, KEDA's `ScaledObject` included.
 
-    Skipped only by the checks that grade the HPA's own `min`/`max` (3.6,
-    3.22): on an owned HPA those are a copy the operator writes from a CRD
-    this audit cannot read, so grading them grades a projection. The checks
+    Skipped only by the checks that grade the HPA's own `min`/`max` or
+    `behavior` (3.6, 3.22, 3.25): on an owned HPA those are a copy the operator
+    writes from a CRD this audit cannot read, so grading them grades a
+    projection. The checks
     that ask whether a workload is autoscaled at all (3.4, 3.5, 3.11) keep
     it -- a KEDA-scaled Deployment is autoscaled, and its floor is the one
     KEDA wrote. This is not `_defers_to_owner`: a workload owned by a CRD
@@ -2517,6 +2547,139 @@ def check_hpa_floors_at_one(context: dict) -> list[dict]:
                 }
             )
     return hits
+
+
+def _scaledown_policy_is_aggressive(policy: object) -> bool:
+    """Whether one `HPAScalingPolicy` removes at least half the replicas in a period."""
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("type") != HPA_POLICY_TYPE_PERCENT:
+        return False
+    value = policy.get("value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return value >= HPA_AGGRESSIVE_SCALEDOWN_PERCENT_FLOOR
+
+
+def check_hpa_aggressive_scaledown(context: dict) -> list[dict]:
+    """§3.25 -- an HPA whose `behavior.scaleDown` sets `stabilizationWindowSeconds`
+    below 60 with an aggressive `Percent` scale-down policy on a workload whose
+    containers declare no `lifecycle.preStop` hook.
+
+    Kubernetes defaults `behavior.scaleDown.stabilizationWindowSeconds` to 300
+    seconds and `policies` to 100% per 15 seconds under `selectPolicy: Max`.
+    With the 300-second window intact, that default policy waits out post-burst
+    dips; overriding `stabilizationWindowSeconds` below 60 exposes the 100%
+    step immediately when metrics fall, and a target container with no
+    `preStop` hook receives `SIGTERM` before callers stop sending work to it.
+    """
+    workloads = {(w["ns"], w["kind"], w["name"]): w for w in context["workloads"]}
+    hits = []
+    for ns, hpas in context["hpas"].items():
+        if _is_system_namespace(ns):  # S1
+            continue
+        for hpa in hpas:
+            meta = hpa.get("metadata") or {}
+            if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):  # S2
+                continue
+            if _hpa_is_owned(hpa):
+                continue
+            spec = hpa.get("spec") or {}
+            floor = spec.get("minReplicas")
+            if not isinstance(floor, int) or isinstance(floor, bool):
+                floor = DEFAULT_HPA_MIN_REPLICAS
+            max_replicas = spec.get("maxReplicas")
+            if not isinstance(max_replicas, int) or isinstance(max_replicas, bool) or max_replicas <= floor:
+                continue
+            behavior = spec.get("behavior")
+            if not isinstance(behavior, dict):
+                continue
+            scale_down = behavior.get("scaleDown")
+            if not isinstance(scale_down, dict):
+                continue
+            select_policy = scale_down.get("selectPolicy") or DEFAULT_HPA_SCALEDOWN_SELECT_POLICY
+            if select_policy == HPA_SELECT_POLICY_DISABLED:
+                continue
+            stabilization = scale_down.get("stabilizationWindowSeconds")
+            if stabilization is None:
+                stabilization = DEFAULT_HPA_SCALEDOWN_STABILIZATION_SECONDS
+            if (
+                not isinstance(stabilization, int)
+                or isinstance(stabilization, bool)
+                or stabilization >= HPA_AGGRESSIVE_SCALEDOWN_MAX_STABILIZATION_SECONDS
+            ):
+                continue
+            raw_policies = scale_down.get("policies")
+            if raw_policies is None or raw_policies == []:
+                policies = [
+                    {
+                        "type": HPA_POLICY_TYPE_PERCENT,
+                        "value": DEFAULT_HPA_SCALEDOWN_PERCENT_VALUE,
+                        "periodSeconds": DEFAULT_HPA_SCALEDOWN_PERIOD_SECONDS,
+                    }
+                ]
+                policies_defaulted = True
+            elif isinstance(raw_policies, list):
+                policies = [p for p in raw_policies if isinstance(p, dict)]
+                if not policies:
+                    continue
+                policies_defaulted = False
+            else:
+                continue
+            aggressive = [p for p in policies if _scaledown_policy_is_aggressive(p)]
+            if select_policy == HPA_SELECT_POLICY_MIN:
+                if len(aggressive) != len(policies):
+                    continue
+            elif not aggressive:
+                continue
+            target = spec.get("scaleTargetRef") or {}
+            if (
+                target.get("apiVersion") != _WORKLOAD_API_VERSION
+                or target.get("kind") not in SCALABLE_WORKLOAD_KINDS
+            ):
+                continue
+            workload = workloads.get((ns, target.get("kind"), target.get("name")))
+            if workload is None:
+                continue
+            services = _selecting_services(workload, context)
+            candidate_containers = (
+                _containers_behind_a_service(workload, _routing_services(services))
+                if services and _exposure_scope(services) == _SCOPE_SERVING
+                else _effective_containers(workload)
+            )
+            missing = [
+                c.get("name", "")
+                for c in candidate_containers
+                if c.get("name") not in _SELF_HEALTH_SIDECARS
+                and not (c.get("lifecycle") or {}).get("preStop")
+            ]
+            if not missing:
+                continue
+            grace = workload["template"].get("terminationGracePeriodSeconds")
+            if grace is None:
+                grace = DEFAULT_GRACE_PERIOD_S
+            policy_summary = HPA_HIT_COMMA_JOIN.join(
+                f"{p.get('value')}% per {p.get('periodSeconds')}s" for p in aggressive
+            )
+            if policies_defaulted:
+                policy_summary += " (API default)"
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"HorizontalPodAutoscaler/{meta.get('name', '')}",
+                    "excerpt": (
+                        f"behavior.scaleDown: stabilizationWindowSeconds={stabilization}, "
+                        f"selectPolicy={select_policy}, policies={policy_summary}; "
+                        f"scaling {workload['kind']}/{workload['name']} "
+                        f"(minReplicas={floor}, maxReplicas={max_replicas})\n"
+                        f"target containers with no preStop hook: "
+                        f"{HPA_HIT_COMMA_JOIN.join(missing)} (terminationGracePeriodSeconds={grace})"
+                    ),
+                    "reconciler": reconciler_of(meta),
+                    "release": release_of(meta),
+                }
+            )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
 
 
 _HOSTNAME_KEY = "kubernetes.io/hostname"
@@ -6806,11 +6969,6 @@ _INTERNAL_LB_ANNOTATION_VALUE = "Internal"
 # `spec.ports[].protocol` when the field is omitted.
 _DEFAULT_SERVICE_PROTOCOL = "TCP"
 
-# S2, the label GKE stamps on the add-ons it manages. Named here rather than
-# repeated as a literal because this is the first Service-scoped check to apply
-# the suppression; the workload-scoped ones inherit it from `normalize_workloads`.
-_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
-
 _IMPACT_LB_WORLD_OPEN = (
     "This Service holds a public load-balancer address that forwards a "
     "management or datastore port straight to its pods, with no source-range "
@@ -7590,6 +7748,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "major",
         None,
         _IMPACT_UNTARGETED_COMPUTE_CLASS,
+    ),
+    CheckSpec(
+        HPA_AGGRESSIVE_SCALEDOWN_SLUG,
+        CHECK_KIND_CLUSTER,
+        check_hpa_aggressive_scaledown,
+        SEVERITY_MAJOR,
+        None,
+        IMPACT_HPA_AGGRESSIVE_SCALEDOWN,
     ),
 )
 
@@ -8792,12 +8958,12 @@ _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
 # Cluster-kind checks that match against `collected.workloads`, so an empty
 # workload set leaves them nothing to examine exactly as it does a workload
 # check: a PDB is only graded against the workload it covers, and an HPA's
-# floor only against the Service-backed workload it scales. Compliance's two
+# floor or scale-down behavior only against the workload it scales. Compliance's two
 # automount checks iterate the workload set too. `netpol-missing` does not: it
 # reads `pod_namespaces`, every namespace holding a live Pod, so it still has
 # something to examine on a cluster whose workloads are all out of scope.
 _WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({
-    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one",
+    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", HPA_AGGRESSIVE_SCALEDOWN_SLUG,
     "default-sa-automount", "unbound-sa-automount",
 })
 

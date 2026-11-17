@@ -2,6 +2,7 @@ Subject: Run the sample app on a supported Node.js base image
 
 Why: the sample runs the newest Node.js release, ahead of upstream. Dependabot moved the end-of-life `node:18-slim` to `node:26-slim` (#829); upstream has since moved only to `node:22-slim`. Later bumps edit this patch.
 Local-Issue: none (Dependabot bump #829)
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Upstream-Issue: none filed yet
 Retire-When: upstream's sample uses `node:26-slim` or newer
 

@@ -2,14 +2,12 @@
 # HorizontalPodAutoscaler scales its Deployment down with no stabilization
 # window (stabilizationWindowSeconds 0 where Kubernetes defaults to 300; the
 # 100 percent per 15 seconds policy is the Kubernetes default), and the
-# containers declare no preStop hook; no obtainability check reads the
-# scale-down behavior. A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#4941).
+# containers declare no preStop hook; check 3.25 (`hpa-aggressive-scaledown`)
+# reads the scale-down behavior and target container lifecycle.
 id: workload-hpa-scaledown-and-missing-prestop
 name: "HPA Scale-Down With No Stabilization Window on a Workload With No preStop Hook (HPA scale-down check)"
 domain: reliability
 suite: certification
-expected_fail: true
 audit_streams:
   - obtainability-audit
 fixtures: []

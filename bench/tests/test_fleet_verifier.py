@@ -89,6 +89,9 @@ from kube_agents_bench.verifiers import FleetResourcePropertyVerifier
 
 _REPO = Path(__file__).resolve().parents[2]
 _BENCH = _REPO / "bench"
+# What seeds a pool project's GitOps repository, the home of a catalog
+# `repository/<path>` subject.
+_PROVISION_SCRIPT = _REPO / "scripts" / "provision_ci_pool_project.sh"
 _CATALOG = _BENCH / "tf" / "fleet" / "fixtures.json"
 
 
@@ -1043,14 +1046,24 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
     for role, entry in _catalog()["roles"].items():
         if entry["cluster_slot"] is None:
             # A project-scoped probe, `<kind>/<name-prefix>*`: the Terraform
-            # names the object `<name-prefix>${var.cluster_prefix}`.
+            # names the object `<name-prefix>${var.cluster_prefix}`. A network
+            # is the one kind named whole: bare, where a repository declaration
+            # has to spell the object without knowing the prefix (the
+            # declared-mtu-peering network), or as the project's own `default`,
+            # which the stack references as `global/networks/<name>` in a
+            # peering and never plants. The bare form is accepted for networks
+            # alone, so a mistyped instance probe cannot ride on a pool's name.
             for probe in entry["probes"]:
                 seen += 1
-                prefix = probe.split("/", 1)[1].removesuffix("*")
-                assert re.search(rf'name\s*=\s*"{re.escape(prefix)}\$\{{var\.cluster_prefix\}}"', main), (
+                kind, prefix = probe.split("/", 1)
+                prefix = prefix.removesuffix("*")
+                prefixed = rf'name\s*=\s*"{re.escape(prefix)}\$\{{var\.cluster_prefix\}}"'
+                whole = rf'name\s*=\s*"{re.escape(prefix)}"|global/networks/{re.escape(prefix)}"'
+                pattern = f"{prefixed}|{whole}" if kind == "network" else prefixed
+                assert re.search(pattern, main), (
                     f"project-scoped role {role!r} probes for {probe!r}, but no stack "
                     f"file outside the defects files declares a name {prefix!r} followed "
-                    "by ${var.cluster_prefix}"
+                    "by ${var.cluster_prefix}" + (", bare, or as global/networks/" + prefix if kind == "network" else "")
                 )
             continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
@@ -1335,6 +1348,76 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 }
 
 
+# The ComputeClass fixtures on slot c (defects-c.tf): the workload that names
+# the class through nodeAffinity alone. `present` is what the remediation
+# would write; `absent` is the object as planted.
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "ccc-prefilter-nodeaffinity-bypass/audit-did-not-add-the-compute-class-selector"
+] = {
+    # What `kubectl patch deployment app-worker-b -n seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'` writes.
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-b", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-b"}},
+                "spec": {
+                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchExpressions": [
+                                            {
+                                                "key": "cloud.google.com/compute-class",
+                                                "operator": "In",
+                                                "values": ["general-ccc"],
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-b", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-b"}},
+                "spec": {
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchExpressions": [
+                                            {
+                                                "key": "cloud.google.com/compute-class",
+                                                "operator": "In",
+                                                "values": ["general-ccc"],
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+}
+
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.
 
@@ -1454,7 +1537,7 @@ YAML
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
-  "compute instances list"|"compute firewall-rules list")
+  "compute instances list"|"compute firewall-rules list"|"compute networks list")
     # A project-scoped probe. Planted by default: prints one name with the
     # filter's prefix. STUB_COMPUTE_ABSENT lists `<collection>:<prefix>` pairs
     # that are not there; STUB_COMPUTE_FAIL fails every list.
@@ -1882,7 +1965,7 @@ def test_the_runner_publishes_a_project_role_as_its_confirmed_list_alone(shell, 
         assert not any(line.startswith(f"slot.{role}=") for line in context), role
         for probe in entry["probes"]:
             kind, prefix = probe.split("/", 1)
-            collection = {"instance": "instances", "firewall": "firewall-rules"}[kind]
+            collection = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}[kind]
             assert f"compute {collection} list --project kube-agents-evals --filter=name ~ ^{prefix[:-1]} --format=value(name)" in log
 
 
@@ -2500,12 +2583,28 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
         path.read_text() for path in sorted(fleet_dir.glob("*.tf")) if not path.name.startswith("defects-")
     )
     seen = 0
+    provisioning = _PROVISION_SCRIPT.read_text()
+
+    def seeded_by_provisioning(role: str, subject: str) -> bool:
+        """A `repository/<path>` subject, on a cluster role or a project-scoped
+        one: a file in the pool project's GitOps repository, planted by
+        scripts/provision_ci_pool_project.sh, not by the Terraform, as one
+        of its `readonly GITOPS_*_PATH` variables."""
+        if not subject.startswith("repository/"):
+            return False
+        assert re.search(rf'^readonly GITOPS_\w+_PATH="{re.escape(subject[len("repository/"):])}"$', provisioning, re.M), (
+            f"role {role!r} asserts on {subject!r}, but scripts/provision_ci_pool_project.sh seeds no such path"
+        )
+        return True
+
     for role, entry in _catalog()["roles"].items():
         if entry["cluster_slot"] is None:
             # `<kind>/<name-prefix>*`: every subject must be one of the role's
             # probes, which the probe test above ties to the Terraform.
             for assertion in entry["state"]:
                 seen += 1
+                if seeded_by_provisioning(role, assertion["subject"]):
+                    continue
                 assert assertion["subject"] in entry["probes"], (role, assertion["subject"])
             continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
@@ -2515,6 +2614,9 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
             if subject == "cluster":
                 # The GKE cluster itself, which main.tf declares for every slot
                 # (test_the_catalog_agrees_with_the_terraform_it_sits_beside).
+                continue
+            if seeded_by_provisioning(role, subject):
+                seen += 1
                 continue
             if "?" in subject:
                 selector = subject.split("?", 1)[1]

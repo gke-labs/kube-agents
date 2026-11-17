@@ -329,15 +329,6 @@ Each caller splits its suites into a gate and tolerated coverage. `blocking_suit
 
 Both pipelines' gating jobs install and test the A2A stack, which every install runs; the chat test's reply wait is 300 seconds wherever it runs. [`scripts/release/README.md`](../../scripts/release/README.md#what-happens-to-the-rc-cluster) owns what the RC pipeline does to the cluster and the run.
 
-### Against autopush-next
-
-A fourth, [`.github/workflows/autopush-next-e2e-gchat.yml`](../../.github/workflows/autopush-next-e2e-gchat.yml), runs `gchat_agent_test.py` alone every three hours against `autopush-next`, outside `e2e-run.yml` and its gate-and-tolerated split, so the forged event reaches the A2A gateway's Google Chat adapter. It gates nothing. It reads its variables from the `autopush-next` GitHub environment. Until three are set there, a separate readiness job posts a notice and the E2E job shows as skipped, never passed. Once they are set, the readiness job comes out, so an environment that later loses one reds the run instead of skipping it:
-
-- `E2E_GCP_SERVICE_ACCOUNT` and `E2E_GCP_WORKLOAD_IDENTITY_PROVIDER`: the service account and the provider resource name `provision_ci_iam.sh` prints when run with `--gcp_project kube-agents-autopush-next --git_project gke-labs/kube-agents` ("Provision CI Service Account & Workload Identity Federation" above). The service account needs `roles/pubsub.publisher` on the topic; the script grants it on `platform-agent-chat-events` only, so an environment with another `CHAT_TOPIC_NAME` needs the grant by hand. Check it with `gcloud pubsub topics get-iam-policy`, because Terraform owns the topic and a recreated topic does not keep the grant.
-- `E2E_CHAT_SPACE_ID`: a variable, not a secret, so the repository-scoped secret of that name, which names `autopush`'s space, never stands in for it. The `autopush-next` Chat app must be a member.
-
-`E2E_TEST_USER_EMAIL` optionally names the forged sender (the service account otherwise). The gateway admits it only while it is on the environment's `ALLOWED_USERS`, or while `ALLOWED_USERS` is unset and `GOOGLE_CHAT_ALLOW_ALL_USERS` is `true`. The three OTA secrets fall through from the repository unless the environment sets its own. The app is DM-only until a Workspace exception lets it join a space, and app authentication cannot read a DM, so a DM target needs the OTA secrets of that DM's human member set on the environment. The forged event still names the target a `SPACE`, so the gateway answers in the prompt's thread instead of through its DM conversation keying: the run proves ingress, the agent's turn and the reply, not DM threading.
-
 ### Triggering Workflow via GitHub CLI (`gh`):
 
 ```bash

@@ -278,7 +278,15 @@ previous run's stored report (`ledger_document` when the previous run held the o
 `impact`. It also keeps the previous `recommendation` and `remediation` together, but not when
 either side is `manifest` or names a path, not when the previous one is `manual` and this run's is
 not, and not when `finish` wrote part of either note, other than the route notes, which are stripped
-and written again. A carried note loses the route notes of the previous run, which `finish` writes
+and written again. The previous pair is also not kept when it would not pass validation (an unknown
+`kind`, a `note` that is not a string), or when one of its commands fails a rule in `CARRY_RULES`
+and this run's commands pass: a `gcloud container clusters update` for another cluster than the
+finding's, or a literal range for a flag whose value the SOP leaves to the cluster's owner
+(`OWNER_SUPPLIED_FLAGS`). A rule gives no verdict on a command it cannot read, and when this run's
+pair fails too the previous pair stays. The rules read what a finding publishes, and nothing else
+judges whether a carried remediation is right. On a scheduled close that replays the stored
+document (§3.7), this run's pair is the stored pair, so a stored remediation stays until the next
+full run. A carried note loses the route notes of the previous run, which `finish` writes
 again from this run's manifest (the issue-ledger design, §6). When the previous run cut the worker's
 note to give the route notes room, the stored `uncut_note` comes back as the note. So the check for
 text that `finish` wrote reads `uncut_note` as well as the note.
