@@ -5,6 +5,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,31 +55,89 @@ func a2aDeploymentFullyOnTemplate(dep *appsv1.Deployment) bool {
 		dep.Status.AvailableReplicas >= desired
 }
 
-// a2aProfileSupervisorReaders are the Deployments whose containers read a
-// profile task's terminal: the A2A gateway, the agent pod (hermes-bridge), and
+// a2aSupervisorReader is one workload whose container reads a profile task's
+// terminal, and the image this operator renders for that container from its
+// own release defaults.
+type a2aSupervisorReader struct {
+	name      string
+	container string
+	image     string
+	// optional readers that aren't deployed don't hold the gate: one
+	// rendered later is this release's, which reads both forms.
+	optional bool
+}
+
+// a2aProfileSupervisorReaders are the workloads whose containers read a
+// profile task's terminal: the A2A gateway, the agent pod's hermes-bridge (a
+// Deployment, or a StatefulSet for a multi-replica agent on RWO storage), and
 // the MCP server when its door is on.
-func a2aProfileSupervisorReaders(agent *agentv1alpha1.PlatformAgent) []string {
-	names := []string{a2aGatewayName(agent), agent.Name + "-gateway"}
-	if a2aMCPDoorEnabled() {
-		names = append(names, a2aMCPName(agent))
+func a2aProfileSupervisorReaders(agent *agentv1alpha1.PlatformAgent) []a2aSupervisorReader {
+	readers := []a2aSupervisorReader{
+		{name: a2aGatewayName(agent), image: a2aGatewayImage()},
+		{name: agent.Name + "-gateway", container: a2aBridgeContainerName, image: a2aBridgeImage(defaultPlatformAgentImage())},
 	}
-	return names
+	if a2aMCPDoorEnabled() {
+		readers = append(readers, a2aSupervisorReader{name: a2aMCPName(agent), image: a2aConsoleImage(), optional: true})
+	}
+	return readers
+}
+
+// templateRunsImage reports whether spec has the container (any container when
+// name is empty) on image.
+func templateRunsImage(spec corev1.PodSpec, name, image string) bool {
+	for _, c := range spec.Containers {
+		if (name == "" || c.Name == name) && c.Image == image {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aStatefulSetFullyOnTemplate is a2aDeploymentFullyOnTemplate for a
+// StatefulSet: every replica on the update revision and ready.
+func a2aStatefulSetFullyOnTemplate(sts *appsv1.StatefulSet) bool {
+	desired := int32(1)
+	if sts.Spec.Replicas != nil {
+		desired = *sts.Spec.Replicas
+	}
+	return sts.Status.ObservedGeneration >= sts.Generation &&
+		sts.Status.UpdatedReplicas == desired && sts.Status.Replicas == desired &&
+		sts.Status.ReadyReplicas >= desired && sts.Status.CurrentRevision == sts.Status.UpdateRevision
 }
 
 // a2aSupervisorReadersOnTemplate reports whether every profile-terminal reader
-// is fully rolled out on its current template, and names the first that
-// isn't. A reader not deployed yet isn't ready.
+// runs the image this operator renders for it and has finished rolling it out,
+// and names the first that doesn't. Comparing the live template's image, not
+// only the rollout, keeps a reader from an older release that happens to be
+// fully rolled out (a pass that failed before re-applying it) from opening the
+// gate; an install that pins an older agent image, and so an older bridge,
+// stays on the five-token form.
 func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
-	for _, name := range a2aProfileSupervisorReaders(agent) {
+	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		key := client.ObjectKey{Namespace: agent.Namespace, Name: rd.name}
 		dep := &appsv1.Deployment{}
-		if err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: name}, dep); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, name, nil
+		err := r.a2aReader().Get(ctx, key, dep)
+		switch {
+		case err == nil:
+			if !templateRunsImage(dep.Spec.Template.Spec, rd.container, rd.image) || !a2aDeploymentFullyOnTemplate(dep) {
+				return false, rd.name, nil
 			}
-			return false, name, err
+			continue
+		case !apierrors.IsNotFound(err):
+			return false, rd.name, err
 		}
-		if !a2aDeploymentFullyOnTemplate(dep) {
-			return false, name, nil
+		sts := &appsv1.StatefulSet{}
+		if err := r.a2aReader().Get(ctx, key, sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				if rd.optional {
+					continue
+				}
+				return false, rd.name, nil
+			}
+			return false, rd.name, err
+		}
+		if !templateRunsImage(sts.Spec.Template.Spec, rd.container, rd.image) || !a2aStatefulSetFullyOnTemplate(sts) {
+			return false, rd.name, nil
 		}
 	}
 	return true, "", nil

@@ -5907,7 +5907,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-49f99dea
+  name: platformagent-a2a-provision-724f4041
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6067,7 +6067,11 @@ spec:
               bind it and names the difference\" >&2\n}\nfixed_durable gateway-relay gateway
               --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
               --filter='a2a.tasks.p.*.*.supervisor' \\\n  --ack=explicit --deliver=all
-              --replay=instant --max-deliver=-1 \\\n  --max-pending=8192 --defaults\nfixed_durable
+              --replay=instant --max-deliver=-1 \\\n  --max-pending=8192 --defaults\nif
+              ! $NATS consumer info TASKS gateway-relay --json 2>/dev/null | grep -qF
+              '\"a2a.tasks.p.*.*.supervisor\"'; then\n  echo \"TASKS gateway-relay does
+              not filter a2a.tasks.p.*.*.supervisor after this run; the dispatcher stays
+              on the five-token supervisor subject until it does\" >&2\n  exit 1\nfi\nfixed_durable
               bridge-platform bridge --pull \\\n  --filter='a2a.tasks.platform.*.in' \\\n
               \ --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults\n\n#
               DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.\n$NATS

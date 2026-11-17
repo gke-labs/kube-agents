@@ -3672,8 +3672,19 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 // set (#5301, a2aProfileSupervisorFormFor).
 func a2aProvisionScriptForm(agent *agentv1alpha1.PlatformAgent, profileForm bool) string {
 	relayFilters := `--filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `'`
+	relayCheck := ""
 	if profileForm {
 		relayFilters += ` --filter='` + a2aGatewayProfileSupervisorFilter + `'`
+		// fixed_durable leaves a durable that won't take new settings as it
+		// is, with a WARN and exit 0. For the third filter that isn't enough:
+		// the operator switches the dispatcher to the six-token subject when
+		// this Job succeeds, so the run fails, and the Job retries, unless the
+		// relay durable reads the filter back (#5301).
+		relayCheck = `
+if ! $NATS consumer info TASKS ` + a2aGatewayRelayDurable + ` --json 2>/dev/null | grep -qF '"` + a2aGatewayProfileSupervisorFilter + `"'; then
+  echo "TASKS ` + a2aGatewayRelayDurable + ` does not filter ` + a2aGatewayProfileSupervisorFilter + ` after this run; the dispatcher stays on the five-token supervisor subject until it does" >&2
+  exit 1
+fi`
 	}
 	server := a2aNATSAddress(agent)
 	// The reserve the refusal quotes is this CR's, not the default table's:
@@ -3947,7 +3958,7 @@ fixed_durable() { # name reader [consumer add flags...]
 fixed_durable ` + a2aGatewayRelayDurable + ` gateway --pull \
   ` + relayFilters + ` \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
-  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults` + relayCheck + `
 fixed_durable ` + a2aBridgeDurable() + ` bridge --pull \
   --filter='` + a2aBridgeIntakeFilter() + `' \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
