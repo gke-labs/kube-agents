@@ -86,8 +86,9 @@ func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Con
 
 // a2aProfileSupervisorFormFor says how far this pass takes the move: whether
 // the provision Job renders the relay's third filter, and the dispatch config's
-// profileSupervisorForm. It sets the latch condition when it first reaches the
-// switch.
+// profileSupervisorForm. A non-empty form is the latch wanted; the status
+// writers save it (setProfileSupervisorFormCondition), as they save
+// BusProvisioned, so a settled pass that changes nothing else still writes it.
 func (r *PlatformAgentReconciler) a2aProfileSupervisorFormFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (thirdFilter bool, form string, err error) {
 	latched := meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
 	if !latched {
@@ -112,11 +113,27 @@ func (r *PlatformAgentReconciler) a2aProfileSupervisorFormFor(ctx context.Contex
 	if existing.Status.Succeeded == 0 {
 		return true, "", nil
 	}
+	return true, a2aProfileSupervisorFormValue, nil
+}
+
+// profileSupervisorFormConditionCurrent reports whether the CR already carries
+// the latch as wanted. The latch is only ever added, so not wanting it asks
+// for nothing.
+func profileSupervisorFormConditionCurrent(agent *agentv1alpha1.PlatformAgent, want bool) bool {
+	return !want || meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+}
+
+// setProfileSupervisorFormCondition adds the latch when wanted and absent. It
+// never removes it.
+func setProfileSupervisorFormCondition(agent *agentv1alpha1.PlatformAgent, want bool, now metav1.Time) {
+	if !want || meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		return
+	}
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type: a2aProfileSupervisorFormCondition, Status: metav1.ConditionTrue,
 		Reason:             a2aProfileSupervisorFormReason,
 		Message:            "every profile-task reader watches the six-token supervisor subject and the gateway relay filters it, so the dispatcher writes profile terminals there",
 		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
 	})
-	return true, a2aProfileSupervisorFormValue, nil
 }

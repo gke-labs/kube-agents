@@ -7135,6 +7135,11 @@ type a2aProvisionState struct {
 	failed  bool
 	message string
 
+	// profileSupervisorFormLatch is whether the ProfileSupervisorForm latch
+	// is wanted (#5301): the dispatcher writes the six-token form. Written
+	// by the status writers, as BusProvisioned is, so a settled pass saves it.
+	profileSupervisorFormLatch bool
+
 	// busMeta is the JetStream meta group check's finding on a pass that
 	// made it (checkA2ABusMeta), for the A2ABusMetaGroup condition.
 	busMeta a2aBusMetaState
@@ -7764,6 +7769,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err != nil {
 		return state, err
 	}
+	state.profileSupervisorFormLatch = profileSupervisorForm != ""
 	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining, profileSupervisorForm)
 	state.dispatcherJobMode = jobMode
 	if err != nil {

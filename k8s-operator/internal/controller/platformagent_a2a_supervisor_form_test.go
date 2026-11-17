@@ -86,6 +86,10 @@ func TestTheSupervisorFormMovesInOrderAndLatches(t *testing.T) {
 	if filter, form, err := r.a2aProfileSupervisorFormFor(ctx, agent); err != nil || !filter || form != a2aProfileSupervisorFormValue {
 		t.Fatalf("filter Job succeeded: filter %v form %q err %v, want both", filter, form, err)
 	}
+	// The status writers save the latch (setProfileSupervisorFormCondition;
+	// TestTheSupervisorFormLatchIsPersistedWhenNothingElseChanged); here it
+	// is applied as they would.
+	setProfileSupervisorFormCondition(agent, true, metav1.Now())
 	if !meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
 		t.Fatal("the switch didn't latch")
 	}

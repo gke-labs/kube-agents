@@ -373,9 +373,9 @@ const a2aBridgeAddressee = "platform"
 // addressee's input. TestTheFixedDurablesMatchTheirReaders holds both
 // against the a2a sources.
 const (
-	a2aGatewayRelayDurable       = "gateway-relay"
-	a2aGatewayEventsFilter       = "a2a.tasks.*.*.events"
-	a2aGatewaySupervisorFilter   = "a2a.tasks.*.*.supervisor"
+	a2aGatewayRelayDurable     = "gateway-relay"
+	a2aGatewayEventsFilter     = "a2a.tasks.*.*.events"
+	a2aGatewaySupervisorFilter = "a2a.tasks.*.*.supervisor"
 	// a2aGatewayProfileSupervisorFilter is the relay's third filter, a
 	// profile task's six-token supervisor subject (#5301). The gateway
 	// accepts the durable with or without it (#5644); the provision Job

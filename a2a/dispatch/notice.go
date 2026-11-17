@@ -131,8 +131,16 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	// the terminal goes on the five-token one now rather than being retried
 	// without end while the task holds its slot. The envelope id is the
 	// same, so a six-token write that did land is deduplicated onto it.
+	//
+	// The fallback gets its own deadline. A refused publish draws no
+	// JetStream ack, so the first one waits out the caller's context, and a
+	// caller that gave both one deadline (publishTerminalRetry's kvOpTimeout)
+	// would hand the fallback an expired one: it would fail at once and the
+	// held task would be retried without end anyway.
 	d.supervisorFallbacks.Add(1)
 	d.log.Warn("profile task terminal refused on the six-token supervisor subject; writing it on the five-token one",
 		"profile", hk.profile, "task", sub.TaskID, "subject", subject, "err", err)
-	return d.busFor(hk.profile).Publish(ctx, five, env)
+	fallbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kvOpTimeout)
+	defer cancel()
+	return d.busFor(hk.profile).Publish(fallbackCtx, five, env)
 }

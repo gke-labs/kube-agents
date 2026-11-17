@@ -596,12 +596,12 @@ type a2aDispatchConfig struct {
 	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS' max
 	// age, the longer of the constant the provision script creates it with
 	// and the live stream's as its Job reports it (dispatchSubmitRetentionSeconds).
-	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
+	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// ProfileSupervisorForm is lib.DispatchConfig's (#5301): "profile" once
 	// the six-token form is safe to write (a2aProfileSupervisorFormFor),
 	// empty otherwise.
-	ProfileSupervisorForm string `json:"profileSupervisorForm,omitempty"`
-	Profiles               []a2aDispatchProfile `json:"profiles"`
+	ProfileSupervisorForm string               `json:"profileSupervisorForm,omitempty"`
+	Profiles              []a2aDispatchProfile `json:"profiles"`
 	// JobLabels go on every Job the dispatcher creates (lib.DispatchConfig
 	// JobLabels): the agent's, so a teardown deletes only this agent's
 	// Jobs, and dispatchJobLabel. Set only when some profile has a Job
