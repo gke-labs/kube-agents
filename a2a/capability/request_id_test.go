@@ -12,10 +12,8 @@ import (
 // A capability decision is bound to the request that asked for it (#5647), so
 // a caller acts only on the answer to its own question. Each check carries a
 // fresh request id, the verifier echoes it, and the client takes no reply
-// carrying a different id: such a reply is no answer, and a check that never
-// gets its own answer ends the way an unanswered one always has. For one
-// release a reply carrying no id at all, an older verifier's, is still acted
-// on (acceptUnechoedReply), so a new client keeps working during a roll.
+// carrying a different id, or none: such a reply is no answer, and a check that
+// never gets its own answer ends the way an unanswered one always has.
 
 // testRequestID is a well-formed id for tests that build a Request by hand.
 func testRequestID(t *testing.T) string {
@@ -105,14 +103,11 @@ func TestAReplyWithAnotherRequestIDIsNotAnAnswer(t *testing.T) {
 	mustRefuse(t, err, unreachableRule)
 }
 
-// A new client against a verifier from before #5647, which echoes nothing: while
-// acceptUnechoedReply holds, its verdicts are acted on, allowed and refused
-// alike, so a roll that reaches the clients first breaks nothing. The follow-up
-// that turns acceptUnechoedReply false makes this a check that fails closed.
-func TestAnOlderVerifiersUnechoedReplyIsActedOnForNow(t *testing.T) {
-	if !acceptUnechoedReply {
-		t.Skip("un-echoed replies are no longer accepted; TestAnUnechoedReplyFailsClosed covers this")
-	}
+// A reply carrying no request id, which is what a verifier from before #5647
+// sends, is no answer: an allow from it isn't acted on, and the check fails
+// closed at its timeout as an unanswered one does. A refusal without an id is
+// no answer either, so the check ends unreachable rather than on its reason.
+func TestAnUnechoedReplyFailsClosed(t *testing.T) {
 	nc := runServer(t)
 	answeringVerifier(t, nc, func(req Request) []Response {
 		if req.Resource == "project/refused" {
@@ -122,11 +117,13 @@ func TestAnOlderVerifiersUnechoedReplyIsActedOnForNow(t *testing.T) {
 	})
 	c := clientAs(t, nc, podB)
 	c.Timeout, c.ReachWindow = shortAsk, shortWindow
-	if err := c.Check(context.Background(), Ref{Key: "root.task-x", Revision: 1}, VerbTaskExecute, "project/P"); err != nil {
-		t.Fatalf("an older verifier's allow was not acted on: %v", err)
+	err := c.Check(context.Background(), Ref{Key: "root.task-x", Revision: 1}, VerbTaskExecute, "project/P")
+	if err == nil {
+		t.Fatal("a reply carrying no request id was taken as this check's answer")
 	}
-	err := c.Check(context.Background(), Ref{Key: "root.task-x", Revision: 1}, VerbTaskExecute, "project/refused")
-	mustRefuse(t, err, "the older verifier refused it")
+	mustRefuse(t, err, unreachableRule)
+	err = c.Check(context.Background(), Ref{Key: "root.task-x", Revision: 1}, VerbTaskExecute, "project/refused")
+	mustRefuse(t, err, unreachableRule)
 }
 
 // A reply that is not this check's answer is dropped, not the end of the
