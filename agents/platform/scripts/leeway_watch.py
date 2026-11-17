@@ -46,9 +46,9 @@ and routes Kubernetes object reads through the sandbox's `kubectl`
 `leeway report --topology-tier-c-signals --parallelism 2 --timeout <n>s` in the
 sandbox through `sandbox_exec.run` and parses the `leeway.report/v1alpha1` JSON
 document from stdout. `--timeout` is leeway's per-cluster deadline (its own
-default is one minute, which a ~6k-pod cluster already reaches); it is sized
-so every cluster in the call can use its share of the call's sandbox timeout
-(`cluster_timeout_seconds`).
+default is one minute, which a large cluster can exceed); it is sized so every
+cluster in the call can use its share of the call's sandbox timeout, capped so
+one stuck cluster cannot spend the tick (`cluster_timeout_seconds`).
 
 Threshold filtering and environment knobs. Before ledger gating,
 `filter_report_findings` drops `unknown`-cause topology findings at their
@@ -185,6 +185,9 @@ CLUSTER_TIMEOUT_FORMAT = "{seconds}s"
 # leeway's own `--timeout` default (`DefaultClusterTimeout`), kept as the floor
 # so a short call never gives a cluster less than leeway would on its own.
 MIN_CLUSTER_TIMEOUT_SECONDS = 60
+# The ceiling, so one cluster whose read stalls rather than fails spends at most
+# this much of the tick: five stalled projects still fit TICK_BUDGET_SECONDS.
+MAX_CLUSTER_TIMEOUT_SECONDS = 300
 # Held back from the call's sandbox timeout for leeway's start-up and report
 # assembly, so the per-cluster deadline fires before the sandbox kills the call.
 LEEWAY_OVERHEAD_SECONDS = 30
@@ -194,7 +197,9 @@ LIST_CLUSTERS_ARGV = ("gcloud", "container", "clusters", "list", "--format=value
 LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project} exited {code}: {error}"
 PROJECT_TIMEOUT_SECONDS = 900
 TICK_BUDGET_SECONDS = 2700
-MIN_PROJECT_RUN_SECONDS = 60
+# The least a project call is started with: enough for one cluster's floor plus
+# the overhead, so even a budget-cut call lets leeway's deadline fire first.
+MIN_PROJECT_RUN_SECONDS = MIN_CLUSTER_TIMEOUT_SECONDS + LEEWAY_OVERHEAD_SECONDS
 STDERR_EXCERPT_CHARS = 300
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
@@ -529,12 +534,16 @@ def cluster_timeout_seconds(call_timeout: int, cluster_count: int) -> int:
 
     leeway reads `PARALLELISM` clusters at a time, so the call runs in
     `ceil(cluster_count / PARALLELISM)` waves; each wave gets an equal share of
-    the call's sandbox timeout, less `LEEWAY_OVERHEAD_SECONDS`. A slow cluster
-    then ends as a per-cluster `error` row instead of the sandbox killing the
-    whole call and discarding the clusters that finished.
+    the call's sandbox timeout, less `LEEWAY_OVERHEAD_SECONDS`, between
+    `MIN_CLUSTER_TIMEOUT_SECONDS` and `MAX_CLUSTER_TIMEOUT_SECONDS`. A slow
+    cluster then ends as a per-cluster `error` row instead of the sandbox
+    killing the whole call and discarding the clusters that finished. A call
+    with so many clusters that the floor wins (more than about 28 at the full
+    call timeout) can still overrun the sandbox timeout, as it could before.
     """
     waves = math.ceil(max(cluster_count, 1) / PARALLELISM)
-    return max(MIN_CLUSTER_TIMEOUT_SECONDS, (call_timeout - LEEWAY_OVERHEAD_SECONDS) // waves)
+    share = (call_timeout - LEEWAY_OVERHEAD_SECONDS) // waves
+    return max(MIN_CLUSTER_TIMEOUT_SECONDS, min(MAX_CLUSTER_TIMEOUT_SECONDS, share))
 
 
 def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_SECONDS) -> dict[str, Any]:

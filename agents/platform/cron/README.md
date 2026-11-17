@@ -448,8 +448,8 @@ relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
 `--timeout` is leeway's per-cluster deadline: each call's sandbox timeout (15
 minutes, less when the tick budget is nearly spent), less 30 seconds, split
-across the call's waves of two clusters, and never below leeway's own
-one-minute default.
+across the call's waves of two clusters, at most five minutes so one stuck
+cluster can't spend the tick, and never below leeway's own one-minute default.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)

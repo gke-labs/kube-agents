@@ -1465,7 +1465,7 @@ class DiscoveryTests(unittest.TestCase):
                     "--parallelism",
                     "2",
                     "--timeout",
-                    "870s",
+                    "300s",
                     "--clusters",
                     "p1/us-central1/c1,p1/us-east1/c2",
                 ]
@@ -1506,7 +1506,7 @@ class DiscoveryTests(unittest.TestCase):
                     "--parallelism",
                     "2",
                     "--timeout",
-                    "870s",
+                    "300s",
                     "--clusters",
                     "p1/us-east1-b/east,p1/us-west1/west",
                 ],
@@ -1565,7 +1565,7 @@ class DiscoveryTests(unittest.TestCase):
                     "--parallelism",
                     "2",
                     "--timeout",
-                    "870s",
+                    "300s",
                     "--clusters",
                     "p1/us-central1/c1,p2/us-east1/c2",
                 ]
@@ -1642,7 +1642,7 @@ class DiscoveryTests(unittest.TestCase):
                     "--parallelism",
                     "2",
                     "--timeout",
-                    "870s",
+                    "300s",
                     "--clusters",
                     "p-scoped/us-central1/c-included",
                 ]
@@ -1682,7 +1682,7 @@ class DiscoveryTests(unittest.TestCase):
                     "--parallelism",
                     "2",
                     "--timeout",
-                    "870s",
+                    "300s",
                     "--clusters",
                     "p1/us-central1/c-ok",
                 ]
@@ -1715,16 +1715,26 @@ class DiscoveryTests(unittest.TestCase):
 class ClusterTimeoutTests(unittest.TestCase):
     def test_one_wave_gets_the_whole_call_less_overhead(self) -> None:
         # Two clusters read in parallel finish in one wave.
-        self.assertEqual(watch.cluster_timeout_seconds(900, 1), 870)
-        self.assertEqual(watch.cluster_timeout_seconds(900, 2), 870)
+        # Capped: one or two clusters would otherwise get 870 s each.
+        self.assertEqual(watch.cluster_timeout_seconds(900, 1), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 2), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(330, 1), 300)
+        self.assertEqual(watch.cluster_timeout_seconds(200, 1), 170)
 
     def test_waves_split_the_call(self) -> None:
-        self.assertEqual(watch.cluster_timeout_seconds(900, 3), 435)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 3), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
         self.assertEqual(watch.cluster_timeout_seconds(900, 10), 174)
+        self.assertEqual(watch.cluster_timeout_seconds(600, 5), 190)
 
     def test_never_below_leeways_own_default(self) -> None:
         self.assertEqual(watch.cluster_timeout_seconds(900, 100), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
         self.assertEqual(watch.cluster_timeout_seconds(60, 1), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
+
+    def test_a_started_call_always_lets_the_cluster_deadline_fire_first(self) -> None:
+        # The smallest call sweep_fleet starts leaves room for one cluster's
+        # floor and leeway's overhead inside the sandbox timeout.
+        smallest = watch.MIN_PROJECT_RUN_SECONDS
+        self.assertGreaterEqual(smallest - watch.LEEWAY_OVERHEAD_SECONDS, watch.cluster_timeout_seconds(smallest, 1))
 
     def test_run_passes_the_timeout_sized_to_the_call(self) -> None:
         seen_argv: list[list[str]] = []
