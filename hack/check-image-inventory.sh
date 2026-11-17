@@ -264,6 +264,7 @@ check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile fil
 # A persona image has the same two-line shape, with the persona directory as
 # its build context and the payload under /files, where profilepod mounts it.
 check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/
+check_literal_from busybox a2a/Dockerfile.persona-tse . /files/
 
 # The calls above name their files, so a third plugin copied from the pair
 # (agentplugins/README.md, "Adding a plugin"), or a second persona image copied
@@ -685,6 +686,9 @@ check_toggle webConsole --set webConsole.enabled=true
 # The cluster agent's AgentProfile (#3658) adds its persona image; its
 # harness, a2a-worker, is already in the default render.
 check_toggle profiles.cluster --set profiles.cluster.enabled=true
+# The GKE Support Agent's AgentProfile (#3842) adds its persona image the
+# same way.
+check_toggle profiles.tse --set profiles.tse.enabled=true
 # The Hindsight memory store adds its API and Postgres images. hindsight.enabled
 # is a tri-state that follows the memory provider when null; true turns the
 # store on whatever the provider says.

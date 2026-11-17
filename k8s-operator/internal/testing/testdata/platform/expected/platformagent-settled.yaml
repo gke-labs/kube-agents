@@ -1733,6 +1733,35 @@ spec:
   policyTypes:
     - Ingress
 ---
+apiVersion: v1
+data:
+  bridge-activity-key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  bridge-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  callout-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  console-mcp-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  console-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  gateway-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  seed-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  sys-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  web-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-creds
+  name: platformagent-a2a-nats-creds
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -2794,35 +2823,6 @@ spec:
 ---
 apiVersion: v1
 data:
-  bridge-activity-key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  bridge-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  callout-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  console-mcp-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  console-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  gateway-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  seed-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  sys-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-  web-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
-kind: Secret
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: nats-creds
-  name: platformagent-a2a-nats-creds
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
----
-apiVersion: v1
-data:
   issuer-public: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   issuer-seed: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   xkey-public: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
@@ -2963,7 +2963,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "6968d99c141e670f",
+      "version": "85ca76c94916249c",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3073,6 +3073,82 @@ data:
           }
         },
         {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-gateway",
+          "user": "gateway",
+          "account": "TRUSTED",
+          "grants": {
+            "publish": [
+              "a2a.tasks.*.*.in",
+              "a2a.tasks.*.*.supervisor",
+              "a2a.submit.*.*.*.*",
+              "a2a.stop.*.*",
+              "$KV.session-state.>",
+              "$KV.feedback.>",
+              "$KV.people.>",
+              "chat.console.*.out",
+              "chat.notify.reply.agent.>",
+              "$KV.cap.root.*",
+              "chat.board",
+              "$JS.API.STREAM.INFO.TASKS",
+              "$JS.API.CONSUMER.CREATE.TASKS.>",
+              "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+              "$JS.API.DIRECT.GET.TASKS.>",
+              "$JS.API.STREAM.INFO.KV_session-state",
+              "$JS.API.DIRECT.GET.KV_session-state.>",
+              "$JS.API.CONSUMER.CREATE.KV_session-state.>",
+              "$JS.API.CONSUMER.DELETE.KV_session-state.*",
+              "$JS.API.STREAM.INFO.KV_feedback",
+              "$JS.API.DIRECT.GET.KV_feedback.>",
+              "$JS.API.CONSUMER.CREATE.KV_feedback.>",
+              "$JS.API.CONSUMER.DELETE.KV_feedback.*",
+              "$JS.API.STREAM.INFO.KV_people",
+              "$JS.API.DIRECT.GET.KV_people.>",
+              "$JS.API.CONSUMER.CREATE.KV_people.>",
+              "$JS.API.CONSUMER.DELETE.KV_people.*",
+              "$JS.API.STREAM.INFO.DIRECTORY",
+              "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+              "$JS.ACK.TASKS.>",
+              "$JS.FC.>",
+              "_INBOX.gateway.>"
+            ],
+            "subscribe": [
+              "a2a.tasks.*.*.events",
+              "a2a.tasks.*.*.supervisor",
+              "a2a.tasks.p.*.*.supervisor",
+              "a2a.agents.>",
+              "agents.hb.>",
+              "$KV.session-state.>",
+              "$KV.feedback.>",
+              "$KV.people.>",
+              "chat.console.*.in",
+              "chat.console.*.confirm",
+              "chat.notify.gchat",
+              "chat.notify.slack",
+              "chat.notify.console",
+              "chat.board.reply.gateway.>",
+              "_INBOX.gateway.>"
+            ],
+            "denyPublish": [
+              "$JS.API.*.*.KV_cap",
+              "$JS.API.*.*.KV_cap.>",
+              "$JS.API.*.*.*.KV_cap",
+              "$JS.API.*.*.*.KV_cap.>",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+              "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+              "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+            ],
+            "denySubscribe": [
+              "$KV.cap.>"
+            ]
+          }
+        },
+        {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-dispatcher",
           "user": "dispatcher",
           "account": "TRUSTED",
@@ -3104,7 +3180,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 6968d99c141e670f
+    kubeagents.x-k8s.io/a2a-authmap-version: 85ca76c94916249c
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3266,7 +3342,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "8"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "9"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -6227,6 +6303,14 @@ spec:
               value: "true"
             - name: A2A_MAX_SESSIONS
               value: "10"
+            - name: A2A_SESSION_CPU_REQUEST
+              value: 150m
+            - name: A2A_SESSION_MEMORY_REQUEST
+              value: 320Mi
+            - name: A2A_SESSION_CPU_LIMIT
+              value: "2"
+            - name: A2A_SESSION_MEMORY_LIMIT
+              value: 2Gi
             - name: A2A_GATEWAY_RELAY_PRECREATED
               value: "true"
             - name: A2A_BUSY_NOTICE_AT
