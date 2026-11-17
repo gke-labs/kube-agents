@@ -655,6 +655,7 @@ func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
 	jobs := newFakeJobs(-1) // never ready
 	ti := unattendedInstall(1, func(c *lib.DispatchConfig) {
 		c.Profiles[0].Tiers = []string{"read", "unattended"}
+		c.Profiles[0].Durables = nil // derived from the tiers (#5649)
 		c.JobStartSeconds, c.BreakerThreshold = 60, 1
 	})
 	d, _ := b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
@@ -664,6 +665,7 @@ func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
 	start := time.Now()
 	ti.update(func(c *lib.DispatchConfig) {
 		c.Profiles[0].Tiers = []string{"read"}
+		c.Profiles[0].Durables = nil // derived from the tiers and the drain (#5649)
 		c.Profiles[0].DrainingTiers = []lib.DrainingTier{{Tier: "unattended", Mode: "unattended", Until: time.Now().Add(2 * time.Minute), Ending: true}}
 	})
 	ts := b.waitTerminal("task-1", 10*time.Second)
