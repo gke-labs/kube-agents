@@ -49,7 +49,7 @@ const a2aCalloutConfUser = "callout"
 //
 // It is deliberately not a row of a2aIdentities(): the callout is exempt from
 // the callout, so it must not reach the identity map, and a2aStaticPrincipalNames
-// lists it by hand for auth_users and the reserved principals.
+// lists it by hand for the callout's reserved principal names.
 var a2aCalloutConfIdentity = a2aIdentity{
 	user:     a2aCalloutConfUser,
 	auth:     a2aAuthStatic,
@@ -68,8 +68,8 @@ const (
 	a2aSubjectListIndent = a2aUserBlockIndent + "    "
 )
 
-// The separators the two renders of the static principal names join with.
-// auth_users is nats.conf syntax and its spacing is hashed into
+// The separators auth_users and the callout's reserved principal names join
+// with. auth_users is nats.conf syntax and its spacing is hashed into
 // a2aConfigRolloutHash, so it keeps the spacing it always had; the callout's
 // list is parsed by authcallout.ParseReservedPrincipals, which splits on a bare
 // comma.
@@ -92,7 +92,7 @@ const (
 func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, account string, profiles []string) string {
 	var b strings.Builder
 	for _, id := range staticIdentities(agent) {
-		if id.account != account {
+		if id.account != account || frozenOut(agent, id) {
 			continue
 		}
 		if id.user == a2aGatewayUser {
@@ -238,13 +238,30 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 // block is the quiet one: the server accepts the config, and the exemption
 // simply covers nothing.
 func renderA2AAuthUsers(agent *agentv1alpha1.PlatformAgent) string {
-	return strings.Join(a2aStaticPrincipalNames(agent), a2aAuthUsersSeparator)
+	names := []string{a2aCalloutConfUser}
+	for _, id := range staticIdentities(agent) {
+		if !frozenOut(agent, id) {
+			names = append(names, id.user)
+		}
+	}
+	return strings.Join(names, a2aAuthUsersSeparator)
+}
+
+// frozenOut reports a static user the bus migration's write freeze removes
+// from nats.conf: every static user outside SYS, whichever application
+// account it is in (TRUSTED's gateway and seed, APP's bridge and web,
+// CONSOLE's console and console-mcp), once the bus is rendered for the
+// freeze. The callout's own user (AUTH) and SYS stay, and so does the
+// callout's list of reserved principal names, which this does not touch.
+// Keyed on SYS rather than on a list of application accounts, so an account
+// added later is frozen too.
+func frozenOut(agent *agentv1alpha1.PlatformAgent, id a2aIdentity) bool {
+	return id.account != a2aAccountSys && busMigrationFreezeConfigured(agent)
 }
 
 // a2aStaticPrincipalNames is every user nats.conf authenticates by password,
-// in render order: the callout's own user, then the static identities. It is
-// the one list both auth_users and the callout's reserved principal names are
-// rendered from, so the two cannot disagree.
+// in render order: the callout's own user, then the static identities. The
+// callout's reserved principal names are rendered from it.
 func a2aStaticPrincipalNames(agent *agentv1alpha1.PlatformAgent) []string {
 	names := []string{a2aCalloutConfUser}
 	for _, id := range staticIdentities(agent) {

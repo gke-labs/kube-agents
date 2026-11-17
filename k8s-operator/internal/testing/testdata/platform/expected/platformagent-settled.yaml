@@ -3266,7 +3266,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "6"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "7"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -4781,6 +4781,10 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: bus-migration
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
               kubeagents.x-k8s.io/a2a-component: seed
       ports:
         - port: 4222
@@ -6223,6 +6227,14 @@ spec:
               value: "true"
             - name: A2A_MAX_SESSIONS
               value: "10"
+            - name: A2A_SESSION_CPU_REQUEST
+              value: 150m
+            - name: A2A_SESSION_MEMORY_REQUEST
+              value: 320Mi
+            - name: A2A_SESSION_CPU_LIMIT
+              value: "2"
+            - name: A2A_SESSION_MEMORY_LIMIT
+              value: 2Gi
             - name: A2A_GATEWAY_RELAY_PRECREATED
               value: "true"
             - name: A2A_BUSY_NOTICE_AT
