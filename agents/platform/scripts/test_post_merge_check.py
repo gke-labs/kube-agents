@@ -393,6 +393,32 @@ class WatchHealthTest(unittest.TestCase):
         self.assertEqual(self.tick(2)["waiting"], [f"{REPO}/pull/1"])
         self.assertIn("pod checkout-new is starting", self.row()["health_detail"])
 
+    def test_a_pod_from_a_scale_up_seen_ready_then_not_ready_fails(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.workload = deployment(replicas=4, updated=4, ready=4, available=4)
+        scaled = pods(restarts=(0,))["items"][0]
+        scaled["metadata"].update(name="checkout-new", uid="new")
+        self.cluster.pod_list = pods()
+        self.cluster.pod_list["items"].append(scaled)
+        self.assertEqual(self.tick(2)["waiting"], [f"{REPO}/pull/1"])
+        self.assertIn("new/web", json.loads(self.row()["health_baseline"]), "a pod seen Ready joins the baseline")
+        scaled["status"]["conditions"][0]["status"] = "False"
+        self.assertEqual(self.tick(3)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("pod checkout-new is not Ready", self.row()["health_detail"])
+
+    def test_a_known_pod_not_ready_fails_even_while_a_new_pod_is_starting(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.workload = deployment(replicas=4, updated=4, ready=2, available=2)
+        starting = pods(restarts=(0,), ready=False)["items"][0]
+        starting["metadata"].update(name="checkout-new", uid="new")
+        self.cluster.pod_list = pods()
+        self.cluster.pod_list["items"][1]["status"]["conditions"][0]["status"] = "False"
+        self.cluster.pod_list["items"].append(starting)
+        self.assertEqual(self.tick(2)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("pod checkout-1 is not Ready", self.row()["health_detail"])
+
     def test_a_sidecar_restart_after_the_apply_fails_the_window(self):
         def with_sidecar(restarts):
             listed = pods()

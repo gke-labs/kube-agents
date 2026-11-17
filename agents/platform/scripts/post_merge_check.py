@@ -390,21 +390,6 @@ def _is_ready(pod: dict) -> bool:
                for c in (pod.get("status") or {}).get("conditions") or [])
 
 
-def unsettled(workload: dict, pods: dict, baseline: dict[str, int]) -> str:
-    """Why the workload is not settled yet, or "": a rollout or scale under way, or a pod that did not
-    exist at the apply and is still starting (not Ready, nothing restarted). A pod that was there at the
-    apply and is not Ready is not "starting"; :func:`judge_health` fails it."""
-    if not _rolled_out(workload):
-        return "the rollout is not complete"
-    known = {key.split("/", 1)[0] for key in baseline}
-    for pod in _owned_pods(workload, pods):
-        meta = pod.get("metadata") or {}
-        if (meta.get("uid") or meta.get("name")) not in known and not _is_ready(pod) and not any(
-                int(c.get("restartCount") or 0) for c in _container_statuses(pod)):
-            return f"pod {meta.get('name') or ''} is starting"
-    return ""
-
-
 def _owned_by(pod: dict, workload: dict) -> bool:
     """Whether ``pod`` belongs to ``workload``: directly (a StatefulSet) or through a ReplicaSet named after it."""
     name = (workload.get("metadata") or {}).get("name") or ""
@@ -426,37 +411,68 @@ def _healthy_samples(detail: object) -> int:
     return int(count) if count.isdigit() else 0
 
 
-def judge_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[bool, str]:
-    """``(passed, detail)``: rolled out, every pod Ready, no restart over the baseline, no OOMKilled since ``since``.
+#: :func:`assess_health`'s verdicts for one reading.
+HEALTHY, UNSETTLED, RED = "healthy", "unsettled", "red"
 
-    One reading; :func:`watch_health` takes one per run across the window and
-    fails on the first that is not healthy. A rollout still under way (or a
-    StatefulSet with ``OnDelete`` updates, or a workload scaled to zero) reads
-    as not healthy: the fix restarts no pods, so that is "not settled", and the
-    reporter decides what to say.
+
+def _known_pods(baseline: dict[str, int]) -> set[str]:
+    """The pods the baseline holds: there at the apply, or seen Ready on a later reading."""
+    return {key.split("/", 1)[0] for key in baseline}
+
+
+def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[str, str]:
+    """``(verdict, detail)`` for one reading: :data:`RED`, :data:`UNSETTLED` or :data:`HEALTHY`.
+
+    Red comes first, so nothing settling can hide it: a known pod (in the
+    baseline) that is not Ready, or any container, sidecars and init
+    containers included, that restarted past the baseline or was OOMKilled
+    since ``since``. Then unsettled: a rollout or scale under way, or a pod not
+    yet known that is still starting (not Ready, nothing restarted). Healthy
+    needs every owned pod Ready.
     """
-    reason = unsettled(workload, pods, baseline)
-    if reason:
-        return False, reason
     items = _owned_pods(workload, pods)
-    if not items:
-        return False, "no pods belong to the workload"
+    known = _known_pods(baseline)
     for pod in items:
         meta = pod.get("metadata") or {}
         name = meta.get("name") or ""
-        if not _is_ready(pod):
-            return False, f"pod {name} is not Ready"
+        if (meta.get("uid") or name) in known and not _is_ready(pod):
+            return RED, f"pod {name} is not Ready"
         for container in _container_statuses(pod):
             key = f"{meta.get('uid') or name}/{container.get('name')}"
             if int(container.get("restartCount") or 0) > baseline.get(key, 0):
-                return False, f"container {container.get('name')} in pod {name} restarted"
+                return RED, f"container {container.get('name')} in pod {name} restarted"
             for current, state in ((False, container.get("lastState") or {}), (True, container.get("state") or {})):
                 ended = state.get("terminated") or {}
                 finished = _parse_time(ended.get("finishedAt"))
                 # A past termination with no time cannot be placed after the apply; a current one is red now.
                 if ended.get("reason") == OOM_KILLED and (current if finished is None else finished >= since):
-                    return False, f"container {container.get('name')} in pod {name} was OOMKilled"
-    return True, "rolled out, every pod Ready, no restarts"
+                    return RED, f"container {container.get('name')} in pod {name} was OOMKilled"
+    if not _rolled_out(workload):
+        return UNSETTLED, "the rollout is not complete"
+    for pod in items:
+        if not _is_ready(pod):
+            return UNSETTLED, f"pod {(pod.get('metadata') or {}).get('name') or ''} is starting"
+    if not items:
+        return RED, "no pods belong to the workload"
+    return HEALTHY, "rolled out, every pod Ready, no restarts"
+
+
+def judge_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[bool, str]:
+    """``(passed, detail)``: :func:`assess_health` as a pass or not; unsettled is not a pass."""
+    verdict, detail = assess_health(workload, pods, baseline, since)
+    return verdict == HEALTHY, detail
+
+
+def _join_baseline(baseline: dict[str, int], workload: dict, pods: dict) -> dict[str, int]:
+    """``baseline`` plus every owned pod now Ready that it did not hold, at its current restart counts: once
+    seen Ready, a pod that came after the apply is judged like one that was there (NotReady is red)."""
+    known = _known_pods(baseline)
+    joined = dict(baseline)
+    for pod in _owned_pods(workload, pods):
+        meta = pod.get("metadata") or {}
+        if (meta.get("uid") or meta.get("name")) not in known and _is_ready(pod):
+            joined.update(restart_baseline({"items": [pod]}))
+    return joined
 
 
 def _read_workload(kubectl_json: KubectlJson, record: dict) -> tuple[dict, dict]:
@@ -630,15 +646,18 @@ def watch_health(
                     baseline = None
                 if not isinstance(baseline, dict) or not all(isinstance(v, int) for v in baseline.values()):
                     raise WorkloadGone("the restart baseline is unreadable")
-                reason = unsettled(workload, pods, baseline)
-                healthy, detail = judge_health(workload, pods, baseline, applied_at)
+                verdict, detail = assess_health(workload, pods, baseline, applied_at)
                 samples = _healthy_samples(last) + 1
-                if reason:
+                if verdict != RED:
+                    joined = _join_baseline(baseline, workload, pods)
+                    if joined != baseline:
+                        updates["health_baseline"] = json.dumps(joined, sort_keys=True)
+                if verdict == UNSETTLED:
                     # A rollout or scale under way (an HPA, someone else's change) is not settled yet, not red;
                     # it resets the count, and HEALTH_SETTLE_LIMIT ends a wait that never settles.
-                    updates["health_detail"] = f"{NOT_SETTLED}{reason}"
+                    updates["health_detail"] = f"{NOT_SETTLED}{detail}"
                     bucket = "waiting"
-                elif not healthy:
+                elif verdict == RED:
                     # Any red reading after the apply fails the window, even one that would recover.
                     updates.update(health_result=HEALTH_FAILED, health_detail=detail, health_at=stamp)
                     bucket = "failed"
