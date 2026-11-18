@@ -213,15 +213,18 @@ func TestKanbanDispatcher_AStuckTickSetsItBeforeAnyFailure(t *testing.T) {
 	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTickStuck {
 		t.Fatalf("stuck at 400 s: condition %+v, want True with reason %s", cond, kanbanDispatcherReasonTickStuck)
 	}
-	if !strings.Contains(cond.Message, `tick on board "default" waited on its database (it ran past 5m0s, or failed on a lock after a busy timeout)`) || !strings.Contains(cond.Message, "6m40s since it began") {
+	if !strings.Contains(cond.Message, `tick on board "default" waited on its database (it ran past 5m0s, or failed on a lock after a busy timeout)`) || !strings.Contains(cond.Message, "and no good tick has followed; the board may be locked.") {
 		t.Fatalf("message = %q", cond.Message)
 	}
+	written := cond.Message
 	// Still stuck, now with one failure below the streak rules.
 	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 2160}},
 		usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: 1, Seconds: 1440, HasAge: true})
 	h.poll(10)
-	if cond := dispatcherCondition(h); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("stuck with one failure: condition %+v, want True held", cond)
+	// The message is written once per reason; 36 minutes in, it is still true,
+	// because it gives no duration.
+	if cond := dispatcherCondition(h); cond == nil || cond.Status != metav1.ConditionTrue || cond.Message != written {
+		t.Fatalf("stuck with one failure: condition %+v, want True held with the message as written", cond)
 	}
 	h.stub.setDispatcher(chatAddr())
 	h.poll(15)
@@ -291,5 +294,25 @@ func TestKanbanDispatcher_TheMessageFollowsTheCause(t *testing.T) {
 	cond = dispatcherCondition(h)
 	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTicksFailing || strings.Contains(cond.Message, "Look for another process") {
 		t.Fatalf("then a streak again: condition %+v, want %s without the lock hint", cond, kanbanDispatcherReasonTicksFailing)
+	}
+}
+
+// The stuck message gives no duration: it is written once per reason, so it
+// must read the same however long the board has been stuck. That also covers a
+// board that recovers and locks again between two polls.
+func TestKanbanDispatcher_TheStuckMessageGivesNoDuration(t *testing.T) {
+	messages := map[string]int64{}
+	for _, seconds := range []int64{0, 45, 312, 2160, 7260} {
+		h := dispatcherHarness(t)
+		h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: seconds}})
+		h.poll(5)
+		cond := dispatcherCondition(h)
+		if cond == nil || cond.Reason != kanbanDispatcherReasonTickStuck {
+			t.Fatalf("stuck for %d s: condition %+v, want reason %s", seconds, cond, kanbanDispatcherReasonTickStuck)
+		}
+		messages[cond.Message] = seconds
+	}
+	if len(messages) != 1 {
+		t.Errorf("the stuck message changes with the duration: %v", messages)
 	}
 }

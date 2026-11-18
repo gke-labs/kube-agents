@@ -73,6 +73,12 @@ value and the no-schedule effect, as Config Connector YAML through
 When using node pool auto-creation, ComputeClasses auto-tolerate these taints;
 workloads do **not** need matching tolerations.
 
+A pool that carries the label and **no** taint also takes Pods that name no
+class, while its existing nodes have room. When they fill, those Pods can stay
+`Pending` and the pool does not grow (GKE-version dependent; Symptom 13 in
+`compute-class-debug.md`). Name the class on the workload or set a default
+class; do not read the pending Pods as a stockout.
+
 ## Default Class Selection
 
 -   **Cluster Default:** Create ComputeClass named `default` + enable feature on
@@ -80,7 +86,7 @@ workloads do **not** need matching tolerations.
 -   **Namespace Default:** Label NS
     `cloud.google.com/default-compute-class=<name>`.
 -   **Workload Selection:** `nodeSelector: cloud.google.com/compute-class:
-    <name>`.
+    <name>`. A required `nodeAffinity` on the same key also names the class.
 
 ## Integration with Kueue (Batch/Job Queuing)
 

@@ -23,8 +23,8 @@
 id: node-mount-table-leak-exhaustion
 name: "Node mount-table leak (declared gap; planted as a propagation-mounting DaemonSet when its check lands)"
 domain: fleet-audits
-suite: certification
-certification_part: 2
+suite: validated-capabilities
+suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -35,7 +35,7 @@ prompt: >-
 expected_output: >-
   Planted as a DaemonSet with host mount propagation on a seeded Standard
   cluster, once its check lands. Customer failure: a real mount-table leak with
-  FailedMount events. Certified means: the ledger issue carries a finding that
+  FailedMount events. Validated means: the ledger issue carries a finding that
   names DaemonSet `volume-mount-agent` as a propagation-mounting DaemonSet on
   its node pool. The closing response is the SOP's one line with the ledger
   URL.

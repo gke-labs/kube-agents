@@ -1532,6 +1532,259 @@ class TestHpaFloorsAtOne(unittest.TestCase):
         self.assertIsNotNone(hits[0]["reconciler"])
 
 
+class TestHpaAggressiveScaledown(unittest.TestCase):
+    """§3.25 — aggressive HPA scale-down with no preStop hook."""
+
+    def ctx(
+        self,
+        *,
+        ns="seeded-autoscaling",
+        workload_kind="Deployment",
+        replicas=2,
+        min_replicas=2,
+        max_replicas=10,
+        stabilization=0,
+        policies="planted",
+        select_policy="Max",
+        containers=None,
+        grace=None,
+        target=None,
+        owned=False,
+        hpa_labels=None,
+        workload_labels=None,
+    ):
+        d = deployment("web-api-server", ns=ns, kind=workload_kind, **{"spec.replicas": replicas})
+        if workload_labels is not None:
+            d["metadata"]["labels"] = workload_labels
+        if containers is not None:
+            d["spec"]["template"]["spec"]["containers"] = containers
+        if grace is not None:
+            d["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = grace
+
+        h = hpa(
+            "web-api-server-hpa",
+            ns=ns,
+            min_replicas=min_replicas if min_replicas is not None else 1,
+            max_replicas=max_replicas,
+            target=target or {"apiVersion": "apps/v1", "kind": workload_kind, "name": "web-api-server"},
+            owned=owned,
+        )
+        if min_replicas is None:
+            del h["spec"]["minReplicas"]
+        if hpa_labels is not None:
+            h["metadata"]["labels"] = hpa_labels
+        if stabilization != "absent_behavior":
+            scale_down = {}
+            if stabilization is not None:
+                scale_down["stabilizationWindowSeconds"] = stabilization
+            if select_policy is not None:
+                scale_down["selectPolicy"] = select_policy
+            if policies == "planted":
+                scale_down["policies"] = [{"type": "Percent", "value": 100, "periodSeconds": 15}]
+            elif policies is not None:
+                scale_down["policies"] = policies
+            h["spec"]["behavior"] = {"scaleDown": scale_down}
+        return context_of(dump_of(d, h))
+
+    def test_zero_stabilization_and_hundred_percent_without_prestop_flags_hpa(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "HorizontalPodAutoscaler/web-api-server-hpa")
+        self.assertEqual(hits[0]["namespace"], "seeded-autoscaling")
+        self.assertIn("stabilizationWindowSeconds=0", hits[0]["excerpt"])
+        self.assertIn("selectPolicy=Max", hits[0]["excerpt"])
+        self.assertIn("policies=100% per 15s", hits[0]["excerpt"])
+        self.assertIn("scaling Deployment/web-api-server (minReplicas=2, maxReplicas=10)", hits[0]["excerpt"])
+        self.assertIn("target containers with no preStop hook: app (terminationGracePeriodSeconds=30)", hits[0]["excerpt"])
+
+    def test_collect_cluster_grades_it_major_without_requiring_a_service(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "hpa-aggressive-scaledown")
+        self.assertEqual(spec.severity, "major")
+        hits = spec.run(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+
+    def test_omitted_policies_with_short_window_use_kubernetes_default_hundred_percent(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=15, policies=None, select_policy=None))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("policies=100% per 15s (API default)", hits[0]["excerpt"])
+
+    def test_default_or_sixty_second_stabilization_window_is_not_flagged(self):
+        for window in ("absent_behavior", None, 60, 300):
+            with self.subTest(window=window):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=window)), [])
+
+    def test_disabled_select_policy_is_not_flagged(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(select_policy="Disabled")), [])
+
+    def test_bounded_percent_or_pods_policy_is_not_flagged(self):
+        bounded = [
+            [{"type": "Percent", "value": 25, "periodSeconds": 60}],
+            [{"type": "Percent", "value": 49, "periodSeconds": 15}],
+            [{"type": "Pods", "value": 1, "periodSeconds": 60}],
+        ]
+        for pol in bounded:
+            with self.subTest(policies=pol):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=pol)), [])
+
+    def test_select_policy_max_vs_min_handles_mixed_policy_lists(self):
+        mixed = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Pods", "value": 1, "periodSeconds": 60},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Max"))), 1)
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Min")), [])
+        all_aggressive = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Percent", "value": 50, "periodSeconds": 30},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=all_aggressive, select_policy="Min"))), 1)
+
+    def test_container_prestop_hook_clears_it_while_self_health_sidecar_is_ignored(self):
+        containers = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+            {"name": "istio-proxy", "image": "proxyv2"},
+        ]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(containers=containers)), [])
+
+    def test_serving_service_narrows_to_containers_in_its_target_port_path(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "web-api-server"}}
+        d["spec"]["template"]["spec"]["containers"] = [
+            {
+                "name": "app",
+                "image": "pause",
+                "ports": [{"containerPort": 8080}],
+                "lifecycle": {"preStop": {"sleep": {"seconds": 15}}},
+            },
+            {"name": "fluent-bit", "image": "fluent-bit"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        svc = service(
+            "web-api-server",
+            ns="seeded-autoscaling",
+            selector={"app": "web-api-server"},
+            ports=[{"name": "http", "port": 80, "targetPort": 8080}],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h, svc))), [])
+
+    def test_native_sidecar_without_prestop_is_flagged_while_plain_init_container_is_not(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["spec"]["containers"] = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+        ]
+        d["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "migrate", "image": "busybox"},
+            {"name": "envoy-proxy", "image": "envoy", "restartPolicy": "Always"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        hits = collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("target containers with no preStop hook: envoy-proxy", hits[0]["excerpt"])
+
+        d["spec"]["template"]["spec"]["initContainers"] = [{"name": "migrate", "image": "busybox"}]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h))), [])
+
+    def test_daemonset_target_is_not_flagged(self):
+        ds = deployment("node-agent", ns="seeded-autoscaling")
+        ds["kind"] = "DaemonSet"
+        ds["spec"].pop("replicas", None)
+        h = hpa(
+            "node-agent-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "DaemonSet", "name": "node-agent"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(ds, h))), [])
+
+    def test_omitted_min_replicas_defaults_floor_to_one_and_statefulset_target_is_flagged(self):
+        hits = collect.check_hpa_aggressive_scaledown(
+            self.ctx(min_replicas=None, max_replicas=5, workload_kind="StatefulSet", grace=45)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("scaling StatefulSet/web-api-server (minReplicas=1, maxReplicas=5)", hits[0]["excerpt"])
+        self.assertIn("terminationGracePeriodSeconds=45", hits[0]["excerpt"])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=None, max_replicas=1)), [])
+
+    def test_standard_and_hpa_exclusions_hold(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(ns="kube-system")), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(hpa_labels={collect._ADDON_MANAGER_MODE_LABEL: "Reconcile"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(owned=True)), [])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=5, max_replicas=5)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(workload_labels={collect.OPT_OUT_KEY: "exempt"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(replicas=0)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "missing"})
+            ),
+            [],
+        )
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "custom.io/v1", "kind": "Deployment", "name": "web-api-server"})
+            ),
+            [],
+        )
+
+
 class TestSingleReplicaDefersToTheHpaCheck(unittest.TestCase):
     """§3.11's new exclusion — the two checks partition one population."""
 
@@ -4213,10 +4466,11 @@ class TestCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
-        # The three cluster-kind checks that grade against the workload set
+        # The four cluster-kind checks that grade against the workload set
         # examined nothing either: a PDB is only graded against the workload
-        # it covers, an HPA's floor only against a Service-backed workload.
-        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"}
+        # it covers, an HPA's floor or scale-down behavior only against the
+        # workload it scales.
+        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", "hpa-aggressive-scaledown"}
         self.assertEqual(set(na), workload_slugs | anchored)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, a CronJob that has

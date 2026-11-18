@@ -1,12 +1,15 @@
 """Tests for board_snapshot: the Slack Home tab's read of the board, the findings queue and the audit store."""
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -73,6 +76,12 @@ class BoardSnapshotTest(unittest.TestCase):
 
     def snap(self, kanban=None, audit=None):
         return board_snapshot.snapshot(self.session, kanban, NOW, self.profiles, audit or (lambda: None))
+
+    def test_the_dial_section_is_built_and_never_breaks_the_board(self):
+        board = board_snapshot.snapshot(self.session, None, NOW, self.profiles, lambda: None, lambda db: {"enabled": True, "level": "explain"})
+        self.assertEqual(board["dial"], {"enabled": True, "level": "explain"})
+        with mock.patch.dict(sys.modules, {"dial_state": None}):
+            self.assertEqual(board_snapshot.default_dial(self.session), {"enabled": False})
 
     def test_clusters_are_the_fleet_with_their_open_findings_worst_first(self):
         findings_queue.register_findings(
@@ -315,6 +324,272 @@ class BoardSnapshotTest(unittest.TestCase):
     def test_the_audit_lands_on_the_board(self):
         audit = {"name": "n", "findings": 0, "critical": 0, "issue_url": "", "issue": 0, "finished_at": "2026-10-16T10:24:00+00:00"}
         self.assertEqual(self.snap(audit=lambda: audit)["audit"], audit)
+
+
+def resolved_scope(render, rows, clusters):
+    """A resolved scope the publisher stamped for `render` (spec.mode: next)."""
+    import scope_publisher
+
+    return {"v": 1, "resolvedAt": "2026-10-16T12:00:00Z", "state": "ok", "memberHash": scope_publisher.member_hash(render),
+            "excludedProjects": [], "clusters": clusters,
+            "projects": [{"id": p, "via": ["folders/1"], "outcome": o, "confirmedAt": "2026-10-16T12:00:00Z"} for p, o in rows]}
+
+
+class BoardSnapshotNextModeTest(unittest.TestCase):
+    """#3658: under spec.mode: next the clusters come from the resolved scope
+    (fleet_scope_targets.list_scope_clusters), not the Cluster Agent profiles."""
+
+    RENDER = {"present": True, "projects": [], "folders": ["1"],
+              "exclude": {"clusters": [{"projectId": "member-a", "location": "us-central1", "clusterName": "skipped"}]}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.profiles = self.home / "profiles"
+        # A profile that would show up if anything still walked the profiles.
+        ghost = self.profiles / "ca-ghost"
+        ghost.mkdir(parents=True)
+        (ghost / "config.yaml").write_text("cluster_identity:\n  project: ghost-proj\n  cluster: ghost\n  location: us-east1\n")
+        env = mock.patch.dict(os.environ, {"GCP_PROJECT_ID": "mgmt"})
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("KUBEAGENTS_SCOPE_FILE", "KUBEAGENTS_RESOLVED_SCOPE_FILE"):
+            os.environ.pop(name, None)
+        self.session = sqlite3.connect(":memory:")
+        findings_queue.init_findings_schema(self.session)
+
+    def next_mode(self, rows, clusters, render=None):
+        render = render or self.RENDER
+        (self.home / "scope.json").write_text(json.dumps(render))
+        (self.home / "resolved-scope.json").write_text(json.dumps(resolved_scope(render, rows, clusters)))
+        os.environ["KUBEAGENTS_SCOPE_FILE"] = str(self.home / "scope.json")
+        os.environ["KUBEAGENTS_RESOLVED_SCOPE_FILE"] = str(self.home / "resolved-scope.json")
+
+    def snap(self, kanban=None):
+        return board_snapshot.snapshot(self.session, kanban, NOW, self.profiles, lambda: None)
+
+    def test_the_clusters_are_the_resolved_scopes_not_the_profiles(self):
+        self.next_mode([("member-a", "ok")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"], ["europe-west1", "api"], ["us-central1", "skipped"]]},
+        })
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertIn("web", names)
+        self.assertIn("api", names)
+        # The excluded cluster is not the fleet's, and nothing walked the profiles.
+        self.assertNotIn("skipped", names)
+        self.assertNotIn("ghost", names)
+
+    def profile(self, name, project, cluster, location="us-central1"):
+        home = self.profiles / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(f"cluster_identity:\n  project: {project}\n  cluster: {cluster}\n  location: {location}\n")
+
+    def test_a_project_listed_live_is_named_not_left_out(self):
+        # The management project's clusters are listed live by the watch
+        # scripts and the board has no gcloud in its request path, so they come
+        # from its Cluster Agent profiles until those retire (#3658, 4d); a
+        # project listed live that no profile names yet is a row that says so,
+        # never a fleet without it.
+        self.next_mode([], {})
+        rows = self.snap()["clusters"]
+        self.assertEqual([r["name"] for r in rows], ["mgmt (clusters not listed here)"])
+        self.assertEqual(rows[0]["findings"], 0)
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        board = self.snap()
+        self.assertEqual(board["clusters"], [{"name": "host", "findings": 0}])
+        self.assertEqual(board["cluster_count"], 1)
+
+    def test_a_numeric_project_id_still_shows_the_management_projects_clusters(self):
+        # spec.harness.projectId may be the project NUMBER (GCP_PROJECT_ID
+        # then carries it), while the Cluster Agent profiles name the project
+        # ID. The reconcile snapshot's management row has the ID; the board
+        # takes the management project from there, as agent_roster and the
+        # scope render already do (#6245), not from GCP_PROJECT_ID.
+        os.environ["GCP_PROJECT_ID"] = "123456789012"
+        (self.home / board_snapshot.fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}]}))
+        self.next_mode([], {})
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        board = self.snap()
+        self.assertEqual(board["clusters"], [{"name": "host", "findings": 0}])
+        self.assertEqual(board["cluster_count"], 1)
+
+    def test_a_numeric_project_id_with_no_snapshot_falls_back_to_it(self):
+        # No reconcile snapshot yet (or no management row): the board keeps
+        # GCP_PROJECT_ID, as before, and says the project's clusters aren't
+        # listed rather than inventing an ID.
+        os.environ["GCP_PROJECT_ID"] = "123456789012"
+        self.next_mode([], {})
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        self.assertEqual([r["name"] for r in self.snap()["clusters"]], ["123456789012 (clusters not listed here)"])
+
+    def test_a_project_id_is_used_as_it_is_whatever_the_snapshot_says(self):
+        # Only a number is looked up, as agent_roster does: an install that
+        # names its project by ID keeps it, even while a stale snapshot (a
+        # reused volume, say) still names another management project.
+        (self.home / board_snapshot.fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": "old-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}]}))
+        self.next_mode([], {})
+        self.profile("cluster-mgmt-host-us-central1", "mgmt", "host")
+        self.profile("cluster-old-mgmt-gone-us-central1", "old-mgmt", "gone")
+        self.assertEqual(self.snap()["clusters"], [{"name": "host", "findings": 0}])
+
+    def test_an_install_with_no_container_scope_shows_the_management_projects_clusters(self):
+        # Every next install today: no folder, organization, Shared VPC host or
+        # Metrics Scope, so the scope publisher never runs and the management
+        # project is listed live. Its clusters come from its profiles, so the
+        # tab shows what it showed outside next.
+        from cluster_agent_profile import profile_name
+
+        render = {"present": True, "projects": []}
+        self.next_mode([], {}, render=render)
+        for cluster in ("web", "api", "db"):
+            self.profile(profile_name("mgmt", cluster, "us-central1"), "mgmt", cluster)
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'look at db', ?, 'running', ?, ?)",
+                       (profile_name("mgmt", "db", "us-central1"), STARTED, STARTED))
+        board = self.snap(kanban)
+        self.assertEqual(board["clusters"], [{"name": n, "findings": 0} for n in ("api", "db", "web")])
+        self.assertEqual(board["cluster_count"], 3)
+        self.assertEqual(board["running"][0]["cluster"], "db")
+
+    def test_a_mixed_install_reads_members_from_the_scope_and_live_projects_from_profiles(self):
+        # Member clusters from the resolved scope, the management and explicit
+        # projects' from their profiles, an unread member a placeholder row. A
+        # member's own profile (here member-a's retired "old") and a profile in
+        # a project the scope does not name (ghost) are not read into the fleet.
+        from cluster_agent_profile import profile_name
+
+        render = dict(self.RENDER, projects=["explicit-a"])
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]},
+        }, render=render)
+        self.profile(profile_name("mgmt", "host", "us-central1"), "mgmt", "host")
+        self.profile(profile_name("explicit-a", "svc", "us-east1"), "explicit-a", "svc", "us-east1")
+        self.profile(profile_name("member-a", "old", "us-central1"), "member-a", "old")
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'host work', ?, 'running', ?, ?)",
+                       (profile_name("mgmt", "host", "us-central1"), STARTED, STARTED))
+        kanban.execute("INSERT INTO tasks VALUES ('t2', 'old work', ?, 'running', ?, ?)",
+                       (profile_name("member-a", "old", "us-central1"), STARTED, STARTED))
+        board = self.snap(kanban)
+        self.assertEqual([r["name"] for r in board["clusters"]], ["member-b (clusters unread)", "host", "svc", "web"])
+        self.assertEqual(board["cluster_count"], 3)
+        cards = {c["title"]: c for c in board["running"]}
+        self.assertEqual(cards["host work"]["cluster"], "host")
+        self.assertNotIn("cluster", cards["old work"])
+
+    def test_an_unread_project_is_a_row_never_no_clusters(self):
+        self.next_mode([("member-a", "ok"), ("member-b", "denied"), ("member-c", "ok")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]},
+        })
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertIn("member-b, member-c (clusters unread)", names)
+        self.assertIn("web", names)
+
+    def test_an_unusable_resolved_scope_is_a_row_for_its_members(self):
+        self.next_mode([], {})
+        (self.home / "resolved-scope.json").write_text("{not json")
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertIn("scope members (clusters unread)", names)
+
+    def test_many_unread_projects_are_one_row(self):
+        rows = [(f"member-{i:02d}", "denied") for i in range(10)]
+        self.next_mode(rows, {})
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertIn("member-00, member-01, member-02 and 7 more projects (clusters unread)", names)
+        self.assertEqual(len(names), 2)
+
+    def test_one_more_unread_project_is_singular(self):
+        self.next_mode([(f"member-{i:02d}", "denied") for i in range(4)], {})
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertIn("member-00, member-01, member-02 and 1 more project (clusters unread)", names)
+
+    def test_findings_rank_ahead_of_the_unlisted_rows(self):
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"], ["us-central1", "db"]]},
+        })
+        findings_queue.register_findings(self.session, [dict(finding("db", "db crashlooping", "critical"), project="member-a")])
+        names = [c["name"] for c in self.snap()["clusters"]]
+        self.assertEqual(names, ["db", "mgmt (clusters not listed here)", "member-b (clusters unread)", "web"])
+
+    def test_only_the_unlisted_rows_carry_the_flag(self):
+        # The gateway draws an unlisted row neutral, never "no open findings"
+        # in green (a2a/lib/board.go, BoardCluster.Unlisted); a real cluster
+        # row leaves the field out, so its bytes are as before.
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {
+            "member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]},
+        })
+        rows = {r["name"]: r for r in self.snap()["clusters"]}
+        self.assertIs(rows["mgmt (clusters not listed here)"]["unlisted"], True)
+        self.assertIs(rows["member-b (clusters unread)"]["unlisted"], True)
+        self.assertEqual(rows["web"], {"name": "web", "findings": 0})
+
+    def test_the_cap_never_hides_a_placeholder_row(self):
+        # More clusters with findings than the cap, and a project nothing read:
+        # the placeholders ride past the cap, which counts real clusters only,
+        # and cluster_count is clusters, not placeholders.
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {"member-a": {"at": "2026-10-16T12:00:00Z", "clusters": []}})
+        hot = board_snapshot.CLUSTERS_MAX + 1
+        findings_queue.register_findings(self.session, [dict(finding(f"hot-{i:02d}", f"hot{i} broken", "major"), project="member-a")
+                                                        for i in range(hot)])
+        board = self.snap()
+        rows = board["clusters"]
+        self.assertEqual([r["name"] for r in rows if r.get("unlisted")],
+                         ["mgmt (clusters not listed here)", "member-b (clusters unread)"])
+        self.assertEqual(len([r for r in rows if not r.get("unlisted")]), board_snapshot.CLUSTERS_MAX)
+        self.assertEqual(board["cluster_count"], hot)
+
+    def test_a_card_in_a_project_listed_live_with_no_profile_has_no_cluster_label(self):
+        # A project listed live labels its cards from its own profiles (above);
+        # a card filed to a profile name no profile carries gets no label.
+        from cluster_agent_profile import profile_name
+
+        self.next_mode([], {})
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'host work', ?, 'running', ?, ?)",
+                       (profile_name("mgmt", "host", "us-central1"), STARTED, STARTED))
+        (card,) = self.snap(kanban)["running"]
+        self.assertEqual(card["title"], "host work")
+        self.assertNotIn("cluster", card)
+
+    def test_a_blank_resolved_scope_path_is_today_mode(self):
+        # Whitespace is unset, as fleet_scope_targets.resolved_scope_file reads it (#5660).
+        before = self.snap()
+        self.next_mode([("member-a", "ok")], {"member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        os.environ["KUBEAGENTS_RESOLVED_SCOPE_FILE"] = "  \t "
+        self.assertEqual(self.snap(), before)
+
+    def test_a_running_card_on_a_clusters_profile_still_names_its_cluster(self):
+        # Until routing moves to the cluster profile, a card may still be
+        # assigned to the per-cluster profile name, derived from the scope's
+        # triple rather than read from the profile.
+        from cluster_agent_profile import profile_name
+
+        self.next_mode([("member-a", "ok")], {"member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'look at web', ?, 'running', ?, ?)",
+                       (profile_name("member-a", "web", "us-central1"), STARTED, STARTED))
+        kanban.execute("INSERT INTO tasks VALUES ('t2', 'ghost', 'ca-ghost', 'running', ?, ?)", (STARTED, STARTED))
+        running = {c["title"]: c for c in self.snap(kanban)["running"]}
+        self.assertEqual(running["look at web"]["cluster"], "web")
+        self.assertNotIn("cluster", running["ghost"])
+
+    def test_an_unreadable_render_is_a_board_error(self):
+        self.next_mode([], {})
+        os.environ["KUBEAGENTS_SCOPE_FILE"] = str(self.home / "absent.json")
+        with self.assertRaises(board_snapshot.BoardError):
+            self.snap()
+
+    def test_today_mode_ignores_a_resolved_scope_on_disk(self):
+        # Equivalence: an empty KUBEAGENTS_RESOLVED_SCOPE_FILE (the operator's
+        # pin outside next) reads the profiles exactly as before.
+        before = self.snap()
+        self.next_mode([("member-a", "ok")], {"member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        os.environ["KUBEAGENTS_RESOLVED_SCOPE_FILE"] = ""
+        self.assertEqual(self.snap(), before)
+        self.assertEqual([c["name"] for c in before["clusters"]], ["ghost"])
 
 
 if __name__ == "__main__":

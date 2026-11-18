@@ -119,8 +119,11 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name:        ToolSendMessage,
-			Description: "Send a prompt, question, task, or command to kube-agents over the A2A v2 JetStream bus and wait for the answer (or stream live step envelopes when _meta.conversation_id is set). A turn still running when the wait ends returns its task, to read later with task_control.",
+			Name: ToolSendMessage,
+			Description: "Send a prompt, question, task, or command to kube-agents over the A2A v2 JetStream bus and wait for the answer (or stream live step envelopes when _meta.conversation_id is set). A turn still running when the wait ends returns its task, to read later with task_control. " +
+				"To send the turn straight to an AgentProfile, name it in addressee (for example cluster) and pass its task parameters in parameters " +
+				"(for cluster: project, location and cluster); read_topics with action cards lists the agent cards by profile. " +
+				"The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the answer.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"message"},
@@ -137,6 +140,15 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 					"wait_timeout_seconds": map[string]any{
 						"type":        "integer",
 						"description": fmt.Sprintf("Seconds to wait for the answer before returning the still-running task to read later with task_control (default: %d, at most %d; larger values are clamped to %d).", defaultSendWaitSeconds, maxSendWaitSeconds, maxSendWaitSeconds),
+					},
+					"addressee": map[string]any{
+						"type":        "string",
+						"description": "Optional AgentProfile to send the turn to, by name (for example cluster), as a new task for it. Default: the conversation's agent. Refused on a stop word, a bare /feedback or /feedback summary, and on any /session text, a message after it included: an addressed turn is a new task for the profile, not a session.",
+					},
+					"parameters": map[string]any{
+						"type":                 "object",
+						"additionalProperties": map[string]any{"type": "string"},
+						"description":          "Optional task parameters for the addressed profile, as string values (for cluster: project, location and cluster). Only with addressee.",
 					},
 				},
 			},

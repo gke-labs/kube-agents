@@ -23,8 +23,8 @@
 id: control-plane-unpaginated-heavy-list-oom
 name: "Unpaginated cluster-wide LIST caller (declared gap; planted as a suspended CronJob with --chunk-size=0 when its check lands)"
 domain: fleet-audits
-suite: certification
-certification_part: 2
+suite: validated-capabilities
+suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -35,7 +35,7 @@ prompt: >-
 expected_output: >-
   Planted as a suspended CronJob whose command lists cluster-wide without
   pagination, once its check lands. Customer failure: an API server out of
-  memory. Certified means: the ledger issue carries a finding that names
+  memory. Validated means: the ledger issue carries a finding that names
   CronJob `legacy-inventory-poller` as an unpaginated cluster-wide lister
   from its spec. The closing response is the SOP's one line with the ledger
   URL.
