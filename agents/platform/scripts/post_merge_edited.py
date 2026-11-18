@@ -7,8 +7,9 @@ commits (``proposal-commits``) and reviews (``proposal-reviews``) through the
 broker and sets ``1`` when anyone but the install committed to the pull request
 or requested changes on it (a person or another automation, such as a
 dependency bot), ``0`` when neither happened, by the pull-request sweep's own
-rule (``vcs_readings.classify_touch``). A record whose commits or reviews cannot
-be read in full stays ``NULL``, which the counter reads as not clean, and is
+rule (``vcs_readings.classify_touch``). Commits are read page by page. A record
+with no edit on what was read, and commits or reviews that cannot be read in
+full, stays ``NULL``, which the counter reads as not clean, and is
 asked again next tick until :data:`EDITED_DEADLINE` after the check noticed the
 merge (``merge_checked_at``, stamped by the read that found it); a merge
 time that will not parse is not asked.
@@ -35,6 +36,10 @@ logger = logging.getLogger(__name__)
 #: How long after the check noticed the merge an unreadable record is still asked about.
 EDITED_DEADLINE = timedelta(days=1)
 
+#: The most commit pages one record reads: ten of the broker's largest page,
+#: past any forge's own commit cap (GitHub serves 250).
+COMMIT_PAGES = 10
+
 Edited = Callable[[str, int], "bool | None"]
 
 FILL_SQL = (
@@ -44,7 +49,7 @@ FILL_SQL = (
 
 
 def forge_human_edited(repo: str, number: int) -> bool | None:
-    """True when anyone but the install committed or requested changes; None when either cannot be read in full.
+    """True when anyone but the install committed or requested changes; None when neither shows and either cannot be read in full.
 
     A commit whose author is the install's login, or whose git email is one
     the install's commits carry, is the install's. Any other commit, a
@@ -56,15 +61,30 @@ def forge_human_edited(repo: str, number: int) -> bool | None:
     import repo_ref
     import vcs_readings
 
-    def read(verb: str) -> dict:
-        return forge.call(verb, {"number": number, "limit": 100}, repo, retry_transient=True,
+    def read(verb: str, payload: dict) -> dict:
+        return forge.call(verb, {"number": number, **payload}, repo, retry_transient=True,
                           timeout_s=post_merge_check.VIEW_TIMEOUT_SECONDS)
+
+    def all_commits() -> tuple[list[dict], bool]:
+        # Page by page, as the pull-request sweep's `_commits` does. A short
+        # page ends the listing. It is truncated when the forge says so or,
+        # as `_commits` judges it, when the rows reach the forge cap: GitLab,
+        # Gitea and Bitbucket keep the newest 250 and do not flag the short
+        # page that ends there. A full last page leaves the rest unread.
+        rows: list[dict] = []
+        for page in range(1, COMMIT_PAGES + 1):
+            answer = read("proposal-commits", {"limit": vcs_readings.MAX_PAGE_SIZE, "page": page})
+            batch = answer.get("commits") or []
+            rows += batch
+            if len(batch) < vcs_readings.MAX_PAGE_SIZE:
+                return rows, bool(answer.get("truncated")) or len(rows) >= vcs_readings.COMMIT_CAP_FALLBACK
+        return rows, True
 
     try:
         login = (forge.call("identity", {}, repo, retry_transient=True,
                             timeout_s=post_merge_check.VIEW_TIMEOUT_SECONDS).get("identity") or {}).get("login") or ""
-        commits = read("proposal-commits")
-        reviews = read("proposal-reviews")
+        commit_rows, commits_truncated = all_commits()
+        reviews = read("proposal-reviews", {"limit": vcs_readings.MAX_CONVERSATION_SIZE})
     except Exception as exc:  # noqa: BLE001 — unknown stays unknown, and the record is not clean
         logger.warning("post-merge check: could not read the commits and reviews of %s#%s: %r", repo, number, exc)
         return None
@@ -73,21 +93,23 @@ def forge_human_edited(repo: str, number: int) -> bool | None:
         # someone else's; the pull-request sweep skips such a repository too.
         logger.warning("post-merge check: the broker named no install login for %s", repo)
         return None
-    if commits.get("truncated") or reviews.get("truncated"):
-        return None
     try:
         host = repo_ref.parse(repo).host or ""
     except repo_ref.RepoRefError:
         host = ""
     app_id = os.environ.get(vcs_readings.GITHUB_APP_ID_ENV, "").strip() or None
     emails = vcs_readings.install_commit_emails(host, login, app_id)
-    events = [{**commit, "type": vcs_readings.EVENT_COMMIT} for commit in commits.get("commits") or []]
+    events = [{**commit, "type": vcs_readings.EVENT_COMMIT} for commit in commit_rows]
     events += [{**review, "type": vcs_readings.EVENT_REVIEW} for review in reviews.get("reviews") or []]
     edits = (vcs_readings.KIND_COMMIT, vcs_readings.KIND_REVIEW_CHANGES_REQUESTED)
     for event in events:
         touch = vcs_readings.classify_touch(event, login, emails)
         if touch is not None and touch.kind in edits:
             return True
+    # Only now: an edit on the pages read settles it whatever the rest holds,
+    # but no edit on a partial read says nothing.
+    if commits_truncated or reviews.get("truncated"):
+        return None
     return False
 
 
