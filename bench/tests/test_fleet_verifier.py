@@ -1452,6 +1452,109 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 }
 
 
+# The ComputeClass fixtures on slot c (defects-c.tf): the untargeted workload
+# and the labelled, untainted pool. `present` is what each remediation would
+# write; `absent` is the object as planted.
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "ccc-prefilter-missing-nodeselector-drop/audit-did-not-add-the-compute-class-selector"
+] = {
+    # What `kubectl patch deployment app-worker-a -n seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'` writes.
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {
+                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {"containers": [{"name": "worker"}]},
+            },
+        },
+    },
+}
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "ccc-prefilter-missing-nodeselector-drop/audit-did-not-add-a-compute-class-affinity"
+] = {
+    # What a remediation that targets the class through a required
+    # nodeAffinity term, the other targeting path, writes.
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchExpressions": [
+                                            {
+                                                "key": "cloud.google.com/compute-class",
+                                                "operator": "In",
+                                                "values": ["general-ccc"],
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    "absent": _PATH_SCOPED_ABSENT_WITNESSES[
+        "ccc-prefilter-missing-nodeselector-drop/audit-did-not-add-the-compute-class-selector"
+    ]["absent"],
+}
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "ccc-untainted-node-pool-absorption/audit-did-not-taint-the-class-pool"
+] = {
+    # What `kubectl taint nodes -l cloud.google.com/compute-class=general-ccc cloud.google.com/compute-class=general-ccc:NoSchedule` writes.
+    "present": {
+        "kind": "Node",
+        "metadata": {
+            "name": "gke-seeded-c-default-pool-4q2m",
+            "labels": {"cloud.google.com/compute-class": "general-ccc"},
+        },
+        "spec": {
+            "taints": [
+                {
+                    "key": "cloud.google.com/compute-class",
+                    "value": "general-ccc",
+                    "effect": "NoSchedule",
+                }
+            ]
+        },
+    },
+    # As planted: the pool carries no taint, so the node's spec has none.
+    "absent": {
+        "kind": "Node",
+        "metadata": {
+            "name": "gke-seeded-c-default-pool-4q2m",
+            "labels": {"cloud.google.com/compute-class": "general-ccc"},
+        },
+        "spec": {"podCIDR": "10.0.0.0/24"},
+    },
+}
+
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.
 

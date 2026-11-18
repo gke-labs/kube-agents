@@ -169,30 +169,24 @@ spec:
                    pin stays out (kube-agents.a2aBusExporterFromChart), so that
                    install keeps running without the sidecar.
 
-                   `| default dict` because a2aBus is a key this chart gained,
-                   the same guard agentSandbox carries above: a render against an
-                   older release's values (`helm upgrade --reuse-values`) has no
-                   a2aBus, and skipping the four there leaves the operator on its
-                   compiled defaults, the same pins, as that release already
-                   ran. */}}
-            {{- $bus := (.Values.a2aBus | default dict).images | default dict }}
-            {{- with $bus.nats }}
+                   kube-agents.a2aBusImage falls back to the chart's own pins
+                   (kube-agents.a2aBusImageDefaults) where the values carry no
+                   a2aBus, the same guard agentSandbox carries above: a render
+                   against an older release's values (`helm upgrade
+                   --reuse-values`) has no a2aBus key, and skipping the four
+                   there would leave the operator on its compiled Docker Hub
+                   defaults while global.thirdPartyImageRegistry, carried over
+                   from that release, says the install pulls from a mirror
+                   only. */}}
             - name: A2A_NATS_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
-            {{- with $bus.natsBox }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "nats") | quote }}
             - name: A2A_PROVISION_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
-            {{- with $bus.configReloader }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "natsBox") | quote }}
             - name: A2A_NATS_RELOADER_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "configReloader") | quote }}
             {{- if include "kube-agents.a2aBusExporterFromChart" $ }}
-            {{- with $bus.prometheusExporter }}
             - name: A2A_NATS_EXPORTER_IMAGE
-              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
-            {{- end }}
+              value: {{ include "kube-agents.a2aBusImage" (dict "root" $ "key" "prometheusExporter") | quote }}
             {{- end }}
             {{- /* The pull identity for those same pods. Redundant for the CR
                    this release renders, which carries the secrets itself, and
