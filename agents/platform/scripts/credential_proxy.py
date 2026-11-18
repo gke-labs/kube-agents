@@ -1490,6 +1490,10 @@ RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
 # A profile caller's proposal-update that edits labels (#3993): refused whoever
 # owns the proposal (vcs_broker.ProfileLabelsRefused).
 RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
+# A profile caller's `identity` with no repository answers the install's managed
+# repositories under this key (#6389): the names every profile verb is held to,
+# so a profile task that names no repository can find the one it may use.
+PROFILE_IDENTITY_MANAGED_KEY = "managedRepositories"
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
 DIAL_PATH = "/v1/dial"
@@ -2484,6 +2488,8 @@ def executable_refusal_message(role: str, executable: str) -> str:
 #     proposal-view, proposal-list, proposal-commits, branch-view, identity
 #     (the forge login a submission checks it is not proposing as), issue-list
 #     and issue-view. Each is held to the managed list like every other verb.
+#     `identity` with no repository answers the managed list's names instead
+#     (#6389), so a task that names no repository can find the one it may use.
 #   * publish, proposal-create and proposal-update, the writes that put a
 #     change up for review, each further gated in `_dispatch_vcs_post` on the
 #     task credential's permit (PROFILE_PERMIT_GATED_VCS_VERBS).
@@ -14473,6 +14479,33 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         )
         return False
 
+    def _answer_managed_repositories(self) -> str:
+        """Answer the managed repositories' `host/path` keys, sorted, and return the outcome label.
+
+        The same list `repository_is_managed` compares against
+        (`managed_repositories`). An unreadable list is the 503 the managed
+        check answers, a fault rather than an empty answer; an install with
+        nothing registered answers an empty list.
+        """
+        try:
+            names = sorted(managed_repositories())
+        except Exception as exc:
+            LOGGER.warning(
+                "profile identity: the managed-repository list could not be read type=%s",
+                type(exc).__name__,
+            )
+            self.metrics.record_failure(_route_failure_kind(getattr(self, "path", "")))
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the managed repository list is unavailable",
+                    "code": "MANAGED_REPOSITORIES_UNAVAILABLE",
+                },
+            )
+            return TOOL_STATUS_ERROR
+        self._json(HTTPStatus.OK, {PROFILE_IDENTITY_MANAGED_KEY: names})
+        return TOOL_STATUS_SUCCESS
+
     def _repository_is_permitted(
         self, repository: str, forge: providers.Forge | None = None
     ) -> bool:
@@ -17078,6 +17111,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # verb will read it (`snapshot_bare_name_fallback`): lifted
                 # onto the install's GitHub forge, or, when it is read from a
                 # host outside the table with no credential, not at all.
+                if role == CALLER_ROLE_PROFILE and verb == "identity" and not payload.get("repository"):
+                    # A profile's no-repository identity (#6389): the managed
+                    # list's names, read-only, and nothing else. They are the
+                    # names every profile verb is already held to, so this adds
+                    # knowledge of them and no reach: no repository is
+                    # resolved, no forge is called, no credential is spent.
+                    # `capabilities`, which resolves any repository, stays
+                    # refused to the role. Every other role keeps identity's
+                    # repository requirement.
+                    return self._answer_managed_repositories()
                 if verb == PROPOSAL_CLAIM_VERB:
                     # Burned before anything else is asked, so a claim whose
                     # forge check fails below has spent its token too. What

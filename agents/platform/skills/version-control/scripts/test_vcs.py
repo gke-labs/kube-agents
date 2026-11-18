@@ -224,6 +224,30 @@ class VcsTestCase(unittest.TestCase):
         return Path(vcs_client.all_sessions()[0]["path"])
 
 
+class IdentityWithNoRepositoryTest(VcsTestCase):
+    """`identity` with nothing named and nothing cloned asks with no repository (#6389).
+
+    A profile worker's broker answers that with the install's managed
+    repositories; a named repository or a working copy keeps the old resolution.
+    """
+
+    def test_nothing_named_and_nothing_cloned_sends_no_repository(self):
+        code, _ = self.run_vcs("identity")
+        self.assertEqual(code, 0)
+        self.assertNotIn("repository", self.broker.payload("identity"))
+
+    def test_a_named_repository_is_sent(self):
+        code, _ = self.run_vcs("identity", "--repo", "local.test/acme/infra")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("identity")["repository"], "local.test/acme/infra")
+
+    def test_a_working_copy_still_names_its_repository(self):
+        self.clone()
+        code, _ = self.run_vcs("identity")
+        self.assertEqual(code, 0)
+        self.assertIn("repository", self.broker.payload("identity"))
+
+
 # ---------------------------------------------------------------------------
 # clone
 # ---------------------------------------------------------------------------

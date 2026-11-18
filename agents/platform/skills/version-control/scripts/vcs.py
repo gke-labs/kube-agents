@@ -368,11 +368,13 @@ def verb_label_ensure(arguments) -> dict:
 
 
 def verb_identity(arguments) -> dict:
-    return _collaboration(
-        arguments,
-        "identity",
-        {"login": arguments.login, "bot": True if arguments.bot else None},
-    )
+    payload = {"login": arguments.login, "bot": True if arguments.bot else None}
+    if not arguments.repo and not client.all_sessions():
+        # Nothing named and nothing cloned: ask with no repository. A profile
+        # worker's broker answers the install's managed repositories, the ones
+        # it may use (#6389); the shell's names its repository in the task.
+        return client.call("identity", {key: value for key, value in payload.items() if value is not None})
+    return _collaboration(arguments, "identity", payload)
 
 
 def verb_remote_branch_view(arguments) -> dict:
@@ -624,7 +626,9 @@ def build_parser() -> argparse.ArgumentParser:
     repo_option(rdelete).set_defaults(run=verb_remote_branch_delete)
 
     identity = verbs.add_parser(
-        "identity", aliases=["whoami"], help="who this install is on the forge, and whether a login may write"
+        "identity", aliases=["whoami"],
+        help="who this install is on the forge, and whether a login may write; with no repository named "
+        "or cloned, on a profile worker, which repositories this install manages",
     )
     identity.add_argument("--login", help="ask about this login instead of the credential's own")
     identity.add_argument(

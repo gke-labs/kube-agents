@@ -397,7 +397,11 @@ What the operator renders per profile, as built (amended 10/6):
   - Version control (#3993). `/v1/vcs/` admits the profile role, and every verb there needs a
     valid task credential: one with no credential is refused before the body is read, not
     run local-only. The reads (`clone`, `proposal-view`, `proposal-list`, `proposal-commits`,
-    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more. `publish`,
+    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more. An `identity`
+    with no `repository` answers the install's managed repositories instead
+    (`{managedRepositories: [host/path, …]}`), the names every verb is held to, with no
+    repository resolved and no forge called, so a task that names none can find the one it
+    may use. `publish`,
     `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
     `vcs:proposal-create`, which the dispatcher mints only when the submission's
     `changeRequested` is true, and only the gateway sets that, for a structured confirm. The

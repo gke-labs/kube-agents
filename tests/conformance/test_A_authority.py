@@ -14,8 +14,10 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import email.message
+import io
 import types
 import re
 import textwrap
@@ -558,6 +560,57 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertIsNotNone(cp.report_write_permitted(
             cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
         ))
+
+    def test_A3_only_a_profile_learns_the_managed_list_from_identity(self) -> None:
+        # #6389: a profile task that names no repository may ask `identity` with
+        # none and learn the managed repositories' names, the list every profile
+        # verb is held to. That is knowledge, not reach, and it is the profile
+        # role's alone: every other role keeps identity's repository requirement,
+        # so no other caller gains a repository-less answer.
+        cp = h.credential_proxy
+
+        def ask(role: str, task) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            principal = cp.Principal(workload="w", uid="u", role=role, pod="p", pod_uid="u")
+            handler.principal = dataclasses.replace(principal, task=task)
+            handler.vcs = types.SimpleNamespace(
+                registry=types.SimpleNamespace(resolve=lambda named: (_ for _ in ()).throw(AssertionError("resolved"))),
+                snapshot_source=lambda named: (named, None),
+            )
+            body = b"{}"
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda r: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler.metrics = types.SimpleNamespace(record_failure=lambda *a, **k: None)
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            original = cp.managed_repositories
+            cp.managed_repositories = lambda: frozenset({"github.com/acme/infra"})
+            original_table = cp.vcs_broker.route_table
+            cp.vcs_broker.route_table = lambda vcs: {"identity": lambda payload: {"identity": {}}}
+            try:
+                try:
+                    handler._dispatch_vcs_post("identity")
+                except AssertionError:
+                    replies.append((0, {"resolved": True}))
+            finally:
+                cp.managed_repositories = original
+                cp.vcs_broker.route_table = original_table
+            return replies
+
+        task = types.SimpleNamespace(permits=frozenset())
+        replies = ask(cp.CALLER_ROLE_PROFILE, task)
+        self.assertEqual([(200, {cp.PROFILE_IDENTITY_MANAGED_KEY: ["github.com/acme/infra"]})], replies)
+        for role in (cp.CALLER_ROLE_SHELL, ""):
+            with self.subTest(role=role or "socket"):
+                replies = ask(role, None)
+                self.assertFalse(
+                    any(cp.PROFILE_IDENTITY_MANAGED_KEY in body for _, body in replies),
+                    f"{role or 'socket'} learned the managed list from a repository-less identity: {replies}",
+                )
 
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
         # A report credential (#5619) is the one task credential with no

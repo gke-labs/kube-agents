@@ -1641,6 +1641,56 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.assertEqual([credential_proxy.CALLER_ROLE_PROFILE], sessions)
         self.assertEqual([credential_proxy.CLASS_BACKGROUND], classes)
 
+    # -- identity with no repository: the managed list (#6389) ------------------
+
+    def test_a_profile_identity_with_no_repository_answers_the_managed_list(self):
+        managed = frozenset({"github.com/acme/infra", "gitlab.example.com/ops/fleet"})
+        for payload in ({}, {"repository": ""}, {"repository": None}, {"login": "someone"}):
+            with self.subTest(payload=payload):
+                self.reset()
+                with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed):
+                    status, body = self.post(payload, token=VALID["token"], path="/v1/vcs/identity")
+                self.assertEqual(200, status, body)
+                self.assertEqual({credential_proxy.PROFILE_IDENTITY_MANAGED_KEY: sorted(managed)}, body)
+                # Names only: no repository resolved, no forge called, no credential spent.
+                self.routes["identity"].assert_not_called()
+                self.vcs.registry.resolve.assert_not_called()
+                self.managed.assert_not_called()
+
+    def test_a_profile_identity_with_no_repository_needs_a_task_credential(self):
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset({"github.com/a/b"})):
+            status, body = self.post({}, token=None, path="/v1/vcs/identity")
+        self.assertEqual(403, status, body)
+        self.assertEqual("CALLER_PERMIT_REQUIRED", body.get("code"), body)
+
+    def test_an_unreadable_managed_list_is_the_managed_checks_503(self):
+        with mock.patch.object(credential_proxy, "managed_repositories", side_effect=OSError("unmounted")):
+            status, body = self.post({}, token=VALID["token"], path="/v1/vcs/identity")
+        self.assertEqual(503, status, body)
+        self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", body["code"])
+
+    def test_an_install_with_nothing_registered_answers_an_empty_list(self):
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            status, body = self.post({}, token=VALID["token"], path="/v1/vcs/identity")
+        self.assertEqual(200, status, body)
+        self.assertEqual({credential_proxy.PROFILE_IDENTITY_MANAGED_KEY: []}, body)
+
+    def test_a_profile_identity_naming_a_repository_is_unchanged(self):
+        status, body = self.vcs_post("identity", VALID["token"])
+        self.assert_ran("identity", status, body)
+        self.managed.assert_called_once()
+
+    def test_another_role_keeps_identitys_repository_requirement(self):
+        shell = credential_proxy.Principal(workload="system:serviceaccount:ns:shell", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
+        with mock.patch.object(CredentialProxyHandler, "authenticator", _StubAuthenticator(shell)), \
+                mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset({"github.com/a/b"})) as listed:
+            status, body = self.post({}, token=None, path="/v1/vcs/identity")
+        # It takes identity's normal route, the repository resolved and checked
+        # (here the stand-in resolver accepts anything); it never gets the list.
+        self.assertNotIn(credential_proxy.PROFILE_IDENTITY_MANAGED_KEY, body)
+        self.vcs.registry.resolve.assert_called_once()
+        listed.assert_not_called()
+
     def test_every_read_verb_runs_with_the_permit_too(self):
         for verb in sorted(PROFILE_VCS_READS):
             with self.subTest(verb=verb):
