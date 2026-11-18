@@ -156,8 +156,8 @@ func dispatcherIdentityShare(agent *agentv1alpha1.PlatformAgent, base int, p *ag
 // and the bytes each of these profiles' entries adds to it, as
 // buildA2ADispatchConfigMapWith writes it (compact JSON): no durables and a
 // Job template referenced by its hash alone, which the dispatcher resolves
-// (#5479). A profile with a live unattended-mode tier under Job mode carries
-// that reference, whose hash is fixed-width, so which rendering the cluster
+// (#5479). Under Job mode every profile carries that reference (its
+// templates are per tier, #5646), whose hash is fixed-width, so which rendering the cluster
 // takes doesn't change its size. Each share is measured alone and charged
 // one more byte for the comma it takes in the array: exact for every entry
 // after the first, one over for the first, never under.
@@ -205,16 +205,15 @@ func (m dispatchConfigMeasure) bytes(entries []a2aDispatchProfile) (int, error) 
 	return len(body), err
 }
 
-// share is the bytes p's entry adds over base, with its comma. A profile
-// takes a Job template reference when dispatchJobTemplates renders it a
-// template: under Job mode, for its live unattended-mode tier
-// (unattendedTierOf), the built-in or a Tier resource's, and none while that
-// tier drains. Only the reference's hash is written, so a placeholder of the
-// same width measures it without rendering the template.
+// share is the bytes p's entry adds over base, with its comma. Under Job
+// mode every profile takes a Job template reference (dispatchJobTemplates
+// renders one per live tier, #5646), one hash however many tiers. Only the
+// reference's hash is written, so a placeholder of the same width measures
+// it without rendering the templates.
 func (m dispatchConfigMeasure) share(base int, p *agentv1alpha1.AgentProfile) (int, error) {
 	entry := dispatchProfileEntry(m.agent, p, nil)
-	if m.jobMode && unattendedTierOf(p) != "" {
-		entry.JobTemplateRef = &a2aDispatchJobTemplateRef{Hash: strings.Repeat("0", dispatchJobTemplateHashLength)}
+	if m.jobMode {
+		entry.JobTemplateRef = &a2aDispatchJobTemplateRef{Hash: strings.Repeat("0", dispatchJobTemplateHashLength), PerTier: true}
 	}
 	n, err := m.bytes([]a2aDispatchProfile{entry})
 	return n - base + 1, err
@@ -406,7 +405,9 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 	var entry a2aAuthMapIdentity
 	var n int
 	if a2aDispatcherBucketedGrants() {
-		entry, n = dispatcherMapEntry(agent, profiles, draining), len(profiles)+len(draining)
+		// Held names are left out of the measure: a profile is held only
+		// until the bus loads its config, a few bytes each.
+		entry, n = dispatcherMapEntry(agent, profiles, draining, nil), len(profiles)+len(draining)
 	} else {
 		entry, n = a2aDispatcherMapEntry(agent, profiles, draining)
 	}

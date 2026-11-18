@@ -172,10 +172,15 @@ and `AGENT_SANDBOX_IMAGE` follow `global.imageRegistry`, while `FLUENT_BIT_IMAGE
 and the four bus images follow `global.thirdPartyImageRegistry` (the bus images
 from `a2aBus.images`, below). Without passing both, a mirrored install reaches
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
-`CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
-broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image is not derived from the agent image, so
-the chart names it.
+`CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` are passed only when
+`credentialProxy.image` or `hermesBridge.image` names a `repository` or a `tag`;
+empty, the default, leaves the operator deriving the broker from each agent's
+image, and the bridge from the agent image when that is the release
+`platform-agent` image by tag, else from the operator's release set. A pin
+renders under `global.imageRegistry` like the other first-party images and
+applies to every `PlatformAgent` the operator manages; `values.yaml` has the
+contract. The sandbox image is not derived from the agent image, so the chart
+always names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -186,7 +191,8 @@ most on the mirror, one somewhere else — leave `global.imageRegistry` and
 `global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
 mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
 `FLUENT_BIT_IMAGE` and the four `A2A_NATS_*`/`A2A_PROVISION_IMAGE` variables are
-rendered from those values either way.
+rendered from those values either way, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE`
+from `credentialProxy.image` and `hermesBridge.image` when those are set.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -242,16 +248,23 @@ feeds `FLUENT_BIT_IMAGE`:
 | `a2aBus.images.prometheusExporter` | `A2A_NATS_EXPORTER_IMAGE` | `docker.io/natsio/prometheus-nats-exporter`    |
 
 Each takes `repository` and `tag`; the pins are those in `images.json`, which
-`make mirror-images` copies, and the operator's compiled defaults are the same
-pins (`make images-check` holds the three in step). The reloader and the
+`make mirror-images` copies, and the operator's compiled defaults and the chart's
+own copy in `templates/_helpers.tpl` (`kube-agents.a2aBusImageDefaults`) are the
+same pins (`make images-check` holds the four in step). The reloader and the
 exporter are pinned by digest as well as tag. Under
 `global.thirdPartyImageRegistry` each renders as `<prefix>/<trailing name>:<tag>`
 with the digest dropped, because the mirror holds the copy by tag and the
-copy's digest differs from the upstream one. `operator.extraEnv` is appended
+copy's digest differs from the upstream one. A release whose values carry no
+`a2aBus` key, as `helm upgrade --reuse-values` from a release before the key
+renders, takes the same pins from the chart's templates, so a mirrored install
+upgraded that way still pulls the bus from its mirror rather than from the
+operator's compiled Docker Hub defaults. `operator.extraEnv` is appended
 after these and wins, as for every other variable the chart renders; an entry
 that clears `A2A_NATS_EXPORTER_IMAGE` while `A2A_NATS_IMAGE` stays set makes the
 operator render the bus without its exporter sidecar, and the chart then
-renders no PodMonitoring or scrape alert for it.
+renders no PodMonitoring or scrape alert for it. An `extraEnv` entry is the way to
+run the bus without the exporter: a null in `a2aBus.images.prometheusExporter` does
+not omit it, because the chart fills the field from its own pins.
 
 ### LiteLLM gateway
 
@@ -1004,7 +1017,9 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
 `helm upgrade` on an install whose served `PlatformAgent` CRD predates
-`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. A value under
+`googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
+of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
 `GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
 renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
@@ -1430,7 +1445,12 @@ or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.
 folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
 hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
 provisioning Job, so it overstates both.
-The session pods the install spawns on demand are not counted; the operator caps those with
+It counts the session pods the gateway spawns on demand at their cap:
+`platformAgent.harness.tuning.maxSessions` (10 by default) times one session pod, from
+`files/footprint.yaml`'s `operatorRenderedPerReplica.sessionPod` with each key
+`platformAgent.harness.tuning.sessionResources` sets laid over it, as the operator resolves
+them, and on GKE Autopilot at Autopilot's per-Pod minimums. The refusal says how much of
+what it requires is that share. The operator also caps the session pods with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
@@ -1549,9 +1569,10 @@ apply. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them, but not the preflight's quota gate: it sums
 on every render, a namespace with no ResourceQuota and `helm template` included, so the
-refusals the preflight section lists apply wherever the summary prints. It says what it
-leaves out: the session pods, which the
-[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+refusals the preflight section lists apply wherever the summary prints. Its figures
+and cost are the standing release; it prints the session pods' share at the cap on a line
+of its own, as the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) do.
 
 #### Upgrade notes: operator memory floor
 
@@ -1590,7 +1611,7 @@ on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
-target named per task by the `project`, `location` and `cluster` parameters.
+target named per task by the `project`, `cluster` and `location` parameters.
 Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because

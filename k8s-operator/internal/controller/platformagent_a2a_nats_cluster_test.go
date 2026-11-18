@@ -929,7 +929,7 @@ func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
 			}
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			agent.Status.BusReplicas = tc.recorded
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
 				busStreamState: emptyBusStreams}
 			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
@@ -1467,7 +1467,7 @@ func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
 				}})
 			}
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: rec,
 				busStreamState: emptyBusStreams}
 			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
@@ -1633,7 +1633,7 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 			agent := a2aTestAgent()
 			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
 			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
@@ -1885,47 +1885,6 @@ func a2aSingleServerTestAgent() *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
-// A single server reloads a profile's deny in place, so its pod template's
-// hash leaves the profiles out. A cluster's hash carries them, so a profile
-// change rolls the servers one at a time, and the reload plan stands aside:
-// one config_load_time read through the Service can't confirm that every
-// server reloaded, and the reload's fallback restarts one pod.
-func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
-	creds := a2aFullCreds("a", "1")
-	keys := a2aTestCalloutKeys(t)
-	single, cluster := a2aSingleServerTestAgent(), a2aTestAgent()
-	if a2aNATSReplicas(cluster) != 3 {
-		t.Fatalf("the default test agent runs %d servers, want 3", a2aNATSReplicas(cluster))
-	}
-	profiles := []string{"tse"}
-	if a2aConfigRolloutHash(single, creds, keys, "s", nil) != a2aConfigRolloutHash(single, creds, keys, "s", profiles) {
-		t.Error("a single server's hash moved with a profile; it should reload instead")
-	}
-	if a2aConfigRolloutHash(cluster, creds, keys, "s", nil) == a2aConfigRolloutHash(cluster, creds, keys, "s", profiles) {
-		t.Error("a cluster's hash did not move with a profile; it would not roll onto the new deny")
-	}
-
-	sts := buildA2ANATSStatefulSet(cluster, "h1")
-	live := buildA2ANATSConfigSecret(cluster, creds, keys, nil)
-	r := &PlatformAgentReconciler{
-		Client:   fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(cluster, sts, live).Build(),
-		Scheme:   setupScheme(),
-		Recorder: record.NewFakeRecorder(8),
-		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) {
-			t.Error("a cluster's reload plan read config_load_time")
-			return "", nil
-		},
-	}
-	desired := buildA2ANATSConfigSecret(cluster, creds, keys, profiles)
-	plan, err := r.planA2ABusReload(context.Background(), cluster, desired, sts.DeepCopy(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
-		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
-	}
-}
-
 // emptyBusStreams is a bus whose provisioned streams hold nothing: none is
 // over a limit, so a one to three migration may start.
 func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
@@ -1981,7 +1940,7 @@ func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 			sts := buildA2ANATSStatefulSet(render, "h")
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.ask)}}
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec,
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: rec,
 				busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 					return tc.streams, tc.readErr
 				}}
@@ -2043,7 +2002,7 @@ func TestNoMigrationStartsBeforeTheBusIsProvisioned(t *testing.T) {
 		agent.Status.BusReplicas = 3
 		sts := buildA2ANATSStatefulSet(agent, "h")
 		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
-		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(),
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(),
 			Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
 		return agent, r
 	}

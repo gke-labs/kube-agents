@@ -748,22 +748,42 @@ class FootprintBlocksTest(unittest.TestCase):
         self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
 
     def test_the_session_pod_reads_every_quantity_form_kubernetes_accepts(self):
-        footprint = generate_docs.install_footprint
-        constants = {
-            "workerCPURequest": "1.5",
-            "workerMemoryRequest": "1.5Gi",
-            "workerCPULimit": "2500m",
-            "workerMemoryLimit": "2G",
-            "workerEphemeralStorageRequest": "1Ti",
+        """The session row comes from footprint.yaml, which the chart footprint generator
+        reads from the A2A gateway's session env; every quantity form parses there."""
+        import generate_chart_footprint as gcf
+
+        env = {
+            "A2A_SESSION_CPU_REQUEST": "1.5",
+            "A2A_SESSION_MEMORY_REQUEST": "1.5Gi",
+            "A2A_SESSION_CPU_LIMIT": "2500m",
+            "A2A_SESSION_MEMORY_LIMIT": "2G",
+            "A2A_MAX_SESSIONS": "10",
         }
-        source = "\n".join(f'\t{name} = "{value}"' for name, value in constants.items())
-        with mock.patch.object(Path, "read_text", return_value=source):
-            pod = footprint._session_pod()
+        kind, name, (container,) = gcf._A2A_WORKLOADS[gcf._A2A_GATEWAY]
+        gateway = {
+            "kind": kind,
+            "metadata": {"name": name},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": container, "env": [{"name": k, "value": v} for k, v in env.items()]},
+            ]}}},
+        }
+        pod = gcf._session_pod_entry([gateway], "1Ti")
         self.assertEqual(pod["cpuMillisRequest"], 1500)
         self.assertEqual(pod["memoryBytesRequest"], 1536 * 1024**2)
         self.assertEqual(pod["cpuMillisLimit"], 2500)
         self.assertEqual(pod["memoryBytesLimit"], 2 * 1000**3)
         self.assertEqual(pod["ephemeralStorageBytesRequest"], 1024**4)
+        self.assertEqual(pod["maxSessionsDefault"], 10)
+
+    def test_the_session_row_is_footprint_yamls_entry(self):
+        footprint = generate_docs.install_footprint
+        entry = {"pods": 1, "cpuMillisRequest": 7}
+        probe = {"footprint": {"operatorRenderedPerReplica": {"sessionPod": entry}}}
+        with mock.patch.object(footprint, "run_probe", return_value=probe):
+            self.assertIs(footprint._session_pod(), entry)
+        with mock.patch.object(footprint, "run_probe", return_value={"footprint": {}}):
+            with self.assertRaises(SystemExit):
+                footprint._session_pod()
 
     def test_a_sum_that_does_not_split_evenly_over_its_pods_is_refused(self):
         footprint = generate_docs.install_footprint

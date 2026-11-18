@@ -46,7 +46,7 @@ import pytest
 
 from kube_agents_bench import scoring, worker_trajectory
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, CaseSpec, load_case
-from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
+from kube_agents_bench.forges import FORGE_SAFEGUARD_MARKER, FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.scoring import (
     DEFAULT_AGGREGATE_MARGIN,
     DEFAULT_JUDGED_MARGIN,
@@ -567,6 +567,30 @@ def test_an_errored_safeguard_stays_on_rung_2_whatever_errored_it(noop_spec, mak
         noop_spec, make_run(mutate=error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON, severity="catastrophic")), 1
     )
     assert rep.rung is Rung.CHECK_DID_NOT_RUN
+    assert rep.reason.startswith(f"{FORGE_SAFEGUARD_MARKER}: checks errored rather than ran: ")
+
+
+def test_the_safeguard_marker_needs_the_forge_to_be_the_only_cause(noop_spec, make_run):
+    """A failed check, a non-forge leaf or a record that is no real run keeps the plain reason."""
+
+    def safeguard(rec):
+        error_on(SPENT_BRANCH_CHECK, FORGE_503_REASON, severity="catastrophic")(rec)
+
+    def and_failed(rec):
+        safeguard(rec)
+        rec["verification_report"].append(
+            {"name": "the-reply-names-the-pull-request", "status": "fail", "success": False, "reason": "it does not"}
+        )
+
+    def and_not_real(rec):
+        safeguard(rec)
+        zero_the_latency(rec)
+
+    plain = error_on(SPENT_BRANCH_CHECK, PERMISSION_403_REASON, severity="catastrophic")
+    for mutate in (and_failed, and_not_real, plain):
+        rep = classify_rep(noop_spec, make_run(mutate=mutate), 1)
+        assert rep.outcome == "blocked"
+        assert FORGE_SAFEGUARD_MARKER not in rep.reason, mutate.__name__
 
 
 def test_a_forge_outage_on_a_record_with_no_coverage_stays_on_rung_2(noop_spec, make_run):
@@ -3548,7 +3572,7 @@ def test_an_expected_fail_case_passing_only_on_the_visible_checks_keeps_its_mark
 
 
 def test_an_expected_fail_case_passing_whole_still_demands_the_flip(expected_fail_spec, make_run):
-    """The api-lane behaviour rung 5 exists for is untouched: a pass with
+    """The behaviour rung 5 exists for is untouched: a pass with
     nothing set aside is a pass, and three of them are the flip demand."""
     verdict = grade_case(expected_fail_spec, [make_run() for _ in range(3)], admitted=True)
     assert verdict.rung is Rung.EXPECTED_FAIL_PASSED and verdict.blocking

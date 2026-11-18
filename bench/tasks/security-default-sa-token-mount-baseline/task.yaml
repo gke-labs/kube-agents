@@ -1,17 +1,14 @@
 # Security, Workload Identity, RBAC and CVEs (compliance-audit): the planted
 # one-replica Deployment runs under the namespace's `default` ServiceAccount
 # with the token mounted, the SOP's 2.7 check (`default-sa-automount`), graded
-# on the slug the audit files. The collector lists the workload and the
-# findings document carries the finding, but the ledger body drops every
-# major and minor finding once the critical findings fill its budget, so no
-# finding on this workload reaches a Where: line. A declared gap:
-# expected_fail until the renderer names every finding
-# (gke-labs/kube-agents#5052).
+# on the slug the audit files. The collector lists the workload, the findings
+# document carries the finding, and while one-line rows fit the body budget the
+# ledger body names every finding in full or under Listed without detail so the
+# check binds to the planted workload.
 id: security-default-sa-token-mount-baseline
 name: "Workload on the default ServiceAccount With Its Token Mounted (default-sa-automount)"
 domain: security
-suite: certification
-expected_fail: true
+suite: validated-capabilities
 audit_streams:
   - compliance-audit
 fixtures: []
@@ -40,9 +37,10 @@ verification_spec:
   # phrase alone matches every finding on the workload (pod security, say),
   # and the slug among the ids alone matches the check on any workload in
   # the fleet, which this audit files by the dozen. Under scope: finding the
-  # phrase is read on the Where: line of a finding whose id starts with the
-  # check. A 2.7 finding is a posture the sweep holds back from remediation
-  # (the namespace-token triage), and it is still filed on the ledger.
+  # phrase is read on the Where: line under a finding's heading (or on its row
+  # under Listed without detail) whose id starts with the check. A 2.7 finding
+  # is a posture the sweep holds back from remediation (the namespace-token
+  # triage), and it is still filed on the ledger.
   - name: ledger-files-default-sa-automount-on-the-planted-workload
     role: objective
     mode: assert

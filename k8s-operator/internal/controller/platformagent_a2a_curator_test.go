@@ -56,6 +56,9 @@ func TestBuildA2ACuratorDeploymentIsCredentialFreeAndHardened(t *testing.T) {
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
 		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.AutomountServiceAccountToken)
 	}
+	if pod.DNSConfig == nil || len(pod.DNSConfig.Options) != 1 || pod.DNSConfig.Options[0].Name != "ndots" || pod.DNSConfig.Options[0].Value == nil || *pod.DNSConfig.Options[0].Value != "3" {
+		t.Errorf("DNSConfig = %+v, want ndots=3 from brokerCallerPodDNSConfig()", pod.DNSConfig)
+	}
 	for _, vol := range pod.Volumes {
 		if vol.Secret != nil {
 			t.Errorf("curator pod mounts Secret volume %q (%s); curator must hold zero Secrets", vol.Name, vol.Secret.SecretName)
@@ -65,8 +68,8 @@ func TestBuildA2ACuratorDeploymentIsCredentialFreeAndHardened(t *testing.T) {
 				if src.Secret != nil {
 					t.Errorf("curator pod projects Secret %s; curator must hold zero Secrets", src.Secret.Name)
 				}
-				if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience != a2aBusTokenAudience {
-					t.Errorf("curator projected token audience = %q, want %q (never credential-proxy)", src.ServiceAccountToken.Audience, a2aBusTokenAudience)
+				if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience != a2aBusTokenAudience && src.ServiceAccountToken.Audience != credentialProxyCuratorAudience {
+					t.Errorf("curator projected token audience = %q, want %q or %q (never shell/chat credential-proxy)", src.ServiceAccountToken.Audience, a2aBusTokenAudience, credentialProxyCuratorAudience)
 				}
 			}
 		}
@@ -110,8 +113,8 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 	if !slices.Equal(np.Spec.PolicyTypes, wantTypes) {
 		t.Errorf("PolicyTypes = %v, want %v", np.Spec.PolicyTypes, wantTypes)
 	}
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("Egress rules = %d, want 4 (DNS, NATS, LiteLLM, Hindsight)", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("Egress rules = %d, want 5 (DNS, NATS, LiteLLM, Hindsight, credential-proxy snapshot)", len(np.Spec.Egress))
 	}
 	for i, rule := range np.Spec.Egress {
 		if len(rule.To) == 0 {
@@ -125,8 +128,8 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 		for _, peer := range rule.To {
 			if peer.PodSelector != nil {
 				labels := peer.PodSelector.MatchLabels
-				if strings.Contains(labels["app"], "credential-proxy") || strings.Contains(labels["app"], "kube-proxy") {
-					t.Errorf("curator NetworkPolicy grants egress to %v; curator must not reach credential-proxy or kube-proxy", labels)
+				if strings.Contains(labels["app"], "kube-proxy") {
+					t.Errorf("curator NetworkPolicy grants egress to %v; curator must not reach kube-proxy", labels)
 				}
 			}
 		}
@@ -210,6 +213,12 @@ func TestCuratorFlagControlsAuthMapAndNATSPeers(t *testing.T) {
 	}
 	if _, reserved := reservedProfileServiceAccounts(agent)[a2aCuratorName(agent)]; !reserved {
 		t.Errorf("reservedProfileServiceAccounts does not reserve %q", a2aCuratorName(agent))
+	}
+	if !strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), a2aCuratorBrokerCaller(agent)) {
+		t.Errorf("allowedBrokerCallers = %q, missing %q", allowedBrokerCallers(agent, allBrokerCallersOwned), a2aCuratorBrokerCaller(agent))
+	}
+	if len(a2aCuratorBrokerEnv(agent)) != 2 || len(a2aCuratorBrokerPeers(agent)) != 1 {
+		t.Errorf("a2aCuratorBrokerEnv=%v a2aCuratorBrokerPeers=%v", a2aCuratorBrokerEnv(agent), a2aCuratorBrokerPeers(agent))
 	}
 }
 

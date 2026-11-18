@@ -1078,6 +1078,68 @@ class VcsCallErrorTest(unittest.TestCase):
                     self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
                     self.assertTrue(stream.closed, "vcs_call left the refusal open")
 
+    # No token file: the call sends no header, whatever the shell exports.
+    _no_token_file = patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": ""})
+
+    @staticmethod
+    def _answer(body):
+        """A 2xx reply with `body`."""
+
+        def answer(request, *args, **kwargs):
+            return io.BytesIO(body)
+
+        return patch.object(credential_proxy_client, "open_broker_request", answer)
+
+    def test_a_2xx_answer_whose_json_body_is_not_an_object_is_a_value_error(self):
+        # Valid JSON of another type, from something between the client and the
+        # broker, or a broker fault. Every consumer reads the answer as an
+        # object. A ValueError is what a 2xx body that does not parse leaves
+        # as, and `vcs_client.call` has an arm for it.
+        # Each type that `json.load` gives, apart from an object.
+        bodies = (
+            (b"[]", "list"), (b'"busy"', "str"), (b"503", "int"), (b"1.5", "float"), (b"true", "bool"),
+            (b"null", "NoneType"),
+        )
+        for body, type_name in bodies:
+            with self.subTest(body=body):
+                with self._no_token_file, self._answer(body), self.assertRaises(ValueError) as caught:
+                    credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                # The type's name, and nothing of the body.
+                self.assertIn(type_name, str(caught.exception))
+                for content in ("busy", "503", "1.5"):
+                    self.assertNotIn(content, str(caught.exception))
+
+    # `json.load` raises RecursionError for a body nested very deep. The depth
+    # where it stops depends on the Python version, so the tests give the
+    # parser's error directly.
+    _too_deep_for_the_parser = patch.object(
+        credential_proxy_client.json, "load", side_effect=RecursionError("maximum recursion depth exceeded")
+    )
+
+    def test_a_2xx_answer_nested_too_deep_for_the_parser_is_a_value_error(self):
+        with self._no_token_file, self._answer(b"[]"), self._too_deep_for_the_parser:
+            with self.assertRaises(ValueError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+        self.assertIsInstance(caught.exception.__cause__, RecursionError)
+
+    def test_a_refusal_nested_too_deep_for_the_parser_is_the_status_alone(self):
+        for status in (404, 502):
+            with self.subTest(status=status):
+                stream = io.BytesIO(b"[]")
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error), \
+                        self._too_deep_for_the_parser:
+                    with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
+    def test_a_2xx_answer_that_is_an_object_comes_back_as_it_is(self):
+        for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
+            with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
+                self.assertEqual(credential_proxy_client.vcs_call(self.endpoint, "capabilities", {}), answer)
+
 
 class TestCallerCredential(SubmittedPayloadTestCase):
     """The client half of the broker's authentication.
@@ -1200,6 +1262,32 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
         self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
         self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def run_vcs_call(self, environ):
+        captured = {}
+
+        def fake_open(request, *args, **kwargs):
+            captured["request"] = request
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return RecordingResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                captured["answer"] = credential_proxy_client.vcs_call(
+                    self.LOCAL_ENDPOINT, "proposal-create", {"repository": "acme/infra"}
+                )
+        return captured
+
+    def test_a_vcs_call_sends_the_credential_in_its_header(self):
+        # The broker refuses a profile caller's version-control verbs without
+        # it, and reads the write permit off it (#3993).
+        sent = self.run_vcs_call(self.task_env())
+        self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
+        self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def test_a_vcs_call_outside_a_task_sends_no_credential(self):
+        sent = self.run_vcs_call({credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_the_credential_is_read_on_every_call(self):
         # A warm pod's next task writes its own credential to the same file.
@@ -2040,9 +2128,14 @@ class TestBrokerUnreachable(unittest.TestCase):
         """A caller that reads only the URLError (vcs, workspaces) sees no change."""
         import socket
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind(probe.getsockname())
         request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
         with self.assertRaises(urllib.error.URLError) as caught:
             credential_proxy_client.open_broker_request(request)
@@ -2289,9 +2382,10 @@ class TestShimEntryRouting(unittest.TestCase):
         self.shim = self.root / "credential-proxy-exec"
         shutil.copy(credential_proxy_client.__file__, self.shim)
         (self.root / "kubectl").symlink_to(self.shim)
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
         self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
         type(self).answers.clear()
         type(self).requests.clear()
@@ -2362,6 +2456,17 @@ class TestShimEntryRouting(unittest.TestCase):
         refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
         self.assertEqual(2, refused.returncode)
         self.assertIn("invalid choice", refused.stderr)
+
+    def test_the_unreachable_port_stays_reserved_during_the_test(self):
+        """Holding the probe socket bound without listening refuses connects while
+        preventing another process from taking the port (#6044)."""
+        import socket
+
+        parsed = urllib.parse.urlsplit(self.closed)
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind((parsed.hostname, parsed.port))
 
 
 class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):
@@ -2945,6 +3050,79 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual([], self.sleeps)
         self.assertIn("the command may have run", err)
         self.assertNotIn("retrying", err)
+
+    def test_a_2xx_answer_that_cannot_be_read_is_one_line_and_exit_1_and_is_never_sent_again(self):
+        """The broker ran the command before it answered. The line names the shape, never the body."""
+        not_json = credential_proxy_client.NON_JSON_RESPONSE_TEXT
+        shapes = {
+            "<html>upstream answer</html>": not_json,
+            "": not_json,
+            "[1, 2]": "the response is JSON of type list, not an object",
+            "null": "the response is JSON of type NoneType, not an object",
+            "7": "the response is JSON of type int, not an object",
+            '"NAME STATUS"': "the response is JSON of type str, not an object",
+            "true": "the response is JSON of type bool, not an object",
+        }
+        for body, shape in shapes.items():
+            with self.subTest(body=body):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, body), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+        # The status in the line is the answer's own.
+        _, _, err = self.run_shim(self.broker([(201, {}, "[1, 2]")]))
+        self.assertIn("credential proxy error (HTTP 201): ", err)
+
+    def test_an_answer_that_cannot_be_read_is_not_sent_to_the_fallback(self):
+        """With an exec-tier target and a stateful fallback, the command stays where it may have run."""
+        for body in ("not json", "null"):
+            with self.subTest(body=body):
+                exec_tier, stateful = self.broker([(200, {}, body)]), self.broker([(200, {}, OK)])
+                out, err = io.StringIO(), io.StringIO()
+                with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+                    code = credential_proxy_client.execute(
+                        exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                        sleep_fn=self.sleeps.append, rng=self.rng,
+                    )
+                self.assertEqual(1, code)
+                self.assertEqual("", out.getvalue())
+                self.assertEqual(1, len(exec_tier.requests))
+                self.assertEqual([], stateful.requests)
+                self.assertNotIn(credential_proxy_client.EXEC_FALLBACK_NOTICE, err.getvalue())
+                self.assertIn("the command may have run", err.getvalue())
+
+    def test_the_line_for_an_answer_that_cannot_be_read_is_the_shim_s_own_for_the_failure_classifiers(self):
+        import cluster_agent_profile
+
+        for body in ("not json", "[1, 2]"):
+            with self.subTest(body=body):
+                _, _, err = self.run_shim(self.broker([(200, {}, body)]))
+                self.assertIsNotNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(err), err)
+                self.assertIsNone(cluster_agent_profile.CONNECTIVITY_FAILURE_RE.search(err), err)
+
+    def test_a_2xx_body_that_breaks_while_it_is_read_is_still_a_dropped_connection(self):
+        """Only the parse is guarded: a read that ends early is not an answer of the wrong shape."""
+
+        class BrokenBody(RecordingResponse):
+            status = 200
+
+            def read(self, *_args):
+                raise http.client.IncompleteRead(b'{"stdout": "NAME')
+
+        err = io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", lambda _request: BrokenBody()), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid:8765", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        self.assertEqual(1, code)
+        self.assertEqual([], self.sleeps)
+        self.assertIn("the connection dropped after the request was sent", err.getvalue())
+        self.assertNotIn("HTTP 200", err.getvalue())
 
     def test_a_policy_block_still_exits_77_at_once(self):
         blocked = {"code": "SECURITY_POLICY_BLOCKED", "message": "Command blocked.", "rule": "no-delete"}

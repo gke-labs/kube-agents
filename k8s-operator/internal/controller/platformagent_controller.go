@@ -696,9 +696,20 @@ type PlatformAgentReconciler struct {
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
-	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
-	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
-	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+	// busConfigLoadTime stands in for reading a bus server's config_load_time
+	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
+	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
+	// tests; it wins over busConfigLoadTime, which answers a fixed start.
+	busVarz func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error)
+	// busConfigWrittenAt stands in for reading when the live bus config
+	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
+	// keeps no managedFields.
+	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
+	// busTLSWrittenAt stands in for reading when the bus's TLS Secret was
+	// last written (a2aBusWatched), in tests: the fake client keeps no
+	// managedFields.
+	busTLSWrittenAt func(tls *corev1.Secret) (time.Time, bool)
 	// busStreamState stands in for reading each bus stream's state from the
 	// monitoring endpoint (a2aBusStreamState), in tests.
 	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
@@ -1473,6 +1484,26 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// The A2A stack: NATS, the auth callout, the gateway, the capability
 	// verifier, the provisioning Job and the tiers. Every install renders it.
 	a2aState, err := r.reconcileA2A(ctx, renderAgent, homeRec)
+	// The A2A stack ran on the render copy and recorded what it resolved in
+	// that copy's status: the bus's server count, a migration's run record
+	// and its phases, the conditions it sets directly. The status writers
+	// below write instance, so all of it is carried back, with the version a
+	// write made on the copy (#6298). Only the copy's universe-domain pair
+	// stays behind: it was stamped on for the renders, and the Ready writer
+	// records the resolved pair itself.
+	//
+	// Not on a failed pass: a migration step changes its record before the
+	// work it records (a give-up marked before its cleanup, a terminal phase
+	// before its teardown) and leaves the change behind when the work fails,
+	// for the next pass to redo. The deferred writers would persist it, and
+	// the work would never be redone. instance takes the stored status
+	// instead, which holds what this pass did write, such as a new run's
+	// record.
+	if err == nil {
+		adoptRenderedStatus(instance, renderAgent)
+	} else {
+		r.adoptStoredStatus(ctx, instance)
+	}
 	// For the deferred write at 2d, failed pass or not: a step after
 	// the dispatcher's failing doesn't undo what it did to Job mode.
 	dispatcherJobMode = a2aState.dispatcherJobMode
@@ -4879,6 +4910,34 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
+}
+
+// adoptRenderedStatus carries the render copy's status and resourceVersion
+// back into instance, keeping instance's own universe-domain pair (see
+// adoptRenderedStatus's caller).
+func adoptRenderedStatus(instance, rendered *agentv1alpha1.PlatformAgent) {
+	domain, source := instance.Status.ResolvedUniverseDomain, instance.Status.UniverseDomainSource
+	instance.Status = *rendered.Status.DeepCopy()
+	instance.Status.ResolvedUniverseDomain, instance.Status.UniverseDomainSource = domain, source
+	instance.ResourceVersion = rendered.ResourceVersion
+}
+
+// adoptStoredStatus replaces instance's status and version with the stored
+// ones, read past the cache, after a failed pass (see its caller). A read
+// that fails leaves instance as it is: a deferred write against a version
+// this pass moved then conflicts and the pass is redone.
+func (r *PlatformAgentReconciler) adoptStoredStatus(ctx context.Context, instance *agentv1alpha1.PlatformAgent) {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(instance), live); err != nil {
+		logf.FromContext(ctx).Error(err, "could not read the stored PlatformAgent after a failed pass")
+		return
+	}
+	instance.Status = live.Status
+	instance.ResourceVersion = live.ResourceVersion
 }
 
 // busReplicasStatusCurrent reports whether status.busReplicas needs no write:

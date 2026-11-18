@@ -482,6 +482,17 @@ readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
 # gcloud's answer for a cluster that does not exist. Any other describe failure
 # (auth expiry, a 403, a network blip) is a cluster that could not be read.
 readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
+# gcloud's answer when the Kubernetes Engine API is off in the project it
+# names (reason SERVICE_DISABLED). A cluster cannot exist in such a project:
+# disabling the API deletes every cluster in it, and creating one needs it on.
+# So a refusal that names the target project is absence, which a fresh
+# project reaches on its first install; one that names another project (the
+# caller's quota project) says nothing about the target and stays unread.
+# The same grammar scripts/verify_ci_pool_project.py reads for the Gemini key
+# (GEMINI_KEY_SERVICE_DISABLED, GEMINI_KEY_DISABLED_IN); its tests pin the
+# project-extraction pattern equal to this one.
+readonly GKE_API_DISABLED_PATTERN="API has not been used in project [a-z0-9-]+ before or it is disabled|SERVICE_DISABLED"
+readonly GKE_API_DISABLED_PROJECT_PATTERN="API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -4688,6 +4699,28 @@ gke_describe_error_is_not_found() {
   grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN" <<<"${1:-}"
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the Kubernetes Engine API is disabled in the target project ($2, by id;
+# $3 its number when known), and in no other. Read as the cluster being
+# absent: nothing can exist there until the apply's google_project_service
+# turns the API on. A refusal that names only another project, or none, is
+# not this answer.
+gke_describe_error_is_api_disabled_for() {
+  local err="${1:-}" project_id="${2:-}" project_number="${3:-}"
+  grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$err" || return 1
+  local named
+  named="$(grep -oE "$GKE_API_DISABLED_PROJECT_PATTERN" <<<"$err" \
+    | sed -E 's/^API has not been used in project ([a-z0-9-]+) .*$/\1/; s#^consumer: projects/##' | sort -u)"
+  [ -n "$named" ] || return 1
+  local name
+  while IFS= read -r name; do
+    [ "$name" = "$project_id" ] && continue
+    [ -n "$project_number" ] && [ "$name" = "$project_number" ] && continue
+    return 1
+  done <<<"$named"
+  return 0
+}
+
 is_existing_cluster_network_policy_satisfied() {
   local project_id="$1" cluster_name="$2" region="$3"
   local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
@@ -4709,6 +4742,131 @@ is_existing_cluster_network_policy_satisfied() {
   return 0
 }
 
+
+# How much of kubectl's stderr a refused Secret read quotes back.
+readonly SECRET_READ_ERR_MAX_BYTES=400
+# The credentials install.env may not carry (PERSIST_SECRETS_ON_DISK=false),
+# which write_tfvars_from_state recovers from the live Secret.
+readonly RECOVERED_SECRET_KEYS="API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT"
+
+# recover_secret_keys_from_live_secret CONTEXT exports each RECOVERED_SECRET_KEYS
+# key the environment leaves empty from the live platform agent Secret, and
+# refuses to let a key the live Secret holds be written empty (#6126).
+#
+# One read of the whole Secret, not one per key: a per-key read that failed
+# (a timeout, a dropped connection, an RBAC denial) looked exactly like an
+# absent key, and Terraform then rendered that key empty over the live value.
+# Here only a key missing from a Secret that was read is absent. A Secret that
+# doesn't exist (NotFound: a first install onto an existing cluster) has
+# nothing to recover. Any other failure stops the run, naming the keys it
+# couldn't recover, unless each of them is set in the environment or named in
+# ALLOW_EMPTY_SECRET_KEYS (comma- or space-separated), the one way to accept
+# writing a key empty on purpose.
+#
+# Stopping is for the callers that APPLY, which opt in with
+# KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true beside KUBE_AGENTS_REQUIRE_MEMORY_ANSWER
+# (install.sh and upgrade.sh). A caller that doesn't, uninstall.sh, gets a
+# warning and goes on: a destroy has no use for the keys, and an install has
+# to keep a working way to remove itself.
+#
+# Returns 1 to stop the run; prints why on stderr.
+recover_secret_keys_from_live_secret() {
+  local ctx="$1"
+  local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  # Through :- first: bash 4+ under set -u rejects ${unset//,/ }.
+  local allow_raw="${ALLOW_EMPTY_SECRET_KEYS:-}"
+  local key missing=() allow=" ${allow_raw//[,$'\t']/ } "
+  LIVE_SECRET_NONEMPTY_KEYS=""
+  for key in $RECOVERED_SECRET_KEYS; do
+    [ -n "${!key:-}" ] || missing+=("$key")
+  done
+  # Every key already in the environment: nothing to read, so an operator
+  # whose RBAC can't read Secrets can still run by exporting the keys.
+  [ "${#missing[@]}" -gt 0 ] || return 0
+
+  local err_file secret_json read_rc=0
+  err_file="$(mktemp)"
+  # trap - ERR: install.sh runs an inherited ERR trap (set -E); a failed read
+  # is handled below, not by the trap. --request-timeout bounds a context
+  # whose cluster black-holes TCP.
+  secret_json="$(trap - ERR; kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "$ns" \
+    --context "$ctx" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+    -o json 2>"$err_file")" || read_rc=$?
+  local read_err
+  read_err="$(head -c "$SECRET_READ_ERR_MAX_BYTES" "$err_file" | tr '\n' ' ')"
+  rm -f "$err_file"
+
+  if [ "$read_rc" -ne 0 ]; then
+    # This Secret's own 404 only: kubectl prints (NotFound) for any 404,
+    # including a proxy or gateway in front of the API server.
+    if [[ "$read_err" == *"secrets \"${PLATFORM_AGENT_SECRET}\" not found"* ]]; then
+      return 0
+    fi
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret (${read_err:-exit ${read_rc}}); going on without its keys." >&2
+      return 0
+    fi
+    local unknown=()
+    for key in ${missing[@]+"${missing[@]}"}; do
+      [[ "$allow" == *" ${key} "* ]] || unknown+=("$key")
+    done
+    [ "${#unknown[@]}" -gt 0 ] || return 0
+    print_error "Could not read the live '${PLATFORM_AGENT_SECRET}' Secret in '${ns}' to recover ${unknown[*]-}: ${read_err:-kubectl exited ${read_rc}}" >&2
+    print_error "Going on would write those keys empty over their live values. Re-run once the cluster answers, export the keys yourself, or name the ones to leave empty in ALLOW_EMPTY_SECRET_KEYS." >&2
+    return 1
+  fi
+
+  # KEY<TAB>value lines for the listed keys the Secret holds, decoded here so
+  # a value that isn't base64 fails the read rather than recovering garbage.
+  local decoded
+  if ! decoded="$(trap - ERR; printf '%s' "$secret_json" | python3 -c '
+import base64, json, sys
+keys = sys.argv[1].split()
+data = (json.load(sys.stdin).get("data") or {})
+for k in keys:
+    if k in data:
+        v = base64.b64decode(data[k], validate=True).decode()
+        if "\n" in v or "\t" in v:
+            sys.exit("value of %s holds a tab or newline" % k)
+        print(k + "\t" + v)
+' "${missing[*]-}")"; then
+    if ! is_truthy "${KUBE_AGENTS_REQUIRE_SECRET_ANSWER:-false}"; then
+      print_warning "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on without them." >&2
+      return 0
+    fi
+    print_error "Could not decode the live '${PLATFORM_AGENT_SECRET}' Secret's keys; going on would write them empty." >&2
+    return 1
+  fi
+
+  local val
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    if [ -n "$val" ]; then
+      export "${key}=${val}"
+      LIVE_SECRET_NONEMPTY_KEYS="${LIVE_SECRET_NONEMPTY_KEYS} ${key}"
+      print_info "Recovered ${key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
+    fi
+  done <<<"$decoded"
+
+  return 0
+}
+
+# The guard, run just before the generator renders: a key the live Secret held
+# non-empty (LIVE_SECRET_NONEMPTY_KEYS, set by the recovery above) may only be
+# replaced by a non-empty value, unless ALLOW_EMPTY_SECRET_KEYS names it. It
+# checks the values as they will be rendered, so a later change between the
+# recovery and the render can't reopen #6126 without failing here.
+refuse_blanking_live_secret_keys() {
+  local allow_raw="${ALLOW_EMPTY_SECRET_KEYS:-}"
+  local key allow=" ${allow_raw//[,$'\t']/ } "
+  for key in ${LIVE_SECRET_NONEMPTY_KEYS:-}; do
+    if [ -z "${!key:-}" ] && [[ "$allow" != *" ${key} "* ]]; then
+      print_error "${key} is set in the live '${PLATFORM_AGENT_SECRET}' Secret but would be written empty; refusing. Name it in ALLOW_EMPTY_SECRET_KEYS to empty it on purpose." >&2
+      return 1
+    fi
+  done
+  return 0
+}
 
 # What ENABLE_GVISOR means for an install that already exists, read the same
 # way by every caller that re-renders one: the Terraform variables below and
@@ -4869,7 +5027,18 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! gke_describe_error_is_not_found "$describe_err"; then
+    # The refusal may name the project by number; the front doors that reach
+    # this generator before main() exports PROJECT_NUMBER (the menu, upgrade,
+    # uninstall) resolve it here, and only for a refusal of that shape.
+    local probe_number="${PROJECT_NUMBER:-}"
+    if [ -z "$probe_number" ] && grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$describe_err"; then
+      probe_number="$(trap - ERR; gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+    fi
+    if gke_describe_error_is_api_disabled_for "$describe_err" "${PROJECT_ID}" "${probe_number}"; then
+      # A fresh project: the Kubernetes Engine API is off, so no cluster can
+      # be there, and the apply enables the API before it creates one.
+      print_info "The Kubernetes Engine API is not enabled in project '${PROJECT_ID}' yet, so no cluster exists there; the apply enables it."
+    elif ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
@@ -4932,34 +5101,16 @@ write_tfvars_from_state() {
   # re-install must keep the live salt: regenerating it re-anonymises every
   # chat user, severing their past sessions from their future ones.
   #
-  # Only when kubectl's CURRENT context is this install's cluster (the name
-  # get-credentials writes — set just above for adoption, and by upgrade.sh
-  # and uninstall.sh before they generate). A stale context pointing at some
-  # other install would otherwise silently donate that environment's
-  # credentials to this one.
-  local secret_key secret_val
-  local expected_ctx
-  expected_ctx="$(gke_context_name)"
-  if command -v kubectl >/dev/null 2>&1 &&
-    [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
-      [ -z "${!secret_key:-}" ] || continue
-      # Every stage exits 0 on its own (|| true inside the substitution):
-      # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
-      # here — no cluster yet, stale context — must be a silent no-op, not a
-      # trap-and-abort the outer || can never see. --request-timeout bounds
-      # the other stale-context failure mode: a context whose cluster was
-      # just destroyed black-holes TCP instead of refusing, and eight keys
-      # times a hung connect stalls the install for minutes.
-      secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --context "$expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
-        -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
-      if [ -n "$secret_val" ]; then
-        export "${secret_key}=${secret_val}"
-        print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
-      fi
-    done
+  # Only when the probe above found the cluster: a confirmed-absent cluster
+  # has no Secret, and a kubeconfig context left behind by an uninstall would
+  # otherwise send the read to an endpoint that is gone and stop a fresh
+  # install. The read names this install's context, so it can only reach this
+  # cluster, whatever current-context says (get-credentials above is
+  # best-effort, and a shared kubeconfig can be switched underneath). A
+  # context that is missing then fails the read, which stops an applying run.
+  LIVE_SECRET_NONEMPTY_KEYS=""
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    recover_secret_keys_from_live_secret "$(gke_context_name)" || return 1
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
@@ -5362,6 +5513,7 @@ write_tfvars_from_state() {
   # Published for the front doors' ERR traps: the partial file below is mode
   # 600 and holds every secret this run was given, and it sits one character
   # from the real terraform.tfvars. Cleared after the mv succeeds.
+  refuse_blanking_live_secret_keys || { umask "$old_umask"; return 1; }
   TFVARS_TMP_FILE="${dest}.tmp"
   {
     echo "# Generated by the kube-agents installer from install.env — regenerated on every"

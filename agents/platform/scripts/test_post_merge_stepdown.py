@@ -1,5 +1,6 @@
 """Tests for post_merge_stepdown: revert an auto-merged fix that is still broken, and step down."""
 
+import json
 import subprocess
 import tempfile
 import types
@@ -73,14 +74,47 @@ def run(forge, opener=None, *, automerge="on", outcome="still_broken"):
 
 
 class TestGates(unittest.TestCase):
-    def test_switch_not_on_is_report_only(self):
+    def test_switch_not_on_still_reverts_a_labelled_fix_but_adds_no_deny_rule(self):
+        # An operator who turns the switch off after a bad auto-merge still gets the revert (#5879).
         for value in ("off", "practice", "garbage"):
             with self.subTest(value):
-                forge = FakeForge()
-                result = run(forge, automerge=value)
-                self.assertEqual(result["action"], "none")
-                self.assertIn("report only", result["reason"])
-                self.assertEqual(forge.calls, [])
+                forge, opener = FakeForge(), FakeOpen()
+                result = run(forge, opener, automerge=value)
+                self.assertEqual(result["action"], "stepped-down")
+                self.assertEqual([b for b, _, _ in opener.opened], ["platform-agent/revert-7"])
+                self.assertIn(f"KUBEAGENTS_AUTOMERGE is {value}", result["refused"]["stepDown"])
+                body = [p for v, p in forge.calls if v == "proposal-comment"][0]["body"]
+                self.assertIn("I did not change", body)
+
+    def test_switch_not_on_does_nothing_for_an_unlabelled_fix(self):
+        forge, opener = FakeForge(labels=["audit:no-pdb"]), FakeOpen()
+        self.assertEqual(run(forge, opener, automerge="off")["action"], "none")
+        self.assertEqual(opener.opened, [])
+
+    def test_a_comment_that_fails_keeps_the_pull_requests_it_opened(self):
+        class RefusingForge(FakeForge):
+            def __call__(self, verb, payload):
+                if verb == "proposal-comment":
+                    raise RuntimeError("403")
+                return super().__call__(verb, payload)
+
+        result = run(RefusingForge())
+        self.assertEqual(result["action"], "retry")
+        self.assertTrue(result["revert"].startswith("https://"))
+        self.assertTrue(result["stepDown"].startswith("https://"))
+        self.assertEqual(result["errors"], ["comment: 403"])
+
+    def test_the_cli_turns_an_unexpected_forge_error_into_retry(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        out = io.StringIO()
+        with mock.patch.object(pms, "step_down", side_effect=RuntimeError("identity: 502")), redirect_stdout(out):
+            code = pms.main(["--repo", REPO, "--number", "7", "--kind", "no-pdb", "--environment", "dev",
+                             "--outcome", "still_broken"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())["action"], "retry")
 
     def test_other_outcomes_do_nothing(self):
         for outcome in ("verified_fixed", "applied_not_rechecked", "not_applied"):
@@ -327,6 +361,14 @@ class TestWriters(unittest.TestCase):
         self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
         self.assertTrue(raw.startswith(RULES.replace("\n", "\r\n").encode()))
         self.assertFalse(ar.decide(ar.load(self.tree), "no-pdb", "dev").allowed)
+
+    def test_step_down_where_the_base_already_denies_is_refused_before_any_commit(self):
+        (self.tree / ar.RULES_FILE).write_text("version: 1\nautomerge:\n  deny:\n    - fix: '*'\n      environments: [dev]\n")
+        _git(self.tree, "add", "-A")
+        _git(self.tree, "commit", "-q", "-m", "deny all in dev")
+        with self.assertRaisesRegex(pms.StepDownError, "already denies no-pdb fixes in dev"):
+            pms._step_down_writer("no-pdb", "dev", "u")(self.tree, self.vcs, REPO, "b")
+        self.assertFalse(hasattr(self.vcs, "committed"))
 
     def test_step_down_without_a_rules_file_is_refused(self):
         (self.tree / ar.RULES_FILE).unlink()
