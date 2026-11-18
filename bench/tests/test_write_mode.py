@@ -12,6 +12,7 @@ import threading
 
 import pytest
 from kube_agents_bench import write_mode
+from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
 DIRECTIVE = write_mode.DIRECTIVE
 ASK = "Open a pull request that scales checkout-gateway to 4 replicas."
@@ -215,7 +216,7 @@ class _SessionKV:
     def shell(self, command, timeout):
         url = f"http://127.0.0.1:{self.server.server_address[1]}"
         command = command.replace(shlex.quote(write_mode.SESSION_KV_URL), shlex.quote(url))
-        command = command.replace("python3 -c", f"{shlex.quote(sys.executable)} -c")
+        command = command.replace(f"PY={shlex.quote(HERMES_PYTHON)}", f"PY={shlex.quote(sys.executable)}")
         env = {**os.environ, "SESSION_KV_API_KEY": "k"}
         return subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=timeout, env=env, check=False).stdout
 
@@ -280,3 +281,9 @@ def test_a_from_ask_puts_back_the_level_found_before_the_first_set(session_kv):
 def test_a_set_that_never_ran_is_unavailable():
     with pytest.raises(write_mode.ModeUnavailable, match="never ran"):
         write_mode.set_mode(lambda cmd, timeout: "", "none", 1.0)
+
+
+def test_the_set_tries_hermess_interpreter_before_python3_on_path():
+    command = write_mode.set_command("propose")
+    assert command.startswith(f'cd /tmp && PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={FALLBACK_PYTHON}; "$PY" -c ')
+    assert " python3 -c " not in command

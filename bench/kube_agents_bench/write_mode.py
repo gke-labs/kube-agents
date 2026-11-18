@@ -250,9 +250,18 @@ print(json.dumps(out))
 
 
 def set_command(level: str) -> str:
-    """The agent-container command that moves the dial to ``level``."""
+    """The agent-container command that moves the dial to ``level``.
+
+    Hermes's own interpreter first, the one binary the agent image is sure to
+    carry, then ``python3`` on PATH, as :func:`pushed_report.plant_command` does.
+    """
+    from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
+
     args = " ".join(shlex.quote(a) for a in (SENTINEL, SESSION_KV_URL, level))
-    return f"cd /tmp && python3 -c {shlex.quote(_SET_SCRIPT)} {args}"
+    return (
+        f'cd /tmp && PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(_SET_SCRIPT)} {args}'
+    )
 
 
 def _set(shell: Callable[[str, float], str], level: str, timeout: float) -> str:
