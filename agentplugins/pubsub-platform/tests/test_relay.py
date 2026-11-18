@@ -353,6 +353,22 @@ class SettleTest(RelayTestCase):
         self.assertEqual(settles, [(NACK_PATH, {"ackIds": ["ack-1"], "ackDeadlineSeconds": 0})])
 
 
+class NoProxyTest(RelayTestCase):
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_relay(self):
+        """The relay is an in-cluster Service, and each call to it has the gateway's token on it."""
+        proxy = FakeBroker()
+        self.addCleanup(proxy.close)
+        # The patch of os.environ in setUp puts these back.
+        for name in ("no_proxy", "NO_PROXY"):
+            os.environ.pop(name, None)
+        for name in ("http_proxy", "HTTP_PROXY"):
+            os.environ[name] = proxy.url
+        relay = adapter_mod.PubsubRelay(self.broker.url, self.token_file.name)
+        relay.get_subscription(SUB_PATH, timeout=5)
+        self.assertEqual(proxy.calls, [])
+        self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
+
+
 class PreflightTest(RelayTestCase):
     def setUp(self):
         super().setUp()

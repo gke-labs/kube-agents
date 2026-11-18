@@ -164,13 +164,15 @@ class PubsubRelay:
     broker adds the Google credential; this side presents the gateway's
     projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call, and
     never follows a redirect with it (credential_proxy_client's guard, kept
-    here because this file is loaded by path with no sibling module).
+    here because this file is loaded by path with no sibling module). It takes
+    no proxy from the environment, as that client does not: the relay is an
+    in-cluster Service, and a proxy in between would get the token.
     """
 
     def __init__(self, base_url: str, token_file: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token_file = token_file
-        self._opener = urllib.request.build_opener(_NoRedirects)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
