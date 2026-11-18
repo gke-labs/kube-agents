@@ -5536,6 +5536,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// and strips; any other value is off. It adds no path, destination,
 		// credential or code, and changes nothing the model reads.
 		"KUBEAGENTS_EVAL_RUN_TAGS": {},
+
+		// The post-merge check's per-step cap on the records one run reads
+		// from the forge and the clusters (READS_PER_TICK_ENV in
+		// post_merge_check.py; default 20). Parsed as a whole number from 1
+		// to 25, and anything else means the default, so it bounds how much
+		// one run reads and adds no job, path, destination or credential.
+		"POST_MERGE_READS_PER_TICK": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
