@@ -215,6 +215,9 @@ DNS_CACHE_CHECK_SLUG = "missing-nodelocal-dnscache"
 # What the DNS cache check calls its read in a limitation.
 DNS_CACHE_READ = "Cluster add-ons"
 DNS_CACHE_EXCERPT = "addonsConfig.dnsCacheConfig.enabled is not true on a Standard cluster"
+# `networkConfig.dnsConfig.clusterDns` on a cluster that uses Cloud DNS for GKE: its
+# Pods resolve at the metadata address, so no lookup crosses kube-dns or conntrack.
+CLOUD_DNS_PROVIDER = "CLOUD_DNS"
 # A project with the Kubernetes Engine API off holds no cluster to read.
 DNS_CACHE_NO_GKE_REASON = "the Kubernetes Engine API is not enabled in this project, so it holds no cluster"
 # A listing with no `addonsConfig` says nothing about the add-on: unread, not off.
@@ -1308,11 +1311,15 @@ def check_mtu_mismatch(networks: list, project: str) -> list[dict]:
 def check_nodelocal_dnscache(clusters: list) -> tuple[list[dict], list[str]]:
     """SOP 2.7: one hit per Standard cluster whose NodeLocal DNSCache add-on is
     not on, and the clusters whose listing carries no add-ons to decide from.
-    Autopilot always runs the cache, so its add-ons are not read."""
+    Autopilot always runs the cache, and a cluster on Cloud DNS for GKE sends
+    no lookup to kube-dns, so neither is read."""
     hits: list[dict] = []
     undecided: list[str] = []
     for cluster in clusters or []:
         if not isinstance(cluster, dict) or (cluster.get("autopilot") or {}).get("enabled"):
+            continue
+        dns = (cluster.get("networkConfig") or {}).get("dnsConfig") or {}
+        if dns.get("clusterDns") == CLOUD_DNS_PROVIDER:
             continue
         ref = f"{cluster.get('location', '')}/{cluster.get('name', '')}"
         addons = cluster.get("addonsConfig")

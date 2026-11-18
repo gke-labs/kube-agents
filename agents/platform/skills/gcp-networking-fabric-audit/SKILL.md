@@ -1,6 +1,6 @@
 ---
 name: gcp-networking-fabric-audit
-description: Audits VPC subnet IPAM capacity, Cloud NAT port exhaustion, Private Service Connect routing, VPC peering MTU mismatches, Cloud Armor WAF policies, and management ports open to the whole internet.
+description: Audits VPC subnet IPAM capacity, Cloud NAT port exhaustion, Private Service Connect routing, VPC peering MTU mismatches, Cloud Armor WAF policies, management ports open to the whole internet, and Standard clusters without NodeLocal DNSCache.
 ---
 
 # Task

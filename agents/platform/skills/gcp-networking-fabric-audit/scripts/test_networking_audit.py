@@ -2273,10 +2273,13 @@ class NodeLocalDnsCacheTest(unittest.TestCase):
             self.cluster("turned-on", {"dnsCacheConfig": {"enabled": True}}),
             self.cluster("autopilot", {}, autopilot=True),
             self.cluster("no-add-ons-listed"),
+            {**self.cluster("cloud-dns", {}), "networkConfig": {"dnsConfig": {"clusterDns": "CLOUD_DNS"}}},
+            {**self.cluster("kube-dns", {}), "networkConfig": {"dnsConfig": {"clusterDns": "KUBE_DNS"}}},
         ])
         self.assertEqual(
             [hit["object"] for hit in hits],
-            ["Cluster/us-central1-a/key-absent", "Cluster/us-central1-a/turned-off", "Cluster/us-central1-a/empty-block"],
+            ["Cluster/us-central1-a/key-absent", "Cluster/us-central1-a/turned-off", "Cluster/us-central1-a/empty-block",
+             "Cluster/us-central1-a/kube-dns"],
         )
         self.assertEqual(undecided, ["us-central1-a/no-add-ons-listed"])
 
