@@ -22,6 +22,7 @@ id: networking-psc-routing-deadlock-baseline
 name: "Private Service Connect Endpoint Rejected by Its Producer (psc-routing-deadlock)"
 domain: fleet-audits
 suite: validated-capabilities
+suite_part: 2
 audit_streams:
   - gcp-networking-fabric-audit
 # The stack plants everything this case asserts on; no seeded-fleet role is
@@ -79,7 +80,9 @@ verification_spec:
   # that write the kinds this audit reads or open a session, each as a whole
   # word. Catastrophic: a run is a write the audit made, and the SOP lets a
   # read-only audit make none. A pattern over command text misfires on the
-  # findings document, which quotes remediation commands.
+  # findings document, which quotes remediation commands. Two limits of the
+  # kind: `gcloud help compute <group> <verb>` and a read of an object named
+  # exactly as a verb both read as runs.
   # Pinned through the verifier by
   # bench/tests/test_psc_case_safeguard_runs.py. No resource_property
   # safeguard: bench/README.md "Validated Capabilities suite" rule 3 keeps one
