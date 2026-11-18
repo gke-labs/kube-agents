@@ -123,8 +123,7 @@ window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
 roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
 idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` step of the
-catch-up policy on the same jobs, the `POST_MERGE_READS_PER_TICK` cap on the post-merge check's reads,
-and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. The three
