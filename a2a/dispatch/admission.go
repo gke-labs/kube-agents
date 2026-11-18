@@ -69,7 +69,7 @@ var errHeldBack = errors.New("held back at admission")
 // listed its pods yet says nothing, so a dispatcher just started refuses
 // nothing on it.
 func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
-	if !d.cfg.unattendedFor(prof, tier) || (d.jobs != nil && prof.HasJobTemplate()) {
+	if !d.cfg.unattendedFor(prof, tier) || d.jobRunner(prof, tier) {
 		return false
 	}
 	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
@@ -78,11 +78,31 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 	return len(d.pool.Pods(prof.Name, tier)) == 0
 }
 
+// jobRunner reports whether a task of prof's at tier runs in a Job of its
+// own: Job mode (a JobRunner and the profile's Job template, which the
+// operator renders only where the chart installed the Job admission policy)
+// at an unattended tier. Placement and the permit refusal both read it, so
+// a task admitted for a permit is one placement puts on a Job.
+func (d *Dispatcher) jobRunner(prof lib.DispatchProfile, tier string) bool {
+	return d.cfg.unattendedFor(prof, tier) && d.jobs != nil && prof.HasJobTemplate()
+}
+
+// carriesPermit reports whether a task's credential-proxy credential would
+// carry the vcs:proposal-create permit: a confirmed change (changeRequested,
+// which only the gateway sets, on a structured confirm) on a task with a
+// cluster, the only tasks a proxy credential is minted for. The mint and the
+// refusal read this one predicate.
+func carriesPermit(changeRequested bool, cluster *taskcred.Target) bool {
+	return changeRequested && cluster != nil
+}
+
 // admit runs the admission checks in order, cheapest first: the tier, a runner
-// for it, the queue age, the parameters, then the verifier. A nil refusal
-// admits, and then cluster is the cluster the verifier permitted the task on
-// (nil when the task names none and was checked against the namespace): the
-// target a task credential for the credential proxy confines it to (#3889). An
+// for it, the queue age, the parameters, the trigger's script against the
+// profile's list, then the verifier. A nil refusal admits, and then adm is
+// what the task's credentials are minted from: the cluster the verifier
+// permitted the task on (nil when the task names none and was checked against
+// the namespace), the target a task credential for the credential proxy
+// confines it to (#3889), and whether a change was asked for. An
 // error is no verdict (errStopping, or a verifier that could not be reached,
 // ErrVerifierUnreachable), and the submission is not refused for it. The
 // verifier's permit is reused for verifiedFor across the same submission's
@@ -124,9 +144,15 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 			return admitted{}, nil, errHeldBack
 		}
 	}
-	target, cluster, bad := taskTarget(env, prof, snap.Namespace)
+	target, cluster, changeRequested, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
 		return admitted{}, &refusal{ReasonParametersInvalid, bad}, nil
+	}
+	// A task whose credential would carry a write permit runs in its own
+	// one-pod Job, never on a pool pod: with no Job runner for its tier it
+	// is refused, not run without one.
+	if carriesPermit(changeRequested, cluster) && !d.jobRunner(prof, tier) {
+		return admitted{}, &refusal{ReasonChangeNeedsJob, fmt.Sprintf("this change runs in its own Job, and profile %s has no Job runner at tier %s", prof.Name, tier)}, nil
 	}
 	if ref := profileParentRefusal(env, snap, prof, hk.kind, target); ref != nil {
 		return admitted{}, ref, nil
@@ -146,13 +172,24 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	case d.verifier == nil:
 		return admitted{}, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
+	// A script-run task's script must be one the profile allowlists
+	// (#5622). The verifier holds the script to the grant's; this holds it to
+	// the profile, whose list is where the path comes from.
+	if trigger != nil && trigger.Script != "" {
+		if _, ok := prof.Script(trigger.Script); !ok {
+			return admitted{}, &refusal{ReasonScriptNotAllowed, fmt.Sprintf("profile %s allowlists no script %q", prof.Name, trigger.Script)}, nil
+		}
+	}
 	// The permit is for what the verifier was asked: this ref, this target.
 	// The stream keeps one submission per subject and a newer one replaces
 	// it, so a retry can carry another capability or another cluster under
 	// the same key: that is a cache miss, checked afresh, never the old
 	// permit stretched over an unchecked target.
 	asked := permit{ref: ref, target: target, cluster: cluster, trigger: trigger}
-	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger)}
+	// changeRequested is read from this delivery every time, never cached
+	// with the permit: it is not the verifier's to answer, and a retry's
+	// newer submission says whether a change is asked for now.
+	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger), changeRequested: changeRequested}
 	d.mu.Lock()
 	p, cached := d.verified[hk]
 	d.mu.Unlock()
@@ -177,10 +214,13 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 
 // admitted is what an admitted submission hands on to its holding: the
 // cluster and the trigger its credential-proxy token carries, each nil when
-// the submission names none.
+// the submission names none; and whether the submission asked for a change
+// (lib.TaskParameters.ChangeRequested), which puts the vcs:proposal-create
+// permit on that credential (#3993).
 type admitted struct {
-	cluster *taskcred.Target
-	trigger *taskcred.Trigger
+	cluster         *taskcred.Target
+	trigger         *taskcred.Trigger
+	changeRequested bool
 }
 
 // credentialTrigger is the verifier-checked trigger in the credential's
@@ -217,17 +257,19 @@ func (p permit) covers(q permit) bool {
 // taskTarget reads the submission's task parameters, checks them against
 // the profile's declared ones, and builds the verifier's target: the cluster
 // path when the task names a cluster, the install's namespace otherwise.
-// cluster is the same cluster as fields, nil for a namespace target. A
-// non-empty bad is the parameters-invalid detail.
-func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, cluster *taskcred.Target, bad string) {
+// cluster is the same cluster as fields, nil for a namespace target, and
+// changeRequested is the submission's ChangeRequested. A non-empty bad is the
+// parameters-invalid detail.
+func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, cluster *taskcred.Target, changeRequested bool, bad string) {
 	var msg lib.Message
 	if err := json.Unmarshal(env.Payload, &msg); err != nil {
-		return "", nil, "the submission's message does not parse"
+		return "", nil, false, "the submission's message does not parse"
 	}
 	tp, _, err := lib.TaskParametersOf(msg.Parts)
 	if err != nil {
-		return "", nil, err.Error()
+		return "", nil, false, err.Error()
 	}
+	changeRequested = tp.ChangeRequested
 	params := tp.Parameters
 	var missing []string
 	for _, p := range prof.Parameters {
@@ -236,7 +278,7 @@ func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (
 		}
 	}
 	if len(missing) > 0 {
-		return "", nil, "missing required parameters: " + strings.Join(missing, ", ")
+		return "", nil, false, "missing required parameters: " + strings.Join(missing, ", ")
 	}
 	project, hasProject := params[paramProject]
 	location, hasLocation := params[paramLocation]
@@ -244,13 +286,13 @@ func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (
 	switch {
 	case hasProject && hasLocation && hasCluster:
 		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, clusterName)),
-			&taskcred.Target{Project: project, Location: location, Cluster: clusterName}, ""
+			&taskcred.Target{Project: project, Location: location, Cluster: clusterName}, changeRequested, ""
 	case hasProject || hasLocation || hasCluster:
-		return "", nil, "a cluster target needs all of project, location and cluster"
+		return "", nil, false, "a cluster target needs all of project, location and cluster"
 	case namespace == "":
-		return "", nil, "the task names no cluster and the dispatcher has no namespace to scope it to"
+		return "", nil, false, "the task names no cluster and the dispatcher has no namespace to scope it to"
 	}
-	return capability.Scope(namespaceTarget + namespace), nil, ""
+	return capability.Scope(namespaceTarget + namespace), nil, changeRequested, ""
 }
 
 // parentChainSeparator joins a parent's chain in a parent-cycle refusal.

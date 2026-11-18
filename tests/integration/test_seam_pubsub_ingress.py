@@ -157,8 +157,6 @@ class PubsubIngressSeamTest(unittest.TestCase):
         self.addCleanup(self.broker.server_close)
         self.addCleanup(self.broker.shutdown)
 
-        self.module, saved = load_adapter_module()
-        self.addCleanup(self._restore_modules, saved)
         self.token_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.token_dir.cleanup)
         self.token_file = os.path.join(self.token_dir.name, "token")
@@ -170,6 +168,10 @@ class PubsubIngressSeamTest(unittest.TestCase):
         })
         env.start()
         self.addCleanup(env.stop)
+        # After the patch starts: the adapter sets PUBSUB_HOME_CHANNEL when it is
+        # imported, and the patch's end takes that away with the rest.
+        self.module, saved = load_adapter_module()
+        self.addCleanup(self._restore_modules, saved)
 
     def mount_token(self, token):
         """The projected token as the kubelet writes it."""

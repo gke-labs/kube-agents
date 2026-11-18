@@ -165,14 +165,20 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	execTierDroppedMinterEnv:        true,
 	"GOOGLE_CHAT_PROJECT_ID":        true,
 	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
-	// The audit-report store's address and token file (audit_report_store.go):
-	// the store routes are the stateful broker's.
+	// The audit-report store's address, token file and profiles
+	// (audit_report_store.go): the store routes are the stateful broker's.
 	auditReportStoreURLEnv:       true,
 	auditReportStoreTokenFileEnv: true,
+	auditReportProfilesEnv:       true,
 	// The A2A gateway's Chat relay settings: the exec tier runs no relay, and
 	// a subscription change must not roll every exec replica.
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
+	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
+	// allowed callers, the A2A gateway among them while Chat is armed, and
+	// the binding is what holds that account to the a2a-chat audience. The
+	// exec tier confers no a2a-chat role, so there it is refused every
+	// audience. The value changes only when the allowed callers do (#6090).
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

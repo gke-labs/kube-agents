@@ -99,7 +99,8 @@ byte that reaches the broker by another route. The table matches exact text, and
 it saw must be what is forwarded; the query check is also what keeps a byte`http.client`will not put on a request line from surfacing as a traceback, and a`UnicodeError`or`InvalidURL` from the upstream request is answered with the same 400 as a second line
 (`UnicodeError`and not`ValueError`: `ssl.SSLCertVerificationError`is a`ValueError` too,
    and a TLS fault is answered as the upstream's, 502).
-3. Evaluates `api_policy.evaluate(method, host, path, query)`. A refusal answers 403 with the
+3. Evaluates `api_policy.evaluate(method, host, path, query, universe_domain=...)` with the
+   install's universe domain. A refusal answers 403 with the
    same body shape `/v1/exec` uses, so a caller that already reads `rule` and `message` reads
    these:
 
@@ -161,8 +162,9 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)), so
    a relayed read is in the same `tool_execution_audit` trail as a brokered command. The
    `tool` is `gcp-api`, apart from `gcloud` so that a `gcloud` record still means a process
-   ran; the `subcommand` is the service word of a host the table names (`monitoring`,
-   `cloudtrace`, `container`, `logging`) and `other` for any other host. The first line is `started`; the
+   ran; the `subcommand` is the service word of a host the table names in the install's
+   universe domain (`monitoring`, `cloudtrace`, `container`, `logging`) and `other` for any
+   other host, the commercial host on a custom universe domain included. The first line is `started`; the
    verdict is `rejected` for a 400, `blocked` with the `rule` for a 403, `completed` with
    `duration_ms` and `upstream_status` for a forwarded answer whatever its status, and
    `failed` for the disabled relay, a credential the broker cannot obtain and each upstream
@@ -202,8 +204,8 @@ Authorization: Bearer <projected caller token>
 The handler decides on the method, host and path before it reads a byte of the body. A `POST`
 that is not, exactly, a table entry with a body check is refused with `gcp.api.method` and its
 body is drained and discarded, as before. On an install with a custom universe domain the
-entry's host is that universe's Logging host, as for the `GET` routes, and the commercial host
-is refused. For the entry, in order:
+entry's host is that universe's Logging host and the commercial host is refused, by the rule
+[the policy module](#the-policy-module) states for every route. For the entry, in order:
 
 1. The query must be empty (`gcp.api.body`): the read's arguments are its body, and a query
    is a second place to put one.
@@ -292,16 +294,25 @@ validator refuses a table that names one. `PROJECT` is Google's project-id gramm
 number (a decimal int64), since an install's `projectId` may be either, and `HOST_SHAPE` the host
 grammar the table and the handler share.
 
+`evaluate` reads the table in the install's universe domain, which the handler passes to it. On
+the commercial domain, `googleapis.com`, the hosts are as the table writes them. On a custom
+universe domain each `<service>.googleapis.com` host of the table is read as
+`<service>.<universe domain>`, so the host as the table writes it is in no route there: a `GET`
+for it is refused with `gcp.api.host`, any other method at step 1. A `REFUSED_HOSTS` entry is
+refused there as written, and a `<service>.googleapis.com` entry also as
+`<service>.<universe domain>`. A universe domain that is malformed has no routed host, so every
+request is refused: a `GET` with `gcp.api.host`, any other method at step 1.
+
 `evaluate` answers in this order, and the order is the security argument:
 
 1. A `POST` that is not exactly the host and path of an entry with a body check, or any
    method other than `GET` and `POST` → `gcp.api.method`. A `POST` that is such an entry is
    allowed here when its query is empty (`gcp.api.body` otherwise), and its body is still to
    pass `evaluate_body`.
-2. Host in `REFUSED_HOSTS` → `gcp.api.host-refused`. Listed separately from an unknown host so
+2. Host in `REFUSED_HOSTS`, in either of those forms → `gcp.api.host-refused`. Listed separately from an unknown host so
    the log distinguishes "asked for a token endpoint" from "asked for a service nobody has
    added".
-3. Host not in any route → `gcp.api.host`.
+3. Host not in any route for the universe domain → `gcp.api.host`.
 4. Host known, path matches no route → `gcp.api.path`, with the message naming the rule ids
    that host does have.
 5. Otherwise allowed, carrying the matching `rule_id` for the audit line.

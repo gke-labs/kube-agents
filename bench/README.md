@@ -170,22 +170,22 @@ Two speeds, deliberately: the deterministic `Verification*` scores decide whethe
 
 Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_AGGREGATE_MIN_SCORED`, `EVAL_AGGREGATE_ARMED` (unset by default: the suite aggregate is computed and reported against main's rate but cannot red the job until this is set to `1`, `true` or `yes`), `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, `EVAL_BASELINE_CAT_WORKERS` (default 16: how many per-case `gcloud storage cat` calls a GCS read runs at once), `EVAL_ADMISSION_MODE` (`roster` by default: the list decides and the record is reported; `record`: the record decides once it holds a full window) and `BOOTSTRAP_ADMITTED` (the blocking roster, read from `hack/eval/blocking-roster.txt`; [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md) has the decision and what the record must show before the mode changes).
 
-## Certification suite
+## Validated Capabilities suite
 
-The certification suite is the set of cases behind the certified-capabilities page. It has its
-own lane and no roster file: a certification case is an ordinary case under `bench/tasks/<id>/`
-whose `task.yaml` carries the bare line `suite: certification`, and that line is its registration.
-`EVAL_TIER=certification` in `hack/ci-eval-pr.sh` runs every such case and nothing else, in case-id
-order (a section other than 1 is the bare line `certification_part: N`; `EVAL_CERTIFICATION_PART=N`
+The validated-capabilities suite is the set of cases behind the validated-capabilities page. It has its
+own lane and no roster file: a validated-capabilities case is an ordinary case under `bench/tasks/<id>/`
+whose `task.yaml` carries the bare line `suite: validated-capabilities`, and that line is its registration.
+`EVAL_TIER=validated-capabilities` in `hack/ci-eval-pr.sh` runs every such case and nothing else, in case-id
+order (a section other than 1 is the bare line `suite_part: N`; `EVAL_VALIDATED_CAPABILITIES_PART=N`
 runs one section, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
 and no pull request and no nightly runs a case carrying the line. The lane greps for the two lines,
 so `scripts/validate_bench_cases.py` refuses any other spelling of them (a quoted value, a trailing
 comment), a suite case that a roster file also names, and a parked case (`FIXTURE_NOT_READY`,
 `KNOWN_UNREGISTERED`) that carries the line, so one case holds one record on one lane and a case
 pull request edits no shared file. The suite starts with cases of its own; a nightly case joins it in
-a later change by adding the line and dropping its nightly entry, and until then the page certifies
+a later change by adding the line and dropping its nightly entry, and until then the page validates
 a nightly case from its nightly record. The blocking roster is a subset of
-the presubmit, so nothing on this lane arms rung 4: a failing certification case is a record for
+the presubmit, so nothing on this lane arms rung 4: a failing validated-capabilities case is a record for
 the page, not a red. What does red a run of the lane is the same as anywhere: rungs 1 to 3 (a
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked
 `expected_fail: true` that passes every repetition, which says its marker is stale. A case the
@@ -194,7 +194,7 @@ header comment, beside the capability row it grades. The lane's record is its lo
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Nine rules hold for every fixture a certification case plants, enforced in review until a
+Nine rules hold for every fixture a validated-capabilities case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a

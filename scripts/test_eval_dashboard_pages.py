@@ -1084,6 +1084,54 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Workers not finishing", run_page)
         self.assertIn("those runs read not evaluated, not red", run_page)
 
+    def test_a_forge_outage_has_its_own_brief_and_banner(self):
+        health = health_doc(
+            "DEGRADED", condition="forge_outage", failing_cases=[], tracking_issues=[],
+            cause="forge outage: grading's GitHub reads failed on 2 PRs 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2], "runs": 4, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        data = json.loads(json.dumps(self.data))
+        hit = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        forge = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited: writes: answered 403"
+        hit["tasks"][0]["reps"] = [{"n": i + 1, "result": "infra", "reason": forge} for i in range(3)]
+        hit["tasks"][0]["result"] = "infra"
+        out = render_to(pathlib.Path(self.tmp.name) / "forge-brief", data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("Grading cannot read GitHub", app)
+        self.assertIn("Why we think it's GitHub, not the PRs", app)
+        self.assertRegex(app, r"[1-9]\d* of \d+ repetitions</b> lost their checks to a GitHub read that failed during grading")
+        self.assertIn("writes: answered 403", app, "the agent-saw pick is the forge-unavailable case")
+        self.assertIn("#6105", app)
+        self.assertNotIn("Gate outage", app)
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("Grading cannot read GitHub", run_page)
+
+    def test_a_red_only_the_forge_safeguard_explains_is_not_the_prs(self):
+        safeguard = "KUBE_AGENTS_FORGE_SAFEGUARD: checks errored rather than ran: ['writes'] -- writes: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied"
+        data = json.loads(json.dumps(self.data))
+        hit = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        hit["result"] = "FAILURE"
+        for t in hit["tasks"]:
+            t["reps"] = [rep if rep.get("result") == "pass" else dict(rep, result="fail", reason=safeguard) for rep in t.get("reps") or []]
+            if t["name"] == "reliability-pdb-probe":
+                # Admitted, passes beside a block: partial, and the case that reds the run.
+                t["reps"][-1] = dict(t["reps"][-1], result="fail", reason=safeguard)
+            if any(rep["result"] == "fail" for rep in t["reps"]):
+                t["result"] = "fail"
+        base = dom_text(render_to(pathlib.Path(self.tmp.name) / "forge-red-base", self.data, health=health_doc("GREEN")) / "index.html")
+        out = render_to(pathlib.Path(self.tmp.name) / "forge-red", data, health=health_doc("GREEN"))
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("a catastrophic safeguard could not read GitHub", run_page)
+        self.assertNotIn("Fix the PR", run_page)
+        # Admitted partial, held-out partial and held-out ungraded forge cases are listed together, none as passed.
+        group = run_page[run_page.index("Could not read GitHub · "):]
+        for name in ("reliability-pdb-probe", "capacity-pinned-pool-probe", "obtainability-healthy-namespace-silence"):
+            self.assertIn(name, group.split("These checks errored on a GitHub read")[0], name)
+        self.assertNotIn("Passed on retry", run_page)
+        own = re.compile(r"(\d+) look like the PR")
+        self.assertEqual(own.search(dom_text(out / "index.html")).group(1), own.search(base).group(1), "not counted as PR-caused")
+
     def test_a_deadline_kill_outage_has_its_own_brief_and_banner(self):
         # #1894: runs Prow killed at the job deadline with no verdict.
         health = health_doc(

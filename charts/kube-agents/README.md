@@ -242,16 +242,23 @@ feeds `FLUENT_BIT_IMAGE`:
 | `a2aBus.images.prometheusExporter` | `A2A_NATS_EXPORTER_IMAGE` | `docker.io/natsio/prometheus-nats-exporter`    |
 
 Each takes `repository` and `tag`; the pins are those in `images.json`, which
-`make mirror-images` copies, and the operator's compiled defaults are the same
-pins (`make images-check` holds the three in step). The reloader and the
+`make mirror-images` copies, and the operator's compiled defaults and the chart's
+own copy in `templates/_helpers.tpl` (`kube-agents.a2aBusImageDefaults`) are the
+same pins (`make images-check` holds the four in step). The reloader and the
 exporter are pinned by digest as well as tag. Under
 `global.thirdPartyImageRegistry` each renders as `<prefix>/<trailing name>:<tag>`
 with the digest dropped, because the mirror holds the copy by tag and the
-copy's digest differs from the upstream one. `operator.extraEnv` is appended
+copy's digest differs from the upstream one. A release whose values carry no
+`a2aBus` key, as `helm upgrade --reuse-values` from a release before the key
+renders, takes the same pins from the chart's templates, so a mirrored install
+upgraded that way still pulls the bus from its mirror rather than from the
+operator's compiled Docker Hub defaults. `operator.extraEnv` is appended
 after these and wins, as for every other variable the chart renders; an entry
 that clears `A2A_NATS_EXPORTER_IMAGE` while `A2A_NATS_IMAGE` stays set makes the
 operator render the bus without its exporter sidecar, and the chart then
-renders no PodMonitoring or scrape alert for it.
+renders no PodMonitoring or scrape alert for it. An `extraEnv` entry is the way to
+run the bus without the exporter: a null in `a2aBus.images.prometheusExporter` does
+not omit it, because the chart fills the field from its own pins.
 
 ### LiteLLM gateway
 
@@ -1597,7 +1604,7 @@ on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
-target named per task by the `project`, `location` and `cluster` parameters.
+target named per task by the `project`, `cluster` and `location` parameters.
 Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because

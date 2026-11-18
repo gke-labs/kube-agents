@@ -101,6 +101,12 @@ variable "pod_count" {
   }
 }
 
+variable "planted_record" {
+  type        = string
+  description = "Name of the ConfigMap in the burst namespace that records the planted pods' UIDs, which the triage_starts check reads"
+  default     = "eval-burst-planted"
+}
+
 # Bounds the wait for the watcher to fire for every planted pod.
 variable "fire_wait_seconds" {
   type        = number

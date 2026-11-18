@@ -537,8 +537,8 @@ SHELL_UNSAFE_TOKEN_RE = re.compile(r"[`$|<>;&()*?]")
 # (`sh -c 'kubectl …'`), is read as a command of its own.
 SHELL_SUBSTITUTION_RE = re.compile(r"[`$]")
 HARMLESS_REDIRECT_TOKENS = frozenset(("2>/dev/null", "2>&1", ">/dev/null", "&>/dev/null"))
-# The secret stores: for each, the pattern that names its family on a
-# command (the subcommand words after it captured) and the pattern of the
+# The secret stores: for each, the parts that name its family on a command,
+# the subcommand words after it (group 1 is read), and the pattern of the
 # named lists those words may be. Every mention on the command is read, so
 # a list and a value read on one line (`echo $(gcloud secrets list)
 # $(gcloud secrets versions access latest --secret=db)`) withhold. gcloud
@@ -552,31 +552,71 @@ HARMLESS_REDIRECT_TOKENS = frozenset(("2>/dev/null", "2>&1", ">/dev/null", "&>/d
 # a parenthesis or a path separator), since each is also a name elsewhere
 # (a namespace, `--vault-name`, a config file), and `vault` only with `kv`
 # or `read` as a word after its flags.
-SECRET_STORE_FAMILIES = (
+#
+# A family is read in one pass over the command
+# (`_simple_command_reads_a_secret`), so the time is linear in the command:
+# a pattern of the form `tool[^|&;]*?family words` read the command again
+# from each tool name. The pass meets, in the command's order:
+# - a separator (`|`, `&`, `;`): a tool name ahead of it no longer counts;
+# - the tool name (`gcloud`, `aws`, `az`), as a word;
+# - the gate, for the two families whose words may stand anywhere behind
+#   it, past separators too: `ssm` behind the tool name, and `vault` as a
+#   command word, each with a blank behind it;
+# - the start of the subcommand words. Where the parts ahead of it were met,
+#   the words pattern is matched at that place; where it matches, the words
+#   are read and the pass goes on behind them, with no part met.
+# The words start holds no character that another part can start on, so the
+# pass skips nothing when the words do not count.
+STORE_SEPARATOR_PATTERN = r"[|&;]"
+# Every part is read in any case.
+STORE_PATTERN_FLAGS = "(?i)"
+STORE_SEPARATOR_GROUP = "separator"
+STORE_TOOL_GROUP = "tool"
+STORE_GATE_GROUP = "gate"
+STORE_WORDS_GROUP = "words"
+# Per family: the tool name, the gate, the start of the subcommand words, the
+# words (matched at that start), the named lists. None where a family has no
+# such part.
+STORE_FAMILY_PARTS = (
+    (r"\bgcloud\b", None, r"\bsecrets", r"secrets\s+((?:versions\s+)?\S+)", r"^(?:list|describe|versions\s+(?:list|describe))\b"),
     (
-        re.compile(r"(?i)\bgcloud\b[^|&;]*?\bsecrets\s+((?:versions\s+)?\S+)"),
-        re.compile(r"(?i)^(?:list|describe|versions\s+(?:list|describe))\b"),
+        r"\baws\b",
+        None,
+        r"\bsecretsmanager",
+        r"secretsmanager\s+(\S+)",
+        r"^(?:list-secrets|describe-secret|list-secret-version-ids|get-resource-policy)\b",
     ),
+    (r"\baws\b", r"\bssm(?=\s)", r"(?<=\s)(?:get|describe)-parameter", r"((?:get|describe)-parameters?\S*)", r"^describe-parameters\b"),
+    (r"\baz\b", None, r"\bkeyvault", r"keyvault\s+secret\s+(\S+)", r"^(?:list|list-versions|list-deleted)\b"),
+    (None, r"(?:^|[\s('\"`/])vault(?=\s)", r"(?<=\s)(?:kv|read)\b", r"((?:kv|read)\b(?:\s+\S+)?)", r"^kv\s+(?:list|metadata)\b"),
+    (None, None, r"(?:^|[\s('\"`/])sops", r"(?:^|[\s('\"`/])sops\s+(\S+)", r"^(?:-e|--encrypt|encrypt|updatekeys|-v|--version)\b"),
+)
+# Per family, six items: the pattern of the start of the words alone, the
+# pattern of the pass (one named group per part the family has; a separator
+# only matters to a tool name), the words pattern, the named-lists pattern,
+# whether the family has no tool name, and whether it has no gate.
+SECRET_STORE_FAMILIES = tuple(
     (
-        re.compile(r"(?i)\baws\b[^|&;]*?\bsecretsmanager\s+(\S+)"),
-        re.compile(r"(?i)^(?:list-secrets|describe-secret|list-secret-version-ids|get-resource-policy)\b"),
-    ),
-    (
-        re.compile(r"(?i)\baws\b[^|&;]*?\bssm\s+(?:\S+\s+)*?((?:get|describe)-parameters?\S*)"),
-        re.compile(r"(?i)^describe-parameters\b"),
-    ),
-    (
-        re.compile(r"(?i)\baz\b[^|&;]*?\bkeyvault\s+secret\s+(\S+)"),
-        re.compile(r"(?i)^(?:list|list-versions|list-deleted)\b"),
-    ),
-    (
-        re.compile(r"(?i)(?:^|[\s('\"`/])vault\s+(?:\S+\s+)*?((?:kv|read)\b(?:\s+\S+)?)"),
-        re.compile(r"(?i)^kv\s+(?:list|metadata)\b"),
-    ),
-    (
-        re.compile(r"(?i)(?:^|[\s('\"`/])sops\s+(\S+)"),
-        re.compile(r"(?i)^(?:-e|--encrypt|encrypt|updatekeys|-v|--version)\b"),
-    ),
+        re.compile(STORE_PATTERN_FLAGS + words_start),
+        re.compile(
+            STORE_PATTERN_FLAGS
+            + "|".join(
+                "(?P<%s>%s)" % (group, part)
+                for group, part in (
+                    (STORE_SEPARATOR_GROUP, STORE_SEPARATOR_PATTERN if tool else None),
+                    (STORE_TOOL_GROUP, tool),
+                    (STORE_GATE_GROUP, gate),
+                    (STORE_WORDS_GROUP, words_start),
+                )
+                if part
+            )
+        ),
+        re.compile(STORE_PATTERN_FLAGS + words),
+        re.compile(STORE_PATTERN_FLAGS + named_lists),
+        tool is None,
+        gate is None,
+    )
+    for tool, gate, words_start, words, named_lists in STORE_FAMILY_PARTS
 )
 # The reads that stay a list: a jsonpath into a secret's data, and a file
 # read (also after `kubectl exec ... --`) under a well-known secret mount or
@@ -2459,10 +2499,28 @@ def script_prints_token_or_environment(script: str, depth: int, budget: Optional
 
 def _simple_command_reads_a_secret(command: str, depth: int) -> bool:
     """Whether one simple command prints a secret's value: a store's family not in its named lists, a kubectl read, or a quoted script that does."""
-    for family_re, named_lists_re in SECRET_STORE_FAMILIES:
-        for family in family_re.finditer(command):
-            if not named_lists_re.match(family.group(1)):
-                return True
+    for words_start_re, parts_re, words_re, named_lists_re, no_tool, no_gate in SECRET_STORE_FAMILIES:
+        # A command with no start of the family's words holds nothing to read. Most commands stop here, at the cost of one search.
+        if not words_start_re.search(command):
+            continue
+        # The loop is written here, not in a function of its own, so that the read is no deeper in Python frames.
+        tool, gate, read_to = no_tool, no_gate, 0
+        for part in parts_re.finditer(command):
+            if part.start() < read_to:
+                continue
+            kind = part.lastgroup
+            if kind == STORE_SEPARATOR_GROUP:
+                tool = False
+            elif kind == STORE_TOOL_GROUP:
+                tool = True
+            elif kind == STORE_GATE_GROUP:
+                gate = gate or tool
+            elif (tool if no_gate else gate):
+                words = words_re.match(command, part.start())
+                if words:
+                    if not named_lists_re.match(words.group(1)):
+                        return True
+                    tool, gate, read_to = no_tool, no_gate, words.end()
     if kubectl_command_reads_a_secret(command):
         return True
     if depth < MAX_NESTED_COMMAND_DEPTH:

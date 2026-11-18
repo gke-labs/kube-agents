@@ -367,15 +367,32 @@ func alreadyRestored(ctx context.Context, nc *nats.Conn, policy StreamPolicy, st
 // rollback, so no server holds a copy the next shape cannot use: a stream
 // already gone counts as cleared, so a retry continues where a failed clear
 // stopped. The staged snapshot is what these streams are restored from.
+//
+// The streams come in the operator's migration order, where a stream that
+// indexes another comes before it: KV_PROFILE_LEASES (the claimed submits)
+// and DISPATCH_STOPS (the stopped ones) before PROFILE_SUBMITS. So they are
+// deleted last to first. A clear that stops partway, a failed delete, then
+// leaves an index without the submits, never the submits without an index.
+// That matters if the run is then given up: the streams it did not put back
+// are recreated empty, and an empty index next to full submits would admit
+// claimed or stopped submits again (#6287). The restore walks the same
+// order forward, so a restore that stops partway leaves the same safe shape.
 func ClearStreams(ctx context.Context, nc *nats.Conn, streams []string) ([]string, error) {
 	var cleared []string
-	for _, name := range streams {
-		if err := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, name), nil, nil); err != nil && !isStreamNotFound(err) {
+	for i := len(streams) - 1; i >= 0; i-- {
+		name := streams[i]
+		if err := deleteStream(ctx, nc, name); err != nil && !isStreamNotFound(err) {
 			return cleared, fmt.Errorf("stream %s: %w", name, err)
 		}
 		cleared = append(cleared, name)
 	}
 	return cleared, nil
+}
+
+// deleteStream is the clear's one call to the bus, a variable so a test can
+// fail it at a chosen stream.
+var deleteStream = func(ctx context.Context, nc *nats.Conn, name string) error {
+	return request(ctx, nc, fmt.Sprintf(streamDeleteSubject, name), nil, nil)
 }
 
 // HashMain runs `bus-hash --dir D --streams S`: the digests of every staged

@@ -22,7 +22,7 @@
 id: ccc-manual-pools-single-rule-unbacked
 name: "ComputeClass With Auto-Creation Off Backed by a Manual Pool for Only One Priority Rule (ccc-manual-pools-unbacked)"
 domain: capacity
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - stockout-prevention
