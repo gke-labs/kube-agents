@@ -9749,7 +9749,8 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
 
     A check with fixed object kinds accepts only those
     (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
-    the compute snapshot check). The two controller checks file whatever
+    the compute snapshot check and the networking peering check). The two
+    controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5
