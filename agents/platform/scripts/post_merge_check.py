@@ -329,12 +329,9 @@ def forge_paths(repo: str, number: int) -> list[str] | None:
 
 
 def _dir_key(value: object) -> str:
-    """A repository directory as a prefix: no leading ``./`` or ``/``, no trailing ``/``; ``""`` is the root."""
-    text = str(value or "").strip()
-    while text.startswith("./"):
-        text = text[2:]
-    text = text.strip("/")
-    return "" if text == "." else text
+    """A repository directory as a prefix, its empty and ``.`` segments dropped (``/./a//b/.`` is ``a/b``);
+    ``""`` is the root."""
+    return "/".join(part for part in str(value or "").strip().split("/") if part not in ("", "."))
 
 
 def _holds(directory: object, paths: list[str]) -> bool:

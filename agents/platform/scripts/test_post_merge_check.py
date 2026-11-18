@@ -577,7 +577,8 @@ class ReconcilersForTest(unittest.TestCase):
                 self.assertEqual(post_merge_check.reconcilers_for(REPO, "shop", lists, paths), [])
 
     def test_a_root_sync_dir_is_read_however_it_is_written(self):
-        for directory in ("clusters/dev", "/clusters/dev/", "./clusters/dev", "clusters/dev/"):
+        for directory in ("clusters/dev", "/clusters/dev/", "./clusters/dev", "clusters/dev/", "/./clusters/dev",
+                          "clusters/dev/.", "clusters//dev", "././clusters/./dev"):
             with self.subTest(dir=directory):
                 root = {"kind": "RootSync", "spec": {"git": {"repo": REPO, "dir": directory}}}
                 lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
