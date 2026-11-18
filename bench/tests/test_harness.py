@@ -182,6 +182,7 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         self.server.last_request = json.loads(self.rfile.read(length))
         self.server.requests.append(self.server.last_request)
         self.server.last_auth = self.headers.get("Authorization")
+        self.server.eval_runs.append(self.headers.get("X-Kube-Agents-Eval-Run"))
         if len(self.server.requests) in self.server.drop_on:
             # Kill the socket before any status line goes out: the client
             # sees the connection die in flight, not an HTTP answer.
@@ -287,6 +288,7 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
     server.session_lookups = []
     server.get_auths = []
     server.requests = []
+    server.eval_runs = []
     server.turns = []
     server.fail_headers = {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -2001,6 +2003,46 @@ def test_delegated_work_is_awaited_before_the_result_is_returned(
     # The pod read did not complete here, so _settle records the gap.
     assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
+
+
+def test_every_turn_carries_the_eval_run_tag_of_its_conversation(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``X-Kube-Agents-Eval-Run: <run>/<case>/<rep>``, the run being the conversation id.
+
+    The agent records it per session and stamps it on its model requests for
+    the replay proxy's log; the file beside results.json names the run id, so a
+    retried repetition's attempt is told apart from the first.
+    """
+    target = tmp_path / "eval_run.json"
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", str(target))
+    monkeypatch.setenv("EVAL_CASE_ID", "some-case")
+    monkeypatch.setenv("EVAL_REPETITION", "2")
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    run_id = stub_agent.requests[0]["conversation"]
+    assert stub_agent.eval_runs == [f"{run_id}/some-case/2"] * 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "eval_run": f"{run_id}/some-case/2", "run_id": run_id, "case_id": "some-case", "repetition": "2",
+    }
+
+
+def test_the_eval_run_tag_falls_back_outside_the_presubmit(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("EVAL_CASE_ID", raising=False)
+    monkeypatch.delenv("EVAL_REPETITION", raising=False)
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    run_id = stub_agent.requests[0]["conversation"]
+    assert stub_agent.eval_runs == [f"{run_id}/adhoc/1"]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_status_turns_continue_the_same_conversation(

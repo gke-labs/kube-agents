@@ -554,6 +554,20 @@ _TIMING_DECIMALS = 3
 # Where the delivered reply's shape goes (chat_shape.measure), for the eval
 # dashboard. hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
 _SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
+# Where the invocation's eval run tag goes, ``{"eval_run": "<run>/<case>/<rep>",
+# "run_id", "case_id", "repetition"}``, so a retried repetition's attempt is
+# told apart from the first by its run id. hack/ci-eval-pr.sh sets it per
+# repetition and copies it beside results.json; unset, nothing is written.
+_EVAL_RUN_FILE_ENV = "KUBE_AGENTS_EVAL_RUN_FILE"
+_EVAL_RUN_KEY = "eval_run"
+# The api transport sends the tag on each turn. The agent records it for the
+# turn's session and, while the install has KUBEAGENTS_EVAL_RUN_TAGS on, stamps
+# it on every model request the work makes (deploy/docker/patches/eval_run_tag.py),
+# where the replay proxy logs it. Off, the agent ignores it. Nothing the model
+# reads carries it. On the inject transport the bridge sends the same tag from
+# the conversation key (a2a/hermes-bridge/api.go).
+_EVAL_RUN_HEADER = "X-Kube-Agents-Eval-Run"
+_EVAL_RUN_SEPARATOR = "/"
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -2602,6 +2616,27 @@ def _write_chat_shape(result: AgentResult) -> None:
         _write_sidecar(_SHAPE_FILE_ENV, shape, "reply shape")
 
 
+def _eval_run_identity(run_id: str) -> dict[str, str]:
+    """The tag ``<run>/<case>/<rep>`` for ``run_id``, with its parts.
+
+    The case and repetition are ``EVAL_CASE_ID`` and ``EVAL_REPETITION`` as the
+    presubmit exports them, ``adhoc`` and ``1`` outside it, as on the inject path.
+    """
+    case = os.environ.get(_EVAL_CASE_ID_ENV, "").strip() or _EVAL_CASE_FALLBACK
+    repetition = os.environ.get(_EVAL_REPETITION_ENV, "").strip() or _EVAL_REPETITION_FALLBACK
+    return {
+        _EVAL_RUN_KEY: _EVAL_RUN_SEPARATOR.join((run_id, case, repetition)),
+        "run_id": run_id,
+        "case_id": case,
+        "repetition": repetition,
+    }
+
+
+def _write_eval_run(identity: dict[str, str]) -> None:
+    """Write the invocation's eval run tag to ``KUBE_AGENTS_EVAL_RUN_FILE``."""
+    _write_sidecar(_EVAL_RUN_FILE_ENV, identity, "eval run tag")
+
+
 def _write_sidecar(env: str, payload: dict[str, Any], what: str) -> None:
     """Write ``payload`` as JSON to the file ``env`` names, when it names one.
 
@@ -3522,7 +3557,10 @@ class KubeAgentsHarness(AgentHarness):
         # 127.0.0.1 rather than localhost, matching _port_open's probe host: a
         # v4/v6 mismatch would make the probe and the request disagree.
         url = f"http://127.0.0.1:{local_port}{api_path}"
-        headers = {"Content-Type": "application/json"}
+        run_id = _run_id()
+        eval_run = _eval_run_identity(run_id)
+        _write_eval_run(eval_run)
+        headers = {"Content-Type": "application/json", _EVAL_RUN_HEADER: eval_run[_EVAL_RUN_KEY]}
         token = os.environ.get("PLATFORM_AGENT_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -3531,7 +3569,7 @@ class KubeAgentsHarness(AgentHarness):
             # The endpoint is stateful and replays the whole conversation's tool
             # calls, so a shared id would make each task inherit the previous
             # task's trajectory and corrupt trajectory scoring.
-            "conversation": _run_id(),
+            "conversation": run_id,
             "input": prompt,
         }
 
@@ -3962,6 +4000,8 @@ class KubeAgentsHarness(AgentHarness):
         # the door dedupe a retried POST on it.
         conversation = inject.conversation_key(run_id, case_id, repetition)
         message_id = inject.message_id(run_id, case_id, repetition)
+        # The same triple the bridge sends as the tag (a2a/hermes-bridge/api.go).
+        _write_eval_run({_EVAL_RUN_KEY: conversation, "run_id": run_id, "case_id": case_id, "repetition": repetition})
         if follow_up is not None:
             conversation, message_id = follow_up.conversation, message_id + follow_up.suffix
         identity: dict[str, Any] = {
