@@ -85,6 +85,16 @@ class SessionResourcesRenderTest(unittest.TestCase):
                     self.assertNotEqual(proc.returncode, 0, proc.stdout[-300:])
                     self.assertIn("sessionResources", proc.stderr)
 
+    def test_an_exponent_is_held_to_minus_18_and_says_so(self):
+        # #6196: below -18 the operator decodes a quantity only slowly; -18 itself renders.
+        self.assertIn('cpu: "1e-18"', self._render(self._one("requests", "cpu", '"1e-18"')))
+        for value, says in (('"1e-19"', "whose exponent is below -18"), ('"+1e-19"', "is +1e-19, whose exponent"),
+                            ('"1e400"', "past the range")):
+            with self.subTest(value=value):
+                proc = self._helm(self._one("requests", "cpu", value), "--skip-schema-validation")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout[-300:])
+                self.assertIn(says, proc.stderr)
+
     def test_a_cpu_past_int64_millicores_is_refused_and_one_under_renders(self):
         # The operator reads CPU in millicores; 9.3e15 cores is past int64 there.
         proc = self._helm(self._one("limits", "cpu", '"9.3e15"'), "--skip-schema-validation")

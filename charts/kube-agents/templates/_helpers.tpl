@@ -2493,13 +2493,15 @@ these have passed.
        decode of it. Below -18 a quantity is smaller than the n suffix and rounds to 1n, so
        nothing a pod requests needs one. A positive exponent past 18 is past int64 in bytes
        or millicores, which the callers' overflow checks already refuse, by name.
-       Args: raw (the value without a leading sign), key (the values path, for the message). */ -}}
+       Args: raw (the value without a leading sign), key (the values path, for the message), and
+       optionally shown (the value as written, for the message; raw when unset). */ -}}
 {{- define "kube-agents.quantityExponentCheck" -}}
+{{- $shown := .shown | default .raw -}}
 {{- $exp := regexFind "[eE][-+]?[0-9]+$" .raw -}}
 {{- if $exp -}}
 {{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
 {{- if and (contains "-" $exp) (or (gt (len $digits) 2) (and $digits (gt (int $digits) 18))) -}}
-{{- fail (printf "%s is %s, whose exponent is below -18: the operator decodes a quantity like this slowly or not at all, and no pod resource needs one. Write it with a unit suffix (m, n) instead" .key .raw) -}}
+{{- fail (printf "%s is %s, whose exponent is below -18: the operator decodes a quantity like this slowly or not at all, and no pod resource needs one. Write it with a unit suffix (m, n) instead" .key $shown) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -2526,7 +2528,7 @@ these have passed.
        without its sign (the resolver reads a negative as unset, but the operator must
        still decode it): 15 significant digits, and nothing past int64 in bytes or in
        millicores, which a large exponent reaches and the CRD's pattern admits. */ -}}
-{{- include "kube-agents.quantityExponentCheck" (dict "raw" $abs "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
+{{- include "kube-agents.quantityExponentCheck" (dict "raw" $abs "shown" $raw "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" $abs "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
@@ -2580,10 +2582,10 @@ these have passed.
 {{- if hasPrefix "-" $raw -}}
 {{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
-{{- include "kube-agents.quantityExponentCheck" (dict "raw" (trimPrefix "+" $raw) "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
+{{- include "kube-agents.quantityExponentCheck" (dict "raw" (trimPrefix "+" $raw) "shown" $raw "key" (printf "%s.%s.%s" $prefix $side $name)) -}}
 {{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
        within one part in 10^16 of each other, or of a bound, read as equal, and the
        render would pass what the operator's exact comparison refuses. Counted on the

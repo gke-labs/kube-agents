@@ -439,6 +439,10 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
                 err = self._render_error([f"{_VALUE_PATH}.requests.cpu={value}"])
                 self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, whose exponent is below -18", err)
         self._render_cr([f"{_VALUE_PATH}.requests.cpu=1e-3"])
+        self._render_cr([f"{_VALUE_PATH}.requests.cpu=1e-18"])
+        # A value outside the grammar is told so, not about its exponent.
+        err = self._render_error([f"{_VALUE_PATH}.requests.cpu=abce-19"])
+        self.assertIn("which is not a Kubernetes quantity the operator can read", err)
 
     def test_a_quantity_outside_the_grammar_fails_naming_the_key(self):
         for value in ("abc", "1e.5", "2GB"):
