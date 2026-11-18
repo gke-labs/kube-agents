@@ -2314,6 +2314,10 @@ SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
 DEFAULT_CREDENTIAL_PROXY_CURATOR_AUDIENCE = "kubeagents-credential-proxy-curator"
 CURATOR_AUDIENCE_ENV = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"
 CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
+# The A2A gateway's ServiceAccount, the one caller the a2a-chat audience is for
+# (#6090). The operator renders it beside CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE,
+# only while Google Chat is armed on the A2A stack.
+A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"
 # The profile workers' audience (#3889). An AgentProfile's worker pod runs
 # model output and reaches this broker the way a session pod does, over the
 # ClusterIP with a projected token, and gets a role of its own: the exec route,
@@ -5301,6 +5305,12 @@ class ServiceAccountAuthenticator:
 
     ``scope_callers`` binds the scope role exactly as ``mcp_callers`` binds
     the mcp role, empty set included.
+    ``a2a_chat_callers`` binds the a2a-chat role as ``session_callers`` binds
+    the session role, empty set included: a caller named there (the A2A
+    gateway) may present only the a2a-chat audience, and when the set is
+    non-empty the a2a-chat audience is refused to anyone not named. Empty
+    leaves the audience alone deciding, as an older operator's rendering, which
+    names no a2a-chat callers, still needs.
     ``profile_identities`` binds the profile role the way ``mcp_callers``
     binds the mcp one, empty meaning nobody: its keys are the profile workers'
     ServiceAccounts, each held to the profile audience and the only callers
@@ -5326,6 +5336,7 @@ class ServiceAccountAuthenticator:
         scope_callers: frozenset[str] = frozenset(),
         curator_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
+        a2a_chat_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -5339,6 +5350,7 @@ class ServiceAccountAuthenticator:
         self.mcp_callers = mcp_callers
         self.scope_callers = scope_callers
         self.curator_callers = curator_callers
+        self.a2a_chat_callers = a2a_chat_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
@@ -5486,6 +5498,12 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a curator caller may present only the curator audience")
         if role == CALLER_ROLE_CURATOR and username not in self.curator_callers:
             raise AuthenticationError("the curator audience is only for curator callers")
+        # The a2a-chat binding, as the session one: empty leaves the audience
+        # deciding, for an operator that renders no a2a-chat callers.
+        if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:
+            raise AuthenticationError("the A2A gateway may present only the a2a-chat audience")
+        if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:
+            raise AuthenticationError("the a2a-chat audience is only for the A2A gateway")
         # The profile binding, as the mcp one: empty names nobody.
         if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
             raise AuthenticationError("a profile caller may present only the profile audience")
@@ -5711,6 +5729,11 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(CURATOR_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    a2a_chat_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(A2A_CHAT_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     # The profile workers' identities, read only once the profile audience is
     # conferred below; an empty map confers the role on nobody.
     profile_identities: dict[str, Any] = {}
@@ -5734,6 +5757,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif a2a_audience:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
+            if not a2a_chat_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE is set but %s is not; any allowed "
+                    "caller presenting the a2a-chat audience gets the a2a-chat role",
+                    A2A_CHAT_CALLERS_ENV,
+                )
         session_audience = os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip()
         if session_audience and session_audience in audience_roles:
             LOGGER.warning(
@@ -5886,6 +5915,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         mcp_callers=mcp_callers,
         scope_callers=scope_callers,
         curator_callers=curator_callers,
+        a2a_chat_callers=a2a_chat_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",

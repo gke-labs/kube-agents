@@ -13841,6 +13841,97 @@ class SessionCallerBindingTest(unittest.TestCase):
         self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
 
 
+class A2AChatCallerBindingTest(unittest.TestCase):
+    """The a2a-chat role is bound to the A2A gateway's ServiceAccount in both directions.
+
+    The session binding's shape (SessionCallerBindingTest), empty list
+    included: with no a2a-chat callers named, the audience alone decides, as
+    it did before the binding existed, so an older operator's rendering keeps
+    Google Chat working through an upgrade or a rollback.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    A2A_CHAT = "kubeagents-credential-proxy-a2a-chat"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    SHELL_SA = "system:serviceaccount:kubeagents-system:agent-shell"
+    A2A_GATEWAY_SA = "system:serviceaccount:kubeagents-system:agent-a2a-gateway"
+
+    def _authenticator(self, a2a_chat_callers=frozenset({A2A_GATEWAY_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.A2A_CHAT: credential_proxy.CALLER_ROLE_A2A_CHAT,
+            },
+            allowed_callers=frozenset({self.AGENT, self.SHELL_SA, self.A2A_GATEWAY_SA}),
+            a2a_chat_callers=a2a_chat_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_the_a2a_gateway_presenting_the_a2a_chat_audience_is_the_a2a_chat_role(self):
+        principal = self._authenticator()._principal_from(
+            self._review(self.A2A_GATEWAY_SA, self.A2A_CHAT)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal.role)
+
+    def test_another_caller_presenting_the_a2a_chat_audience_is_refused(self):
+        for caller in (self.AGENT, self.SHELL_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for the A2A gateway"
+                ):
+                    self._authenticator()._principal_from(self._review(caller, self.A2A_CHAT))
+
+    def test_the_a2a_gateway_presenting_another_audience_is_refused(self):
+        # The intent the a2a-reports role (#6098) must keep when it lands
+        # beside this: the A2A gateway's ServiceAccount is admitted on the
+        # a2a-chat audience (and, with #6098, a2a-reports) and refused on every
+        # other one. Whichever change merges second widens this binding's
+        # reverse rule to both roles; #6098's "gateway presenting a2a-reports
+        # is admitted" test fails until it does.
+        for audience in (self.SHELL, self.CHAT):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only the a2a-chat audience"
+                ):
+                    self._authenticator()._principal_from(
+                        self._review(self.A2A_GATEWAY_SA, audience)
+                    )
+
+    def test_the_other_callers_keep_their_own_roles(self):
+        authenticator = self._authenticator()
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_SHELL,
+            authenticator._principal_from(self._review(self.SHELL_SA, self.SHELL)).role,
+        )
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_CHAT,
+            authenticator._principal_from(self._review(self.AGENT, self.CHAT)).role,
+        )
+
+    def test_with_no_a2a_chat_callers_named_the_audience_alone_decides(self):
+        # The skew case: a broker rendered by an operator that names no a2a-chat
+        # callers behaves as it did before the binding existed.
+        principal = self._authenticator(frozenset())._principal_from(
+            self._review(self.AGENT, self.A2A_CHAT)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal.role)
+
+
 class PrincipalPodTest(unittest.TestCase):
     """A brokered call names the pod that made it, so it traces to a conversation."""
 
@@ -14553,6 +14644,34 @@ class BuildAuthenticatorTest(unittest.TestCase):
                 authenticator = credential_proxy.build_authenticator()
         self.assertEqual(frozenset(), authenticator.session_callers)
         self.assertTrue(any("CREDENTIAL_PROXY_SESSION_CALLERS" in line for line in logs.output))
+
+
+class A2AChatCallerEnvironmentTest(unittest.TestCase):
+    """CREDENTIAL_PROXY_A2A_CHAT_CALLERS reaches the authenticator, and its absence says so."""
+
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent,system:serviceaccount:ns:agent-a2a-gateway",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+        "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a-chat",
+    }
+
+    def test_the_a2a_chat_callers_are_read_from_the_environment(self):
+        environment = dict(self.BASE, CREDENTIAL_PROXY_A2A_CHAT_CALLERS=" system:serviceaccount:ns:agent-a2a-gateway , ")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent-a2a-gateway"}),
+            authenticator.a2a_chat_callers,
+        )
+
+    def test_an_a2a_chat_audience_without_a2a_chat_callers_warns(self):
+        with mock.patch.dict(os.environ, dict(self.BASE), clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.a2a_chat_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_CALLERS" in line for line in logs.output))
 
 
 class MCPCallerBindingTest(unittest.TestCase):

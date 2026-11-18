@@ -1543,6 +1543,8 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-a2a-chat
+            - name: CREDENTIAL_PROXY_A2A_CHAT_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: A2A_TIERS_FILE
               value: /etc/a2a-tiers/tiers.json
             - name: AUDIT_REPORT_STORE_URL
