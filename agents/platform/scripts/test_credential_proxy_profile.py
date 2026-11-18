@@ -1703,11 +1703,17 @@ class ProfileVcsRouteTest(unittest.TestCase):
     # -- the issue-list query (#6247) ----------------------------------------
 
     def test_an_issue_list_query_with_a_qualifier_is_refused(self):
-        for query in ("repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x"):
-            with self.subTest(query=query):
+        fields = [{"query": q} for q in ("repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x")]
+        fields += [
+            {"labels": ['bug" repo:other/secret "']},
+            {"excludeLabels": ["ok", 'x" org:acme "']},
+            {"labels": ["a\\"]},
+        ]
+        for extra in fields:
+            with self.subTest(extra=extra):
                 self.reset()
                 status, body = self.post(
-                    {**self.PAYLOAD, "query": query}, token=VALID["token"], path="/v1/vcs/issue-list"
+                    {**self.PAYLOAD, **extra}, token=VALID["token"], path="/v1/vcs/issue-list"
                 )
                 self.assertEqual(403, status, body)
                 self.assertEqual(credential_proxy.PROFILE_QUERY_QUALIFIER_CODE, body["code"])
@@ -1717,7 +1723,10 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 self.vcs.registry.resolve.assert_not_called()
 
     def test_an_issue_list_query_of_plain_words_runs(self):
-        for extra in ({"query": "node pressure"}, {}, {"query": ""}):
+        for extra in (
+            {"query": "node pressure"}, {}, {"query": ""},
+            {"labels": ["area: networking", "good first issue"], "excludeLabels": ["platform-agent/claimed"]},
+        ):
             with self.subTest(extra=extra):
                 self.reset()
                 payload = {**self.PAYLOAD, **extra}
@@ -1731,6 +1740,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.assertIsNone(refusal({"query": "plain words"}))
         self.assertIsNone(refusal({}))
         self.assertIsNone(refusal({"query": 7}))  # the adapter refuses a non-string
+        self.assertIsNotNone(refusal({"labels": ['x" repo:y/z "']}))
+        self.assertIsNone(refusal({"labels": "not-a-list"}))
         source = inspect.getsource(CredentialProxyHandler._dispatch_vcs_post)
         self.assertIn('if role == CALLER_ROLE_PROFILE and verb == "issue-list":', source)
 

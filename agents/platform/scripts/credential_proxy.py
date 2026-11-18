@@ -2469,7 +2469,8 @@ def executable_refusal_message(role: str, executable: str) -> str:
 #     proposal-view, proposal-list, proposal-commits, branch-view, identity
 #     (the forge login a submission checks it is not proposing as), issue-list
 #     and issue-view. Each is held to the managed list like every other verb,
-#     and an issue-list `query` may carry no search qualifier
+#     and an issue-list's search fields may start no qualifier of their own: no
+#     ':' in `query`, no quote or backslash in a label name
 #     (profile_issue_query_refusal, rule caller.vcs-query).
 #   * publish, proposal-create and proposal-update, the writes that put a
 #     change up for review, each further gated in `_dispatch_vcs_post` on the
@@ -2557,15 +2558,19 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
 
 
 def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
-    """Why a profile caller's ``issue-list`` ``query`` is refused, or None.
+    """Why a profile caller's ``issue-list`` search fields are refused, or None.
 
-    A forge may compose ``query`` into its own search grammar: GitHub puts it
-    ahead of the ``repo:<managed repository>`` qualifier it adds, so a
-    ``repo:``, ``org:`` or ``user:`` in it widens the search to whatever the
-    forge credential can read. Every qualifier needs a colon, so a ``query``
-    holding one is refused, as ``LOGIN_RE`` refuses one in ``author``. Free
-    text with no colon is kept. A ``query`` that is not a string is left to
-    the adapter, which refuses it.
+    A forge may compose these into its own search grammar, where a caller's
+    byte could start a qualifier of its own. GitHub puts ``query`` ahead of
+    the ``repo:<managed repository>`` qualifier it adds, so a ``repo:``,
+    ``org:`` or ``user:`` in it widens the search to whatever the forge
+    credential can read; every qualifier needs a colon, so a ``query`` holding
+    one is refused, as ``LOGIN_RE`` refuses one in ``author``. It quotes each
+    ``labels`` and ``excludeLabels`` entry as ``label:"<name>"``, so a ``"``
+    in a name closes the quote and what follows is a qualifier; a name holding
+    ``"`` or ``\\`` is refused. A colon inside a label name stays, since the
+    quotes hold it. Fields of the wrong type are left to the adapter, which
+    refuses them.
     """
     query = payload.get("query")
     if isinstance(query, str) and ":" in query:
@@ -2573,6 +2578,13 @@ def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
             "a profile caller's issue-list query may not contain ':', which starts a search "
             "qualifier; search the managed repository with plain words"
         )
+    for field in ("labels", "excludeLabels"):
+        names = payload.get(field)
+        if isinstance(names, list) and any(isinstance(n, str) and ('"' in n or "\\" in n) for n in names):
+            return (
+                f"a profile caller's issue-list {field} may not contain a quote or a backslash, "
+                "which would end the label's quoting in a forge's search"
+            )
     return None
 
 

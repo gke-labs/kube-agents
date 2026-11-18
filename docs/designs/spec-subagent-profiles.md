@@ -395,7 +395,11 @@ What the operator renders per profile, as built (amended 10/6):
   - Version control (#3993). `/v1/vcs/` admits the profile role, and every verb there needs a
     valid task credential: one with no credential is refused before the body is read, not
     run local-only. The reads (`clone`, `proposal-view`, `proposal-list`, `proposal-commits`,
-    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more. `publish`,
+    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more, except that an
+    `issue-list` whose `query` holds a `:`, or whose label names hold a quote or a backslash,
+    is refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
+    fields into a search, and either could add a `repo:` or `org:` qualifier that reaches past
+    the managed repository. `publish`,
     `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
     `vcs:proposal-create`, which the dispatcher mints only when the submission's
     `changeRequested` is true, and only the gateway sets that, for a structured confirm. The

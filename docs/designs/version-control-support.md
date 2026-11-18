@@ -681,8 +681,9 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `vcs:proposal-create` permit. Each write is held to the install's own work: a
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
-repository, and no label edit. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
-owns that caller.
+repository, and no label edit. Its `issue-list` search fields may start no search
+qualifier of their own (no `:` in `query`, no quote or backslash in a label name).
+[`spec-subagent-profiles.md`](spec-subagent-profiles.md) owns that caller.
 
 ### No shallow clones
 
