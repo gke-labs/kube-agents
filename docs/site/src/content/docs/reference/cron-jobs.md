@@ -110,6 +110,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `feedback-prompt` | Platform Agent | `0 13 * * *` | Daily 13:00 | yes | `feedback_prompt.py` |
 | `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 | `stall-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `stall_watch.py` |
+| `post-merge-check` | Platform Agent | `*/5 * * * *` | Every 5 minutes | yes | `post_merge_check.py` |
 | `upgrade-readiness-watch` | Platform Agent | `10 10 * * *` | Daily 10:10 | yes | `upgrade_readiness_watch.py` |
 | `upgrade-readiness-weekly-review` | Platform Agent | `0 6 * * 6` | Weekly, Saturday 06:00 | yes | `upgrade_readiness_review.py` |
 | `upgrade-readiness-weekly-brief` | Platform Agent | `0 7 * * 6` | Weekly, Saturday 07:00 | yes | Write this week's upgrade readiness brief. Read the SOP at '/opt/data/profiles/platform/governance/upgrade_... |

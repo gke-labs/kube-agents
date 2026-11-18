@@ -910,9 +910,17 @@ SESSION_KV_DB_DEFAULT = "/var/lib/kube-agents/session/session_kv.db"
 SWITCH = "POST_MERGE_CHECK"
 
 
-def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None) -> int:
-    """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply and health
-    steps; prints what it saw as JSON.
+#: The cron run's summary, in the agent's shipped logs (``script_log``).
+LOG_FILE = "post_merge_check.log"
+
+
+def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None,
+         **tick_overrides) -> int:
+    """With no arguments, the ``post-merge-check`` cron job: one ``post_merge_outcome.tick``, printing
+    nothing to stdout. The summary goes to ``logs/post_merge_check.log``. A run in which any record or
+    step errored exits 1 with one line naming them on stderr, so chat gets the scheduler's failure
+    line; a clean run exits 0 and the scheduler relays nothing. ``notice`` and ``health`` run one step
+    by hand and print what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
     """
@@ -921,19 +929,21 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     from contextlib import closing
 
     argv = sys.argv[1:] if argv is None else argv
-    if argv not in (["notice"], ["health"]):
-        print("usage: post_merge_check.py notice|health", file=sys.stderr)
+    if argv not in ([], ["notice"], ["health"]):
+        print("usage: post_merge_check.py [notice|health]", file=sys.stderr)
         return 2
     import kubeagents_switches
 
-    if kubeagents_switches.switch(SWITCH) == kubeagents_switches.OFF:
-        print(json.dumps({"switch": kubeagents_switches.OFF}))
+    mode = kubeagents_switches.switch(SWITCH)
+    if mode == kubeagents_switches.OFF:
+        if argv:
+            print(json.dumps({"switch": kubeagents_switches.OFF}))
         return 0
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
         if argv == ["notice"]:
             print(json.dumps(notice_merges(conn, view, limit=reads_per_tick())))
-        else:
+        elif argv == ["health"]:
             import post_merge_scope
 
             try:
@@ -942,6 +952,22 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
                 print(json.dumps({"scope": "unreadable", "error": str(exc)[:300]}))
                 return 1
             print(json.dumps(watch_health(conn, kubectl_json, limit=reads_per_tick(), scope_refusal=refusal)))
+        else:
+            import post_merge_outcome
+
+            seen = post_merge_outcome.tick(conn, view=view, kubectl_json=kubectl_json, **tick_overrides)
+            summary = f"post-merge check ({mode}): {json.dumps(seen)}"
+            try:
+                import script_log
+
+                script_log.append(LOG_FILE, [summary])
+            except Exception as exc:  # noqa: BLE001 — the log is best effort
+                print(f"post-merge check: could not write {LOG_FILE}: {exc!r}", file=sys.stderr)
+            failures = post_merge_outcome.errored(seen)
+            if failures:
+                print(f"post-merge check ({mode}): {len(failures)} failed: {', '.join(failures)[:1500]}; "
+                      f"the run's summary is in logs/{LOG_FILE}", file=sys.stderr)
+                return 1
     return 0
 
 

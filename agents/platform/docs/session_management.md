@@ -427,11 +427,11 @@ kanban worker, which includes the scheduled audits. `environment` is stored if a
 (the plugin does not). The merge step is `post_merge_check.py notice`,
 one run of which reads at most `READS_PER_TICK` (20) waiting records' pull requests, least recently
 read first (`POST_MERGE_READS_PER_TICK` in `spec.deployment.env` sets another cap, a whole number from
-1 to 500, for this step and the apply step), and reads nothing while the switch is `off`; no job schedules it yet. A merge fills
+1 to 500, for this step and the apply step), and reads nothing while the switch is `off`. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply and health steps are
-`post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
+`post_merge_check.py health`, under the same switch and per-run cap, least
 recently read first by `health_checked_at`. A record whose cluster the install's declared scope leaves out, by the fleet audit's own rule
 (`post_merge_scope.py`), or whose scope cannot be judged, is not read: `sync_state` says why
 (`out of scope: ...` or `scope unknown: ...`), and it takes no place in the per-run cap. A scope
@@ -445,8 +445,24 @@ path narrows the namespace matches and never empties them, and a diff it cannot 
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
-(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted) is Ready, and no container, sidecars and init containers included, restarted past its baseline or was OOMKilled since the apply. A rollout or scale still under way, or a pod that did not exist at the apply and is still starting, is not settled rather than red: the run waits and the count starts again. A pod that was there at the apply, or has been seen Ready since (it then joins `health_baseline`), and is not Ready fails it, even while another pod is starting. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried, until `HEALTH_SETTLE_LIMIT` (30 minutes) past the window with no healthy reading fails it as not settled. The edit, revert and outcome
-columns are left for the later steps. `cleanup_old_records` leaves the table: each row
+(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted) is Ready, and no container, sidecars and init containers included, restarted past its baseline or was OOMKilled since the apply. A rollout or scale still under way, or a pod that did not exist at the apply and is still starting, is not settled rather than red: the run waits and the count starts again. A pod that was there at the apply, or has been seen Ready since (it then joins `health_baseline`), and is not Ready fails it, even while another pod is starting. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried, until `HEALTH_SETTLE_LIMIT` (30 minutes) past the window with no healthy reading fails it as not settled.
+
+The last step (`post_merge_outcome.py`) stores one outcome per merged record in `outcome`,
+`outcome_at` and `outcome_detail`, written only over none, so it never changes. `verified_fixed`:
+applied, healthy, and the fleet audit's check (`recheck.py`, imported from the image's copy of the
+skill) no longer fires. `still_broken`: the health window failed, or the check still fires.
+`applied_not_rechecked`: applied, but the workload or the re-check could not be read within
+`CHECK_DEADLINE` (60 minutes) after the window, or the declared scope leaves the cluster out.
+`not_applied`: not live `APPLY_DEADLINE` (60 minutes for `no-pdb`) after the merge was noticed, or
+out of scope before the apply. `outcome_detail` starts with a fixed category (`apply`, `health`,
+`re-check`, `unreadable`, `out of scope`, `scope unknown`). A record whose scope cannot be judged waits
+until both deadlines have passed. A pull request closed without a merge never gets an outcome. At most
+the per-run cap of re-checks run each time, and one that did not answer goes behind the rest.
+Nothing is commented on the pull request. The `post-merge-check` cron job (every 5 minutes,
+`no_agent`) runs `post_merge_check.py` with no arguments: the merge, apply and health steps, then the
+outcomes. When the declared scope cannot be read, it notices merges and reads no cluster. It prints
+nothing, keeps its summary in `logs/post_merge_check.log`, and exits non-zero with one line for chat
+when a record or step errored. The edit and revert columns are left for later steps. `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 
 `GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
