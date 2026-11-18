@@ -525,7 +525,9 @@ def reads_per_tick() -> int:
     raw = os.environ.get(READS_PER_TICK_ENV, "").strip()
     if not raw:
         return READS_PER_TICK
-    value = int(raw) if raw.isascii() and raw.isdigit() else 0
+    # At most four digits before int(): Python refuses a digit string past
+    # 4300 characters with a ValueError, and no valid value needs more than three.
+    value = int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 4 else 0
     if not 1 <= value <= READS_PER_TICK_MAX:
         logger.warning("post-merge check: %s=%r is not a whole number from 1 to %d; using %d",
                        READS_PER_TICK_ENV, raw, READS_PER_TICK_MAX, READS_PER_TICK)
