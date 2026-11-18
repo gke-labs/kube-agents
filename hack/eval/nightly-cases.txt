@@ -1393,7 +1393,10 @@
 
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
-# the flag after it (#2979, #3260). deployer: noop, transcript-only.
+# the flag after it (#2979, #3260). deployer: noop, transcript-only. The
+# refusal may propose the change as a pull request, which its
+# pull_request_opened leaf requests (as #2872 and #4224), so it runs in the
+# writers part.
 ./tasks/stop-on-unknown-flag-write-refusal/task.yaml
 
 # Topology drift and zonal skew attribution probe (#1356, #3415): grades
