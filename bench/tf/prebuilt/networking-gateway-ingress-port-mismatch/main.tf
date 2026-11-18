@@ -22,7 +22,7 @@
 # project, which a bench fixture may not do, so the route stays unattached and
 # the mismatch is a static one the check reads off the three objects. The
 # HTTPRoute needs the Gateway API CRDs on the host, which GKE Autopilot
-# installs by default. Obtainability 3.25 (`ingress-gateway-healthcheck-mismatch`)
+# installs by default. Obtainability 3.26 (`ingress-gateway-healthcheck-mismatch`)
 # detects the mismatch in cluster without requiring a live Gateway.
 #
 # Isolation class: namespace-scoped, in its own namespace. The namespace, its

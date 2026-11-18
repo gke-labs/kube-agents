@@ -4254,10 +4254,10 @@ class TestServicePortUnresolved(unittest.TestCase):
 
 
 class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
-    """§3.25 (`ingress-gateway-healthcheck-mismatch`). Cross-checks HTTPRoute /
+    """§3.26 (`ingress-gateway-healthcheck-mismatch`). Cross-checks HTTPRoute /
     Ingress backendRefs, Service numeric targetPorts, and BackendConfig /
     HealthCheckPolicy health-check ports against the backing workload's declared
-    containerPorts and readinessProbe in cluster without requiring a Gateway."""
+    containerPorts and probes in cluster without requiring a Gateway."""
 
     def hits(self, *items):
         return collect.check_ingress_gateway_healthcheck_mismatch(context_of(dump_of(*items)))
@@ -4472,16 +4472,18 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
         )
         self.assertEqual(hits, [])
 
-    def test_readiness_probe_port_catches_mismatch_and_clears_matching_targetport(self):
-        bad = self.hits(
+    def test_readiness_probe_does_not_arm_without_ports_and_clears_matching_targetport(self):
+        # A container with no `ports` and a readinessProbe on 8081 (e.g. a dedicated health port)
+        # while serving 8080 must not arm the port comparison and file `major`.
+        probe_only_clean = self.hits(
             self.httproute(),
             self.svc(port=80, target=8080),
             endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
-            self.backend(ports=None, readiness_probe={"httpGet": {"path": "/readyz", "port": 8443}}),
+            self.backend(ports=None, readiness_probe={"httpGet": {"path": "/readyz", "port": 8081}}),
         )
-        self.assertEqual(len(bad), 1)
-        self.assertIn("readiness:8443", bad[0]["excerpt"])
+        self.assertEqual(probe_only_clean, [])
 
+        # When `ports` is declared, a readinessProbe on targetPort still satisfies the comparison.
         clean = self.hits(
             self.httproute(),
             self.svc(port=80, target=8080),
@@ -4492,6 +4494,62 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
             ),
         )
         self.assertEqual(clean, [])
+
+    def test_auxiliary_only_container_port_does_not_arm_mismatch_while_serving_port_still_fires(self):
+        # A container that declares only `metrics: 9090` and serves 8080 without declaring 8080
+        # must not falsely arm the comparison and file `major`.
+        metrics_only_clean = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(ports=[{"name": "metrics", "containerPort": 9090, "protocol": "TCP"}]),
+        )
+        self.assertEqual(metrics_only_clean, [])
+
+        # Declaring a serving port alongside `metrics: 9090` still arms the check on a real mismatch.
+        true_mismatch = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            self.backend(
+                ports=[
+                    {"name": "http", "containerPort": 8443, "protocol": "TCP"},
+                    {"name": "metrics", "containerPort": 9090, "protocol": "TCP"},
+                ]
+            ),
+        )
+        self.assertEqual(len(true_mismatch), 1)
+        self.assertEqual(true_mismatch[0]["severity"], "major")
+        self.assertIn("targetPort 8080/TCP", true_mismatch[0]["excerpt"])
+
+    def test_multi_container_pod_requires_every_app_container_to_declare_serving_ports(self):
+        # If one application container omits `ports`, another container declaring a port must not
+        # arm the comparison for the whole Service.
+        dep_partial = self.backend(ports=None, readiness_probe=None)
+        dep_partial["spec"]["template"]["spec"]["containers"].append(
+            {"name": "helper", "ports": [{"containerPort": 9090}]}
+        )
+        self.assertEqual(
+            self.hits(
+                self.httproute(),
+                self.svc(port=80, target=8080),
+                endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+                dep_partial,
+            ),
+            [],
+        )
+
+        # A self-health sidecar omitting `ports` does not prevent a real mismatch on the app container.
+        dep_sidecar = self.backend(ports=[{"name": "https", "containerPort": 8443}])
+        dep_sidecar["spec"]["template"]["spec"]["containers"].append({"name": "cloud-sql-proxy"})
+        sidecar_hits = self.hits(
+            self.httproute(),
+            self.svc(port=80, target=8080),
+            endpointslice("backend-api-svc", ns="seeded-networking", ports=["http"]),
+            dep_sidecar,
+        )
+        self.assertEqual(len(sidecar_hits), 1)
+        self.assertEqual(sidecar_hits[0]["severity"], "major")
 
     def test_native_sidecar_port_satisfies_targetport_while_plain_init_does_not(self):
         dep = self.backend(ports=[{"containerPort": 8443}])
@@ -4544,7 +4602,7 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
             ),
             [],
         )
-        # Unresolved named targetPort belongs to §3.17 (`service-port-unresolved`), not §3.25.
+        # Unresolved named targetPort belongs to §3.17 (`service-port-unresolved`), not §3.26.
         self.assertEqual(
             self.hits(
                 self.httproute(),

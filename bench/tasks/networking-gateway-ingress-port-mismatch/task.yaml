@@ -1,11 +1,11 @@
 # Networking fabric, load balancers and Gateway (obtainability-audit): the
 # planted HTTPRoute sends traffic to a Service whose numeric targetPort names a
 # port no backing container declares or serves, detected in cluster by
-# obtainability 3.25 (`ingress-gateway-healthcheck-mismatch`,
+# obtainability 3.26 (`ingress-gateway-healthcheck-mismatch`,
 # gke-labs/kube-agents#2576 item 3). Obtainability 3.17 flags a named
 # targetPort no container declares and 3.16 an empty endpoint set; a numeric
 # mismatch passes both, and the networking audit reads the VPC fabric with no
-# cluster read at all. Check 3.25 cross-checks HTTPRoute and Ingress
+# cluster read at all. Check 3.26 cross-checks HTTPRoute and Ingress
 # backendRefs, Service numeric targetPorts, and BackendConfig /
 # HealthCheckPolicy probe ports against the ports and probes the backing pods
 # declare in cluster without requiring an accepted parent Gateway or a live GCP

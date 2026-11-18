@@ -7,7 +7,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-five-check roster (§3.1–§3.25 of `governance/obtainability_audit_sop.md`),
+twenty-six-check roster (§3.1–§3.26 of `governance/obtainability_audit_sop.md`),
 `compliance-audit`'s nineteen-check roster (§2.1–§2.19 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
@@ -20,7 +20,7 @@ so their candidates carry a marker that keeps the automatic sweep from
 opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers most checks from one
-workload dump plus supplemental CRD and node-pool reads for §3.24/§3.25 and
+workload dump plus supplemental CRD and node-pool reads for §3.24/§3.26 and
 the reads its declaration fields need; compliance issues
 several distinct `kubectl` and `gcloud` reads per cluster, seven of them
 best-effort (five because their CRDs are not installed everywhere, two because
@@ -208,7 +208,7 @@ TRIAGE_BY_SLUG = {
     SERVICEENTRY_HOST_COLLISION_SLUG: SERVICEENTRY_OWNER_TRIAGE,
 }
 
-# §3.25 (`ingress-gateway-healthcheck-mismatch`): in-cluster cross-check of
+# §3.26 (`ingress-gateway-healthcheck-mismatch`): in-cluster cross-check of
 # HTTPRoute / Ingress backendRefs, Service numeric targetPorts, and
 # BackendConfig / HealthCheckPolicy probe ports against backing workloads.
 INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG = "ingress-gateway-healthcheck-mismatch"
@@ -253,6 +253,32 @@ READINESS_PROBE_FIELD = "readinessProbe"
 PROBE_PORT_HANDLERS: tuple[str, ...] = ("httpGet", "tcpSocket", "grpc")
 RESTART_POLICY_ALWAYS = "Always"
 WILDCARD_PORT_KEY = "*"
+# Container port names that expose observability, health, or admin endpoints
+# rather than application traffic. A container declaring only these ports does
+# not state a serving-port contract for Service targetPort comparison.
+AUXILIARY_PORT_NAMES: frozenset[str] = frozenset(
+    {
+        "metrics",
+        "http-metrics",
+        "https-metrics",
+        "prometheus",
+        "prom",
+        "telemetry",
+        "health",
+        "healthz",
+        "ready",
+        "readyz",
+        "live",
+        "livez",
+        "probe",
+        "probes",
+        "status",
+        "admin",
+        "debug",
+        "pprof",
+        "stats",
+    }
+)
 ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
 OPT_OUT_EXEMPT_VALUE = "exempt"
 _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH = (
@@ -1055,7 +1081,7 @@ DUMP_COMMAND_KINDS = (
     ",persistentvolumeclaims"
     # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload).
     ",namespaces,nodes"
-    # `ingresses` serves 3.25 (ingress-gateway-healthcheck-mismatch).
+    # `ingresses` serves 3.26 (ingress-gateway-healthcheck-mismatch).
     ",ingresses"
 )
 
@@ -4229,14 +4255,22 @@ def _resolve_probe_port(probe: object, named_ports: dict[str, int]) -> int | Non
 
 
 def _backing_port_inventory(raw_workloads: list[dict], ns: str, selector: dict) -> dict:
-    """Ports and probes declared across active workloads matching `selector` in `ns`."""
+    """Ports and probes declared across active workloads matching `selector` in `ns`.
+
+    Arms `has_app_port_contract` only when every non-self-health-sidecar
+    application container across the matching workloads declares at least one
+    non-auxiliary `containerPort`. A `readinessProbe` alone, or a container
+    declaring only observability/health/admin ports (such as `metrics: 9090`),
+    does not arm the port comparison because Kubernetes does not require a
+    serving port to be declared in `container.ports`.
+    """
     backends: list[str] = []
     declared_ports: set[tuple[str, int]] = set()
     declared_labels: list[str] = []
-    readiness_ports: set[int] = set()
     readiness_labels: list[str] = []
     all_probe_ports: set[int] = set()
-    has_app_port_contract = False
+    app_containers_seen = 0
+    all_app_containers_declare_serving_port = True
 
     for item in raw_workloads:
         meta = item.get("metadata") or {}
@@ -4251,16 +4285,16 @@ def _backing_port_inventory(raw_workloads: list[dict], ns: str, selector: dict) 
             continue
         backends.append(f"{item['kind']}/{meta.get('name', '')}")
         pod_spec = template.get("spec") or {}
+        app_containers = [c for c in (pod_spec.get("containers") or []) if isinstance(c, dict)]
         sidecars = [
             ic
             for ic in pod_spec.get("initContainers") or []
             if isinstance(ic, dict) and ic.get("restartPolicy") == RESTART_POLICY_ALWAYS
         ]
-        for container in list(pod_spec.get("containers") or []) + sidecars:
-            if not isinstance(container, dict):
-                continue
+        for is_regular, container in [(True, c) for c in app_containers] + [(False, sc) for sc in sidecars]:
             is_self_health_sidecar = (container.get("name") or "") in _SELF_HEALTH_SIDECARS
             named_ports: dict[str, int] = {}
+            declares_serving_port = False
             for port_entry in container.get("ports") or []:
                 if not isinstance(port_entry, dict):
                     continue
@@ -4273,22 +4307,24 @@ def _backing_port_inventory(raw_workloads: list[dict], ns: str, selector: dict) 
                     named_ports[pname] = cport
                 declared_ports.add((proto, cport))
                 if not is_self_health_sidecar:
-                    has_app_port_contract = True
+                    if pname.lower() not in AUXILIARY_PORT_NAMES:
+                        declares_serving_port = True
                     label = f"{pname}:{cport}/{proto}" if pname else f"{cport}/{proto}"
                     if label not in declared_labels:
                         declared_labels.append(label)
+            if is_regular and not is_self_health_sidecar:
+                app_containers_seen += 1
+                if not declares_serving_port:
+                    all_app_containers_declare_serving_port = False
             for field in PROBE_FIELDS:
                 pport = _resolve_probe_port(container.get(field), named_ports)
                 if pport is None:
                     continue
                 all_probe_ports.add(pport)
-                if field == READINESS_PROBE_FIELD:
-                    readiness_ports.add(pport)
-                    if not is_self_health_sidecar:
-                        has_app_port_contract = True
-                        rlabel = f"readiness:{pport}"
-                        if rlabel not in readiness_labels:
-                            readiness_labels.append(rlabel)
+                if field == READINESS_PROBE_FIELD and not is_self_health_sidecar:
+                    rlabel = f"readiness:{pport}"
+                    if rlabel not in readiness_labels:
+                        readiness_labels.append(rlabel)
 
     parts = list(declared_labels)
     for rlabel in readiness_labels:
@@ -4299,9 +4335,8 @@ def _backing_port_inventory(raw_workloads: list[dict], ns: str, selector: dict) 
     return {
         "backends": backends,
         "declared_ports": declared_ports,
-        "readiness_ports": readiness_ports,
         "all_probe_ports": all_probe_ports,
-        "has_app_port_contract": has_app_port_contract,
+        "has_app_port_contract": app_containers_seen > 0 and all_app_containers_declare_serving_port,
         "summary": f"{backends_str} declares {ports_str}",
     }
 
@@ -4356,7 +4391,7 @@ def _service_backend_configs(
 
 
 def check_ingress_gateway_healthcheck_mismatch(context: dict) -> list[dict]:
-    """Cluster-scoped: route, numeric `targetPort`, or LB health-check port mismatch (§3.25).
+    """Cluster-scoped: route, numeric `targetPort`, or LB health-check port mismatch (§3.26).
 
     §3.17 catches a named `targetPort` that no container declares because the
     EndpointSlice controller omits unresolved named ports. A numeric `targetPort`
