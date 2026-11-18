@@ -200,12 +200,34 @@ def problems(text: str) -> list[str]:
         elif keyword == "RUN" and _run_changes_modes(args) and _run_reaches_root(args, workdir):
             found.append(f"RUN {args[:120]}: sets an owner or a mode that can reach {SCRIPT_ROOT}, which this can't check")
         elif keyword == "RUN" and not _is_root_user(user) and (
-            _non_root_reach(workdir) or any(_non_root_reach(p) for p in RUN_PATH.findall(args))
+            _non_root_reach(workdir)
+            or any(_non_root_reach(p) for p in RUN_PATH.findall(args))
+            or _run_relative_reach(args, workdir)
         ):
             found.append(f"RUN {args[:120]}: runs as USER {user} and writes into {SCRIPT_ROOT}, so what it writes is owned by {user}")
         if current:
             stages[current] = (workdir, user)
     return found
+
+
+def _run_relative_reach(args: str, workdir: str) -> bool:
+    """Whether a relative argument of any command in a RUN, read against WORKDIR before the shell changes
+    directory, bears on the root (`_non_root_reach`): `kube-agents/scripts/a.py` from `/opt`."""
+    for segment in re.split(r"[;&|()<>]+", args):
+        words = segment.split()
+        while words and (words[0].startswith("--") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] == "sudo"):
+            words = words[1:]
+        if not words:
+            continue
+        if words[0] == "cd":
+            break
+        for word in words[1:]:
+            word = word.strip("\"'")
+            if not word or word.startswith(("-", "/", "$")) or "=" in word:
+                continue
+            if _non_root_reach(posixpath.join(workdir, word)):
+                return True
+    return False
 
 
 def _run_reaches_root(args: str, workdir: str) -> bool:
@@ -279,6 +301,8 @@ class ScriptRootOwnershipTest(unittest.TestCase):
             "USER node\nRUN ls / && cd /opt && ls",  # not every ancestor
             f"FROM scratch AS a\nUSER node\nFROM scratch AS b\nRUN cp /tmp/x.py {SCRIPT_ROOT}/",  # b names no stage
             f"FROM scratch AS a\nONBUILD USER node\nRUN cp /tmp/x.py {SCRIPT_ROOT}/",  # ONBUILD runs downstream
+            "WORKDIR /opt\nUSER node\nRUN mkdir -p work && cp /tmp/a work/a",  # relative, not the root
+            "WORKDIR /opt\nUSER node\nRUN cd /tmp && cp a kube-agents/scripts/a",  # after a cd: not seen
         ):
             with self.subTest(line=line):
                 self.assertEqual(problems(f"FROM scratch\n{line}\n"), [])
@@ -336,10 +360,14 @@ class ScriptRootOwnershipTest(unittest.TestCase):
             f"FROM scratch AS base\nUSER node\nFROM base AS next\nRUN cp /tmp/x.py {SCRIPT_ROOT}/",  # inherits USER
             f"FROM scratch AS base\nWORKDIR {SCRIPT_ROOT}\nFROM Base\nCOPY --chown=1000 a.py .",  # inherits WORKDIR; names are case-blind
             f"WORKDIR {SCRIPT_ROOT}\nUSER node\nRUN touch a.py",  # WORKDIR made as root, written as node
+            f"WORKDIR {SCRIPT_ROOT}\nUSER node\nRUN date > out.txt",  # a write with no path argument
             "WORKDIR /opt/kube-agents\nUSER node\nRUN cp -r x scripts",
             "USER node\nRUN mkdir -p /opt/kube-agents",  # the root's parent
             "USER node\nWORKDIR /opt/kube-agents\nRUN cp -r x scripts",
             f"USER node\nWORKDIR {SCRIPT_ROOT}",  # creates the root as node
+            "WORKDIR /opt\nUSER node\nRUN mkdir -p kube-agents/scripts && cp /tmp/a.py kube-agents/scripts/a.py",
+            "USER node\nRUN mkdir -p opt/kube-agents/scripts",  # relative to WORKDIR /
+            "WORKDIR /opt\nUSER node\nRUN tee kube-agents/scripts/a.py < /tmp/a.py",
         ):
             with self.subTest(line=line):
                 self.assertNotEqual(problems(f"FROM scratch\n{line}\n"), [])
