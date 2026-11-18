@@ -1250,6 +1250,8 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
 
     def setUp(self):
         self.main = (_FULL_INSTALL / "main.tf").read_text()
+        # The checks the chart's values must pass sit on the values output.
+        self.outputs = (_FULL_INSTALL / "outputs.tf").read_text()
         self.variables = (_FULL_INSTALL / "variables.tf").read_text()
 
     def test_variables_exist_with_github_defaults(self):
@@ -1277,7 +1279,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn('role = "gitops"', self.main)
 
     def test_precondition_refuses_a_minter_on_gitlab(self):
-        self.assertIn("!var.enable_github_minter", self.main)
+        self.assertIn("!var.enable_github_minter", self.outputs)
 
 
 class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):

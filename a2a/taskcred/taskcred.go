@@ -8,7 +8,8 @@
 // apart by audience. The callout reads AudienceNATS and narrows a worker's
 // second bus connection to that task's subjects. AudienceCredentialProxy is for
 // the credential proxy, which confines a task's kubectl and gcloud to the
-// cluster and project its target names; that verifier is Python
+// cluster and project its target names, and admits a task's version-control
+// writes only under the permit the credential carries; that verifier is Python
 // (agents/platform/scripts/task_credential.py), held to this one by the
 // fixtures in proxy_fixtures_test.go. A token minted for one audience is
 // refused by the other.
@@ -51,9 +52,30 @@ const (
 	AudienceNATS Audience = "nats"
 
 	// AudienceCredentialProxy is the credential proxy's: what a task's tool
-	// calls may reach. Only this audience may carry a Target.
+	// calls may reach. Only this audience may carry a Target or Permits.
 	AudienceCredentialProxy Audience = "credential-proxy" // #nosec G101 -- an audience name, not a credential
 )
+
+// Permit is one thing a credential-proxy credential lets its task do beyond
+// what its role does without one. The set is closed: Verify refuses a
+// credential naming a permit outside it rather than ignoring the name, since
+// a permit a verifier skips is one someone believes is granted (#3993).
+type Permit string
+
+const (
+	// PermitVCSProposalCreate lets a profile worker reach the broker's
+	// version-control write verbs that publish a change: publish,
+	// proposal-create and proposal-update. The dispatcher grants it only to a
+	// task whose submission says the requester asked for a change
+	// (lib.TaskParameters.ChangeRequested), which only a structured confirm
+	// sets.
+	PermitVCSProposalCreate Permit = "vcs:proposal-create"
+)
+
+// known reports whether p is a permit this package mints and verifies.
+func (p Permit) known() bool {
+	return p == PermitVCSProposalCreate
+}
 
 // known reports whether a is an audience this package mints and verifies.
 // Verify refuses any other, on either side of the comparison.
@@ -255,6 +277,11 @@ type Claims struct {
 	// Target is for AudienceCredentialProxy only, and optional there.
 	Target *Target
 
+	// Permits is for AudienceCredentialProxy only: each a known Permit, none
+	// twice. Mint omits the claim when Permits is empty, so a credential
+	// without one is the same bytes it was before the claim existed, and
+	// Verify refuses the claim present but empty.
+	Permits []Permit
 	// Trigger is for AudienceCredentialProxy only, and optional there: set
 	// when an unattended trigger started the task.
 	Trigger *Trigger
@@ -281,6 +308,7 @@ type payload struct {
 	Pod     string   `json:"pod"`
 	PodUID  string   `json:"pod_uid"`
 	Target  *Target  `json:"target,omitempty"`
+	Permits []Permit `json:"permits,omitempty"`
 	Trigger *Trigger `json:"trigger,omitempty"`
 }
 
@@ -330,6 +358,9 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 	if c.Target != nil {
 		gc.Data["target"] = *c.Target
 	}
+	if len(c.Permits) > 0 {
+		gc.Data["permits"] = slices.Clone(c.Permits)
+	}
 	if c.Trigger != nil {
 		gc.Data["trigger"] = *c.Trigger
 	}
@@ -353,7 +384,9 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 //   - task, profile, tier and pod must be single subject tokens (dot-free
 //     DNS-1123 labels: no ".", "*", ">" or whitespace, at most 63 bytes), and
 //     pod_uid a bounded UID.
-//   - target and trigger may appear only under AudienceCredentialProxy.
+//   - target, permits and trigger may appear only under
+//     AudienceCredentialProxy, and permits, when present, is a non-empty list
+//     of known permits, none twice.
 func Verify(token string, trusted []string, aud Audience, now time.Time, maxLifetime, skew time.Duration) (Claims, error) {
 	if !aud.known() {
 		return Claims{}, fmt.Errorf("audience %q is not one this package verifies", aud)
@@ -390,6 +423,11 @@ func Verify(token string, trusted []string, aud Audience, now time.Time, maxLife
 	p, err := decodePayload(gc.Data)
 	if err != nil {
 		return Claims{}, err
+	}
+	// Mint omits an empty permits claim, so one that is present and empty
+	// (or null) wasn't minted here: one credential has one spelling.
+	if _, present := gc.Data["permits"]; present && len(p.Permits) == 0 {
+		return Claims{}, fmt.Errorf("task credential permits is present but empty")
 	}
 	if p.Type != TokenType {
 		return Claims{}, fmt.Errorf("token type %q is not a task credential", p.Type)
@@ -445,6 +483,7 @@ func Verify(token string, trusted []string, aud Audience, now time.Time, maxLife
 		Audience: got,
 		Expires:  exp,
 		Target:   p.Target,
+		Permits:  p.Permits,
 		Trigger:  p.Trigger,
 		IssuedAt: iat,
 		ID:       gc.ID,
@@ -483,6 +522,23 @@ func (c Claims) validate() error {
 			if !validTargetField(f.value) {
 				return fmt.Errorf("task credential target %s %q is empty, too long or not printable", f.name, f.value)
 			}
+		}
+	}
+	if len(c.Permits) > 0 {
+		// The same rule as Target: the callout enforces no permit, so a nats
+		// credential carrying one would be a claim nobody checks.
+		if c.Audience != AudienceCredentialProxy {
+			return fmt.Errorf("a %q task credential may not carry permits; only %q enforces them", c.Audience, AudienceCredentialProxy)
+		}
+		seen := map[Permit]bool{}
+		for _, p := range c.Permits {
+			if !p.known() {
+				return fmt.Errorf("task credential permit %q is not one this package knows", p)
+			}
+			if seen[p] {
+				return fmt.Errorf("task credential permit %q appears twice", p)
+			}
+			seen[p] = true
 		}
 	}
 	if c.Trigger != nil {
@@ -529,10 +585,10 @@ func checkHeader(token string) error {
 
 // The claim keys a credential may carry, exactly as spelled: the standard
 // claims jwt/v2's ClaimsData emits, the nats block's fields, the target's and
-// the trigger's.
+// the trigger's. permits is a list of strings, so it has no keys of its own.
 var (
 	topLevelClaims = map[string]bool{"jti": true, "iat": true, "iss": true, "name": true, "sub": true, "aud": true, "exp": true, "nbf": true, "nats": true}
-	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true, "trigger": true}
+	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true, "permits": true, "trigger": true}
 	targetClaims   = map[string]bool{"project": true, "location": true, "cluster": true}
 	triggerClaims  = map[string]bool{"name": true, "origin": true, "stream": true, "script": true}
 )
