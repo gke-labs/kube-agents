@@ -501,36 +501,34 @@ func ExpectedConsumerReplicas(cfg nats.ConsumerConfig, stream nats.StreamConfig,
 // proposes the restored consumers' assignments only once the restore has
 // answered, so the list can lag it, and a raise sent before an assignment
 // would leave that consumer out of its remap. Ephemerals are left out: the
-// server deletes them once idle, and one deleted meanwhile still counts
-// towards restored. Errors, a lagging or silent answer, keep it waiting
-// until ctx ends.
+// server deletes them once idle. Errors, a lagging or silent answer, keep it
+// waiting until ctx ends.
+//
+// Every name ever listed counts towards restored, not only those listed
+// now: under the migration's write freeze nothing but the server creates or
+// deletes a consumer, so a name that was listed and is gone was a restored
+// consumer the server deleted (an idle ephemeral, or a durable past its
+// inactivity threshold), and one still missing is one not assigned yet.
 func AssignedDurables(ctx context.Context, nc *nats.Conn, stream string, restored int, cfg nats.StreamConfig, replicas int) ([]DurableSpec, error) {
 	short := "no answer yet"
-	gone := map[string]bool{}
-	var unanswered []string
+	seen := map[string]bool{}
 	for {
 		why := ""
 		names, err := listAssigned(ctx, nc, stream)
 		if err != nil {
 			why = fmt.Sprintf("listing consumers: %v", err)
 		} else {
-			// A name that answered "not found" last time and is no longer
-			// listed was deleted: an idle ephemeral.
-			for _, n := range unanswered {
-				if !slices.Contains(names, n) {
-					gone[n] = true
-				}
+			for _, n := range names {
+				seen[n] = true
 			}
-			unanswered = nil
-			if len(names)+len(gone) < restored {
-				why = fmt.Sprintf("%d of %d restored consumers assigned", len(names)+len(gone), restored)
+			if len(seen) < restored {
+				why = fmt.Sprintf("%d of %d restored consumers assigned", len(seen), restored)
 			} else {
 				var specs []DurableSpec
 				for _, n := range names {
 					info, err := consumerInfo(ctx, nc, stream, n)
 					switch {
 					case err != nil:
-						unanswered = append(unanswered, n)
 						if why == "" {
 							why = fmt.Sprintf("consumer %s: %v", n, err)
 						}

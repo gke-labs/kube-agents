@@ -315,7 +315,10 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			built.MaxBytes, built.MaxAge = meta.Config.MaxBytes, meta.Config.MaxAge
 		}
 		// How many consumers the restore brought back, by the server's
-		// final answer; unknown (-1) for a stream an earlier attempt built.
+		// final answer; unknown (-1) for a stream an earlier attempt or pod
+		// run built. An attempt that counted and then failed failed its
+		// read-back, so its stream was deleted or is outside policy and is
+		// restored again, never taken as already restored.
 		restored := -1
 		for attempt := 1; ; attempt++ {
 			if alreadyRestored(ctx, nc, built, meta.State, replicas) {
@@ -323,7 +326,7 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 				// after the server built the stream, or this pod run
 				// again): the server builds a stream only on the final
 				// message, which is sent only for the operator's digest.
-				err, restored = nil, -1
+				err = nil
 				break
 			}
 			// Into three servers, the forward restore: the rendered limits,

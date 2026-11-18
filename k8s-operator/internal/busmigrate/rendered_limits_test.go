@@ -471,3 +471,43 @@ func TestARestoreWaitsForItsConsumersAssignmentsBeforeTheRaise(t *testing.T) {
 		t.Errorf("worker after the restore: %+v, %v; want it at three replicas", ci, err)
 	}
 }
+
+// Consumers the server never assigns fail the restore at the assignment
+// bound, before the raise, and the run turns back like any failed restore.
+func TestARestoreWhoseConsumersAreNeverAssignedFails(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	dir, run := stageTasks(t, meta, data, policyOf(meta.Config))
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, _ := nc.JetStream()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		if _, err := js.AccountInfo(); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the cluster's JetStream never came up: %v", err)
+		}
+	}
+	defer func(d time.Duration) { restoreAssignTimeout = d }(restoreAssignTimeout)
+	restoreAssignTimeout = 2 * time.Second
+	defer func(l func(context.Context, *nats.Conn, string) ([]string, error)) { listAssigned = l }(listAssigned)
+	listAssigned = func(context.Context, *nats.Conn, string) ([]string, error) { return nil, nil }
+	start := time.Now()
+	_, settled, err := restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 3)
+	if took := time.Since(start); took > 30*time.Second {
+		t.Errorf("the restore took %s to give up, want it at the assignment bound (2s here)", took.Round(time.Second))
+	}
+	if err == nil || !strings.Contains(err.Error(), "restored consumers not assigned: 0 of 1") || settled != 0 {
+		t.Fatalf("restore with its consumer never assigned = %v (settled %s), want the assignment bound's error", err, settled)
+	}
+	if info, err := streamInfo(context.Background(), nc, "TASKS"); err != nil || info.Config.Replicas != 1 {
+		t.Errorf("TASKS after the failed restore: %+v, %v; want it left at one replica, never raised", info, err)
+	}
+}

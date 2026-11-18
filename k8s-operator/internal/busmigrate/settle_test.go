@@ -268,3 +268,42 @@ func TestTheRaiseWaitsForTheRestoredConsumersAssignments(t *testing.T) {
 		t.Fatalf("AssignedDurables with the worker listed = %v, %v", d, err)
 	}
 }
+
+// listInTurn makes AssignedDurables' consumer list answer each of lists in
+// turn, then the last one forever.
+func listInTurn(t *testing.T, lists ...[]string) {
+	t.Helper()
+	old := listAssigned
+	t.Cleanup(func() { listAssigned = old })
+	i := 0
+	listAssigned = func(context.Context, *nats.Conn, string) ([]string, error) {
+		l := lists[min(i, len(lists)-1)]
+		i++
+		return l, nil
+	}
+}
+
+// A restored ephemeral listed and then deleted (idle) while the durable's
+// assignment still lags still counts: every name ever listed does, since
+// under the freeze only the server deletes consumers.
+func TestAConsumerListedThenDeletedStillCountsAsRestored(t *testing.T) {
+	nc := fakeJetStream(t, []string{"worker"}, "up")
+	listInTurn(t, []string{"eph"}, nil, []string{"worker"})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	d, err := AssignedDurables(ctx, nc, "TASKS", 2, nats.StreamConfig{Retention: nats.LimitsPolicy}, 3)
+	if err != nil || len(d) != 1 || d[0] != (DurableSpec{"worker", 3}) {
+		t.Fatalf("AssignedDurables = %v, %v; want the worker, the deleted ephemeral counted", d, err)
+	}
+}
+
+// Every listed consumer must answer before the raise: one listed but not
+// answering yet holds it, so its expected replicas are known.
+func TestAListedConsumerThatDoesNotAnswerHoldsTheRaise(t *testing.T) {
+	nc := fakeJetStream(t, []string{"worker"}, "not-found")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if d, err := AssignedDurables(ctx, nc, "TASKS", 1, nats.StreamConfig{Retention: nats.LimitsPolicy}, 3); err == nil || !strings.Contains(err.Error(), "consumer worker:") {
+		t.Fatalf("AssignedDurables with the worker not answering = %v, %v; want a timeout naming it", d, err)
+	}
+}
