@@ -565,12 +565,12 @@ class WatchHealthTest(unittest.TestCase):
         self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
         asked = []
 
-        def paths(repo, number):
-            asked.append((repo, number))
+        def paths(repo, number, name):
+            asked.append((repo, number, name))
             return ["clusters/prod/shop/pdb.yaml"]
 
         seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=1), paths=paths)
-        self.assertEqual(asked, [(REPO, 1)])
+        self.assertEqual(asked, [(REPO, 1, "checkout")])
         self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
         self.assertTrue(self.row()["sync_state"].startswith("applied"), self.row()["sync_state"])
         # No reconciler names the repository: the files are not read at all.
@@ -587,7 +587,7 @@ class WatchHealthTest(unittest.TestCase):
         self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
         asked = []
 
-        def paths(repo, number):
+        def paths(repo, number, name):
             asked.append(number)
             return ["clusters/prod/shop/pdb.yaml"]
 
@@ -605,7 +605,7 @@ class WatchHealthTest(unittest.TestCase):
         self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
         asked = []
 
-        def unknown(repo, number):
+        def unknown(repo, number, name):
             asked.append(number)
 
         for minutes in (1, 2):
@@ -614,6 +614,33 @@ class WatchHealthTest(unittest.TestCase):
         self.assertEqual(asked, [1, 1], "an unknown answer is not kept")
         self.assertIsNone(self.row()["changed_paths"])
         self.assertIn("files unknown", self.row()["sync_state"])
+
+    def test_a_root_sync_of_another_file_in_the_pull_request_never_marks_the_workload_applied(self):
+        from unittest import mock
+
+        # The pull request changes platform/x.yaml and the workload's own budget under apps/team; the
+        # RootSync on this cluster delivers platform/ and has synced past the merge.
+        diff = ("diff --git a/platform/x.yaml b/platform/x.yaml\n--- a/platform/x.yaml\n+++ b/platform/x.yaml\n"
+                "@@ -1 +1 @@\n-replicas: 1\n+replicas: 2\n"
+                "diff --git a/apps/team/pdb.yaml b/apps/team/pdb.yaml\n--- /dev/null\n+++ b/apps/team/pdb.yaml\n"
+                "@@ -0,0 +2 @@\n+  selector: {matchLabels: {app: checkout}}\n+  maxUnavailable: 1\n")
+        root = {"apiVersion": "configsync.gke.io/v1beta1", "kind": "RootSync",
+                "metadata": {"name": "root-sync", "namespace": "config-management-system"},
+                "spec": {"git": {"repo": REPO, "dir": "platform"}}, "status": {"lastSyncedCommit": MERGE}}
+        self.cluster.apps = []
+        self.cluster.lists = {post_merge_check.CONFIGSYNC_ROOTSYNCS: {"items": [root]}}
+        forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
+        with mock.patch.dict(sys.modules, {"forge": forge}):
+            seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=1))
+        self.assertEqual(seen["waiting"], [f"{REPO}/pull/1"], "observed directly, and no budget is live yet")
+        self.assertIn("no reconciler targets", self.row()["sync_state"])
+        self.assertEqual(json.loads(self.row()["changed_paths"]), ["apps/team/pdb.yaml"])
+        # Its own directory holding the workload's file does count.
+        root["spec"]["git"]["dir"] = "apps"
+        self.conn.execute("UPDATE post_merge_records SET sync_state = NULL")
+        with mock.patch.dict(sys.modules, {"forge": forge}):
+            seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=2))
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"], self.row()["sync_state"])
 
     def test_with_no_reconciler_for_the_namespace_the_budget_is_observed_directly(self):
         self.cluster.apps = [argo_app(namespace="elsewhere")]
@@ -876,6 +903,31 @@ class ReconcilersForTest(unittest.TestCase):
         diff = 'diff --git "a/caf\u00e9/\\"q\\".yaml" "b/caf\u00e9/\\"q\\".yaml"\n--- "a/caf\u00e9/\\"q\\".yaml"\n'
         self.assertEqual(post_merge_check.diff_paths(diff), ['caf\u00e9/"q".yaml'])
 
+    def test_diff_paths_with_a_name_keeps_only_the_files_that_name_it(self):
+        diff = ("diff --git a/platform/x.yaml b/platform/x.yaml\n--- a/platform/x.yaml\n+++ b/platform/x.yaml\n"
+                "@@ -1 +1 @@\n context checkout\n+replicas: 2\n"
+                "diff --git a/apps/checkout.yaml b/apps/checkout.yaml\n--- a/apps/checkout.yaml\n+++ b/apps/checkout.yaml\n"
+                "@@ -1 +1 @@\n+x: 1\n"
+                "diff --git a/apps/pdb.yaml b/apps/pdb.yaml\n--- /dev/null\n+++ b/apps/pdb.yaml\n@@ -0,0 +1 @@\n"
+                "+  name: checkout-pdb\n"
+                "diff --git a/apps/other.yaml b/apps/other.yaml\n--- a/apps/other.yaml\n+++ b/apps/other.yaml\n"
+                "@@ -1 +1 @@\n+app: checkout2\n")
+        self.assertEqual(post_merge_check.diff_paths(diff, "checkout"), ["apps/checkout.yaml", "apps/pdb.yaml"])
+        self.assertEqual(len(post_merge_check.diff_paths(diff)), 4)
+
+    def test_diff_paths_ends_lines_only_where_git_does(self):
+        diff = ("diff --git a/a.yaml b/a.yaml\r\n--- a/a.yaml\r\n+++ b/a.yaml\r\n@@ -1 +1 @@\r\n"
+                "+x\rdiff --git a/clusters/prod/p.yaml b/clusters/prod/p.yaml\n+y\u2028diff --git a/c/q b/c/q\n")
+        self.assertEqual(post_merge_check.diff_paths(diff), ["a.yaml"])
+
+    def test_forge_paths_reads_an_undecodable_escape_as_unknown(self):
+        from unittest import mock
+
+        diff = 'diff --git "a/\\400/p.yaml" "b/\\400/p.yaml"\n--- "a/\\400/p.yaml"\n'
+        forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
+        with mock.patch.dict(sys.modules, {"forge": forge}), self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+
     def test_diff_paths_reads_renames_and_binary_files(self):
         diff = ("diff --git a/old/pdb.yaml b/clusters/dev/pdb.yaml\nsimilarity index 100%\n"
                 "rename from old/pdb.yaml\nrename to clusters/dev/pdb.yaml\n"
@@ -1032,6 +1084,34 @@ class MainTest(unittest.TestCase):
                     redirect_stdout(io.StringIO()):
                 self.assertEqual(post_merge_check.main(["notice"], view=forge), 0)
             self.assertEqual(len(forge.reads), 3)
+
+
+    def test_an_unreadable_scope_reads_no_cluster_and_exits_one(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        import kubeagents_switches
+        import post_merge_scope
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kv.db")
+            with sqlite3.connect(db) as conn:
+                conn.execute(schema())
+                conn.execute(
+                    "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, "
+                    "object, opened_at, merged_at, merge_commit) VALUES (?, ?, 1, 'no-pdb', 'p', 'l', 'prod', 'shop', "
+                    "'Deployment/checkout', ?, ?, ?)", (f"{REPO}/pull/1", REPO, NOW.isoformat(), NOW.isoformat(), MERGE))
+            cluster, out = FakeCluster(), io.StringIO()
+            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": "report", "SESSION_KV_DB_PATH": db}), \
+                    mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
+                    mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
+                    mock.patch.object(post_merge_scope, "install_scope", side_effect=RuntimeError("render unreadable")), \
+                    redirect_stdout(out):
+                self.assertEqual(post_merge_check.main(["health"], kubectl_json=cluster), 1)
+        self.assertEqual(cluster.calls, [], "an unreadable scope reads no cluster, never every cluster")
+        self.assertEqual(json.loads(out.getvalue())["scope"], "unreadable")
 
 
 if __name__ == "__main__":
