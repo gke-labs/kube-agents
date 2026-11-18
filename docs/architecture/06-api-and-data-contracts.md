@@ -334,7 +334,7 @@ kube-agents knowledge types:
 The six baseline types (`cluster-blueprint`, `tenancy-model`, `runbook`, `metric-definition`,
 `escalation`, `observation`) ship today, and [`docs/designs/memory.md`](../designs/memory.md) proposes adding `decision` and `lesson`; `type` is an **open convention, not a hard enum** — new
 types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}` (singular `<type>/` canonical, with plural aliases such as `decisions/` and `lessons/` also accepted when ingesting existing repos); markdown
-links form the knowledge graph; optional `log.md` for history. Root `index.md` (navigation) and `log.md` (history) are reserved filenames at the `knowledge/` root: they carry no `type` frontmatter, and `index` and `log` must not be used as `type` values or entry filenames. Any entry may include the OKF v0.2 recommended trust and lifecycle fields (`sources`, `generated` with `by` and `at`, `verified` with `by` and `at`, `status`, and `stale_after`), which are validated for shape when present while legacy `timestamp` remains tolerated on existing notes. For `status`, `decision` and `lesson` notes use `proposed`, `active`, `rejected`, `superseded`, and `retired` as a `kube-agents` lifecycle extension ([`docs/designs/memory.md`](../designs/memory.md)), while all other OKF types use the OKF v0.2 values `draft`, `stable`, and `deprecated`. Agents **read** OKF for context and
+links form the knowledge graph; optional `log.md` for history. Root `index.md` (navigation) and `log.md` (history) are reserved filenames at the `knowledge/` root: they carry no `type` frontmatter, and `index` and `log` must not be used as `type` values or entry filenames (root overview files `STATE_OF_BEING.md` and `README.md` are likewise permitted at the `knowledge/` root without `type` frontmatter and skipped by record ingestion). Any entry may include the OKF v0.2 recommended trust and lifecycle fields (`sources`, `generated` with `by` and `at`, `verified` with `by` and `at`, `status`, and `stale_after`), which are validated for shape when present while legacy `timestamp` remains tolerated on existing notes. For `status`, `decision` and `lesson` notes use `proposed`, `active`, `rejected`, `superseded`, and `retired` as a `kube-agents` lifecycle extension ([`docs/designs/memory.md`](../designs/memory.md)), while all other OKF types use the OKF v0.2 values `draft`, `stable`, and `deprecated`. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
 **not** session state. Baseline posture entries may carry `declares:`, a list of
 `{check, namespace, object}` items (plus `cluster` for a one-cluster choice and `expires`, a `YYYY-MM-DD`
@@ -409,7 +409,8 @@ The concrete code delta that enforces [03](03-security-model.md):
 - **OKF:** `scripts/check_okf_knowledge.py` (run in `make docs-check-links`) confirms every `knowledge/`
   tree conforms to the
   [Open Knowledge Format v0.2 `SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)
-  and `kube-agents` conventions: root `index.md` and `log.md` carry no `type`, entry files carry valid
+  and `kube-agents` conventions: root `index.md` and `log.md` (alongside root overview files
+  `STATE_OF_BEING.md` and `README.md`) carry no `type`, entry files carry valid
   YAML frontmatter with a non-reserved `type`, present recommended fields (`sources`, `generated`,
   `verified`, `status`, `stale_after`, plus tolerated legacy `timestamp`) match their expected shape and
   per-type `status` vocabulary, and relative markdown links resolve. (A richer OKF _visualizer_ is

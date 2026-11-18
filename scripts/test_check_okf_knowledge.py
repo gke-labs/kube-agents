@@ -78,6 +78,14 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
             """,
         )
         self.write(
+            "STATE_OF_BEING.md",
+            """
+            # State of Being
+
+            Baseline summary linking [Standard GKE](cluster-blueprint/standard-gke.md).
+            """,
+        )
+        self.write(
             "cluster-blueprint/standard-gke.md",
             """
             ---
@@ -125,7 +133,7 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
         )
 
         count, errors = self.validate()
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
         self.assertEqual(errors, [])
 
     def test_root_index_and_log_reject_type_and_malformed_frontmatter(self) -> None:
@@ -158,6 +166,32 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
             "index.md",
             """
             ---
+            ---
+
+            # Empty frontmatter
+            """,
+        )
+        self.write(
+            "log.md",
+            """
+            ---
+            null
+            ---
+
+            # Null frontmatter
+            """,
+        )
+        _, empty_errors = self.validate()
+        self.assertEqual(len(empty_errors), 2, empty_errors)
+        self.assertTrue(
+            all(check_okf_knowledge.MSG_FRONTMATTER_NOT_MAPPING in err for err in empty_errors),
+            empty_errors,
+        )
+
+        self.write(
+            "index.md",
+            """
+            ---
             title: Unclosed frontmatter
             # No closing delimiter
             """,
@@ -180,7 +214,7 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
             """,
         )
         self.write(
-            "runbook/log.md",
+            "runbook/Log.md",
             """
             ---
             type: runbook
@@ -222,7 +256,7 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
         )
         self.assertTrue(
             any(
-                "runbook/log.md" in err and check_okf_knowledge.MSG_RESERVED_ENTRY_FILENAME in err
+                "runbook/Log.md" in err and check_okf_knowledge.MSG_RESERVED_ENTRY_FILENAME in err
                 for err in errors
             ),
             errors,
@@ -407,14 +441,52 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
             item_errors,
         )
 
+        self.write(
+            "runbook/naive-timestamps.md",
+            """
+            ---
+            type: runbook
+            generated:
+              by: human
+              at: 2026-07-23T00:00:00
+            stale_after: 2026-07-23 00:00:00
+            timestamp: 2026-07-23T12:30:00
+            ---
+
+            # Naive unquoted timestamps without timezone
+            """,
+        )
+        _, naive_errors = self.validate()
+        self.assertTrue(
+            any(
+                "naive-timestamps.md" in err and check_okf_knowledge.MSG_INVALID_GENERATED in err
+                for err in naive_errors
+            ),
+            naive_errors,
+        )
+        self.assertTrue(
+            any(
+                "naive-timestamps.md" in err and check_okf_knowledge.MSG_INVALID_STALE_AFTER in err
+                for err in naive_errors
+            ),
+            naive_errors,
+        )
+        self.assertTrue(
+            any(
+                "naive-timestamps.md" in err and check_okf_knowledge.MSG_INVALID_TIMESTAMP in err
+                for err in naive_errors
+            ),
+            naive_errors,
+        )
+
     def test_status_vocabulary_for_decision_lesson_vs_other_types(self) -> None:
         for status in ("proposed", "active", "rejected", "superseded", "retired"):
             self.write(
                 f"decision/dec-{status}.md",
                 f"""
                 ---
-                type: decision
-                status: {status}
+                type: Decision
+                status: " {status} "
                 ---
 
                 # Decision {status}
@@ -424,7 +496,7 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
                 f"lesson/les-{status}.md",
                 f"""
                 ---
-                type: lesson
+                type: LESSON
                 status: {status}
                 ---
 
@@ -586,6 +658,76 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
         self.assertEqual(len(tracked_errors), 1, tracked_errors)
         self.assertIn(check_okf_knowledge.MSG_UNTRACKED_LINK_PREFIX, tracked_errors[0])
         self.assertNotEqual(untracked_peer, linker)
+
+    def test_frontmatter_regex_and_ellipsis_closer_do_not_break_link_or_anchor_checks(self) -> None:
+        self.write(
+            "runbook/target-ellipsis.md",
+            """
+            ---
+            type: runbook
+            # frontmatter comment that must not become a heading anchor
+            ...
+
+            # Target Runbook
+
+            ---
+
+            ## Details
+            """,
+        )
+        self.write(
+            "decision/DEC-2026-001.md",
+            """
+            ---
+            type: decision
+            status: active
+            guard:
+              rule: Finding IDs match pattern
+              expect:
+                file: findings.yaml
+                path: $.id
+                op: regex
+                value: "^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$"
+            notes: |
+              [not-a-ref]: missing-frontmatter-target.md
+            ---
+
+            # Decision with Regex Guard
+
+            See [Target Runbook](../runbook/target-ellipsis.md#target-runbook) and
+            [Details](../runbook/target-ellipsis.md#details).
+            """,
+        )
+        _, errors = self.validate()
+        self.assertEqual(errors, [])
+
+    def test_symlinks_inside_knowledge_root_are_rejected(self) -> None:
+        outside = self.root / "outside.md"
+        outside.write_text("# Outside\n", encoding="utf-8")
+        index_file = self.write("index.md", "# Index\n")
+        runbook_dir = self.knowledge / "runbook"
+        runbook_dir.mkdir(parents=True, exist_ok=True)
+        (runbook_dir / "linked.md").symlink_to(outside)
+        (runbook_dir / "index.md").symlink_to(index_file)
+
+        _, errors = self.validate()
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(
+            any(
+                "knowledge/runbook/linked.md" in err
+                and check_okf_knowledge.MSG_SYMLINK_NOT_ALLOWED in err
+                for err in errors
+            ),
+            errors,
+        )
+        self.assertTrue(
+            any(
+                "knowledge/runbook/index.md" in err
+                and check_okf_knowledge.MSG_SYMLINK_NOT_ALLOWED in err
+                for err in errors
+            ),
+            errors,
+        )
 
     def test_empty_knowledge_root_fails_loudly(self) -> None:
         buf = io.StringIO()

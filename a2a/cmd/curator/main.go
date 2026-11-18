@@ -1,7 +1,7 @@
 // Command curator is the Go OKF Curator and Dreamer daemon and CLI for kube-agents.
 // It subscribes to NATS JetStream (a2a.topics.shared.annotations on TOPICS-JOURNAL
-// and _INBOX.agent.curator.outcomes), synthesizes and updates Operational Knowledge
-// Framework (OKF) records (DEC-* and LES-*), indexes them verbatim into Hindsight
+// and a2a.topics.agent.platform.curator-outcomes), synthesizes and updates Open Knowledge
+// Format (OKF) records (DEC-* and LES-*), indexes them verbatim into Hindsight
 // (kube-agents-decisions) with in-place status transitions, graduates multi-cluster
 // recurrences into fleet-wide decisions, and broadcasts the active digest to
 // a2a.topics.shared.blueprint on TOPICS-STATE.
