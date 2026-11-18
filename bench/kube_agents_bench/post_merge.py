@@ -281,6 +281,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     _kubeconfig: str = PrivateAttr(default="")
     _touched: list[tuple[str, str]] = PrivateAttr(default_factory=list)
     _base: str = PrivateAttr(default="")
+    _number: int | None = PrivateAttr(default=None)
 
     def verify(self, timeout_sec: float):
         try:
@@ -311,13 +312,13 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         if not token or self._repo is None:
             return
         owner, repo = self._repo
-        if self._merged is not None:
+        if self._number is not None:
             try:
-                why = self._unlabel(owner, repo, self._merged[2], token)
+                why = self._unlabel(owner, repo, self._number, token)
             except Exception as exc:  # noqa: BLE001 -- the files still go back
                 why = repr(exc)
             if why:
-                logger.warning("post_merge_outcome: %s/%s#%s keeps its audit labels: %s", owner, repo, self._merged[2], why)
+                logger.warning("post_merge_outcome: %s/%s#%s keeps its audit labels: %s", owner, repo, self._number, why)
         for path, file_status in self._touched:
             try:
                 why = self._restore(owner, repo, path, file_status, token)
@@ -448,17 +449,12 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         except fleet.FleetRoleUnresolved as exc:
             return "error", str(exc)
         api = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}"
-        status, payload = _github_write("PUT", f"{api}/merge", write_token, {"merge_method": "squash"})
-        if status not in (200, 405):
-            return "error", f"GitHub answered {status} to merging {owner}/{repo}#{number}: {(payload or {}).get('message')}"
-        if status == 405:
-            status, pull = _forge_get_json(api, read_token, timeout)
-            if status != 200 or not (isinstance(pull, dict) and pull.get("merged")):
-                return "error", f"{owner}/{repo}#{number} is not mergeable: {(payload or {}).get('message')}"
-        self._repo = (owner, repo)
-        self._kubeconfig = kubeconfig
+        # Every read cleanup needs happens before the merge, so a read that fails costs no merge
+        # and a merge always leaves cleanup what it needs to undo it.
         status, pull = _forge_get_json(api, read_token, timeout)
-        self._base = str(((pull or {}).get("base") or {}).get("sha") or "") if status == 200 and isinstance(pull, dict) else ""
+        if status != 200 or not isinstance(pull, dict):
+            return "error", f"GitHub answered {status} for {owner}/{repo}#{number}"
+        self._base = str((pull.get("base") or {}).get("sha") or "")
         for page in range(1, MAX_FILES_PAGES + 1):
             status, files = _forge_get_json(f"{api}/files?per_page={FILES_PAGE_SIZE}&page={page}", read_token, timeout)
             if status != 200 or not isinstance(files, list):
@@ -477,6 +473,17 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                 break
         if not self._added:
             return "error", f"{owner}/{repo}#{number} adds no manifest to apply"
+        status, payload = _github_write("PUT", f"{api}/merge", write_token, {"merge_method": "squash"})
+        if status not in (200, 405):
+            return "error", f"GitHub answered {status} to merging {owner}/{repo}#{number}: {(payload or {}).get('message')}"
+        if status == 405:
+            status, pull = _forge_get_json(api, read_token, timeout)
+            if status != 200 or not (isinstance(pull, dict) and pull.get("merged")):
+                return "error", f"{owner}/{repo}#{number} is not mergeable: {(payload or {}).get('message')}"
+        # Merged from here on: cleanup unlabels it whatever fails next.
+        self._repo = (owner, repo)
+        self._number = number
+        self._kubeconfig = kubeconfig
         for _, manifest in self._added:
             ok, why = _apply(manifest, self._kubeconfig)
             if not ok:

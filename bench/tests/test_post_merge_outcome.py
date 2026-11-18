@@ -265,6 +265,14 @@ def test_a_bad_role_name_fails_at_load():
         _verifier(apply_fixture_role="No_Such Role")
 
 
+def test_a_failed_apply_after_the_merge_still_unlabels_and_restores(world, monkeypatch):
+    monkeypatch.setattr(post_merge, "_apply", lambda text, kubeconfig: (False, "denied"))
+    assert _verifier().verify(0).status == "error"
+    writes = [(m, url.rsplit("/", 1)[1]) for m, url in world.forge.writes]
+    assert ("DELETE", "audit%3Aremediation") in writes
+    assert ("DELETE", "checkout-gateway-pdb.yaml") in writes
+
+
 def test_an_unreadable_jobs_file_is_an_error(world):
     world.pod.jobs.write_text("not json")
     assert _verifier().verify(0).status == "error"
