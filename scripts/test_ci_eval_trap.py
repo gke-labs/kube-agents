@@ -367,6 +367,9 @@ class CancelStopsModelCallsTest(unittest.TestCase):
         whether it ran to its end.
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
+        state_dir = tmp / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        self.last_state_dir = state_dir
         judge = tmp / "judge-called"
         child = tmp / "child-finished"
         stack = tmp / "stack-destroyed"
@@ -374,6 +377,7 @@ class CancelStopsModelCallsTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 self.constants(),
+                f'STATE_DIR="{state_dir}"',
                 'readonly LITELLM_LOG_DEPLOYMENT="deployment/litellm"',
                 f'JOB_TYPE="{job_type}"',
                 f'AGENT_CLUSTER_CONTEXT="{context}"',
@@ -412,12 +416,14 @@ class CancelStopsModelCallsTest(unittest.TestCase):
         self.assertLess(out.index("called collect_litellm_log"), out.index(scale))
         self.assertLess(out.index(scale), out.index("exit trap 143"))
         self.assertTrue(stack, "a unit with a stack must be left to destroy it")
+        self.assertTrue((self.last_state_dir / "cancelled").exists(), "cancel marker must be created")
 
     def test_a_batch_is_cut_the_same_way(self):
         code, out, left, stack = self.run_cancelled("batch")
         self.assertEqual(code, 143, out)
         self.assertEqual(left, [])
         self.assertIn("--replicas=0", out)
+        self.assertTrue((self.last_state_dir / "cancelled").exists(), "cancel marker must be created")
 
     def test_a_main_branch_run_keeps_its_units_and_its_gateway(self):
         for job_type in ("periodic", "postsubmit", ""):
@@ -426,6 +432,7 @@ class CancelStopsModelCallsTest(unittest.TestCase):
             self.assertEqual(len(left), 2, f"JOB_TYPE={job_type!r}: the unit and its child should run on")
             self.assertNotIn("called kubectl", out)
             self.assertNotIn("called collect_litellm_log", out)
+            self.assertFalse((self.last_state_dir / "cancelled").exists())
 
     def test_a_cancel_before_the_cluster_context_still_kills_the_units(self):
         for context in ("", "gke_other-project_us-central1_host"):

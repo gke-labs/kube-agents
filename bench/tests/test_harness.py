@@ -6929,3 +6929,35 @@ def test_an_unresolved_fleet_role_is_a_setup_problem_not_the_models(tmp_path, mo
     _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\n")
     _, problem = harness.expand_fleet_cluster_placeholders(prompt)
     assert problem is not None and "never reached" in problem
+
+
+def test_a_cancelled_run_skips_all_evaluators_and_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report_only_judges: tuple[type, type],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A cancelled run emits a marker under STATE_DIR; all devops-bench evaluators skip."""
+    import devops_bench.metrics.pipeline as pipeline  # type: ignore[import-not-found,import-untyped]
+    from devops_bench.metrics.base import METRICS
+    from kube_agents_bench.cancel import reset_cancel_log_state
+
+    reset_cancel_log_state()
+    marker = tmp_path / "cancelled"
+    marker.touch()
+    monkeypatch.setenv("KUBE_AGENTS_CANCEL_MARKER", str(marker))
+
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert not METRICS["outcome_validity"]().applies(ctx)
+    assert not any(evaluator().applies(ctx) for evaluator in report_only_judges)
+    assert getattr(pipeline.evaluate_metrics_batch, "_is_cancel_guarded", False)
+    assert "run cancelled: devops-bench judge and verification scores are off for this run" in capsys.readouterr().err
+
+    reset_cancel_log_state()
+    # A record without 'input' raises KeyError in the unguarded evaluate_metrics_batch.
+    # The cancel wrapper short-circuits before context construction and preserves scores.
+    record = {"scores": {"prior": 1.0}}
+    pipeline.evaluate_metrics_batch([record], judge_model=None)
+    assert record["scores"] == {"prior": 1.0}
+    assert "run cancelled: devops-bench judge and verification scores are off for this run" in capsys.readouterr().err
