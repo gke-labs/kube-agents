@@ -397,6 +397,12 @@ def health_box(red: Red, health_doc: dict) -> str:
         text = HARD_FAILURE
         if red.held_out_failed:
             text += HELD_OUT_NOTE
+        # Only on a run that carries the outage's signature (health.py rule
+        # 2c): a hard failure without it is a real trip the outage does not
+        # explain. cause_text falls through to post_health.cause_sentence,
+        # whose forge-outage sentence carries no repetition count.
+        if incident and health_doc.get("condition") == health.FORGE_OUTAGE and red.run.forge_reps >= health.FORGE_RUN_SIGNATURE_REPS:
+            text += " " + BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=cause_text(health_doc))
         return f"> {text} {' · '.join(links)}"
 
     theirs, yours, unclear = red.theirs(), red.yours(), red.unclear()
