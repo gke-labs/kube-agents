@@ -2110,6 +2110,7 @@ main() {
   # deliberately does not opt in.
   NAMESPACE="$target_namespace" \
     KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"
 
   if [ "$PARAM_PLAN" = "true" ]; then

@@ -25,7 +25,7 @@
 id: ccc-prefilter-missing-nodeselector-drop
 name: "Workload Omitting the ComputeClass Selector the Autoscaler Pre-Filter Drops (stockout untargeted-workload check)"
 domain: capacity
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - stockout-prevention

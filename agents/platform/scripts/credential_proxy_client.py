@@ -2362,7 +2362,14 @@ def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
     )
     try:
         with open_broker_request(request) as response:
-            return json.load(response)
+            answer = json.load(response)
+            if not isinstance(answer, dict):
+                # Valid JSON, but not an object, and every consumer reads the
+                # answer as one. A ValueError, as for a body that is not JSON:
+                # `vcs_client.call` has an arm for it. The type's name only,
+                # never the body.
+                raise ValueError(f"the broker's answer is JSON of type {type(answer).__name__}, not an object")
+            return answer
     except urllib.error.HTTPError as exc:
         try:
             answer = json.load(exc)
