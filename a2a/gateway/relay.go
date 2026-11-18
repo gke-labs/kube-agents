@@ -1131,10 +1131,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		} else if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
-			} else if doneLine != "" && (toCards || g.answersWholeOnLine(rec.Key, answer)) && result != completedNonTextResult {
+			} else if doneLine != "" && (toCards || (rs.turnsStarted == 0 && rs.steersSent == 0 && g.answersWholeOnLine(rec.Key, answer))) && result != completedNonTextResult {
 				// The task's live message becomes the acknowledgement, or
 				// the whole answer where the backend takes one that fits
-				// (WholeLineAnswerer, answersWholeOnLine),
+				// (WholeLineAnswerer, answersWholeOnLine) and nothing has
+				// been posted under the line since: once a turn answer or
+				// a queued follow-up sits below it, an edit would put the
+				// last answer above what it answers, so it posts instead;
 				// and takes no terminal edit below (LineAnswerer); an
 				// edit that does not land posts it instead. An answer
 				// posts, so it notifies: a Chat edit raises none, and

@@ -3069,7 +3069,7 @@ plain `summary` for the chat list; a card over the 28 KB activity budget posts a
 over it is cut with a marker. A long reply reaches the adapter already split: the gateway cuts
 a backend's text at its piece size before it posts (`chatChunks`, which carries an open fence
 and a table's header into the next piece); the size is the backend's own where it names one
-(`PieceSizer`: Teams says 10,000 runes, so a report's table is one card rather than two with
+(`PieceSizer`: Teams says 10,000 bytes, so a report's table is one card rather than two with
 the header repeated) and Discord's 1,900 elsewhere, so one activity is one piece and the
 adapter only fits it under the budget. The chat.notify route (`chat.notify.teams`, `NewTeamsNotifier`)
 posts a kanban card's report back into the Teams conversation it came from (the bridge records

@@ -67,13 +67,13 @@ const (
 	// it in every script (the Hermes adapter's budget, agents/platform/
 	// scripts/teams_relay_patch.py).
 	teamsMaxActivityBytes = 28 * 1024
-	// teamsPieceRunes is the most runes one post or edit carries
+	// teamsPieceBytes is the most bytes one post or edit carries
 	// (PieceSizer): the relay and the notifier split above it. Well under
 	// teamsMaxActivityBytes once the card's per-line overhead is added, and
 	// far above discordChunk, so a report's table lands in one card rather
 	// than cut into two with its header repeated (the 11-17 live test: a
 	// seven-row table with console links came as six rows and one).
-	teamsPieceRunes = 10000
+	teamsPieceBytes = 10000
 	// The Adaptive Card vocabulary the builder emits (teamsMarkdownToCard):
 	// element types, the header weight, heading sizes, the code font, and
 	// the Markdown marks it reads.
@@ -596,7 +596,7 @@ func teamsRelayError(prefix string, body []byte) error {
 // Post writes text to a conversation as one activity and returns its id
 // (Adapter.Post). The text arrives already split: the gateway cuts a
 // backend's replies at its piece size before it posts (chatChunks at
-// PieceSize, teamsPieceRunes here), so one call is one piece, and the
+// PieceSize, teamsPieceBytes here), so one call is one piece, and the
 // adapter only fits it under the activity budget (teamsFitActivity).
 func (a *TeamsAdapter) Post(conversation, text string) (string, error) {
 	convID := teamsConversationFromID(conversation)
@@ -696,12 +696,21 @@ func teamsIsChannelID(id string) bool {
 
 // teamsThreadInHome reports a thread the home conversation holds: the home
 // itself, or a channel thread of it (home + ";messageid=…").
+//
+// The shape is checked here, where Notifier.validate reads it, not only on
+// the worker: a padded or malformed thread accepted here is queued, and a
+// padded one is keyed untrimmed, so every later update misses the stored
+// message id and posts anew instead of editing. Only a channel threads, so
+// a thread suffix on a personal or group chat is refused too.
 func teamsThreadInHome(thread, home string) bool {
 	if thread == home {
 		return true
 	}
+	if !teamsIsChannelID(home) || !teamsIsConversationID(thread) {
+		return false
+	}
 	rest, ok := strings.CutPrefix(thread, home+teamsThreadToken)
-	return ok && rest != ""
+	return ok && rest != "" && !teamsHasThreadToken(rest)
 }
 
 // Edit replaces a posted activity with text (Adapter.Edit): Bot Framework's
@@ -782,8 +791,8 @@ func (a *TeamsAdapter) AnswersOnLine(string) bool { return true }
 // second one. The live test of 11-17 showed the pair on every direct answer.
 func (a *TeamsAdapter) AnswersWholeOnLine(string) bool { return true }
 
-// PieceSize is teamsPieceRunes for every conversation (PieceSizer).
-func (a *TeamsAdapter) PieceSize(string) int { return teamsPieceRunes }
+// PieceSize is teamsPieceBytes for every conversation (PieceSizer).
+func (a *TeamsAdapter) PieceSize(string) int { return teamsPieceBytes }
 
 // React and RemoveReaction draw no mark on Teams: a nil no-op, as the
 // Adapter contract allows a backend that does not react.
@@ -998,10 +1007,10 @@ func teamsMarkdownToCard(text string) map[string]any {
 		if strings.Contains(stripped, teamsPipe) {
 			switch {
 			case len(table) > 0:
-				// A row of a running table; a stray delimiter row is skipped.
-				if !slackTableSepRE.MatchString(stripped) {
-					table = append(table, teamsTableCells(stripped))
-				}
+				// A row of the running table. Every row after the delimiter
+				// is data (GitHub's rule, Slack's tableEnd), so a body row of
+				// dashes, an empty entry, is kept.
+				table = append(table, teamsTableCells(stripped))
 				continue
 			case i+1 < len(lines) && teamsTableStart(stripped, lines[i+1]):
 				// A table starts only where a header row is followed by a

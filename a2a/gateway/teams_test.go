@@ -179,6 +179,11 @@ func TestTeamsMarkdownTableRules(t *testing.T) {
 	if b := body("| a | b |\n| - | - |\n| 1 | 2 |"); len(b) != 1 || b[0]["type"] != teamsCardTable || len(b[0]["rows"].([]map[string]any)) != 2 {
 		t.Fatalf("one-dash delimiter: %v", b)
 	}
+	// Every row after the delimiter is data: a body row of dashes, an empty
+	// entry, stays (GitHub's rule, as Slack's scanner reads it).
+	if b := body("| pod | restarts |\n|---|---|\n| a | 3 |\n| - | - |\n| --- | --- |"); len(b) != 1 || len(b[0]["rows"].([]map[string]any)) != 4 {
+		t.Fatalf("dash body rows dropped: %v", b)
+	}
 	if got := teamsTableCells(`| kubectl get pods \| grep x | c |`); len(got) != 2 || got[0] != "kubectl get pods | grep x" || got[1] != "c" {
 		t.Fatalf("escaped pipe split: %q", got)
 	}
@@ -639,6 +644,21 @@ func TestTeamsNotifyRoutePostsIntoTheConversation(t *testing.T) {
 	if !teamsThreadInHome(home+";messageid=1794603936403", home) || teamsThreadInHome("a:other", home) || !teamsThreadInHome(home, home) {
 		t.Fatal("thread-in-home rule")
 	}
+	// The shape is checked where the request arrives: a padded, malformed
+	// or doubled suffix, or a thread suffix on a chat Teams does not
+	// thread, is refused rather than queued and keyed wrong.
+	for _, bad := range []struct{ thread, home string }{
+		{home + ";messageid=123 ", home},
+		{home + ";messageid=1 2", home},
+		{home + ";messageid=123/../x", home},
+		{home + ";messageid=123;messageid=4", home},
+		{testTeamsDM + ";messageid=123", testTeamsDM},
+		{"19:group@thread.v2;messageid=123", "19:group@thread.v2"},
+	} {
+		if teamsThreadInHome(bad.thread, bad.home) {
+			t.Fatalf("thread %q accepted in home %q", bad.thread, bad.home)
+		}
+	}
 	// A top-level home post in a channel lands in the thread it starts, so
 	// later chunks and a person's reply key that thread; a thread post lands
 	// in its thread.
@@ -682,8 +702,8 @@ func TestTeamsAnswersWholeOnTheLineWithItsOwnPieceSize(t *testing.T) {
 	if !a.AnswersWholeOnLine("teams:19:abc@thread.tacv2") || !a.AnswersOnLine("teams:a:1") {
 		t.Fatal("want the whole answer on the line for every Teams conversation")
 	}
-	if got := a.PieceSize("teams:19:abc@thread.tacv2"); got != teamsPieceRunes || got <= discordChunk || got >= teamsMaxActivityBytes {
-		t.Fatalf("PieceSize = %d, want %d: above discordChunk (%d), under the activity cap (%d)", got, teamsPieceRunes, discordChunk, teamsMaxActivityBytes)
+	if got := a.PieceSize("teams:19:abc@thread.tacv2"); got != teamsPieceBytes || got <= discordChunk || got >= teamsMaxActivityBytes {
+		t.Fatalf("PieceSize = %d, want %d: above discordChunk (%d), under the activity cap (%d)", got, teamsPieceBytes, discordChunk, teamsMaxActivityBytes)
 	}
 	var _ WholeLineAnswerer = a
 	var _ PieceSizer = a

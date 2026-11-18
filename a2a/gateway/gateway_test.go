@@ -2788,7 +2788,7 @@ func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
 		{slackBackend, "not-a-key", false},
 		{discordBackend, "discord:g1/thread-s1", false},
 		{teamsBackend, "teams:19:abc@thread.tacv2;messageid=1794603936403", true},
-		{teamsBackend, "teams:a:1UxxASmI", true},
+		{teamsBackend, "teams:a:1UxxASmI", false},
 		{teamsBackend, "teams:19:abc@thread.tacv2", false},
 		{teamsBackend, "teams:19:group@thread.v2", false},
 	} {

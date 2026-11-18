@@ -303,6 +303,45 @@ func TestAWholeLineAnswerBackendEditsAFittingAnswerOntoTheLine(t *testing.T) {
 	}
 }
 
+// Once a turn answer has been posted under the line (a follow-up during
+// the task), the final answer posts too: edited onto the line it would sit
+// above the follow-up it answers, and an edit raises no notification.
+func TestAWholeLineAnswerBackendPostsTheAnswerAfterATurnWasPosted(t *testing.T) {
+	t.Parallel()
+	r := startWholeLineAnsweringRig(t)
+	origin := startChatTask(t, r, "discord:g1/whole-answer-after-turn", false)
+	line := lineID(t, r)
+	exec := r.execFor(t, origin, "platform")
+	_ = exec.PublishStatus(context.Background(), lib.StateWorking, false)
+	publishTurnAnswer(t, r, origin, "platform", 1, "first answer")
+	waitFor(t, "turn posted", postedContaining(r, "first answer"))
+	completeTask(t, exec, "the fleet is fine")
+	waitFor(t, "the answer posted under the turn", postedContaining(r, "the fleet is fine"))
+	for _, e := range editsOf(r, line) {
+		if e == "the fleet is fine" {
+			t.Fatalf("edits = %q, want the answer posted, not edited above the turn", editsOf(r, line))
+		}
+	}
+}
+
+// The piece size is bytes, the unit the chunker and the activity budget
+// use: an answer under the piece in runes but over it in bytes posts
+// rather than being edited onto the line and cut by the activity cap.
+func TestAWholeLineAnswerBackendMeasuresThePieceInBytes(t *testing.T) {
+	t.Parallel()
+	r := startWholeLineAnsweringRig(t)
+	origin := startChatTask(t, r, "discord:g1/whole-answer-multibyte", false)
+	line := lineID(t, r)
+	wide := strings.Repeat("艦", 30) // 30 runes, 90 bytes, past the fake's 60
+	completeTask(t, r.execFor(t, origin, "platform"), wide)
+	waitFor(t, "the answer posted", postedContaining(r, strings.Repeat("艦", 10)))
+	for _, e := range editsOf(r, line) {
+		if strings.Contains(e, "艦") {
+			t.Fatalf("edits = %q, want a 90-byte answer posted, not edited onto a 60-byte piece", editsOf(r, line))
+		}
+	}
+}
+
 // An answer past the backend's piece size posts, in pieces, and the line
 // ends as the bare mark, as on a backend that answers on the line.
 func TestAWholeLineAnswerBackendPostsAnAnswerPastOnePiece(t *testing.T) {

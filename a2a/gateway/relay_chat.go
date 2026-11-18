@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -163,7 +162,10 @@ func (g *Gateway) answersWholeOnLine(conversation string, m OutMessage) bool {
 	if !ok || !answerer.AnswersWholeOnLine(conversation) {
 		return false
 	}
-	return utf8.RuneCountInString(m.Text) <= pieceSizeOf(g.adapter, conversation)
+	// Bytes, the unit chatChunks, truncateRunes and the Teams activity
+	// budget measure in: counted in runes, a long answer in a multi-byte
+	// script would fit the piece and overflow the activity.
+	return len(m.Text) <= pieceSizeOf(g.adapter, conversation)
 }
 
 // answerOnLine edits messageID, the task's live message, into m, the

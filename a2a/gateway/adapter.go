@@ -317,7 +317,7 @@ type WholeLineAnswerer interface {
 	AnswersWholeOnLine(conversation string) bool
 }
 
-// PieceSizer names the most runes one post or edit to conversation carries.
+// PieceSizer names the most bytes one post or edit to conversation carries
 // A backend that does not implement it takes discordChunk, Discord's cap,
 // which every other backend fits under; one whose cap is far above it
 // (Teams, 28 KiB an activity) says so, and a table that fits one card is not

@@ -2758,10 +2758,12 @@ func conversationIsOwnThread(backend, conversation string) bool {
 		_, threadTS, ok := slackChannelThread(conversation)
 		return ok && threadTS != ""
 	case teamsBackend:
-		// A channel thread carries its ;messageid= suffix; a personal chat is
-		// one thread by itself. A bare channel id names the whole channel.
+		// A channel thread carries its ;messageid= suffix. A bare channel id
+		// names the whole channel, and a personal or group chat has no
+		// threads: every message there shares one key, so the generic
+		// wording (sessionOnAck) is the true one.
 		id, ok := strings.CutPrefix(conversation, teamsKeyPrefix)
-		return ok && (strings.Contains(id, teamsThreadToken) || strings.HasPrefix(id, teamsPersonalConversationPrefix))
+		return ok && strings.Contains(id, teamsThreadToken)
 	}
 	return false
 }
