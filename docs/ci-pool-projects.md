@@ -8,7 +8,7 @@ Every GCP project registered in the Boskos pool must be provisioned with the pre
 
 Identifiers this page deliberately does not print — the two GitHub App IDs, the Prow runner's service account, and where the ledger App's key is held — are named constants in `scripts/provision_ci_pool_project.sh` and `scripts/verify_ci_pool_project.py`, named inline below where a step needs one. The scripts are the source; a copy here would be one more place to rotate.
 
-Sections 1 to 6 are what a leasable project must end up holding, and section 7 is how you check it. `scripts/provision_ci_pool_project.sh --project-id=<id>` does all of it — grouped differently from the section order, since it enables the APIs, IAM and registry together before building the host cluster. Run the script rather than the individual commands, which are here so a project provisioned by hand does not miss one. Its flags: `--pem-file=PATH` imports the App private key in section 5 (without it the key stays `PENDING_IMPORT` and the run ends amber); `--skip-host-cluster` and `--skip-fleet` skip sections 2 and 6 for a project that already has them; `--allow-unmapped` downgrades the mapping precondition below to a warning; `--app-id` overrides the App the run provisions and verifies against.
+Sections 1 to 6 are what a leasable project must end up holding, and section 7 is how you check it. `scripts/provision_ci_pool_project.sh --project-id=<id>` does all of it — grouped differently from the section order, since it enables the APIs, IAM and registry together before building the host cluster. Run the script rather than the individual commands, which are here so a project provisioned by hand does not miss one. Its flags: `--pem-file=PATH` imports the App private key in section 5 (without it the key stays `PENDING_IMPORT` and the run ends amber); `--skip-host-cluster` skips section 2's host-cluster apply for a project that already has one (the managed OpenTelemetry scope step after it still runs, which is what a resume after a failed scope update needs) and `--skip-fleet` skips section 6; `--allow-unmapped` downgrades the mapping precondition below to a warning; `--app-id` overrides the App the run provisions and verifies against.
 
 ## 0. Preconditions
 
@@ -83,7 +83,7 @@ in `scripts/provision_ci_pool_project.sh` for the set it writes.
 
 `api_server_key` is generated the same way `hack/ci-deploy.sh` generates it when unset. It is regenerated on every apply, which is why section 8 forbids re-running the provisioning script after registration.
 
-The managed OpenTelemetry scope is the one step after the apply. The flag is on the GA `gcloud` surface from the version `MIN_GCLOUD_VERSION` in `scripts/installer/min_versions.sh` names (older SDKs carry it under `gcloud beta`), and the provisioning script checks the installed version in its Step 0 so an old SDK fails before the apply rather than after it:
+The managed OpenTelemetry scope is the one step after the apply. The script first waits for the cluster's running operations, since an Autopilot host is still creating node pools for the pods Helm installed and GKE refuses a second operation (`CLUSTER_ALREADY_HAS_OPERATION`) while one runs; the hand command below meets the same refusal on a busy cluster and is safe to repeat. The flag is on the GA `gcloud` surface from the version `MIN_GCLOUD_VERSION` in `scripts/installer/min_versions.sh` names (older SDKs carry it under `gcloud beta`), and the provisioning script checks the installed version in its Step 0 so an old SDK fails before the apply rather than after it:
 
 ```bash
 gcloud container clusters update platform-agent-host \
@@ -526,6 +526,8 @@ gcloud compute firewall-rules create allow-forge-443 --network=default --directi
 gcloud compute firewall-rules create deny-forge-ingress --network=default --direction=INGRESS --action=DENY --rules=all \
   --priority=1100 --source-ranges=0.0.0.0/0 --target-tags=forge --project="${PROJECT_ID}"
 gcloud iam service-accounts create forge-vm --display-name="kube-agents forge VM" --project="${PROJECT_ID}"
+# IAM can refuse this binding with "does not exist" for up to about a minute
+# after the create; repeat it until it takes (the script retries it).
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:forge-vm@${PROJECT_ID}.iam.gserviceaccount.com" --role=roles/artifactregistry.reader
 for member in "${PROW_RUNNER_SA}" "${NIGHTLY_RUNNER_SA}"; do
@@ -537,21 +539,21 @@ The external address is the VM's way to github.com, which the proxy forwards to;
 
 The GitLab CE lane runs the forge table's `gitlab-ce` row: GitLab CE itself (`gitlab/gitlab-ce`, pinned by digest in `hack/ci-forge.sh`) at `gitlab.eval.internal` on an `e2-standard-4` with a 50 GB disk, which `up` stands up the same way, with these differences. There is no image build: the VM pulls the image from Docker Hub through its external address. `up` mints the two tokens the deploy and the eval read (`agent-token`: `api` and `write_repository`; `ledger-token`: `api`; dated two days out, since GitLab expires a token at 00:00 UTC on its date), hands them to the VM in metadata beside the key with the checkout-gateway manifest the remediation cases read (the provisioning script's seed), and the VM's first boot does the rest once GitLab's own readiness check passes with Gitaly up (the sign-in page answers minutes earlier): one `gitlab-rails runner` call as root makes the bot `kube-agents-eval-bot` with the two tokens set on it and the group `gke-agentic`, then root, through the API, creates the project `<PROJECT_ID>-infra` (the layout the eval derives from the lease) with its README, commits the manifest to the default branch and adds the bot as a Developer, as on gitlab.com, so the default branch keeps GitLab's protection and the bot opens merge requests; it prints `FORGE ready` only then; a cold boot takes 6 to 8 minutes, and the deadline is 30. GitLab's data lives in a docker volume, since the VM's stateful partition is mounted noexec and Gitaly runs git from that data. Then, because the eval's token check, ledger probe, resets, grader and leftovers report all call the private host from the job pod by its bare name, `up` opens a tunnel: a relay pod (`forge-relay`, socat, pinned) in the host cluster forwarding to the forge's 443, a `kubectl port-forward` to it on the job pod's loopback 443 (the only port every consumer dials, so the job runs as root, as the Prow pod does), kept up by a loop that restarts it when its API stream drops, and a line in the hosts file; the loop outlives `up`, its pid in the state directory, and `down` kills it and the port-forward, deletes the relay pod and removes the line. Last, `up` writes `ca.crt`, `agent-token` and `ledger-token` into the state directory. The lane runs `hack/eval/gitlab-cases.txt`, the gitlab.com lane's list, as `pull-kube-agents-smoke-test-gitlab-ce` on demand and `ci-kube-agents-eval-weekly-gitlab-ce-next` weekly, both under `spec.mode: next` (the weekly job named in `EVAL_MODE_NEXT_JOB_NAMES`); none appends to the evidence store.
 
-### 5.9 The certification lane
+### 5.9 The validated-capabilities lane
 
 `ci-kube-agents-certification-1` in `oss-test-infra` (`kube-agents-periodics.yaml`) runs the
-certification suite's first part (the cases whose task file carries `suite: certification` and no `certification_part` line above 1) under
-`EVAL_TIER=certification`, weekly on Saturday 14:00 UTC and on Deck's Rerun, at 60 repetitions per
-case against the newest GA release's published images, on a leased pool project, with the nightlies' identity, decoration and log bucket
+validated-capabilities suite's first part (the cases whose task file carries `suite: validated-capabilities` and no `suite_part` line above 1) under
+`EVAL_TIER=validated-capabilities`, on Saturday and Sunday at 14:00 UTC and on Deck's Rerun, at 3 repetitions per
+case while the suite is built out, against the newest GA release's published images, on a leased pool project, with the nightlies' identity, decoration and log bucket
 (`gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-certification-1/`). The lane is the
-record behind the certified-capabilities page: the page reads its case files from that bucket, the
+record behind the validated-capabilities page: the page reads its case files from that bucket, the
 tier appends nothing to the evidence store, and no case on it is on the blocking roster, so rung 4
 never arms there. A failed build therefore reaches a person only through the CI health digest,
 which watches the job (`WATCHED` in `scripts/eval_dashboard/periodics.py`, read from the lane's
 own bucket) and notes a failed or overdue run.
 
 When the note fires, read the build in Deck first. The reds that are the lane's own: a rung 1 to 3
-verdict (a forbidden write, a check that never ran, inconsistent liveness) on a certification case,
+verdict (a forbidden write, a check that never ran, inconsistent liveness) on a validated-capabilities case,
 or rung 5, an `expected_fail` case that passed every repetition, which says its marker is stale and
 the gap issue named in the roster is closed by a fix that did not remove it. The reds that are the
 lane's plumbing: the deploy refusing `EVAL_MODE_NEXT=1` because the job's name is missing from

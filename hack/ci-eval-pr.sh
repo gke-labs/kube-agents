@@ -52,16 +52,16 @@ readonly REPLAY_LANE_SAFETY_ARMS=2
 # Where the lane tells lane_report.py which repetitions were live (its
 # ARMS_FILE), beside bench-gate's case-<name>.json.
 readonly REPLAY_LANE_ARMS_FILE="replay-lane-arms.json"
-# The certification suite has no roster file: a case is on its lane when its
-# task file carries the bare line `suite: certification` (and in part N when
-# it carries `certification_part: N`; absent is part 1). The two line
+# The validated-capabilities suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: validated-capabilities` (and in part N when
+# it carries `suite_part: N`; absent is part 1). The two line
 # patterns below are the whole grammar; scripts/eval_rosters.py and
 # scripts/validate_bench_cases.py read the same two lines, and the validator
 # refuses any other spelling (a quoted or commented value), so a case the
 # validator registers is a case this grep sees.
-readonly CERTIFICATION_SUITE_LINE_RE='^suite: certification$'
-readonly CERTIFICATION_PART_KEY='certification_part'
-readonly CERTIFICATION_PART_LINE_RE="^${CERTIFICATION_PART_KEY}: [1-9][0-9]*$"
+readonly VALIDATED_CAPABILITIES_SUITE_LINE_RE='^suite: validated-capabilities$'
+readonly VALIDATED_CAPABILITIES_PART_KEY='suite_part'
+readonly VALIDATED_CAPABILITIES_PART_LINE_RE="^${VALIDATED_CAPABILITIES_PART_KEY}: [1-9][0-9]*$"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
 # (#3384, #4238): a stack-bearing case on no list runs in main-a, which
@@ -792,8 +792,8 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_SLACK_LANE=1 is set: the Slack lane is advisory and grades no matrix"
     return 0
   fi
-  if [ "${EVAL_TIER:-}" = "certification" ]; then
-    echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
+  if [ "${EVAL_TIER:-}" = "validated-capabilities" ]; then
+    echo "eval-dashboard publish skipped: EVAL_TIER=validated-capabilities: the validated-capabilities lane's record is its logs bucket, read by the validated-capabilities page, not the nightly dashboard"
     return 0
   fi
   if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
@@ -3236,9 +3236,9 @@ fi
 # ./tasks/<id>/task.yaml path, a path with no case directory behind it, or a
 # nightly entry that is also a presubmit one (it would run twice a night) all
 # stop the job here, before it spends a cluster, rather than running a wrong
-# matrix and reporting green around it. The certification suite is the one
-# matrix read from the task files themselves: `suite: certification` in a
-# task file is what EVAL_TIER=certification runs (the certification tier,
+# matrix and reporting green around it. The validated-capabilities suite is the one
+# matrix read from the task files themselves: `suite: validated-capabilities` in a
+# task file is what EVAL_TIER=validated-capabilities runs (the validated-capabilities tier,
 # below).
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
@@ -3357,24 +3357,24 @@ for ENTRY in "${NIGHTLY_TASKS[@]}"; do
   fi
 done
 
-# ─── The certification tier ──────────────────────────────────────────────────
-# The certification suite: the cases behind the certified-capabilities page,
-# graded on their own lane (the ci-kube-agents-certification periodics in
-# oss-test-infra, EVAL_TIER=certification) and never on a pull request or a
+# ─── The validated-capabilities tier ──────────────────────────────────────────────────
+# The validated-capabilities suite: the cases behind the validated-capabilities page,
+# graded on their own lane (the ci-kube-agents-validated-capabilities periodics in
+# oss-test-infra, EVAL_TIER=validated-capabilities) and never on a pull request or a
 # nightly. Membership is read from the task files, not from a roster: every
 # top-level case under bench/tasks/ whose task file carries the bare line
-# `suite: certification` is in the suite, in case-id order (LC_ALL=C, the
+# `suite: validated-capabilities` is in the suite, in case-id order (LC_ALL=C, the
 # order scripts/eval_rosters.py sorts in), so a case pull request edits no
 # shared file. An entry that is also a presubmit or nightly case stops the
 # job, since a case graded on two lanes would hold two records under one
 # name. The suite may be empty between the tier landing and its first case,
 # so the empty read is refused only when this tier is the one running.
-# `certification_part: N` in a task file (N from 1, the bare line) puts the
-# case in section N, one periodic each (EVAL_CERTIFICATION_PART below); a
+# `suite_part: N` in a task file (N from 1, the bare line) puts the
+# case in section N, one periodic each (EVAL_VALIDATED_CAPABILITIES_PART below); a
 # case without the line is part 1. scripts/eval_rosters.py reads the same
-# two lines (CERTIFICATION_SUITE_LINE_RE, CERTIFICATION_PART_LINE_RE); the
+# two lines (VALIDATED_CAPABILITIES_SUITE_LINE_RE, VALIDATED_CAPABILITIES_PART_LINE_RE); the
 # two must stay twins.
-certification_entries() {
+validated_capabilities_entries() {
   # grep -l exits 1 when no task file matches; that is the empty suite, not
   # an error, and the tier switch below is what refuses it. Exit 2 (a task
   # file it could not read) is an error: a case dropped in silence would
@@ -3384,9 +3384,9 @@ certification_entries() {
   (
     cd "${BENCH_DIR}" || exit 1
     local files rc=0
-    files="$(LC_ALL=C grep -lE "${CERTIFICATION_SUITE_LINE_RE}" tasks/*/task.yaml)" || rc=$?
+    files="$(LC_ALL=C grep -lE "${VALIDATED_CAPABILITIES_SUITE_LINE_RE}" tasks/*/task.yaml)" || rc=$?
     if [ "${rc}" -gt 1 ]; then
-      echo "ERROR: could not read every task file under bench/tasks/ for the certification suite (grep exit ${rc})." >&2
+      echo "ERROR: could not read every task file under bench/tasks/ for the validated-capabilities suite (grep exit ${rc})." >&2
       exit 1
     fi
     if [ -n "${files}" ]; then
@@ -3394,37 +3394,37 @@ certification_entries() {
     fi
   )
 }
-CERTIFICATION_ENTRIES="$(certification_entries)"
-CERTIFICATION_TASKS=()
+VALIDATED_CAPABILITIES_ENTRIES="$(validated_capabilities_entries)"
+VALIDATED_CAPABILITIES_TASKS=()
 while IFS= read -r ENTRY; do
-  if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
-done <<< "${CERTIFICATION_ENTRIES}"
-check_case_entries "bench/tasks (suite: certification)" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+  if [ -n "${ENTRY}" ]; then VALIDATED_CAPABILITIES_TASKS+=("${ENTRY}"); fi
+done <<< "${VALIDATED_CAPABILITIES_ENTRIES}"
+check_case_entries "bench/tasks (suite: validated-capabilities)" ${VALIDATED_CAPABILITIES_TASKS[@]+"${VALIDATED_CAPABILITIES_TASKS[@]}"}
 # A here-string, not `printf | grep -q`: grep exits on its first match, a
 # producer still writing dies of SIGPIPE, and under pipefail the duplicate
 # reads as absent. printf hands the pipe a few KiB per write, so on today's
 # rosters that is a rare race (the flake this replaced); past a pipe buffer
 # it is every run.
-for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
+for ENTRY in ${VALIDATED_CAPABILITIES_TASKS[@]+"${VALIDATED_CAPABILITIES_TASKS[@]}"}; do
   if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
-    echo "ERROR: ${ENTRY} carries 'suite: certification' and is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
+    echo "ERROR: ${ENTRY} carries 'suite: validated-capabilities' and is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a validated-capabilities case runs on the validated-capabilities lane only, or it holds two records under one name." >&2
     exit 1
   fi
 done
 
-# The part a certification case is in: the N of its bare
-# `certification_part: N` line, 1 when it has none.
-certification_part_of() { # <entry>
+# The part a validated-capabilities case is in: the N of its bare
+# `suite_part: N` line, 1 when it has none.
+suite_part_of() { # <entry>
   local part
-  part="$(grep -E "${CERTIFICATION_PART_LINE_RE}" "${BENCH_DIR}/$1" | head -n 1 | sed "s/^${CERTIFICATION_PART_KEY}: //" || true)"
+  part="$(grep -E "${VALIDATED_CAPABILITIES_PART_LINE_RE}" "${BENCH_DIR}/$1" | head -n 1 | sed "s/^${VALIDATED_CAPABILITIES_PART_KEY}: //" || true)"
   echo "${part:-1}"
 }
 
 # The entries of section N of the suite, in case-id order.
-certification_part_entries() { # <N>
+suite_part_entries() { # <N>
   local entry
-  for entry in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
-    if [ "$(certification_part_of "${entry}")" = "$1" ]; then echo "${entry}"; fi
+  for entry in ${VALIDATED_CAPABILITIES_TASKS[@]+"${VALIDATED_CAPABILITIES_TASKS[@]}"}; do
+    if [ "$(suite_part_of "${entry}")" = "$1" ]; then echo "${entry}"; fi
   done
 }
 
@@ -3464,7 +3464,7 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # A here-string, not `printf | grep -q`: grep exits on its first match, a
   # producer still writing dies of SIGPIPE, and under pipefail a registered
   # entry reads as unregistered. A rare race on today's rosters, every run
-  # past a pipe buffer; the certification check above says why.
+  # past a pipe buffer; the validated-capabilities check above says why.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
     if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
       echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
@@ -3494,24 +3494,24 @@ case "${EVAL_TIER}" in
       echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
     fi
     ;;
-  certification)
+  validated-capabilities)
     # The suite replaces the presubmit matrix: nothing from the other two
     # files runs here, and the blocking roster, a subset of the presubmit,
-    # arms nothing, so a failing certification case is a record and never a
+    # arms nothing, so a failing validated-capabilities case is a record and never a
     # red. The suite grades GitHub only.
     if [ -n "${LANE_CASES_FILE}" ]; then
-      echo "ERROR: EVAL_TIER=certification grades GitHub only; unset EVAL_FORGE=${EVAL_FORGE}." >&2
+      echo "ERROR: EVAL_TIER=validated-capabilities grades GitHub only; unset EVAL_FORGE=${EVAL_FORGE}." >&2
       exit 1
     fi
-    if [ "${#CERTIFICATION_TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: no task file under bench/tasks/ carries the bare line 'suite: certification'; the certification tier would run nothing and report green." >&2
+    if [ "${#VALIDATED_CAPABILITIES_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: no task file under bench/tasks/ carries the bare line 'suite: validated-capabilities'; the validated-capabilities tier would run nothing and report green." >&2
       exit 1
     fi
-    TASKS=("${CERTIFICATION_TASKS[@]}")
-    echo "EVAL_TIER=certification: ${#TASKS[@]} certification case(s) make the matrix; no presubmit or nightly case runs"
+    TASKS=("${VALIDATED_CAPABILITIES_TASKS[@]}")
+    echo "EVAL_TIER=validated-capabilities: ${#TASKS[@]} validated-capabilities case(s) make the matrix; no presubmit or nightly case runs"
     ;;
   *)
-    echo "ERROR: EVAL_TIER must be 'presubmit', 'nightly' or 'certification', got '${EVAL_TIER}'." >&2
+    echo "ERROR: EVAL_TIER must be 'presubmit', 'nightly' or 'validated-capabilities', got '${EVAL_TIER}'." >&2
     exit 1
     ;;
 esac
@@ -3671,36 +3671,36 @@ case "${EVAL_NIGHTLY_PART}" in
     ;;
 esac
 
-# ─── The certification part ──────────────────────────────────────────────────
-# Which section of the certification suite this run takes (the cases whose
-# task file carries `certification_part: N`; none means part 1), applied
+# ─── The validated-capabilities part ──────────────────────────────────────────────────
+# Which section of the validated-capabilities suite this run takes (the cases whose
+# task file carries `suite_part: N`; none means part 1), applied
 # to TASKS here, before the exclusions and TASK_NAMES are built from it, so
 # the suite can run as one periodic per section on one leased project each: a
 # week's worth of runs at three repetitions is longer than any single job
 # here. "all", the default, is the whole suite. A part outside the
-# certification tier would be a typo that silently ran the wrong matrix, so
+# validated-capabilities tier would be a typo that silently ran the wrong matrix, so
 # it stops the job, as does any value that is not "all" or a whole number.
-EVAL_CERTIFICATION_PART="${EVAL_CERTIFICATION_PART:-all}"
-case "${EVAL_CERTIFICATION_PART}" in
+EVAL_VALIDATED_CAPABILITIES_PART="${EVAL_VALIDATED_CAPABILITIES_PART:-all}"
+case "${EVAL_VALIDATED_CAPABILITIES_PART}" in
   all) ;;
   *[!0-9]* | 0*)
-    echo "ERROR: EVAL_CERTIFICATION_PART must be 'all' or a whole number from 1, got '${EVAL_CERTIFICATION_PART}'." >&2
+    echo "ERROR: EVAL_VALIDATED_CAPABILITIES_PART must be 'all' or a whole number from 1, got '${EVAL_VALIDATED_CAPABILITIES_PART}'." >&2
     exit 1
     ;;
   *)
-    if [ "${EVAL_TIER}" != "certification" ]; then
-      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects part of the certification matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the certification tier." >&2
+    if [ "${EVAL_TIER}" != "validated-capabilities" ]; then
+      echo "ERROR: EVAL_VALIDATED_CAPABILITIES_PART=${EVAL_VALIDATED_CAPABILITIES_PART} selects part of the validated-capabilities matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the validated-capabilities tier." >&2
       exit 1
     fi
     TASKS=()
     while IFS= read -r ENTRY; do
       if [ -n "${ENTRY}" ]; then TASKS+=("${ENTRY}"); fi
-    done <<< "$(certification_part_entries "${EVAL_CERTIFICATION_PART}")"
+    done <<< "$(suite_part_entries "${EVAL_VALIDATED_CAPABILITIES_PART}")"
     if [ "${#TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification suite; the run would grade nothing and report green." >&2
+      echo "ERROR: EVAL_VALIDATED_CAPABILITIES_PART=${EVAL_VALIDATED_CAPABILITIES_PART} selects no case of the ${#VALIDATED_CAPABILITIES_TASKS[@]}-case validated-capabilities suite; the run would grade nothing and report green." >&2
       exit 1
     fi
-    echo "Certification part: ${EVAL_CERTIFICATION_PART} (${#TASKS[@]} of ${#CERTIFICATION_TASKS[@]} cases)"
+    echo "Validated Capabilities part: ${EVAL_VALIDATED_CAPABILITIES_PART} (${#TASKS[@]} of ${#VALIDATED_CAPABILITIES_TASKS[@]} cases)"
     ;;
 esac
 
@@ -4554,14 +4554,14 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
 fi
 BLOCKING_ROSTER_DEFAULT=""
 BLOCKING_ROSTER_ON_LANE=""
-# The certification tier grades no presubmit case, so no roster name is in
+# The validated-capabilities tier grades no presubmit case, so no roster name is in
 # its matrix: every name leaves the export (the file is still checked below,
 # since it stays the presubmit's roster), or bench-gate's "BOOTSTRAP_ADMITTED
 # names no graded case" banner, which exists to catch a misspelled entry,
-# would open every certification run. Rung 4 is disarmed on the lane by
+# would open every validated-capabilities run. Rung 4 is disarmed on the lane by
 # construction; said once in the log.
-if [ "${EVAL_TIER}" = "certification" ]; then
-  echo "EVAL_TIER=certification: no blocking-roster case is in the certification matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
+if [ "${EVAL_TIER}" = "validated-capabilities" ]; then
+  echo "EVAL_TIER=validated-capabilities: no blocking-roster case is in the validated-capabilities matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
 fi
 # The replay lane gates nothing: no roster name is armed on it, whatever its
 # roster shares with the presubmit's.
@@ -4598,7 +4598,7 @@ while IFS= read -r NAME; do
   if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
     continue
   fi
-  if [ "${EVAL_TIER}" = "certification" ]; then
+  if [ "${EVAL_TIER}" = "validated-capabilities" ]; then
     continue
   fi
   BLOCKING_ROSTER_ON_LANE="true"
@@ -4706,11 +4706,11 @@ fi
 if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
-# The certification lane never appends either: its record is the logs
-# bucket, read by the certified-capabilities page per case and release, and
+# The validated-capabilities lane never appends either: its record is the logs
+# bucket, read by the validated-capabilities page per case and release, and
 # none of its cases is on the blocking roster, so the admission window has
 # nothing to decide for them. It reads the store like a presubmit.
-if [ "${EVAL_TIER}" = "certification" ]; then
+if [ "${EVAL_TIER}" = "validated-capabilities" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # A run at a named reasoning effort never appends either: the version key

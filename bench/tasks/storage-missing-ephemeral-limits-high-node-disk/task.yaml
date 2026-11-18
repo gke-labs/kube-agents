@@ -30,7 +30,7 @@
 id: storage-missing-ephemeral-limits-high-node-disk
 name: "Container With No ephemeral-storage Limit Can Fill the Node's Boot Disk (missing-ephemeral-storage-limit check)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit

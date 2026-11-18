@@ -25,7 +25,7 @@
 id: ccc-untainted-node-pool-absorption
 name: "Untainted ComputeClass Node Pool Absorbing Untargeted Pods Until Exhausted (untainted-compute-class-pool)"
 domain: capacity
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - stockout-prevention

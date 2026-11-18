@@ -30,7 +30,7 @@
 id: observability-fluentbit-dcgm-cpu-throttling-oom
 name: "Log Collector Throttled at Its CPU Limit, Zero Restarts (collector CPU-throttling check)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit

@@ -100,7 +100,8 @@ func TestBuildProfileQuota(t *testing.T) {
 // that Job's pod may still be in its deletion grace period, which the pods
 // quota counts: the next Job's pod would then be refused. The quota adds a
 // second ceiling's worth for one terminating Job pod per slot, but only with
-// the chart's Job policy signal and a profile allowing the unattended tier.
+// the chart's Job policy signal and some profile bound: every profile has
+// Jobs then, a read-only one's permit-carrying tasks' (#5646).
 func TestTheProfileQuotaCoversTerminatingJobPods(t *testing.T) {
 	readOnly := testAgentProfile("test-ns", "a")
 	unattended := testAgentProfile("test-ns", "c", func(p *agentv1alpha1.AgentProfile) {
@@ -115,8 +116,11 @@ func TestTheProfileQuotaCoversTerminatingJobPods(t *testing.T) {
 	if got, want := pods(readOnly, unattended), int64(1*1+1+2*5); got != want {
 		t.Errorf("Job mode on, an unattended profile: pods = %d, want %d (a warm pool and its surge, and the ceiling twice)", got, want)
 	}
-	if got, want := pods(readOnly), int64(1*1+1+5); got != want {
-		t.Errorf("Job mode on, no unattended profile: pods = %d, want %d", got, want)
+	if got, want := pods(readOnly), int64(1*1+1+2*5); got != want {
+		t.Errorf("Job mode on, a read-only profile: pods = %d, want %d (its permit-carrying tasks run as Jobs)", got, want)
+	}
+	if got, want := pods(), int64(5); got != want {
+		t.Errorf("Job mode on, no profile: pods = %d, want %d", got, want)
 	}
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
 	if got, want := pods(readOnly, unattended), int64(1*1+1+5); got != want {
