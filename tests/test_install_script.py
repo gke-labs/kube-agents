@@ -8565,8 +8565,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         return get_isolated_test_env(overrides=overrides, absent=(
             "SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
             "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME", "SLACK_HOME_CHANNEL_POLICY",
-            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
-            "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
+            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "GOOGLE_CHAT_MODE",
+            "CHAT_TOPIC_NAME", "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
         ))
 
     def _run(self, body, install_env, extra_env=None):
@@ -8594,7 +8594,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     # integration's settings and nothing in the test exported them.
     _EMPTY_COMPANIONS = {
         "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\n",
-        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_MODE=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
     }
 
     def _check(self, tmp, content, flags, extra_env=None):
@@ -8650,6 +8650,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_HOME_CHANNEL_POLICY=auto\n", "--slack-home-channel-policy=manual", "SLACK_HOME_CHANNEL_POLICY", "--slack-home-channel-policy=manual"),
                 ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
                 ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
+                ("GOOGLE_CHAT_HOME_CHANNEL_POLICY=auto\n", "--google-chat-home-channel-policy=manual", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "--google-chat-home-channel-policy=manual"),
                 # A topic rename is a destroy and re-create of the Pub/Sub topic.
                 ("CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b", "CHAT_TOPIC_NAME", "--chat-topic-name=topic-b"),
                 ("GOOGLE_CHAT_MODE=default\n", "--google-chat-mode=debug", "GOOGLE_CHAT_MODE", "--google-chat-mode=debug"),
@@ -8839,6 +8840,35 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     path, proc, out = self._check(tmp, f"SLACK_HOME_CHANNEL_POLICY={value}\n", f"--slack-home-channel-policy={value}")
                     self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
 
+    def test_the_google_chat_policy_is_checked_the_same_way(self):
+        # main() runs require_google_chat_home_channel_policy beside Slack's,
+        # before the file check, with the flag named only when this run typed it.
+        source = _INSTALL_SH.read_text()
+        main = source[source.index("\nmain() {"):]
+        start = main.index('require_google_chat_home_channel_policy "${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"')
+        call = main[start:main.index("|| exit 1", start) + len("|| exit 1")]
+        self.assertIn("check_flags_against_install_env || exit 1", main[start:])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(f"parse_args --google-chat-home-channel-policy=sometimes; {call}; {self._CHECK}", path)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'sometimes'", out)
+            self.assertIn("--google-chat-home-channel-policy", out)
+            self.assertNotIn("QUEUED=", out)
+            path = self._file(tmp, "GOOGLE_CHAT_HOME_CHANNEL_POLICY=Manual\n")
+            proc = self._run(f"parse_args; {call}; {self._CHECK}", path)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("GOOGLE_CHAT_HOME_CHANNEL_POLICY is 'Manual'", out)
+            self.assertIn("Set it in install.env and run again", out)
+            self.assertNotIn("--google-chat-home-channel-policy", out)
+            for value in ("", "auto", "manual"):
+                with self.subTest(value=value):
+                    path, proc, out = self._check(tmp, f"GOOGLE_CHAT_HOME_CHANNEL_POLICY={value}\n",
+                                                  f"--google-chat-home-channel-policy={value}")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
     def test_a_bad_policy_this_run_did_not_type_is_sent_back_to_the_file(self):
         # The remedy names --slack-home-channel-policy only when this run typed
         # it. A flag cannot correct a value the file carries: the enum check
@@ -8954,6 +8984,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-home-channel-policy", "SLACK_HOME_CHANNEL_POLICY", "manual"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
+                ("--google-chat-home-channel-policy", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
                 ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
                 ("--google-chat-mode", "GOOGLE_CHAT_MODE", "debug"),
             ):
@@ -9015,9 +9046,11 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 (
                     "--enable-google-chat",
                     "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
-                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
+                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual "
+                    "GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
                     ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
-                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
+                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual",
+                     "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
                     ("CHAT_SUB_NAME",),
                 ),
             ):
@@ -10731,6 +10764,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
         "--slack-home-channel-policy": ("PARAM_SLACK_HOME_CHANNEL_POLICY", "manual"),
+        "--google-chat-home-channel-policy": ("PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
         "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
         "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),

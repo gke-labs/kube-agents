@@ -113,6 +113,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # (see the README).
 # enable_google_chat        = true
 # google_chat_allowed_users = ["you@example.com"]
+# google_chat_home_channel_policy = "auto"   # or "manual": with no google_chat_home_channel, "auto" learns it from the first mention in a named space
 
 # Model routing for the bundled LiteLLM gateway (defaults: gemini and the
 # provider's default model; set the matching *_api_key above).

@@ -764,6 +764,7 @@ PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
+PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY="${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Whether --model-default-name was typed: a switch to openai_compatible does not
 # carry over a model install.env pinned for another provider.
@@ -1064,6 +1065,10 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
+  --google-chat-home-channel-policy=POLICY
+                                auto (the default, also empty) or manual: sets
+                                spec.integration.googleChat.homeChannelPolicy on the
+                                PlatformAgent; the CRD reference describes the field
   --slack-bot-token=TOKEN       One workspace's Slack bot token (xoxb-...). The A2A
                                 gateway serves one workspace, with or without Google
                                 Chat: a comma-separated list is refused
@@ -1413,6 +1418,10 @@ parse_args() {
       --google-chat-home-channel=*)
         PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"
         note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL
+        shift ;;
+      --google-chat-home-channel-policy=*)
+        PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY="${1#*=}"
+        note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY
         shift ;;
       --migrate-node-pools=*)
         PARAM_MIGRATE_NODE_POOLS="${1#*=}"
@@ -2540,7 +2549,7 @@ record_gitops_forge_keys() {
 install_env_toggle_companions() {
   case "${1:-}" in
     SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
-    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_HOME_CHANNEL_POLICY GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
 }
@@ -3129,6 +3138,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
   write_env_var "$tmp" GOOGLE_CHAT_ENABLED "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   write_env_var "$tmp" GOOGLE_CHAT_HOME_CHANNEL "${GOOGLE_CHAT_HOME_CHANNEL:-}"
+  write_env_var "$tmp" GOOGLE_CHAT_HOME_CHANNEL_POLICY "${GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"
   write_env_var "$tmp" GOOGLE_CHAT_MODE "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   write_env_var "$tmp" SLACK_ENABLED "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   write_secret_env_var "$tmp" SLACK_BOT_TOKEN "${SLACK_BOT_TOKEN:-}"
@@ -7494,6 +7504,9 @@ main() {
   # refuse the disagreement, so that value is sent back to the file.
   require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
     "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
+  # GOOGLE_CHAT_HOME_CHANNEL_POLICY, on the same terms.
+  require_google_chat_home_channel_policy "${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"GOOGLE_CHAT_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
   # The chat flags against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -7780,6 +7793,7 @@ main() {
     exit 1
   fi
   local google_chat_home_channel="${PARAM_GOOGLE_CHAT_HOME_CHANNEL:-}"
+  local google_chat_home_channel_policy="${PARAM_GOOGLE_CHAT_HOME_CHANNEL_POLICY:-}"
   # Seeded from PARAM_SLACK_*, which carry both the --slack-* flags and the
   # loaded SLACK_* keys, so the non-interactive path can carry the Slack
   # settings: prompt_read keeps a non-empty current value there.
@@ -8861,6 +8875,7 @@ main() {
   export CHAT_SUB_NAME="$chat_sub_name"
   export GOOGLE_CHAT_ENABLED="$google_chat_enabled"
   export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
+  export GOOGLE_CHAT_HOME_CHANNEL_POLICY="$google_chat_home_channel_policy"
   export GOOGLE_CHAT_MODE="$google_chat_mode"
   export SLACK_ENABLED="$slack_enabled"
   export SLACK_BOT_TOKEN="$slack_bot_token"
