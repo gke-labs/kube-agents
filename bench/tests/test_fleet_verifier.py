@@ -1417,6 +1417,40 @@ _PATH_SCOPED_ABSENT_WITNESSES[
         },
     },
 }
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "obtainability-untargeted-compute-class-manifest/audit-did-not-add-the-compute-class-selector"
+] = {
+    # What the fix the case describes writes: the compute-class nodeSelector
+    # on the untargeted workload (`kubectl patch deployment app-worker-a -n
+    # seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'`).
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {
+                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    # As planted (defects-c.tf): no nodeSelector and no affinity on the template.
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {"containers": [{"name": "worker"}]},
+            },
+        },
+    },
+}
+
 
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.
@@ -1537,7 +1571,7 @@ YAML
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
-  "compute instances list"|"compute firewall-rules list"|"compute networks list")
+  "compute instances list"|"compute firewall-rules list"|"compute networks list"|"compute snapshots list")
     # A project-scoped probe. Planted by default: prints one name with the
     # filter's prefix. STUB_COMPUTE_ABSENT lists `<collection>:<prefix>` pairs
     # that are not there; STUB_COMPUTE_FAIL fails every list.
@@ -1965,7 +1999,7 @@ def test_the_runner_publishes_a_project_role_as_its_confirmed_list_alone(shell, 
         assert not any(line.startswith(f"slot.{role}=") for line in context), role
         for probe in entry["probes"]:
             kind, prefix = probe.split("/", 1)
-            collection = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}[kind]
+            collection = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots"}[kind]
             assert f"compute {collection} list --project kube-agents-evals --filter=name ~ ^{prefix[:-1]} --format=value(name)" in log
 
 

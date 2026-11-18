@@ -18,7 +18,7 @@
 # defect-to-scenario map, and the scheduled re-apply of this stack is what
 # keeps the defects planted (GKE auto-upgrade would otherwise quietly heal
 # seeded-b's version lag, and a well-meaning cleanup would delete the orphan
-# disks).
+# disks and snapshots).
 #
 # The label is deliberately NOT managed-by=kube-agents-bench: that label is
 # what the eval orphan sweep in modules/cluster/gke deletes clusters by, and
@@ -150,12 +150,13 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 }
 
 # The project-scoped fixtures (the startup-fail VM, the world-open firewall
-# rule and its VM, the peered mtu-peer-declared network; fixtures.json roles
-# with cluster_slot null) are Compute Engine objects, which container.viewer
-# cannot read. The CI health bot's scan runs every gcloud read as this
-# account, so the presence probe and the state pass list instances, firewall
-# rules and networks as it (#2483, #2682), and the state pass reads the
-# startup-fail VM's serial port output as it.
+# rule and its VM, the peered mtu-peer-declared network, the two orphaned
+# snapshots; fixtures.json roles with cluster_slot null) are Compute Engine
+# objects, which container.viewer cannot read. The CI health bot's scan runs
+# every gcloud read as this account, so the presence probe and the state pass
+# list instances, firewall rules, networks and snapshots as it (#2483, #2682),
+# and the state pass reads the startup-fail VM's serial port output and lists
+# the snapshots' source disks as it.
 # roles/compute.viewer is get and list on Compute Engine resources, with no
 # create, update or delete. It does show instance metadata and serial port
 # output (compute.instances.getSerialPortOutput), so no secret goes in this
@@ -923,6 +924,97 @@ resource "google_compute_disk" "orphan_pd" {
   zone  = var.zone
 
   labels = local.fleet_labels
+}
+
+# Posture (compute): two Persistent Disk snapshots whose source disk is gone.
+# The GCE compute audit's §2.5 (`orphaned-snapshots`) flags a snapshot whose
+# `sourceDisk` names no live disk, that no snapshot schedule took, and that is
+# more than 90 full days old. Its own exclusion names a legal hold or a
+# compliance retention the collector cannot read, which is why the check is
+# proposed as the stream's one declarable posture: once it is, the pool
+# project's GitOps knowledge/ note declares `declared-orphan-snap-<prefix>`
+# on purpose and the audit lists it under Declared intent, while
+# `orphan-snap-<prefix>`, undeclared, stays a finding beside it (the control
+# that shows a declaration moved one snapshot and not the check). Catalogue
+# roles: declared-orphan-snapshot and orphan-snapshot.
+#
+# No resource can hold the shape: a google_compute_snapshot needs its source
+# disk at create time, and a google_compute_disk the state holds is re-created
+# by the next apply, which un-orphans the snapshot. So orphan_snapshot.py
+# plants it once: a 10 GB throwaway disk, the two snapshots of it, then the
+# disk deleted. The snapshots are the fixture; the disk is scaffolding, and
+# nothing in the state names either, so no plan ever re-creates the disk.
+#
+# AGE-GATED, the longest in the fleet: invisible to the audit for 91 days
+# (`(now - creationTimestamp).days > 90`), and creationTimestamp is
+# server-set and immutable -- backdating is impossible, do not try. The
+# fixture-state scan reports the roles NOT READY, never drifted, until the
+# date, so a project applied today is registrable.
+#
+# With nothing of theirs in the state, the daily re-apply would never notice
+# a snapshot a sweep deleted or a source disk someone re-created, so the
+# probe below reads both at plan time and its result is a trigger: a change
+# in what is missing or in the disk's presence plans a replace of the
+# planter (the standing reconcile-allow.json entry), and the re-run re-takes
+# the missing snapshot, with a fresh clock, or deletes the disk (by name, in
+# any zone, as the audit indexes live disks), and never touches a snapshot
+# that is there. A broken reading carries the time of the
+# read (`read_at`), because the stored trigger is the reading of the plan
+# that replaced the resource, the broken one on a repairing run, and the
+# same breakage recurring before the next clean plan would otherwise read
+# equal to it and plan nothing; a clean reading is the same empty value every
+# time, so the run after a repair plans one more replace, a no-op, and then
+# converges. A changed name below is a new snapshot with a new clock; the
+# old one is deleted by hand. `tofu destroy` leaves the snapshots (a few MB
+# of stored blocks each); they are removed by hand too, and the compute plant
+# sweep does not read them.
+locals {
+  orphan_snapshot_source = "orphan-snap-source-${var.cluster_prefix}"
+  # Each entry's `name =` is the form bench/tests/test_fleet_verifier.py reads
+  # to check that a catalogue probe names an object this stack plants.
+  orphan_snapshots = [
+    { name = "declared-orphan-snap-${var.cluster_prefix}" },
+    { name = "orphan-snap-${var.cluster_prefix}" },
+  ]
+  orphan_snapshot_names = [for snapshot in local.orphan_snapshots : snapshot.name]
+}
+
+# What the planter would repair, read at plan time as the reconciler: the
+# snapshot names not there and whether the source disk is back.
+data "external" "orphan_snapshots" {
+  program = ["python3", "${path.module}/orphan_snapshot.py", "probe"]
+  query = {
+    project = var.project_id
+    zone    = var.zone
+    source  = local.orphan_snapshot_source
+    names   = jsonencode(local.orphan_snapshot_names)
+  }
+}
+
+resource "terraform_data" "orphan_snapshots" {
+  # A changed script, source or name re-runs the planter on every project, and
+  # so does a probe that reads a snapshot missing or the source disk present;
+  # the script leaves what is already planted alone.
+  triggers_replace = [
+    filesha256("${path.module}/orphan_snapshot.py"),
+    local.orphan_snapshot_source,
+    jsonencode(local.orphan_snapshot_names),
+    data.external.orphan_snapshots.result.missing,
+    data.external.orphan_snapshots.result.source_disk,
+    data.external.orphan_snapshots.result.read_at,
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["python3"]
+    command     = "${path.module}/orphan_snapshot.py"
+    environment = {
+      ORPHAN_SNAPSHOT_PROJECT = var.project_id
+      ORPHAN_SNAPSHOT_ZONE    = var.zone
+      ORPHAN_SNAPSHOT_SOURCE  = local.orphan_snapshot_source
+      ORPHAN_SNAPSHOT_NAMES   = jsonencode(local.orphan_snapshot_names)
+      ORPHAN_SNAPSHOT_LABELS  = jsonencode(local.fleet_labels)
+    }
+  }
 }
 
 # Defect (networking): an etcd port open to the whole internet on a VM with an
