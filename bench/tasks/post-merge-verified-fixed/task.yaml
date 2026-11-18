@@ -72,19 +72,22 @@ fixtures:
   - no-pdb-workload
 
 verification_spec:
-  - name: the-fix-was-opened-as-a-pull-request
-    role: objective
-    mode: assert
-    check:
-      type: pull_request_opened
-      owner: gke-agentic
-  # One assert call does the merge, the apply and the ticks; see the header.
+  # One fail-fast sequence: pull_request_opened checks that the reply names a
+  # pull request from this run before post_merge_outcome merges, applies and
+  # ticks it, so a run that opened no pull request is a graded fail at the
+  # first leaf, not a post_merge_outcome setup error at the coverage rung.
+  # One assert call of the second leaf does the merge, the apply and the
+  # ticks; see the header.
   - name: the-merged-fix-is-verified-fixed-and-reported-silently
     role: objective
     mode: assert
     check:
-      type: post_merge_outcome
-      owner: gke-agentic
-      outcome: verified_fixed
-      report: silent
-      apply_fixture_role: no-pdb-workload
+      type: sequence
+      checks:
+        - type: pull_request_opened
+          owner: gke-agentic
+        - type: post_merge_outcome
+          owner: gke-agentic
+          outcome: verified_fixed
+          report: silent
+          apply_fixture_role: no-pdb-workload
