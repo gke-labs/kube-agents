@@ -1049,6 +1049,7 @@ var DefaultBuiltInPlugins = []string{
 	"bootstrap_onboarding",
 	"pr_opened",
 	"chat_metrics",
+	"eval_run_tag",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -1594,6 +1595,8 @@ var frontDoorPlugins = []string{
 // records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
+	// eval_run_tag registers nothing unless KUBEAGENTS_EVAL_RUN_TAGS is on.
+	"eval_run_tag",
 }
 
 // kanbanDispatchIntervalSeconds and kanbanWakeOnEvents mirror the `kanban` block
@@ -5511,6 +5514,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// the roster run, by moving their next_run_at in the profile's own
 		// store, and adds no job, path, destination or credential.
 		"CRON_CATCH_UP_STAGGER_MINUTES": {},
+
+		// The eval run tag switch (deploy/docker/patches/eval_run_tag.py),
+		// which the chart renders from platformAgent.deployment.evalRunTags
+		// and only the eval deploy turns on. `1` (or true/yes/on) makes the
+		// API server record an incoming X-Kube-Agents-Eval-Run per session,
+		// stamps it on the cards that session files, and adds it to the
+		// headers of the agent's model requests, which the replay proxy logs
+		// and strips; any other value is off. It adds no path, destination,
+		// credential or code, and changes nothing the model reads.
+		"KUBEAGENTS_EVAL_RUN_TAGS": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

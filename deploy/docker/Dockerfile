@@ -1893,6 +1893,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # wraps. hermes_cli/ is the destination no chmod loop walks, hence install -m.
 # See the module docstring in deploy/docker/patches/kanban_origin.py.
 #
+# eval_run_tag: which eval run, case and repetition a model request serves,
+# for the replay proxy's log. hermes_cli/eval_run_tag.py is installed beside
+# kanban_origin, which calls it from the same two wrappers to stamp a card's
+# tag (side table kanban_task_eval_runs); apply_eval_run_tag.py makes the API
+# server's chat-completions and responses handlers record an incoming
+# X-Kube-Agents-Eval-Run for the turn's session in the Session KV server; the
+# eval_run_tag plugin (agents/platform/plugins) adds it to each model
+# request's headers. All of it is inert unless KUBEAGENTS_EVAL_RUN_TAGS is on.
+# The build counts the two awaited calls; verify_eval_run_tag.py checks each
+# follows every session_id assignment, the import is the real module, and the
+# switch gates the header. See the module docstring in
+# deploy/docker/patches/eval_run_tag.py.
+#
 # kanban_ended_run: a block from outside a card's run stops the run's worker,
 # and a worker whose run is over is told so (#2947). Upstream's block_task ends
 # the run but leaves the process running (archive_task stops it), and a refused
@@ -1985,6 +1998,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_origin.py \
      deploy/docker/patches/apply_kanban_origin.py \
      deploy/docker/patches/verify_kanban_origin.py \
+     deploy/docker/patches/eval_run_tag.py \
+     deploy/docker/patches/apply_eval_run_tag.py \
+     deploy/docker/patches/verify_eval_run_tag.py \
      deploy/docker/patches/kanban_ended_run.py \
      deploy/docker/patches/apply_kanban_ended_run.py \
      deploy/docker/patches/verify_kanban_ended_run.py \
@@ -2090,6 +2106,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'create_task = _kanban_origin_wrap_create_task(create_task)' /opt/hermes/hermes_cli/kanban_db.py && \
     grep -qF '_HANDLERS["create"] = _cmd_create' /opt/hermes/hermes_cli/kanban.py && \
     grep -qF '_HANDLERS["swarm"] = _cmd_swarm' /opt/hermes/hermes_cli/kanban.py && \
+    install -m 0644 /tmp/latency-patches/eval_run_tag.py /opt/hermes/hermes_cli/eval_run_tag.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_eval_run_tag.py /opt/hermes && \
+    test "$(grep -c 'await _kube_agents_eval_run_record(request, session_id)  # kube-agents patch: eval_run_tag' /opt/hermes/gateway/platforms/api_server_openai_routes.py)" = "2" && \
     cp /tmp/latency-patches/kanban_ended_run.py /opt/hermes/tools/kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_ended_run.py /opt/hermes && \
     test "$(grep -c '_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)' /opt/hermes/tools/kanban_tools.py)" = "2" && \
@@ -2130,6 +2149,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_origin.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_eval_run_tag.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \
     KUBE_AGENTS_REDACTOR_MODULE=/tmp/latency-patches/redactor.py \

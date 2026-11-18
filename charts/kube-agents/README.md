@@ -1086,6 +1086,12 @@ wins, and a `valueFrom` entry for it fails the render while the key is above `0`
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
 says what is counted and what a held triage does.
 
+`platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
+LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
+agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
+proxy logs and does not forward. `false`, the default, renders nothing. An entry with the same name
+in `platformAgent.deployment.env` wins.
+
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
 `failedSchedulingMinSpan`, `scaleUpHold`, `settle`, `quietAfter` and `autopilotScaleToZeroHold`.

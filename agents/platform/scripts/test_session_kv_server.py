@@ -1456,6 +1456,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/tasks/t-1", None),
         ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/sessions/sess-1/origin", None),
+        ("PUT", "/v1/sessions/sess-1/eval-run", {"eval_run": "devops-bench-abc/case-a/1"}),
+        ("GET", "/v1/sessions/sess-1/eval-run", None),
         ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
@@ -14310,6 +14312,62 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
             os.environ.pop(self.LIMIT, None)
             session_kv_server._load_dotenv_ignoring_operator_switches(path)
             self.assertIsNone(os.environ.get(self.LIMIT))
+
+
+class TestSessionEvalRun(unittest.TestCase):
+    """The session's eval run tag (deploy/docker/patches/eval_run_tag.py): first write wins, read through compression."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS session_eval_runs")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_no_table_reads_as_no_tag(self):
+        self.assertEqual(self.client.get("/v1/sessions/ev-none/eval-run").status_code, 404)
+
+    def test_the_first_write_wins(self):
+        first = self.client.put("/v1/sessions/ev-1/eval-run", json={"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put("/v1/sessions/ev-1/eval-run", json={"eval_run": "devops-bench-bb/case-b/2"})
+        self.assertEqual(second.json(), {"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(self.client.get("/v1/sessions/ev-1/eval-run").json(), {"eval_run": "devops-bench-aa/case-a/1"})
+
+    def test_a_malformed_tag_is_refused(self):
+        for bad in ("", "no-slashes", "a/b/c", "a/b/1\nX: y", 7, None):
+            response = self.client.put("/v1/sessions/ev-bad/eval-run", json={"eval_run": bad})
+            self.assertEqual(response.status_code, 400, bad)
+        self.assertEqual(self.client.get("/v1/sessions/ev-bad/eval-run").status_code, 404)
+
+    def test_the_session_metadata_row_is_not_touched(self):
+        self.client.put("/v1/sessions/ev-meta/eval-run", json={"eval_run": "devops-bench-aa/case-a/1"})
+        self.assertEqual(session_kv_server._session_metadata("ev-meta"), {})
+
+    def test_a_compressed_child_reads_its_parents_tag(self):
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('ev-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('ev-child', 'ev-root', NULL);
+                INSERT INTO sessions VALUES ('ev-other', 'ev-lone', NULL);
+                INSERT INTO sessions VALUES ('ev-lone', NULL, 'user_exit');
+                """
+            )
+        self.client.put("/v1/sessions/ev-root/eval-run", json={"eval_run": "devops-bench-aa/case-a/3"})
+        self.client.put("/v1/sessions/ev-lone/eval-run", json={"eval_run": "devops-bench-aa/case-b/1"})
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/ev-child/eval-run")
+            self.assertEqual(child.json(), {"eval_run": "devops-bench-aa/case-a/3"})
+            # A parent that did not end in compression is another conversation.
+            self.assertEqual(self.client.get("/v1/sessions/ev-other/eval-run").status_code, 404)
 
 
 class TestProposalOrigin(unittest.TestCase):

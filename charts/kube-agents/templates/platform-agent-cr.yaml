@@ -507,6 +507,15 @@ spec:
     {{- end }}
     {{- end }}
     {{- /*
+      deployment.evalRunTags renders KUBEAGENTS_EVAL_RUN_TAGS=1 when true, and
+      nothing when false, so a default render is unchanged. A name that
+      deployment.env also lists is skipped.
+    */}}
+    {{- $evalRunTagsName := "KUBEAGENTS_EVAL_RUN_TAGS" }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (not (hasKey $userEnvNames $evalRunTagsName)) }}
+    {{- $env = append $env (dict "name" $evalRunTagsName "value" "1") }}
+    {{- end }}
+    {{- /*
       The event watcher's settings in deployment.eventWatcher come next, as
       WATCHER_<NAME>. A name that deployment.env also lists is skipped, so the
       explicit entry wins, a valueFrom entry included: the operator forwards
