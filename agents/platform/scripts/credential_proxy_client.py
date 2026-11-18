@@ -588,9 +588,11 @@ def authorization_headers() -> dict[str, str]:
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
-# the task's end. Sent in this header on every exec, re-read on every call, so a
-# warm pod's next task presents its own. The broker confines the call to the
-# cluster the credential names (credential_proxy.TASK_CREDENTIAL_HEADER).
+# the task's end. Sent in this header on every exec and version-control call,
+# re-read on every call, so a warm pod's next task presents its own. The broker
+# confines an exec to the cluster the credential names, and admits a
+# version-control write only under its permit
+# (credential_proxy.TASK_CREDENTIAL_HEADER).
 TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
 TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 # The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
@@ -2272,6 +2274,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     # 401, and the stock opener would put a total socket timeout on a clone
     # that legitimately runs for minutes.
     headers.update(authorization_headers())
+    # A profile worker's task credential, as `execute` sends it: the broker
+    # refuses a profile caller's version-control verbs without one, and its
+    # permit is what admits the writes (#3993). Nothing outside task mode.
+    headers.update(task_credential_headers())
     request = urllib.request.Request(
         endpoint.rstrip("/") + f"/v1/vcs/{verb}",
         data=body,
@@ -2280,7 +2286,14 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     )
     try:
         with open_broker_request(request) as response:
-            return json.load(response)
+            answer = json.load(response)
+            if not isinstance(answer, dict):
+                # Valid JSON, but not an object, and every consumer reads the
+                # answer as one. A ValueError, as for a body that is not JSON:
+                # `vcs_client.call` has an arm for it. The type's name only,
+                # never the body.
+                raise ValueError(f"the broker's answer is JSON of type {type(answer).__name__}, not an object")
+            return answer
     except urllib.error.HTTPError as exc:
         try:
             answer = json.load(exc)

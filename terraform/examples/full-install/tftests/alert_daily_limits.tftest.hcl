@@ -53,8 +53,8 @@ variables {
 run "default_passes_no_alert_daily_limits" {
   command = apply
   assert {
-    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment), "alertDailyLimits")
-    error_message = "deployment: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment)}"
+    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment), "alertDailyLimits")
+    error_message = "deployment: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment)}"
   }
 }
 
@@ -64,8 +64,8 @@ run "all_null_passes_no_alert_daily_limits" {
     alert_daily_limits = { critical = null, drift = null }
   }
   assert {
-    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment), "alertDailyLimits")
-    error_message = "deployment: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment)}"
+    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment), "alertDailyLimits")
+    error_message = "deployment: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment)}"
   }
 }
 
@@ -75,11 +75,11 @@ run "only_the_set_keys_are_passed" {
     alert_daily_limits = { critical = 50, drift = 20 }
   }
   assert {
-    condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment.alertDailyLimits) == jsonencode({ critical = 50, drift = 20 })
-    error_message = "alertDailyLimits: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment.alertDailyLimits)}"
+    condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment.alertDailyLimits) == jsonencode({ critical = 50, drift = 20 })
+    error_message = "alertDailyLimits: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment.alertDailyLimits)}"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment.image.tag == var.image_tag
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment.image.tag == var.image_tag
     error_message = "the ceilings replaced the rest of the deployment block"
   }
 }
@@ -93,12 +93,12 @@ run "extra_helm_values_env_reaches_the_release_beside_the_ceilings" {
     }
   }
   assert {
-    condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment.alertDailyLimits) == jsonencode({ warning = 30 })
-    error_message = "alertDailyLimits: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.deployment.alertDailyLimits)}"
+    condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment.alertDailyLimits) == jsonencode({ warning = 30 })
+    error_message = "alertDailyLimits: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.deployment.alertDailyLimits)}"
   }
   assert {
-    condition     = jsonencode(yamldecode(helm_release.kube_agents.values[1]).platformAgent.deployment.env) == jsonencode([{ name = "EOD_EXCLUDE_NAMESPACES", value = "kube-system" }])
-    error_message = "extra_helm_values: ${helm_release.kube_agents.values[1]}"
+    condition     = jsonencode(yamldecode(helm_release.kube_agents[0].values[1]).platformAgent.deployment.env) == jsonencode([{ name = "EOD_EXCLUDE_NAMESPACES", value = "kube-system" }])
+    error_message = "extra_helm_values: ${helm_release.kube_agents[0].values[1]}"
   }
 }
 

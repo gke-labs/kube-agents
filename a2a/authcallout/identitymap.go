@@ -147,6 +147,14 @@ type Identity struct {
 	// working credential behind. Only on an entry that names its grants: a
 	// narrowed entry's lifetime is its pod's and its task credential's.
 	NotAfter *time.Time `json:"notAfter,omitempty"`
+
+	// Held names the profiles a NarrowingDispatcher entry must not be
+	// granted yet: bound, with their own entries in the map, but held until
+	// every bus server has loaded their config (the operator's profile hold,
+	// #5580). A bucket's grants are derived from the profile entries, so
+	// without this a held profile's bucket would be granted its subjects
+	// before the hold lifts (#5935). Set only with that narrowing.
+	Held []string `json:"held,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -321,6 +329,9 @@ func (id Identity) validate() error {
 	}
 	if id.Narrowing != NarrowingDispatcher && len(id.Draining) > 0 {
 		return fmt.Errorf("user %q lists draining profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
+	}
+	if id.Narrowing != NarrowingDispatcher && len(id.Held) > 0 {
+		return fmt.Errorf("user %q lists held profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
 	}
 	// Deny entries count: a narrowed entry carrying only a deny would still
 	// be a grant someone wrote into the map.

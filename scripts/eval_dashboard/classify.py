@@ -1241,6 +1241,9 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     else:
         matches = False
     headline, lede, verdict = headline_for(cases, run, matches, has_incident)
+    # A red only the forge safeguard explains carries the forge class and Do
+    # at run level, so the pages neither say "fix the PR" nor count it as one.
+    forge_red = headline == FORGE_RED_HEADLINE
     return dict(
         base,
         headline=headline,
@@ -1249,8 +1252,8 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         cases=cases,
         matches_incident=matches,
         setup_death=False,
-        cls=None,
-        do="",
+        cls=CLS_FORGE if forge_red else None,
+        do=DO_FORGE if forge_red else "",
         storm_reps=storm_reps(run),
         ceiling_reps=ceiling_reps(run),
     )

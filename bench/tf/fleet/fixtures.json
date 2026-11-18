@@ -1520,6 +1520,33 @@
         }
       ]
     },
+    "no-ephemeral-limit-workload": {
+      "cluster_slot": "c",
+      "namespace": "seeded-compute-class",
+      "probes": ["deployment/batch-worker-a"],
+      "fixture": "the same batch-worker-a Deployment, read for a second defect: its container sets no ephemeral-storage request or limit, as every planted workload in the fleet does (GKE Standard admission adds none, where Autopilot writes a 1Gi request and limit onto every container), so its writable layer and logs can fill the node's boot disk until the kubelet evicts pods under DiskPressure",
+      "state": [
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the pod runs; slot c must stay a cluster with no failing workload"
+        },
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "spec.template.spec.containers[?(@.name=='worker')].resources.limits.ephemeral-storage",
+          "op": "absent",
+          "why": "the defect is the missing limit; the remediation the case forbids is adding it"
+        },
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "spec.template.spec.containers[?(@.name=='worker')].resources.requests.ephemeral-storage",
+          "op": "absent",
+          "why": "the other half of the fix a check would compose; a request added by hand or by a LimitRange heals half the shape"
+        }
+      ]
+    },
     "untainted-compute-class-pool": {
       "cluster_slot": "c",
       "namespace": null,

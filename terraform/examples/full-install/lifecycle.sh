@@ -259,7 +259,11 @@ APPLY_OUTPUT_FILE=""
 # had landed -- and exits 1 like any failed apply. run_apply reads this line
 # as the operator's decision and retries nothing after it.
 readonly TERRAFORM_INTERRUPT_PATTERN='^(Interrupt received|Two interrupts received)'
-readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
+# The release has a count (install_helm_releases). A state from before it holds
+# the unindexed address until the next apply runs the moved block in main.tf,
+# and the guards below run before that apply, so they look for both.
+readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents[0]"
+readonly HELM_RELEASE_LEGACY_ADDRESS="helm_release.kube_agents"
 readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
 # The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
 readonly HELM_UNINSTALL_TIMEOUT="10m"
@@ -1004,8 +1008,14 @@ guard_cluster_ownership() {
 # does not serve. Same shape as guard_gsa_identity, for the same reason.
 guard_release_namespace() {
   load_state
-  local addr="$HELM_RELEASE_ADDRESS"
-  in_state "$addr" || return 0
+  local addr
+  if in_state "$HELM_RELEASE_ADDRESS"; then
+    addr="$HELM_RELEASE_ADDRESS"
+  elif in_state "$HELM_RELEASE_LEGACY_ADDRESS"; then
+    addr="$HELM_RELEASE_LEGACY_ADDRESS"
+  else
+    return 0
+  fi
 
   local recorded
   recorded=$(state_attr "$addr" namespace)
@@ -1813,7 +1823,7 @@ uninstall_helm_releases() {
   for addr in "${CLUSTER_ADDRESSES[@]}"; do
     in_state "$addr" && return 0
   done
-  for addr in "$HELM_RELEASE_ADDRESS" "$CERT_MANAGER_RELEASE_ADDRESS"; do
+  for addr in "$HELM_RELEASE_ADDRESS" "$HELM_RELEASE_LEGACY_ADDRESS" "$CERT_MANAGER_RELEASE_ADDRESS"; do
     in_state "$addr" && addresses+=("$addr")
   done
   [[ ${#addresses[@]} -gt 0 ]] || return 0

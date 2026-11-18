@@ -3723,6 +3723,28 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
             "is followed by an apply it needs KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true",
         )
 
+    def test_every_applying_generator_call_refuses_to_blank_a_secret_it_could_not_read(self):
+        """#6126: a generator call whose tfvars get applied must carry
+        KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true, or a failed read of the live
+        Secret writes its keys empty over the live values. install.sh and
+        upgrade.sh only apply, so every call site in either needs it; only
+        uninstall.sh, which destroys, goes without.
+        """
+        unguarded = []
+        for script in (_INSTALL_SH, _INSTALL_SH.parent / "upgrade.sh"):
+            lines = script.read_text().splitlines()
+            for index, line in enumerate(lines):
+                code_line = line.split("#", 1)[0].strip()
+                if not re.search(r"\bwrite_tfvars_from_state\b", code_line) or code_line.startswith("write_tfvars_from_state()"):
+                    continue
+                prefix, back = [line], index - 1
+                while back >= 0 and lines[back].rstrip().endswith("\\"):
+                    prefix.append(lines[back])
+                    back -= 1
+                if "KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true" not in "\n".join(prefix):
+                    unguarded.append(f"{script.name}:{index + 1}")
+        self.assertEqual(unguarded, [], "a generator call site that applies lacks KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true")
+
     def test_accepting_the_memory_prompts_unseeded_default_is_not_an_answer(self):
         """A bare enter on the memory menu must not count as a stated mode.
 
@@ -7347,6 +7369,7 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
     _GENERATOR = (
         "  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n"
         "    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n"
+        "    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \\\n"
         '    write_tfvars_from_state "$tfvars_file" "$image_tag"\n'
     )
     _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
@@ -9350,8 +9373,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            # One read of the whole Secret (-o json) holding both tokens.
+            f'  *"get secret platform-agent-secrets"*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"SLACK_BOT_TOKEN\": \"{bot_b64}\", \"SLACK_APP_TOKEN\": \"{app_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -9365,6 +9389,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
             env=env,
             kubectl_script=kubectl_stub,
+            # The cluster exists (recovery runs only then); get-credentials succeeds.
+            describe_stub="printf 'False\\n'; exit 0",
+            gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
