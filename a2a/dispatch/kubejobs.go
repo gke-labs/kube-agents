@@ -219,15 +219,6 @@ func (k *KubeJobs) forget(name string) {
 	delete(k.launched, name)
 }
 
-// legacyJobName is the name a dispatcher from before the kind was in it gave
-// the task's Job, its key joined with slashes. Delete removes a Job under it
-// only when the Job's own annotations say it is this task's; to go a release
-// on.
-func legacyJobName(profile, tier, taskID string) string {
-	sum := sha256.Sum256([]byte(profile + "/" + tier + "/" + taskID))
-	return "dispatch-" + hex.EncodeToString(sum[:10])
-}
-
 // ErrJobRefusedByPolicy marks a Launch the dispatcher Job admission policy
 // refused: the Job, built from the operator's template, didn't match the
 // policy's copy of it.
@@ -390,41 +381,5 @@ func (k *KubeJobs) Delete(ctx context.Context, profile, tier, kind, taskID strin
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	return k.deleteLegacy(ctx, profile, tier, kind, taskID)
-}
-
-// deleteLegacy deletes the Job a dispatcher from before the kind was in the
-// name launched for this task, and only that one: the Job under the legacy
-// name must say, by its own annotations, that it is this (profile, tier,
-// task)'s, and of this kind if it names one (an older Job names none), and
-// the delete is held to the UID that was read, so a Job made under the name
-// meanwhile is left alone.
-func (k *KubeJobs) deleteLegacy(ctx context.Context, profile, tier, kind, taskID string) error {
-	jobs := k.kube.BatchV1().Jobs(k.config().ProfileNamespace)
-	old, err := jobs.Get(ctx, legacyJobName(profile, tier, taskID), metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	// TODO(#6166): remove deleteLegacy a release after #5646.
-	a := old.Annotations
-	if a[jobProfileAnnotation] != profile || a[jobTierAnnotation] != tier || a[jobTaskAnnotation] != taskID {
-		return nil
-	}
-	// An older Job names no kind; a dispatcher from before #5646 ran
-	// top-level tasks on Jobs under that name, and a child's cleanup mustn't
-	// take one.
-	if got := a[jobKindAnnotation]; (got == "" && kind != lib.SubmitKindTop) || (got != "" && got != kind) {
-		return nil
-	}
-	err = jobs.Delete(ctx, old.Name, metav1.DeleteOptions{
-		PropagationPolicy: ptr.To(metav1.DeletePropagationBackground),
-		Preconditions:     &metav1.Preconditions{UID: &old.UID},
-	})
-	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-		return nil
-	}
-	return err
+	return nil
 }
