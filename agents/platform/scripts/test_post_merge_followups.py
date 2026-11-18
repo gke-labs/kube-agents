@@ -97,7 +97,8 @@ class FollowupsTest(unittest.TestCase):
         [(number, body)] = self.comments
         self.assertEqual(number, 1)
         self.assertIn("revert: diff too large", body)
-        self.assertIn(f"tried {pmf.FOLLOWUP_ATTEMPTS} times", body)
+        self.assertIn("could not open a revert or a pull request to stop auto-merging no-pdb fixes in dev", body)
+        self.assertIn("Revert this change by hand", body)
         self.assertTrue(body.endswith(post_merge_stepdown.MARKER))
         self.follow(script, minutes=30)
         self.assertEqual((len(script.calls), len(self.comments)), (pmf.FOLLOWUP_ATTEMPTS, 1))
@@ -131,6 +132,68 @@ class FollowupsTest(unittest.TestCase):
         self.assertEqual(len(script.calls), 1)
         self.assertEqual(self.row()["followup_state"], "failed")
         self.assertIn("base is protected", self.comments[0][1])
+
+    def test_a_long_answer_is_stored_whole_and_a_capped_run_reads_it_back(self):
+        # followup_detail used to be cut mid-JSON, and the capped run's json.loads then aborted the tick.
+        add_record(self.conn, 1, followup_state="retry", followup_attempts=pmf.FOLLOWUP_ATTEMPTS - 1)
+        add_record(self.conn, 2, outcome_at=NOW - timedelta(minutes=1))
+        long_errors = {"action": "retry", "errors": ["revert: " + "x" * 400, "step-down: " + "y" * 400]}
+        script = Script(**{pmf.STEPDOWN_SCRIPT: long_errors})
+
+        def refuse(repo, number, body):
+            raise RuntimeError("403")
+
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            pmf.run_followups(self.conn, script, ready_in=self.ready_in, comment=refuse,
+                              has_marker=lambda r, n, m: False, now=NOW)
+        detail = self.row()["followup_detail"]
+        self.assertLessEqual(len(detail), pmf.DETAIL_CHARS)
+        json.loads(detail)
+        seen = self.follow(script, minutes=5)
+        self.assertEqual(seen["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("revert: xxx", self.comments[0][1])
+        self.assertEqual(self.row(2)["followup_state"], "retry", "the record behind it still ran")
+
+    def test_a_detail_that_is_not_json_still_gives_up(self):
+        add_record(self.conn, 1, followup_state="retry", followup_attempts=pmf.FOLLOWUP_ATTEMPTS,
+                   followup_detail='{"action": "retry", "reason": "cut')
+        self.follow(Script())
+        self.assertEqual(self.row()["followup_state"], "failed")
+        self.assertEqual(len(self.comments), 1)
+
+    def test_a_retry_that_ages_out_before_the_cap_still_gets_the_give_up_comment(self):
+        add_record(self.conn, 1, outcome_at=NOW - timedelta(days=1, minutes=1), followup_state="retry",
+                   followup_attempts=2, followup_detail=json.dumps({"action": "retry", "reason": "base is protected"}))
+        script = Script()
+        seen = self.follow(script)
+        self.assertEqual((seen["failed"], script.calls), ([f"{REPO}/pull/1"], []))
+        self.assertIn("base is protected", self.comments[0][1])
+
+    def test_an_aged_out_give_up_the_forge_keeps_refusing_ends_after_two_days(self):
+        add_record(self.conn, 1, outcome_at=NOW - timedelta(days=2, minutes=1), followup_state="retry",
+                   followup_attempts=2)
+
+        def refuse(repo, number, body):
+            raise RuntimeError("403")
+
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            pmf.run_followups(self.conn, Script(), ready_in=self.ready_in, comment=refuse,
+                              has_marker=lambda r, n, m: False, now=NOW)
+        self.assertEqual(self.row()["followup_state"], "failed")
+        self.assertIn("not commented", json.loads(self.row()["followup_detail"])["gaveUp"])
+
+    def test_an_unreadable_outcome_time_is_old_not_new(self):
+        add_record(self.conn, 1)
+        self.conn.execute("UPDATE post_merge_records SET outcome_at = 'garbage'")
+        script = Script()
+        self.follow(script)
+        self.assertEqual((script.calls, self.row()["followup_state"]), ([], None))
+
+    def test_the_give_up_names_a_revert_that_did_open(self):
+        body = pmf.give_up_text({"kind": "no-pdb", "environment": "dev"},
+                                {"action": "retry", "revert": "https://x/pull/9", "errors": ["step-down: 502"]})
+        self.assertIn("I opened a revert (https://x/pull/9), but could not open a pull request to stop", body)
+        self.assertNotIn("by hand", body)
 
     def test_too_many_comments_gives_up_without_a_comment(self):
         add_record(self.conn, 1, followup_state="retry", followup_attempts=pmf.FOLLOWUP_ATTEMPTS - 1)

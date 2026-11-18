@@ -209,7 +209,9 @@ def report_outcomes(conn: sqlite3.Connection, mode: str, comment: Comment = forg
                     bucket, reported = "commented", stamp
             except Exception as exc:  # noqa: BLE001 — retried next tick; the marker stops a double post
                 logger.warning("post-merge check: could not comment on %s: %r", url, exc)
-                if (_since(record["outcome_at"], now) or timedelta(0)) <= REPORT_DEADLINE:
+                age = _since(record["outcome_at"], now)
+                # An outcome_at that cannot be read counts as past the deadline, not as new.
+                if age is not None and age <= REPORT_DEADLINE:
                     bucket, reported = "failed", RETRY_PREFIX + stamp
                 else:
                     bucket, reported = "given_up", GAVE_UP_PREFIX + stamp

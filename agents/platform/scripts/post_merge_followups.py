@@ -64,6 +64,11 @@ REVERT_BRANCH = "platform-agent/revert-{number}"
 STEPDOWN_MARKER = "<!-- kube-agents:post-merge-step-down -->"
 #: How much of the last failure the give-up comment quotes.
 REASON_CHARS = 300
+#: ``followup_detail``'s bound, and each string field's within it.
+DETAIL_CHARS = 500
+FIELD_CHARS = 200
+#: How long after the outcome a give-up comment the forge refuses is tried again.
+GIVE_UP_WINDOW = 2 * FOLLOWUP_WINDOW
 RETRY = "retry"
 FAILED = "failed"
 
@@ -155,12 +160,17 @@ def _reason(answer: dict) -> str:
 
 
 def give_up_text(record: dict, answer: dict) -> str:
-    """The one comment on a fix whose step-down reached :data:`FOLLOWUP_ATTEMPTS`."""
-    return (
-        f"Still broken after merge. I tried {FOLLOWUP_ATTEMPTS} times to open a revert and a pull request to stop "
-        f"auto-merging {record['kind']} fixes in {record['environment']}, and stopped. The last attempt failed: "
-        f"{_reason(answer)}. Revert this change by hand if it is still needed.\n\n{STEPDOWN_MARKER}"
-    )
+    """The one comment on a fix whose step-down stopped being retried, saying what did and did not open."""
+    target = f"a pull request to stop auto-merging {record['kind']} fixes in {record['environment']}"
+    revert = answer.get("revert")
+    if isinstance(revert, str) and revert:
+        done = f"I opened a revert ({revert}), but could not open {target}"
+        advice = ""
+    else:
+        done = f"I could not open a revert or {target}"
+        advice = " Revert this change by hand if it is still needed."
+    return (f"Still broken after merge. {done}, and stopped trying. The last attempt failed: "
+            f"{_reason(answer)}.{advice}\n\n{STEPDOWN_MARKER}")
 
 
 def _give_up(record: dict, answer: dict, comment: Comment, has_marker: HasMarker) -> str:
@@ -174,6 +184,26 @@ def _give_up(record: dict, answer: dict, comment: Comment, has_marker: HasMarker
     return "commented"
 
 
+def _detail(answer: dict) -> str:
+    """``answer`` as ``followup_detail``: whole JSON within :data:`DETAIL_CHARS`, never cut mid-document."""
+    bounded = {key: (value[:FIELD_CHARS] if isinstance(value, str) else value) for key, value in answer.items()}
+    if isinstance(bounded.get("errors"), list):
+        bounded["errors"] = [str(error)[:FIELD_CHARS] for error in bounded["errors"][:3]]
+    text = json.dumps(bounded, sort_keys=True)
+    if len(text) <= DETAIL_CHARS:
+        return text
+    keep = {key: bounded[key] for key in ("action", "revert", "gaveUp") if isinstance(bounded.get(key), str)}
+    return json.dumps({**keep, "reason": _reason(answer)}, sort_keys=True)
+
+
+def _load_detail(text: object) -> dict:
+    try:
+        found = json.loads(str(text or "{}"))
+    except ValueError:
+        return {"reason": str(text)}
+    return found if isinstance(found, dict) else {"reason": str(text)}
+
+
 def run_followups(conn: sqlite3.Connection, script: SandboxScript = sandbox_script,
                   ready_in: ReadyIn = module_ready_in, comment: Comment = forge_comment,
                   has_marker: HasMarker = forge_has_marker, now: datetime | None = None,
@@ -182,7 +212,9 @@ def run_followups(conn: sqlite3.Connection, script: SandboxScript = sandbox_scri
 
     Writes ``followup_state`` (the script's ``action``, ``retry`` while it is
     retried, ``failed`` once given up), ``followup_attempts`` and
-    ``followup_detail``. At most ``limit`` scripts run a call.
+    ``followup_detail``. At most ``limit`` records are acted on a call. A
+    step-down still in ``retry`` when its outcome turns :data:`FOLLOWUP_WINDOW`
+    old is given up as if capped, and its give-up comment posted.
     """
     now = now or datetime.now(timezone.utc)
     seen: dict[str, list[str]] = {
@@ -192,19 +224,22 @@ def run_followups(conn: sqlite3.Connection, script: SandboxScript = sandbox_scri
     for values in conn.execute(FOLLOWUP_SQL).fetchall():
         record = dict(zip(FOLLOWUP_COLUMNS, values))
         url, attempts = record["url"], int(record["followup_attempts"] or 0)
-        if (_since(record["outcome_at"], now) or timedelta(0)) > FOLLOWUP_WINDOW:
-            continue
+        # An outcome_at that cannot be read counts as old: never acted on fresh, never retried for ever.
+        age = _since(record["outcome_at"], now)
+        expired = age is None or age > FOLLOWUP_WINDOW
+        if expired and record["followup_state"] != RETRY:
+            continue  # an old outcome is not followed up, so turning the switch on does not act on history
         if record["environment"] is None:
             seen["waiting"].append(url)
             continue
         if ran >= limit:
             break
-        updates: dict[str, object] = {}
-        if attempts >= FOLLOWUP_ATTEMPTS:
-            # Capped, and the give-up comment did not land last time: only the comment is tried.
-            action, answer = RETRY, json.loads(record["followup_detail"] or "{}") if record["followup_detail"] else {}
+        ran += 1
+        if expired or attempts >= FOLLOWUP_ATTEMPTS:
+            # Out of time or out of attempts: nothing more is run, only the give-up is said.
+            action, answer = RETRY, _load_detail(record["followup_detail"])
+            give_up = True
         else:
-            ran += 1
             base = ["--repo", record["repo"], "--number", record["number"], "--kind", record["kind"],
                     "--environment", record["environment"]]
             try:
@@ -224,18 +259,19 @@ def run_followups(conn: sqlite3.Connection, script: SandboxScript = sandbox_scri
                 action, answer = RETRY, {"reason": str(exc)}
             if action == RETRY:
                 attempts += 1
-        state = action
-        if action == RETRY and attempts >= FOLLOWUP_ATTEMPTS:
-            state = FAILED
-            if record["outcome"] == STILL_BROKEN:
-                try:
-                    answer = {**answer, "gaveUp": _give_up(record, answer, comment, has_marker)}
-                except Exception as exc:  # noqa: BLE001 — the comment is tried again next run
-                    logger.warning("post-merge check: could not tell %s the step-down stopped: %r", url, exc)
+            give_up = action == RETRY and attempts >= FOLLOWUP_ATTEMPTS
+        state = FAILED if give_up else action
+        if give_up and record["outcome"] == STILL_BROKEN:
+            try:
+                answer = {**answer, "gaveUp": _give_up(record, answer, comment, has_marker)}
+            except Exception as exc:  # noqa: BLE001 — the comment is tried again, for a bounded time
+                logger.warning("post-merge check: could not tell %s the step-down stopped: %r", url, exc)
+                if age is not None and age <= GIVE_UP_WINDOW:
                     state = RETRY
-        updates.update(followup_state=state, followup_attempts=attempts,
-                       followup_detail=json.dumps(answer, sort_keys=True)[:500])
-        if not _update(conn, url, updates, "the follow-up"):
+                else:
+                    answer = {**answer, "gaveUp": f"not commented: {exc}"}
+        if not _update(conn, url, {"followup_state": state, "followup_attempts": attempts,
+                                   "followup_detail": _detail(answer)}, "the follow-up"):
             seen["errors"].append(url)
             continue
         if state == FAILED:

@@ -440,13 +440,13 @@ object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload)
 (`health_baseline`) for the health window, a later step. A workload that is gone or cannot be judged
 fails with the reason in `health_result` and `health_detail`; any other read failure is kept and
 retried. The edit, revert and outcome
-columns are left for the later steps. `cleanup_old_records` leaves the table: each row
+columns are left for the later steps (the follow-ups below write `reverted_at`). `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 
 The report step is `post_merge_check.py report` (`post_merge_report.py`), under the same switch and
-per-run cap and likewise unscheduled. It takes each record with an `outcome` and no `reported_at`. At
-`silent` it stamps `reported_at` and posts nothing, so turning `report` on later does not post old
-outcomes. At `report` it comments once on the fix pull request, from a fixed text per outcome (never
+likewise unscheduled. It takes each record with an `outcome` and no `reported_at`. At `silent` it
+stamps every such record's `reported_at` and posts nothing, so turning `report` on later does not post old
+outcomes. At `report` it reads at most `READS_PER_TICK` pull requests a run and comments once on each, from a fixed text per outcome (never
 the outcome's detail, which can carry cluster output) ending in a hidden marker; it looks for the
 marker first, so a restart between the comment and the stamp never posts twice. A pull request whose
 comments do not fit in one read is not commented, and a comment the forge refuses is retried for a
@@ -456,9 +456,10 @@ The follow-ups (`post_merge_followups.py`, likewise unscheduled) act once on a `
 `verified_fixed` record with an `environment`, within a day of the outcome. `still_broken` runs
 `post_merge_stepdown.py` in the shell sandbox; `verified_fixed` reads `clean_merges.ready_in` here and
 runs `post_merge_offer.py` only when it says ready. The script's answer goes in `followup_state` and
-`followup_detail`. A `retry` is run again, `FOLLOWUP_ATTEMPTS` (5) times in all, and then
-`followup_state` is `failed`; a step-down that fails that way comments once on the fix, behind the
-step-down's marker. `reverted_at` is stamped once the revert a step-down opened merges, watched for
+`followup_detail`. A `retry` is run again, `FOLLOWUP_ATTEMPTS` (5) times in all or until the outcome
+is a day old, and then `followup_state` is `failed`; a step-down that ends that way comments once on
+the fix, behind the step-down's marker, saying what did and did not open. Nothing fills `environment`
+yet, so every record waits. `reverted_at` is stamped once the revert a step-down opened merges, watched for
 eight days.
 
 `GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
