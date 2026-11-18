@@ -1,0 +1,22 @@
+# The a2a-worker image's system git config (/etc/gitconfig, a2a/Dockerfile.worker).
+#
+# git here works on local working copies only. A profile's version-control
+# skill clones and publishes through scripts/vcs.py, which asks the credential
+# broker; this git never talks to a remote and never holds a credential:
+#
+#   - no credential helper, so git has nowhere to store or fetch one;
+#   - every transport refused but `file`, so fetch, push, clone and ls-remote
+#     against an https, http, ssh, git or ext URL fail with
+#     "transport '<name>' not allowed", while a local path or bundle works.
+#
+# This is a default, not the boundary: the model owns its environment and can
+# point git at another config. The image also deletes git's HTTP remote helpers
+# and ships no ssh client, the pod holds no forge credential, and the profile
+# namespace's NetworkPolicy lets a worker reach only DNS, the bus, LiteLLM and
+# the broker. tests/test_worker_git_config.py runs git under this file.
+[credential]
+	helper =
+[protocol]
+	allow = never
+[protocol "file"]
+	allow = always

@@ -64,11 +64,13 @@ RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
 # those crash after the broker has already run the command. jq is installed
 # too, because the cluster agent's persona requires it (requires.commands in
 # agents/cluster/persona/persona.yaml): its skills filter gcloud and kubectl
-# JSON with it. It holds no credential. No native gcloud, gh or git exist in
-# this image, and the guard below keeps it so. With the flag off the pod has no
-# KUBE_PROXY_URL or CREDENTIAL_PROXY_URL. gh and git are deliberately not
-# linked: the broker's session role refuses them anyway, and a name that is not
-# on PATH is a clearer answer. The forwarder itself lives under libexec, off
+# JSON with it. It holds no credential. git is installed for the persona's
+# version-control skill, credential-free and local-only (the layer after the
+# shim says how). No native gcloud or gh exist in this image, and the guard
+# below keeps it so. With the flag off the pod has no KUBE_PROXY_URL or
+# CREDENTIAL_PROXY_URL. gh and git are deliberately not linked to the shim: the
+# broker's session role refuses them anyway, and the forge is reached through
+# the version-control verbs. The forwarder itself lives under libexec, off
 # PATH, so the only shim on PATH is gcloud.
 ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
@@ -77,7 +79,7 @@ COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 # The wrapper below asks this first, and starts Python only when the context is not registered yet.
 COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq git \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c 'import yaml' \
     && jq --version \
@@ -122,11 +124,59 @@ COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/creden
 RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py \
     && python3 -v /opt/credential-proxy/libexec/credential-proxy-exec --help 2>&1 \
        | grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
+# The version-control skill a profile persona carries (its scripts/vcs.py, a
+# copy of agents/platform/skills/version-control/scripts/vcs.py) imports
+# vcs_client from here, beside the broker client: vcs.py appends this directory
+# to its path. These three are vcs_client's whole import closure besides
+# credential_proxy_client, and the import below fails the build if that stops
+# being true. Root-owned and read-only to the node user, like the client.
+COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
+     agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/repo_ref.py \
+     /opt/credential-proxy/libexec/
+# git for that skill's local half: the working copy `clone` unpacks from a
+# bundle, and `commit` and `publish` on it. It holds no credential and reaches
+# no remote. deploy/shared/worker-gitconfig, the system config, sets no
+# credential helper and refuses every transport but `file`. That is a default
+# the model can override, so the HTTP remote helpers are deleted too, as in the
+# sandbox image (deploy/sandbox/Dockerfile says why deletion and not config is
+# what holds there), and no ssh client is installed. The probes match git's
+# message rather than its exit status, since example.invalid fails to resolve
+# whatever the image holds: refused by the config, then, with the config
+# overridden, no helper to run. The last probe is the file transport working,
+# so a git broken outright doesn't pass for a git disarmed.
+COPY --chmod=0644 deploy/shared/worker-gitconfig /etc/gitconfig
+RUN rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
+          /usr/lib/git-core/git-remote-ftp /usr/lib/git-core/git-remote-ftps \
+    && for helper in http https ftp ftps; do \
+         if [ -e "/usr/lib/git-core/git-remote-${helper}" ]; then \
+           echo "worker git still has a remote transport: ${helper}" >&2; exit 1; \
+         fi; \
+         git ls-remote "${helper}://example.invalid/x.git" 2>&1 \
+           | grep -q "transport '${helper}' not allowed" \
+           || { echo "worker git does not refuse ${helper}:// by config" >&2; exit 1; }; \
+         git -c "protocol.${helper}.allow=always" ls-remote "${helper}://example.invalid/x.git" 2>&1 \
+           | grep -qE "'remote-${helper}' is not a git command|Unable to find remote helper" \
+           || { echo "worker git still resolves a ${helper} transport" >&2; exit 1; }; \
+       done \
+    && for client in ssh scp sftp; do \
+         if command -v "${client}" >/dev/null 2>&1; then \
+           echo "worker image has an ssh client: ${client}" >&2; exit 1; \
+         fi; \
+       done \
+    && git ls-remote ssh://example.invalid/x 2>&1 | grep -q "transport 'ssh' not allowed" \
+    && test -z "$(git config --system --get-all credential.helper)" \
+    && git init -q /tmp/vcs-guard \
+    && git -C /tmp/vcs-guard -c user.name=g -c user.email=g@x commit -q --allow-empty -m g \
+    && git -C /tmp/vcs-guard bundle create /tmp/vcs-guard.bundle --all \
+    && git clone -q /tmp/vcs-guard.bundle /tmp/vcs-guard-clone \
+    && rm -rf /tmp/vcs-guard /tmp/vcs-guard.bundle /tmp/vcs-guard-clone \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -I -c "import sys; sys.path.append('/opt/credential-proxy/libexec'); import vcs_client, gitops_workspace, repo_ref"
 RUN mkdir -p /opt/credential-proxy/bin \
     && for binary in gcloud; do \
          ln -s /opt/credential-proxy/libexec/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
        done \
-    && for binary in gcloud gh git; do \
+    && for binary in gcloud gh; do \
          if command -v "${binary}" >/dev/null 2>&1; then \
            echo "unexpected credential-aware CLI in the worker image: ${binary}" >&2; exit 1; \
          fi; \
@@ -148,8 +198,13 @@ RUN mkdir -p /home/node/.claude /scratch \
 COPY --from=build /out/claude/CLAUDE.md /home/node/.claude/CLAUDE.md
 COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
 USER node
+# vcs_client's git and working copies: the image's git, and the worker's
+# scratch volume, which the worker empties after every task (the root
+# filesystem is read-only on a profile worker).
 ENV HOME=/home/node \
     CLAUDE_CONFIG_DIR=/home/node/.claude \
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
+    KUBE_AGENTS_LOCAL_GIT=/usr/bin/git \
+    KUBE_AGENTS_VCS_ROOT=/scratch/vcs
 
 ENTRYPOINT ["/usr/local/bin/worker-adapter"]
