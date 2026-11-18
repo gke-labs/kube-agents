@@ -239,7 +239,7 @@ def forge_contains(repo: str, ancestor: str, revision: str) -> bool | None:
 
 
 #: ``paths(repo, number)`` -> the files the pull request changed; None when unknown.
-Paths = Callable[[str, int], "list[str] | None"] | None
+Paths = Callable[[str, int, "str | None"], "list[str] | None"] | None
 DIFF_GIT_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$")
 DIFF_RENAME_RE = re.compile(r"^rename (?:from|to) (.+)$")
 DIFF_PATH_RE = re.compile(r'^(?:\+\+\+|---) (?:"([ab]/(?:[^"\\]|\\.)*)"|([ab]/.*?))\t?$')
@@ -268,8 +268,18 @@ def _unquote(text: str) -> str:
         return out.decode("utf-8", "replace")
 
 
-def diff_paths(diff: str) -> list[str]:
+def _names(text: str, name: str) -> bool:
+    """Whether ``text`` holds ``name`` as a whole word (``checkout`` in ``app: checkout`` or ``checkout-pdb``)."""
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", text) is not None
+
+
+def diff_paths(diff: str, name: str | None = None) -> list[str]:
     """The files a unified diff changes, old and new names both, in order of appearance.
+
+    With ``name``, only the files whose section of the diff (its paths or its
+    changed lines) holds ``name`` as a whole word: the files that carry the
+    workload, so a reconciler that delivers some other file of the same pull
+    request is not taken to deliver the fix.
 
     Only a file's header is read (from ``diff --git`` to its first ``@@``), so
     a content line that happens to start ``--- a/`` is not taken for a path:
@@ -278,16 +288,25 @@ def diff_paths(diff: str) -> list[str]:
     file or a forge's collapsed entry with no ``---``/``+++`` lines.
     """
     found: list[str] = []
+    section: list[str] = []
+    mentioned = name is None
     in_header = False
 
     def add(path: str) -> None:
-        if path and path not in found:
-            found.append(path)
+        if path and path not in section:
+            section.append(path)
+
+    def close() -> None:
+        if mentioned or any(_names(path, name) for path in section):
+            found.extend(path for path in section if path not in found)
+        section.clear()
 
     # Split on "\n" alone, as git does: splitlines() also breaks on a bare "\r" or U+2028
     # inside a changed line, which could start a header that is not one.
     for line in (raw.removesuffix("\r") for raw in diff.split("\n")):
         if line.startswith("diff --git "):
+            close()
+            mentioned = name is None
             in_header = True
             simple = DIFF_GIT_RE.match(line)
             if simple:
@@ -298,6 +317,8 @@ def diff_paths(diff: str) -> list[str]:
             in_header = False
             continue
         if not in_header:
+            if not mentioned and line[:1] in "+-" and _names(line[1:], name):
+                mentioned = True
             continue
         match = DIFF_PATH_RE.match(line)
         if match:
@@ -305,13 +326,15 @@ def diff_paths(diff: str) -> list[str]:
             continue
         renamed = DIFF_RENAME_RE.match(line)
         if renamed:
-            name = renamed.group(1)
-            add(_unquote(name[1:-1]) if name.startswith('"') and name.endswith('"') else name)
+            renamed_to = renamed.group(1)
+            add(_unquote(renamed_to[1:-1]) if renamed_to.startswith('"') and renamed_to.endswith('"') else renamed_to)
+    close()
     return found
 
 
-def forge_paths(repo: str, number: int) -> list[str] | None:
-    """The files pull request ``number`` changed, from the forge's diff; None when it cannot say."""
+def forge_paths(repo: str, number: int, name: str | None = None) -> list[str] | None:
+    """The files pull request ``number`` changed that name ``name`` (:func:`diff_paths`), from the
+    forge's diff; None when it cannot say or no file names it."""
     try:
         import forge
 
@@ -328,7 +351,7 @@ def forge_paths(repo: str, number: int) -> list[str] | None:
         # narrow the match to the reconcilers of those files for good.
         return None
     try:
-        return diff_paths(diff) or None
+        return diff_paths(diff, name) or None
     except ValueError as exc:  # an escape no path decodes (\\400): unknown, never a crash
         logger.warning("post-merge check: could not read the files of %s#%s: %r", repo, number, exc)
         return None
@@ -364,7 +387,9 @@ def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict],
     applied once that one has synced.
 
     A Config Sync RootSync names no namespace: it counts when its source is a
-    git ``repo`` and its ``dir`` holds one of ``paths``. Without ``paths`` no
+    git ``repo`` and its ``dir`` holds one of ``paths``, which ``watch_health``
+    narrows to the files that name the record's workload, so a RootSync that
+    delivers some other file of the pull request never counts. Without ``paths`` no
     RootSync counts, and with nothing else delivering the fix it is observed
     directly. ``lists`` maps the resource names above to their ``kubectl get
     -A -o json`` answers. ``paths`` may be a function, called only when they
@@ -643,7 +668,8 @@ def watch_health(
                 # A merged pull request's files never change: read them once and keep them on the row.
                 if record["changed_paths"]:
                     return json.loads(record["changed_paths"])
-                found = paths(record["repo"], record["number"])
+                workload = str(record["object"] or "").rpartition("/")[2]
+                found = paths(record["repo"], record["number"], workload) if workload else None
                 if found:
                     updates["changed_paths"] = json.dumps(found)
                 else:
@@ -666,7 +692,7 @@ def watch_health(
                 state = OBSERVED if applied else reconciler_sync.PENDING
                 detail = f"no reconciler targets {record['namespace'] or 'default'}; {direct}"
             if unknown:
-                detail = f"files unknown: no RootSync counts and no path narrows the match; {detail}"
+                detail = f"the workload's files unknown: no RootSync counts and no path narrows the match; {detail}"
             updates["sync_state"] = f"{state}: {detail}"[:500]
             if applied:
                 updates["applied_at"] = stamp
