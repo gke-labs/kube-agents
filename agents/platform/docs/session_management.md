@@ -423,8 +423,12 @@ whose `cluster_identity` names that cluster (all three parts must match for the 
 `<project>/<location>/<name>`), empty when none names it or the profiles that do disagree. The finding itself is
 still the opener's word, so the check verifies the fix rather than trusting the row. `repo` is read
 off the pull request url, and the thread is the one the opening card reports to: empty outside a
-kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it
-(the plugin does not). The merge step is `post_merge_check.py notice`,
+kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it,
+and is `NULL` otherwise (the plugin does not send it). `post_merge_environment.py fill` fills it for a `verified_fixed` or
+`still_broken` record: the cluster's resource labels, read with `gcloud` in the shell sandbox and
+resolved by `automation_rules.cluster_environment`, or `""` when there is no such label. It runs under
+the same switch, reads at most `READS_PER_TICK` clusters a run, and is likewise unscheduled. A cluster
+it cannot read is retried for a day after the outcome, then given `""`. The merge step is `post_merge_check.py notice`,
 one run of which reads at most `READS_PER_TICK` (20) waiting records' pull requests, least recently
 read first, and reads nothing while the switch is `off`; no job schedules it yet. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
