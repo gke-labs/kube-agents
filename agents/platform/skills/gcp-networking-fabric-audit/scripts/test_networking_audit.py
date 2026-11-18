@@ -2311,10 +2311,13 @@ class NodeLocalDnsCacheTest(unittest.TestCase):
 
     def test_a_partial_listing_and_a_cluster_with_no_add_ons_are_limitations(self):
         warning = "WARNING: The following zones did not respond: us-east1-b. List results may be incomplete."
-        entry = self.collect(**{"clusters list": Warned([self.cluster("bare")], warning)})
+        entry = self.collect(**{"clusters list": Warned([self.cluster("bare"), self.cluster("other")], warning)})
         self.assertEqual(entry["candidates"], [])
         self.assertIn("Cluster add-ons partially read", entry["limitations"])
-        self.assertIn("missing-nodelocal-dnscache was not decided for us-central1-a/bare", entry["limitations"])
+        self.assertIn(
+            "missing-nodelocal-dnscache was not decided for us-central1-a/bare, us-central1-a/other:",
+            entry["limitations"],
+        )
 
     def test_the_fleet_run_lists_each_projects_clusters_once(self):
         calls = []

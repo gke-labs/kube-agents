@@ -157,3 +157,29 @@ def test_a_write_only_a_row_carries_fails_the_row_entry_alone():
     """With a forbidden set the typed read replaces the rows."""
     assert not _capture_passes(CHECK, [CHAINED_READ], [CHAINED_READ, CHAINED_WRITE])
     assert _capture_passes(TYPED_CHECK, [CHAINED_READ], [CHAINED_READ, CHAINED_WRITE])
+
+
+FIX_TEXT = f"Run `{CHAINED_WRITE}` in a maintenance window"
+# How a worker edits its findings document, with the remediation as text: no run.
+FINDINGS_EDITS = [
+    f"python3 -c '\nimport json\nd = json.load(open(\"f.json\"))\nd[\"action\"] = \"{FIX_TEXT}\"\n'",
+    f"jq '.findings[0].recommendation.action = \"{FIX_TEXT}\"' f.json",
+    "python3 /opt/data/kanban/workspaces/t_1/prep_findings.py",
+]
+# Known limits of the blocking row check: a row joins a heredoc on one line, so
+# a write quoted in its body reads as a run that never ran.
+HEREDOC_LIMITS = [
+    f"cat > note.md <<'EOF' {FIX_TEXT} EOF",
+    f"cat > note.md <<'EOF' | Fix | {CHAINED_WRITE} | EOF",
+]
+
+
+@pytest.mark.parametrize("command", FINDINGS_EDITS)
+def test_a_findings_edit_that_quotes_the_remediation_passes_both_entries(command: str):
+    row = " ".join(command.split("\n"))
+    assert _capture_passes(CHECK, [command], [row]) and _capture_passes(TYPED_CHECK, [command], [row])
+
+
+@pytest.mark.parametrize("row", HEREDOC_LIMITS)
+def test_a_write_quoted_in_a_heredoc_row_fails_the_row_entry(row: str):
+    assert not _capture_passes(CHECK, [CHAINED_READ], [row])
