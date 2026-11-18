@@ -24,7 +24,7 @@
 id: ccc-toleration-missing-equal-operator
 name: "ComputeClass Toleration Written Without an Operator (ccc-toleration-operator-mismatch)"
 domain: capacity
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - stockout-prevention

@@ -8,6 +8,8 @@ shared helpers two of them source live in the sibling [`../installer/`](../insta
 | Script                                     | What it does                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `dev_rebuild_agent.sh`                     | Rebuilds the agent image and the two that follow its tag, and redeploys (see below)     |
+| `profile_kubectl_costs.py`                 | Profiles each fleet-wide `kubectl get` and writes `deploy/sandbox/kubectl-costs.json`   |
+| `profile_kubectl_costs_job.sh`             | Runs that profiler as a Job on a tier's reference cluster                               |
 | `repeat_under_load.sh`                     | Runs a new or changed test several times under CPU load; prints the PR body's line      |
 | `setup-gcp-github-wif.sh`                  | Workload Identity Federation for CI, documented below                                   |
 | `teardown_dev_01_gcp_artifact_registry.sh` | Deletes the throwaway dev Artifact Registry this tooling created                        |

@@ -1231,9 +1231,8 @@ const (
 
 	// kubeagentsModeEnvKey is the managed .env key an agent image from before
 	// the removal of spec.mode today reads to learn which stack it runs, and
-	// kubeagentsModeValue the one answer. The agent image's runtime_mode.py
-	// still reads it; the pin goes once no supported agent image predates the
-	// removal.
+	// kubeagentsModeValue the one answer. Nothing in the current image reads
+	// it; the pin goes once no supported agent image predates the removal.
 	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
 	kubeagentsModeValue  = agentv1alpha1.PlatformAgentModeNext
 )
@@ -5020,9 +5019,14 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				// not built, so one consumer pulls it. The audience is what
 				// the broker confers the a2a-chat role by; the legacy chat
 				// caller's audience must not reach the A2A event routes.
+				// The callers bind that role to the A2A gateway's
+				// ServiceAccount, the one pod that projects the audience,
+				// so no other caller holding it gets the role. Rendered
+				// only here, so turning Chat off drops both together.
 				envVars = append(envVars,
 					corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: subscription},
 					corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+					corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},
 				)
 			} else {
 				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
@@ -5047,6 +5051,12 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	// is what enforces the base, and the agent and the shell sandbox get no
 	// copy they could be mistaken for the authority over.
 	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
+	// The install's tier table (#6091), for the report-credential rule to key
+	// on a tier's mode rather than its name. Declared in the managed set, so
+	// mergeCredentialProxyEnv reserves the name: a CR must not point the
+	// broker at a tier table the operator did not render.
+	_, _, tiersEnv := a2aTiersVolumeAndMount(agent)
+	envVars = append(envVars, tiersEnv)
 	// The Pub/Sub platform relay's subscription set, from the AgentPlugin
 	// configs (platformagent_pubsub_relay.go). Absent when no plugin configures
 	// a Pub/Sub platform, and the broker refuses every relayed Pub/Sub call.
@@ -5129,6 +5139,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		// And its callers: one that could set them would choose who holds
+		// the a2a-chat role. Rendered only while Chat is armed, so reserved
+		// by name.
+		credentialProxyA2AChatCallersEnvVar,
 		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
 		// shell's audience would hand the session the shell's role.
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",

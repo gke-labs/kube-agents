@@ -7,7 +7,7 @@
 # platform or filed a Kanban card instead.
 #
 # The profile is `cluster`, the generic cluster agent (#3658), which takes the
-# target cluster as its project, location and cluster parameters. The prompt
+# target cluster as its project, cluster and location parameters. The prompt
 # names the agent's own cluster through the harness's {{AGENT_CLUSTER_*}}
 # placeholders, expanded from AGENT_CLUSTER_CONTEXT; a run without a GKE context
 # is a setup failure, not the model's. Where a profile is pinned to that

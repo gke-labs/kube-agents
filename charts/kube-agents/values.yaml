@@ -1000,10 +1000,14 @@ fluentBit:
 # A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and
 # A2A_NATS_EXPORTER_IMAGE, but the pins have to live somewhere the mirror can be
 # pointed at, so they live here and in images.json (the operator's compiled
-# defaults are the same pins; hack/check-image-inventory.sh holds all three in
-# step). Under global.thirdPartyImageRegistry each renders as
-# <prefix>/<trailing name>:<tag>, the digest dropped, which is the copy
-# `make mirror-images` writes.
+# defaults and templates/_helpers.tpl's kube-agents.a2aBusImageDefaults are the
+# same pins; hack/check-image-inventory.sh holds all four in step). Under
+# global.thirdPartyImageRegistry each renders as <prefix>/<trailing name>:<tag>,
+# the digest dropped, which is the copy `make mirror-images` writes. A release
+# whose values have no a2aBus key (a `helm upgrade --reuse-values` from before
+# the key) renders the four from the same pins held in templates/_helpers.tpl
+# (kube-agents.a2aBusImageDefaults), so a mirrored install upgraded that way
+# still pulls the bus from its mirror.
 a2aBus:
   images:
     nats:
@@ -1467,6 +1471,11 @@ platformAgent:
     # opening remediation pull requests on their own; a `/remediate` on a
     # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
+    #
+    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
+    # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
+    # from; "fleet" for clusters of tens of thousands of Pods, unset for
+    # "default". Also forwarded to the shell sandbox only.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
@@ -2168,8 +2177,8 @@ profiles:
       # The GKE Support Agent's persona (agents/tse/persona), which a profile
       # worker pod mounts at /persona. The Hermes `tse` profile the gateway
       # scaffolds from `/opt/tse-template` does not use it. Under the
-      # dispatcher a tse task takes a cluster target (project, location and
-      # cluster, all required); project-wide questions wait on #5424.
+      # dispatcher a tse task takes a cluster target (project, cluster and
+      # location, all required); project-wide questions wait on #5424.
       image:
         repository: ghcr.io/gke-labs/kube-agents/persona-tse
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
@@ -2196,7 +2205,7 @@ profiles:
         cpu: "1"
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
-  # which each task names by its project, location and cluster parameters
+  # which each task names by its project, cluster and location parameters
   # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
   # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.

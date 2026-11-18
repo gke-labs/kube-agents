@@ -76,12 +76,22 @@ class SessionResourcesRenderTest(unittest.TestCase):
         # 1e.5 passes the CRD's pattern, is stored, and then fails resource.ParseQuantity on
         # every decode of the PlatformAgent. The schema refuses it first, and the template's
         # own check refuses it when schema validation is skipped.
-        for value in ['"1e.5"', '"2GB"', '"lots"', '"1.5.0"']:
+        for value in ['"1e.5"', '"2GB"', '"lots"', '"1.5.0"', '"1e99999999999999999999"',
+                      '"-1e99999999999999999999"', '"1234567890123456"', '"8Ei"', '"1e-99999999999999999999"',
+                      '"1e-2147483649"', '"+-1"']:
             for extra in ((), ("--skip-schema-validation",)):
                 with self.subTest(value=value, extra=extra):
                     proc = self._helm(self._one("limits", "memory", value), *extra)
                     self.assertNotEqual(proc.returncode, 0, proc.stdout[-300:])
                     self.assertIn("sessionResources", proc.stderr)
+
+    def test_a_cpu_past_int64_millicores_is_refused_and_one_under_renders(self):
+        # The operator reads CPU in millicores; 9.3e15 cores is past int64 there.
+        proc = self._helm(self._one("limits", "cpu", '"9.3e15"'), "--skip-schema-validation")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout[-300:])
+        self.assertIn("millicore", proc.stderr)
+        self.assertIn('cpu: "9e15"', self._render(self._one("limits", "cpu", '"9e15"')))
+        self.assertIn('memory: "7Ei"', self._render(self._one("limits", "memory", '"7Ei"')))
 
     def test_a_signed_or_exponent_quantity_renders(self):
         # The resolver treats zero and negative as unset, so they pass through; an integer
