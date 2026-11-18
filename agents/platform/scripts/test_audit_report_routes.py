@@ -755,9 +755,10 @@ class A2AReportsTest(RoutesTestCase):
                     self.assert_refused(self.request(method, path), credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE)
 
     def test_unreadable_state_refuses_the_relays_reads(self):
-        for target in ("gitops_workspace.get_managed_repo_keys", "gitops_workspace.gitops_repo_key_text"):
+        for target in ("gitops_workspace.get_managed_repos", "gitops_workspace.gitops_repo_key_text"):
             with self.subTest(target=target), mock.patch(target, side_effect=RuntimeError("unreadable")):
                 credential_proxy._managed_repository_cache = None
+                credential_proxy._managed_repository_name_cache = None
                 self.assert_refused(self.request("GET", f"/v1/audit-reports/{AUDIT}/publish/latest"),
                                     status=503, code="GITOPS_REPO_UNAVAILABLE")
 
@@ -859,6 +860,21 @@ class A2AReportsTest(RoutesTestCase):
                 self.assertNotEqual(credential_proxy.CALLER_ROLE_A2A_REPORTS, principal_from(self.review(username, audience)).role)
         with self.assertRaises(credential_proxy.AuthenticationError):
             principal_from(self.review(self.a2a.workload, "reports-aud", "a2a-chat-aud"))
+
+    def test_with_chat_armed_the_gateway_holds_both_its_audiences(self):
+        # Chat armed: the gateway is named by the a2a-chat binding too, which
+        # must still let it present the reports audience, and nothing else.
+        with mock.patch.dict(os.environ, self.env(**{credential_proxy.A2A_CHAT_CALLERS_ENV: self.a2a.workload})):
+            authenticator = credential_proxy.build_authenticator()
+        principal_from = authenticator._principal_from
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_REPORTS, principal_from(self.review(self.a2a.workload, "reports-aud")).role)
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal_from(self.review(self.a2a.workload, "a2a-chat-aud")).role)
+        for audience in ("shell-aud", "chat-aud", "profile-aud"):
+            with self.subTest(gateway_audience=audience), self.assertRaises(credential_proxy.AuthenticationError):
+                principal_from(self.review(self.a2a.workload, audience))
+        for username in (SHELL_SA, PROFILE_SA):
+            with self.subTest(other=username), self.assertRaises(credential_proxy.AuthenticationError):
+                principal_from(self.review(username, "reports-aud"))
 
     def test_no_callers_named_confers_the_role_on_nobody(self):
         with mock.patch.dict(os.environ, self.env(**{credential_proxy.A2A_REPORTS_CALLERS_ENV: ""})):

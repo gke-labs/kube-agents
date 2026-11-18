@@ -76,7 +76,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-a2a-chat-gateway-any-audience",
         "agents/platform/scripts/credential_proxy.py",
-        ("        if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:\n",
+        ("        if username in self.a2a_chat_callers and role not in (CALLER_ROLE_A2A_CHAT, CALLER_ROLE_A2A_REPORTS):\n",
          "        if False:\n"),
         "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
         "let the A2A gateway's account present any audience, since its pod "
