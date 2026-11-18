@@ -2486,6 +2486,28 @@ class BatchTests(unittest.TestCase):
         self.roster = {"p1": triples("p1", 2)}
         self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
 
+    def test_a_bare_configured_cluster_that_leaves_the_list_closes_its_episode(self) -> None:
+        # Bare names (no project/location) are a supported LEEWAY_WATCH_CLUSTERS
+        # form; a failed one that is removed from the variable must not keep
+        # the episode open and silence later failures.
+        def web_errors(clusters, _):
+            return completed_json(make_report([
+                {"cluster": c, "status": "error" if c == "web" else "ok", "error": "denied"} for c in clusters
+            ]))
+
+        def db_errors(clusters, _):
+            return completed_json(make_report([
+                {"cluster": c, "status": "error" if c == "db" else "ok", "error": "forbidden"} for c in clusters
+            ]))
+
+        with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: "web,api", watch.PROJECTS_ENV: ""}):
+            self.assertEqual(len(self.tick(0, web_errors)), 1)
+        with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: "api,db", watch.PROJECTS_ENV: ""}):
+            self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
+            lines = self.tick(2, db_errors)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("db returned an error (forbidden)", lines[0])
+
     def test_error_rows_name_up_to_three_clusters_then_count_them(self) -> None:
         def errors(names, causes=None):
             def outcome(clusters, _):

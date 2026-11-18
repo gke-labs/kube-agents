@@ -2047,7 +2047,7 @@ def announce_failed_targets(
         read = target_reads.get(target)
         remembered = set(episodes.get(target) or ())
         if read is not None:
-            unlisted = {c for c in remembered if CLUSTER_KEY_SEPARATOR in c and c not in read.listed}
+            unlisted = {c for c in remembered if c != WHOLE_TARGET_MARKER and c not in read.listed}
             remembered -= read.clean | unlisted
         if target in failures:
             if read is None or read.unattributed_failure:
