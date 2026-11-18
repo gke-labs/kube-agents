@@ -182,12 +182,24 @@ class HomePostPlatformsTest(unittest.TestCase):
         self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
         self.assertFalse(chat_notify.routes("slack"))
 
-    def test_a_learned_chat_space_joins_a_slack_home_chat_first(self):
-        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
-        self._write_gchat("spaces/AAA\n")
-        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
-        self._write("C1\n")
-        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+    def test_a_learned_home_never_outranks_a_configured_one(self):
+        # (A2A_NOTIFY_PLATFORM, slack_home, gchat_home, expected): configured
+        # platforms first, then learned ones, Chat before Slack in each group.
+        rows = (
+            ("slack", "C1\n", "spaces/AAA\n", ["slack", "google_chat"]),
+            ("slack", "", "spaces/AAA\n", ["slack", "google_chat"]),
+            ("google_chat", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+            ("google_chat", "C1\n", "", ["google_chat", "slack"]),
+            ("", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+            ("google_chat,slack", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+        )
+        for listed, slack_file, gchat_file, expected in rows:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = listed
+                self._write(slack_file)
+                self._write_gchat(gchat_file)
+                self.assertEqual(chat_notify.home_platforms(), expected)
+                self.assertEqual(chat_notify.routed_platforms(), expected)
 
     def test_both_learned_homes_are_the_list(self):
         self._write("C1\n")
@@ -206,6 +218,15 @@ class HomePostPlatformsTest(unittest.TestCase):
         os.remove(os.path.join(self.dir, chat_notify.GCHAT_HOME_FILE_KEY))
         self.assertEqual(chat_notify.home_platforms(), [])
         self.assertEqual(chat_notify.home_file(chat_notify.GCHAT_HOME_FILE_KEY), ("", True))
+
+    def test_any_home_file_value_reads_both_files(self):
+        self._write("")
+        self.assertFalse(chat_notify.any_home_file_value())
+        self._write_gchat("spaces/AAA\n")
+        self.assertTrue(chat_notify.any_home_file_value())
+        self._write_gchat("")
+        self._write("C1\n")
+        self.assertTrue(chat_notify.any_home_file_value())
 
     def test_home_platforms_names_only_a_platform_with_a_home_channel(self):
         # (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, projected file or None, expected)

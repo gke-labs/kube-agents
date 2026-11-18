@@ -2984,7 +2984,7 @@ def enabled_chat_platforms() -> list[str]:
     A2A gateway holds its backend, and posts to it go through the gateway
     instead, so each is still a platform this install posts to. The operator
     lists the armed routes with a CR home channel; ``routed_platforms()`` adds
-    Slack when the file names a channel, and takes every armed route when no
+    a platform whose projected file names a learned home, after those, and takes every armed route when no
     platform has a home, the gateway keeping the refused posts for a digest.
     The alert takes the first of them. The variables are the operator's, and
     they are reserved against every other source.

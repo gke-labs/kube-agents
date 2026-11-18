@@ -267,15 +267,26 @@ class RoutedPlatformsCopiesAgreeTest(unittest.TestCase):
                                 self.assertEqual(kanban_chat_notify.routed_platforms(),
                                                  self.chat_notify.routed_platforms())
 
-    def test_a_learned_chat_space_routes_chat_first(self):
-        self._set_file("", kanban_chat_notify.HOME_FILE_KEY)
-        self._set_file("spaces/AAA\n", kanban_chat_notify.GCHAT_HOME_FILE_KEY)
-        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "slack",
-                                          kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}):
-            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
-        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
-                                          kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}):
-            self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat"])
+    def test_a_learned_home_never_outranks_a_configured_one(self):
+        # (A2A_NOTIFY_PLATFORM, slack_home, gchat_home, expected): configured
+        # platforms first, then learned ones, Chat before Slack in each group.
+        rows = (
+            ("slack", "C1\n", "spaces/AAA\n", ["slack", "google_chat"]),
+            ("slack", "", "spaces/AAA\n", ["slack", "google_chat"]),
+            ("google_chat", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+            ("google_chat", "C1\n", "", ["google_chat", "slack"]),
+            ("", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+            ("", "", "spaces/AAA\n", ["google_chat"]),
+            ("google_chat,slack", "C1\n", "spaces/AAA\n", ["google_chat", "slack"]),
+        )
+        for listed, slack_file, gchat_file, expected in rows:
+            with self.subTest(listed=listed, slack=slack_file, gchat=gchat_file):
+                self._set_file(slack_file, kanban_chat_notify.HOME_FILE_KEY)
+                self._set_file(gchat_file, kanban_chat_notify.GCHAT_HOME_FILE_KEY)
+                with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: listed,
+                                                  kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack"}):
+                    self.assertEqual(kanban_chat_notify.routed_platforms(), expected)
+                    self.assertEqual(self.chat_notify.routed_platforms(), expected)
 
 
 class _Runner:

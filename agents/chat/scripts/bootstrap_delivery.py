@@ -1709,14 +1709,15 @@ def resend_lost_summaries(data_dir: Path, now: float) -> None:
     A first-run audit that ends before anyone has opened the chat finds no home channel: under
     the gateway keeps the post for its digest, the run is recorded failed, and
     nothing posts the summary once the channel is learned minutes later. This stage watches the home
-    channel the operator projects into the pod (``chat_notify.home_file``: Slack where the gateway holds
-    it; Google Chat, and Slack on the Hermes adapter, project none, and get no re-send) and, once it names a channel, asks the chat relay
+    channels the operator projects into the pod (``chat_notify.any_home_file_value``: Slack's and Google
+    Chat's, where the gateway holds the platform; Slack on the Hermes adapter projects none, and gets no
+    re-send) and, once either names a channel, asks the chat relay
     to post each pending run's report through the route a scheduled run's delivery leg takes, so the
     relay reads the audit's own chat report record, posts it the same way, and records the post. The
     relay's answer settles the audit in ``RESENT_FILE``; for a request whose answer was lost the relay's
     record decides. Each outcome goes to the stage log.
     """
-    if not chat_notify.home_file_value():
+    if not chat_notify.any_home_file_value():
         return
     pending = pending_resends(data_dir, oobe.read_state(data_dir), now)
     if not pending:

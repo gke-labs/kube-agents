@@ -63,6 +63,8 @@ PLATFORM_LIST_SEPARATOR = ","
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
 HOME_FILE_KEY = "slack_home"
 GCHAT_HOME_FILE_KEY = "gchat_home"
+# Every platform's file in that directory.
+HOME_FILE_KEYS = (HOME_FILE_KEY, GCHAT_HOME_FILE_KEY)
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -121,6 +123,9 @@ ALERT_UPDATE_FORMAT = "alert-{session}"
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
 GCHAT_PLATFORM = "google_chat"
+# Each platform whose home the gateway can learn, with its projected file, in
+# the order learned homes are listed: Chat before Slack (home_platforms).
+LEARNED_HOME_FILES = ((GCHAT_PLATFORM, GCHAT_HOME_FILE_KEY), (SLACK_PLATFORM, HOME_FILE_KEY))
 GCHAT_MESSAGES_TOKEN = "/messages/"
 GCHAT_THREADS_TOKEN = "/threads/"
 
@@ -160,6 +165,11 @@ def home_file_value(key: str = HOME_FILE_KEY) -> str:
     return home_file(key)[0]
 
 
+def any_home_file_value() -> bool:
+    """Whether the operator projected a home channel into the pod for any platform."""
+    return any(home_file_value(key) for key in HOME_FILE_KEYS)
+
+
 def platform_list(raw: str) -> list[str]:
     """The platform names in a comma-separated env value: stripped, empties dropped, first of a duplicate kept, in order."""
     names: list[str] = []
@@ -171,20 +181,23 @@ def platform_list(raw: str) -> list[str]:
 
 
 def home_platforms() -> list[str]:
-    """The platforms with a home channel the agent can see, Chat first, or [] when none has one.
+    """The platforms with a home channel the agent can see, or [] when none has one.
 
     The operator lists every armed route whose home channel the CR sets
-    (``A2A_NOTIFY_PLATFORM``), and this adds Slack or Chat when the gateway
-    holds it and its projected file names a channel, the CR's or one the
-    gateway learned. Chat stays first.
+    (``A2A_NOTIFY_PLATFORM``, Chat first), and this adds Slack or Chat when the
+    gateway holds it and its projected file names a channel the gateway
+    learned. A learned home never outranks a configured one: the configured
+    platforms come first, then the learned ones, Chat before Slack in each
+    group, so a caller that takes one platform stays on the configured home.
     """
     listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     armed = gateway_platforms()
-    if GCHAT_PLATFORM in armed and GCHAT_PLATFORM not in listed and home_file_value(GCHAT_HOME_FILE_KEY):
-        listed = [GCHAT_PLATFORM, *listed]
-    if SLACK_PLATFORM in armed and SLACK_PLATFORM not in listed and home_file_value():
-        listed = [*listed, SLACK_PLATFORM]
-    return listed
+    learned = [
+        platform
+        for platform, key in LEARNED_HOME_FILES
+        if platform in armed and platform not in listed and home_file_value(key)
+    ]
+    return [*listed, *learned]
 
 
 def routed_platforms() -> list[str]:
