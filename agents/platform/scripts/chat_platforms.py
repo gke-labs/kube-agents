@@ -181,7 +181,7 @@ def _env_enabled(platform: str) -> bool:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than per
     source — so a file that names one platform cannot silence another that only a
@@ -226,7 +226,9 @@ def enabled_chat_platforms() -> list[str]:
             enabled = _env_enabled(name)
         if enabled:
             resolved.append(name)
-    return resolved or [DEFAULT_PLATFORM]
+    # The routed platforms in the routing rule's order, as session_kv_server's
+    # resolver returns them: a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved) or [DEFAULT_PLATFORM]
 
 
 __all__ = ["CHAT_PLATFORMS", "DEFAULT_PLATFORM", "enabled_chat_platforms"]

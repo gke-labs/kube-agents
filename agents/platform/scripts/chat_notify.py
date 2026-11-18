@@ -188,7 +188,9 @@ def home_platforms() -> list[str]:
     gateway holds it and its projected file names a channel the gateway
     learned. A learned home never outranks a configured one: the configured
     platforms come first, then the learned ones, Chat before Slack in each
-    group, so a caller that takes one platform stays on the configured home.
+    group. The enabled-platform resolvers return the routed platforms in this
+    order (:func:`in_routed_order`), so a caller that takes one platform stays
+    on the configured home.
     """
     listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     armed = gateway_platforms()
@@ -210,6 +212,23 @@ def routed_platforms() -> list[str]:
     every process computes the same list and a learned channel restarts no pod.
     """
     return home_platforms() or gateway_platforms()
+
+
+def in_routed_order(platforms: list[str]) -> list[str]:
+    """``platforms`` with its routed members in :func:`routed_platforms` order, the rest where they were.
+
+    The enabled-platform resolvers walk a fixed platform order, and a caller
+    that takes one destination (the alert, the drift digest, the data-volume
+    warning) takes the first. This puts the routed members in the order the
+    routing rule gives them, so a configured home is taken ahead of a learned
+    one. With no routed platform, as on an install the gateway does not serve,
+    the list comes back unchanged.
+    """
+    routed = [name for name in routed_platforms() if name in platforms]
+    if len(routed) < 2:
+        return list(platforms)
+    ordered = iter(routed)
+    return [next(ordered) if name in routed else name for name in platforms]
 
 
 def gateway_platforms() -> list[str]:

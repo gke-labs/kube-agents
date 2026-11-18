@@ -219,6 +219,19 @@ class HomePostPlatformsTest(unittest.TestCase):
         self.assertEqual(chat_notify.home_platforms(), [])
         self.assertEqual(chat_notify.home_file(chat_notify.GCHAT_HOME_FILE_KEY), ("", True))
 
+    def test_in_routed_order_moves_only_the_routed_platforms(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        self._write("")
+        self._write_gchat("spaces/AAA\n")
+        self.assertEqual(chat_notify.in_routed_order(["google_chat", "slack"]), ["slack", "google_chat"])
+        self.assertEqual(chat_notify.in_routed_order(["google_chat", "teams", "slack"]), ["slack", "teams", "google_chat"])
+        self.assertEqual(chat_notify.in_routed_order(["slack"]), ["slack"])
+        self.assertEqual(chat_notify.in_routed_order([]), [])
+        # No routed platform, as where the gateway serves none: unchanged.
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = ""
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = ""
+        self.assertEqual(chat_notify.in_routed_order(["google_chat", "slack"]), ["google_chat", "slack"])
+
     def test_any_home_file_value_reads_both_files(self):
         self._write("")
         self.assertFalse(chat_notify.any_home_file_value())

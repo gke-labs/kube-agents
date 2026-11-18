@@ -2953,7 +2953,7 @@ def _slack_home_channel() -> str:
 
 
 def enabled_chat_platforms() -> list[str]:
-    """Every chat platform this install posts to, in CHAT_PLATFORMS order.
+    """Every chat platform this install posts to, in CHAT_PLATFORMS order, the routed ones in routing order.
 
     Three sources, most specific first, resolved **per platform** rather than
     per source — so a file that names one platform cannot silence another that
@@ -2986,7 +2986,9 @@ def enabled_chat_platforms() -> list[str]:
     lists the armed routes with a CR home channel; ``routed_platforms()`` adds
     a platform whose projected file names a learned home, after those, and takes every armed route when no
     platform has a home, the gateway keeping the refused posts for a digest.
-    The alert takes the first of them. The variables are the operator's, and
+    The routed platforms come back in that order (``chat_notify.in_routed_order``),
+    and the alert takes the first of them, so a configured home is picked
+    ahead of a learned one. The variables are the operator's, and
     they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
@@ -3063,7 +3065,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
             )
         if enabled:
             resolved.append(name)
-    return resolved, explicit
+    # The routed platforms in the routing rule's order, so every caller that
+    # takes one destination takes a configured home ahead of a learned one.
+    return chat_notify.in_routed_order(resolved), explicit
 
 
 def _chat_platforms_disabled() -> bool:
