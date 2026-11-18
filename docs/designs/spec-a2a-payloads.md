@@ -238,7 +238,9 @@ admit.
 `name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` (the only origin
 today, since a user's schedule runs at its creator's tier and carries no trigger), and `stream` is
 the report stream the grant binds, absent when it binds none. A stream is only ever the
-schedule's own name: `schedule/<stream>`, nothing else. The block is read strictly: a key twice,
+schedule's own name: `schedule/<stream>`, nothing else. `script`, absent on a prompt run, names
+the profile script a built-in schedule's run executes (#5622): a DNS-1123 label, never a path,
+and only on a `schedule/<name>` trigger. The block is read strictly: a key twice,
 a key that matches `trigger` or one of its fields only under case folding, or a null inside the
 trigger is refused. The gateway writes it
 on a trigger's submission and nowhere else; it is absent on every other task. It is a claim,
@@ -341,6 +343,8 @@ starting it.
 | `a2a.submit.{profile}.{tier}.{kind}.{taskId}` | Added 10/22 (#3660) as `a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit`, moved to its own prefix and stream (`PROFILE_SUBMITS`) 10/28 (#4121). A new task for a profile, `message` only, written by the gateway. `{tier}` is the requester's tier and `{kind}` is `top` for a task a client asked for or `child` for one another task started; both exist only to route the submission to the operator's durable for that (profile, tier, kind), whose dispatcher holds the task until it ends. Nothing on TASKS matches a submission, and a follow-up on `…in` never reaches the durable. The task's follow-ups and cancels go on `…in`, its events on `…events` and `…supervisor`. Envelope agreement: `taskId` and `to` match the tokens, and the writer is the submitter: `from.session` is the one a consumer names (the gateway), or, where it names none, neither `from.session` nor `from.profile` is the profile. |
 | `a2a.cap.verify.{caller}`                     | Added 9/9 with the capability envelope. An executor's request to resolve a capability reference, executor to the verifier. `{caller}` is the asking principal's name and the verifier reads its identity off that token rather than off the payload, which is sound only because each principal's grant is exactly one subject: a `a2a.cap.verify.*` grant would turn the identity check into a self-assertion. The `cap` KV bucket behind it is readable by the verifier alone.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `a2a.cap.reply.{caller}.{inbox}`              | Added 9/9. The verifier's answer, verifier to the one executor that asked. Scoped under `{caller}` so a principal's reply grant cannot reach another's - a subscribe permission on a reply space is interception and not observation, because any subscriber may join a queue group on it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `a2a.trigger.{source}.submit`                 | Added 11/14 (#5617). An unattended trigger's request for one task (`lib.TriggerSubmit`), core request/reply, the trigger to the elected gateway. `{source}` is the trigger's source (`schedule` today), bound to its ServiceAccount by the callout, so the gateway reads the source off the token, not the payload. The gateway mints the task's unattended grant with the trigger bound and answers on the reply subject below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `a2a.trigger.reply.{source}.{id}`             | Added 11/14 (#5617). The gateway's answer (`lib.TriggerSubmitReply`: a task ID or a refusal), gateway to the one source that asked. A namespace of its own, not the caller's `_INBOX`, for the reason `a2a.cap.reply` is: a grant to publish into callers' inboxes would reach where they read their JetStream replies. A submission naming any other reply subject is dropped unanswered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `a2a.agents.{profile}`                        | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `agents.hb.{agentType}.{owner}.{session}`     | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
@@ -767,6 +771,15 @@ builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`
 to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
+The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
+request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
+and only for a turn that arrived as a structured confirm action, never from free text or a
+delegation's arguments. A child task carries its parent's value from the gateway's own record and
+cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
+the field and every profile write is refused. Absent means false, so a
+submission that asks for no change is byte-identical to one written before the field existed. The
+dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
+
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
   `.`, `..` or a flag.
@@ -790,8 +803,11 @@ chat session's turn ends when it delegates, so a session parent keeps the chatop
 (`spec-chatops-gateway.md`, the delegation primitive). On its child's end the gateway starts a new
 turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
 finished turn's `…in`. A session's request may mint a batch of children (`tasks`), which run side by
-side and queue at the dispatcher like any child. Gathering a batch's results into one wake is the
-next step of fan-out and isn't built yet, which is why the gateway accepts no width but one for now.
+side and queue at the dispatcher like any child, and wake the session once, when the last of them
+has ended, with every child's result or end (`spec-chatops-gateway.md`, "A fan-out's wake"). A
+child of such a batch that reaches `input-required` ends there, with its question as its result,
+rather than pausing the conversation. A stop that cancels every child is the next step of fan-out,
+which is why the gateway accepts no width but one for now.
 
 **Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
 `{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?}}`: the
@@ -813,7 +829,7 @@ listed, and a turn with none reads as `platform` only.
 - `widthMax` is how many children one `delegate` request from the turn may ask for, the gateway's
   `A2A_DELEGATION_WIDTH_MAX`. The gateway sets it only when it is over one; absent means one, the
   single shape, so the tool offers `tasks` only when it is present. The gateway accepts no width but
-  one until fan-out's results and stop are built, so no part carries it yet. It is at most 16
+  one until a stop cancels a batch's every child, so no part carries it yet. It is at most 16
   (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the
   single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
@@ -1032,13 +1048,13 @@ granted as one wildcard at connection time. Not built; recorded so the door has 
 
 Worked examples:
 
-| Subject                                       | Class   | Writer                 | Content                                                                                         |
-| --------------------------------------------- | ------- | ---------------------- | ----------------------------------------------------------------------------------------------- |
-| `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent         | DataPart: current per-cluster readiness verdicts                                                |
-| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent         | DataPart: the latest `leeway.report/v1alpha1` document (per-cluster topology and rank findings) |
-| `a2a.topics.agent.platform.version-skew`      | state   | platform agent         | DataPart: skew summary across the fleet                                                         |
-| `a2a.topics.shared.blueprint`                 | state   | designated writer, TBD | DataPart: the shared environment model                                                          |
-| `a2a.topics.shared.annotations`               | journal | any agent              | TextPart/DataPart: dated observations                                                           |
+| Subject                                       | Class   | Writer                          | Content                                                                                         |
+| --------------------------------------------- | ------- | ------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent                  | DataPart: current per-cluster readiness verdicts                                                |
+| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent                  | DataPart: the latest `leeway.report/v1alpha1` document (per-cluster topology and rank findings) |
+| `a2a.topics.agent.platform.version-skew`      | state   | platform agent                  | DataPart: skew summary across the fleet                                                         |
+| `a2a.topics.shared.blueprint`                 | state   | OKF Curator (`a2a/cmd/curator`) | DataPart: active OKF digest (`kube-agents.memory.blueprint/v1`)                                 |
+| `a2a.topics.shared.annotations`               | journal | any agent                       | TextPart/DataPart: dated observations and candidate proposals (`kube-agents.memory.outcome/v1`) |
 
 ### Payload
 

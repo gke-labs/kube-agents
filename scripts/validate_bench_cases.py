@@ -56,6 +56,10 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 # its rule rather than a second one.
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
+# The [bench:profile ...] directive's parser (#5945), loaded by path so a case's
+# directive is held to the shape the harness reads.
+PROFILE_HOOK_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "profile_hook.py"
+PROFILE_HOOK_MODULE_NAME = "bench_profile_hook"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
@@ -195,18 +199,11 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # Parked from hack/eval/nightly-cases.txt by the dispatcher flip (#5394):
-    # its tse profile's persona image is a placeholder a dispatched worker can't
-    # stage, so the CI next lane stops enabling tse until #3842 gives it a real
-    # one. #3842 re-enables tse on the lane, puts the case back and removes this.
-    "tse-node-notready-pleg-probe": (
-        "#3842: the CI next lane enables tse again once #3842 gives it a real persona image"
-    ),
     # The cluster agent as a dispatched profile diagnosing a fleet fixture
-    # (#3658). Like the case above, its child runs only where the dispatcher
-    # does; it is registered in hack/eval/nightly-cases.txt and on
-    # hack/eval/api-lane-exclusions.txt once #5394 turns the dispatcher on in
-    # the CI next lane, and this entry goes then.
+    # (#3658). Its child runs only where the dispatcher does, which the CI
+    # next lane has since #5394; #5500's follow-up registers it in
+    # hack/eval/nightly-cases.txt and on hack/eval/api-lane-exclusions.txt,
+    # and this entry goes then.
     "cluster-profile-names-the-oom-kill": (
         "#5394: needs the AgentProfile dispatcher and profiles.cluster, which the CI next lane gets from #5394"
     ),
@@ -330,15 +327,6 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
-    # Needs a Standard seeded cluster with a manual node pool labelled for a
-    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
-    # refuse the shape, so it is a fleet fixture addressed by role, and
-    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
-    # host constraint.
-    "ccc-manual-pools-single-rule-unbacked": (
-        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
-        "whose auto-creation is off; the lane's host clusters are Autopilot"
-    ),
     # Needs a pool with a live node whose surge node, or green pool, draws more
     # of a regional quota than the project has left. GKE bounds the surge by
     # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
@@ -481,11 +469,6 @@ FIXTURE_NOT_READY = {
         "install's context_repos, as the case's header gives; no pool install "
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
-    ),
-    "obtainability-untargeted-compute-class-manifest": (
-        "#2540: needs a ComputeClass cluster without default ComputeClass and with "
-        "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
-        "finding on the planted workload is verifiable"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
@@ -654,6 +637,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # Likewise: that no first-run audit's run ended in a state other than completed is the
+    # whole assertion.
+    "oobe_audits_ended": (),
     # This repository, agent-pod-reading: the states of findings-queue rows a
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
@@ -964,6 +950,37 @@ def _strings_outside_prompt(node: Any, path: str, out: list[tuple[str, str]]) ->
             _strings_outside_prompt(value, f"{path}[{i}]", out)
     elif isinstance(node, str):
         out.append((path, node))
+
+
+def profile_hook_reader() -> Any:
+    """profile_hook, loaded once. Registered in sys.modules before it runs:
+    its dataclass looks its own module up there."""
+    if PROFILE_HOOK_MODULE_NAME in sys.modules:
+        return sys.modules[PROFILE_HOOK_MODULE_NAME]
+    spec = importlib.util.spec_from_file_location(PROFILE_HOOK_MODULE_NAME, PROFILE_HOOK_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{PROFILE_HOOK_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[PROFILE_HOOK_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profile_directive(spec: dict[str, Any], problems: list[str]) -> None:
+    """A prompt that opens with [bench:profile ...] parses as the harness reads
+    it (profile_hook). A malformed one errors every run before the agent sees
+    the ask, which a lint catches far cheaper."""
+    prompt = spec.get("prompt")
+    if not isinstance(prompt, str):
+        return
+    hook = profile_hook_reader()
+    if hook.PROFILE_DIRECTIVE in prompt and not hook.is_profile_ask(prompt):
+        problems.append(f"prompt: {hook.PROFILE_DIRECTIVE} ...] must open the prompt, or it reaches the agent as text")
+        return
+    try:
+        hook.parse(prompt)
+    except ValueError as exc:
+        problems.append(f"prompt: {exc}")
 
 
 def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked: bool) -> None:
@@ -1413,6 +1430,7 @@ def validate_case(
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
     _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
+    _profile_directive(spec, problems)
 
     # The suite. The bare line `suite: certification` is the registration on
     # the certification lane: hack/ci-eval-pr.sh greps for that exact line,

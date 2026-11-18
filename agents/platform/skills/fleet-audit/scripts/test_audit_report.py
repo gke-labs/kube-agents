@@ -263,6 +263,7 @@ NUMBER_WORDS = {
             "twenty-two",
             "twenty-three",
             "twenty-four",
+            "twenty-five",
         )
     )
 }
@@ -18213,6 +18214,160 @@ class TestCarryUnchangedFindings(unittest.TestCase):
         self.assertEqual(ids, [])
 
 
+class TestCarryRules(unittest.TestCase):
+    """A carried remediation that fails a `CARRY_RULES` rule gives way to this
+    run's, and one that no rule can judge stays."""
+
+    CLUSTER = "acme-prod/us-east4/seeded-c"
+    FLAGS = "--enable-master-authorized-networks --master-authorized-networks"
+    RIGHT = f"gcloud container clusters update seeded-c --location=us-east4 {FLAGS}=<ranges>"
+    REWORDED = f"gcloud container clusters update seeded-c --region us-east4 {FLAGS}=<owner-ranges>"
+
+    def finding(self, note, check="authorized-networks", cluster=CLUSTER, kind="gcloud", **overrides):
+        finding = {
+            "id": f"{check}.c._.cluster-seeded-c",
+            "check": check,
+            "cluster": cluster,
+            "title": "seeded-c has no authorized networks",
+            "impact": "The control plane answers every address.",
+            "recommendation": {"action": "Enable authorized networks.", "risk": "None."},
+            "remediation": {"kind": kind, "note": note},
+            "evidence": {"command": "gcloud container clusters list", "excerpt": "a"},
+            "severity": "critical",
+        }
+        finding.update(overrides)
+        return finding
+
+    def carry(self, before, now):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ids = audit_report.carry_unchanged_findings([now], {"findings": [before]})
+        return ids, now, err.getvalue()
+
+    def assert_kept(self, note, **kwargs):
+        """The previous note stays, and the run log does not name a rule."""
+        before = self.finding(note, title="previous title", **kwargs)
+        _, out, err = self.carry(before, self.finding(self.REWORDED, **kwargs))
+        self.assertEqual(out["remediation"]["note"], note)
+        self.assertEqual(out["title"], "previous title")
+        self.assertNotIn("not carried forward", err)
+
+    def assert_replaced(self, note, rule, **kwargs):
+        """This run's pair is published; title and impact still carry."""
+        before = self.finding(
+            note, title="previous title", recommendation={"action": "Previous action."}, **kwargs
+        )
+        now = self.finding(self.REWORDED, **kwargs)
+        ids, out, err = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], self.REWORDED)
+        self.assertEqual(out["recommendation"]["action"], "Enable authorized networks.")
+        self.assertEqual(out["title"], "previous title")
+        self.assertEqual(ids, [now["id"]])
+        self.assertIn(f"{now['id']}: the previous run's remediation is not carried forward ({rule}).", err)
+        self.assertNotIn("gcloud", err)
+
+    def test_a_right_command_for_the_same_cluster_is_kept(self):
+        self.assert_kept(self.RIGHT)
+        self.assert_kept(self.RIGHT.replace("--location=us-east4", "--location us-east4 --project=acme-prod"))
+
+    def test_a_command_for_another_cluster_is_replaced(self):
+        for wrong in (
+            self.RIGHT.replace("seeded-c", "seeded-a"),
+            self.RIGHT.replace("us-east4", "us-west1"),
+            self.RIGHT + " --project=acme-dev",
+            f"{self.RIGHT}\n{self.RIGHT.replace('seeded-c', 'seeded-a')}",
+            f"# Close the endpoint.\n$ {self.RIGHT.replace('seeded-c', 'seeded-a')}",
+        ):
+            with self.subTest(wrong=wrong):
+                self.assert_replaced(wrong, audit_report.CARRY_RULE_OTHER_CLUSTER, check="release-channel")
+
+    def test_a_wrong_command_in_a_manual_note_or_the_recommendation_is_replaced(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding(f"Run `{wrong}` in a change window.", kind="manual", check="release-channel")
+        now = self.finding("Ask the owner.", kind="manual", check="release-channel")
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], "Ask the owner.")
+        for field in audit_report.COMMAND_BEARING_RECOMMENDATION_FIELDS:
+            with self.subTest(field=field):
+                before = self.finding(self.RIGHT, recommendation={field: f"Run `{wrong}`."})
+                _, out, _ = self.carry(before, self.finding(self.REWORDED))
+                self.assertEqual(out["remediation"]["note"], self.REWORDED)
+
+    def test_the_note_before_the_route_cut_is_read(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding("See the route note.", check="release-channel")
+        before["remediation"][audit_report.ROUTE_UNCUT_NOTE_FIELD] = wrong
+        _, out, _ = self.carry(before, self.finding(self.REWORDED, check="release-channel"))
+        self.assertEqual(out["remediation"], {"kind": "gcloud", "note": self.REWORDED})
+
+    def test_a_command_the_rule_cannot_judge_is_kept(self):
+        update = "gcloud container clusters update"
+        for note in (
+            f"{update} <C> --location=<L> --project=<PROJECT> {self.FLAGS}=<CIDR>",
+            f"{update} $CLUSTER --location $LOCATION {self.FLAGS}=${{RANGES}}",
+            f"{update} seeded-c --location=us-east4 --project=123456789012 {self.FLAGS}=<ranges>",
+            f"{update} seeded-a {self.FLAGS}=<ranges>",
+            f"{update} projects/acme-prod/locations/us-east4/clusters/seeded-c --location=us-east4",
+            f"{update} SEEDED-C --location=US-EAST4 --project=Acme-Prod",
+            f"{update} seeded-a --location=us-west1 {self.FLAGS}=<ranges the cluster's own owner approves>",
+            "gcloud container node-pools update pool-1 --cluster=seeded-a --location=us-west1",
+            "Update seeded-a in us-west1 with gcloud container clusters update.",
+        ):
+            with self.subTest(note=note):
+                self.assert_kept(note)
+
+    def test_a_scope_that_is_not_one_cluster_is_kept(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        for cluster in ("project/acme-prod", "seeded-c", ""):
+            with self.subTest(cluster=cluster):
+                self.assert_kept(wrong, cluster=cluster, check="release-channel")
+
+    def test_a_literal_range_where_the_sop_leaves_it_to_the_owner_is_replaced(self):
+        for value in (
+            "=203.0.113.0/24",
+            " 203.0.113.0/24",
+            "=<ranges>,203.0.113.7",
+            '="198.51.100.0/24,203.0.113.0/24"',
+            "=2001:db8::/32",
+        ):
+            with self.subTest(value=value):
+                note = self.RIGHT.replace("=<ranges>", value)
+                self.assert_replaced(note, audit_report.CARRY_RULE_OWNER_VALUE)
+
+    def test_a_range_the_owner_rule_does_not_cover_is_kept(self):
+        literal = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        self.assert_kept(literal, check="release-channel")
+        # `public-control-plane` has no row; its carried command still gets its repair.
+        before = self.finding(literal, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        now = self.finding(self.REWORDED, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(
+            out["remediation"]["note"], f"{literal} {audit_report.GOOGLE_CLOUD_ACCESS_FLAG}"
+        )
+        self.assert_kept(self.RIGHT.replace("<ranges>", "<CIDR/len>,<X>/32"))
+        self.assert_kept(f"{self.RIGHT}  # not 203.0.113.0/24, which is a peer's")
+        self.assert_kept(f"{self.RIGHT} --cluster-ipv4-cidr=10.0.0.0/14")
+
+    def test_the_previous_pair_stays_when_this_runs_pair_fails_too(self):
+        previous = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        mine = self.RIGHT.replace("<ranges>", "198.51.100.0/24")
+        _, out, err = self.carry(self.finding(previous), self.finding(mine))
+        self.assertEqual(out["remediation"]["note"], previous)
+        self.assertNotIn("not carried forward", err)
+
+    def test_a_previous_remediation_validation_would_refuse_is_not_carried(self):
+        for remediation in ({"kind": "script", "note": "x"}, {"note": "x"}, {"kind": "manual", "note": 7}):
+            with self.subTest(remediation=remediation):
+                before = self.finding("x", title="previous title", remediation=remediation)
+                _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+                self.assertEqual(out["remediation"], {"kind": "manual", "note": "Ask the owner."})
+                self.assertEqual(out["title"], "previous title")
+
+    def test_a_previous_remediation_with_no_note_is_still_carried(self):
+        before = self.finding("x", remediation={"kind": "manual"})
+        _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+        self.assertEqual(out["remediation"], {"kind": "manual", "note": ""})
+
+
 class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
     """`finish` reads the previous run's document and keeps its wording, in a
     dry run and in the real run alike."""
@@ -18302,6 +18457,25 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
         body = self.harness.forge_calls("issue-create")[0]["body"]
         self.assertIn(self.OLD_TITLE, body)
         self.assertNotIn(self.NEW_TITLE, body)
+
+    def test_a_previous_command_for_another_cluster_is_not_published(self):
+        cluster = "acme-prod/us-east4/prod-us-east"
+        update = "gcloud container clusters update {} --location=us-east4 --enable-network-policy"
+
+        def finding(title, name):
+            return make_finding(
+                title=title, cluster=cluster, remediation={"kind": "gcloud", "note": update.format(name)}
+            )
+
+        before = finding(self.OLD_TITLE, "prod-us-west")
+        before["id"] = derived_id(cluster=cluster)
+        self.store({"findings": [before]})
+        rc = self.run_finish(make_doc(findings=[finding(self.NEW_TITLE, "prod-us-east")]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertIn(update.format("prod-us-east"), self.out)
+        self.assertNotIn("prod-us-west", self.out)
+        self.assertIn(f"not carried forward ({audit_report.CARRY_RULE_OTHER_CLUSTER})", self.err)
 
     def test_changed_evidence_publishes_the_new_wording(self):
         self.store(self.previous(excerpt="an older excerpt"))
@@ -22483,6 +22657,116 @@ class TestDraftFindings(BaseTestCase):
             self.run_main(["draft", "--audit", AUDIT, "--manifest-file", str(path), "--out", str(out)]), 0, self.err
         )
         self.assertEqual(json.loads(out.read_text())["findings"][0]["check"], "netpol-missing")
+
+    def draft(self, *extra):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        self.out = self.err = ""
+        return self.run_main(["draft", "--audit", AUDIT, "--manifest-file", str(path), *extra])
+
+    def test_the_draft_goes_to_the_findings_path_and_not_through_the_worker(self):
+        """With no --out the document is on disk where `finish` reads it, and the
+        output is a status line: a document printed to stdout enters the worker's
+        context and has to be sent back through one tool call to become a file."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.draft(), 0, self.err)
+        written = json.loads(Path(audit_report.findings_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(written["findings"][0]["check"], "netpol-missing")
+        said = self.out + self.err
+        self.assertNotIn('"findings"', said)
+        self.assertIn(f"wrote {audit_report.findings_path_for(AUDIT)}", said)
+        self.assertIn("in place", said)
+        self.assertIn("Never send the document, or a block of its findings, through a tool call", said)
+        self.assertIn("one `patch` for one finding's fields", said)
+        # The card gate reads a JSON line with these key pairs as a `start` or a `finish`.
+        for line in said.splitlines():
+            self.assertFalse(line.lstrip().startswith("{"), line)
+
+    def test_a_dash_prints_the_draft_for_a_person(self):
+        self.assertEqual(self.draft("--out", audit_report.DRAFT_STDOUT), 0, self.err)
+        self.assertEqual(json.loads(self.out)["findings"][0]["check"], "netpol-missing")
+        self.assertFalse(Path(audit_report.findings_path_for(AUDIT)).exists())
+
+    def test_a_second_draft_does_not_erase_filled_findings(self):
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+        self.assertEqual(self.draft(), 0, self.err)
+        self.assertEqual(self.draft(), 0, "an unfilled draft is replaced: " + self.err)
+        document = json.loads(target.read_text(encoding="utf-8"))
+        document["findings"][0]["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        target.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SystemExit) as refused:
+            self.draft()
+        self.assertIn("a second draft would erase", str(refused.exception))
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "a")
+        self.assertEqual(self.draft("--overwrite"), 0, self.err)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "")
+
+    def test_a_second_draft_keeps_an_edit_to_any_field(self):
+        """The worker fills more than recommendations in place, and a run with no finding has no
+        recommendation at all, so the guard reads the whole document."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+
+        def remediation_only(document):
+            document["findings"][0]["remediation"] = {"kind": "manual", "note": "narrow the rule"}
+
+        def resolved_because(document):
+            document["resolved_because"] = {"some.finding.id": "the workload is gone"}
+
+        def declared(document):
+            document["declared"] = {"some.finding.id": "accepted by the owner"}
+
+        def scope_note(document):
+            document["scope"]["clusters"][0]["limitations"] = ["one read failed"]
+
+        for edit in (remediation_only, resolved_because, declared, scope_note):
+            with self.subTest(edit=edit.__name__):
+                self.assertEqual(self.draft("--overwrite"), 0, self.err)
+                document = json.loads(target.read_text(encoding="utf-8"))
+                edit(document)
+                kept = json.dumps(document)
+                target.write_text(kept, encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    self.draft()
+                self.assertEqual(target.read_text(encoding="utf-8"), kept)
+        with self.subTest(edit="a file that no longer parses"):
+            target.write_text('{"audit": "half an edit', encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                self.draft()
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"audit": "half an edit')
+        with self.subTest(edit="an empty file is not work"):
+            target.write_text("", encoding="utf-8")
+            self.assertEqual(self.draft(), 0, self.err)
+            self.assertIn("findings", json.loads(target.read_text(encoding="utf-8")))
+
+    def test_the_fill_step_bounds_a_tool_call_under_half_the_stale_bound(self):
+        """A tool call's arguments arrive only when complete, so the call must be written well
+        inside the runtime's stale bound: by the fill step an audit's prompt is large, which is the
+        300 s tier (the configured base when that is higher), and a slow writer produces 25 tokens a
+        second at about 3.5 characters each."""
+        large_prompt_stale_seconds = 300
+        slow_chars_per_second = 25 * 3.5
+        config = (Path(__file__).resolve().parents[3] / "config.yaml").read_text(encoding="utf-8")
+        base = int(re.search(r"^\s*stale_timeout_seconds:\s*(\d+)\s*$", config, re.M).group(1))
+        bound = max(base, large_prompt_stale_seconds)
+        self.assertLessEqual(audit_report.DRAFT_FILL_CALL_CHARS / slow_chars_per_second, bound / 2)
+        self.assertIn(str(audit_report.DRAFT_FILL_CALL_CHARS), audit_report.DRAFT_FILL_HINT)
+        skill = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(f"about {audit_report.DRAFT_FILL_CALL_CHARS:,} characters", skill)
+
+    def test_no_procedure_orders_the_document_through_one_call(self):
+        """Three procedures said "in one shot"; a worker that obeys writes the whole
+        document as one tool call, which is the call the runtime drops."""
+        governance = Path(__file__).resolve().parents[3] / "governance"
+        skill = Path(__file__).resolve().parents[1]
+        texts = list(governance.glob("*_sop.md")) + [skill / "SKILL.md"] + list((skill / "references").glob("*.md"))
+        self.assertTrue(texts)
+        for text in texts:
+            with self.subTest(file=text.name):
+                body = text.read_text(encoding="utf-8")
+                self.assertNotIn("in one shot", body)
+                self.assertNotIn("Write the whole document", body)
 
 
 class TestUnwrittenSweepFixes(HarnessTestCase):

@@ -85,13 +85,31 @@ MUTATIONS: list[Mutation] = [
         "the host cluster, so a task the dispatcher gave no target still works",
     ),
     Mutation(
-        "A3-profile-reaches-vcs",
+        "A3-profile-reaches-forge",
         "agents/platform/scripts/credential_proxy.py",
-        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
-         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
-        "test_A3_the_profile_role_reaches_exec_the_mcp_relay_and_the_audit_reports_alone",
-        "let a profile worker read a proposal the way the MCP pod does -- a "
-        "forge read no task target confines",
+        ('    ("/v1/forge/", (CALLER_ROLE_SHELL,)),\n',
+         '    ("/v1/forge/", (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_exec_mcp_vcs_and_the_audit_reports_alone",
+        "let a profile worker refresh the forge credential the way the shell "
+        "does, since it already reaches the version-control routes",
+    ),
+    Mutation(
+        "A3-profile-write-without-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in",
+         "    if False and VCS_PROPOSAL_CREATE_PERMIT not in"),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "admit a profile worker's publish on any task credential, trusting the "
+        "persona rule to keep it from opening an unrequested pull request",
+    ),
+    Mutation(
+        "A3-profile-vcs-without-credential",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if task is None:\n        return "a profile caller needs a task credential for version control"\n',
+         '    if False:\n        return "a profile caller needs a task credential for version control"\n'),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "let a warm profile pod between tasks read the managed repository, "
+        "as the shell does with no per-task identity",
     ),
     Mutation(
         "A3-report-credential-any-route",
@@ -1090,8 +1108,8 @@ Mutation(
     Mutation(
         "C3-management-project-unpinned",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
-         "    RECONCILE_PROJECT=\n"),
+        ("    KUBEAGENTS_DIAL_ADMINS=\n    GKE_PROJECT_ID=example-project\n",
+         "    KUBEAGENTS_DIAL_ADMINS=\n"),
         "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
         "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
         "line in the agent-writable PVC .env then re-points the management "
@@ -1688,6 +1706,18 @@ Mutation(
         "test_C2_the_agent_api_proxy_refuses_to_start_without_its_key",
         "give the external key a development default, which is how the "
         "loopback sentinel got there in the first place",
+    ),
+    Mutation(
+        "C2-custom-universe-commercial-fallback",
+        "agents/platform/scripts/api_policy.py",
+        ("        else frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n",
+         "        else _ROUTED_HOSTS | frozenset(credential_proxy_client.rewrite_google_api_host(h, universe) for h in _ROUTED_HOSTS)\n"
+         "    )\n"),
+        "test_C2_custom_universe_refuses_commercial_googleapis_relays",
+        "keep commercial googleapis.com hosts in routed_hosts alongside the "
+        "custom universe's hosts for convenience, letting custom-universe "
+        "credentials cross a universe boundary when route_host also matches",
     ),
     Mutation(
         "C3-policy-reads-a-file",
@@ -2770,7 +2800,10 @@ Mutation(
     Mutation(
         "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "drop the gateway's call to lib.ValidateDelegateRequest: an "
         "over-length text, or a malformed batch, that reached the bus without "
@@ -2778,10 +2811,26 @@ Mutation(
         "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
+        "C1-delegate-gateway-validates-only-a-resumed-batch",
+        "a2a/gateway/delegation.go",
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && lib.ValidateDelegateRequest(req) != nil) || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "AND the gateway's call to lib.ValidateDelegateRequest with the "
+        "resumed-batch term beside it: the call is still in "
+        "handleDelegateRequest, but only a batch finished after a restart "
+        "is validated, so a fresh over-length or malformed request that "
+        "reached the bus without the adapter is minted",
+    ),
+    Mutation(
         "C1-delegate-gateway-validates-only-some-requests",
         "a2a/gateway/delegation.go",
-        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {",
-         "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 {"),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
         "condition the gateway's validator call so it guards only batches: "
         "the call still appears, but a single over-length task that reached "

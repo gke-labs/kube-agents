@@ -2,6 +2,7 @@ Subject: Open a pull request in Step 5 only when the request asked for the fix
 
 Why: the platform persona opens a pull request only when the request asked for the fix (agents/platform/SOUL.md section 3, item 3); upstream's Step 5 opens one on every crashloop walk.
 Local-Issue: #2037
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Upstream-Issue: none (specific to this repository)
 Retire-When: never; the persona rule is ours
 

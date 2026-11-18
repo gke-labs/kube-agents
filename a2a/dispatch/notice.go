@@ -26,6 +26,13 @@ const (
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
 	ReasonStopped           = "stopped"
+	// ReasonChangeNeedsJob refuses a task whose confirmed change would put
+	// a write permit on its credential while its tier has no Job runner: a
+	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
+	ReasonChangeNeedsJob = "change-needs-job"
+	// ReasonTierEnded ends a held task whose tier an administrator ended
+	// the drain of (lib.DrainingTier.Ending, #5850): canceled, not failed.
+	ReasonTierEnded = "tier-ended"
 	// The re-check of a child whose parent is an AgentProfile task (#5686):
 	// the gateway checks the same at mint, and the dispatcher holds a child
 	// an older gateway sent, or one that breaks either rule, to them.
@@ -38,6 +45,9 @@ const (
 	// ReasonOutsideParentScope: the child's target lies outside its parent's
 	// scope.
 	ReasonOutsideParentScope = "outside-parent-scope"
+	// ReasonScriptNotAllowed: the submission's trigger names a script its
+	// profile's spec.scripts doesn't list (#5622).
+	ReasonScriptNotAllowed = "script-not-allowed"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.

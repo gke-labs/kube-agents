@@ -799,6 +799,8 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The token for the audit-report store and nothing else
 	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
 	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
+	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
+	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -1020,6 +1022,10 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	// The token the broker presents to the audit-report store.
 	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
+	// The install's tier table (#6091): the operator's rendered, non-secret
+	// tiers ConfigMap, mounted read-only.
+	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)
+	volumes = append(volumes, tiersVolume)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 

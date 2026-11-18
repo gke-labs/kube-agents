@@ -1000,10 +1000,14 @@ fluentBit:
 # A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and
 # A2A_NATS_EXPORTER_IMAGE, but the pins have to live somewhere the mirror can be
 # pointed at, so they live here and in images.json (the operator's compiled
-# defaults are the same pins; hack/check-image-inventory.sh holds all three in
-# step). Under global.thirdPartyImageRegistry each renders as
-# <prefix>/<trailing name>:<tag>, the digest dropped, which is the copy
-# `make mirror-images` writes.
+# defaults and templates/_helpers.tpl's kube-agents.a2aBusImageDefaults are the
+# same pins; hack/check-image-inventory.sh holds all four in step). Under
+# global.thirdPartyImageRegistry each renders as <prefix>/<trailing name>:<tag>,
+# the digest dropped, which is the copy `make mirror-images` writes. A release
+# whose values have no a2aBus key (a `helm upgrade --reuse-values` from before
+# the key) renders the four from the same pins held in templates/_helpers.tpl
+# (kube-agents.a2aBusImageDefaults), so a mirrored install upgraded that way
+# still pulls the bus from its mirror.
 a2aBus:
   images:
     nats:
@@ -1182,6 +1186,13 @@ platformAgent:
     clusterName: ""
     location: ""
     projectId: ""
+    # Optional Google Cloud API universe domain (for example, a Google Cloud
+    # Dedicated sovereign domain). Leave empty to auto-detect from the GKE
+    # metadata server on operator-rendered workloads; set explicitly when
+    # chart-rendered litellm (vertex_ai) or githubMinter run in a custom
+    # universe so Helm templates render GOOGLE_CLOUD_UNIVERSE_DOMAIN and the
+    # cluster's OIDC issuer host at install time.
+    universeDomain: ""
     # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
     # own default applies — dashboardEnabled therefore lands `true` unless an
     # install pins it, so set it explicitly when it must not float with the
@@ -1339,12 +1350,27 @@ platformAgent:
       # maxSessions caps the A2A session pods the install runs at once; the
       # operator's default applies when it is unset.
       # maxSessions: 10
+      # sessionResources are the session pods' CPU and memory requests and
+      # limits; only cpu and memory are read. Each key you set to a positive
+      # value replaces its default (requests 150m / 320Mi, limits 2 / 2Gi) and
+      # the rest keep theirs. A request set alone above its default limit
+      # raises the limit to match; otherwise a request above its limit is
+      # lowered to it. A change rolls the gateway, and running session pods
+      # keep their shape until they respawn. The session cap multiplies the
+      # requests. On
+      # Autopilot without Pod bursting, its per-pod minimums (250m / 512Mi)
+      # apply whatever is set lower.
+      # sessionResources:
+      #   requests:
+      #     cpu: 150m
+      #     memory: 384Mi
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
       # cluster that cannot have them (kind, a one-node Standard pool), before the
-      # first install: an existing bus keeps its count, and a different value is
-      # refused rather than converting it.
+      # first install. Changing it on an existing bus migrates the bus between one
+      # server and three, keeping its data; one to three freezes writes for its
+      # window.
       # busReplicas: 3
       # admission is the memory admission the kanban dispatcher applies to its
       # own workers, board-wide: past the budget it refuses a card rather than
@@ -2143,14 +2169,13 @@ profiles:
       skills, returning either a grounded Root Cause Analysis with a proposed
       GitOps fix or a redacted Google Cloud Support Escalation Bundle.
     persona:
-      # Placeholder image reference required by the AgentProfile CRD schema:
-      # tse has no persona image of its own yet (#3842). On a next install the
-      # profile dispatcher (on by default) gives every bound profile a warm
-      # worker, and tse's crash-loops at its persona step until #3842 ships
-      # one; Kanban to tse still works. Leave tse off there, or switch the
-      # dispatcher off (operator.profileDispatcher.enabled: false).
+      # The GKE Support Agent's persona (agents/tse/persona), which a profile
+      # worker pod mounts at /persona. The Hermes `tse` profile the gateway
+      # scaffolds from `/opt/tse-template` does not use it. Under the
+      # dispatcher a tse task takes a cluster target (project, cluster and
+      # location, all required); project-wide questions wait on #5424.
       image:
-        repository: ghcr.io/gke-labs/kube-agents/platform-agent
+        repository: ghcr.io/gke-labs/kube-agents/persona-tse
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
     harness:
       image:
@@ -2175,7 +2200,7 @@ profiles:
         cpu: "1"
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
-  # which each task names by its project, location and cluster parameters
+  # which each task names by its project, cluster and location parameters
   # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
   # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.

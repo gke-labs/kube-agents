@@ -25,7 +25,12 @@ import (
 )
 
 func TestSensitiveEnvVars(t *testing.T) {
-	expectedVars := []string{"API_SERVER_KEY", "HERMES_HOME"}
+	expectedVars := []string{
+		"API_SERVER_KEY",
+		"HERMES_HOME",
+		GoogleCloudUniverseDomainEnv,
+		CloudSDKUniverseDomainEnv,
+	}
 	for _, v := range expectedVars {
 		if _, ok := SensitiveEnvVars[v]; !ok {
 			t.Errorf("expected sensitive env var %q to be present", v)

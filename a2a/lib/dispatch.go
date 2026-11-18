@@ -388,11 +388,71 @@ type DispatchConfig struct {
 // DispatchJobTemplateRef is where a profile's Job template is, and which
 // rendering of it this config means.
 type DispatchJobTemplateRef struct {
-	// Name is the DispatchJobTemplate's name in the profile namespace.
-	Name string `json:"name"`
+	// Name is the DispatchJobTemplate's name in the profile namespace. An
+	// operator from #5479 on leaves it out: it is always the profile's own
+	// param, DispatchJobTemplateName (NameFor).
+	Name string `json:"name,omitempty"`
 	// Hash is the rendering's hash, as the object's
 	// DispatchJobTemplateHashAnnotation carries it.
 	Hash string `json:"hash"`
+}
+
+// dispatchJobTemplatePrefix is a profile's DispatchJobTemplate name, less the
+// profile's name: the operator's own dispatchJobTemplatePrefix
+// (agentprofile_job_template.go), which must stay the same string.
+const dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
+
+// DispatchJobTemplateName is the DispatchJobTemplate that holds profile's Job
+// template in the profile namespace.
+func DispatchJobTemplateName(profile string) string { return dispatchJobTemplatePrefix + profile }
+
+// NameFor is the DispatchJobTemplate r names for profile: its Name when it
+// carries one, else the profile's own param.
+func (r *DispatchJobTemplateRef) NameFor(profile string) string {
+	if r.Name != "" {
+		return r.Name
+	}
+	return DispatchJobTemplateName(profile)
+}
+
+// DerivedDurables are the shared durables p is read on: one per kind for each
+// of its live tiers and each tier it drains, so what is queued at a draining
+// tier still reaches a terminal (tier-withdrawn). A draining profile has none.
+// The operator creates the same set (its profileDurableName over
+// AllowedTierList), pinned by the shared fixture testdata/rendered-dispatch-durables.json.
+func (p DispatchProfile) DerivedDurables() []DispatchDurable {
+	if p.Draining() {
+		return nil
+	}
+	tiers := append([]string(nil), p.Tiers...)
+	for _, d := range p.DrainingTiers {
+		tiers = append(tiers, d.Tier)
+	}
+	out := make([]DispatchDurable, 0, 2*len(tiers))
+	for _, tier := range tiers {
+		for _, kind := range []string{SubmitKindTop, SubmitKindChild} {
+			out = append(out, DispatchDurable{Tier: tier, Kind: kind, Name: ProfileDurableName(p.Name, tier, kind)})
+		}
+	}
+	return out
+}
+
+// sameDurables reports whether a and b name the same set of durables.
+func sameDurables(a, b []DispatchDurable) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := map[DispatchDurable]int{}
+	for _, d := range a {
+		set[d]++
+	}
+	for _, d := range b {
+		if set[d] == 0 {
+			return false
+		}
+		set[d]--
+	}
+	return true
 }
 
 // DispatchJobTemplateHashAnnotation is the annotation on a DispatchJobTemplate
@@ -420,9 +480,17 @@ type DispatchProfile struct {
 	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []ProfileParameter `json:"parameters,omitempty"`
-	// Durables are the shared durables the operator created for it, one
-	// per (tier, kind). A draining profile has none.
-	Durables []DispatchDurable `json:"durables"`
+	// Scripts are the helper scripts the profile allowlists
+	// (spec.scripts, #5622). The dispatcher refuses a submission naming a
+	// script not listed here. A script-run task's path comes from here,
+	// never from the task.
+	Scripts []DispatchScript `json:"scripts,omitempty"`
+	// Durables, when listed, are the shared durables the operator created
+	// for it, one per (tier, kind). An operator from #5479 on no longer lists
+	// them: the dispatcher derives them (DerivedDurables). For one release a
+	// listed set is still accepted, and Validate holds it to exactly the
+	// derived one. A draining profile lists none.
+	Durables []DispatchDurable `json:"durables,omitempty"`
 	// JobTemplate is the pod template (a core/v1 PodTemplateSpec) the
 	// profile's unattended tasks run on as Jobs, rendered by the operator
 	// only where the chart installed the Job admission policy, which holds
@@ -453,6 +521,34 @@ type DispatchProfile struct {
 	DrainingTiers []DrainingTier `json:"drainingTiers,omitempty"`
 }
 
+// ScriptRoot is the one directory helper scripts ship in, in the worker
+// image (#5622), and ScriptPath the shape of a script path under it: each
+// segment starts with a letter, digit or underscore and holds only those,
+// dots and hyphens, so there is no "." or ".." segment, no empty one, and no
+// shell metacharacter. Both are the AgentProfile CRD's (spec.scripts[].path),
+// which TestScriptPathIsTheCRDs holds them to.
+const ScriptRoot = "/opt/kube-agents/scripts/"
+
+var ScriptPath = regexp.MustCompile(`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`)
+
+// Script is the profile's allowlisted script named name, if it lists one.
+func (p DispatchProfile) Script(name string) (DispatchScript, bool) {
+	for _, sc := range p.Scripts {
+		if sc.Name == name {
+			return sc, true
+		}
+	}
+	return DispatchScript{}, false
+}
+
+// DispatchScript is one helper script a profile allowlists: its name, its
+// path in the worker image, and the bound on one run.
+type DispatchScript struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+}
+
 // DrainingTier is one tier a live profile drains, until Until.
 type DrainingTier struct {
 	Tier string `json:"tier"`
@@ -460,6 +556,12 @@ type DrainingTier struct {
 	// the operator keeps rendering for it while it drains.
 	Mode  string    `json:"mode"`
 	Until time.Time `json:"until"`
+	// Ending, set, is an administrator ending this drain now (#5850): the
+	// dispatcher ends every task it holds at the tier instead of letting it
+	// run to its end, and the operator tears the tier down at Until, which it
+	// has shortened to a grace. An older dispatcher ignores it; the teardown
+	// still ends the work, as lease-expired.
+	Ending bool `json:"ending,omitempty"`
 }
 
 // DrainsTier reports whether tier is one p drains (DrainingTiers).
@@ -532,8 +634,8 @@ func (c DispatchConfig) Validate() error {
 		if len(p.JobTemplate) > 0 && !PodTemplateWithContainers(p.JobTemplate) {
 			return fmt.Errorf("dispatch config: profile %s's jobTemplate is not a pod template with containers", p.Name)
 		}
-		if r := p.JobTemplateRef; r != nil && (len(p.JobTemplate) > 0 || !objectName.MatchString(r.Name) || r.Hash == "" || !labelValue.MatchString(r.Hash)) {
-			return fmt.Errorf("dispatch config: profile %s's jobTemplateRef needs a name and a hash, and no inline jobTemplate beside it", p.Name)
+		if r := p.JobTemplateRef; r != nil && (len(p.JobTemplate) > 0 || (r.Name != "" && !objectName.MatchString(r.Name)) || r.Hash == "" || !labelValue.MatchString(r.Hash)) {
+			return fmt.Errorf("dispatch config: profile %s's jobTemplateRef needs a hash (and, if it names one, a valid name), and no inline jobTemplate beside it", p.Name)
 		}
 		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
 			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
@@ -541,8 +643,8 @@ func (c DispatchConfig) Validate() error {
 		if p.Concurrency < 1 || len(p.Tiers) == 0 {
 			return fmt.Errorf("dispatch config: profile %s needs a concurrency and a tier", p.Name)
 		}
-		if p.Draining() != (len(p.Durables) == 0) {
-			return fmt.Errorf("dispatch config: profile %s has %d durables; a live profile needs one, a draining one has none", p.Name, len(p.Durables))
+		if p.Draining() && len(p.Durables) > 0 {
+			return fmt.Errorf("dispatch config: draining profile %s lists %d durables; a draining one has none", p.Name, len(p.Durables))
 		}
 		drains := map[string]bool{}
 		for _, d := range p.DrainingTiers {
@@ -551,10 +653,24 @@ func (c DispatchConfig) Validate() error {
 			}
 			drains[d.Tier] = true
 		}
+		scripts := map[string]bool{}
+		for _, sc := range p.Scripts {
+			if !ValidSubjectToken(sc.Name) || scripts[sc.Name] || !ScriptPath.MatchString(sc.Path) ||
+				sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
+				return fmt.Errorf("dispatch config: profile %s script %q is not a subject token, is listed twice, has a path outside %s, or a timeout outside 1 to %ds",
+					p.Name, sc.Name, ScriptRoot, p.ActiveDeadlineSeconds)
+			}
+			scripts[sc.Name] = true
+		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {
 				return fmt.Errorf("dispatch config: profile %s durable %q is not %s", p.Name, d.Name, ProfileDurableName(p.Name, d.Tier, d.Kind))
 			}
+		}
+		// An entry that still lists its durables (an operator from before
+		// #5479) lists exactly the derived set; neither side is preferred.
+		if len(p.Durables) > 0 && !sameDurables(p.Durables, p.DerivedDurables()) {
+			return fmt.Errorf("dispatch config: profile %s lists durables that are not the ones its tiers derive", p.Name)
 		}
 	}
 	return nil

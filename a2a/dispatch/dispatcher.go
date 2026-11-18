@@ -52,6 +52,9 @@ const (
 	abandonWithdrawn    = "offer withdrawn: the accept came after the dispatcher stopped waiting"
 	abandonTimedOut     = "offer withdrawn: no accept within the accept window"
 	abandonLeaseExpired = "lease expired: the dispatcher heard no renewal in time"
+	// abandonTierEnded is the abandon reason sent a worker whose task's tier
+	// an administrator ended the drain of (#5850).
+	abandonTierEnded    = "the tier's drain was ended by an administrator"
 	abandonStopping     = "offer withdrawn: the dispatcher is stopping"
 	abandonUnrecorded   = "offer withdrawn: the dispatcher could not record the lease"
 	abandonNoCredential = "offer withdrawn: the dispatcher could not mint the task's credentials"
@@ -112,6 +115,9 @@ type holding struct {
 	// cluster is the cluster admission checked the task against, nil when
 	// it names none: the target of its credential-proxy token (#3889).
 	cluster *taskcred.Target
+	// changeRequested is the submission's ChangeRequested: whether its
+	// credential-proxy token carries the vcs:proposal-create permit (#3993).
+	changeRequested bool
 	// trigger is the trigger the verifier found equal to the grant's, nil
 	// when the submission names none: its credential-proxy token carries it
 	// (#4685).
@@ -135,6 +141,10 @@ type holding struct {
 	// when hold starts, wakes hold for it.
 	stopRequested bool
 	stopc         chan struct{}
+	// tierEnded is an administrator ending the drain of this task's tier
+	// (syncEndingTiers, #5850): the hold ends the task at once, and so does
+	// runJob for a task whose Job is still starting (#6134).
+	tierEnded bool
 
 	renewals chan renewal
 	done     chan struct{}
@@ -385,7 +395,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	// The connection was made against the config as it stands now.
 	for _, p := range d.src.Config().Profiles {
 		d.grantedProfiles[p.Name] = true
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			d.granted[dur.Name] = true
 		}
 	}
@@ -405,6 +415,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 	d.syncBindings(ctx)
 	d.syncStops()
+	d.syncEndingTiers()
 	defer d.stopAllStops()
 	refresh := time.NewTicker(d.cfg.RefreshInterval)
 	defer refresh.Stop()
@@ -421,6 +432,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		case <-refresh.C:
 			d.syncBindings(ctx)
 			d.syncStops()
+			d.syncEndingTiers()
 			// The stream reads run off the loop, one pass at a time.
 			if rechecking.CompareAndSwap(false, true) {
 				d.bg.Add(1)
@@ -498,7 +510,7 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 		if !d.grantedProfiles[p.Name] {
 			addedProfiles[slot] = append(addedProfiles[slot], p.Name)
 		}
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
 				added[slot] = append(added[slot], dur.Name)
@@ -849,19 +861,20 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.offeringWaiting(hk)
-	h.cluster = adm.cluster
+	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 	h.trigger = adm.trigger
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobs != nil && prof.HasJobTemplate() {
+	if h.unattended && d.jobRunner(prof, h.tier) {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
 		if ended {
-			// The Job path ended the task itself (no worker): it no
+			// The Job path ended the task itself (no worker, or its tier
+			// ended while the Job started): it no
 			// longer waits.
 			d.clearWaiting(hk)
 			return
@@ -1289,7 +1302,10 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
-// refuses one as too long-lived. Each is read back with the key's public
+// refuses one as too long-lived. The proxy token carries the
+// vcs:proposal-create permit when the submission asked for a change and the
+// task runs on a Job of its own (#5646), and no permits claim at all
+// otherwise (#3993); the bus credential never carries one. Each is read back with the key's public
 // half before it is used, and only its jti is logged, never the token.
 func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid string, deadline time.Time) (natsToken, proxyToken string, err error) {
 	if now := d.pool.PodUID(h.profile, h.tier, pod); now != uid {
@@ -1306,7 +1322,19 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		return "", "", err
 	}
 	if h.cluster != nil {
-		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
+		proxy := base
+		// The permit goes only on a Job's pod, the task's alone. A pool
+		// pod runs the next task too, so a permit task that reached one
+		// (admission refuses it) is minted no permit, and its writes are
+		// refused.
+		if carriesPermit(h.changeRequested, h.cluster) {
+			if h.onJob {
+				proxy.Permits = []taskcred.Permit{taskcred.PermitVCSProposalCreate}
+			} else {
+				log.Error("a task with a confirmed change reached a pool pod; minting no write permit", "task", h.taskID, "profile", h.profile, "tier", h.tier)
+			}
+		}
+		proxyToken, err = d.mintOne(log, proxy, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
 		if err != nil {
 			return "", "", err
 		}
@@ -1338,7 +1366,7 @@ func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.A
 	if err != nil {
 		return "", fmt.Errorf("the %s credential just minted does not verify: %w", aud, err)
 	}
-	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires)
+	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires, "permits", back.Permits)
 	return token, nil
 }
 
@@ -1433,10 +1461,19 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 	if h.stopRequested {
 		stopAt = stopDeadline(d.src.Config(), d.now())
 	}
+	ended := h.tierEnded
 	d.mu.Unlock()
+	if ended { // marked before the hold began, or a re-adopted task
+		d.endTierHeld(ctx, log, del, h, key, rec)
+		return
+	}
 	for {
 		select {
 		case <-h.stopc:
+			if d.tierEndedOn(h) {
+				d.endTierHeld(ctx, log, del, h, key, rec)
+				return
+			}
 			if stopAt.IsZero() {
 				stopAt = stopDeadline(d.src.Config(), d.now())
 				log.Info("stop requested; the executor has a grace to end the task", "until", stopAt)
@@ -2043,14 +2080,14 @@ func submitRetention(cfg lib.DispatchConfig) time.Duration {
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
-// config lists is bound. Callers hold d.mu.
+// config derives is bound. Callers hold d.mu.
 func (d *Dispatcher) tierBoundLocked(cfg lib.DispatchConfig, profile, tier string) bool {
 	prof, ok := profileOf(cfg, profile)
 	if !ok {
 		return false
 	}
 	n := 0
-	for _, dur := range prof.Durables {
+	for _, dur := range prof.DerivedDurables() {
 		if dur.Tier != tier {
 			continue
 		}

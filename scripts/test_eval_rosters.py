@@ -889,6 +889,7 @@ API_LANE_EXCLUDED = [
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
     "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
+    "tse-profile-names-the-oom-kill",  # #3842: delegated_to, as above
 ]
 
 
@@ -934,6 +935,22 @@ class ApiLaneExclusionsTest(unittest.TestCase):
             if is_stopped_ask(str(doc.get("prompt") or "")):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
+    def test_every_registered_profile_ask_is_excluded(self):
+        # A [bench:profile ...] ask errors on the api transport (#5945), so an
+        # unlisted one would error there every repetition. Read from the
+        # harness's own module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.profile_hook import is_profile_ask
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_profile_ask(str(doc.get("prompt") or "")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} is a profile ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
     def test_every_registered_reply_under_pushed_report_is_excluded(self):
         # The same rule for the pushed-report replay: it errors on the api
@@ -1155,8 +1172,7 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
 # written list, each line with its issue, never a way to seat a new case.
 SEAT_BAR_EXEMPT = [
     ("agent-kanban-smoke", "c-slot", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
-    ("vcs-spent-branch-reuse", "c-repository", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
-    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
+    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing on its roles about that repository"),
 ]
 FLEET_FIXTURE_STATE_SCRIPT = REPO_ROOT / "hack" / "fleet-fixture-state.py"
 FLEET_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
@@ -1365,11 +1381,13 @@ class SeatBarTest(unittest.TestCase):
         self.assertEqual(self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": [{"op": "absent"}]})), [])
 
     def test_an_exemption_covers_its_own_mechanism_only(self):
-        # vcs-spent-branch-reuse is exempt for its pool-repository write; a
-        # slot read added to it would be a c-slot finding the entry does not cover.
+        # pdb-remediation-pr is exempt for its pool-repository write; a slot
+        # read added to it would be a c-slot finding the entry does not cover.
+        # (vcs-spent-branch-reuse lists no role, so the scan's declared-intent
+        # note assertion, anywhere in the catalog, cleared its entry.)
         exempt = {(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT}
-        self.assertIn(("vcs-spent-branch-reuse", "c-repository"), exempt)
-        self.assertNotIn(("vcs-spent-branch-reuse", "c-slot"), exempt)
+        self.assertIn(("pdb-remediation-pr", "c-repository"), exempt)
+        self.assertNotIn(("pdb-remediation-pr", "c-slot"), exempt)
         doc = {"verification_spec": [{"name": "o", "role": "objective", "check": {
             "type": "report_contains", "required_phrases": ["seeded-b"]}}]}
         self.assertEqual(sorted(r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())), ["c-repository", "c-slot"])

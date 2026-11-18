@@ -71,7 +71,7 @@ from typing import Any
 from kube_agents_bench import chat_shape
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
-from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
+from kube_agents_bench.forges import FORGE_SAFEGUARD_MARKER, FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
 from kube_agents_bench.worker_trajectory import NO_WORKER_CALLS_ENTRY
 
@@ -910,18 +910,20 @@ def _errored_check_reasons(record: RunRecord) -> list[str]:
     return out
 
 
-def _forge_unavailable_only(record: RunRecord) -> bool:
+def _forge_unavailable_only(record: RunRecord, *, catastrophic_ok: bool = False) -> bool:
     """Whether checks errored, no check failed, and every errored leaf of every
     errored check leads with FORGE_UNAVAILABLE_MARKER (a forge read failed
     transiently). A failed check is a verdict the outage cannot excuse, as
     a fail outranks an error in devops-bench's own conjunction; one leaf that
-    errored for any other reason, a skipped step included, keeps it False."""
+    errored for any other reason, a skipped step included, keeps it False.
+    `catastrophic_ok` lets an errored catastrophic safeguard through, for the
+    rung-2 reason's FORGE_SAFEGUARD_MARKER; the verdict never asks for it."""
     statuses = [str(entry.get("status") or "").lower() for entry in record.verification_report]
     if "fail" in statuses:
         return False
     # An errored catastrophic safeguard is a forbidden action nobody could rule out; rung 1
     # cannot see it, so rung 2 keeps it.
-    if any(
+    if not catastrophic_ok and any(
         status == "error" and str(entry.get("severity") or "").lower() == SEVERITY_CATASTROPHIC
         for entry, status in zip(record.verification_report, statuses)
     ):
@@ -1763,12 +1765,12 @@ def classify_rep(
     # provider rate limit is. AFTER rung 1, so a tripped safeguard still
     # blocks; any other error, a parse error included, stays on rung 2, and so
     # does a record that also fails rung 3, which the outage cannot explain.
-    if (
-        _forge_unavailable_only(record)
-        and not record.verification_parse_errors
+    forge_weather = (
+        not record.verification_parse_errors
         and not (spec.declares_verification_spec and record.coverage is None)
         and not _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)
-    ):
+    )
+    if forge_weather and _forge_unavailable_only(record):
         return rep(
             "infra",
             f"{FORGE_UNAVAILABLE_MARKER}: a forge read failed in transport or was rate limited, "
@@ -1813,7 +1815,11 @@ def classify_rep(
             "VerificationCoverage"
         )
     if problems:
-        return rep("blocked", "; ".join(problems), Rung.CHECK_DID_NOT_RUN)
+        # The same forge weather, kept here only by an errored catastrophic
+        # safeguard: still blocked, but the reason leads with
+        # FORGE_SAFEGUARD_MARKER so the dashboard names the forge (#6105).
+        lead = f"{FORGE_SAFEGUARD_MARKER}: " if forge_weather and _forge_unavailable_only(record, catastrophic_ok=True) else ""
+        return rep("blocked", lead + "; ".join(problems), Rung.CHECK_DID_NOT_RUN)
 
     # --- Rung 3. Evidence that an agent actually ran.
     liveness = _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)

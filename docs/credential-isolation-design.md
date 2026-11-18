@@ -337,6 +337,13 @@ which also run in the sandbox, before any identity is written to disk; hashing
 it anywhere else would mean shipping the plaintext address out of the sandbox
 first, which is exactly what it exists to prevent.
 
+The sandbox holds one more Secret-backed value, `A2A_ACTIVITY_SECRET`: the key
+hermes signs its tool-call deliveries to the bridge sidecar's loopback door with.
+It is pod-scoped like the two above, and hermes needs it in its own process. The
+activity signing key is withheld from child processes: `_run_env` in
+`agent_common_server.py` drops it from every child it spawns, so the gcloud,
+kubectl and hermes CLI children see only the two Session KV values.
+
 Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
 nothing. Both keys are optional in the CRD, so a Secret without them yields
@@ -1051,7 +1058,10 @@ host, method and path against the code allowlist in
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
 unchanged under a response cap and a deadline (a route with a projection, the GKE
-cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
+cluster list and get, returns its 2xx body cut down to the fields it names). One read is a
+`POST`, Logging `entries:list`: its JSON body is read under a size cap, held to the
+table's body check (one `projects/<project>`, no other resource), and forwarded as the
+runtime's own serialisation. The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
@@ -1228,7 +1238,8 @@ gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespa
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
 
 The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
-the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+the envelope keys and, on the records of the exec route, the Cloud API relay and the feedback
+route, the `tool_execution_audit` fields the site's
 [observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
 as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
 mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
