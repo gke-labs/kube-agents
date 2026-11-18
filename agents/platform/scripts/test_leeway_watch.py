@@ -24,6 +24,10 @@ WATCHDOGS_PAGE = (
     Path(__file__).resolve().parents[3] / "docs" / "site" / "src" / "content" / "docs" / "concepts" / "autonomous-watchdogs.md"
 )
 T0 = datetime(2026, 10, 19, 8, 30, 0, tzinfo=timezone.utc)
+NO_REPORT_LINE = (
+    "leeway watch: the tick failed: no cluster could be read this run (every read timed out or failed); "
+    "it will try again next run"
+)
 # The simulated leeway's start-up and report assembly per call.
 SIM_STARTUP_SECONDS = 10.0
 
@@ -2077,16 +2081,25 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.finding_clusters(), sorted(failed), "findings retire only on clusters read")
         self.assertEqual(watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {watch.EXPLICIT_TARGET_LABEL: detail})
 
-    def test_explicit_clusters_with_every_batch_failed_fail_the_tick_with_the_first_cause(self) -> None:
+    def test_explicit_clusters_with_every_batch_failed_fail_the_tick_with_the_fixed_detail(self) -> None:
         explicit = triples("p1", 20)
         with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: ",".join(explicit), watch.PROJECTS_ENV: ""}), self.sandbox(
             lambda clusters, _: subprocess.CompletedProcess([], 255, "", f"crash {clusters[0]}")
         ):
+            with self.assertRaises(watch.NoReportReturned) as raised:
+                self.sweep({}, {}, 3600.0)
+        # Which batch went first, and so its cause, changes from run to run:
+        # the detail names neither.
+        self.assertEqual(str(raised.exception), watch.NO_REPORT_DETAIL)
+        self.assertEqual(len(self.calls), 2)
+        # One call that held every cluster keeps its own cause, as before batching.
+        self.calls.clear()
+        with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: "p1/l/c00", watch.PROJECTS_ENV: ""}), self.sandbox(
+            lambda clusters, _: subprocess.CompletedProcess([], 255, "", "crash")
+        ):
             with self.assertRaises(RuntimeError) as raised:
                 self.sweep({}, {}, 3600.0)
-        first = clusters_arg(self.calls[0][0])[0]
-        self.assertEqual(str(raised.exception), f"leeway exited 255 without a report: crash {first}")
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(str(raised.exception), "leeway exited 255 without a report: crash")
 
     def test_cluster_stamps_are_saved_pruned_by_the_project_list_and_optional_in_the_ledger(self) -> None:
         self.assertEqual(watch.ledger_cluster_runs({}), {})
@@ -2157,12 +2170,9 @@ class BatchTests(unittest.TestCase):
                 firsts.append(clusters_arg(self.calls[0][0])[0].split("/")[0])
                 self.assertEqual(len(self.calls), 3, "three hung calls spend the tick")
         self.assertEqual(firsts, ["p1", "p4", "p3"], "the projects that had a turn rotate behind")
-        # The failures are counted, not named, so the rotation does not change
-        # the line and it posts once.
-        self.assertEqual(outputs, [[
-            "leeway watch: the tick failed: RuntimeError: 3 target(s) failed "
-            "(the sandbox run timed out after 900s) and the time ran out before the rest"
-        ], [], []])
+        # The line names no target and no count, so the rotation does not
+        # change it and it posts once.
+        self.assertEqual(outputs, [[NO_REPORT_LINE], [], []])
         ledger = watch.load_ledger(self.home)
         self.assertEqual(set(ledger[watch.CLUSTER_RUNS_KEY]), set(every))
 
@@ -2375,31 +2385,56 @@ class BatchTests(unittest.TestCase):
         open_p2 = {"p2": ["p2/l/c00"]}
         signature = watch.ANNOUNCED_PARTIAL_KEY
         targets = watch.ANNOUNCED_FAILED_TARGETS_KEY
+        scan_failed = [watch.ERROR_KIND_SCAN_FAILED]
+        held = [watch.ERROR_KIND_CLUSTER_ERROR, watch.ERROR_KIND_TIMEOUT]
         cases = (
-            # A failure was announced by kind: today's failures post as new,
-            # and a tick with none posts the recovery main would have.
-            ({signature: [watch.ERROR_KIND_SCAN_FAILED]}, fails("p2"), [self.partial(1, entry)], open_p2),
-            ({signature: [watch.ERROR_KIND_CLUSTER_ERROR, watch.ERROR_KIND_TIMEOUT]}, fails("p2"),
-             [self.partial(1, entry)], open_p2),
-            ({signature: [watch.ERROR_KIND_SCAN_FAILED]}, None, [cleared], None),
+            # A failure was announced by kind: one of the same kind today is
+            # taken as announced, as main would; one of another kind posts.
+            # The signature stays until a run with nothing failing.
+            ({signature: scan_failed}, fails("p2"), [], open_p2, scan_failed),
+            ({signature: held}, fails("p2"), [self.partial(1, entry)], open_p2, held),
+            ({signature: scan_failed}, None, [cleared], None, None),
             # A budget gap alone announced no failure under today's rules.
-            ({signature: [watch.ERROR_KIND_BUDGET_EXHAUSTED, "cut_short"]}, fails("p2"), [self.partial(1, entry)], open_p2),
-            ({signature: [watch.ERROR_KIND_BUDGET_EXHAUSTED]}, None, [], None),
+            ({signature: [watch.ERROR_KIND_BUDGET_EXHAUSTED, "cut_short"]}, fails("p2"), [self.partial(1, entry)],
+             open_p2, None),
+            ({signature: [watch.ERROR_KIND_BUDGET_EXHAUSTED]}, None, [], None, None),
             # A list of targets: each is open as a whole until read without failing.
-            ({targets: ["p2"]}, fails("p2"), [], open_p2),
-            ({targets: ["p2"]}, None, [cleared], None),
+            ({targets: ["p2"]}, fails("p2"), [], open_p2, None),
+            ({targets: ["p2"]}, None, [cleared], None, None),
             # The clusters each target failed on.
-            ({targets: open_p2}, fails("p2"), [], open_p2),
-            ({targets: open_p2}, None, [cleared], None),
+            ({targets: open_p2}, fails("p2"), [], open_p2, None),
+            ({targets: open_p2}, None, [cleared], None, None),
         )
-        for stored, outcome, expected, open_targets in cases:
+        for stored, outcome, expected, open_targets, kept in cases:
             with self.subTest(stored=stored, failing=outcome is not None):
                 self.write_ledger(**{watch.ANNOUNCED_KEY: stored})
                 with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
                     self.assertEqual(self.tick(0, outcome), expected)
                 announced = watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {})
-                self.assertNotIn(signature, announced)
+                self.assertEqual(announced.get(signature), kept)
                 self.assertEqual(announced.get(targets), open_targets)
+
+    def test_an_older_ledgers_signature_recovers_only_once_nothing_fails_or_goes_unread(self) -> None:
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
+        cleared = "leeway watch: every target that failed reads cleanly again"
+        signature = watch.ANNOUNCED_PARTIAL_KEY
+        spend_tick = watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0
+        for failing_first in (True, False):
+            with self.subTest(failing_first=failing_first):
+                self.write_ledger(**{watch.ANNOUNCED_KEY: {signature: [watch.ERROR_KIND_SCAN_FAILED]}})
+                outputs = []
+                with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+                    if failing_first:
+                        outputs.append(self.tick(0, fails("p2")))
+                    # p1 reads cleanly and spends the tick: p2 is not reached,
+                    # so recovery is not claimed for it.
+                    outputs.append(self.tick(1, seconds=spend_tick))
+                    self.assertEqual(self.ok, set(self.roster["p1"]))
+                    announced = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY]
+                    self.assertEqual(announced[signature], [watch.ERROR_KIND_SCAN_FAILED])
+                    outputs.append(self.tick(2))
+                self.assertEqual(outputs, [[]] * (len(outputs) - 1) + [[cleared]])
+                self.assertEqual(watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {}), {})
 
     def test_a_big_project_with_an_always_erroring_cluster_posts_once_and_does_not_flap(self) -> None:
         # 100 clusters at 60 s a read: about 84 are read a tick, so the
@@ -2459,8 +2494,8 @@ class BatchTests(unittest.TestCase):
         cases = (
             (errors({"c01", "c03"}, {"c03": "timeout"}),
              "p1: 3 of 5 clusters read — c01 and c03 returned an error (forbidden + 1 other cause(s))"),
-            (errors({"c00", "c01", "c02"}), "p1: 2 of 5 clusters read — c00 and c01 and c02 returned an error (forbidden)"),
-            (errors({"c00", "c01", "c02", "c03"}), "p1: 1 of 5 clusters read — 4 returned an error (forbidden)"),
+            (errors({"c00", "c01", "c02"}), "p1: 2 of 5 clusters read — c00, c01 and c02 returned an error (forbidden)"),
+            (errors({"c00", "c01", "c02", "c03"}), "p1: 1 of 5 clusters read — 4 clusters returned an error (forbidden)"),
         )
         for outcome, entry in cases:
             with self.subTest(entry=entry):
@@ -2537,6 +2572,150 @@ class BatchTests(unittest.TestCase):
         )
         listing["seconds"] = 0.0
         self.assertEqual(tick(2), ["leeway watch: every target that failed reads cleanly again"])
+
+    # --- row matching -----------------------------------------------------
+
+    def test_rows_match_by_source_then_context_then_a_short_name_the_call_does_not_share(self) -> None:
+        batch = ["p1/us-a/web", "p1/us-b/web", "p1/us-a/api"]
+        cases = (
+            # leeway's own row: a short name two clusters share, and a unique source.
+            ({"cluster": "web", "source": "gke:p1/us-b/web", "status": "error", "error": "denied"},
+             watch.CallRows(errors={"p1/us-b/web": "denied"})),
+            ({"cluster": "gke_p1_us-a_web", "status": "ok"}, watch.CallRows(ok={"p1/us-a/web"})),
+            ({"cluster": "p1/us-a/web", "status": "ok"}, watch.CallRows(ok={"p1/us-a/web"})),
+            ({"cluster": "api", "status": "ok"}, watch.CallRows(ok={"p1/us-a/api"})),
+            # A shared short name, a stray source and no name match nothing.
+            ({"cluster": "web", "status": "error", "error": "denied"}, watch.CallRows(unmatched_errors=["denied"])),
+            ({"cluster": "web", "source": "gke:p9/l/web", "status": "ok"}, watch.CallRows(unmatched_ok=1)),
+            ({"status": "error"}, watch.CallRows(unmatched_errors=[watch.DEFAULT_CLUSTER_SCAN_FAILED])),
+            ({"cluster": "", "source": "", "status": "ok"}, watch.CallRows(unmatched_ok=1)),
+            ({"cluster": "api", "status": "pending"}, watch.CallRows()),
+        )
+        for row, expected in cases:
+            with self.subTest(row=row):
+                self.assertEqual(watch.batch_rows({"clusters": [row]}, batch), expected)
+
+    def test_clusters_sharing_a_short_name_are_told_apart_by_source_across_batches(self) -> None:
+        # leeway names a row by the cluster's short name and its source by the
+        # full triple; two locations of one project share every short name.
+        self.roster = {"p1": [f"p1/{loc}/c{i:02d}" for loc in ("us-a", "us-b") for i in range(8)]}
+        first_batch = watch.order_clusters(self.roster["p1"], {}, T0)[: watch.CLUSTERS_PER_BATCH]
+        bad = next(t for t in first_batch if t.startswith("p1/us-b/") and t.replace("us-b", "us-a") in first_batch)
+        state = {"bad": bad}
+
+        def leeway_rows(clusters, _):
+            return completed_json({"clusters": [
+                {"cluster": c.rsplit("/", 1)[-1], "source": f"gke:{c}",
+                 "status": "error" if c == state["bad"] else "ok", "error": "forbidden"}
+                for c in clusters
+            ]})
+
+        short = bad.rsplit("/", 1)[-1]
+        self.assertEqual(self.tick(0, leeway_rows),
+                         [self.partial(1, f"p1: 15 of 16 clusters read — {short} returned an error (forbidden)")])
+        announced = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY]
+        self.assertEqual(announced[watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": [bad]})
+        # Its twin in the other location reads cleanly; the episode stays open
+        # until the failed cluster itself does.
+        state["bad"] = bad.replace("us-b", "us-a")
+        self.assertEqual(self.tick(1, leeway_rows), [])
+        state["bad"] = None
+        self.assertEqual(self.tick(2, leeway_rows), ["leeway watch: every target that failed reads cleanly again"])
+
+    def test_an_unnamed_error_row_is_counted_unnamed_and_its_episode_closes_on_the_next_clean_call(self) -> None:
+        self.roster = {"p1": triples("p1", 4)}
+
+        def unnamed_errors(count):
+            def outcome(clusters, _):
+                rows = [{"cluster": c.rsplit("/", 1)[-1], "source": f"gke:{c}", "status": "ok"}
+                        for c in clusters[: len(clusters) - count]]
+                return completed_json({"clusters": rows + [{"status": "error", "error": "forbidden"}] * count})
+
+            return outcome
+
+        for count, part in ((1, "1 cluster returned an error"), (2, "2 clusters returned an error")):
+            with self.subTest(count=count):
+                self.write_ledger()
+                lines = self.tick(0, unnamed_errors(count))
+                # read + errored = clusters: each unnamed row counts once.
+                self.assertEqual(lines, [self.partial(1, f"p1: {4 - count} of 4 clusters read — {part} (forbidden)")])
+                self.assertNotIn(watch.DEFAULT_UNKNOWN, lines[0])
+                announced = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY]
+                self.assertEqual(announced[watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": None})
+                self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
+
+        # Beside a named error row, an unnamed one still makes the episode whole.
+        def named_and_unnamed(clusters, _):
+            rows = [{"cluster": c, "status": "error" if c == "p1/l/c00" else "ok", "error": "denied"}
+                    for c in clusters if c != "p1/l/c03"]
+            return completed_json({"clusters": rows + [{"status": "error", "error": "forbidden"}]})
+
+        self.write_ledger()
+        self.assertEqual(self.tick(0, named_and_unnamed), [self.partial(
+            1, "p1: 2 of 4 clusters read — 2 clusters returned an error (denied + 1 other cause(s))"
+        )])
+        announced = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY]
+        self.assertEqual(announced[watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": None})
+
+    def test_a_project_whose_list_is_now_empty_closes_its_episode(self) -> None:
+        self.roster = {"p1": []}
+        self.write_ledger(**{watch.ANNOUNCED_KEY: {watch.ANNOUNCED_FAILED_TARGETS_KEY: {"p1": ["p1/l/c00"]}}})
+
+        def run(argv, **kw):
+            self.assertEqual(argv[: len(watch.LIST_CLUSTERS_ARGV)], list(watch.LIST_CLUSTERS_ARGV))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        buf = io.StringIO()
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=run), redirect_stdout(buf):
+            watch.tick(now=T0)
+        self.assertEqual(buf.getvalue().splitlines(), ["leeway watch: every target that failed reads cleanly again"])
+        self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
+
+    # --- tick failure -----------------------------------------------------
+
+    def test_a_tick_where_no_call_returns_posts_one_fixed_line_over_days(self) -> None:
+        # Projects of mixed sizes: four hang (one only on some calls, after
+        # others exit 1), two exit 1 with a cause that names the batch. The
+        # hangs spend the tick, so the rotation changes which projects fail,
+        # how far each gets and why from day to day; the line does not.
+        self.roster = {"pa": triples("pa", 30), "pb": triples("pb", 5), "pc": triples("pc", 1),
+                       "pd": triples("pd", 13), "pe": triples("pe", 3), "pf": triples("pf", 2)}
+
+        def outcome(clusters, timeout):
+            project = clusters[0].split("/")[0]
+            if project in ("pa", "pe", "pf") or (project == "pd" and len(self.calls) % 2):
+                raise subprocess.TimeoutExpired(cmd="leeway", timeout=timeout)
+            return subprocess.CompletedProcess([], 1, "", f"error reading {clusters[0]}")
+
+        outputs = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(self.roster)}):
+            for day in range(6):
+                outputs.append(self.tick(day, outcome, seconds=30.0))
+        self.assertEqual(outputs, [[NO_REPORT_LINE]] + [[]] * 5)
+        self.assertNotIn("Error:", NO_REPORT_LINE)
+        self.assertEqual(
+            (self.home / watch.FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip(), watch.NO_REPORT_DETAIL
+        )
+
+    # --- refresh gate -----------------------------------------------------
+
+    def test_a_deferred_refresh_waits_while_clusters_are_not_reached(self) -> None:
+        self.roster = {"p1": triples("p1", 30)}
+        published: list[str] = []
+        reports = self.home / watch.REPORTS_DIR_NAME
+        self.write_ledger(**{watch.ANNOUNCED_KEY: {watch.ANNOUNCED_DEFERRED_REFRESH_KEY: watch.REASON_ALL_RESOLVED}})
+        with mock.patch.object(watch, "publish_blackboard_topic",
+                               side_effect=lambda summary, path: (published.append(summary), (True, None))[1]):
+            # Nothing fails, but six clusters are not reached: no refresh.
+            self.assertEqual(self.tick(1, seconds=watch.TICK_BUDGET_SECONDS / 2), [])
+            self.assertEqual(len(self.ok), 24)
+            self.assertFalse(reports.exists())
+            self.assertEqual(published, [])
+            self.assertIn(watch.ANNOUNCED_DEFERRED_REFRESH_KEY, watch.load_ledger(self.home)[watch.ANNOUNCED_KEY])
+            self.tick(2)
+        self.assertTrue((reports / watch.LATEST_JSON_LINK_NAME).is_file())
+        self.assertEqual(published, [watch.A2A_RETRY_SUMMARY.format(prefix=watch.LINE_PREFIX)])
+        self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
 
     # --- retirement -------------------------------------------------------
 
