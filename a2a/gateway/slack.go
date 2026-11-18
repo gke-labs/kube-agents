@@ -303,7 +303,7 @@ type SlackAdapter struct {
 	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
 
 	// homeLearn is the learned home channel's state (slack_home_channel.go).
-	homeLearn slackHomeLearn
+	homeLearn homeLearner
 
 	// workspaceURL is the bot's workspace as auth.test names it
 	// ("https://acme.slack.com/"), the root of a message's permalink; home is
