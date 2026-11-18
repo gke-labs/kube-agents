@@ -150,11 +150,31 @@ def test_a_from_mode_needs_both_sets():
     assert "1 of 2" in got["result"]["error"]
 
 
-@pytest.mark.parametrize("initial, restored", [("explain", "explain"), ("propose", "explain")])
-def test_the_entry_refuses_a_dial_level_where_a_broker_mode_belongs(initial, restored):
-    got = write_mode.entry(write_mode.WriteMode(ASK, "none"), initial, [{"set": "none", "read": "none"}], restored, (PODS, PODS))
+@pytest.mark.parametrize(
+    "initial, readings, restored",
+    [
+        ("explain", [{"set": "none", "read": "none"}], "explain"),
+        ("propose", [{"set": "none", "read": "none"}], "explain"),
+        ("propose", [{"set": "explain", "read": "explain"}], "propose"),
+    ],
+)
+def test_the_entry_refuses_a_dial_level_where_a_broker_mode_belongs(initial, readings, restored):
+    got = write_mode.entry(write_mode.WriteMode(ASK, "none"), initial, readings, restored, (PODS, PODS))
     assert got["status"] == "error"
-    assert "not broker modes" in got["result"]["error"]
+    assert "not all broker modes" in got["result"]["error"]
+
+
+@pytest.mark.parametrize(
+    "asked, readings",
+    [
+        (write_mode.WriteMode(ASK, "none"), [{"set": "propose", "read": "propose"}]),
+        (write_mode.WriteMode(ASK, "propose", "none"), [{"set": "none", "read": "none"}, {"set": "none", "read": "none"}]),
+    ],
+)
+def test_the_entry_needs_the_sets_that_were_asked_for(asked, readings):
+    got = write_mode.entry(asked, "propose", readings, "propose", (PODS, PODS))
+    assert "did not read back as asked" in got["result"]["error"]
+    assert got["status"] == "error"
 
 
 class _SessionKV:

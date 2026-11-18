@@ -326,15 +326,22 @@ def entry(
     saw. A put-back that failed is one too: the next case would run at the
     wrong mode."""
     before, after = pods
-    if not error and (initial_mode not in MODES or restored_mode not in (*MODES, None)):
-        error = f"the entry got {initial_mode!r} and {restored_mode!r}, which are not broker modes (a dial level from set_mode?)"
-    wanted = 2 if asked.from_mode else 1
-    first = asked.from_mode or asked.mode
-    if not error and initial_mode == first:
+    if not error and (
+        initial_mode not in MODES
+        or restored_mode not in (*MODES, None)
+        or any(r.get("set") not in MODES or r.get("read") not in MODES for r in readings)
+    ):
+        error = (
+            f"the entry got {initial_mode!r}, {readings!r} and {restored_mode!r}, "
+            "which are not all broker modes (a dial level from set_mode?)"
+        )
+    wanted = (asked.from_mode, asked.mode) if asked.from_mode else (asked.mode,)
+    if not error and initial_mode == wanted[0]:
         error = f"the install was already at {initial_mode}, so setting it proves nothing"
-    if not error and len(readings) != wanted:
-        error = f"{len(readings)} of {wanted} sets were made"
-    if not error and any(r["read"] != r["set"] for r in readings):
+    if not error and len(readings) != len(wanted):
+        error = f"{len(readings)} of {len(wanted)} sets were made"
+    # Each set is the one asked for, in order, and read back as that mode.
+    if not error and any(r.get("set") != mode or r.get("read") != mode for r, mode in zip(readings, wanted)):
         error = "a set did not read back as asked"
     if not error and (not before or after is None):
         error = "the agent's and the broker's pods could not be listed, so a restart could not be ruled out"
