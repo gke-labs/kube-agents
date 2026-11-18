@@ -1685,6 +1685,9 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reached-the-next-step", proc.stdout)
         self.assertIn("WARN: could not refresh", proc.stderr)
+        # The volume had a copy, so the warning says that it is kept, not that the plugin is missing.
+        self.assertIn("keeps the previous image's copy", proc.stderr)
+        self.assertNotIn("is missing", proc.stderr)
         self.assertEqual(kept, "stale\n", "a failed copy did not leave the old module whole")
         self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
         self.assertEqual(refreshed, "image\n", "one failed plugin stopped the loop")
@@ -1717,6 +1720,101 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         self.assertIn("WARN: could not refresh", proc.stderr)
         self.assertEqual(kept, "stale\n")
         self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
+
+    def test_a_copy_that_fails_part_way_on_a_new_volume_names_the_plugin_as_missing_or_incomplete(self):
+        # No earlier copy, and the rename of the first file fails: the folder is made but
+        # holds no module. The warning must not say that a previous copy is kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "mv").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            left = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("the chat_metrics plugin is missing or incomplete", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
+        self.assertEqual(left, [], "the failed copy left a file behind")
+
+    def test_a_copy_that_fails_after_its_first_file_on_a_new_volume_is_not_called_an_earlier_copy(self):
+        # The first file lands and the second fails. The folder now holds a file, but it
+        # held none before the copy, so the plugin is incomplete, not kept.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            for module in ("metrics.py", "plugin.py"):
+                (image / "plugins" / "chat_metrics" / module).write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            real_mv = shutil.which("mv")
+            count = pathlib.Path(tmp) / "mv-calls"
+            (shims / "mv").write_text(
+                f'#!/bin/sh\nn=$(cat "{count}" 2>/dev/null || echo 0)\nn=$((n + 1))\necho "$n" > "{count}"\n'
+                f'[ "$n" -le 1 ] && exec "{real_mv}" "$@"\nexit 1\n',
+                encoding="utf-8",
+            )
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            landed = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(landed), 1, f"one file should have landed before the failure: {landed}")
+        self.assertIn("the chat_metrics plugin is missing or incomplete", proc.stderr)
+        self.assertNotIn("keeps the previous image's copy", proc.stderr)
+
+    def test_each_failed_plugin_gets_the_warning_for_its_own_folder(self):
+        # Two plugins fail in one start. The first had a copy; the second has a folder with
+        # no module in it, and a temporary file that an earlier failed copy left. The second
+        # must not take the first one's warning.
+        if os.geteuid() == 0:
+            self.skipTest("root writes into a read-only directory")
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+            (pvc / "plugins" / "agent_roster" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            (pvc / "plugins" / "chat_metrics" / "plugin.py.refresh.pod0").write_text("partial\n", encoding="utf-8")
+            for name in ("agent_roster", "chat_metrics"):
+                (pvc / "plugins" / name).chmod(0o555)
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            finally:
+                for name in ("agent_roster", "chat_metrics"):
+                    (pvc / "plugins" / name).chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warnings = {line.split("/plugins/")[1].split(" ")[0]: line for line in proc.stderr.splitlines() if "could not refresh" in line}
+        self.assertEqual(sorted(warnings), ["agent_roster", "chat_metrics"], proc.stderr)
+        self.assertIn("keeps the previous image's copy", warnings["agent_roster"])
+        self.assertIn("the chat_metrics plugin is missing or incomplete", warnings["chat_metrics"])
+        self.assertNotIn("keeps the previous image's copy", warnings["chat_metrics"])
 
     def test_a_symlinked_plugin_destination_is_left_alone(self):
         # A symlink at the destination is not the image's copy to refresh: the loop
@@ -1787,8 +1885,9 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n")
 
     def test_a_plugins_directory_the_entrypoint_cannot_write_does_not_end_the_start(self):
-        # On a fresh volume the kubelet creates $TARGET_DIR/plugins as root when a plugin
-        # is mounted beneath it; under `set -e` an unguarded mkdir there ends the container.
+        # On a fresh volume the container runtime creates $TARGET_DIR/plugins as root when a
+        # plugin is mounted beneath it and the operator did not make the folder first; under
+        # `set -e` an unguarded mkdir there ends the container.
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
@@ -1817,6 +1916,10 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             self.assertIn("reached-the-next-step", proc.stdout)
             self.assertIn("WARN: could not refresh", proc.stderr)
             self.assertFalse((pvc / name).exists())
+            # A new volume has no earlier copy to keep: the warning names the plugin as
+            # missing and does not say that a previous copy is kept.
+            self.assertIn("the bootstrap_onboarding plugin is missing", proc.stderr)
+            self.assertNotIn("keeps the previous image's copy", proc.stderr)
 
 
 class ManagedScopeAssertionTest(unittest.TestCase):
