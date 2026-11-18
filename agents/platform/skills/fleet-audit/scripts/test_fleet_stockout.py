@@ -3871,6 +3871,10 @@ class ReservedPoolTest(unittest.TestCase):
         # holds for a pool with no autoscaling too.
         self.assertIn("cannot add a node; with autoscaling on, the autoscaler reports `scale.up.error.reservation.not.found`", candidate["impact"])
         self.assertTrue(candidate["impact_authoritative"])
+        # Each fix costs money or replaces the pool, so the sweep opens no
+        # pull request for it, whatever kind the published remediation has.
+        self.assertEqual(candidate["needs_triage"], fs.RESERVED_POOL_TRIAGE)
+        self.assertIn(fs.RESERVED_POOL_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
         self.assertEqual(candidate["command"], f"{self.POOLS_COMMAND}; gcloud compute reservations list --project acme --format json")
         # The check ran here: its record stays and nothing is unevaluated.
         self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])

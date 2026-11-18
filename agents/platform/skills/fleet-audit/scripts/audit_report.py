@@ -3193,7 +3193,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Nine markers. A cost collector sets `service-fronted` on an idle
+# Twelve markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -3209,6 +3209,12 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # two files, where a finding carries one `remediation.path`, so the sweep's
 # pull request would land a class nothing selects. `/remediate` opens the same
 # one-file pull request, for a person who knows to add the selector to it.
+#
+# The stockout collector also sets `reserved-pool` on a §3.10(d) finding, a
+# node pool whose named reservation is in none of its zones. Each fix creates
+# a reservation, which is billed from the moment it exists, or replaces the
+# pool. The SOP has that finding published as `manual`, and the marker keeps a
+# `manifest` the model wrote anyway out of the sweep.
 #
 # The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)
 # whose `major` grade the Autopilot bump supplied rather than its magnitude.
@@ -3245,6 +3251,7 @@ TRIAGE_REASONS = {
     "service-fronted": "stands down a controller a Service routes to",
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
     "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
+    "reserved-pool": "creates a billed reservation or replaces the node pool",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",

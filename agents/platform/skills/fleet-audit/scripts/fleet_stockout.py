@@ -490,6 +490,11 @@ MISSING_RESERVATION_IMPACT = (
     "pool's zones, so the pool cannot add a node; with autoscaling on, the autoscaler reports "
     "`scale.up.error.reservation.not.found`."
 )
+# The `needs_triage` marker on a §3.10(d) finding: each fix creates billed
+# capacity or replaces the node pool, so the automatic sweep opens no pull
+# request for it even if the published remediation is a manifest. Read by
+# `triage_markers` in audit_report.py, as `NEW_COMPUTE_CLASS_TRIAGE` is.
+RESERVED_POOL_TRIAGE = "reserved-pool"
 # Entry keys that carry the two halves of §3.10(d) to `collect_fleet`, which
 # removes them: a cluster's pools bound to named reservations, and a project's
 # `{reservation name: zones}`.
@@ -1755,6 +1760,7 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
                         "severity": MISSING_RESERVATION_SEVERITY,
                         "excerpt": f"reservationAffinity={POOL_SPECIFIC_RESERVATION}, pool zones {', '.join(reserved['zones'])}; {where}",
                         "impact": MISSING_RESERVATION_IMPACT,
+                        "needs_triage": RESERVED_POOL_TRIAGE,
                         # Both reads: the pool's affinity and zones, then the
                         # reservations of each owner project.
                         "command": "; ".join([reserved["command"], *(shlex.join(reservations_argv(owner)) for owner in owners)]),
