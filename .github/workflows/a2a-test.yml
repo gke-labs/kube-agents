@@ -49,10 +49,14 @@ on:
       # broker policy the session's read tables must stay a subset of. An
       # edit to either alone has to run those tests. lib/persona's tests read
       # the tse persona and the skills it copies the same way (mcp_policy.py,
-      # which bounds its servers, is listed below).
+      # which bounds its servers, is listed below), and the Hermes tse
+      # profile's SOUL.md and AGENTS.md, which the persona must stay in step
+      # with (tse_profile_drift_test.go).
       - "agents/cluster/skills/**"
       - "agents/tse/persona/**"
       - "agents/tse/skills/**"
+      - "agents/tse/SOUL.md"
+      - "agents/tse/AGENTS.md"
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
@@ -127,6 +131,8 @@ jobs:
               - "agents/cluster/skills/**"
               - "agents/tse/persona/**"
               - "agents/tse/skills/**"
+              - "agents/tse/SOUL.md"
+              - "agents/tse/AGENTS.md"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
               - "agents/cluster/persona/**"
