@@ -56,6 +56,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_INSTALL = REPO_ROOT / "terraform" / "examples" / "full-install"
 ROOT_VARIABLES = FULL_INSTALL / "variables.tf"
 ROOT_MAIN = FULL_INSTALL / "main.tf"
+# The checks the chart's values must pass sit on the values output, so a plan
+# that installs no release (install_helm_releases = false) runs them too.
+ROOT_OUTPUTS = FULL_INSTALL / "outputs.tf"
 MODULE_VARIABLES = REPO_ROOT / "terraform" / "modules" / "drift-pubsub" / "variables.tf"
 DETECTOR_MAIN = REPO_ROOT / "k8s-operator" / "cmd" / "drift-detector" / "main.go"
 CHART_VALUES = REPO_ROOT / "charts" / "kube-agents" / "values.yaml"
@@ -229,7 +232,7 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
     def test_the_detector_cannot_be_enabled_without_the_ingress(self):
         single(
             PRECONDITION_RE,
-            self.main,
+            ROOT_OUTPUTS.read_text(encoding="utf-8"),
             f"precondition refusing the detector without {FLAG_VARIABLE}",
         )
 
@@ -297,7 +300,7 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
         )
         single(
             COUNTERMAND_PRECONDITION_RE,
-            self.main,
+            ROOT_OUTPUTS.read_text(encoding="utf-8"),
             f"precondition refusing local.{COUNTERMAND_LOCAL}",
         )
 

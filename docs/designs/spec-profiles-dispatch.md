@@ -375,7 +375,14 @@ leave open:
   group- or world-writable (#5622). The broker also accepts a
   `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
   credential, which reaches only the audit-report routes and is refused on every other route,
-  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. Both name the task, its profile and
+  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod: one
+  whose tier has no Job runner is refused at admission (`change-needs-job`), and the permit is
+  minted only for a task on a Job (#5646). Otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
@@ -471,8 +478,9 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid`, `queue-timeout`, `script-not-allowed` (the trigger names a
-  script its profile's `spec.scripts` doesn't list, #5622), and for a child of an AgentProfile task
+  `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`, `parameters-invalid`,
+  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, #5622),
+  and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`
