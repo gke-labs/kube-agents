@@ -42,7 +42,6 @@ package controller
 // gateway's account reaches no other role there either.
 
 import (
-	"fmt"
 	"path"
 
 	corev1 "k8s.io/api/core/v1"
@@ -82,12 +81,6 @@ var a2aReportsEnvNames = []string{
 	credentialProxyA2AReportsCallersEnvVar,
 	a2aReportStoreURLEnvVar,
 	a2aReportStoreTokenFileEnvVar,
-}
-
-// a2aGatewayBrokerCaller is the A2A gateway's ServiceAccount as the broker's
-// TokenReview names it.
-func a2aGatewayBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
-	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent))
 }
 
 // a2aReportsBrokerEnv is the broker's half: the audience and its binding.

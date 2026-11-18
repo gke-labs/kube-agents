@@ -4957,6 +4957,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// The A2A gateway's report-reader audience and its binding, on every
 	// install (a2a_report_reader.go).
 	envVars = append(envVars, a2aReportsBrokerEnv(agent)...)
+	envVars = append(envVars, a2aCuratorBrokerEnv(agent)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
 	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
@@ -5022,9 +5023,14 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				// not built, so one consumer pulls it. The audience is what
 				// the broker confers the a2a-chat role by; the legacy chat
 				// caller's audience must not reach the A2A event routes.
+				// The callers bind that role to the A2A gateway's
+				// ServiceAccount, the one pod that projects the audience,
+				// so no other caller holding it gets the role. Rendered
+				// only here, so turning Chat off drops both together.
 				envVars = append(envVars,
 					corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: subscription},
 					corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+					corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},
 				)
 			} else {
 				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
@@ -5137,6 +5143,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		// And its callers: one that could set them would choose who holds
+		// the a2a-chat role. Rendered only while Chat is armed, so reserved
+		// by name.
+		credentialProxyA2AChatCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
 		// (a2a_report_reader.go, a2aReportsEnvNames).
 		credentialProxyA2AReportsAudienceEnvVar,
@@ -5164,6 +5174,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		credentialProxyCuratorAudienceEnvVar,
+		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// The profile role's four, by name because each is rendered only

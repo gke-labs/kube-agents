@@ -189,8 +189,8 @@ RETRY_JITTER_FLOOR = 0.5
 BROKER_ADMISSION_WAIT_SECONDS = 60.0
 RETRY_DEADLINE_SECONDS = 170.0
 RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
-# What a refusal with no JSON body is reported as; the broker's own text is
-# used when it sent one.
+# What an answer with no JSON body is reported as, a refusal or a 2xx; the
+# broker's own text is used when a refusal sent one.
 NON_JSON_RESPONSE_TEXT = "non-JSON response"
 CLASS_INTERACTIVE = "interactive"
 CLASS_BACKGROUND = "background"
@@ -241,6 +241,12 @@ _exec_url_notice_written = False
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
 _DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the command may have run"
+# A 2xx answer on `/v1/exec` that cannot be read. The broker ran the command
+# before it answered, so the line ends as the dropped connection's does, and
+# the command is never sent again. `{what}` names the shape: the body can be
+# a command's output and is never printed.
+_UNREADABLE_ANSWER_LINE = "credential proxy error (HTTP {status}): {what}; the command may have run"
+_NOT_AN_OBJECT_TEXT = "the response is JSON of type {type}, not an object"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -2104,7 +2110,20 @@ def execute(
             return 1
         try:
             with open_broker_request(request) as response:
-                payload = json.load(response)
+                # Only the parse is guarded: a read that breaks is a dropped
+                # connection, below.
+                try:
+                    payload = json.load(response)
+                except ValueError:
+                    print(
+                        _UNREADABLE_ANSWER_LINE.format(status=response.status, what=NON_JSON_RESPONSE_TEXT),
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not isinstance(payload, dict):
+                    shape = _NOT_AN_OBJECT_TEXT.format(type=type(payload).__name__)
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=sys.stderr)
+                    return 1
             break
         except urllib.error.HTTPError as exc:
             payload = _refusal_payload(exc)
@@ -2286,11 +2305,24 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     )
     try:
         with open_broker_request(request) as response:
-            return json.load(response)
+            try:
+                answer = json.load(response)
+            except RecursionError as exc:
+                # A body nested deeper than the parser goes. A RuntimeError by
+                # type, so no clause for a body that is not JSON sees it. A
+                # ValueError, as for the answer below that is not an object.
+                raise ValueError("the broker's answer is JSON nested too deep to read") from exc
+            if not isinstance(answer, dict):
+                # Valid JSON, but not an object, and every consumer reads the
+                # answer as one. A ValueError, as for a body that is not JSON:
+                # `vcs_client.call` has an arm for it. The type's name only,
+                # never the body.
+                raise ValueError(f"the broker's answer is JSON of type {type(answer).__name__}, not an object")
+            return answer
     except urllib.error.HTTPError as exc:
         try:
             answer = json.load(exc)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):  # RecursionError: a body nested too deep to parse
             # The status arrived but the body is not a refusal document. The
             # status is the whole answer.
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc

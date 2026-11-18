@@ -90,6 +90,22 @@ Names are this server's memory only, and they're shared:
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.
 
+## Sending a turn to an AgentProfile
+
+`send_message` takes two optional fields that send the turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can:
+
+- `addressee`: the profile's name, for example `cluster`. It must be one subject token: no spaces, dots or wildcards.
+- `parameters`: the profile's task parameters, an object of string values, for `cluster` its `project`, `location` and `cluster`. They are refused without an `addressee`.
+
+Both go into the console frame as the gateway's `ConsoleInFrame` reads them (`addressee`, `parameters`). Without them the frame is the same as before. An `addressee` is refused on a stop word, a bare `/feedback` or `/feedback summary`, and any `/session` text, a message after it included, since those are commands for the conversation rather than tasks. An addressed turn is a new task for the profile, never a session. Everything else is the gateway's to check: it refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards on `DIRECTORY` by profile.
+
+The gateway publishes a profile's task on `a2a.submit`, which the console account can't read, so the turn can't find its task from the submission the way a plain turn does. Instead, the gateway's status line for a profile turn (`⏳ submitted…`) names the task, the profile it went to and the inbound frame whose turn started it (`taskId`, `addressee`, `inReplyTo`). The turn takes only the line that answers its own frame, so another turn's line on the same conversation (an earlier turn's that came late, or another client's) is not taken for it, and follows that task's events and terminal on `TASKS`, as it follows its own. A turn still running when the wait ends returns the task as `<profile>/<task-id>`. Read it with `task_control get` under that reference, which always resolves. A bare task id resolves only while this server still holds the task as running, since otherwise it is looked up from the task's submission, which the console can't see.
+
+Two known limits:
+
+- The gateway posts the status line before it publishes the submission. If that publish fails, the turn reports a running task that never existed, until its wait runs out.
+- Against a gateway older than this change, the status line names no task, so an addressed turn returns after the gateway's notice with no task, about ten seconds later.
+
 ## Card reports and poll_events
 
 On the Hermes bridge's `api` executor, a console or MCP turn that files Kanban cards holds the turn open while its cards run (`waitForKanbanCards`), streams card `subtask` steps (`steps` artifact) and `progress` updates in turn, and folds settled card results directly into the task's `result` artifact, clearing `cardsFiled` so no `handoff` artifact or `cardsPending: true` result flag is emitted when the cards settle in turn. When a turn instead ends with unsettled cards (under the `cli` executor, when a card is still open at turn exit), the card's report arrives on the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card in `replyTo`. A delegation chain's terminal result is posted there too, as a `result` frame; the server doesn't keep those, since the chain's tasks hold the result and `send_message` and `task_control` read it there. A turn in progress reads one flag off its own result frame, below.

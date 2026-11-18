@@ -235,7 +235,8 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	// audit reports through the store routes (a2a_report_reader.go), and its
 	// Google Chat adapter, when armed, pulls the relay hosted here. Held by
 	// CREDENTIAL_PROXY_A2A_REPORTS_CALLERS to the a2a-reports and a2a-chat
-	// audiences, so it reaches no other role.
+	// audiences, and with Chat armed by CREDENTIAL_PROXY_A2A_CHAT_CALLERS
+	// as well, so it reaches no other role.
 	callers = append(callers, a2aGatewayBrokerCaller(agent))
 	// The third caller exists only under the cluster-view flag. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
@@ -261,7 +262,17 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if scopePublisherMayRun(agent, owned.scope) {
 		callers = append(callers, scopePublisherBrokerCaller(agent))
 	}
+	if a2aCuratorEnabled() {
+		callers = append(callers, a2aCuratorBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
+}
+
+// a2aGatewayBrokerCaller is the TokenReview username of the A2A gateway's
+// ServiceAccount, as the broker sees it: an allowed caller while Chat is
+// armed, and the one CREDENTIAL_PROXY_A2A_CHAT_CALLERS names.
+func a2aGatewayBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent))
 }
 
 // a2aSessionBrokerCaller is the TokenReview username of the session pods'
