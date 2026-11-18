@@ -142,9 +142,13 @@ type a2aIdentity struct {
 	// its subscribe list is two exact prefixes, so it cannot read an entry
 	// with or without the deny.
 	//
-	// Rendered only for static principals. No callout principal needs one:
+	// Rendered into nats.conf for a static principal, and into the callout's
+	// identity map for a mapped one (its grants' denyPublish and
+	// denySubscribe, #5301), where the callout subtracts them in the minted
+	// JWT. No principal in a2aIdentities' callout set carries one today:
 	// provision's JetStream grants are enumerated the same way seed's are,
 	// the session's are derived at mint time, and the verifier is the reader.
+	// The gateway's map entry (gatewayCalloutEntry) carries its static user's.
 	denyPublish   []string
 	denySubscribe []string
 }

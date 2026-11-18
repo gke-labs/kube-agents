@@ -304,6 +304,54 @@ spec:
                     - limits
                     - requests
                   type: object
+                scripts:
+                  description: |-
+                    Scripts are the helper scripts this profile may run as a script-run
+                    task (#5622): a built-in schedule's run that execs one of them, with no
+                    model turn. A task names a script, and the dispatcher refuses one this
+                    list doesn't name. The path comes from here, through the operator's
+                    render of the dispatch config, never from the task. Absent means the
+                    profile runs no scripts. Set by an admin or the chart, like the rest
+                    of the spec.
+                  items:
+                    description: AgentProfileScript is one helper script a profile allowlists.
+                    properties:
+                      name:
+                        description: |-
+                          Name is how a task names the script: a DNS-1123 label, unique in the
+                          list. It is a subject token on the bus, so it can't hold a dot.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$
+                        type: string
+                      path:
+                        description: |-
+                          Path is the script's absolute path in the worker image, under
+                          /opt/kube-agents/scripts/. Each segment starts with a letter, digit or
+                          underscore and holds only those, dots and hyphens, so there is no ".."
+                          or "." segment, no empty segment, and no shell metacharacter. There is
+                          no args field: a script takes its input from the task's parameters.
+                        maxLength: 255
+                        minLength: 1
+                        pattern: ^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$
+                        type: string
+                      timeoutSeconds:
+                        description: |-
+                          TimeoutSeconds bounds one run of the script. It may not exceed
+                          spec.lifecycle.activeDeadlineSeconds, which bounds the whole task.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                      - name
+                      - path
+                      - timeoutSeconds
+                    type: object
+                  maxItems: 16
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - name
+                  x-kubernetes-list-type: map
                 tools:
                   description: |-
                     Tools are OCI images of command-line tools for the profile's pods. Each
@@ -366,6 +414,10 @@ spec:
                 - resources
               type: object
               x-kubernetes-validations:
+                - message: each spec.scripts timeoutSeconds must be at most spec.lifecycle.activeDeadlineSeconds
+                  rule:
+                    "!has(self.scripts) || self.scripts.all(s, s.timeoutSeconds <=
+                    self.lifecycle.activeDeadlineSeconds)"
                 - message:
                     "spec.identity.serviceAccountName names one ServiceAccount,
                     so it can serve only one tier: leave it unset (the operator creates

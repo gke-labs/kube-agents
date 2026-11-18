@@ -255,10 +255,14 @@ not been set.
 
 **Image pins.** `images.json` is the source of truth for every image an install pulls, but a bump
 starts there and rarely ends there. Several images keep a second copy that the file is the source
-for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator, the chart's
+template default for the A2A bus's four (`kube-agents.a2aBusImageDefaults` in
+`charts/kube-agents/templates/_helpers.tpl`) — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
-default and a mirrored install, and what each off-by-default toggle it renders adds to each (the
-GitHub token minter, the web console, the cluster profile, Hindsight); the build-time
+default and a mirrored install, what each off-by-default toggle it renders adds to each (the
+GitHub token minter, the web console, the cluster profile, Hindsight), and the four bus env vars of
+a `helm upgrade --reuse-values` render from before `a2aBus` (no `a2aBus` key), unmirrored and
+mirrored; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's

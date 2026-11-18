@@ -1560,12 +1560,15 @@ provisioned or not visible scans as "not checked".
 **The document.** `fixture-state.json` is `{schema_version, scanned_at,
 duration_s, projects{}, summary, previous}`. `projects` has one entry per
 pool project, `{roles{}, summary, duration_s, reader, error?}`, and `roles`
-one entry per catalog role: `{"state": "healthy" | "drifted" | "absent" | "not_checked",
+one entry per catalog role: `{"state": "healthy" | "drifted" | "absent" | "not_ready" | "not_checked",
 "detail": [...]}` — for a drifted role, the assertion and what the scan
 observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gateway
 status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
-slot), a rollout the next reconcile finishes; for one not checked, why (the reader
+slot), a rollout the next reconcile finishes; for one not ready (the orphaned-snapshot
+roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours` line
+with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
+in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
 read failed). One assertion this job never makes: the five `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
@@ -1575,7 +1578,10 @@ as before) and names the subject in its own `--report`'s `unasserted` list,
 which this document does not carry; the note is judged at lease time by the
 presubmit and the nightly, never here, and a stale note surfaces as
 `fixture-drift:<role>` on their runs, with the replace command's printer in
-the drift line. `summary` counts projects, projects checked (at least one role
+the drift line. The digest's fixture line and `health.json`'s `fixture_state` block carry
+drifted, absent and unread roles only, so a project whose two snapshots are young reads
+there as every fixture in its designed state; the document's `summary` and each project's
+carry `not_ready` beside the other counts. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
 document's `scanned_at` and its `{project: [drifted roles]}` map, carried so
 the adjudicator can ask "drifted last scan too?" from one file.
@@ -1585,9 +1591,10 @@ read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
-firewall-rules list`, `gcloud compute networks list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress` and
-`declared-mtu-peering`, which have no cluster slot; the account holds
+firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots list`,
+`gcloud compute disks list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
+`declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
