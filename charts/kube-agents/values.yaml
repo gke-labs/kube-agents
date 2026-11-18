@@ -2079,7 +2079,7 @@ plugins:
 # Service with the agent's API_SERVER_KEY, which stays in the pod. It is
 # reachable only through `kubectl port-forward`: the Service is always
 # ClusterIP and a NetworkPolicy refuses ingress from every other pod. See
-# docs/site/src/content/docs/deploy/web-console.md.
+# docs/site/src/content/docs/deploy/web-console.mdx.
 webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and
