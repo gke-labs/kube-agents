@@ -838,13 +838,27 @@ listed, and a turn with none reads as `platform` only.
 **Reply to.** A turn that answers a card's report carries `{"replyTo": {"taskId": "<task>"}}`: the
 gateway task whose turn filed the card, which the report's console frame named as `replyTo` (the
 root of its chain when a delegated child filed it, so that card's row, keyed by the child's task, is
-not reached; `hermes-bridge.md`) and the client echoed with its reply (the console frame's `replyTo`; the MCP server's `send_message`
-`reply_to`). The hermes-bridge reads the report the kanban notifier stored for that turn
-(`a2a/docs/hermes-bridge.md`, the reply under a pushed report) and puts it ahead of the words. A
+not reached; the pushed report below carries it; `a2a/docs/hermes-bridge.md`) and the client echoed with its reply (the console frame's `replyTo`; the MCP server's `send_message`
+`reply_to`). The hermes-bridge reads the report the kanban notifier stored for that turn when the
+turn carries no pushed report (below) (`a2a/docs/hermes-bridge.md`, the reply under a pushed
+report) and puts it ahead of the words. A
 chat backend's turn never carries one: a Slack or Google Chat reply is in the report's thread. The
 task id is a subject token; the gateway drops one that is not and sends the turn without it, and
 a reader that finds a part breaking that, or two parts, ignores them (`lib.ReplyToOf`) and looks the
 report up by the conversation alone.
+
+**Pushed report.** A turn under a report the gateway's notify route posted into the conversation
+carries `{"pushedReport": {"taskId"?, "text"}}`: the report's text, kept by the gateway from the
+report it posted (a post the kanban notifier marks as a card's report, `report`, naming its task
+with `reply_to`; `spec-chatops-gateway.md`, "Proactive posts"), and the root of the task it reported on. The gateway
+attaches it to a human turn, on any route, that names the task (`replyTo`, read as its chain's
+root): a console or MCP turn, since only console posts name their task today; a chat thread reply
+keeps the executor's lookup. The hermes-bridge (the platform route, the install's default) frames
+the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
+(`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
+gateway with a note; a part with no text, text past the cap, a task id that is not a subject
+token, or a second part is ignored (`lib.PushedReportOf`) and the executor looks the report up
+instead. Only the gateway writes it; it is the gateway's own relay, not the sender's text.
 
 ### Card work after the task ends
 

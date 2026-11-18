@@ -2300,12 +2300,23 @@ func chunkString(s string, size int) []string {
 // follow-up's. ok is false when there is nothing textual to ask: no text
 // part holds anything but blankRune's runes.
 func promptFromMessage(payload json.RawMessage) (string, bool) {
+	return promptFromParts(messageParts(payload))
+}
+
+// messageParts are the payload's message parts, or nil when it is not a
+// message.
+func messageParts(payload json.RawMessage) []lib.Part {
 	var m lib.Message
 	if err := json.Unmarshal(payload, &m); err != nil {
-		return "", false
+		return nil
 	}
+	return m.Parts
+}
+
+// promptFromParts is promptFromMessage on parts already decoded.
+func promptFromParts(parts []lib.Part) (string, bool) {
 	var texts []string
-	for _, p := range m.Parts {
+	for _, p := range parts {
 		if p.Kind == "text" && strings.TrimFunc(p.Text, blankRune) != "" {
 			texts = append(texts, p.Text)
 		}

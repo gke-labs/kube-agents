@@ -25,7 +25,10 @@ import (
 // (agents/platform/plugins/incident_context); under next a reply arrives on
 // the A2A gateway and reaches Hermes through this executor, which never runs
 // that hook. So before a task's first turn the bridge makes the same lookup,
-// at the same server, and frames the report the same way.
+// at the same server, and frames the report the same way. First, though,
+// the report the A2A gateway relays on the submission (a pushedReport part,
+// lib.PushedReportOf), which needs no store; the lookup serves a reply the
+// relay did not.
 const (
 	// incidentPath is session-kv's lookup, by the chat and thread a report
 	// was stored against.
@@ -51,14 +54,10 @@ const (
 	// thread is gchat:spaces/<s>/threads/<t>, or gchat:dm/spaces/<s>/threads/<t>
 	// when the home is a DM space, stored either way as (spaces/<s>, the
 	// thread name). A Slack DM, a whole Google Chat DM or a bare space has no
-	// stored report of this shape.
-	incidentSlackPrefix   = "slack:"
-	incidentSlackDMPrefix = "slack:dm/"
-	incidentGchatPrefix   = "gchat:"
-	incidentGchatDMPrefix = "gchat:dm/"
-	incidentGchatDM       = "dm/"
-	incidentGchatSpace    = "gchat:space/"
-	incidentGchatThreads  = "/threads/"
+	// stored report of this shape. The DM and thread shapes are lib's
+	// (SlackDMKeyPrefix, GchatDMKeyPrefix, GchatThreadsSep).
+	incidentSlackPrefix = "slack:"
+	incidentGchatPrefix = "gchat:"
 	// incidentReplyTaskSep joins a console conversation's key and the task
 	// of the turn that filed a card in the row the notifier stores for the
 	// card's report (kanban_event_routing.CONSOLE_THREAD_TASK_SEP).
@@ -128,7 +127,7 @@ type incidentAddress struct {
 // had this, since it looks up the message's own thread.
 func incidentAddresses(key, sessionID, replyTo string) []incidentAddress {
 	key = strings.TrimSpace(key)
-	if key == "" || incidentWholeConversation(key) {
+	if key == "" || lib.WholeConversationKey(key) {
 		return nil
 	}
 	var out []incidentAddress
@@ -144,26 +143,16 @@ func incidentAddresses(key, sessionID, replyTo string) []incidentAddress {
 	return out
 }
 
-// incidentWholeConversation reports whether key names a conversation every
-// top-level message shares: a Google Chat space, a Google Chat DM with no
-// thread, or a Slack DM with no thread.
-func incidentWholeConversation(key string) bool {
-	switch {
-	case strings.HasPrefix(key, incidentGchatSpace):
-		return true
-	case strings.HasPrefix(key, incidentGchatDMPrefix):
-		return !strings.Contains(key[len(incidentGchatDMPrefix):], incidentGchatThreads)
-	case strings.HasPrefix(key, incidentSlackDMPrefix):
-		return !strings.Contains(key[len(incidentSlackDMPrefix):], "/")
-	}
-	return false
-}
-
 // incidentThread is the stored address of a home-channel thread's post, when
 // key names one.
 func incidentThread(key string) (incidentAddress, bool) {
+	if !lib.ThreadKeyedConversation(key) {
+		return incidentAddress{}, false
+	}
 	switch {
-	case strings.HasPrefix(key, incidentSlackDMPrefix), strings.HasPrefix(key, incidentGchatSpace):
+	case strings.HasPrefix(key, lib.SlackDMKeyPrefix):
+		// A thread in a Slack DM is one conversation per thread, but no
+		// home-channel post was stored for it.
 		return incidentAddress{}, false
 	case strings.HasPrefix(key, incidentSlackPrefix):
 		channel, ts, ok := strings.Cut(key[len(incidentSlackPrefix):], "/")
@@ -174,8 +163,8 @@ func incidentThread(key string) (incidentAddress, bool) {
 	case strings.HasPrefix(key, incidentGchatPrefix):
 		// A thread in a DM home is keyed gchat:dm/<thread name>; the relay
 		// stores it by the thread name alone, as in any space.
-		thread := strings.TrimPrefix(key[len(incidentGchatPrefix):], incidentGchatDM)
-		space, _, ok := strings.Cut(thread, incidentGchatThreads)
+		thread := strings.TrimPrefix(strings.TrimPrefix(key, lib.GchatDMKeyPrefix), incidentGchatPrefix)
+		space, _, ok := strings.Cut(thread, lib.GchatThreadsSep)
 		if !ok || space == "" {
 			return incidentAddress{}, false
 		}
@@ -184,25 +173,33 @@ func incidentThread(key string) (incidentAddress, bool) {
 	return incidentAddress{}, false
 }
 
-// attachPushedReport returns prompt with the report stored for the task's
-// conversation ahead of it, framed as untrusted data, or prompt unchanged:
-// when the bridge has no route store, the conversation names no thread, no
-// report is stored, or the lookup fails. A failed lookup is logged and the
-// turn goes on without the report, as the hook's does: a reply the agent
-// has to find its way back from beats one it never answers.
-func (b *Bridge) attachPushedReport(ctx context.Context, sessionID string, env *lib.Envelope, prompt string) string {
-	if b.cfg.RouteURL == "" || strings.TrimSpace(b.cfg.RouteKey) == "" {
-		return prompt
-	}
+// attachPushedReport returns prompt with the report the reply is under
+// ahead of it, framed as untrusted data: the report the gateway relayed on
+// the submission (a pushedReport part, kept from the notify post it made
+// into the conversation), else the one stored in session-kv for the
+// conversation. The prompt is unchanged when the submission carries no
+// report and the bridge has no route store, the conversation names no
+// thread, no report is stored, or the lookup fails. A failed lookup is logged and
+// the turn goes on without the report, as the hook's does: a reply the
+// agent has to find its way back from beats one it never answers.
+func (b *Bridge) attachPushedReport(ctx context.Context, sessionID string, env *lib.Envelope, parts []lib.Part, prompt string) string {
 	auth, err := parseRouteAuthority(env)
 	if err != nil {
 		return prompt
 	}
 	key := strings.TrimSpace(auth.Audience.Conversation)
+	if report, ok := b.relayedReport(env, parts); ok {
+		b.cfg.Logger.Info("pushed report attached from the gateway's relay",
+			"task", env.TaskID, "session", sessionID, "conversation", key, "reportTask", report.TaskID, "bytes", len(report.Text))
+		return incidentReply(report.Text, prompt)
+	}
+	if b.cfg.RouteURL == "" || strings.TrimSpace(b.cfg.RouteKey) == "" {
+		return prompt
+	}
 	// The part is read only for a key that is looked up at all.
 	replyTo := ""
-	if key != "" && !incidentWholeConversation(key) {
-		replyTo = b.incidentReplyTo(env)
+	if key != "" && !lib.WholeConversationKey(key) {
+		replyTo = b.incidentReplyTo(env, parts)
 	}
 	for _, addr := range incidentAddresses(key, sessionID, replyTo) {
 		report, err := b.getIncident(ctx, addr)
@@ -221,15 +218,23 @@ func (b *Bridge) attachPushedReport(ctx context.Context, sessionID string, env *
 	return prompt
 }
 
+// relayedReport is the report the gateway put on the submission, when it
+// did. A part the gateway would not have written (lib.PushedReportOf) is
+// logged and read as none, so the turn looks the report up instead.
+func (b *Bridge) relayedReport(env *lib.Envelope, parts []lib.Part) (lib.PushedReport, bool) {
+	r, found, err := lib.PushedReportOf(parts)
+	if err != nil {
+		b.cfg.Logger.Warn("pushedReport part ignored; the turn looks the report up instead", "task", env.TaskID, "err", err)
+		return lib.PushedReport{}, false
+	}
+	return r, found
+}
+
 // incidentReplyTo is the task the submission's replyTo part names, or "":
 // no part, or one the gateway would not have written (lib.ReplyToOf), which
 // is logged and read as none, so the turn runs on the other addresses.
-func (b *Bridge) incidentReplyTo(env *lib.Envelope) string {
-	var m lib.Message
-	if err := json.Unmarshal(env.Payload, &m); err != nil {
-		return ""
-	}
-	r, found, err := lib.ReplyToOf(m.Parts)
+func (b *Bridge) incidentReplyTo(env *lib.Envelope, parts []lib.Part) string {
+	r, found, err := lib.ReplyToOf(parts)
 	if err != nil {
 		b.cfg.Logger.Warn("replyTo part ignored; the turn looks for its report by conversation alone", "task", env.TaskID, "err", err)
 		return ""

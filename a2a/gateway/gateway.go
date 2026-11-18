@@ -234,6 +234,9 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// reports keeps the notify route's posts into conversations for the
+	// replies under them (reports.go).
+	reports pushedReports
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -3317,6 +3320,22 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 				"taskId", taskID, "replyTo", truncateRunes(ts.ReplyTo, consoleMessageIDCap), "bytes", len(ts.ReplyTo))
 		} else {
 			extra = append(extra, part)
+		}
+	}
+	// A human turn under a report the notify route posted carries that
+	// report, on every route (pushedReports); the replyTo part above stays
+	// its fallback. Every executor a human turn reaches reads text parts
+	// only and ignores a data part it does not know: the hermes-bridge
+	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
+	// which runs session pods and profile tasks, does not read it yet; the
+	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	if ts.Role == "" {
+		if report, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+			if part, err := lib.PushedReportPart(report); err != nil {
+				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
+			} else {
+				extra = append(extra, part)
+			}
 		}
 	}
 	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
