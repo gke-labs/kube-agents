@@ -42,11 +42,15 @@ Google Chat ingress is gated by `spec.integration.googleChat.allowedUsers` (a li
 
 ### Home channel
 
-`spec.integration.googleChat.homeChannel` on the PlatformAgent is the space an alert-driven report lands in when there is no thread to reply into. Set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env`, pass `--google-chat-home-channel`, or set the field on the `PlatformAgent` resource. Left unset, alert-driven reports have nowhere to go until the digest below. The investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
+`spec.integration.googleChat.homeChannel` on the PlatformAgent is the space an alert-driven report lands in when there is no thread to reply into. Set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env`, pass `--google-chat-home-channel`, or set the field on the `PlatformAgent` resource. Left unset, the gateway learns the home space from the first mention (below). Until it has one, alert-driven reports have nowhere to go until the digest below. The investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
 
-Only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
+The operator hands the field to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); a malformed value turns the agent's unprompted Google Chat posts off. With no home space, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 
-The agent sends home posts to each platform on the gateway that has a home channel. A Slack channel the gateway learned counts. When no platform has one, the gateway refuses them and keeps each platform's posts apart, up to fifty for thirty days. It posts one digest once that platform's home channel is set.
+With the field unset and `spec.integration.googleChat.homeChannelPolicy` `auto` (the default), the first top-level mention of the agent in a named space makes that space the home channel. A direct message or a group chat never does, and neither does a reply inside a thread or a command. The gateway checks the space first: the app is a member, and the space does not admit people outside your organization. It then posts one line in that thread saying so, and proactive posts follow within about a minute with no pod restarted.
+
+`manual` turns the learn off, so `homeChannel` alone decides. A set `homeChannel` wins over a learned space. To move a learned space, set the field; to forget it, delete the `<agent>-home-channel` ConfigMap and mention the agent again ([the learned home channel](/kube-agents/operator/platformagent-crd/#specintegrationslack-on-the-a2a-gateway) has the record).
+
+The agent sends home posts to each platform on the gateway that has a home channel. A channel or space the gateway learned counts. When no platform has one, the gateway refuses them and keeps each platform's posts apart, up to fifty for thirty days. It posts one digest once that platform's home channel is set.
 
 ### What it looks like end to end
 

@@ -1745,13 +1745,13 @@ at the next refusal, with a meta entry counting the refusals since the last dige
 last five subjects. When a home channel arrives, the gateway posts one digest into it (the
 count, the span, the last subjects, how many of those texts it still holds) and takes what it
 named off the count; the texts stay until pruned. The arrival is seen where the home channel is
-read: at a start that has one (the CR's, or on Slack the projected file's), or at the first
-home request that finds the projected file naming one (Slack, with the learn armed). The
+read: at a start that has one (the CR's, or the projected file's), or at the first
+home request that finds the projected file naming one (with the learn armed). The
 requester's answer is the same refusal, worded to say the post is kept and carrying `kept`;
 the relay records its own undelivered line as before, and the alert path records the alert as
 kept. The operator names every armed route in `A2A_NOTIFY_CONVERSATIONS` and every armed route
-with a home channel set on the CR in `A2A_NOTIFY_PLATFORM`; the agent adds Slack when the gateway
-learned a channel, and sends home posts to every armed route when no platform has a home, each
+with a home channel set on the CR in `A2A_NOTIFY_PLATFORM`; the agent adds a platform whose
+projected file names a learned channel, and sends home posts to every armed route when no platform has a home, each
 keeping them for its digest (below; `routed_platforms()`).
 Each backend keeps its own refused posts under its own key. The `HomeChannelUnset` condition
 names every armed platform without a home channel, and says where its posts go meanwhile. The gateway writes nothing to the
@@ -1769,7 +1769,7 @@ with `kept` beside the error, and `a2a notify` exits with a fourth status for it
 senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
 it as handled, so the keep holds one copy, and the alert path records the alert as kept
 rather than lost. The agent-side callers
-(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()` (`A2A_NOTIFY_PLATFORM`, plus Slack when the projected file names a channel, else every armed route) and send to every
+(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()` (`A2A_NOTIFY_PLATFORM`, plus Slack or Chat when its projected file names a channel, else every armed route) and send to every
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
 first report, that report is a ledger issue on GitHub, and a home line on each routed platform links it the same way).
 `A2A_NOTIFY_PLATFORM` holds a comma-separated list of platform names, and a single name is a list of one;
@@ -1777,11 +1777,11 @@ these are the agent's platform names (`google_chat`, `slack`), not the gateway's
 name or unset (`a2aGchatNotifyArmed`), and for `slack` by the Slack rule below. The operator
 renders in `A2A_NOTIFY_PLATFORM` every armed platform whose home channel the CR sets, a space name
 or a channel id, Chat first (`a2aNotifyHomePlatforms`), and renders no variable when none is. It
-reads CR fields only, so a learn replaces no pod. `routed_platforms()` adds Slack to that list when
-the gateway holds Slack and the projected file names a channel, the CR's or a learned one. With
-no list, it takes Slack alone when the file names a channel, and otherwise every armed route, and
-each gateway backend keeps the refused posts for its digest. The rule reads only the two variables
-and the file, so a cron child or the terminal tool, which Hermes strips of `*_HOME_CHANNEL`,
+reads CR fields only, so a learn replaces no pod. `routed_platforms()` adds Slack or Chat to that
+list when the gateway holds the platform and its projected file (`slack_home`, `gchat_home`) names a
+channel, the CR's or a learned one, Chat first. With no platform left with a home, it takes every
+armed route, and each gateway backend keeps the refused posts for its digest. The rule reads only
+the two variables and the two files, so a cron child or the terminal tool, which Hermes strips of `*_HOME_CHANNEL`,
 computes the same answer as the session server. The alert picks one platform from that answer,
 Chat first. The kanban patch's copy applies the same rule. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
@@ -1847,17 +1847,18 @@ Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` then names `slac
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
 route off, as on Chat. With both backends armed `A2A_NOTIFY_CONVERSATIONS` reads
 `google_chat,slack`, and `A2A_NOTIFY_PLATFORM` names the ones with a home channel on the CR; the
-agent adds a learned Slack channel, and sends home posts to both when neither has one.
+agent adds a learned Slack channel or Chat space, and sends home posts to both when neither has one.
 
-**The home-channel record.** Under `next`, Slack on the gateway or not, the operator owns a ConfigMap
+**The home-channel record.** Under `next`, Slack or Chat on the gateway or not, the operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
 record's name as `A2A_HOME_CHANNEL_RECORD`, the gateway's own image as `A2A_SELF_IMAGE` and the switch
-that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway. The
+that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway
+(Google Chat has the same contract with its own policy and keys: "The Google Chat half" below). The
 operator reads the record once per reconcile and projects the home channel it stands behind, "the CR,
-else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key `slack_home`
-always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
+else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key per backend
+(`slack_home`, `gchat_home`) always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
 in the agent pod at `/etc/kube-agents/chat-home` and in the gateway pod at `/etc/a2a/chat-home`; the
 kubelet refreshes the file in place within about a minute, so a learned channel reaches both pods with
 no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
@@ -1865,7 +1866,8 @@ The agent's env carries the CR field only, as any CR edit does. The operator adm
 only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
 stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks a
 file-sourced home before each post (below), never the CR field. The projection joins the stack's teardown list, and a hand edit of it is
-rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
+rewritten on the next pass. The gateway's half (`a2a/gateway/home_channel.go`, the learner both
+backends share, and `a2a/gateway/slack_home_channel.go`, Slack's candidate, check and line) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
 channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
 operator admits (the CR field, else the record), which the operator change that admits the record
@@ -1907,6 +1909,31 @@ move over the projected file for at most two minutes, one line in the new channe
 and one in the old says it moved. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
 nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
 patches with the read `resourceVersion` as the precondition are the gateway's contract.
+
+**The Google Chat half.** Chat learns its home space the same way, in the same record and the same
+projection, under its own names, so a gateway that holds both backends keeps two homes:
+`spec.integration.googleChat.homeChannelPolicy` (`auto`, also absent, or `manual`), rendered as
+`A2A_GCHAT_HOME_POLICY`; the record keys `gchat`, `gchat.setBy`, `gchat.setAt` and `gchat.refused`
+(`writer` is shared and names the image that wrote last); and the projected file `gchat_home`. The
+operator renders the record name, the image and the switch whenever Chat is on the gateway, mounts the
+projection in both pods then, and admits a recorded space only under policy `auto`, when the value is
+a space name (`spaces/<id>`) of at most 64 runes and no `gchat.refused` stands beside it. The
+switch is the one Slack reads: a gateway whose operator renders it without a `gchat_home` file finds
+the file absent, and an absent file learns nothing. The shared learner is the Slack flow above with
+the backend's keys; what is Chat's own (`a2a/gateway/gchat_home_channel.go`) is this. The candidate is
+a verified, typed message that is not a command, outside a direct message, that Chat does not mark
+`threadReply`: Chat delivers a space message to the app only when it mentions the app, so every such
+message is addressed, and in a space without threading every message is top-level. A direct message
+is never a candidate and a group chat (`GROUP_CHAT`) is refused without a call. The home is the
+space, never a thread of it. The check is `spaces.get` through the relay, under the app's own
+credentials: a 403 or 404 is `not-member`, a direct message or group chat is `direct-message`, a
+space that admits people outside the organization (`externalUserAllowed`) is `shared`, as a Slack
+Connect channel is, and a value that is not a space name is `malformed`; Chat has no `archived`. The
+same check runs once per home post the file named, and writes `gchat.refused` beside the record. The
+one line is posted in the learning thread and names `spec.integration.googleChat.homeChannel` as the
+override; Chat has no Home tab, so there is no picker, and a move is a CR edit or an edit of the
+record. `HomeChannelUnset` carries Chat's sentence with the same suffixes as Slack's. A sender's
+record entry is the `users/<id>` resource name, not the email.
 
 A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
 and posted on the `ts`, or a bare `ts`, which names no channel, so the gateway checks it only for
@@ -2503,7 +2530,7 @@ restarts, while a chat backend that stops is run again after a backoff and the r
 keep going. The inject and A2A doors sit beside the backends, for the reason the inject
 section gives. The operator renders every backend the CR enables into the one gateway,
 Chat and Slack together when both are. Decided 2026-11-12. Home posts go to every armed route
-with a home channel set on the CR, plus Slack when the gateway learned a channel; with none,
+with a home channel set on the CR, plus any whose channel the gateway learned; with none,
 every armed route keeps them for its digest. Revised 2026-11-13, because an alert picks one
 platform and stops when the gateway keeps it. The operator renders the CR half and the agent adds
 the learned channel from the projected file, so a learn replaces no pod.

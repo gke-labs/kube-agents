@@ -528,8 +528,11 @@ it is the home channel, where alerts and scheduled reports land. The gateway pos
 only to `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (the `PlatformAgent`'s
 `spec.integration.googleChat.homeChannel`), and it must be a space name, `spaces/<id>`. A home
 channel set from chat with `/sethome`, or by the install's first chat message, before the move is
-kept in the Planning Agent's profile and does not count. With the key unset or not a space name,
-the agent posts nothing to Google Chat unprompted.
+kept in the Planning Agent's profile and does not count.
+
+With the key not a space name, the agent posts nothing to Google Chat unprompted. With it unset,
+the gateway makes the space of the first top-level mention of the agent in a named space the home
+channel, and the agent posts nothing unprompted until then.
 
 Before the upgrade, set `GOOGLE_CHAT_HOME_CHANNEL` in `install.env`, so the full run applies it
 ([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After it, check that
