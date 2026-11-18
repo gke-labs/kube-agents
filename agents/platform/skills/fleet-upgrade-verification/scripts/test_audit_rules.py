@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
+# The audit-log reads ask the credential broker's relay first when its URL is set
+# (audit_log._relay_page); with it unset they make no request, so no test here reaches
+# the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_upgrade_report as report  # noqa: E402
 import readiness_rules as shared  # noqa: E402
 import upgrade_readiness as readiness  # noqa: E402

@@ -216,7 +216,15 @@ JSON_OBJECT_CLOSE = "}"
 YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
 YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
 JSON_SECRET_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
-JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
+# A `"key": "value"` pair (groups 1 to 3; a value the block body cuts short
+# ends at the body's end), or a string that opens no pair, up to its closing
+# quote or to where it stops when it does not close (no group). Without the
+# second branch such a string was read again from each escaped quote in it,
+# which costs quadratic time; each of those reads ends where the first one
+# ended and meets the same text after it, so none of them finds a pair. A
+# match with no group 1 is left as it is, and the next read starts at the
+# closing quote, as before.
+JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)|"(?:[^"\\]|\\.)*')
 URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[ \t]*\r?\n[A-Za-z0-9+/=\s]*\Z",
@@ -607,11 +615,14 @@ SECRET_READ_COMMAND_RE = re.compile(
 # Where the rule cannot read, it decides on less. Text with an unclosed quote
 # is read line by line; one such line, such text of many lines, a long
 # substitution and a line of many substitutions withhold when a dump starts a
-# line or a command, or a token printer stands anywhere (`UNSPLIT_LINE_RE`). A
+# line or a command, or when a `gcloud` token printer, another tool's name
+# with its printer path, or a language's use of its whole environment (by
+# the word walk's own patterns) stands anywhere (`_unsplit_text_prints`). A
 # command that costs more than
-# `MAX_READ_STEPS` to walk withholds when any of its words names a dump word
-# or `gcloud`, and a call past its read budget (`MAX_READ_CHARS_FACTOR`)
-# withholds.
+# `MAX_READ_STEPS` to walk withholds when any of its words names a dump word,
+# `gcloud`, another tool with a token printer or an interpreter
+# (`WALK_LIMIT_COMMAND_WORDS`), and a call past its read budget
+# (`MAX_READ_CHARS_FACTOR`) withholds.
 #
 # `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
 # but the ones named here, which print no token, and a flag right behind
@@ -636,6 +647,61 @@ GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
 # `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
 GCLOUD_SSH_COMMAND = "ssh"
 SCRIPT_LONG_FLAG = "--command"
+# Other tools' token printers: for each binary, the subcommand paths that
+# print a token. A path counts where the tool's subcommand can start, behind
+# the tool's own flags and their values (`_first_operands`), and its words
+# stand together (`kubectl -n ci create token builder`). The same words
+# behind another subcommand are arguments (`gh search issues auth token`),
+# and so is a path word behind a flag (`kubectl create -f token`).
+TOKEN_PRINTER_PATHS = {
+    "gh": (("auth", "token"),),
+    "az": (("account", "get-access-token"),),
+    "aws": (("sts", "get-session-token"),),
+    "kubectl": (("create", "token"),),
+    "oc": (("create", "token"),),
+}
+# Another language's print of its whole environment, as inline code
+# (`python3 -c '...os.environ...'`, `node -e '...process.env...'`, the code
+# behind the flag or in one word with it), also behind a tool that runs the
+# interpreter (`uv run python -c ...`). Served, because they print no value
+# of the whole: a read of one variable by a whole literal name
+# (`os.environ["HOME"]`, `os.environ.get("HOME")`, `process.env.HOME`),
+# `.update(`, `.keys()` and `Object.keys(...)`, a membership test of a
+# literal name (`"X" in os.environ`), the environment as a call's `env`
+# argument (`run(..., env=os.environ)`, `env={**os.environ, ...}`), a
+# destructuring of named variables (`const { NAME } = process.env`), and the
+# import itself (`from os import environ`). A subscript or a `.get(` by a
+# variable withholds (`os.environ[k]` in a loop over the names), and so does
+# an assignment of the whole to a variable (`env = os.environ.copy()`): the
+# rule cannot follow the variable to a print, so it decides closed. A code
+# file and code on standard input are not read.
+PYTHON_BINARY_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?)$")
+PYTHON_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?c")
+_ENVIRONMENT_LITERAL = r"""(?:'[^']*'|"[^"]*")"""
+_ENVIRONMENT_LITERAL_KEY = r"\[\s*" + _ENVIRONMENT_LITERAL + r"\s*\]"
+# A method that reads or sets one variable: its first argument is a whole literal, closed by `,` or `)`.
+_PYTHON_ENVIRONMENT_ONE_VARIABLE = (
+    r"(?!\s*(?:" + _ENVIRONMENT_LITERAL_KEY + r"|\.(?:get|setdefault|pop)\s*\(\s*" + _ENVIRONMENT_LITERAL + r"\s*[,)]|\.(?:update|keys)\s*\())"
+)
+PYTHON_ENVIRONMENT_RE = re.compile(r"""(?:(?<!\w)os|__import__\(\s*['"]os['"]\s*\))\.environb?\b""" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
+# `from os import environ` makes the bare name the environment.
+PYTHON_ENVIRONMENT_IMPORT_RE = re.compile(r"\bfrom\s+os\s+import\b[^;\n]*\benvironb?\b")
+PYTHON_IMPORTED_ENVIRONMENT_RE = re.compile(r"(?<![\w.])environb?\b" + _PYTHON_ENVIRONMENT_ONE_VARIABLE)
+PYTHON_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(
+    r"""(?:[(,]\s*env\s*=\s*(?:\{\*\*|dict\()?|['"]\s+(?:not\s+)?in\s+|\bimport\s+(?:\w+\s*,\s*)*)$"""
+)
+NODE_BINARIES = frozenset(("node", "nodejs"))
+NODE_CODE_FLAG_RE = re.compile(r"^-[A-Za-z]*?[ep]")
+NODE_CODE_LONG_FLAGS = frozenset(("--eval", "--print"))
+NODE_ENVIRONMENT_RE = re.compile(r"(?<!\w)process\.env\b(?!\s*(?:\.[A-Za-z_$]|" + _ENVIRONMENT_LITERAL_KEY + r"))")
+NODE_ENVIRONMENT_SERVED_BEFORE_RE = re.compile(r"""(?:\{[^{}.]*\}\s*=\s*|Object\.keys\(|['"]\s+in\s+)$""")
+# How much text ahead of the environment's name the served forms are read in.
+CODE_LOOKBACK_CHARS = 32
+# Tools that run a command in a project's environment. `npx` runs its
+# operand; `uv`, `poetry` and `pipenv` run one behind `run`, as `docker`
+# does (`uv venv env` names a folder).
+PACKAGE_RUNNER_WORDS = frozenset(("npx",))
+PACKAGE_RUN_VERB_WORDS = frozenset(("uv", "poetry", "pipenv"))
 # The environment: `env` with no command behind its options, and `printenv`,
 # `export`, `declare`, `typeset` or `readonly` with no name, print all of it;
 # bare `set` prints every variable. With a name, `printenv` and a declaring
@@ -702,11 +768,13 @@ EVAL_WORD_JOIN = " "
 # host env`); ahead of the `--` a later word that names a command still
 # counts, since the `--` may be the inner command's (`ssh host printenv --
 # NAME`).
-REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl"))
+REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl")) | PACKAGE_RUN_VERB_WORDS
 REMOTE_COMMAND_VERBS = frozenset(("exec", "run"))
-OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock"))
+OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock")) | PACKAGE_RUNNER_WORDS
 OPERAND_AND_COMMAND_WIDTH = 2
-REMOTE_NAMED_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | SHELL_BINARIES
+# A walk past its step limit withholds on one of these words, or an interpreter's name, anywhere on the command.
+WALK_LIMIT_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | NODE_BINARIES | frozenset(TOKEN_PRINTER_PATHS)
+REMOTE_NAMED_COMMAND_WORDS = WALK_LIMIT_COMMAND_WORDS | SHELL_BINARIES
 # A word that may be an argument names a command by its bare name or by a path into a `bin` directory.
 BINARY_DIRECTORY_SUFFIX = "bin"
 FIND_BINARY = "find"
@@ -721,6 +789,8 @@ COMMAND_READING_WORDS = (
     | REMOTE_COMMAND_WORDS
     | OPERAND_COMMAND_WORDS
     | SCRIPT_FLAG_WORDS
+    | NODE_BINARIES
+    | frozenset(TOKEN_PRINTER_PATHS)
     | frozenset((TRAP_BUILTIN, EVAL_BUILTIN, FIND_BINARY))
 )
 OPTION_PREFIXES = ("-", "+")
@@ -763,14 +833,20 @@ HERE_STRING_OPERATOR = "<<<"
 # first character of a word, outside quotes.
 SHELL_MARK_RE = re.compile(r"\\.|['\"#`]|\$\(", re.DOTALL)
 SHELL_ESCAPE_CHAR = "\\"
-SHELL_SINGLE_QUOTE = "'"
 SHELL_COMMENT_CHAR = "#"
 COMMENT_LEAD_CHARS = frozenset(" \t\n;|&()")
 # No script without one of these fragments, or `/proc/`, is withheld by this
 # rule. Quotes, backslashes and a continuation's line break can stand inside
 # a shell word (`e"n"v`), so the fragments are looked for in the text without
 # them.
-TOKEN_OR_ENVIRONMENT_FRAGMENTS = tuple(sorted(TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | GCLOUD_TOKEN_PRINTERS | frozenset((ENVIRON_FILE,))))
+TOKEN_OR_ENVIRONMENT_FRAGMENTS = tuple(
+    sorted(
+        TOKEN_OR_ENVIRONMENT_COMMAND_WORDS
+        | GCLOUD_TOKEN_PRINTERS
+        | frozenset((ENVIRON_FILE,))
+        | frozenset(path[-1] for paths in TOKEN_PRINTER_PATHS.values() for path in paths)
+    )
+)
 SHELL_QUOTING_CHARS_REMOVED = str.maketrans("", "", "\"'\\\n")
 PROC_DIRECTORY = "/proc/"
 # A line that cannot be read as words withholds on this much: a token printer
@@ -786,6 +862,16 @@ _UNSPLIT_DUMP = (
     + r")(?:[ \t]+-[\w-]*)*[ \t]*|"
     + SET_BUILTIN
     + r"[ \t]*)"
+)
+# Another tool's printer there: the tool's name as a word, and its path's
+# words together, each anywhere in the text (two searches, each linear).
+UNSPLIT_PRINTER_RES = tuple(
+    (
+        re.compile(rf"(?<![\w-]){re.escape(tool)}(?![\w-])"),
+        re.compile(r"(?<![\w-])" + r"\s+".join(re.escape(word) for word in path) + r"(?![\w-])"),
+    )
+    for tool, paths in sorted(TOKEN_PRINTER_PATHS.items())
+    for path in paths
 )
 UNSPLIT_LINE_RE = re.compile(
     r"(?:^|[\n;&|])[ \t]*" + _UNSPLIT_DUMP + r"(?=[\n;|&<>#]|$)"
@@ -826,18 +912,51 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
     # `apiVersion`. A `stringData` object is a Secret's wherever it sits. A
     # log line's or an API envelope's `data` is kept, whatever an earlier
     # line said.
+    # The nearest opener line before a block and the first marker at or after
+    # that line are followed with two iterators over the text, each read once.
+    # Before, the opener line was looked for again from the text's start for
+    # each block (quadratic on JSON lines), and the marker from the opener
+    # line (quadratic on many blocks with no opener line before them). Two
+    # facts make one read enough: `re.sub` calls `_mask_json_block` for the
+    # blocks in the text's order, so both places only move forward; and two
+    # marker matches never overlap (a marker is a quoted key, blanks and a
+    # colon), so the first marker at or after the opener line is the one a
+    # search from there finds, and when it ends after the block's start, no
+    # marker stands between the two.
+    openers = JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined)
+    markers = JSON_MANIFEST_MARKER_RE.finditer(joined)
+    next_opener = next(openers, None)
+    document_start = 0
+    next_marker = next(markers, None)
+
+    def _mask_json_pair(pair: "re.Match[str]") -> str:
+        return pair.group(1) + REDACTED_SECRET_MARKER + pair.group(3)
+
     def _mask_json_block(m: "re.Match[str]") -> str:
+        nonlocal next_opener, document_start, next_marker
         if JSON_STRING_DATA_KEY_QUOTED not in m.group(1):
-            document_start = 0
-            for opener in JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined, 0, m.start() + 1):
-                document_start = opener.start()
-            if not JSON_MANIFEST_MARKER_RE.search(joined, document_start, m.start()):
+            # An opener line counts when its `{` stands before the block.
+            while next_opener is not None and next_opener.end() <= m.start() + 1:
+                document_start = next_opener.start()
+                next_opener = next(openers, None)
+            while next_marker is not None and next_marker.start() < document_start:
+                next_marker = next(markers, None)
+            if next_marker is None or next_marker.end() > m.start():
                 return m.group(0)
-        return (
-            m.group(1)
-            + JSON_PAIR_RE.sub(lambda p: p.group(1) + REDACTED_SECRET_MARKER + p.group(3), m.group(2))
-            + m.group(3)
-        )
+        # `_mask_json_pair` is called for a pair only, as the pattern's `sub`
+        # called its function before: a call for each string that opens no
+        # pair would be one Python frame more than before at that place, and
+        # a deeply nested step would reach the recursion limit sooner.
+        body = m.group(2)
+        pieces: list[str] = []
+        done = 0
+        for pair in JSON_PAIR_RE.finditer(body):
+            if pair.group(1) is not None:
+                pieces.append(body[done : pair.start()])
+                pieces.append(_mask_json_pair(pair))
+                done = pair.end()
+        pieces.append(body[done:])
+        return m.group(1) + "".join(pieces) + m.group(3)
 
     return JSON_SECRET_BLOCK_RE.sub(_mask_json_block, joined)
 
@@ -1925,6 +2044,52 @@ def _gcloud_prints_token(rest: Sequence[str]) -> bool:
     return False
 
 
+def _runs_token_printer(paths: Sequence[Sequence[str]], words: Sequence[str], behind: int) -> bool:
+    """Whether the words from `behind` on run one of a tool's token-printer paths (see `TOKEN_PRINTER_PATHS`)."""
+    return any(tuple(words[start : start + len(path)]) == tuple(path) for start in _first_operands(words, behind) for path in paths)
+
+
+def _code_prints_environment(code: str, environment_re: "re.Pattern[str]", served_before_re: "re.Pattern[str]") -> bool:
+    """Whether inline code uses a language's whole environment (see `PYTHON_BINARY_RE`)."""
+    for found in environment_re.finditer(code):
+        if not served_before_re.search(code[max(0, found.start() - CODE_LOOKBACK_CHARS) : found.start()]):
+            return True
+    return False
+
+
+def _python_code_prints_environment(code: str) -> bool:
+    """Whether inline Python code uses its whole environment, under `os.environ` or under the name it imports from `os`."""
+    if _code_prints_environment(code, PYTHON_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE):
+        return True
+    return bool(PYTHON_ENVIRONMENT_IMPORT_RE.search(code)) and _code_prints_environment(
+        code, PYTHON_IMPORTED_ENVIRONMENT_RE, PYTHON_ENVIRONMENT_SERVED_BEFORE_RE
+    )
+
+
+def _inline_codes(rest: Sequence[str], flag_re: "re.Pattern[str]", long_flags: frozenset) -> List[str]:
+    """The words after an interpreter that may be its inline code; none when no word is a code flag.
+
+    Every word may be the code, and so may the text behind a code flag in one
+    word with it (`-c'print(1)'` is the word `-cprint(1)`).
+    """
+    flags = [flag_re.match(word) for word in rest]
+    if not any(flags) and not any(word.partition(EQUALS_SEPARATOR)[0] in long_flags for word in rest):
+        return []
+    return [*rest, *(word[flag.end() :] for word, flag in zip(rest, flags) if flag)]
+
+
+def _interpreter_prints_environment(base: str, rest: Sequence[str]) -> bool:
+    """Whether an interpreter's inline code, among the words after it, prints its whole environment."""
+    if PYTHON_BINARY_RE.match(base):
+        return any(_python_code_prints_environment(code) for code in _inline_codes(rest, PYTHON_CODE_FLAG_RE, frozenset()))
+    if base in NODE_BINARIES:
+        return any(
+            _code_prints_environment(code, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE)
+            for code in _inline_codes(rest, NODE_CODE_FLAG_RE, NODE_CODE_LONG_FLAGS)
+        )
+    return False
+
+
 def _flag_values(words: Sequence[str], flag: str) -> List[str]:
     """The values of `flag` among `words`: `flag=value`, and the word behind a bare `flag`."""
     joined = flag + EQUALS_SEPARATOR
@@ -1975,13 +2140,17 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
             continue
         read.add(start)
         base = _base_word(words[start])
-        if base not in COMMAND_READING_WORDS:
+        if base not in COMMAND_READING_WORDS and not PYTHON_BINARY_RE.match(base):
             continue
         steps += len(words) - start
         if steps > MAX_READ_STEPS:
-            return any(_is_named_word(word, TOKEN_OR_ENVIRONMENT_COMMAND_WORDS) for word in words)
+            return any(_is_named_word(word, WALK_LIMIT_COMMAND_WORDS) or PYTHON_BINARY_RE.match(_base_word(word)) for word in words)
         behind = start + 1
         rest = words[behind:]
+        if base in TOKEN_PRINTER_PATHS and _runs_token_printer(TOKEN_PRINTER_PATHS[base], words, behind):
+            return True
+        if _interpreter_prints_environment(base, rest):
+            return True
         if base in SCRIPT_FLAG_WORDS:
             script_flag = next((index for index, word in enumerate(rest) if _is_flag_cluster_with(word, SHELL_SCRIPT_FLAG)), None)
             if script_flag is not None:
@@ -2019,7 +2188,11 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
                     starts.append((behind + dashes + OPERAND_AND_COMMAND_WIDTH, False))
                 named_among = rest[:dashes]
             if base in OPERAND_COMMAND_WORDS or not REMOTE_COMMAND_VERBS.isdisjoint(rest):
-                starts.extend((behind + index, False) for index, word in enumerate(named_among) if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS))
+                starts.extend(
+                    (behind + index, False)
+                    for index, word in enumerate(named_among)
+                    if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS) or PYTHON_BINARY_RE.match(_base_word(word))
+                )
         elif base == EVAL_BUILTIN:
             if _quoted_script_prints(EVAL_WORD_JOIN.join(rest), depth, budget):
                 return True
@@ -2162,6 +2335,16 @@ def _substitution_texts(text: str) -> Optional[List[str]]:
     return texts
 
 
+def _unsplit_text_prints(text: str) -> bool:
+    """Whether text the rule cannot read as words holds a dump, a token printer or an environment name (see `UNSPLIT_LINE_RE`)."""
+    if UNSPLIT_LINE_RE.search(text):
+        return True
+    if any(tool_re.search(text) and path_re.search(text) for tool_re, path_re in UNSPLIT_PRINTER_RES):
+        return True
+    # The same patterns as the word walk's, so that the two cannot know different spellings.
+    return _python_code_prints_environment(text) or _code_prints_environment(text, NODE_ENVIRONMENT_RE, NODE_ENVIRONMENT_SERVED_BEFORE_RE)
+
+
 def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) -> bool:
     """Whether a shell line, read as words and operators, holds a command that prints a token or the environment."""
     budget[0] -= len(text) + READ_COST_CHARS
@@ -2181,7 +2364,7 @@ def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
         lines = [line for line in text.split(LINE_BREAK) if _holds_print_fragment(line)] if LINE_BREAK in text else []
         if lines and len(lines) <= MAX_READ_LINES:
             return any(_text_prints_token_or_environment(line, depth, budget) for line in lines)
-        return bool(UNSPLIT_LINE_RE.search(text))
+        return _unsplit_text_prints(text)
     segment: List[str] = []
     here_strings: List[str] = []
     foreign = False
@@ -2241,10 +2424,10 @@ def _text_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
     # A `$(...)` runs inside double quotes too, where the line's words do not show it.
     substitutions = _substitution_texts(text)
     if substitutions is None:
-        return bool(UNSPLIT_LINE_RE.search(text))
+        return _unsplit_text_prints(text)
     for inner in substitutions:
         if len(inner) > MAX_READ_SUBSTITUTION_CHARS:
-            if UNSPLIT_LINE_RE.search(inner):
+            if _unsplit_text_prints(inner):
                 return True
         elif _line_prints_token_or_environment(inner, depth, budget):
             return True

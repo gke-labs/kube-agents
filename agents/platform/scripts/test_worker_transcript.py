@@ -1186,6 +1186,181 @@ class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
 
 
+class TestJsonBlockRuleKeepsItsOutput(unittest.TestCase):
+    """The JSON `data` block rule was quadratic on many blocks, and its pair
+    pattern on a string with escaped quotes (#6036). The linear forms must
+    give the same output as the old ones."""
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+
+        # The pair pattern before #6036, kept here ONLY as the reference for
+        # equal output. It costs quadratic time; nothing but these tests uses it.
+        cls.old_pair = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
+        cls.never = re.compile(r"(?!)")
+
+    @staticmethod
+    def _strings(units, short, count, seed, parts=()):
+        """Every string of up to `short` units, every string made of one
+        choice from each of `parts`, then `count` longer random ones."""
+        import itertools
+        import random
+
+        for length in range(short + 1):
+            for combo in itertools.product(units, repeat=length):
+                yield "".join(combo)
+        if parts:
+            for combo in itertools.product(*parts):
+                yield "".join(combo)
+        rng = random.Random(seed)
+        for _ in range(count):
+            yield "".join(rng.choice(units) for _ in range(rng.randint(short + 1, 40)))
+
+    def _old_pairs(self, body):
+        return self.old_pair.sub(lambda p: p.group(1) + MARKER + p.group(3), body)
+
+    @staticmethod
+    def _new_pairs(body):
+        # As the block rule uses the pattern: a match with no pair is left as it is.
+        return worker_transcript.JSON_PAIR_RE.sub(
+            lambda p: p.group(0) if p.group(1) is None else p.group(1) + MARKER + p.group(3), body
+        )
+
+    def _old_blocks(self, text):
+        """The JSON block step before #6036, kept ONLY as the reference: the
+        nearest opener line and the marker are looked for again, from the
+        text's start, for each block. It reads the text the YAML step leaves
+        (`scrub_secret_blocks` with the JSON step off)."""
+        with mock.patch.object(worker_transcript, "JSON_SECRET_BLOCK_RE", self.never):
+            joined = worker_transcript.scrub_secret_blocks(REDACTOR, text)
+
+        def mask(m):
+            if worker_transcript.JSON_STRING_DATA_KEY_QUOTED not in m.group(1):
+                document_start = 0
+                for opener in worker_transcript.JSON_DOCUMENT_OPENER_LINE_RE.finditer(joined, 0, m.start() + 1):
+                    document_start = opener.start()
+                if not worker_transcript.JSON_MANIFEST_MARKER_RE.search(joined, document_start, m.start()):
+                    return m.group(0)
+            return m.group(1) + self._old_pairs(m.group(2)) + m.group(3)
+
+        return worker_transcript.JSON_SECRET_BLOCK_RE.sub(mask, joined)
+
+    def test_the_pair_rule_masks_what_the_old_form_masked(self):
+        units = ['"', "\\", ":", "a", " ", "\t", "\n", "\r", "\r\n", ",", '\\"', "\\\\", "\\\n", "é"]
+        # A key, a separator and a value in each form, so that each string
+        # can hold a pair, a string that opens no pair, or one that does not close.
+        parts = (
+            ["", "x ", '"p":"q",', '"', '\\"', "\\"],
+            ['"k"', '"k\\"k"', '"\\\\"', '"é"', '"k', "k", '""', '"k\\\n"'],
+            [":", " : ", "\t:\n", "", " "],
+            ['"v"', '"v\\"v"', '"v', '"v\\', '"v\\\n"', "v", '"', '"\\"\\"\\"'],
+            ["", ",", ', "n":"m"', "\n", '"'],
+        )
+        for body in self._strings(units, 4, 20000, 6036, parts):
+            self.assertEqual(self._new_pairs(body), self._old_pairs(body), repr(body))
+
+    def test_the_block_rule_masks_what_the_old_form_masked(self):
+        units = [
+            '"data":{', '"stringData":{', "}", "{", '"a":"b"', '"kind":', '"apiVersion" :', "\n", "\r\n", " ", "\t", ",", '"', "\\", '\\"',
+            ":", "x", "\n{", "\n  {", "\n\t{", "data:", "\n  a: b", "kind: Secret", "é", '"data":\n{', '"data" :\n  {',
+        ]
+        # Lines before the block, an opener line or none, a marker or none, a
+        # block, and what follows it, so that each string holds a block.
+        parts = (
+            ["", '{"kind":"x"}\n', 'log "kind": 1\n', "x\n", '{"level":"info"}\n'],
+            ["", "{", "  {", "\t{", "x{", '{"a":{'],
+            ["", '"kind":"Secret",', '"apiVersion" : "v1",\n', '"kind"', '"kind":', "'kind':"],
+            ['"data":{', '"data" : {', '"stringData":{', '"Data":{', '"data":', '"data":\n{', '"data" :\n\t{'],
+            ['"a":"b"', '"a":"b\\"c","d":"e"', "", '"a":"b', '"a" "b":"c"'],
+            ["}", "", "}}", '},"kind":"y","data":{"z":"w"}}', '}\n{"data":{"n":"m"}}'],
+        )
+        for text in self._strings(units, 3, 20000, 6036, parts):
+            self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), self._old_blocks(text), repr(text))
+
+    def test_the_block_rule_keeps_the_cases_that_shaped_it(self):
+        # A marker that ends exactly where the block starts counts; an opener
+        # line starts a new document, and a marker before it does not count;
+        # two blocks in one document; a block before the first opener line; a
+        # marker after the block does not count; a block's own brace at a
+        # line's start opens no document; and the pair rule on escaped quotes,
+        # on a value the text cuts short, and on strings that open no pair.
+        for text, want in (
+            ('{"kind":"data":{"a":"b"}}', '{"kind":"data":{"a":"' + MARKER + '"}}'),
+            ('{"kind":"Secret"}\n{"level":"info","data":{"a":"b"}}', '{"kind":"Secret"}\n{"level":"info","data":{"a":"b"}}'),
+            (
+                '{"kind":"ConfigMap","data":{"a":"b"},"more":"x","data":{"c":"d"}}',
+                '{"kind":"ConfigMap","data":{"a":"' + MARKER + '"},"more":"x","data":{"c":"' + MARKER + '"}}',
+            ),
+            ('x "kind": 1 "data":{"a":"b"}\n{"data":{"c":"d"}}', 'x "kind": 1 "data":{"a":"' + MARKER + '"}\n{"data":{"c":"d"}}'),
+            ('{"data":{"a":"b"},"kind":"x"}', '{"data":{"a":"b"},"kind":"x"}'),
+            (
+                '{"level":"info","data":{"a":"b"}}\n{"apiVersion":"v1",\n "data":{"c":"d"}}\n{"data":{"e":"f"}}',
+                '{"level":"info","data":{"a":"b"}}\n{"apiVersion":"v1",\n "data":{"c":"' + MARKER + '"}}\n{"data":{"e":"f"}}',
+            ),
+            ('  {"apiVersion":"v1"}\n"data":{"a":"b"}', '  {"apiVersion":"v1"}\n"data":{"a":"' + MARKER + '"}'),
+            (
+                'log {"kind":"x"} "data":{"a":"b"}\nnext "data":{"c":"d"}',
+                'log {"kind":"x"} "data":{"a":"' + MARKER + '"}\nnext "data":{"c":"' + MARKER + '"}',
+            ),
+            ('{"kind":"Secret",\n"data":\n{"a":"b"}}', '{"kind":"Secret",\n"data":\n{"a":"' + MARKER + '"}}'),
+            ('x "kind": 1\n  "data" :\n\t{"a":"b"}', 'x "kind": 1\n  "data" :\n\t{"a":"' + MARKER + '"}'),
+            ('"stringData":{"a":"b\\"c","d":"e"}', '"stringData":{"a":"' + MARKER + '","d":"' + MARKER + '"}'),
+            ('"stringData":{"a":"b', '"stringData":{"a":"' + MARKER),
+            (
+                '"stringData":{"a" "b": "c", "d":"e\\\n", "f":"g"}',
+                '"stringData":{"a" "b": "' + MARKER + '", "d":"e\\\n", "f":"' + MARKER + '"}',
+            ),
+            ('"stringData":{"\\"\\"\\"" x "k":"v"}', '"stringData":{"\\"\\"\\"" x "k":"' + MARKER + '"}'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), want)
+
+    def test_many_blocks_scrub_in_linear_time(self):
+        # The whole scrub. Each text took seconds on the old forms (1.3 s to
+        # 2.6 s) and takes at most 0.04 s of CPU time on the new ones. The
+        # bound is on CPU time, and the texts are no larger than this on
+        # purpose: the coverage job in CI runs this file about 5 times slower
+        # than a developer's machine, which leaves the 1 s bound a margin of
+        # about 5. The longer texts are in the next test, on the rule alone.
+        import time
+
+        for text in (
+            '"data":{}\n' * 8000,
+            '"stringData":{' + '\\"' * 16000,
+            '{"kind":"Secret",\n"data":{' + '\\"' * 16000,
+            '"stringData":{"' + '\\"' * 16000 + '" x',
+        ):
+            with self.subTest(text=text[:30]):
+                start = time.process_time()
+                out = _scrub("tool_result", text)
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(out, text)
+
+    def test_many_blocks_cost_the_block_rule_linear_time(self):
+        # The rule alone, on texts of 60 KB to 380 KB. The new forms need a
+        # few milliseconds of CPU time; the old forms need 6 s or more. So
+        # the 1 s bound has a wide margin on a slow runner, and a quadratic
+        # form fails on a fast one.
+        import time
+
+        for name, read, text in (
+            ("blocks with no opener line", lambda text: worker_transcript.scrub_secret_blocks(REDACTOR, text), '"data":{}\n' * 20000),
+            (
+                "JSON lines, a block in each",
+                lambda text: worker_transcript.scrub_secret_blocks(REDACTOR, text),
+                '{"level":"info","msg":"sync ok","data":{"n":1}}\n' * 8000,
+            ),
+            ("pairs, a string that does not close", self._new_pairs, '\\"' * 30000),
+            ("pairs, a string that opens no pair", self._new_pairs, '"' + '\\"' * 30000 + '" x'),
+            ("pairs, a string that stops at a backslash", self._new_pairs, '"' + '\\"' * 30000 + "\\\n"),
+        ):
+            with self.subTest(cmd=name):
+                start = time.process_time()
+                read(text)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
@@ -1707,6 +1882,86 @@ class TestSecretReadDetector(unittest.TestCase):
         "cat /proc/thread-self/e*",
         "cat /proc/*/e*",
         "cat /proc/$PID/e*",
+        # another tool's token printer (#5803), behind the tool's own flags and behind a wrapper
+        "gh auth token",
+        "gh auth token --hostname github.com",
+        "az account get-access-token --resource https://management.azure.com",
+        "az --subscription s account get-access-token",
+        "aws sts get-session-token",
+        "aws --profile p sts get-session-token --duration-seconds 900",
+        "kubectl create token builder",
+        "kubectl -n ci create token builder --duration 10m",
+        "oc create token builder",
+        "sudo gh auth token",
+        "T=$(gh auth token)",
+        "kubectl exec p -- gh auth token",
+        'curl -H "Authorization: Bearer $(gh auth token)" https://api.github.com/user',
+        # another language's print of its whole environment, as inline code
+        "python3 -c 'import os; print(os.environ)'",
+        "python3 -c 'import os, json; print(json.dumps(dict(os.environ)))'",
+        'python -c "import os\nfor k, v in os.environ.items(): print(k, v)"',
+        "python3.12 -Ic 'import os; print(sorted(os.environ.items()))'",
+        "pypy3 -c 'import os; print(os.environ.copy())'",
+        "python3 -c 'import os\nfor k in os.environ: print(k, os.environ[k])'",
+        "python3 -c 'import os; print(os.environb)'",
+        "kubectl exec p -- python3 -c 'import os; print(os.environ)'",
+        "sh -c \"python3 -c 'import os; print(os.environ)'\"",
+        "node -e 'console.log(process.env)'",
+        "node -p process.env",
+        "node --eval 'console.log(JSON.stringify(process.env))'",
+        "node --print process.env",
+        "node --eval='console.log(process.env)'",
+        "nodejs -pe 'Object.entries(process.env)'",
+        "node -e 'console.log({...process.env})'",
+        "python3 -c 'print(__import__(\"os\").environ)'",
+        "python3 -c 'import os; print(sorted(os.environ))'",
+        # a subscript by a variable, in a loop over the names
+        "python3 -c 'import os\nfor k in sorted(os.environ.keys()): print(k, os.environ[k])'",
+        "node -e 'Object.keys(process.env).forEach(k => console.log(k, process.env[k]))'",
+        # the new commands behind a word that runs a command elsewhere, and behind a tool that runs the interpreter
+        "docker exec app gh auth token",
+        "docker run --rm ghcr.io/cli/cli gh auth token",
+        "ssh host az account get-access-token",
+        "ssh host aws sts get-session-token",
+        "docker exec app oc create token builder",
+        "docker exec app python3 -c 'import os; print(os.environ)'",
+        "ssh host node -e 'console.log(process.env)'",
+        "docker exec app nodejs -p process.env",
+        "uv run python -c 'import os; print(os.environ)'",
+        "poetry run python -c 'import os; print(os.environ)'",
+        "pipenv run python -c 'import os; print(os.environ)'",
+        "npx node -e 'console.log(process.env)'",
+        "uv run env",
+        # a key that only starts with a literal, and a `.get(` by a variable
+        "python3 -c 'import os; print([os.environ[\"\" + k] for k in os.environ.keys()])'",
+        "node -e 'Object.keys(process.env).forEach(k => console.log(process.env[\"\" + k]))'",
+        "python3 -c 'import os\nfor k in sorted(os.environ.keys()): print(k, os.environ.get(k))'",
+        "python3 -c 'import os; print([os.environ.get(\"\" + k) for k in os.environ.keys()])'",
+        "python3 -c 'import os; print([os.environ.pop(\"\" + k) for k in list(os.environ)])'",
+        # the name imported from `os`
+        "python3 -c 'from os import environ; print(environ)'",
+        "python3 -c 'from os import path, environ\nprint(dict(environ))'",
+        # the whole environment assigned to a variable: the rule cannot follow it to a print, so it decides
+        # closed. Known cost: the first form is honest code that prints nothing.
+        "python3 -c 'import os; env = os.environ.copy()'",
+        "python3 -c 'import os; env = os.environ; print(env)'",
+        "python3 -c 'import os; env = {**os.environ}; print(env)'",
+        "node -e 'const { ...env } = process.env; console.log(env)'",
+        "node -e 'console.log({env: process.env})'",
+        # code in one word with its flag
+        "python3 -c'import os; print(os.environ)'",
+        "python3 -Ic'import os; print(os.environ)'",
+        "node -e'console.log(process.env)'",
+        "node -pprocess.env",
+        # a line that cannot be split: another tool's name with its printer path, or an environment name
+        "echo 'unclosed; gh auth token",
+        "echo 'unclosed; az account get-access-token",
+        "echo 'unclosed; aws sts get-session-token",
+        "echo 'unclosed; oc create token builder",
+        "echo 'unclosed; python3 -c print(os.environ)",
+        "echo 'unclosed; node -p process.env",
+        "echo 'unclosed; python3 -c print(__import__(\"os\").environ)",
+        "echo 'unclosed; python3 -c from os import environ; print(environ)",
     ]
     # The same words where nothing of the environment is printed.
     NO_TOKEN_OR_ENVIRONMENT_PRINTS = [
@@ -1851,6 +2106,68 @@ class TestSecretReadDetector(unittest.TestCase):
         "runuser -u app -- ls env",
         "script -q /dev/null ls env",
         "docker-compose up -d env",
+        # another tool's words that print no token, and a printer's words as arguments
+        "gh auth status",
+        "gh auth login --with-token",
+        "gh search issues auth token",
+        "gh issue create --title 'auth token is stale'",
+        "az account show",
+        "aws sts get-caller-identity",
+        "kubectl create secret generic token --from-literal=a=b",
+        "kubectl create -f token.yaml",
+        "kubectl create namespace token",
+        "oc create -f token.yaml",
+        "echo gh auth token",
+        # another language's read of one variable, of the names, a membership test, the environment handed on
+        "python3 -c 'import os; print(os.environ[\"HOME\"])'",
+        "python3 -c \"import os; print(os.environ.get('PATH'))\"",
+        "python3 -c 'import os; print(\"KUBECONFIG\" in os.environ)'",
+        "python3 -c 'import os; print(\"A\" not in os.environ)'",
+        "python3 -c 'import os, subprocess; subprocess.run([\"ls\"], env=os.environ)'",
+        "python3 -c 'import os; print(sorted(os.environ.keys()))'",
+        "python3 -c 'import os; os.environ.setdefault(\"A\", \"b\")'",
+        "python3 -c 'import os; os.environ.pop(\"A\", None)'",
+        "python3 -c 'import os; os.environ.update(A=\"b\")'",
+        "python3 script.py os.environ",
+        "node -e 'console.log(process.env.HOME)'",
+        "node -e 'console.log(process.env[\"HOME\"])'",
+        "node -e 'console.log(Object.keys(process.env))'",
+        "node -e \"console.log('PATH' in process.env)\"",
+        "node script.js process.env",
+        # another name that ends in the environment's name
+        "python3 -c 'print(myos.environ)'",
+        "node -e 'console.log(subprocess.env)'",
+        # the environment handed on or taken apart
+        "python3 -c 'import os, subprocess; subprocess.run([\"ls\"], env={**os.environ, \"A\": \"b\"})'",
+        "python3 -c 'import os, subprocess; subprocess.run([\"ls\"], env=dict(os.environ, LC_ALL=\"C\"))'",
+        "node -e 'const { NODE_ENV } = process.env; console.log(NODE_ENV)'",
+        # a path word behind a flag is the flag's value
+        "kubectl create -f token",
+        "kubectl create -n token deployment web --image=nginx",
+        # the tools that run an interpreter, with other commands
+        "uv run pytest -q",
+        "uv run python -c 'print(1)'",
+        "npx prettier --check .",
+        "docker run --rm img gh auth status",
+        "ssh host aws s3 ls",
+        "uv venv env",
+        "poetry env --help",
+        "uv pip uninstall set",
+        "pipenv install env",
+        # a whole literal key, a `.get(` by a literal, and the import alone
+        "python3 -c 'import os; print(os.environ.get(\"A\", \"b\"))'",
+        "python3 -c 'from os import environ; print(environ[\"HOME\"])'",
+        "python3 -c 'from os import environ; print(environ.get(\"HOME\"))'",
+        "python3 -c 'from os import path; print(path.exists(\"environ\"))'",
+        "python3 -c 'import subprocess, os; subprocess.Popen(env=os.environ, args=[\"ls\"])'",
+        # a line that cannot be split, with another tool's name and no printer path
+        "echo 'unclosed; gh auth status",
+        "echo 'unclosed; aws s3 ls",
+        # ... and with a printer path's words and no tool's name
+        "echo 'unclosed; the auth token is stale",
+        # ... and with a read of one variable, which the walk's patterns serve
+        "echo 'unclosed; python3 -c print(os.environ[\"HOME\"])",
+        "echo 'unclosed; node -p process.env.HOME",
     ]
 
     def test_a_token_print_or_an_environment_dump_is_withheld(self):
@@ -1891,6 +2208,18 @@ class TestSecretReadDetector(unittest.TestCase):
         for _ in range(worker_transcript.MAX_NESTED_COMMAND_DEPTH):
             nested_reads = "echo " + "$(" * worker_transcript.MAX_READ_SUBSTITUTIONS + shlex.quote(nested_reads)
         self.assertTrue(worker_transcript.command_reads_a_secret(nested_reads))
+        # Past the step limit another tool's name or an interpreter's name withholds too; past the substitution
+        # limit another tool's printer path does.
+        # (Each line holds the word `token`, so that it passes the fragment gate and reaches the walk.)
+        self.assertFalse(worker_transcript.command_reads_a_secret("sudo gh api user --jq .token"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "gh api user --jq .token"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "python3 x.py --token-file f"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "node x.js --token-file f"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "git config token"))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_substitutions + '"$(gh auth token)"'))
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_substitutions + '"$(gh auth status)"'))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_substitutions + "\"$(python3 -c 'from os import environ; print(environ)')\""))
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_substitutions + '"$(node -p process.env.HOME)"'))
         # A script word nested past the depth limit is not read, and withholds.
         nested = "sh<<<x"
         self.assertFalse(worker_transcript.command_reads_a_secret("env=1 " + nested))

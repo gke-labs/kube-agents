@@ -113,7 +113,7 @@ class BuildReleaseBinariesTest(unittest.TestCase):
             goos, goarch = platform.split("/")
             self.assertIn(f"GOOS={goos} GOARCH={goarch} CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local", line)
             self.assertIn("-trimpath", line)
-            self.assertIn("-ldflags=-s -w", line)
+            self.assertIn(f"-ldflags=-s -w -X main.version={MOCK_TARGET_RELEASE_TAG}", line)
             self.assertIn("./cmd/k8s-api-proxy", line)
 
     def test_builds_from_the_release_commit_not_the_working_tree(self):

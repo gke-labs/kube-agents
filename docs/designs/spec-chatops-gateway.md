@@ -1252,7 +1252,13 @@ not be silent about it.
 
 **The three endpoints.**
 
-- `POST /inject` takes a conversation key, an author and the text. The adapter prefixes the key
+- `POST /inject` takes a conversation key, an author and the text, and optionally a `profile` and
+  its `parameters` (#5945). A `profile` addresses the turn to that AgentProfile as a new top task,
+  as the console's frame can: the door refuses a name that can't be a subject token, and
+  `parameters` without a `profile` (platform takes none), each with a 400. Everything else goes
+  down the one profile path every door takes: the profile resolved (a generic one yields to the one
+  pinned to the target), its card, tier, parameters and target scope checked, and a refusal posted
+  to the conversation. It reaches nothing the same eval identity can't already reach by asking a session to delegate to the profile: the same tier (read) and the same profile checks. Neither path checks the target's allowed-users list for a profile today, since only `platform` renders one (#5947). The adapter prefixes the key
   with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
@@ -2620,7 +2626,13 @@ with `views.publish`: a dashboard of five panels, with no model in the loop (`sl
 Running, Recent pull requests and Last audit are one board snapshot, read over the board route: the
 gateway publishes an empty request on `chat.board` with its reply under `chat.board.reply.gateway.`,
 and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
-every Cluster Agent profile's cluster and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total, the running
+the managed clusters and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total. Under
+`spec.mode: next` (#3658) a member project's clusters are the resolved scope's, read through `fleet_scope_targets.list_scope_clusters` with no profile
+read; the projects the scope lists live (the management and explicit projects) keep their Cluster Agent profiles' clusters until those retire, the
+profiles walk filtered to those projects. Outside `next` every Cluster Agent profile's cluster is listed. One `unlisted` row per kind stands for the
+projects the board holds no cluster list for (`(clusters not listed here)` for a project listed live that no profile names, `(clusters unread)` for the
+unread members); the cap and the total leave it out, and the tab draws it as `⚪ health unknown`, never green, and heads a board of only such rows
+`No clusters listed`, never `0 clusters`. A running card's cluster label comes from the same identities. Then the running
 kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
 store; and `first_report_pending` while onboarding has filed its sweep, its first report is not out
 (the findings nudge's own marker pair, `findings_nudge.first_report_markers`: the delivery claim, or

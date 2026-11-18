@@ -330,6 +330,10 @@ func a2aDispatcherResources() corev1.ResourceRequirements {
 }
 
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+	// The install's tier table (#6091), for the report-credential mint to key
+	// on a tier's mode rather than its name. Nothing reads it yet: the mount
+	// is inert until the dispatcher's mint reads A2A_TIERS_FILE.
+	tiersVolume, tiersMount, tiersEnv := a2aTiersVolumeAndMount(agent)
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)
 	podLabels := a2aLabels(agent, "dispatcher")
@@ -382,9 +386,10 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							// so the process opens its bucket connections
 							// exactly when the callout splits its grants.
 							{Name: a2aDispatcherBucketedGrantsEnvVar, Value: strconv.FormatBool(a2aDispatcherBucketedGrants())},
+							tiersEnv,
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
-							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},
+							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}, tiersMount},
 						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -403,7 +408,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 						Resources:       a2aDispatcherResources(),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent), tiersVolume},
 				},
 			},
 		},

@@ -1863,6 +1863,164 @@ func TestUnreadablePollsBreakARunOfTasksMisses(t *testing.T) {
 	}
 }
 
+// stopAfterReRun drives a re-run for missing that leaves stillMissing off
+// the bus: three polls confirm, the Job is recreated, and a poll settles it.
+func stopAfterReRun(rig *busStreamsRig, missing, stillMissing []string) {
+	rig.t.Helper()
+	rig.serve(1, allStreamsBut(missing...)...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, allStreamsBut(stillMissing...)...)
+	rig.poll()
+}
+
+// #5700 case 1: a stream the re-run restored is not stopped when it is lost
+// again, once the name it left missing is back.
+func TestARestoredStreamIsNotStoppedWhenLostAgain(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	stopAfterReRun(rig, []string{"KV_cap", "TASKS"}, []string{"KV_cap"})
+	if got := readBusReprovisionRecord(rig.agent()).Stopped; !slices.Equal(got, []string{"KV_cap"}) {
+		t.Fatalf("Stopped after the re-run = %v, want [KV_cap]", got)
+	}
+	// KV_cap fixed by hand, then TASKS lost again past the rate limit.
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	rig.now = rig.now.Add(busStreamsReprovisionMinGap)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatal("a second loss of the restored TASKS was not re-run")
+	}
+	c := rig.condition()
+	if c == nil || c.Reason == busStreamsReasonDidNotRestore {
+		t.Fatalf("condition = %+v, want a re-run, not a stop", c)
+	}
+	if got := readBusReprovisionRecord(rig.agent()).Stopped; len(got) != 0 {
+		t.Errorf("Stopped = %v, want none once KV_cap was back", got)
+	}
+}
+
+// #5700 case 2: a loss of another stream is confirmed, re-run and named
+// while a stop holds.
+func TestALossIsReRunWhileAStopHolds(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	stopAfterReRun(rig, []string{"DIRECTORY"}, []string{"DIRECTORY"})
+	// The stop holds: only DIRECTORY missing, no re-run.
+	rig.poll()
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, "DIRECTORY") {
+		t.Fatalf("condition with only the stopped name missing = %+v, want %s naming DIRECTORY", c, busStreamsReasonDidNotRestore)
+	}
+	if !rig.jobExists() {
+		t.Fatal("the stopped name was re-run")
+	}
+	rig.now = rig.now.Add(busStreamsReprovisionMinGap)
+	rig.serve(1, allStreamsBut("DIRECTORY", "TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatal("TASKS lost under a stop was never re-run")
+	}
+	c := rig.condition()
+	if c == nil || c.Reason != busStreamsReasonReprovisioning || !strings.Contains(c.Message, "TASKS") || !strings.Contains(c.Message, "Still stopped") || !strings.Contains(c.Message, "DIRECTORY") {
+		t.Fatalf("condition = %+v, want Reprovisioning naming TASKS and the stopped DIRECTORY", c)
+	}
+	rec := readBusReprovisionRecord(rig.agent())
+	if last := rec.last(); last == nil || !slices.Equal(last.Missing, []string{"TASKS"}) {
+		t.Errorf("new attempt = %+v, want Missing [TASKS]", last)
+	}
+	if !slices.Equal(rec.Stopped, []string{"DIRECTORY"}) {
+		t.Errorf("Stopped = %v, want [DIRECTORY] still", rec.Stopped)
+	}
+}
+
+// Each stopped name is lifted on its own once seen back.
+func TestStoppedNamesAreLiftedOneByOne(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	stopAfterReRun(rig, []string{"DIRECTORY", "KV_cap"}, []string{"DIRECTORY", "KV_cap"})
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	if got := readBusReprovisionRecord(rig.agent()).Stopped; !slices.Equal(got, []string{"KV_cap"}) {
+		t.Fatalf("Stopped after DIRECTORY came back = %v, want [KV_cap]", got)
+	}
+	// DIRECTORY lost again is re-run, KV_cap still stopped.
+	rig.now = rig.now.Add(busStreamsReprovisionMinGap)
+	rig.serve(1, allStreamsBut("DIRECTORY", "KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatal("DIRECTORY, lifted, was not re-run when lost again")
+	}
+}
+
+// A record from before Stopped existed: a settled, unrestored attempt is
+// that operator's stop. Its names still missing are seeded; one that is back
+// is not.
+func TestAnOldStopIsSeededFromTheNamesStillMissing(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	live := rig.agent()
+	live.Annotations = map[string]string{busStreamsReprovisionAnnotation: fmt.Sprintf(`{"attempts":[{"at":%q,"missing":["DIRECTORY","KV_cap"],"settled":true}]}`,
+		busStreamsTestNow.Add(-30*time.Minute).Format(time.RFC3339))}
+	if err := rig.cl.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	rig.serve(1, allStreamsBut("DIRECTORY")...)
+	rig.poll()
+	rec := readBusReprovisionRecord(rig.agent())
+	if !slices.Equal(rec.Stopped, []string{"DIRECTORY"}) {
+		t.Fatalf("Stopped seeded from the old record = %v, want [DIRECTORY]", rec.Stopped)
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore {
+		t.Errorf("condition = %+v, want the seeded stop", c)
+	}
+}
+
+// Pruning on a later write keeps the stop whatever the attempts' age.
+func TestPruningKeepsTheStop(t *testing.T) {
+	rec := busReprovisionRecord{
+		Attempts: []busReprovisionAttempt{{At: busStreamsTestNow.Add(-48 * time.Hour), Missing: []string{"DIRECTORY"}, Settled: true}},
+		Stopped:  []string{"DIRECTORY"},
+	}
+	if got := rec.pruned(busStreamsTestNow).Stopped; !slices.Equal(got, []string{"DIRECTORY"}) {
+		t.Errorf("pruned Stopped = %v, want [DIRECTORY]", got)
+	}
+}
+
+// A stopped TASKS is not re-run, but its loss is still tracked from the
+// verdict and its clients are restarted once it is back (#5783's path).
+func TestAStoppedTasksStillRestartsItsClientsWhenBack(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	stopAfterReRun(rig, []string{"TASKS"}, []string{"TASKS"})
+	if got := readBusReprovisionRecord(rig.agent()).Stopped; !slices.Equal(got, []string{"TASKS"}) {
+		t.Fatalf("Stopped = %v, want [TASKS]", got)
+	}
+	rig.poll()
+	if !rig.jobExists() {
+		t.Fatal("a stopped TASKS was re-run")
+	}
+	if readBusTasksLoss(rig.agent()) == nil {
+		t.Fatal("the stopped TASKS' loss was not recorded")
+	}
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if len(rig.deleted) == 0 {
+		t.Errorf("TASKS back: deleted %v, want its clients restarted", rig.deleted)
+	}
+	if got := readBusReprovisionRecord(rig.agent()).Stopped; len(got) != 0 {
+		t.Errorf("Stopped = %v, want TASKS lifted once back", got)
+	}
+}
+
 // TASKS lost, re-run, a client started after the first loss binds to the
 // new stream, and TASKS is lost again before any poll sees it present. The
 // re-run closes the first loss, so the second is dated afresh and the client
@@ -1998,5 +2156,35 @@ func TestTheLossIsKeptWhileAClientIsNotRunning(t *testing.T) {
 	rig.poll()
 	if readBusTasksLoss(rig.agent()) == nil {
 		t.Errorf("the loss was cleared while the bridge wasn't running")
+	}
+}
+
+// An attempt whose Job delete failed settles as restored once its own names
+// are back, even while a stop holds for another: otherwise it waits on the
+// stopped name, and the Job's next routine re-run is taken for its re-run.
+func TestAFailedDeleteSettlesUnderAStop(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	stopAfterReRun(rig, []string{"DIRECTORY"}, []string{"DIRECTORY"})
+	rig.now = rig.now.Add(busStreamsReprovisionMinGap)
+	rig.serve(1, allStreamsBut("DIRECTORY", "KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.jobDeleteErr = errors.New("etcdserver: request timed out")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the Job delete failing")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	rig.jobDeleteErr = nil
+
+	// KV_cap back by hand; DIRECTORY, stopped, still missing.
+	rig.serve(1, allStreamsBut("DIRECTORY")...)
+	rig.poll()
+	last := readBusReprovisionRecord(rig.agent()).last()
+	if last == nil || len(last.Missing) != 0 || !last.Settled || !last.Restored {
+		t.Fatalf("attempt for KV_cap = %+v, want settled as restored with nothing named", last)
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, "DIRECTORY") || strings.Contains(c.Message, "KV_cap") {
+		t.Fatalf("condition = %+v, want the stop naming DIRECTORY alone", c)
 	}
 }
