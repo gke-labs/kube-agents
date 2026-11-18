@@ -71,6 +71,19 @@ class GuardVerdictTest(unittest.TestCase):
         self.assertIn("this-file-does-not-exist.md", proc.stdout)
         self.assertNotIn("No document states this cap", proc.stdout)
 
+    def test_operational_knowledge_framework_is_rejected(self):
+        bad = run_guard(
+            ["The Operational Knowledge Framework (OKF) stores knowledge notes.\n"]
+        )
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn("Open Knowledge Format", bad.stdout)
+        self.assertIn("Operational Knowledge Framework", bad.stdout)
+
+        good = run_guard(
+            ["The Open Knowledge Format (OKF) stores knowledge notes.\n"]
+        )
+        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+
 
 class GuardWiringTest(unittest.TestCase):
     """Properties of the script a source read or a run from elsewhere shows."""

@@ -1,6 +1,6 @@
 # OKF Curator and Dreamer (`a2a/memory`)
 
-`a2a/memory` and `a2a/cmd/curator` implement the Go Operational Knowledge Framework (OKF) Curator, Dreamer, and deterministic manifest guard evaluator for `kube-agents`.
+`a2a/memory` and `a2a/cmd/curator` implement the Go Open Knowledge Format (OKF) Curator, Dreamer, and deterministic manifest guard evaluator for `kube-agents`.
 
 ## Responsibilities
 
