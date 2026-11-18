@@ -470,7 +470,10 @@ job's threads since the fire, and the chat report the run's `finish` left on the
 passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
 silent run or one that never ended is an error. `triage_starts`, in its own module
-(`bench/kube_agents_bench/triage_starts.py`), lists the pods in its `namespace` on the agent's cluster,
+(`bench/kube_agents_bench/triage_starts.py`), reads the planted pods from the ConfigMap the stack
+records them in (`planted_record`, optional; without it, or when the namespace holds no such ConfigMap,
+the pods in its `namespace` on the agent's cluster), so a pod deleted mid-run is still graded and is
+named in the reason; a live pod the record leaves out is an error. It
 joins the Session KV server's admitted `intercepted_events` rows for them (by pod UID) to the default
 profile's Hermes `state.db`, and passes when at least `min_alerts` pods have an admitted alert and every
 one of those alerts has a session with a message, a started triage turn; a session with no message is a
