@@ -868,7 +868,7 @@ CLUSTER_PLACEHOLDER_ANY = "any"
 EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
 EXPANDING_MODEL_PATTERN_KEYS = ("forbidden_patterns", "required_patterns", "any_of_patterns")
 MODEL_PLACEHOLDER = re.compile(r"\{model\}")
-MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{[^}\n]*model[^}\n]*\}", re.IGNORECASE)
+MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{\s*model\b[^}\n]*\}", re.IGNORECASE)
 MODEL_PLACEHOLDER_TOKEN = "{model}"
 REPORT_CHECK_TYPE = "report_contains"
 

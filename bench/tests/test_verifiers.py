@@ -11730,8 +11730,12 @@ def test_report_contains_expands_model_placeholder_from_runner_env(monkeypatch):
         ReportContainsVerifier(type="report_contains", required_phrases=["{model}"])
     with pytest.raises(ValidationError, match="malformed model placeholder"):
         ReportContainsVerifier(type="report_contains", required_patterns=["{model:default}"])
+    # JSON and JSONPath snippets containing the word "model" are not placeholders.
+    json_check = ReportContainsVerifier(type="report_contains", forbidden_patterns=[r'\{"model": "model-default"\}'])
+    assert json_check.forbidden_patterns
 
     check = ReportContainsVerifier(type="report_contains", required_patterns=["{model}"])
+    monkeypatch.delenv("MODEL_PROVIDER", raising=False)
     monkeypatch.delenv("MODEL_DEFAULT_NAME", raising=False)
     monkeypatch.delenv("AGENT_MODEL", raising=False)
     monkeypatch.setenv("AGENT_MODEL_NAME", "model-default")
@@ -11739,6 +11743,30 @@ def test_report_contains_expands_model_placeholder_from_runner_env(monkeypatch):
     err = check.verify(timeout_sec=5.0)
     assert err.status == "error"
     assert "MODEL_DEFAULT_NAME" in err.reason
+
+    # Trailing-slash provider prefix with empty model half is rejected.
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "vertex_ai/")
+    err_empty = check.verify(timeout_sec=5.0)
+    assert err_empty.status == "error"
+
+    # Falls back to AGENT_MODEL and strips known provider prefixes (including ollama).
+    monkeypatch.delenv("MODEL_DEFAULT_NAME", raising=False)
+    monkeypatch.setenv("AGENT_MODEL", "ollama/meta-llama/Llama-3.1-8B-Instruct")
+    _stash("Running on Llama-3.1-8B-Instruct.")
+    assert check.verify(timeout_sec=5.0).success
+
+    # Falls back to AGENT_MODEL_NAME when MODEL_DEFAULT_NAME and AGENT_MODEL are absent.
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_MODEL_NAME", "vertex_ai/gemini-3.1-pro-preview")
+    _stash("I run on gemini-3.1-pro-preview.")
+    assert check.verify(timeout_sec=5.0).success
+
+    # Underscore model IDs match under both fold_decoration=False and fold_decoration=True.
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "deepseek_r1")
+    _stash("Running on deepseek_r1.")
+    assert check.verify(timeout_sec=5.0).success
+    folded_check = ReportContainsVerifier(type="report_contains", required_patterns=["{model}"], fold_decoration=True)
+    assert folded_check.verify(timeout_sec=5.0).success
 
     monkeypatch.setenv("MODEL_PROVIDER", "vertex_ai")
     monkeypatch.setenv("MODEL_DEFAULT_NAME", "gemini-3.1-pro-preview")

@@ -301,8 +301,10 @@ _NO_RECORDED_SLOT_REASON = (
 )
 _PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
 _MODEL_PLACEHOLDER = re.compile(r"\{model\}")
-_MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{[^}\n]*model[^}\n]*\}", re.IGNORECASE)
+_MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{\s*model\b[^}\n]*\}", re.IGNORECASE)
 _MODEL_PLACEHOLDER_STAND_IN = "stand-in-model-1.0"
+_MODEL_PROVIDER_ENV_KEY = "MODEL_PROVIDER"
+_MODEL_ENV_KEYS = ("MODEL_DEFAULT_NAME", "AGENT_MODEL", "AGENT_MODEL_NAME")
 _NO_RECORDED_MODEL_REASON = (
     "a pattern names {model} and the runner has no backing model recorded in "
     "MODEL_DEFAULT_NAME, AGENT_MODEL, or AGENT_MODEL_NAME"
@@ -314,6 +316,7 @@ _KNOWN_PROVIDER_PREFIXES = frozenset(
     {
         "vertex_ai",
         "gemini",
+        "google",
         "anthropic",
         "openai",
         "openai_compatible",
@@ -324,6 +327,14 @@ _KNOWN_PROVIDER_PREFIXES = frozenset(
         "bedrock",
         "databricks",
         "chatgpt",
+        "ollama",
+        "xai",
+        "deepseek",
+        "mistral",
+        "cohere",
+        "groq",
+        "together_ai",
+        "fireworks_ai",
     }
 )
 
@@ -335,18 +346,19 @@ def recorded_model() -> str:
     ``hack/ci-eval-pr.sh`` exports ``AGENT_MODEL``; ``harness.py`` reads
     ``AGENT_MODEL_NAME``.
     """
-    env_provider = os.environ.get("MODEL_PROVIDER", "").strip().casefold()
-    for key in ("MODEL_DEFAULT_NAME", "AGENT_MODEL", "AGENT_MODEL_NAME"):
+    env_provider = os.environ.get(_MODEL_PROVIDER_ENV_KEY, "").strip().casefold()
+    for key in _MODEL_ENV_KEYS:
         raw = os.environ.get(key, "").strip()
         if not raw:
             continue
         if "/" in raw:
             prefix, rest = raw.split("/", 1)
             folded_prefix = prefix.strip().casefold()
-            if rest.strip() and (
-                folded_prefix in _KNOWN_PROVIDER_PREFIXES
-                or (env_provider and folded_prefix == env_provider)
+            if folded_prefix in _KNOWN_PROVIDER_PREFIXES or (
+                env_provider and folded_prefix == env_provider
             ):
+                if not rest.strip():
+                    continue
                 raw = rest.strip()
         if raw and raw.casefold() not in _ROUTER_MODEL_ALIASES:
             return raw
@@ -752,9 +764,10 @@ class ReportContainsVerifier(BaseVerifier):
         return _CLUSTER_PLACEHOLDER.sub(frame_for, pattern)
 
     @staticmethod
-    def _model_frame(model: str) -> str:
+    def _model_frame(model: str, *, fold_decoration: bool = False) -> str:
         """The regex for the recorded backing model, matching hyphenated or spaced tokens."""
-        norm = _normalize(model).strip()
+        raw = _INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", model)) if fold_decoration else model
+        norm = _normalize(raw).strip()
         prefix_part = ""
         leaf = norm
         if "/" in norm:
@@ -772,11 +785,11 @@ class ReportContainsVerifier(BaseVerifier):
         return f"(?:(?<![a-z0-9-])(?<![a-z0-9][.]){prefix_part}{body}(?![a-z0-9-]|[.][a-z0-9]))"
 
     @classmethod
-    def expand_model_placeholders(cls, pattern: str, model: str) -> str:
+    def expand_model_placeholders(cls, pattern: str, model: str, *, fold_decoration: bool = False) -> str:
         """``pattern`` with every ``{model}`` replaced by the recorded model frame."""
         if not _MODEL_PLACEHOLDER.search(pattern):
             return pattern
-        frame = cls._model_frame(model)
+        frame = cls._model_frame(model, fold_decoration=fold_decoration)
         return _MODEL_PLACEHOLDER.sub(lambda _: frame, pattern)
 
     def _expanded_patterns(
@@ -797,9 +810,15 @@ class ReportContainsVerifier(BaseVerifier):
             any_of = [self.expand_cluster_placeholders(p, clusters) for p in any_of]
         if any(_MODEL_PLACEHOLDER.search(p) for p in all_patterns):
             model = recorded_model()
-            forbidden = [self.expand_model_placeholders(p, model) for p in forbidden]
-            required = [self.expand_model_placeholders(p, model) for p in required]
-            any_of = [self.expand_model_placeholders(p, model) for p in any_of]
+            forbidden = [
+                self.expand_model_placeholders(p, model, fold_decoration=self.fold_decoration) for p in forbidden
+            ]
+            required = [
+                self.expand_model_placeholders(p, model, fold_decoration=self.fold_decoration) for p in required
+            ]
+            any_of = [
+                self.expand_model_placeholders(p, model, fold_decoration=self.fold_decoration) for p in any_of
+            ]
         return forbidden, required, any_of, clusters, model
 
     def verify(self, timeout_sec: float) -> VerificationResult:

@@ -1119,7 +1119,7 @@ class TestTheRulesReject(unittest.TestCase):
         )
 
     def test_model_placeholder_is_accepted_only_in_report_contains_pattern_lists(self):
-        for key in ("forbidden_patterns", "any_of_patterns"):
+        for key in ("forbidden_patterns", "required_patterns", "any_of_patterns"):
             with self.subTest(valid_key=key):
                 self.assertEqual(
                     self._validate(verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]})),
@@ -1139,6 +1139,16 @@ class TestTheRulesReject(unittest.TestCase):
         ):
             with self.subTest(bad_check=bad_check):
                 self._only("which only report_contains expands", verification_spec=self._entry(check=bad_check))
+        for valid_non_placeholder in (
+            {"type": "report_contains", "forbidden_patterns": [r'\{"model": "model-default"\}']},
+            {"type": "worker_commands", "required_patterns": [r"jsonpath=\{\.spec\.model\}"]},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"body": r'\{"model": "gemini"\}'}},
+        ):
+            with self.subTest(valid_non_placeholder=valid_non_placeholder):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check=valid_non_placeholder)),
+                    [],
+                )
         for malformed in ("{ model }", "{Model}", "{model:default}"):
             with self.subTest(malformed=malformed):
                 self._only(

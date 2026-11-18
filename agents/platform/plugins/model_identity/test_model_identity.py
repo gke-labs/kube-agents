@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import sys
@@ -314,6 +313,51 @@ class TestModelIdentityPlugin(unittest.TestCase):
             self.assertIn("Backing model: gemini-3.1-flash", out or "")
         finally:
             server.server_close()
+            thread.join(timeout=2.0)
+
+    def test_probe_uses_model_info_litellm_provider_fallback(self) -> None:
+        payload = {
+            "data": [
+                {
+                    "model_name": "model-default",
+                    "litellm_params": {"model": "gpt-4o"},
+                    "model_info": {"litellm_provider": "openai"},
+                }
+            ]
+        }
+        with mock.patch.object(
+            model_identity, "_load_profile_endpoint", return_value=("http://inference-gateway/v1/model/info", "")
+        ), mock.patch.object(model_identity._MODEL_INFO_OPENER, "open", return_value=self._mock_resp(payload)):
+            out = model_identity.render_model_identity()
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("Backing model: gpt-4o (GPT-4o)", out)
+        self.assertIn("Provider: OpenAI (openai)", out)
+
+    def test_probe_rejects_non_http_scheme_and_oversized_response(self) -> None:
+        with mock.patch.object(model_identity._MODEL_INFO_OPENER, "open") as mock_open:
+            self.assertEqual(model_identity._probe_gateway_model(base_url="file:///etc/passwd"), "")
+            mock_open.assert_not_called()
+
+        oversized = b"x" * (model_identity._MAX_RESPONSE_BYTES + 10)
+        with mock.patch.object(
+            model_identity, "_load_profile_endpoint", return_value=("http://inference-gateway/v1/model/info", "")
+        ), mock.patch.object(model_identity._MODEL_INFO_OPENER, "open", return_value=self._mock_resp(oversized)):
+            self.assertEqual(model_identity._probe_gateway_model(), "")
+
+    def test_missing_endpoint_sets_cooldown_and_clears_expired_cache(self) -> None:
+        payload = {"data": [{"model_name": "model-default", "litellm_params": {"model": "vertex_ai/gemini-3.1-pro"}}]}
+        now = [1000.0]
+        with mock.patch.object(model_identity.time, "monotonic", side_effect=lambda: now[0]):
+            with mock.patch.object(
+                model_identity, "_load_profile_endpoint", return_value=("http://inference-gateway/v1/model/info", "")
+            ), mock.patch.object(model_identity._MODEL_INFO_OPENER, "open", return_value=self._mock_resp(payload)):
+                self.assertEqual(model_identity._probe_gateway_model(), "vertex_ai/gemini-3.1-pro")
+            now[0] += model_identity._PROBE_SUCCESS_CACHE_TTL_SECS + 1.0
+            with mock.patch.object(model_identity, "_load_profile_endpoint", return_value=("", "")) as mock_ep:
+                self.assertEqual(model_identity._probe_gateway_model(), "")
+                self.assertEqual(model_identity._probe_gateway_model(), "")
+                self.assertEqual(mock_ep.call_count, 1)
 
     def test_register_and_handle_pre_llm_call(self) -> None:
         ctx = mock.MagicMock()
@@ -326,8 +370,9 @@ class TestModelIdentityPlugin(unittest.TestCase):
             res = model_identity.handle_pre_llm_call()
         self.assertIsNotNone(res)
         assert res is not None
-        self.assertIn("[RUNTIME MODEL IDENTITY]", res["system_prompt"])
-        self.assertIn("gemini-3.1-pro-preview", res["system_prompt"])
+        self.assertEqual(set(res.keys()), {"context"})
+        self.assertTrue(res["context"].startswith("\n\n[RUNTIME MODEL IDENTITY]\n"))
+        self.assertIn("gemini-3.1-pro-preview", res["context"])
 
 
 if __name__ == "__main__":

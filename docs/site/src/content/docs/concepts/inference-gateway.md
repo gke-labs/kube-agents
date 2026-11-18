@@ -197,7 +197,7 @@ router_settings:
         index: -1
 ```
 
-The agent cannot do this itself, and that is the point of putting it here. It asks for `model-default` over the Completions API and never learns what is behind the alias. (Each profile's prompt does get the backing model name, from the `model_identity` plugin, but only so it can answer users who ask; the harness does not read it.)
+The agent cannot do this itself, and that is the point of putting it here. It asks for `model-default` over the Completions API, so the harness never learns what is behind the alias. (Each profile's turn context does get the backing model name from the `model_identity` plugin, but only so it can answer users who ask; the harness does not read it.)
 
 The harness also only emits its own cache markers when it recognises a Claude-named model — so on an Anthropic backend it caches nothing. Teaching it otherwise would mean naming the model in the agent config, which is exactly the coupling the gateway exists to prevent. A 45-call agent session measured 3.5M input tokens and zero cache reads before this block; the first cron tick after it re-ran the same 83k-token prompt as a cache write, and subsequent ticks read it back.
 

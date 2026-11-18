@@ -4,8 +4,8 @@
 # WHAT THIS GRADES: the agent's answer to a model identity inquiry (#3295).
 # Every profile routes through LiteLLM using the internal router alias
 # `model-default` and provider `custom`. The shared `model_identity` plugin
-# probes `<model.base_url>/model/info` and injects `[RUNTIME MODEL IDENTITY]`
-# into the system prompt. A correct reply names the configured backing model
+# probes `<model.base_url>/model/info` and appends `[RUNTIME MODEL IDENTITY]`
+# to the turn context. A correct reply names the configured backing model
 # (expanded from the runner's environment via `{model}`) without leaking
 # internal router aliases or the `custom` provider placeholder, and files no
 # kanban card.
