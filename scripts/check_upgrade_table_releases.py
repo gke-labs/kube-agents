@@ -357,13 +357,37 @@ def release_cell_problems() -> list[str]:
     return found
 
 
-def order_problems(text: str) -> list[str]:
-    """Where the table's released rows stop running newest first: each released row labelled a newer
-    release than a released row above it. A reader upgrading to the newest release reads the top of the
-    table, so a newer row below an older one is one they miss. `pending` rows are not placed by this."""
+def pending_key(change: str) -> str:
+    """The order `pending` rows run in: their change text without a `#<number>: ` prefix or backticks,
+    case-folded."""
+    return CHANGE_PREFIX.sub("", change).replace("`", "").casefold()
+
+
+def pending_order_problems(rows_: list[Row]) -> list[str]:
+    """Where the `pending` rows stop running in order of their change text (pending_key), each with the row
+    it belongs below. A new row goes where its text sorts rather than always on top, so two changes open at
+    once add their rows at different places and merge cleanly; at the top they conflict (#6286)."""
+    pending = [row for row in rows_ if row.release == PENDING]
     found = []
+    for previous, row in zip(pending, pending[1:]):
+        if pending_key(row.change) >= pending_key(previous.change):
+            continue
+        before = [other for other in pending if other is not row and pending_key(other.change) <= pending_key(row.change)]
+        where = (f"below the row \"{max(before, key=lambda other: pending_key(other.change)).change}\""
+                 if before else "to the top of the `pending` rows")
+        found.append(f"{UPGRADE_PAGE}:{row.line}: the `pending` row \"{row.change}\" is out of order; `pending` "
+                     f"rows run in order of their change text, ignoring case and backticks, so move it {where}")
+    return found
+
+
+def order_problems(text: str) -> list[str]:
+    """Where the table's rows are out of order: each released row labelled a newer release than a released
+    row above it, since a reader upgrading to the newest release reads the top of the table and a newer row
+    below an older one is one they miss; and each `pending` row out of order (pending_order_problems)."""
+    table = table_rows(text)
+    found = pending_order_problems(table)
     above: Row | None = None
-    for row in table_rows(text):
+    for row in table:
         if row.release == PENDING:
             continue
         if above is not None and version_key(row.release) > version_key(above.release):

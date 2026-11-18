@@ -129,6 +129,28 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(check.order_problems(page(row("0.10.0", "a"), row("0.9.0", "c"), other=other)), [])
         self.assertEqual([r.change for r in check.table_rows(page(row("0.9.0", "c"), other=other))], ["c"])
 
+    def test_pending_rows_run_in_order_of_their_change_text_and_a_misplaced_one_is_told_where(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        def page(*rows_: str) -> str:
+            return "# Upgrade\n\n" + HEADING + HEADER + "".join(rows_) + "\n"
+        # Case, backticks and a `#<number>: ` prefix don't count, so these run in order.
+        ordered = page(row("pending", "a change"), row("pending", "`B` change"), row("pending", "#12: c change"),
+                       row("pending", "D change"), row("0.10.0", "z"))
+        self.assertEqual(check.order_problems(ordered), [])
+        # One row added on top: it is named, with the row it belongs below.
+        problems = check.order_problems(page(row("pending", "m change"), row("pending", "a change"),
+                                             row("pending", "z change")))
+        self.assertEqual(len(problems), 1)
+        self.assertIn('the `pending` row "a change" is out of order', problems[0])
+        self.assertIn('move it to the top of the `pending` rows', problems[0])
+        problems = check.order_problems(page(row("pending", "a change"), row("pending", "z change"),
+                                             row("pending", "m change")))
+        self.assertEqual(len(problems), 1)
+        self.assertIn('move it below the row "a change"', problems[0])
+        # Released rows are placed by release alone, not by their change text.
+        self.assertEqual(check.order_problems(page(row("0.10.0", "z"), row("0.10.0", "a"))), [])
+
     def test_a_disorder_already_on_main_warns_a_pull_request_that_leaves_the_page_alone(self):
         self.repo.commit("feat: a", row=row("pending", "change a"))
         self.repo.tag("1.0.0")
