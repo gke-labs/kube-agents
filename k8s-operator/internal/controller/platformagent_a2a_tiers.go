@@ -21,9 +21,11 @@ import (
 // that check a grant's tier: the capability verifier, the gateway (its mint
 // validates every grant) and the auth callout (a profile entry may name any
 // profile tier). Each reads it with capability.StartTierFile and re-reads it on
-// change. The file can only add profile tiers at one of the two built-in verb
-// sets: the built-in and legacy tiers are compiled in and can't be redefined,
-// and a missing or bad file serves the compiled-in table.
+// change. It's also mounted, the same way, into the credential broker and the
+// dispatcher (#6091), which will key the report credential on a tier's mode
+// rather than its name. The file can only add profile tiers at one of the two
+// built-in verb sets: the built-in and legacy tiers are compiled in and can't
+// be redefined, and a missing or bad file serves the compiled-in table.
 //
 // Who can change it: the ConfigMap is the operator's, rendered only from the
 // Tier resources, and it sits in the install's namespace. Anyone who can edit

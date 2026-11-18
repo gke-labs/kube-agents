@@ -177,6 +177,10 @@ type slackHome struct {
 	// superseded once the count has moved past its own.
 	moves uint64
 	picks map[string]slackHomePickStatus
+	// dialPicks is each member's picked repository per dial row, and
+	// dialStatuses the answer to their last dial tap (slack_home_dial.go).
+	dialPicks    map[string]map[string]string
+	dialStatuses map[string]slackDialStatus
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -232,6 +236,7 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 			board = &lib.Board{Error: err.Error()}
 		}
 		blocks := s.homeBlocks(board, s.waitingOn(member), time.Now())
+		blocks = append(blocks, s.homeDialBlocks(member, board.Dial)...)
 		blocks = append(blocks, s.homeChannelBlocks(member)...)
 		view.Blocks = slack.Blocks{BlockSet: append(blocks, s.homeFeedback()...)}
 	}
@@ -356,11 +361,17 @@ func (s *SlackAdapter) noteViewer(member string) {
 	if s.home.viewers == nil {
 		s.home.viewers = map[string]time.Time{}
 	}
+	// The prune drops dial picks of members it does not count as viewers;
+	// keep this member's, made just before an admitted redraw.
+	picks := s.home.dialPicks[member]
 	s.pruneViewersLocked(time.Now())
 	if _, ok := s.home.viewers[member]; !ok && len(s.home.viewers) >= slackHomeViewersCap {
 		return
 	}
 	s.home.viewers[member] = time.Now()
+	if picks != nil {
+		s.home.dialPicks[member] = picks
+	}
 }
 
 func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
@@ -372,6 +383,16 @@ func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
 	for m, st := range s.home.picks {
 		if now.Sub(st.at) > slackHomeViewerTTL {
 			delete(s.home.picks, m)
+		}
+	}
+	for m, st := range s.home.dialStatuses {
+		if now.Sub(st.at) > slackHomeViewerTTL {
+			delete(s.home.dialStatuses, m)
+		}
+	}
+	for m := range s.home.dialPicks {
+		if _, viewing := s.home.viewers[m]; !viewing {
+			delete(s.home.dialPicks, m)
 		}
 	}
 }

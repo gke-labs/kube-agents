@@ -527,6 +527,12 @@ The tab is drawn when you open it and drawn again, for about ten minutes after t
 
 Only a member on the [allowed users](#allowed-users-1) list sees the dashboard; anyone else who opens the tab sees one line saying the fleet is shown only to the people the install lets ask it. With the list left empty, that is every member of the app's own workspace, checked with `users.info`; if that check fails, the tab is left blank rather than refused. A Slack Connect guest the list names as `T…:U…` sees it too, checked the same way. The app needs the Home tab turned on and the `app_home_opened` event in its manifest ([Slack app setup](/kube-agents/install/slack-app/)). Under the dashboard, the Home channel panel names where alerts and reports post and lets an allowed member pick another channel ([Home channel](#home-channel-1)).
 
+With `KUBEAGENTS_DIAL=on` (off by default), the **Autonomy dial** panel sits above the Home channel panel. It shows what the agent may change on its own: Explain (finds and explains, changes nothing), Propose fixes (opens a pull request, your team merges) or Auto-merge proven fixes (your pipeline merges proven fixes).
+
+Under the level, each kind of fix shows one repository's clean merges toward the auto-merge offer, for example `org/infra · 3 of 5 clean merges · off`, with a picker when the kind has fixes in more than one repository. The state is `off`, `Pending: rules PR #N` while the pull request that turns it on is open, or `auto-merges`. A note under the row says why the last change did nothing, when it did nothing.
+
+A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser on every change, and its one-line answer appears under the panel for the person who pressed.
+
 ### People seen
 
 The gateway keeps a record of the people who write to it, so an install can count them. Each person who writes on Google Chat, Slack or Discord, once the gateway has verified them, has one hashed key and the time of their last turn, within an hour. A person is the identity the gateway attributes the turn to, so a principal map that folds two member IDs into one identity makes them one person. The key is derived for this record alone and matches no other pseudonym the install keeps.

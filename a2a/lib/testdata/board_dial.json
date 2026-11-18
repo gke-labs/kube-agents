@@ -1,0 +1,38 @@
+{
+  "generated_at": "2026-11-16T15:00:00Z",
+  "clusters": [],
+  "cluster_count": 0,
+  "running": [],
+  "prs": [],
+  "dial": {
+    "enabled": true,
+    "level": "propose",
+    "set_by": "U0123",
+    "set_at": 1763300000,
+    "admins": ["U0123"],
+    "kinds": [
+      {
+        "kind": "no-pdb",
+        "title": "Disruption budgets",
+        "environment": "dev",
+        "repos": [
+          {
+            "repo": "org/infra",
+            "repo_key": "github.com/org/infra",
+            "clean": 3,
+            "needed": 5,
+            "days": 1,
+            "days_needed": 2,
+            "ready": false,
+            "state": "pending",
+            "note": "Not changed: a person's deny rule",
+            "pending_pr": {
+              "number": 35,
+              "url": "https://github.com/org/infra/pull/35"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
