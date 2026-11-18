@@ -54,11 +54,11 @@ run "a_budget_renders_litellm_budget_with_its_period" {
     litellm_budget = { usd = 25, period = "7d" }
   }
   assert {
-    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm.budget) == jsonencode({
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm.budget) == jsonencode({
       usd    = 25
       period = "7d"
     })
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -68,8 +68,8 @@ run "the_period_defaults_to_one_day" {
     litellm_budget = { usd = 2.5 }
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm.budget.period == "1d"
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm.budget.period == "1d"
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -79,8 +79,8 @@ run "the_period_defaults_to_one_day" {
 run "unset_renders_no_budget_key" {
   command = apply
   assert {
-    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm), "budget")
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm), "budget")
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -90,8 +90,8 @@ run "zero_renders_no_budget_key_whatever_the_period" {
     litellm_budget = { usd = 0, period = "not-a-duration" }
   }
   assert {
-    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm), "budget")
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm), "budget")
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
