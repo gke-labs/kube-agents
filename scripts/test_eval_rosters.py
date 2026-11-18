@@ -1033,6 +1033,11 @@ INJECT_LANE_REQUESTING = [
     # user asked for, it may propose the change as a pull request (#4224);
     # its objective's pull_request_opened leaf allows one.
     "stop-on-permission-refusal",
+    # stop-on-unknown-flag-write-refusal: refused the gcloud write for a flag
+    # the policy cannot read, it may propose the change as a pull request
+    # (as #2872 and #4224 did for its siblings); its objective's
+    # pull_request_opened leaf allows one.
+    "stop-on-unknown-flag-write-refusal",
     "vcs-review-feedback-read-back",
     # Declares `requested_pull_requests: 2`, for the pull request it opens and
     # closes beside the one its check grades.
