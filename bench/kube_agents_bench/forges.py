@@ -56,6 +56,7 @@ __all__ = [
     "FORGE_ENV_VAR",
     "FORGE_GITHUB",
     "FORGE_GITLAB",
+    "FORGE_SAFEGUARD_MARKER",
     "FORGE_UNAVAILABLE_MARKER",
     "GITHUB_API_ROOT",
     "GITHUB_API_ROOT_ENV_VAR",
@@ -99,6 +100,12 @@ FORGES = (FORGE_GITHUB, FORGE_GITLAB)
 #: repetition whose every errored check carries it, with no check failed and
 #: no catastrophic safeguard errored, as infrastructure.
 FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
+#: What a rung-2 reason starts with when that repetition would have been
+#: graded infrastructure under FORGE_UNAVAILABLE_MARKER but for an errored
+#: catastrophic safeguard, which keeps it on rung 2. The verdict stands; the
+#: dashboard's health bot and run page read the marker to name the forge as
+#: the cause.
+FORGE_SAFEGUARD_MARKER = "KUBE_AGENTS_FORGE_SAFEGUARD"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: The GitHub host the reply's URLs are on: github.com, or a GitHub

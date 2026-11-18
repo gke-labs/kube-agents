@@ -44,6 +44,7 @@ const DefaultAgentProfileQueueTimeoutSeconds = 3600
 const AgentProfileTopicPattern = `^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`
 
 // AgentProfileSpec defines the desired state of AgentProfile.
+// +kubebuilder:validation:XValidation:rule="!has(self.scripts) || self.scripts.all(s, s.timeoutSeconds <= self.lifecycle.activeDeadlineSeconds)",message="each spec.scripts timeoutSeconds must be at most spec.lifecycle.activeDeadlineSeconds"
 // +kubebuilder:validation:XValidation:rule="!has(self.identity) || !has(self.identity.serviceAccountName) || self.identity.serviceAccountName.size() == 0 || !has(self.allowedTiers) || size(self.allowedTiers) <= 1",message="spec.identity.serviceAccountName names one ServiceAccount, so it can serve only one tier: leave it unset (the operator creates one per tier) or allow one tier"
 type AgentProfileSpec struct {
 	// Description is the routing blurb, rendered into the A2A agent card.
@@ -153,6 +154,19 @@ type AgentProfileSpec struct {
 	// +optional
 	Parameters []AgentProfileParameter `json:"parameters,omitempty"`
 
+	// Scripts are the helper scripts this profile may run as a script-run
+	// task (#5622): a built-in schedule's run that execs one of them, with no
+	// model turn. A task names a script, and the dispatcher refuses one this
+	// list doesn't name. The path comes from here, through the operator's
+	// render of the dispatch config, never from the task. Absent means the
+	// profile runs no scripts. Set by an admin or the chart, like the rest
+	// of the spec.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Scripts []AgentProfileScript `json:"scripts,omitempty"`
+
 	// Resources is the pod resource class.
 	// +required
 	Resources AgentProfileResources `json:"resources"`
@@ -168,6 +182,39 @@ type AgentProfileParameter struct {
 	// Required means a submission without it is refused.
 	// +optional
 	Required bool `json:"required,omitempty"`
+}
+
+// AgentProfileScriptRoot is the one directory helper scripts ship in: a
+// fixed path in the worker image, whose layers are root-owned. A profile's
+// script path must lie under it.
+const AgentProfileScriptRoot = "/opt/kube-agents/scripts/"
+
+// AgentProfileScript is one helper script a profile allowlists.
+type AgentProfileScript struct {
+	// Name is how a task names the script: a DNS-1123 label, unique in the
+	// list. It is a subject token on the bus, so it can't hold a dot.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`
+	// +required
+	Name string `json:"name"`
+
+	// Path is the script's absolute path in the worker image, under
+	// /opt/kube-agents/scripts/. Each segment starts with a letter, digit or
+	// underscore and holds only those, dots and hyphens, so there is no ".."
+	// or "." segment, no empty segment, and no shell metacharacter. There is
+	// no args field: a script takes its input from the task's parameters.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`
+	// +required
+	Path string `json:"path"`
+
+	// TimeoutSeconds bounds one run of the script. It may not exceed
+	// spec.lifecycle.activeDeadlineSeconds, which bounds the whole task.
+	// +kubebuilder:validation:Minimum=1
+	// +required
+	TimeoutSeconds int32 `json:"timeoutSeconds"`
 }
 
 // AgentProfilePersona is the persona artifact.

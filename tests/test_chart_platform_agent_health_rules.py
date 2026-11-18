@@ -253,6 +253,11 @@ class HealthRulesRenderTest(unittest.TestCase):
             ("exporter image cleared alone", exporter_cleared, False),
             ("no a2aBus values, as a reused older release's", ["--set", "a2aBus=null"], True),
             ("no a2aBus values, nats image overridden alone", ["--set", "a2aBus=null", *image], False),
+            # The chart renders A2A_NATS_IMAGE from its own pins there too, so
+            # clearing the exporter alone leaves the bus image set and the
+            # operator omits the sidecar.
+            ("no a2aBus values, exporter image cleared alone", ["--set", "a2aBus=null", *exporter_cleared], False),
+            ("no a2aBus values, both overridden", ["--set", "a2aBus=null", *image, *exporter], True),
         ):
             with self.subTest(name):
                 docs = _render(*_ON, *extra)

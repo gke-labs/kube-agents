@@ -34,6 +34,9 @@ Model responses vary from run to run, and a provider 429 can look like a harness
 
 ## Metrics
 
+These metrics are per container and per install. [`capability-usage-attribution.md`](capability-usage-attribution.md)
+designs the split of memory and model tokens by capability.
+
 Each metric has a threshold. The breaking point of a metric is the stress level where it reaches its threshold. The last column says whether the Phase 1 runner records the metric. Phases 2 and 3 add each container's requests and the CPU it used over each window (`cpu_seconds`), the commands the credential proxy ran and their run time, and the proxy load's commands per second and their times (`bench/scale/README.md` lists every metric).
 
 | Metric                                                                                                                                                                                                                                                                        | Source                                                                                                                                                                                                                             | Threshold                                                                                     | Phase 1                                                               |
@@ -171,6 +174,9 @@ Each operation runs against the factors that load it, not against every factor. 
 # Phases
 
 Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2, from 2026-10-26 to 2026-10-27, measured the points the Phase 1 data pointed at. Phase 3, from 2026-10-27 to 2026-10-28, measured the cluster levels again in 30-minute windows.
+
+The phases are one-off runs. [`sized-test-fleet.md`](sized-test-fleet.md) designs the recurring
+form: fixed S, M and L fleets on real nodes, M measured six nights a week and L once.
 
 ## Phase 1: two data points per factor
 

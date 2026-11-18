@@ -180,7 +180,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -3206,6 +3206,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if profile_hook.is_profile_ask(prompt):
+            return AgentResult.errored(
+                f"{profile_hook.PROFILE_DIRECTIVE} ...] needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
         if transport == TRANSPORT_SLACK:
             return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
@@ -3917,6 +3921,11 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
+            # Read first. No other directive may follow it (profile_hook), so
+            # the stop and pushed-report reads below find nothing behind one.
+            target = None if follow_up else profile_hook.parse(prompt)
+            if target is not None:
+                prompt = target.prompt
             stop = None if follow_up else stop_hook.parse(prompt)
             pushed = None if follow_up else pushed_report.parse(prompt)
         except ValueError as exc:
@@ -4241,6 +4250,9 @@ class KubeAgentsHarness(AgentHarness):
                 return "cancelled"
             return "no cancel was published (see the log), so it may still be running"
 
+        # The profile fields go only on a turn addressed to a profile, so every
+        # other turn is built exactly as it was before #5945.
+        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
@@ -4248,6 +4260,7 @@ class KubeAgentsHarness(AgentHarness):
             token=token,
             author=author,
             message_id=message_id,
+            **addressed,
         )
 
         # A stopped ask waits on nothing it filed: the stop is the point. Sent

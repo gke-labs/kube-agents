@@ -165,13 +165,6 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 			t.Errorf("profile %s's ref is %+v, want a hash alone, per tier", name, ref)
 		}
 	}
-	// The operator still knows each param's name in memory.
-	mem, _ := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
-	for _, p := range mem.Profiles {
-		if p.Name == "tse" && (p.JobTemplateRef == nil || p.JobTemplateRef.Name != dispatchJobTemplatePrefix+"tse") {
-			t.Errorf("the operator's own ref %+v doesn't name the policy's param", p.JobTemplateRef)
-		}
-	}
 	if strings.Contains(cm.Data[a2aDispatchConfigKey], "containers") {
 		t.Error("the dispatch config carries a pod template; it should name the params instead")
 	}

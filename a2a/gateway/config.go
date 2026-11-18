@@ -224,6 +224,19 @@ type Config struct {
 	NATSPassword string
 	DiscordToken string
 
+	// BusAuth is how the gateway authenticates to the bus
+	// (A2A_GATEWAY_BUS_AUTH, #5301): BusAuthPassword, the default, as the
+	// static user nats.conf carries (NATSUser, NATSPassword); or
+	// BusAuthToken, with its projected ServiceAccount token (BusTokenFile),
+	// which the auth callout mints from the operator's map entry for the
+	// gateway's ServiceAccount. Both are rendered while the flip is
+	// pending, so rolling back across it is this setting alone.
+	BusAuth string
+
+	// BusTokenFile is the token BusAuthToken presents: lib.EnvBusTokenFile,
+	// or lib.BusTokenPath. Read on every connect and reconnect.
+	BusTokenFile string
+
 	// NATSCAFile is the CA bundle this gateway trusts the bus by
 	// (lib.EnvNATSCAFile), and NATSCAConfigMap the ConfigMap it was mounted
 	// from. The spawner hands both to every session pod: the pod mounts the
@@ -666,7 +679,7 @@ type Config struct {
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// default requests (150m/320Mi, SessionResources) ten concurrent sessions
-	// hold 1.5 CPU / 3.2Gi, which a small dev cluster absorbs without
+	// hold 1.5 CPU / about 3.1Gi, which a small dev cluster absorbs without
 	// preemption. Raising it buys more
 	// concurrent delegations at that per-pod price plus model-quota
 	// contention; lowering it turns busy-hour delegations into refusals
@@ -810,6 +823,14 @@ func (c *Config) Elected() bool { return c.GatewayLease != "" }
 
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
+
+// The values A2A_GATEWAY_BUS_AUTH takes.
+const (
+	BusAuthPassword = "password"
+	BusAuthToken    = "token"
+
+	envGatewayBusAuth = "A2A_GATEWAY_BUS_AUTH"
+)
 
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
@@ -1115,6 +1136,14 @@ func FromEnv() (*Config, error) {
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 
+	switch cfg.BusAuth = envOr(envGatewayBusAuth, BusAuthPassword); cfg.BusAuth {
+	case BusAuthPassword:
+	case BusAuthToken:
+		cfg.BusTokenFile = envOr(lib.EnvBusTokenFile, lib.BusTokenPath)
+	default:
+		return nil, fmt.Errorf("%s=%q: want %q or %q", envGatewayBusAuth, cfg.BusAuth, BusAuthPassword, BusAuthToken)
+	}
+
 	// Salt precedence: the install's provisioned SESSION_KV_SALT is the
 	// salt (the spec's settled answer); the explicit override and the
 	// derived fallback are playground posture, in that order. The trim is
@@ -1126,6 +1155,13 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = []byte(strings.TrimSpace(os.Getenv("SESSION_KV_SALT")))
 	case os.Getenv("A2A_ATTRIBUTION_SALT") != "":
 		cfg.AttributionSalt = []byte(os.Getenv("A2A_ATTRIBUTION_SALT"))
+	case cfg.BusAuth == BusAuthToken:
+		// The derived fallback keys on the bus password, which a gateway
+		// on its token no longer presents and which goes from nats.conf a
+		// release after the flip. Deriving from it here would work until
+		// then and re-key every pseudonym the day it went, silently
+		// unjoining the audit trail; refusing the boot names the gap now.
+		return nil, fmt.Errorf("%s=%s needs SESSION_KV_SALT or A2A_ATTRIBUTION_SALT: the derived fallback keys on NATS_PASSWORD, which token auth retires", envGatewayBusAuth, BusAuthToken)
 	default:
 		// Derived fallback while the install has no provisioned salt Secret.
 		// An empty password would make this a public constant and the

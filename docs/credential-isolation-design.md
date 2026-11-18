@@ -26,7 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key, and, where enabled, the drift detector. Neither calls Google
    on the pod's own identity: both make their Google calls through the
    broker's watcher routes with a token for the `watcher` audience, which is
-   mounted here and in no other container.
+   mounted here and in no other container. And the
+   audit-report store listener on 8700, which renders with the A2A stack on every install.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
@@ -1056,7 +1057,10 @@ host, method and path against the code allowlist in
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
 unchanged under a response cap and a deadline (a route with a projection, the GKE
-cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
+cluster list and get, returns its 2xx body cut down to the fields it names). One read is a
+`POST`, Logging `entries:list`: its JSON body is read under a size cap, held to the
+table's body check (one `projects/<project>`, no other resource), and forwarded as the
+runtime's own serialisation. The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.

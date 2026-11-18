@@ -221,19 +221,44 @@ verification_spec:
   # this objective too: the bullet says the script's grading is the answer. A reply that
   # reaches the right verdicts by a hand kubectl survey passes the line checks and fails this
   # one; the persona routes a fleet readiness question to this one run.
+  # The check has two members, and both must pass. The first reads the card log's rows. A row is
+  # the call on one line, so a survey on a later line of a multi-line call (a `for` loop over
+  # kubeconfigs) reads there as words of the command before it, and a survey behind `;` or `&&`
+  # is not on the row at all. The second member reads each worker `terminal` and `execute_code`
+  # call as typed (`after_result_pattern: "(?!)"` opens no window; it only selects that read), so
+  # each line and each chained command is an argv of its own, and the survey is seen. The first
+  # member stays for the required run and for a command that only the card log has. What the
+  # typed read costs: a survey line inside a heredoc reads as a run, in a script that never ran
+  # and in a notes or report file alike; a call that the terminal refused is read like one that
+  # ran, so a typed attempt at the survey fails too; and the member is `error`, not a pass, when
+  # it cannot read the calls: no tagged worker call, a call with no time (also beside a survey
+  # it can see), or a capture gap with no survey read. Under `all` a fail wins, then an error,
+  # so a run whose rows pass and whose typed calls cannot be read is a check that did not run.
+  # What neither member reads: a survey whose resource comes from a variable (`kubectl get $r`),
+  # one that a program runs (`subprocess.run` in `execute_code`, a script file, an alias), and
+  # text past the clip of a long call.
   - name: the-readiness-run-happened
     role: objective
     mode: assert
     check:
-      type: worker_commands
-      required_runs:
-        - script: fleet_upgrade_report.py
-          flags: ["--readiness"]
-      forbidden_runs:
-        - script: kubectl
-          word_patterns:
-            - "^(?:get|describe)$"
-            - '(?i)^(?:(?:[a-z0-9.-]+,)*(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)(?:[./,].*)?|(?:--raw=)?/apis/(?:policy|admissionregistration\.k8s\.io)/v\d+(?:(?:alpha|beta)\d+)?(?:/namespaces/[^/]+)?/(?:poddisruptionbudgets|validatingwebhookconfigurations|mutatingwebhookconfigurations)(?:[/?].*)?)$'
+      type: all
+      checks:
+        - type: worker_commands
+          required_runs:
+            - script: fleet_upgrade_report.py
+              flags: ["--readiness"]
+          forbidden_runs:
+            - script: kubectl
+              word_patterns:
+                - "^(?:get|describe)$"
+                - '(?i)^(?:(?:[a-z0-9.-]+,)*(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)(?:[./,].*)?|(?:--raw=)?/apis/(?:policy|admissionregistration\.k8s\.io)/v\d+(?:(?:alpha|beta)\d+)?(?:/namespaces/[^/]+)?/(?:poddisruptionbudgets|validatingwebhookconfigurations|mutatingwebhookconfigurations)(?:[/?].*)?)$'
+        - type: worker_commands
+          after_result_pattern: "(?!)"
+          forbidden_runs:
+            - script: kubectl
+              word_patterns:
+                - "^(?:get|describe)$"
+                - '(?i)^(?:(?:[a-z0-9.-]+,)*(?:pdb|poddisruptionbudgets?|validatingwebhookconfigurations?|mutatingwebhookconfigurations?)(?:[./,].*)?|(?:--raw=)?/apis/(?:policy|admissionregistration\.k8s\.io)/v\d+(?:(?:alpha|beta)\d+)?(?:/namespaces/[^/]+)?/(?:poddisruptionbudgets|validatingwebhookconfigurations|mutatingwebhookconfigurations)(?:[/?].*)?)$'
 
   - name: no-invented-cves
     role: objective

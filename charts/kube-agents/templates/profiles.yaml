@@ -1,6 +1,10 @@
 # This template renders the built-in optional `tse` (GKE Support Agent)
 # AgentProfile custom resource when both `.Values.platformAgent.enabled` and
 # `.Values.profiles.tse.enabled` are true.
+# Its persona is agents/tse/persona, published as the persona-tse image. The
+# parameters are the persona's own (agents/tse/persona/persona.yaml), in its
+# order, for the same reason as the cluster profile's below; the gateway routes
+# a task that names a cluster only to a profile that declares all three.
 {{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.tse .Values.profiles.tse.enabled }}
 {{- $tse := .Values.profiles.tse -}}
 {{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}
@@ -34,6 +38,13 @@ spec:
       {{- toYaml . | nindent 6 }}
     {{- end }}
   identity: {}
+  parameters:
+    - name: project
+      required: true
+    - name: cluster
+      required: true
+    - name: location
+      required: true
   lifecycle:
     activeDeadlineSeconds: {{ $tse.lifecycle.activeDeadlineSeconds }}
     ttlSecondsAfterFinished: {{ $tse.lifecycle.ttlSecondsAfterFinished }}
@@ -43,7 +54,7 @@ spec:
 {{- end }}
 {{- /*
 The generic cluster agent (#3658): one AgentProfile for every cluster in scope,
-with the target named per task by the project, location and cluster
+with the target named per task by the project, cluster and location
 parameters. Its persona is agents/cluster/persona, published as the
 persona-cluster image, and its worker pods come from the profile dispatcher,
 so no pod runs it until the dispatcher, the worker and the pool land (#4148,

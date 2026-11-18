@@ -532,6 +532,11 @@ type DispatchProfile struct {
 	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []ProfileParameter `json:"parameters,omitempty"`
+	// Scripts are the helper scripts the profile allowlists
+	// (spec.scripts, #5622). The dispatcher refuses a submission naming a
+	// script not listed here. A script-run task's path comes from here,
+	// never from the task.
+	Scripts []DispatchScript `json:"scripts,omitempty"`
 	// Durables, when listed, are the shared durables the operator created
 	// for it, one per (tier, kind). An operator from #5479 on no longer lists
 	// them: the dispatcher derives them (DerivedDurables). For one release a
@@ -566,6 +571,34 @@ type DispatchProfile struct {
 	// starts at them; a task already held at one runs to its end. Not in
 	// Tiers.
 	DrainingTiers []DrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// ScriptRoot is the one directory helper scripts ship in, in the worker
+// image (#5622), and ScriptPath the shape of a script path under it: each
+// segment starts with a letter, digit or underscore and holds only those,
+// dots and hyphens, so there is no "." or ".." segment, no empty one, and no
+// shell metacharacter. Both are the AgentProfile CRD's (spec.scripts[].path),
+// which TestScriptPathIsTheCRDs holds them to.
+const ScriptRoot = "/opt/kube-agents/scripts/"
+
+var ScriptPath = regexp.MustCompile(`^/opt/kube-agents/scripts/[A-Za-z0-9_][-A-Za-z0-9_.]*(/[A-Za-z0-9_][-A-Za-z0-9_.]*)*$`)
+
+// Script is the profile's allowlisted script named name, if it lists one.
+func (p DispatchProfile) Script(name string) (DispatchScript, bool) {
+	for _, sc := range p.Scripts {
+		if sc.Name == name {
+			return sc, true
+		}
+	}
+	return DispatchScript{}, false
+}
+
+// DispatchScript is one helper script a profile allowlists: its name, its
+// path in the worker image, and the bound on one run.
+type DispatchScript struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
 }
 
 // DrainingTier is one tier a live profile drains, until Until.
@@ -671,6 +704,15 @@ func (c DispatchConfig) Validate() error {
 				return fmt.Errorf("dispatch config: profile %s drains tier %q, which is not a subject token, is listed twice or live, or has no end", p.Name, d.Tier)
 			}
 			drains[d.Tier] = true
+		}
+		scripts := map[string]bool{}
+		for _, sc := range p.Scripts {
+			if !ValidSubjectToken(sc.Name) || scripts[sc.Name] || !ScriptPath.MatchString(sc.Path) ||
+				sc.TimeoutSeconds < 1 || sc.TimeoutSeconds > p.ActiveDeadlineSeconds {
+				return fmt.Errorf("dispatch config: profile %s script %q is not a subject token, is listed twice, has a path outside %s, or a timeout outside 1 to %ds",
+					p.Name, sc.Name, ScriptRoot, p.ActiveDeadlineSeconds)
+			}
+			scripts[sc.Name] = true
 		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {

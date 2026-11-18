@@ -59,6 +59,7 @@ import contextvars
 import copy
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -252,6 +253,7 @@ AUDITS: dict[str, AuditSpec] = {
             "hpa-floors-at-one",
             "pdb-overlapping",
             "untargeted-compute-class-workload",
+            "hpa-aggressive-scaledown",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -564,7 +566,23 @@ FINISH_USAGE_HINT = (
 )
 DRAFT_USAGE_HINT = (
     "`draft` takes --audit and --manifest-file <the manifest the SOP's collector command "
-    "wrote>, and writes the findings document for `finish` to --out <findings file>."
+    "wrote>, and writes the findings document for `finish` to --out <findings file> "
+    "(the run's findings path when --out is left out)."
+)
+# `--out -` prints the document instead of writing it: for a person or a test, never for a run.
+DRAFT_STDOUT = "-"
+# What one tool call may carry while the worker fills the drafted file. A tool call's arguments do
+# not stream, so the runtime sees silence while they are written and drops the call past its stale
+# bound (agents/platform/config.yaml: 120 s, raised to 300 s for the large prompt an audit has by
+# this step). A slow writer, 25 tokens a second, writes this much in under half of that bound.
+DRAFT_FILL_CALL_CHARS = 12000
+DRAFT_FILL_HINT = (
+    "Fill each finding's `recommendation` and `remediation` in that file, in place: a short "
+    "script that loads the file, sets the fields and writes it back, or one `patch` for one "
+    f"finding's fields. Keep every tool call under about {DRAFT_FILL_CALL_CHARS} characters. "
+    "Never send the document, or a block of its findings, through a tool call (write_file, "
+    "patch, a heredoc, execute_code): a call that large is dropped before it completes and "
+    "the audit files nothing."
 )
 SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
@@ -578,6 +596,21 @@ MANUAL_REMEDIATION_KIND = "manual"
 # Remediation block never come from different runs.
 CARRIED_FINDING_FIELDS = ("title", "impact")
 CARRIED_REMEDIATION_FIELDS = ("recommendation", "remediation")
+# The checks whose remediation gives a flag a value that only the cluster's
+# owner can supply, and those flags. The drift SOP forbids a copied range for
+# authorized networks, so a literal one in a carried command is one a run
+# copied. The compliance SOP also leaves `public-control-plane`'s list to a
+# human; that check has no row, so its carried range is not judged.
+OWNER_SUPPLIED_FLAGS: dict[str, tuple[str, ...]] = {
+    "authorized-networks": ("--master-authorized-networks",),
+}
+# What marks a command argument that is not one part of a cluster target: a
+# placeholder or a shell variable that the reader fills in, or a resource path
+# (`projects/p/locations/l/clusters/c`), which holds all three parts.
+COMMAND_UNCOMPARED_MARKS = ("<", "$", "{", "…", "/")
+# The names of the carry rules, as the run log prints them.
+CARRY_RULE_OTHER_CLUSTER = "a command for another cluster"
+CARRY_RULE_OWNER_VALUE = "a literal value where the SOP leaves the value to the owner"
 
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
@@ -1228,6 +1261,7 @@ CHECK_PHRASES = {
     "hpa-floors-at-one": "{object} can scale down to one replica",
     "pdb-overlapping": "{object} has overlapping disruption budgets",
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
+    "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -3950,14 +3984,14 @@ def next_steps(audit_id: str, findings_path: str) -> list[str]:
     return [
         f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
         "the way it says, recording each check and its command in checks_run as it completes.",
-        f"Write the findings document at {findings_path}"
-        + (
-            f", starting it with {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
-            f"--manifest-file {manifest_path_for(audit_id)}"
+        (
+            f"Run {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
+            f"--manifest-file {manifest_path_for(audit_id)}: it writes the findings document to "
+            f"{findings_path}. {DRAFT_FILL_HINT}"
             if audit_id in COLLECTOR_AUDITS
-            else ""
+            else f"Write the findings document at {findings_path}."
         )
-        + f". Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
+        + f" Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
         f"Run {finish}. Its output and exit codes are in "
         f"{skill_path(REFERENCES_DIR_NAME, FINISH_REFERENCE)}.",
     ]
@@ -8139,6 +8173,9 @@ def _remediation_may_carry(before: object, now: object) -> bool:
     that wrote the other parts runs again after the carry, so a copied note
     gets the text two times, or keeps a statement that is not true for this
     run.
+
+    Not when the previous remediation does not pass the rules that
+    `validate_findings` has for a new one: a known `kind`, a string `note`.
     """
     if not isinstance(before, dict) or not isinstance(now, dict):
         return False
@@ -8146,7 +8183,105 @@ def _remediation_may_carry(before: object, now: object) -> bool:
         return False
     if before.get("kind") == MANUAL_REMEDIATION_KIND and now.get("kind") != MANUAL_REMEDIATION_KIND:
         return False
+    if before.get("kind") not in REMEDIATION_KINDS or not isinstance(before.get("note", ""), str):
+        return False
     return not (_harness_wrote_note(before) or _harness_wrote_note(now))
+
+
+def _command_names_another_cluster(finding: dict, command: str) -> bool:
+    """Whether a `clusters update` `command` is for a cluster other than `finding`'s.
+
+    The finding's `cluster` is `project/location/name`. Each part the command
+    gives as a literal must agree. False where there is nothing to compare: a
+    `cluster` of another shape (`project/<id>`), a command `_parse_update_target`
+    cannot read, a placeholder, a shell variable or a resource path
+    (`COMMAND_UNCOMPARED_MARKS`), a project given by number.
+    """
+    parts = str(finding.get("cluster") or "").split("/")
+    if len(parts) != CLUSTER_TARGET_SEGMENTS or not command.startswith(CLUSTERS_UPDATE_PREFIX):
+        return False
+    target = _parse_update_target(command)
+    if target is None:
+        return False
+    name, location, project = target
+    if project.isdigit():
+        project = ""
+    project_id, cluster_location, cluster_name = parts
+    return any(
+        given
+        and not any(mark in given for mark in COMMAND_UNCOMPARED_MARKS)
+        and given.lower() != want.lower()
+        for given, want in (
+            (name, cluster_name),
+            (location, cluster_location),
+            (project, project_id),
+        )
+    )
+
+
+def _is_literal_network(value: str) -> bool:
+    try:
+        ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def _command_gives_owner_value(finding: dict, command: str) -> bool:
+    """Whether `command` gives a literal range to a flag in `OWNER_SUPPLIED_FLAGS`
+    for `finding`'s check. False for a command `shlex` cannot read."""
+    flags = OWNER_SUPPLIED_FLAGS.get(str(finding.get("check") or ""), ())
+    if not flags:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    for index, token in enumerate(argv):
+        key, sep, value = token.partition("=")
+        if key not in flags:
+            continue
+        if not sep and index + 1 < len(argv):
+            value = argv[index + 1]
+        if any(_is_literal_network(item) for item in value.split(",")):
+            return True
+    return False
+
+
+# One row per rule on a carried remediation: its name in the run log, and
+# whether one gcloud command fails it for a finding. A rule answers False
+# where it cannot tell, so a command it cannot read is never refused.
+CARRY_RULES: tuple[tuple[str, Callable[[dict, str], bool]], ...] = (
+    (CARRY_RULE_OTHER_CLUSTER, _command_names_another_cluster),
+    (CARRY_RULE_OWNER_VALUE, _command_gives_owner_value),
+)
+
+
+def _carry_rule_failed(finding: dict, source: dict) -> str:
+    """The first `CARRY_RULES` rule that `source`'s `recommendation` and
+    `remediation` fail for `finding`, or `""`.
+
+    Every field that publishes a command is read: the note, the note before
+    the route-note cut, which the carry puts back, and the Recommendation and
+    confirm lines.
+    """
+    remediation = source.get("remediation")
+    recommendation = source.get("recommendation")
+    texts: list[object] = []
+    if isinstance(remediation, dict):
+        texts += [remediation.get(field) for field in ("note", ROUTE_UNCUT_NOTE_FIELD)]
+    if isinstance(recommendation, dict):
+        texts += [recommendation.get(field) for field in COMMAND_BEARING_RECOMMENDATION_FIELDS]
+    commands = [
+        command
+        for text in texts
+        if isinstance(text, str)
+        for command, _line in _gcloud_commands(text)
+    ]
+    for name, fails in CARRY_RULES:
+        if any(fails(finding, command) for command in commands):
+            return name
+    return ""
 
 
 def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> list[str]:
@@ -8170,6 +8305,12 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
     same way before the comparison. A change in severity stops the carry: the
     collector calculates severity, so a new severity is a new observation,
     and the old impact can give the old reason.
+
+    Evidence says nothing about the remediation, so a wrong one would stay
+    for as long as the evidence does. The previous `recommendation` and
+    `remediation` are not kept when they fail a `CARRY_RULES` rule and this
+    run's pass it. When this run's fail too, the previous ones stay: new words
+    that are also wrong are no reason to change the text.
 
     The copied text did not go through `validate_findings` in this run, so
     `normalise_finding_commands` runs on it again.
@@ -8195,7 +8336,11 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
             continue
         fields = list(CARRIED_FINDING_FIELDS)
         if _remediation_may_carry(before.get("remediation"), finding.get("remediation")):
-            fields.extend(CARRIED_REMEDIATION_FIELDS)
+            failed = _carry_rule_failed(finding, before)
+            if failed and not _carry_rule_failed(finding, finding):
+                log(f"{fid}: the previous run's remediation is not carried forward ({failed}).")
+            else:
+                fields.extend(CARRIED_REMEDIATION_FIELDS)
         changed = False
         for field in fields:
             if field in before and before[field] != finding.get(field):
@@ -22563,12 +22708,36 @@ def handle_draft(args: argparse.Namespace) -> None:
     """Write the findings document `draft_findings` builds from a manifest."""
     validate_audit_id(args.audit)
     manifest = load_manifest(args.manifest_file, args.audit, command="draft")
-    text = json.dumps(draft_findings(manifest, args.audit), indent=2) + "\n"
-    if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
-        log(f"draft: wrote {args.out}; fill each finding's recommendation and remediation")
-    else:
+    document = draft_findings(manifest, args.audit)
+    text = json.dumps(document, indent=2) + "\n"
+    if args.out == DRAFT_STDOUT:
         sys.stdout.write(text)
+        return
+    out = Path(args.out or findings_path_for(args.audit))
+    if not args.overwrite and _draft_would_erase(out, text):
+        raise SystemExit(
+            f"draft: {out} holds content a second draft would erase: fields you filled, or the draft of "
+            "another manifest. Go on to `finish`, or pass --overwrite to start the document again."
+        )
+    out.write_text(text, encoding="utf-8")
+    log(f"draft: wrote {out}: {len(document['findings'])} findings, each with an empty recommendation. {DRAFT_FILL_HINT}")
+
+
+def _draft_would_erase(path: Path, fresh: str) -> bool:
+    """Whether `path` holds anything other than the document `fresh`, the text this draft would write.
+
+    The worker fills the drafted file in place, in any field: a recommendation, a remediation,
+    `declared`, `resolved_because`, a scope note. So any difference is content a second draft
+    would erase. `start` removes the stream's findings file, so what is there is this run's work.
+    """
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        return json.loads(existing) != json.loads(fresh)
+    except ValueError:
+        return bool(existing.strip())
 
 
 def handle_grep(args: argparse.Namespace) -> None:
@@ -27551,15 +27720,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     draft_parser = subparsers.add_parser(
         "draft",
-        help="Write a findings document from the collector manifest: scope, "
-        "checks_run, and one finding per candidate with its evidence. The "
-        "recommendation fields are left empty and each remediation `manual`, "
-        "for you to fill before `finish`.",
+        help="Write the findings document from the collector manifest to the run's "
+        "findings path: scope, checks_run, and one finding per candidate with its "
+        "evidence. The recommendation fields are left empty and each remediation "
+        "`manual`, for you to fill in that file before `finish`.",
     )
     draft_parser.usage_hint = DRAFT_USAGE_HINT
     draft_parser.add_argument("--audit", required=True, help="Audit id.")
     draft_parser.add_argument("--manifest-file", required=True, help="The manifest the collector wrote.")
-    draft_parser.add_argument("--out", default=None, help="Write the document here rather than to stdout.")
+    draft_parser.add_argument(
+        "--out",
+        default=None,
+        help="Write the document here rather than to the run's findings path; `-` prints it instead.",
+    )
+    draft_parser.add_argument(
+        "--overwrite", action="store_true", help="Replace a findings document that differs from a fresh draft."
+    )
 
     list_parser = subparsers.add_parser(
         "list",
