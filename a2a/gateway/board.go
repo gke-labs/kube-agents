@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -97,12 +98,35 @@ func requestBoard(ctx context.Context, nc *nats.Conn) (*lib.Board, error) {
 	if err != nil {
 		return nil, err
 	}
-	var b lib.Board
-	if err := json.Unmarshal(data, &b); err != nil {
-		return nil, fmt.Errorf("board: unreadable answer: %w", err)
+	b, err := decodeBoard(data)
+	if err != nil {
+		return nil, err
 	}
 	if b.Error != "" {
 		return nil, fmt.Errorf("board: the bridge could not read it: %s", b.Error)
+	}
+	return b, nil
+}
+
+// decodeBoard reads a board answer. The dial section is decoded on its own,
+// so one this gateway cannot read leaves the rest of the board drawn, with no
+// dial panel, rather than taking the whole dashboard with it.
+func decodeBoard(data []byte) (*lib.Board, error) {
+	var wire struct {
+		lib.Board
+		Dial json.RawMessage `json:"dial"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, fmt.Errorf("board: unreadable answer: %w", err)
+	}
+	b := wire.Board
+	if len(wire.Dial) > 0 && string(wire.Dial) != "null" {
+		var d lib.BoardDial
+		if err := json.Unmarshal(wire.Dial, &d); err != nil {
+			slog.Warn("board: the dial section is unreadable; drawing the board without it", "err", err)
+		} else {
+			b.Dial = &d
+		}
 	}
 	return &b, nil
 }
