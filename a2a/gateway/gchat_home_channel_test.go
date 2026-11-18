@@ -510,3 +510,29 @@ func TestGchatHomeNoLearnStartsAfterShutdown(t *testing.T) {
 		t.Errorf("after shutdown: patches %d, checks %d; want none", homePatches(cs), len(relayCalls(f, gchatSpacesGet)))
 	}
 }
+
+// TestFromEnvGchatHomeLearn: the operator's env for a Chat-only gateway arms
+// Chat's learn and not Slack's; its policy env disarms it.
+func TestFromEnvGchatHomeLearn(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_GCHAT_RELAY_URL", "http://relay.ns.svc:8081")
+	t.Setenv("A2A_HOME_CHANNEL_RECORD", homeTestRecord)
+	t.Setenv("A2A_HOME_CHANNEL_LEARN", "true")
+	t.Setenv("A2A_GCHAT_HOME_POLICY", "auto")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GchatHomeLearnArmed() || cfg.HomeLearnArmed() {
+		t.Fatalf("GchatHomeLearnArmed = %v, HomeLearnArmed = %v; want Chat's alone", cfg.GchatHomeLearnArmed(), cfg.HomeLearnArmed())
+	}
+	t.Setenv("A2A_GCHAT_HOME_POLICY", "manual")
+	if cfg, err = FromEnv(); err != nil || cfg.GchatHomeLearnArmed() {
+		t.Fatalf("policy manual: armed = %v, err = %v", cfg != nil && cfg.GchatHomeLearnArmed(), err)
+	}
+	t.Setenv("A2A_GCHAT_HOME_POLICY", "")
+	t.Setenv("A2A_GCHAT_HOME_CHANNEL", "spaces/CR")
+	if cfg, err = FromEnv(); err != nil || cfg.GchatHomeLearnArmed() {
+		t.Fatalf("a CR home channel: armed = %v, err = %v", cfg != nil && cfg.GchatHomeLearnArmed(), err)
+	}
+}
