@@ -532,6 +532,12 @@ SERVICEENTRY_KIND = "serviceentries.networking.istio.io"
 # entry's managedFields, annotations and status, which is most of its bytes and
 # what pushes a large mesh's reply past the credential proxy's output cap.
 # kubectl's jsonpath prints a map as JSON, so the spec field parses as JSON.
+# Measured on one cluster with the shell sandbox's default 2 GiB: correct to
+# 50,000 entries, but kubectl decodes every full object before projecting, so it
+# peaked at 917 MiB there (sandbox 1,160 MiB, against 239 MiB with no mesh). The
+# sandbox's memory guard kills the largest process near 1.75 GiB, so one mesh of
+# roughly 85-90k entries, or two large meshes read in the same sweep wave, ends
+# the read and leaves the check Undetermined. The SOP's §2.19 states the same.
 SERVICEENTRY_PROJECTION = 'jsonpath={range .items[*]}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\t"}{.spec}{"\\n"}{end}'
 SERVICEENTRY_PROJECTION_FIELDS = 3
 # Istio's `exportTo` values (`pkg/config/visibility`): namespace-local, every
@@ -550,6 +556,9 @@ SERVICEENTRY_SEVERITY_IDENTICAL = "minor"
 # it counts the rest, so a host declared in hundreds of namespaces stays one
 # readable line.
 MAX_SERVICEENTRY_NAMED = 5
+# The longest one field's value may run in an excerpt before it is cut with an
+# ellipsis: an entry with dozens of endpoints would otherwise fill the excerpt.
+MAX_SERVICEENTRY_VALUE_CHARS = 120
 # Two declarers, or two of them seen from one namespace, are a collision.
 SERVICEENTRY_COLLISION_MINIMUM = 2
 
@@ -7902,40 +7911,64 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def _serviceentry_shape(spec: dict) -> tuple:
-    """What a sidecar would route by, in a form two declarations compare equal on
-    when they would route the same: every spec field but `hosts` and `exportTo`,
-    which are what make two entries collide rather than how each routes. Lists
-    whose order carries no meaning are sorted."""
-    ports = sorted(_canonical(p) for p in spec.get("ports") or [])
-    endpoints = sorted(_canonical(e) for e in spec.get("endpoints") or [])
-    rest = {
-        k: v for k, v in spec.items()
-        if k not in ("hosts", "exportTo", "ports", "endpoints", "addresses", "subjectAltNames")
+def _serviceentry_port_text(port: dict) -> str:
+    """A port as a person reads it: `443/TLS https`, `443/TLS https->8443` with a
+    target port. The name stays even with a protocol set: an endpoint's `ports`
+    map is keyed by the service port's name, so a renamed port routes elsewhere."""
+    text = f"{port.get('number', '?')}/{port.get('protocol') or 'unset'}"
+    if port.get("name"):
+        text += f" {port['name']}"
+    if port.get("targetPort"):
+        text += f"->{port['targetPort']}"
+    return text
+
+
+def _serviceentry_endpoint_text(endpoint: dict) -> str:
+    """An endpoint as its address, then any other field as `key=value`."""
+    extras = [f"{k}={_canonical(v)}" for k, v in sorted(endpoint.items()) if k != "address"]
+    return str(endpoint.get("address") or "?") + (f" ({', '.join(extras)})" if extras else "")
+
+
+def _serviceentry_fields(spec: dict) -> dict[str, str]:
+    """What a sidecar routes by, one readable string per field, in a fixed order:
+    every spec field but `hosts` and `exportTo`, which are what make two entries
+    collide rather than how each routes. Two entries route the same when these
+    are equal, and the excerpt names the fields where they are not. Lists whose
+    order carries no meaning are sorted."""
+    fields = {
+        "location": str(spec.get("location") or "unset"),
+        "resolution": str(spec.get("resolution") or "unset"),
+        "ports": ", ".join(sorted(_serviceentry_port_text(p) for p in spec.get("ports") or [] if isinstance(p, dict))) or "none",
+        "addresses": ", ".join(sorted(str(a) for a in spec.get("addresses") or [])) or "none",
+        "endpoints": ", ".join(sorted(_serviceentry_endpoint_text(e) for e in spec.get("endpoints") or [] if isinstance(e, dict))) or "none",
+        "subjectAltNames": ", ".join(sorted(str(n) for n in spec.get("subjectAltNames") or [])) or "none",
     }
-    return (
-        str(spec.get("resolution") or ""),
-        tuple(ports),
-        tuple(sorted(str(a) for a in spec.get("addresses") or [])),
-        tuple(endpoints),
-        tuple(sorted(str(n) for n in spec.get("subjectAltNames") or [])),
-        _canonical(rest),
-    )
+    for key in sorted(k for k in spec if k not in fields and k not in ("hosts", "exportTo")):
+        fields[key] = _canonical(spec[key])
+    return fields
 
 
-def _serviceentry_shape_text(shape: tuple) -> str:
-    resolution, ports, addresses, endpoints, sans, rest = shape
-    parts = [f"resolution {resolution or 'unset'}", "ports " + (",".join(ports) or "none")]
-    if addresses:
-        parts.append("addresses " + ",".join(addresses))
-    if endpoints:
-        parts.append("endpoints " + ",".join(endpoints))
-    if sans:
-        parts.append("subjectAltNames " + ",".join(sans))
-    others = {k: v for k, v in json.loads(rest).items() if k != "resolution"}
-    if others:
-        parts.append(_canonical(others))
-    return "; ".join(parts)
+def _clipped(text: str) -> str:
+    return text if len(text) <= MAX_SERVICEENTRY_VALUE_CHARS else text[: MAX_SERVICEENTRY_VALUE_CHARS - 1] + "…"
+
+
+def _serviceentry_difference(seen: list[tuple[str, dict[str, str]]]) -> str:
+    """The fields the seen entries disagree on, each value with the entries that
+    carry it: `addresses 192.0.2.10 in team-a/x, 192.0.2.20 in team-b/y`. The
+    number of fields, of values per field and of entries per value are capped,
+    and each value is cut at MAX_SERVICEENTRY_VALUE_CHARS, so the sentence stays
+    bounded."""
+    keys = list(dict.fromkeys(k for _, fields in seen for k in fields))
+    differing = [k for k in keys if len({fields.get(k, "unset") for _, fields in seen}) > 1]
+    parts = []
+    for key in differing[:MAX_SERVICEENTRY_NAMED]:
+        by_value: dict[str, list[str]] = {}
+        for ref, fields in seen:
+            by_value.setdefault(fields.get(key, "unset"), []).append(ref)
+        values = [f"{_clipped(value)} in {_named(sorted(refs))}" for value, refs in sorted(by_value.items())]
+        parts.append(f"{key} {_named(values)}")
+    more = len(differing) - len(parts)
+    return "; ".join(parts) + (f"; and {more} more field(s)" if more > 0 else "")
 
 
 def _named(values: list[str]) -> str:
@@ -7976,14 +8009,14 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
         if not namespace or not name:
             continue
         public, names = _serviceentry_visibility(spec.get("exportTo"), namespace)
-        shape = _serviceentry_shape(spec)
+        fields = _serviceentry_fields(spec)
         for host in {str(h).strip().lower() for h in spec.get("hosts") or [] if str(h).strip()}:
             declarer = by_host.setdefault(host, {}).setdefault(
                 namespace, {"public": False, "names": set(), "items": []}
             )
             declarer["public"] = declarer["public"] or public
             declarer["names"] |= names
-            declarer["items"].append((f"{namespace}/{name}", public, names, shape))
+            declarer["items"].append((f"{namespace}/{name}", public, names, fields))
 
     hits = []
     for host, declarers in by_host.items():
@@ -8011,35 +8044,37 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
         # entry for the host, exported to `.` or to no affected namespace, is
         # not part of the collision and must not name it or move its severity.
         viewers = set(affected)
-        seen = [
-            (ref, shape)
+        seen = sorted(
+            (ref, fields)
             for ns in involved
-            for ref, entry_public, entry_names, shape in declarers[ns]["items"]
+            for ref, entry_public, entry_names, fields in declarers[ns]["items"]
             if entry_public or entry_names & viewers
-        ]
-        entries = sorted(ref for ref, _ in seen)
-        shapes = {shape for _, shape in seen}
+        )
+        entries = [ref for ref, _ in seen]
+        difference = _serviceentry_difference(seen)
         where = (
             "every namespace that declares none of them"
             if len(public) >= SERVICEENTRY_COLLISION_MINIMUM
             else f"namespace {_named(affected)}"
         )
-        if len(shapes) > 1:
+        if difference:
             severity = SERVICEENTRY_SEVERITY_CONFLICTING
-            described = sorted({f"{ref.split('/', 1)[0]}: {_serviceentry_shape_text(shape)}" for ref, shape in seen})
-            shown = described[:MAX_SERVICEENTRY_NAMED]
-            more = len(described) - len(shown)
-            detail = "and they disagree: " + " | ".join(shown) + (f" | and {more} more" if more > 0 else "")
+            detail = f"They differ in {difference}."
         else:
             severity = SERVICEENTRY_SEVERITY_IDENTICAL
-            detail = "and they are identical today, so routing does not change until one is edited"
+            detail = "They are identical today, so routing does not change until one is edited."
         hits.append(
             {
                 "namespace": "",
                 "object": f"ServiceEntry host {host}",
                 "severity": severity,
+                # The fix comes before the difference: publication trims a long
+                # excerpt from the end, and the SOP has the agent start from it.
                 "excerpt": f"host {host} is declared by ServiceEntries in {len(involved)} namespaces "
-                f"({_named(entries)}); {where} sees more than one of them, {detail}",
+                f"({_named(entries)}), and {where} sees more than one of them. "
+                f"First fix to consider, if no namespace that declares none of them needs the host: set "
+                f"exportTo: [\".\"] on {_named(entries)}, so each team keeps its own entry and no other "
+                f"namespace sees two. {detail}",
             }
         )
     return sorted(hits, key=lambda h: h["object"])
