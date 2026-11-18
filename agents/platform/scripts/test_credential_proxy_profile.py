@@ -1698,12 +1698,19 @@ class ProfileVcsRouteTest(unittest.TestCase):
         before_read = source.split("payload = self._read_json_body", 1)[0]
         answers = before_read.count("self._json(")
         self.assertEqual(5, answers, "an answer was added or removed ahead of the body read; drain it")
-        self.assertEqual(answers, before_read.count("drain_request_body(self, body_limit)"))
+        self.assertEqual(answers, before_read.count("self._drain_vcs_body(body_limit)"))
 
     # -- the issue-list query (#6247) ----------------------------------------
 
     def test_an_issue_list_query_with_a_qualifier_is_refused(self):
-        fields = [{"query": q} for q in ("repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x")]
+        fields = [
+            {"query": q}
+            for q in (
+                "repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x",
+                # No colon, yet each would change what GitHub reads after it.
+                '"crash', "crash (", "crash\\", "crash OR", "NOT crash", "a AND b",
+            )
+        ]
         fields += [
             {"labels": ['bug" repo:other/secret "']},
             {"excludeLabels": ["ok", 'x" org:acme "']},
@@ -1724,7 +1731,7 @@ class ProfileVcsRouteTest(unittest.TestCase):
 
     def test_an_issue_list_query_of_plain_words_runs(self):
         for extra in (
-            {"query": "node pressure"}, {}, {"query": ""},
+            {"query": "node pressure"}, {}, {"query": ""}, {"query": "or and not ORbit it's #42 a-b/c"},
             {"labels": ["area: networking", "good first issue"], "excludeLabels": ["platform-agent/claimed"]},
         ):
             with self.subTest(extra=extra):

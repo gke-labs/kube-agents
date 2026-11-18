@@ -2469,8 +2469,8 @@ def executable_refusal_message(role: str, executable: str) -> str:
 #     proposal-view, proposal-list, proposal-commits, branch-view, identity
 #     (the forge login a submission checks it is not proposing as), issue-list
 #     and issue-view. Each is held to the managed list like every other verb,
-#     and an issue-list's search fields may start no qualifier of their own: no
-#     ':' in `query`, no quote or backslash in a label name
+#     and an issue-list's search fields may start no qualifier of their own:
+#     plain words in `query`, no quote or backslash in a label name
 #     (profile_issue_query_refusal, rule caller.vcs-query).
 #   * publish, proposal-create and proposal-update, the writes that put a
 #     change up for review, each further gated in `_dispatch_vcs_post` on the
@@ -2557,6 +2557,16 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
     return None
 
 
+# What a profile caller's issue-list `query` may not hold, because each can
+# change what a forge's search grammar reads after it (#6247): a colon starts a
+# qualifier; a quote, a backslash or a parenthesis can open a phrase or a group
+# that swallows the `repo:` qualifier GitHub appends; and OR, AND and NOT,
+# GitHub's boolean operators, can join the caller's words to that qualifier as
+# an alternative rather than a narrowing.
+PROFILE_QUERY_REFUSED_CHARACTERS = frozenset(':"\\()')
+PROFILE_QUERY_REFUSED_WORDS = frozenset({"OR", "AND", "NOT"})
+
+
 def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
     """Why a profile caller's ``issue-list`` search fields are refused, or None.
 
@@ -2565,7 +2575,11 @@ def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
     the ``repo:<managed repository>`` qualifier it adds, so a ``repo:``,
     ``org:`` or ``user:`` in it widens the search to whatever the forge
     credential can read; every qualifier needs a colon, so a ``query`` holding
-    one is refused, as ``LOGIN_RE`` refuses one in ``author``. It quotes each
+    one is refused, as ``LOGIN_RE`` refuses one in ``author``. Nor may ``query``
+    reach that qualifier without one: an unclosed quote or parenthesis would
+    swallow it, and ``OR`` would make it one alternative of two. So ``query`` is
+    held to plain words, with none of PROFILE_QUERY_REFUSED_CHARACTERS and none
+    of PROFILE_QUERY_REFUSED_WORDS as a word of its own. It quotes each
     ``labels`` and ``excludeLabels`` entry as ``label:"<name>"``, so a ``"``
     in a name closes the quote and what follows is a qualifier; a name holding
     ``"`` or ``\\`` is refused. A colon inside a label name stays, since the
@@ -2573,10 +2587,14 @@ def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
     refuses them.
     """
     query = payload.get("query")
-    if isinstance(query, str) and ":" in query:
+    if isinstance(query, str) and (
+        PROFILE_QUERY_REFUSED_CHARACTERS.intersection(query)
+        or PROFILE_QUERY_REFUSED_WORDS.intersection(query.split())
+    ):
         return (
-            "a profile caller's issue-list query may not contain ':', which starts a search "
-            "qualifier; search the managed repository with plain words"
+            "a profile caller's issue-list query may hold plain words only: no ':', quote, "
+            "backslash or parenthesis, and no OR, AND or NOT, any of which can change what a "
+            "forge's search reads after it"
         )
     for field in ("labels", "excludeLabels"):
         names = payload.get(field)
@@ -16193,7 +16211,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(verb),
                 RULE_CALLER_VCS_VERB,
             )
-            drain_request_body(self, body_limit)
+            self._drain_vcs_body(body_limit)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -16228,7 +16246,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 }
                 if detail := vcs_broker.write_mode_detail(raw):
                     refusal["detail"] = detail
-                drain_request_body(self, body_limit)
+                self._drain_vcs_body(body_limit)
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return TOOL_STATUS_BLOCKED
         if role == CALLER_ROLE_PROFILE:
@@ -16241,7 +16259,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     RULE_CALLER_VCS_PERMIT,
                     refusal,
                 )
-                drain_request_body(self, body_limit)
+                self._drain_vcs_body(body_limit)
                 self._json(
                     HTTPStatus.FORBIDDEN,
                     {
@@ -16253,7 +16271,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return TOOL_STATUS_BLOCKED
         if self.vcs is None:
-            drain_request_body(self, body_limit)
+            self._drain_vcs_body(body_limit)
             self._json(
                 HTTPStatus.NOT_FOUND,
                 {
@@ -16264,7 +16282,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return TOOL_STATUS_ERROR
         route = vcs_broker.route_table(self.vcs).get(verb)
         if route is None:
-            drain_request_body(self, body_limit)
+            self._drain_vcs_body(body_limit)
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return TOOL_STATUS_BLOCKED
         try:
@@ -16473,6 +16491,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
             return TOOL_STATUS_ERROR
+
+    def _drain_vcs_body(self, body_limit: int) -> None:
+        """Drain a vcs request's unread body ahead of an answer (`drain_request_body`).
+
+        A handler the route tests build by hand has no connection and nothing
+        to drain, as the body read in `_dispatch_vcs_post` allows for.
+        """
+        if getattr(self, "connection", None) is not None:
+            drain_request_body(self, body_limit)
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
