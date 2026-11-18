@@ -361,6 +361,12 @@ def release_cell_problems() -> list[str]:
             # skip every check, so it is reported rather than passed.
             found.append(f"{UPGRADE_PAGE}:{number + 1}: the row is not written as \"| <release> | <change> | ... |\" "
                          f"with one space after each \"|\", so the check cannot read it")
+    # The table ends at the first line that doesn't start with "|" (table_lines). A row indented before its
+    # "|" ends it there, and it and every row below it would skip every check, the relabel included (#6429).
+    after = table[-1] + 1
+    if after < len(lines) and lines[after][:1].isspace() and lines[after].lstrip().startswith(TABLE_CELL_SEPARATOR):
+        found.append(f"{UPGRADE_PAGE}:{after + 1}: the row starts with a space before its \"|\", which ends the "
+                     f"table there, so the check cannot read it or any row below it")
     return found
 
 

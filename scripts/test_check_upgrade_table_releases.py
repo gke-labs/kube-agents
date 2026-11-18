@@ -183,6 +183,24 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("so the check cannot read it", problems[0])
 
+    def test_a_row_indented_before_its_bar_is_reported(self):
+        # #6429: an indented row ends the table, so it and every row below it would skip every check.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import check_upgrade_table_releases as check
+        lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + " " + row("pending", "b")
+                 + row("pending", "c")).split("\n")
+        with mock.patch.object(check, "working_file_lines", return_value=lines):
+            problems = check.release_cell_problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("starts with a space before its", problems[0])
+        self.assertIn(f":{lines.index(' ' + row('pending', 'b').rstrip()) + 1}:", problems[0])
+        # Prose after the table, or a blank line, ends it without a report.
+        for tail in ("\nSome prose.\n", "Some prose.\n", "  indented prose\n"):
+            with self.subTest(tail=tail):
+                lines = ("# Upgrade\n\n" + HEADING + HEADER + row("pending", "a") + tail).split("\n")
+                with mock.patch.object(check, "working_file_lines", return_value=lines):
+                    self.assertEqual(check.release_cell_problems(), [])
+
     def test_a_disorder_already_on_main_warns_a_pull_request_that_leaves_the_page_alone(self):
         self.repo.commit("feat: a", row=row("pending", "change a"))
         self.repo.tag("1.0.0")
