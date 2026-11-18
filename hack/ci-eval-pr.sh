@@ -4758,6 +4758,10 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # The full compliance audit with its ledger write (#1983), after a plant of
+    # four namespaces and at most one CRD on the host. Unmeasured: priced at
+    # the audit band.
+    security-serviceentry-host-collision) echo 900 ;;
     # Written to outrun the worker turn budget: about 150 trivial model calls,
     # twice (the dispatcher retries the timed-out card once), on the agent's
     # own cluster. 13-26 min a repetition at 90 turns on a dev install on
