@@ -197,6 +197,20 @@ fixtures:
       pinned-inference-pool cannot play this part, since its backlog is the
       defect stockout-pinned-pool grades.
 
+  - role: missing-reservation-pool
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/missing-reservation-pool
+    namespace: null
+    defect: >-
+      A pool with no autoscaling, held at zero nodes behind the taint
+      seeded-role=missing-reservation, that consumes one named reservation
+      (SPECIFIC_RESERVATION) while no reservation of that name exists in any
+      zone of the project. GKE reports the pool RUNNING and refuses the first
+      node it would add, so the pool can never grow. The stack plants no
+      reservation: the missing one is the defect. Zero nodes cost nothing.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0

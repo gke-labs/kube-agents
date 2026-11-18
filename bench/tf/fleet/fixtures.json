@@ -112,6 +112,40 @@
         }
       ]
     },
+    "missing-reservation-pool": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": [],
+      "fixture": "missing-reservation-pool, a pool held at zero nodes behind a NO_SCHEDULE taint, with no autoscaling, that consumes the one reservation it names (SPECIFIC_RESERVATION) while no reservation of that name exists in any zone of the project: GKE reports the pool RUNNING and refuses the first node it would add. The stack plants no reservation; the missing one is the defect",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='missing-reservation-pool')].config.reservationAffinity.consumeReservationType",
+          "op": "any_eq",
+          "value": "SPECIFIC_RESERVATION",
+          "why": "the defect is a pool bound to one named reservation; with any other affinity the pool can take on-demand capacity, and a check that compares the pool with the project's reservations has nothing to name"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='missing-reservation-pool')].config.reservationAffinity.values[*]",
+          "op": "any_eq",
+          "value": "seeded-absent-reservation",
+          "why": "the name is one that no reservation carries; a pool edited to name a real reservation is healed, and the case then grades a pool with nothing wrong"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='missing-reservation-pool')].autoscaling.enabled",
+          "op": "absent",
+          "why": "with autoscaling on, the stockout SOP's 3.9 names the pool as a single-zone autoscaling pool, a second finding on the object that no case expects"
+        },
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=missing-reservation-pool",
+          "path": "metadata.name",
+          "op": "absent",
+          "why": "a node in the pool means a reservation of that name exists now or the affinity changed; either way the pool can grow and the defect is gone"
+        }
+      ]
+    },
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
