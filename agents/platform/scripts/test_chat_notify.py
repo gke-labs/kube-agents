@@ -172,6 +172,41 @@ class HomePostPlatformsTest(unittest.TestCase):
         self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
 
 
+    def _write_gchat(self, text):
+        with open(os.path.join(self.dir, chat_notify.GCHAT_HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_learned_chat_space_takes_the_home_posts(self):
+        self._write("")
+        self._write_gchat("spaces/AAA\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
+        self.assertFalse(chat_notify.routes("slack"))
+
+    def test_a_learned_chat_space_joins_a_slack_home_chat_first(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        self._write_gchat("spaces/AAA\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+        self._write("C1\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_both_learned_homes_are_the_list(self):
+        self._write("C1\n")
+        self._write_gchat("spaces/AAA\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_a_chat_file_counts_only_while_the_gateway_holds_chat(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
+        self._write_gchat("spaces/AAA\n")
+        self.assertEqual(chat_notify.home_platforms(), [])
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+    def test_an_empty_or_missing_chat_file_names_no_home(self):
+        self._write_gchat("  \n")
+        self.assertEqual(chat_notify.home_platforms(), [])
+        os.remove(os.path.join(self.dir, chat_notify.GCHAT_HOME_FILE_KEY))
+        self.assertEqual(chat_notify.home_platforms(), [])
+        self.assertEqual(chat_notify.home_file(chat_notify.GCHAT_HOME_FILE_KEY), ("", True))
+
     def test_home_platforms_names_only_a_platform_with_a_home_channel(self):
         # (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, projected file or None, expected)
         rows = (

@@ -40,7 +40,8 @@ from contextlib import closing
 # a2aNotifyPlatformEnvVar): every armed platform whose home channel the CR
 # sets, and absent when none is. Its value is a list of platform names as
 # Hermes spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list
-# of one. routed_platforms() adds the learned Slack channel and the fallback.
+# of one. routed_platforms() adds a learned Slack channel or Chat space and the
+# fallback.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
@@ -51,14 +52,17 @@ NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 PLATFORM_LIST_SEPARATOR = ","
 # The operator projects the home channel it admitted (the CR field, else the
 # channel the gateway learned) into a ConfigMap mounted as a directory in the
-# agent pod, so a learned channel reaches the pod without a restart. One file,
-# the Slack channel id or empty; the directory is absent on an operator older
-# than the projection and where the gateway does not hold Slack. No env
+# agent pod, so a learned channel reaches the pod without a restart. One file
+# per platform, the Slack channel id or the Chat space name, or empty; the
+# directory is absent on an operator older than the projection and where the
+# gateway holds neither platform, and the Chat file alone is absent on an
+# operator older than Chat's learn. No env
 # override: the agent's own
 # .env is loaded into its environment, so a seam there would let a line on
 # the writable volume point the readers at a file of its own.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
 HOME_FILE_KEY = "slack_home"
+GCHAT_HOME_FILE_KEY = "gchat_home"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -126,19 +130,22 @@ def alert_update_key(session_id: str) -> str:
     return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
 
 
-def home_file() -> tuple[str, bool]:
-    """The projected Slack home channel, trimmed, and whether the file is mounted.
+def home_file(key: str = HOME_FILE_KEY) -> tuple[str, bool]:
+    """A projected home channel, trimmed, and whether the projection is mounted.
+
+    ``key`` names the platform's file: Slack's by default, ``GCHAT_HOME_FILE_KEY``
+    for the Chat space.
 
     Read on every call: the kubelet refreshes the file in place when the
     operator's projection changes, within about a minute, and no process
     restarts for it. Mounted means the directory is there: the Optional
     volume gives an empty directory until the operator writes the ConfigMap,
     and in that gap the home is still the operator's to say. No directory at
-    all is an install where the gateway does not hold Slack, or an operator
-    older than the projection: ("", False).
+    all is an install where the gateway holds neither Slack nor Chat, or an
+    operator older than the projection: ("", False).
     """
     try:
-        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+        with open(os.path.join(HOME_FILE_DIR, key), encoding="utf-8") as handle:
             try:
                 return handle.read().strip(), True
             except ValueError:
@@ -148,9 +155,9 @@ def home_file() -> tuple[str, bool]:
         return "", os.path.isdir(HOME_FILE_DIR)
 
 
-def home_file_value() -> str:
-    """The Slack home channel the operator projected into the pod, or "" when none."""
-    return home_file()[0]
+def home_file_value(key: str = HOME_FILE_KEY) -> str:
+    """The home channel the operator projected into the pod for ``key``'s platform, or "" when none."""
+    return home_file(key)[0]
 
 
 def platform_list(raw: str) -> list[str]:
@@ -167,13 +174,16 @@ def home_platforms() -> list[str]:
     """The platforms with a home channel the agent can see, Chat first, or [] when none has one.
 
     The operator lists every armed route whose home channel the CR sets
-    (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds it
-    and the projected file names a channel, the CR's or one it learned.
+    (``A2A_NOTIFY_PLATFORM``), and this adds Slack or Chat when the gateway
+    holds it and its projected file names a channel, the CR's or one the
+    gateway learned. Chat stays first.
     """
     listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
-    slack_home = SLACK_PLATFORM in gateway_platforms() and bool(home_file_value())
-    if slack_home and SLACK_PLATFORM not in listed:
-        return [*listed, SLACK_PLATFORM]
+    armed = gateway_platforms()
+    if GCHAT_PLATFORM in armed and GCHAT_PLATFORM not in listed and home_file_value(GCHAT_HOME_FILE_KEY):
+        listed = [GCHAT_PLATFORM, *listed]
+    if SLACK_PLATFORM in armed and SLACK_PLATFORM not in listed and home_file_value():
+        listed = [*listed, SLACK_PLATFORM]
     return listed
 
 
@@ -183,7 +193,7 @@ def routed_platforms() -> list[str]:
     Those are the platforms with a home channel (:func:`home_platforms`). With
     none, home posts go to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
     whose posts the gateway keeps for the digest it posts once a channel is set.
-    The rule reads only those two variables and the projected Slack file, so
+    The rule reads only those two variables and the projected files, so
     every process computes the same list and a learned channel restarts no pod.
     """
     return home_platforms() or gateway_platforms()

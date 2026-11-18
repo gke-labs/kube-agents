@@ -130,10 +130,13 @@ NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # (chat_notify.PLATFORM_LIST_SEPARATOR).
 PLATFORM_LIST_SEPARATOR = ","
 # The operator's projection of the home channel, mounted in the agent pod
-# (agents/platform/scripts/chat_notify.py keeps the same three names).
+# (agents/platform/scripts/chat_notify.py keeps the same names): one file per
+# platform, Slack's and Google Chat's.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
 HOME_FILE_KEY = "slack_home"
 HOME_FILE_PLATFORM = "slack"
+GCHAT_HOME_FILE_KEY = "gchat_home"
+GCHAT_HOME_FILE_PLATFORM = "google_chat"
 # The bus CLI in the agent image, on PATH.
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
@@ -289,10 +292,10 @@ def platform_list(raw: str) -> list:
     return names
 
 
-def _home_file_value() -> str:
-    """The projected Slack home channel, trimmed, or "" when there is none."""
+def _home_file_value(key: str = HOME_FILE_KEY) -> str:
+    """The projected home channel in ``key``'s file, trimmed, or "" when there is none."""
     try:
-        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+        with open(os.path.join(HOME_FILE_DIR, key), encoding="utf-8") as handle:
             return handle.read().strip()
     except (OSError, ValueError):
         return ""
@@ -302,23 +305,20 @@ def routed_platforms() -> list:
     """The platforms whose home posts the gateway holds, or [] when none.
 
     The operator lists every armed route whose home channel the CR sets, Chat
-    first, and this adds Slack when the gateway holds it and the projected file
-    names a channel, the CR's or one it learned. With no such list, home posts
-    go to Slack alone when the file names a channel, and otherwise to every
+    first, and this adds Slack or Chat when the gateway holds it and its
+    projected file names a channel, the CR's or one the gateway learned, Chat
+    still first. With no platform left with a home, home posts go to every
     armed route, whose posts the gateway keeps for its digest. The rule reads
-    only the two variables and the file, so it gives the same list as
+    only the two variables and the files, so it gives the same list as
     chat_notify.routed_platforms, which this patch cannot import.
     """
     listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     armed = conversation_platforms()
-    slack_home = HOME_FILE_PLATFORM in armed and bool(_home_file_value())
-    if listed:
-        if slack_home and HOME_FILE_PLATFORM not in listed:
-            return [*listed, HOME_FILE_PLATFORM]
-        return listed
-    if slack_home:
-        return [HOME_FILE_PLATFORM]
-    return armed
+    if GCHAT_HOME_FILE_PLATFORM in armed and GCHAT_HOME_FILE_PLATFORM not in listed and _home_file_value(GCHAT_HOME_FILE_KEY):
+        listed = [GCHAT_HOME_FILE_PLATFORM, *listed]
+    if HOME_FILE_PLATFORM in armed and HOME_FILE_PLATFORM not in listed and _home_file_value():
+        listed = [*listed, HOME_FILE_PLATFORM]
+    return listed or armed
 
 
 def routes(platform: Any) -> bool:
