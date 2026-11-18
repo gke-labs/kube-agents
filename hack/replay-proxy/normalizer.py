@@ -452,6 +452,31 @@ RECENT_WORK_ESCAPED_RE = re.compile(
     r"\\n\\n" + RECENT_WORK_ESCAPED_SECTION + r"(?=\\n|\Z|\")|" + RECENT_WORK_ESCAPED_SECTION + r"(?:\\n(?:\\n)?)?"
 )
 
+# Hermes ends its system prompt with a runtime environment block, from a probe
+# it runs in the terminal backend (hermes-agent v2026.9.14,
+# agent/prompt_builder.py `_format_backend_probe`): `  OS: <uname -s> <uname -r>`, then the user, home
+# and working directory. The kernel is that of the node the sandbox landed on,
+# so it differs between otherwise identical runs when a pool's nodes do (Nov 18:
+# 3 of 8 nightly shards on 6.12.110+, the rest and the replay lane on
+# 6.12.105+). The key holds a fixed token for it (runtime_kernel_fixed), in a
+# system message's block only: the same kernel in a tool result or a user
+# message is a node the agent may be reasoning about, and stays literal. The
+# token is bound to no value, so no answer is rewritten with it: an answer
+# rarely names a kernel, and then one it read in a tool result the key keeps.
+# Hermes takes the last heading as the block (split_runtime_boundary uses
+# rpartition: prose may quote the heading), so the match starts at the last
+# heading before the end marker. The block's other
+# lines are the same on every node (User, Home) or already keyed (Working
+# directory's card id).
+SYSTEM_ROLE = "system"
+TEXT_PART_FIELD = "text"
+RUNTIME_ENVIRONMENT_HEADING = "# Hermes runtime environment\n"
+RUNTIME_ENVIRONMENT_BLOCK_RE = re.compile(
+    re.escape(RUNTIME_ENVIRONMENT_HEADING) + r"(?:(?!" + re.escape(RUNTIME_ENVIRONMENT_HEADING) + r").)*?"
+    r"<!-- End Hermes runtime environment -->", re.S)
+RUNTIME_KERNEL_LINE_RE = re.compile(r"(?m)^(  OS: \S+ )\S+$")
+KERNEL_PLACEHOLDER = f"{OPEN}KERNEL{CLOSE}"
+
 # Hermes' read_file answers a missing file with `File not found: <path>` and,
 # when the directory holds names like it, `similar_files`: up to five picked
 # from an `ls` of the directory at that moment (hermes-agent v2026.9.14
@@ -709,6 +734,27 @@ def strip_recent_work(text: str) -> str:
     """Drop the `## Recent work` digest, which the key leaves out (RECENT_WORK_RE)."""
     text = RECENT_WORK_RE.sub("", text)
     return RECENT_WORK_ESCAPED_RE.sub("", text)
+
+
+def kernel_fixed(text: str) -> str:
+    """`text` with the kernel on each runtime environment block's OS line as KERNEL_PLACEHOLDER."""
+    return RUNTIME_ENVIRONMENT_BLOCK_RE.sub(
+        lambda block: RUNTIME_KERNEL_LINE_RE.sub(lambda line: line.group(1) + KERNEL_PLACEHOLDER, block.group(0)), text)
+
+
+def runtime_kernel_fixed(message: Any) -> Any:
+    """`message`, with kernel_fixed applied to its content (a string or text parts) when it is a system message."""
+    if not (isinstance(message, dict) and message.get(ROLE_FIELD) == SYSTEM_ROLE):
+        return message
+    content = message.get(CONTENT_FIELD)
+    if isinstance(content, str):
+        fixed: Any = kernel_fixed(content)
+    elif isinstance(content, list):
+        fixed = [dict(part, **{TEXT_PART_FIELD: kernel_fixed(part[TEXT_PART_FIELD])})
+                 if isinstance(part, dict) and isinstance(part.get(TEXT_PART_FIELD), str) else part for part in content]
+    else:
+        return message
+    return message if fixed == content else dict(message, **{CONTENT_FIELD: fixed})
 
 
 def without_similar_files(text: str) -> Tuple[str, List[str]]:
@@ -1146,7 +1192,8 @@ class Normalizer:
             self.note_skill_view_calls(message)
             self.note_kanban_create_calls(message)
         try:
-            return self.walk(self.queue_fields_dropped(self.similar_files_dropped(self.skill_listings_sorted(message))))
+            return self.walk(self.queue_fields_dropped(self.similar_files_dropped(self.skill_listings_sorted(
+                runtime_kernel_fixed(message)))))
         finally:
             self.in_answer = outer
 

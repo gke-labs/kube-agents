@@ -26,7 +26,7 @@
 id: ccc-prefilter-nodeaffinity-bypass
 name: "ComputeClass Named Through nodeAffinity Instead of nodeSelector, Bypassed by the Autoscaler Pre-Filter (ccc-prefilter-nodeaffinity)"
 domain: capacity
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - stockout-prevention

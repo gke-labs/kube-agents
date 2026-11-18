@@ -801,16 +801,24 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_guard_release_namespace_refuses_a_release_move(self):
-        """helm_release.namespace is ForceNew: a changed NAMESPACE plans destroy-and-recreate."""
-        proc = self._run_guard(
-            "guard_release_namespace",
-            state_list="helm_release.kube_agents",
-            state_show='resource "helm_release" "kube_agents" {\n    name      = "kube-agents"\n    namespace = "kubeagents-system"\n}',
-            tfvar_namespace='"agents-two"',
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
-        self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+        """helm_release.namespace is ForceNew: a changed NAMESPACE plans destroy-and-recreate.
+
+        The release has a count (install_helm_releases), so a state written since
+        holds it at [0]; a state from before holds the unindexed address until
+        the apply runs the moved block, and this guard runs before that apply.
+        Both must be refused."""
+        for address in ("helm_release.kube_agents[0]", "helm_release.kube_agents"):
+            with self.subTest(address=address):
+                proc = self._run_guard(
+                    "guard_release_namespace",
+                    state_list=address,
+                    state_show='resource "helm_release" "kube_agents" {\n    name      = "kube-agents"\n    namespace = "kubeagents-system"\n}',
+                    tfvar_namespace='"agents-two"',
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
+                self.assertIn(f"({address})", proc.stderr)
+                self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
     # terraform state show prints a number bare and the top-level attributes
     # before the nested blocks; the node_pool block repeats the name.
@@ -2774,7 +2782,10 @@ class UninstallHelmReleasesTest(unittest.TestCase):
     state installed with the helm CLI, and stops the destroy when it cannot.
     """
 
-    _KUBE_AGENTS = "helm_release.kube_agents"
+    # The release has a count (install_helm_releases); a state from before it
+    # holds the unindexed address until an apply runs the moved block.
+    _KUBE_AGENTS = "helm_release.kube_agents[0]"
+    _KUBE_AGENTS_LEGACY = "helm_release.kube_agents"
     _CERT_MANAGER = "helm_release.cert_manager[0]"
     _CONTEXT = "gke_test-project_us-central1_test-cluster"
 
@@ -2871,6 +2882,11 @@ exit 0
             # get-credentials sharing it can move mid-teardown.
             self.assertIn(f"--kube-context {self._CONTEXT}", " ".join(uninstall))
             self.assertIn("--wait", uninstall)
+
+    def test_a_state_from_before_the_count_still_uninstalls_kube_agents(self):
+        proc, calls = self._run(state=(self._CERT_MANAGER, self._KUBE_AGENTS_LEGACY))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([u[2] for u in self._uninstalls(calls)], ["kube-agents", "cert-manager"], calls)
 
     def test_a_cert_manager_this_state_did_not_install_is_left_alone(self):
         proc, calls = self._run(state=(self._KUBE_AGENTS,))

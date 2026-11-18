@@ -15,7 +15,7 @@
 id: storage-gcsfuse-unbounded-cache-oom
 name: "GCS Fuse Volume Mounted Without Sidecar Memory or Cache Limits (gcsfuse sidecar limits check)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit

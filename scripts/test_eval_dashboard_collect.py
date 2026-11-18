@@ -299,7 +299,7 @@ class TestCaseDerivation(unittest.TestCase):
 class TestLaneExcluded(unittest.TestCase):
     def test_the_inject_lanes_dropped_cases_are_named_once_each(self):
         log = (
-            "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
+            "running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
             "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
             "AGENT_TRANSPORT=inject: case-d leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
             "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
@@ -1679,7 +1679,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
 
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
-        self.assertEqual(cov["domains_total"], 13)
+        self.assertEqual(cov["domains_total"], 14)
         # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
         # probe, took a roster seat, closing the gap open since the tofu case
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
@@ -1707,9 +1707,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # The canary took its roster line on 2026-11-02 (#2013 step 4, #4094),
         # covering fleet-audits, and monitoring-alert-policy-read took one the
         # same day (#4095), covering observability.
+        # harness-scale is a new row whose only case is parked until its
+        # fixture exists (#4896), so it starts on the allowlist.
         self.assertEqual(
             cov["uncovered"],
-            [],
+            ["harness-scale"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 

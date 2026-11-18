@@ -58,7 +58,7 @@ run "service_form_renders_the_target_port" {
     openai_compatible_target_port = 8000
   }
   assert {
-    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm) == jsonencode({
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm) == jsonencode({
       maxTokens        = 0
       modelDefaultName = "some-org/some-model"
       modelProvider    = "openai_compatible"
@@ -69,7 +69,7 @@ run "service_form_renders_the_target_port" {
         targetPort        = 8000
       }
     })
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
   # No key given: nothing lands in the Secret.
   assert {
@@ -89,13 +89,13 @@ run "cidr_form_renders_the_ranges_the_ca_and_the_key" {
     openai_compatible_api_key        = "oc-key"
   }
   assert {
-    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm.openaiCompatible) == jsonencode({
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm.openaiCompatible) == jsonencode({
       apiBase           = "https://llm.corp.example.com:8443/v1"
       caBundleSecretRef = { key = "ca.crt", name = "llm-ca" }
       egressCIDRs       = ["10.8.0.0/24", "10.9.0.0/24"]
       targetPort        = null
     })
-    error_message = "openaiCompatible: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm.openaiCompatible)}"
+    error_message = "openaiCompatible: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm.openaiCompatible)}"
   }
   assert {
     condition     = nonsensitive(local.credentials["OPENAI_COMPATIBLE_API_KEY"]) == "oc-key"
@@ -113,8 +113,8 @@ run "other_providers_render_no_openai_compatible_key" {
     openai_compatible_egress_cidrs = ["10.8.0.0/24"]
   }
   assert {
-    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm), "openaiCompatible")
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm), "openaiCompatible")
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -125,7 +125,7 @@ run "missing_model_fails_the_plan" {
     openai_compatible_api_base    = "http://llm.models.svc.cluster.local/v1"
     openai_compatible_target_port = 8000
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "missing_api_base_fails_the_plan" {
@@ -135,7 +135,7 @@ run "missing_api_base_fails_the_plan" {
     model_default_name            = "some-org/some-model"
     openai_compatible_target_port = 8000
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "target_port_out_of_range_is_refused" {

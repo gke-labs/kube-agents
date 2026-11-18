@@ -763,6 +763,20 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	}}
 }
 
+// a2aBusMigrationStreams is a2aProvisionedStreams in the order the bus
+// migration's pods walk them: PROFILE_SUBMITS last, after both streams that
+// index it (KV_PROFILE_LEASES, the claimed submits; DISPATCH_STOPS, the
+// stopped ones). The clear deletes last to first and the restore goes
+// first to last, so one that stops partway leaves an index without the
+// submits, never the submits without an index: a give-up recreates the
+// missing streams empty, and an empty index next to full submits would
+// admit claimed or stopped submits again (#6287). A separate list, so the
+// rendered bus config, which follows a2aProvisionedStreams, is unchanged.
+func a2aBusMigrationStreams() []string {
+	streams := slices.DeleteFunc(slices.Clone(a2aProvisionedStreams), func(s string) bool { return s == a2aProfileSubmitStream })
+	return append(streams, a2aProfileSubmitStream)
+}
+
 // busMigrationPrincipal is a migration step's bus user, which is also its
 // inbox prefix.
 func busMigrationPrincipal(step, runID string) string {
@@ -833,7 +847,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(step, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams", strings.Join(a2aProvisionedStreams, ","),
+		"--streams", strings.Join(a2aBusMigrationStreams(), ","),
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
@@ -865,7 +879,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 // mounted read-only, writing the digests to its termination message for the
 // operator to read. It holds no bus credential at all.
 func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.Pod {
-	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aProvisionedStreams, ",")}
+	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aBusMigrationStreams(), ",")}
 	volumes := []corev1.Volume{{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
 		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: true},
 	}}}
@@ -926,7 +940,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(busMigrationStreamIdentity, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams", strings.Join(a2aProvisionedStreams, ","),
+		"--streams", strings.Join(a2aBusMigrationStreams(), ","),
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}

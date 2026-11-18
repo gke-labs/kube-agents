@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Fifty fixtures: forty-four across the four cluster slots and six project-scoped. Five of the project-scoped ones, `startup-fail-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Fifty-one fixtures: forty-five across the four cluster slots and six project-scoped. Five of the project-scoped ones, `startup-fail-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
@@ -146,6 +146,7 @@ its roles are never published.
 | `untargeted-compute-class-workload` | c       | 0   | `app-worker-a`, three replicas, no compute-class nodeSelector or affinity, in `seeded-compute-class`, on the cluster whose only untainted pool carries the class label; the pods run                                                                                                                                                          |
 | `compute-class-affinity-workload`   | c       | 0   | `app-worker-b`, the class named only in a required nodeAffinity term                                                                                                                                                                                                                                                                          |
 | `compute-class-toleration-workload` | c       | 0   | `batch-worker-a`, nodeSelector on the class with a toleration that names key, value and effect and no operator; the pool carries no taint, so the pod runs                                                                                                                                                                                    |
+| `no-ephemeral-limit-workload`       | c       | 0   | `batch-worker-a` again: its container sets no ephemeral-storage request or limit, the second defect the same object carries; GKE Standard admission adds none                                                                                                                                                                                 |
 | `untainted-compute-class-pool`      | c       | 0   | `default-pool` labelled `cloud.google.com/compute-class=general-ccc` with no matching taint                                                                                                                                                                                                                                                   |
 | `manual-pools-compute-class`        | c       | 0   | ComputeClass `general-ccc`: a `nodepools` rule `default-pool` backs, two `machineFamily` rules nothing backs, auto-creation off                                                                                                                                                                                                               |
 | `no-nodelocal-dnscache`             | c       | 0   | The NodeLocal DNSCache add-on off on slot c, where GKE turns it on by default and every other cluster in the project has it on                                                                                                                                                                                                                |
@@ -292,13 +293,13 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-one of the forty-four are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Forty-two of the forty-five are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `declared-single-zone-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
-`cuda-pinned-gpu-job`), `default-pool-headroom`, `config-connector-namespaced`, `scaled-zero-gateway` and the six ComputeClass roles on slot `c` (`untargeted-compute-class-workload`, `compute-class-affinity-workload`, `compute-class-toleration-workload`, `untainted-compute-class-pool`, `manual-pools-compute-class`, `no-nodelocal-dnscache`), covering
+`cuda-pinned-gpu-job`), `default-pool-headroom`, `config-connector-namespaced`, `scaled-zero-gateway` and the seven roles of the ComputeClass fixtures on slot `c` (`untargeted-compute-class-workload`, `compute-class-affinity-workload`, `compute-class-toleration-workload`, `untainted-compute-class-pool`, `manual-pools-compute-class`, `no-nodelocal-dnscache`, `no-ephemeral-limit-workload`), covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
 API deprecation, zonal skew, the upgrade-failure shapes and the stall watch between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail

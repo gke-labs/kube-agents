@@ -75,9 +75,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import yaml
+
 import automation_rules
 import automerge_checks
 import automerge_eligibility
+import okf_guard
 from providers import (
     CliTransport,
     HttpTransport,
@@ -140,10 +143,25 @@ _SHORT_REF_PREFIXES = ("refs/heads/", "heads/")
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
 # of a leftover ref cannot happen by naming a plausible branch.
 _INCOMING = "refs/vcs/incoming"
+DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
+DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_OVERRIDE_PREFIX = "decision-override:"
+FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
+DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
 
 # What `git ls-remote --exit-code` exits with when the remote answered and holds
 # no matching ref; any other failure is a remote it could not ask.
 LS_REMOTE_NO_MATCH_EXIT_CODE = 2
+
+# The fields every adapter's proposal-create reads, plus the repository it is
+# bound to. A profile caller's proposal-create may carry no other
+# (VcsBroker.require_agent_proposal): none names a source repository today, and
+# one that did would be a fork source this check had not read.
+PROFILE_PROPOSAL_CREATE_FIELDS = frozenset({"repository", "title", "body", "source", "target", "draft"})
+# The fields a profile caller's proposal-update may carry: which proposal, and
+# its text. No label field (labelsAdd, labelsRemove) and no target.
+PROFILE_PROPOSAL_UPDATE_FIELDS = frozenset({"repository", "number", "title", "body"})
 
 # The namespace every branch this install publishes is named under, and the only
 # one `branch-delete` will touch. Every shipped caller derives its branch as
@@ -355,6 +373,21 @@ def _remove_tree(path: Path) -> None:
 _AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
 
 
+def _as_pull_request(agent_forge: Any, proposal: Mapping[str, Any]) -> Any:
+    """A translated proposal as `forge.PullRequest`, the fields its ownership test reads.
+
+    The same mapping `forge.ForgeProvider.list_open_prs` makes from the same
+    neutral proposal: `source` is the head ref, `sourceRepo` the repository it
+    lives in (empty for a deleted fork, which reads as not ours).
+    """
+    return agent_forge.PullRequest(
+        number=int(proposal.get("number") or 0),
+        head_ref=str(proposal.get("source") or ""),
+        author=str(proposal.get("author") or ""),
+        head_repo=str(proposal.get("sourceRepo") or ""),
+    )
+
+
 def _short_ref(branch: str) -> str:
     """`refs/heads/x` and `heads/x` name the branch `x`; compare them as `x`."""
     short = branch.strip()
@@ -483,6 +516,55 @@ def _login_key(login: str) -> str:
     spelling is how the comparison broke in the first place.
     """
     return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
+
+
+class ProposalNotOurs(WorkspaceError):
+    """A profile caller's write names a proposal or branch this install does not own.
+
+    Raised only by `VcsBroker.require_agent_proposal`, which the credential
+    proxy calls for the profile role alone; the HTTP layer answers it 403 under
+    its own rule. Its own type so that layer can tell an ownership refusal from
+    a forge fault, which keeps the forge's own status.
+    """
+
+    code = "PROPOSAL_NOT_OURS"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=403, code=self.code)
+
+
+class ProfileLabelsRefused(ProposalNotOurs):
+    """A profile caller's proposal-update carries a label edit.
+
+    Refused whoever owns the proposal: labels are where a person holds or
+    approves a change, so a worker that can edit them on its own proposal can
+    lift a hold or add an approval. The HTTP layer answers it under its own
+    rule, apart from the ownership one.
+    """
+
+    code = "PROFILE_LABELS_FORBIDDEN"
+
+
+def _canonical_branch(value: Any, field: str) -> str:
+    """A profile caller's branch name, refused unless it is already the short name.
+
+    `validate_branch` first (so `owner:branch` is refused, a colon being no
+    branch character), then `_short_ref` must leave it unchanged: `publish`
+    pushes `refs/heads/<name>` with the name as given, so a check made on the
+    shortened name would judge one branch and write another.
+    """
+    try:
+        name = validate_branch(value, field)
+    except WorkspaceError as refused:
+        raise ProposalNotOurs(
+            f"{refused} -- a profile task names a branch of this repository, bare."
+        ) from refused
+    if _short_ref(name) != name:
+        raise ProposalNotOurs(
+            f"{field} {name!r} is not a bare branch name; a profile task names "
+            f"{_short_ref(name)!r} as itself."
+        )
+    return name
 
 
 def _padded(size: int, unit: int) -> int:
@@ -1801,13 +1883,292 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            policy_branch = (
+                self._pinned_base(bound.forge, bound.repo)
+                or self._default_branch_of_remote(git, root, self._tls_refusal)
+            )
+            policy_branch = _short_ref(policy_branch) if policy_branch else ""
+            if not policy_branch:
+                raise WorkspaceError(
+                    f"could not resolve base branch for Decision Memory guard on {bound.repo}",
+                    status=502,
+                    code=DECISION_MEMORY_CHECK_FAILED,
+                )
+            if policy_branch == target:
+                policy_base_rev = remote_target
+            else:
+                fetched_policy = git(
+                    root, "fetch", "--quiet", "--no-tags", "origin", policy_branch, check=False,
+                )
+                rev_base = (
+                    git(root, "rev-parse", "FETCH_HEAD", check=False)
+                    if fetched_policy.returncode == 0
+                    else fetched_policy
+                )
+                policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
+                if not policy_base_rev:
+                    raise WorkspaceError(
+                        f"could not resolve base branch for Decision Memory guard on {bound.repo}",
+                        status=502,
+                        code=DECISION_MEMORY_CHECK_FAILED,
+                    )
+            dm_markdown = self._check_decision_memory_on_publish(
+                git,
+                root,
+                policy_base_rev,
+                tip,
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
         if existing_head:
             self._drop_practice_label(bound, branch)
-        return bound.stamp({"branch": branch, "revision": tip})
+        result: dict[str, Any] = {"branch": branch, "revision": tip}
+        if dm_markdown:
+            result["decisionMemoryMarkdown"] = dm_markdown
+        return bound.stamp(result)
+
+    @staticmethod
+    def _extract_revision_paths_to_dir(
+        git: Callable,
+        root: Path,
+        rev: str,
+        paths: list[str],
+        out_dir: Path | None,
+        scratch_dir: Path,
+        *,
+        oversize_out: set[str] | None = None,
+    ) -> dict[str, str]:
+        """Extract `paths` at `rev` with `git archive` without repository checkout.
+
+        Uses `git archive --output` instead of stdout capture so binary files and
+        non-UTF-8 bytes do not pass through the text-mode git runner. Writes
+        `SNAPSHOT_ATTRIBUTES` to `.git/info/attributes` so repository `.gitattributes`
+        rules (`export-ignore`, `export-subst`, `working-tree-encoding`) cannot hide
+        or alter guarded manifests.
+        """
+        extracted: dict[str, str] = {}
+        if not paths:
+            return extracted
+        attrs = root / ".git" / SNAPSHOT_ATTRIBUTES_FILE
+        attrs.parent.mkdir(parents=True, exist_ok=True)
+        attrs.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
+
+        tar_path = scratch_dir / "extract.tar"
+        for idx in range(0, len(paths), MAX_SNAPSHOT_PATHS):
+            chunk = paths[idx : idx + MAX_SNAPSHOT_PATHS]
+            tar_path.unlink(missing_ok=True)
+            written = git(
+                root,
+                "--literal-pathspecs",
+                "archive",
+                "--format=tar",
+                f"--output={tar_path}",
+                rev,
+                "--",
+                *chunk,
+                check=False,
+            )
+            if written.returncode != 0 or not tar_path.is_file():
+                tar_path.unlink(missing_ok=True)
+                continue
+            try:
+                with tarfile.open(tar_path, "r:") as tf:
+                    for member in tf:
+                        if not member.isfile():
+                            continue
+                        try:
+                            rel = validate_path(member.name)
+                        except WorkspaceError:
+                            continue
+                        if member.size > DM_MAX_GUARD_FILE_BYTES:
+                            if oversize_out is not None:
+                                oversize_out.add(rel)
+                                continue
+                            if out_dir is not None:
+                                dest = out_dir / rel
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                dest.write_bytes(b"")
+                            extracted[rel] = ""
+                            continue
+                        fobj = tf.extractfile(member)
+                        raw_bytes = fobj.read(DM_MAX_GUARD_FILE_BYTES) if fobj is not None else b""
+                        if out_dir is not None:
+                            dest = out_dir / rel
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(raw_bytes)
+                        extracted[rel] = raw_bytes.decode("utf-8", errors="replace")
+            finally:
+                tar_path.unlink(missing_ok=True)
+        return extracted
+
+    def _check_decision_memory_on_publish(
+        self,
+        git: Callable,
+        root: Path,
+        policy_base_rev: str,
+        tip: str,
+    ) -> str:
+        """Run deterministic OKF `scope` and `guard.expect` checks against base `knowledge/`.
+
+        Reads `knowledge/` and `.kube-agents/intent.yaml` from `policy_base_rev` (the
+        operator-pinned `baseBranch` or `_default_branch_of_remote` on `origin`, never a
+        caller-supplied `target`) via `git ls-tree` and `git archive` without checkout.
+        Runs `okf_guard.check_changed_files` in-process with zero LLM calls, zero
+        subprocesses, and zero sandbox-supplied override flags.
+        """
+        tree_ls = git(
+            root, "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only", policy_base_rev, "--",
+            "knowledge", ".kube-agents/intent.yaml", check=False,
+        )
+        if getattr(tree_ls, "truncated", False):
+            raise WorkspaceError(
+                "Decision Memory guard check failed against base branch: base tree listing was truncated",
+                status=409,
+                code=DECISION_MEMORY_CHECK_FAILED,
+            )
+        base_knowledge_files = [
+            validate_path(entry)
+            for entry in (tree_ls.stdout or "").split("\0")
+            if entry and entry.endswith((".md", ".yaml", ".yml"))
+        ]
+        if not base_knowledge_files:
+            return ""
+
+        mb_res = git(root, "merge-base", policy_base_rev, tip, check=False)
+        diff_base = (
+            (mb_res.stdout or "").strip()
+            if mb_res.returncode == 0 and (mb_res.stdout or "").strip()
+            else policy_base_rev
+        )
+        diff_ns = git(
+            root, "diff-tree", "-r", "--no-renames", "--name-status", "-z", diff_base, tip, check=False,
+        )
+        if diff_ns.returncode != 0 or getattr(diff_ns, "truncated", False):
+            raise WorkspaceError(
+                "Decision Memory guard check failed against base branch: diff-tree failed or was truncated",
+                status=409,
+                code=DECISION_MEMORY_CHECK_FAILED,
+            )
+        changed_paths: list[tuple[str, str]] = []
+        tokens = [t for t in (diff_ns.stdout or "").split("\0") if t]
+        idx = 0
+        while idx + 1 < len(tokens):
+            status = tokens[idx].strip()
+            if status.startswith(("R", "C")) and idx + 2 < len(tokens):
+                changed_paths.append((status, tokens[idx + 2]))
+                idx += 3
+            else:
+                changed_paths.append((status, tokens[idx + 1]))
+                idx += 2
+        if not changed_paths:
+            return ""
+
+        check_dir = self._scratch("dmcheck")
+        try:
+            k_root = check_dir / "base"
+            k_root.mkdir(parents=True, exist_ok=True)
+
+            self._extract_revision_paths_to_dir(
+                git, root, policy_base_rev, base_knowledge_files, k_root, check_dir,
+            )
+
+            intent_file = k_root / ".kube-agents" / "intent.yaml"
+            if intent_file.is_file():
+                try:
+                    intent_doc = yaml.safe_load(
+                        intent_file.read_text(encoding="utf-8", errors="replace")
+                    )
+                except yaml.YAMLError:
+                    intent_doc = None
+                raw_paths = intent_doc.get("paths") if isinstance(intent_doc, dict) else None
+                if isinstance(raw_paths, list):
+                    extra_files: list[str] = []
+                    for entry in raw_paths:
+                        cleaned = str(entry or "").strip().strip("/")
+                        if not cleaned:
+                            continue
+                        try:
+                            safe_prefix = validate_path(cleaned)
+                        except WorkspaceError:
+                            continue
+                        extra_ls = git(
+                            root, "--literal-pathspecs", "ls-tree", "-r", "-z", "--name-only",
+                            policy_base_rev, "--", safe_prefix, check=False,
+                        )
+                        if getattr(extra_ls, "truncated", False):
+                            raise WorkspaceError(
+                                "Decision Memory guard check failed against base branch: extra path listing was truncated",
+                                status=409,
+                                code=DECISION_MEMORY_CHECK_FAILED,
+                            )
+                        for erel in (extra_ls.stdout or "").split("\0"):
+                            if not erel or not erel.endswith((".md", ".yaml", ".yml")):
+                                continue
+                            try:
+                                extra_files.append(validate_path(erel))
+                            except WorkspaceError:
+                                continue
+                    if extra_files:
+                        self._extract_revision_paths_to_dir(
+                            git, root, policy_base_rev, extra_files, k_root, check_dir,
+                        )
+
+            rel_args: list[str] = []
+            non_deleted: list[str] = []
+            deleted_set: set[str] = set()
+            for status, raw_rel in changed_paths:
+                rel = validate_path(raw_rel)
+                rel_args.append(rel)
+                if status.startswith("D"):
+                    deleted_set.add(rel)
+                else:
+                    non_deleted.append(rel)
+
+            oversize_files: set[str] = set()
+            extracted_head = self._extract_revision_paths_to_dir(
+                git, root, tip, non_deleted, None, check_dir, oversize_out=oversize_files,
+            )
+            for rel in non_deleted:
+                if rel not in extracted_head:
+                    oversize_files.add(rel)
+            changed_map: dict[str, str | None] = {}
+            for rel in rel_args:
+                if rel in deleted_set:
+                    changed_map[rel] = None
+                else:
+                    changed_map[rel] = extracted_head.get(rel)
+
+            try:
+                out = okf_guard.check_changed_files(
+                    k_root, changed_map, oversize_files=oversize_files
+                )
+            except ValueError as exc:
+                raise WorkspaceError(
+                    f"Decision Memory guard check failed against base branch: {exc}",
+                    status=409,
+                    code=DECISION_MEMORY_CHECK_FAILED,
+                ) from exc
+
+            markdown = str(out.get("markdown") or "") if out.get("findings") else ""
+            if out.get("verdict") == "block":
+                msg = (
+                    "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
+                    f"{markdown}\n\n"
+                    "Do NOT open this Pull Request. In your final response, quote the "
+                    "record IDs (DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), "
+                    "Revert/Fix PR (#...), and the technical root-cause details verbatim."
+                )
+                raise WorkspaceError(
+                    msg,
+                    status=409,
+                    code=DECISION_MEMORY_BLOCKED,
+                    detail=markdown,
+                )
+            return markdown
+        finally:
+            self._discard_scratch(check_dir)
 
     def branch_view(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Whether `branch` exists on the remote, and at which revision.
@@ -2385,6 +2746,150 @@ class VcsBroker:
                 code="CLONED_BRANCH",
             )
 
+    def require_agent_proposal(self, verb: str, payload: dict[str, Any]) -> None:
+        """Refuse a profile caller's write unless what it touches is this install's own.
+
+        Called by the credential proxy for the profile role only (#3993), after
+        the permit and the managed list and before the verb runs; the shell's
+        `publish` and `proposal-update` never come through here. The permit
+        says the requester asked for a change, not which proposal, so this
+        holds the change to proposals and branches the install itself made:
+
+          * `proposal-update`: the proposal must be the install's own by
+            `forge.is_agent_pull_request` -- opened by the credential's login,
+            from a branch under `AGENT_BRANCH_PREFIX`, in this repository rather
+            than a fork. Read through the forge's own proposal view, and the
+            login through `_viewer`. Without it a profile worker under the
+            permit could retitle a person's proposal or strip its hold label.
+          * `publish`: the branch must be under `AGENT_BRANCH_PREFIX`, the rule
+            `branch-delete` applies. Whenever the branch carries an open
+            proposal, every open proposal on it must pass the same
+            `is_agent_pull_request` bar, `advance` or not: a publish without it
+            still fast-forwards an existing remote branch, so keying the check
+            on the field would let a profile worker add commits to a person's
+            proposal by leaving it out. A list that came back full or truncated
+            is refused, since the proposals past it are unread. `advance` also
+            needs at least one open proposal, as it does for every caller. A
+            branch under the prefix with no open proposal stays publishable.
+            The bar `_require_open_proposal` keeps for the shell -- an open
+            proposal, the author compared only when the credential can name
+            itself -- is weaker on purpose there and is left as it is.
+          * `proposal-update` also carries no label field (`labelsAdd`,
+            `labelsRemove`, or any key naming labels) and nothing beyond
+            PROFILE_PROPOSAL_UPDATE_FIELDS: on an owned proposal it may change
+            the title and body, never add `lgtm` or remove a hold.
+          * Branch names are taken in their one canonical spelling: a `branch`
+            or `source` that `_short_ref` would shorten (`refs/heads/x`,
+            `heads/x`) is refused, because `publish` pushes the name as given
+            and `heads/platform-agent/x` would land as
+            `refs/heads/heads/platform-agent/x`.
+          * `proposal-create`: the source must be a branch under
+            `AGENT_BRANCH_PREFIX` in this repository. The adapters open a
+            proposal from the bound repository's own branch, and
+            `validate_branch` already refuses `owner:branch`; the payload may
+            carry no field beyond the ones every adapter reads
+            (PROFILE_PROPOSAL_CREATE_FIELDS), so a field naming another
+            repository is refused rather than left for a later adapter to
+            honour.
+
+        A credential that cannot name itself refuses: `is_agent_pull_request`
+        answers no for an empty viewer. A lookup that failed is the forge's
+        error, raised with its own status, never read as "not ours".
+        """
+        # Imported here: forge.py is the agent-side forge module, and this is
+        # the one place the broker borrows its ownership predicate, so the two
+        # sides share one definition of "the agent's own proposal".
+        import forge as agent_forge
+
+        bound = self._bind(payload)
+        if verb == "publish":
+            branch = _canonical_branch(payload.get("branch"), "branch")
+            if not branch.startswith(AGENT_BRANCH_PREFIX):
+                raise ProposalNotOurs(
+                    f"{branch} is not under {AGENT_BRANCH_PREFIX}, the namespace this "
+                    "install publishes in; a profile task publishes only a branch of "
+                    "its own there."
+                )
+            if "proposal-list" not in getattr(bound.forge, "verbs", ()):
+                raise ProposalNotOurs(
+                    f"{bound.forge.name} cannot list proposals here, so whether {branch} "
+                    "carries somebody else's proposal cannot be established."
+                )
+            answer = bound.forge.proposal_list(
+                bound.api,
+                bound.repo,
+                {"state": "open", "source": branch, "limit": OPEN_PROPOSALS_ON_A_BRANCH},
+            )
+            proposals = answer.get("proposals") or []
+            if answer.get("truncated") or len(proposals) >= OPEN_PROPOSALS_ON_A_BRANCH:
+                raise ProposalNotOurs(
+                    f"{branch} carries at least {len(proposals)} open proposals, a full page, "
+                    "so whether every one is this install's cannot be established."
+                )
+            if payload.get("advance") and not proposals:
+                raise ProposalNotOurs(
+                    f"`advance` says {branch} carries a proposal to add to, but no open "
+                    "proposal on this repository has it as its source."
+                )
+            if not proposals:
+                return
+            viewer = self._viewer(bound)
+            strangers = [
+                item for item in proposals
+                if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, item), bound.repo, viewer, hostless=True)
+            ]
+            if strangers:
+                named = strangers[0].get("url") or "#%s" % (strangers[0].get("number"),)
+                raise ProposalNotOurs(
+                    f"{branch} carries an open proposal that is not this install's own "
+                    f"({named}), so a profile task does not publish to it."
+                )
+            return
+        if verb == "proposal-create":
+            extra = sorted(set(payload) - PROFILE_PROPOSAL_CREATE_FIELDS)
+            if extra:
+                raise ProposalNotOurs(
+                    f"proposal-create from a profile task takes only "
+                    f"{', '.join(sorted(PROFILE_PROPOSAL_CREATE_FIELDS))}; {extra[0]!r} is refused, "
+                    "since a proposal opens only from this repository's own branch."
+                )
+            # `owner:branch`, the cross-repository head form, is refused here:
+            # a colon is no branch character.
+            source = _canonical_branch(payload.get("source"), "source")
+            if not source.startswith(AGENT_BRANCH_PREFIX):
+                raise ProposalNotOurs(
+                    f"{source} is not under {AGENT_BRANCH_PREFIX}, so a profile task does "
+                    "not open a proposal from it."
+                )
+            return
+        if verb == "proposal-update":
+            # Before the proposal is read: no label edit, and no field beyond
+            # the text, whoever owns the proposal (see ProfileLabelsRefused).
+            labelled = sorted(key for key in payload if "label" in str(key).casefold())
+            if labelled:
+                raise ProfileLabelsRefused(
+                    f"a profile task does not edit labels ({labelled[0]!r}); a hold or "
+                    "approval label is a person's call. Update the title or body only."
+                )
+            extra = sorted(set(payload) - PROFILE_PROPOSAL_UPDATE_FIELDS)
+            if extra:
+                raise ProposalNotOurs(
+                    f"proposal-update from a profile task takes only "
+                    f"{', '.join(sorted(PROFILE_PROPOSAL_UPDATE_FIELDS))}; {extra[0]!r} is refused."
+                )
+            number = validate_number(payload.get("number"))
+            viewer = self._viewer(bound)
+            view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number})
+            proposal = view.get("proposal") or {}
+            if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, proposal), bound.repo, viewer, hostless=True):
+                raise ProposalNotOurs(
+                    f"proposal #{number} is not this install's own (opened by its login, "
+                    f"from a branch under {AGENT_BRANCH_PREFIX}, in this repository), so a "
+                    "profile task does not update it."
+                )
+            return
+        raise ProposalNotOurs(f"{verb} is not a write this check knows, so it is refused")
+
     def _viewer(self, bound: Binding) -> str:
         """The login this credential authenticates as, or "" when it cannot say.
 
@@ -2438,7 +2943,26 @@ class VcsBroker:
         method = getattr(bound.forge, verb.replace("-", "_"))
         return bound.stamp(method(bound.api, bound.repo, payload))
 
+    @staticmethod
+    def _refuse_decision_override_labels(payload: dict[str, Any]) -> None:
+        """Refuse agent attempts to create or apply `decision-override:*` labels."""
+        candidates: list[Any] = []
+        if "name" in payload:
+            candidates.append(payload.get("name"))
+        for field in ("labels", "labelsAdd"):
+            vals = payload.get(field)
+            if isinstance(vals, list):
+                candidates.extend(vals)
+        for item in candidates:
+            if isinstance(item, str) and item.strip().casefold().startswith(DECISION_OVERRIDE_PREFIX):
+                raise WorkspaceError(
+                    f"label {item.strip()!r} is reserved for human reviewers on the forge and cannot be set by an agent.",
+                    status=403,
+                    code=FORBIDDEN_LABEL,
+                )
+
     def proposal_create(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
     def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2502,6 +3026,7 @@ class VcsBroker:
         return self._forge_verb("proposal-comment", payload)
 
     def issue_create(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("issue-create", payload)
 
     def issue_list(self, payload):
@@ -2518,6 +3043,7 @@ class VcsBroker:
         # `target` that reaches one is held to the same pinned base as
         # `proposal-create`, and the rule stays true the day an adapter learns
         # to retarget.
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb(
             "proposal-update", payload,
             pinned_target=payload.get("target") is not None,
@@ -2529,16 +3055,24 @@ class VcsBroker:
     def proposal_commits(self, payload):
         return self._forge_verb("proposal-commits", payload)
 
+    def proposal_reviews(self, payload):
+        # Every submitted review with its state, a bodiless approval included,
+        # for the post-merge check's change-request read. A library verb: no
+        # `vcs.py` command runs it.
+        return self._forge_verb("proposal-reviews", payload)
+
     def proposal_acknowledge(self, payload):
         return self._forge_verb("proposal-acknowledge", payload)
 
     def issue_update(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("issue-update", payload)
 
     def issue_close(self, payload):
         return self._forge_verb("issue-close", payload)
 
     def label_ensure(self, payload):
+        self._refuse_decision_override_labels(payload)
         return self._forge_verb("label-ensure", payload)
 
     def identity(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3050,6 +3584,7 @@ VCS_VERBS = frozenset(
         "proposal-update",
         "proposal-close",
         "proposal-commits",
+        "proposal-reviews",
         "proposal-acknowledge",
         "proposal-claim",
         "issue-update",
@@ -3087,6 +3622,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-update": broker.proposal_update,
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
+        "proposal-reviews": broker.proposal_reviews,
         "proposal-acknowledge": broker.proposal_acknowledge,
         "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,
@@ -3105,6 +3641,8 @@ __all__ = [
     "VcsBroker",
     "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
+    "ProposalNotOurs",
+    "ProfileLabelsRefused",
     "ROLE_CONTEXT",
     "ROLE_MANAGED",
     "ROLE_SELECTED_VERBS",

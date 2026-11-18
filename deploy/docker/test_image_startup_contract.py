@@ -1153,7 +1153,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
         # scripts; the entrypoint hard-codes that path rather than the PVC copy,
         # which `cp -ru` can leave older than the image.
         self.assertIn("/opt/defaults/scripts/verify_skills_provenance.py", self.entrypoint)
-        self.assertIn("agents/platform/scripts/ /opt/defaults/scripts/", self.stage)
+        self.assertRegex(self.stage, r"COPY [^\n]*agents/platform/scripts/ [^\n]*/opt/defaults/scripts/\n")
 
 
 # The tree no normalization loop walks, so every write into it has to carry its

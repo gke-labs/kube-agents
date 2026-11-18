@@ -243,6 +243,9 @@ type fakeAdapter struct {
 	// nil, and a text edit of a text line is not.
 	stopLines []fakePost
 	laidOut   map[string]bool
+	// stopPosts records every text PostMessage that carried Stop, whole,
+	// so a test can read the fields a backend may put on the line.
+	stopPosts []OutMessage
 	// privates records every PostPrivate (privatePosts), the posts one
 	// viewer alone sees; they are not in posts.
 	privates []fakePrivatePost
@@ -313,6 +316,7 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 		if err == nil && m.Stop != "" {
 			a.mu.Lock()
 			a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+			a.stopPosts = append(a.stopPosts, m)
 			a.mu.Unlock()
 		}
 		return id, err
@@ -342,6 +346,12 @@ func (a *fakeAdapter) setLaidOutLocked(messageID string, laidOut bool) {
 		a.laidOut = map[string]bool{}
 	}
 	a.laidOut[messageID] = laidOut
+}
+
+func (a *fakeAdapter) stopPostsCopy() []OutMessage {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]OutMessage(nil), a.stopPosts...)
 }
 
 func (a *fakeAdapter) stopLinesCopy() []fakePost {

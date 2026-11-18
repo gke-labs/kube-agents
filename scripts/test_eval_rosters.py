@@ -412,53 +412,53 @@ def write_tasks(root: pathlib.Path, tasks: dict[str, str]) -> pathlib.Path:
     return root
 
 
-class CertificationSuiteTest(unittest.TestCase):
-    """The certification suite is read from the task files: the bare line
-    `suite: certification` is membership, the bare line `certification_part: N`
+class ValidatedCapabilitiesSuiteTest(unittest.TestCase):
+    """The validated-capabilities suite is read from the task files: the bare line
+    `suite: validated-capabilities` is membership, the bare line `suite_part: N`
     is the section, and the text read here is held equal to the YAML read the
     validator makes, since the shell greps the same two lines."""
 
     def test_the_part_is_the_bare_line_or_one(self):
-        self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\ncertification_part: 3\n"), 3)
-        self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\n"), 1)
-        for not_the_line in ('certification_part: "2"\n', "certification_part: 2  # note\n", "  certification_part: 2\n", "certification_part: 0\n", "certification_part: 02\n"):
+        self.assertEqual(eval_rosters.suite_part("id: a\nsuite: validated-capabilities\nsuite_part: 3\n"), 3)
+        self.assertEqual(eval_rosters.suite_part("id: a\nsuite: validated-capabilities\n"), 1)
+        for not_the_line in ('suite_part: "2"\n', "suite_part: 2  # note\n", "  suite_part: 2\n", "suite_part: 0\n", "suite_part: 02\n"):
             with self.subTest(line=not_the_line):
-                self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\n" + not_the_line), 1)
+                self.assertEqual(eval_rosters.suite_part("id: a\nsuite: validated-capabilities\n" + not_the_line), 1)
 
     def test_membership_is_the_bare_line_in_id_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = write_tasks(pathlib.Path(tmp), {
-                "zed-case": "id: zed-case\nsuite: certification\n",
-                "alpha-case": "id: alpha-case\nsuite: certification\ncertification_part: 2\n",
-                "quoted-case": 'id: quoted-case\nsuite: "certification"\n',
-                "noted-case": "id: noted-case\nsuite: certification  # the page row\n",
-                "nested-case": "id: nested-case\nprompt: |\n  x\n  suite: certification\n",
+                "zed-case": "id: zed-case\nsuite: validated-capabilities\n",
+                "alpha-case": "id: alpha-case\nsuite: validated-capabilities\nsuite_part: 2\n",
+                "quoted-case": 'id: quoted-case\nsuite: "validated-capabilities"\n',
+                "noted-case": "id: noted-case\nsuite: validated-capabilities  # the page row\n",
+                "nested-case": "id: nested-case\nprompt: |\n  x\n  suite: validated-capabilities\n",
                 "plain-case": "id: plain-case\n",
             })
-            self.assertEqual(eval_rosters.certification_cases(root), ["alpha-case", "zed-case"])
-            self.assertEqual(eval_rosters.certification_parts(root), {1: ["zed-case"], 2: ["alpha-case"]})
+            self.assertEqual(eval_rosters.validated_capabilities_cases(root), ["alpha-case", "zed-case"])
+            self.assertEqual(eval_rosters.suite_parts(root), {1: ["zed-case"], 2: ["alpha-case"]})
 
     def test_a_crlf_file_is_off_the_lane_as_it_is_to_grep(self):
-        # grep sees `suite: certification\r`, not the bare line; the Python
+        # grep sees `suite: validated-capabilities\r`, not the bare line; the Python
         # read keeps the `\r` too (newline=""), so the two agree and the
         # validator's spelling rule is what reports the file.
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / "crlf-case").mkdir()
-            (root / "crlf-case" / "task.yaml").write_bytes(b"id: crlf-case\r\nsuite: certification\r\ncertification_part: 2\r\n")
+            (root / "crlf-case" / "task.yaml").write_bytes(b"id: crlf-case\r\nsuite: validated-capabilities\r\nsuite_part: 2\r\n")
             (root / "lf-case").mkdir()
-            (root / "lf-case" / "task.yaml").write_bytes(b"id: lf-case\nsuite: certification\n")
-            self.assertEqual(eval_rosters.certification_cases(root), ["lf-case"])
+            (root / "lf-case" / "task.yaml").write_bytes(b"id: lf-case\nsuite: validated-capabilities\n")
+            self.assertEqual(eval_rosters.validated_capabilities_cases(root), ["lf-case"])
 
     def test_the_order_is_by_case_id_as_the_shell_sorts(self):
         # `foo-bar` sorts before `foo` as a path (`-` before `/`) and after it
         # as an id; both readers sort by id.
         with tempfile.TemporaryDirectory() as tmp:
             root = write_tasks(pathlib.Path(tmp), {
-                "foo-bar": "id: foo-bar\nsuite: certification\n",
-                "foo": "id: foo\nsuite: certification\n",
+                "foo-bar": "id: foo-bar\nsuite: validated-capabilities\n",
+                "foo": "id: foo\nsuite: validated-capabilities\n",
             })
-            self.assertEqual(eval_rosters.certification_cases(root), ["foo", "foo-bar"])
+            self.assertEqual(eval_rosters.validated_capabilities_cases(root), ["foo", "foo-bar"])
 
     def test_the_text_read_agrees_with_the_yaml_read_on_every_task(self):
         """The grammar rule: what the validator registers by YAML is what the
@@ -468,27 +468,27 @@ class CertificationSuiteTest(unittest.TestCase):
                 text = task.read_text(encoding="utf-8")
                 doc = yaml.safe_load(text) or {}
                 self.assertEqual(
-                    doc.get("suite") == eval_rosters.CERTIFICATION_SUITE,
-                    eval_rosters.CERTIFICATION_SUITE_LINE_RE.search(text) is not None,
+                    doc.get("suite") == eval_rosters.VALIDATED_CAPABILITIES_SUITE,
+                    eval_rosters.VALIDATED_CAPABILITIES_SUITE_LINE_RE.search(text) is not None,
                     "the suite key is written in a spelling the lane does not read",
                 )
                 self.assertEqual(
-                    doc.get(eval_rosters.CERTIFICATION_PART_KEY, eval_rosters.CERTIFICATION_DEFAULT_PART),
-                    eval_rosters.certification_part(text),
+                    doc.get(eval_rosters.VALIDATED_CAPABILITIES_PART_KEY, eval_rosters.VALIDATED_CAPABILITIES_DEFAULT_PART),
+                    eval_rosters.suite_part(text),
                     "the part key is written in a spelling the lane does not read",
                 )
 
     def test_the_real_tree_shares_no_case_with_the_other_rosters(self):
-        certification = eval_rosters.certification_cases()
-        self.assertEqual(certification, sorted(set(certification)), "one entry per case, in id order")
-        shared = set(certification) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
-        self.assertEqual(shared, set(), "a certification case runs on its lane only")
-        self.assertEqual(sum(len(v) for v in eval_rosters.certification_parts().values()), len(certification))
+        validated_capabilities = eval_rosters.validated_capabilities_cases()
+        self.assertEqual(validated_capabilities, sorted(set(validated_capabilities)), "one entry per case, in id order")
+        shared = set(validated_capabilities) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
+        self.assertEqual(shared, set(), "a validated-capabilities case runs on its lane only")
+        self.assertEqual(sum(len(v) for v in eval_rosters.suite_parts().values()), len(validated_capabilities))
 
     def test_the_summary_counts_the_suite(self):
         got = eval_rosters.summary()
-        self.assertEqual(got["certification cases"], len(eval_rosters.certification_cases()))
-        self.assertEqual(got["certification parts"], len(eval_rosters.certification_parts()))
+        self.assertEqual(got["validated-capabilities cases"], len(eval_rosters.validated_capabilities_cases()))
+        self.assertEqual(got["validated-capabilities parts"], len(eval_rosters.suite_parts()))
 
 
 class NightlySortedSectionTest(unittest.TestCase):
@@ -709,7 +709,7 @@ class SplitLostNothingTest(unittest.TestCase):
 INJECT_LANE_EXCLUDED = [
     "chat-question-typed-answer-fresh-session",  # #4004: its answer turn is today's Slack thread context, which next's door does not send
 ]
-# Each exclusion's api-lane tier, pinned beside it: an entry is not a
+# Each exclusion's roster tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
     "chat-question-typed-answer-fresh-session": "nightly",
@@ -811,8 +811,8 @@ class GitLabLaneTest(unittest.TestCase):
 class InjectLaneExclusionsTest(unittest.TestCase):
     """hack/eval/inject-lane-exclusions.txt: the lane-level list, checked here.
 
-    A per-case marker would change what the api lane does to the case; a
-    list read only under AGENT_TRANSPORT=inject changes nothing there. The
+    Every matrix goes through the inject door, so a listed case runs on no
+    lane until its entry goes; the rosters are untouched. The
     shape is FIXTURE_NOT_READY's -- an exclusion with a reason -- and every
     entry must name a registered case, carry a reason, and cite the issue
     that decides when the entry goes.
@@ -843,11 +843,9 @@ class InjectLaneExclusionsTest(unittest.TestCase):
         self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
 
     def test_the_blocking_roster_cases_it_excludes_are_the_pinned_set(self):
-        # The merge-blocking presubmit runs on the inject lane, so a roster
-        # case listed here leaves what can red a pull request: hack/ci-eval-pr.sh
-        # drops it from the matrix and from BOOTSTRAP_ADMITTED there. It keeps
-        # its seat on the today lane, which grades over the api transport but
-        # gates nothing. Adding another is that decision, made here and in
+        # A roster case listed here leaves what can red a pull request:
+        # hack/ci-eval-pr.sh drops it from the matrix and from
+        # BOOTSTRAP_ADMITTED. Adding one is that decision, made here and in
         # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
         # exclusion entry.
         roster = set(eval_rosters.blocking_roster())
@@ -867,9 +865,8 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
 
     def test_an_exclusion_keeps_the_case_on_its_roster(self):
-        # An entry here leaves the case on its roster: the today lane still
-        # grades an excluded presubmit case, and an excluded nightly case runs
-        # nowhere in CI until it can go through the inject door.
+        # An entry here leaves the case on its roster; it runs nowhere in CI
+        # until it can go through the inject door.
         self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
         for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
             with self.subTest(case=case, tier=tier):
@@ -878,118 +875,6 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, eval_rosters.blocking_roster())
                 else:
                     self.assertIn(case, eval_rosters.nightly_cases())
-
-
-# The api lane's exclusions at their introduction (#3263): the cases only the
-# inject door can carry. An edit to the file edits this set.
-API_LANE_EXCLUDED = [
-    "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
-    "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
-    "chat-stop-during-card-wait-a2a-door",  # #5407: the harness cancels through the A2A door, which only the next lane turns on
-    "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
-    "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
-    "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
-    "tse-profile-names-the-oom-kill",  # #3842: delegated_to, as above
-]
-
-
-class ApiLaneExclusionsTest(unittest.TestCase):
-    """hack/eval/api-lane-exclusions.txt: the inject lane's mirror, checked the same way."""
-
-    def test_the_file_is_the_pinned_set(self):
-        self.assertEqual(list(eval_rosters.api_lane_exclusions()), API_LANE_EXCLUDED)
-
-    def test_every_exclusion_names_a_registered_nightly_case(self):
-        # Not a presubmit case: the presubmit matrix also runs on the today
-        # lane over api, where a case excluded here would hold a seat it
-        # never fills, and a case new to the inject door earns its record in
-        # the nightly first.
-        for case in eval_rosters.api_lane_exclusions():
-            with self.subTest(case=case):
-                self.assertTrue((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").is_file(), f"{case} has no task.yaml")
-                self.assertIn(case, eval_rosters.nightly_cases())
-                self.assertNotIn(case, eval_rosters.presubmit_cases())
-                self.assertNotIn(case, eval_rosters.blocking_roster())
-
-    def test_every_exclusion_carries_a_reason_that_names_an_issue(self):
-        for case, reason in eval_rosters.api_lane_exclusions().items():
-            with self.subTest(case=case):
-                self.assertTrue(reason, f"{case}: no reason in the comment block above it")
-                self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
-
-    def test_no_case_is_excluded_on_both_lanes(self):
-        self.assertFalse(set(eval_rosters.api_lane_exclusions()) & set(eval_rosters.inject_lane_exclusions()))
-
-    def test_every_registered_stopped_ask_is_excluded(self):
-        # A stopped ask errors on the api transport, so an unlisted one would
-        # error there every repetition. The directive is read from the module
-        # the harness reads it from, so the two cannot disagree.
-        import yaml
-
-        sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench.stop_hook import is_stopped_ask
-
-        excluded = eval_rosters.api_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if is_stopped_ask(str(doc.get("prompt") or "")):
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
-
-    def test_every_registered_profile_ask_is_excluded(self):
-        # A [bench:profile ...] ask errors on the api transport (#5945), so an
-        # unlisted one would error there every repetition. Read from the
-        # harness's own module.
-        import yaml
-
-        sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench.profile_hook import is_profile_ask
-
-        excluded = eval_rosters.api_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if is_profile_ask(str(doc.get("prompt") or "")):
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} is a profile ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
-
-    def test_every_registered_reply_under_pushed_report_is_excluded(self):
-        # The same rule for the pushed-report replay: it errors on the api
-        # transport, and its directive is read from the harness's module.
-        import yaml
-
-        sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench.pushed_report import is_reply_under_pushed_report
-
-        excluded = eval_rosters.api_lane_exclusions()
-        found = []
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if is_reply_under_pushed_report(str(doc.get("prompt") or "")):
-                found.append(case)
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
-        self.assertIn("chat-reply-under-pushed-report", found)
-
-    def test_every_registered_case_grading_delegated_to_is_excluded(self):
-        # delegated_to reads the inject read route's childAddressees, which
-        # the api transport has no chain to report, so the check errors
-        # there; a case that uses it anywhere in its spec runs on the inject
-        # lane only.
-        import yaml
-
-        def uses_delegated_to(node) -> bool:
-            if isinstance(node, dict):
-                return node.get("type") == "delegated_to" or any(uses_delegated_to(v) for v in node.values())
-            if isinstance(node, list):
-                return any(uses_delegated_to(v) for v in node)
-            return False
-
-        excluded = eval_rosters.api_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if uses_delegated_to(doc.get("verification_spec")):
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} grades delegated_to but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
@@ -1033,6 +918,11 @@ INJECT_LANE_REQUESTING = [
     # user asked for, it may propose the change as a pull request (#4224);
     # its objective's pull_request_opened leaf allows one.
     "stop-on-permission-refusal",
+    # stop-on-unknown-flag-write-refusal: refused the gcloud write for a flag
+    # the policy cannot read, it may propose the change as a pull request
+    # (as #2872 and #4224 did for its siblings); its objective's
+    # pull_request_opened leaf allows one.
+    "stop-on-unknown-flag-write-refusal",
     "vcs-review-feedback-read-back",
     # Declares `requested_pull_requests: 2`, for the pull request it opens and
     # closes beside the one its check grades.
@@ -1619,7 +1509,7 @@ def roster_comment_lines(text: str):
     for number, raw in enumerate(text.splitlines(), start=1):
         if "#" not in raw:
             continue
-        # Section markers are not comments about a case. The certification
+        # Section markers are not comments about a case. The validated-capabilities
         # suite's `# part N` file is gone (membership is the task file), so the
         # nightly's sorted-section marker is the only one left.
         if raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
