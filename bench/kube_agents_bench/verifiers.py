@@ -3396,10 +3396,9 @@ class DelegatedToVerifier(BaseVerifier):
     ``forbidden_addressees``: Python regular expressions, none of which may
     ``re.fullmatch`` any addressee. At least one of the two lists is set.
 
-    Fails closed: a run that could not say (the api transport, or a door
-    older than the field) is ``status="error"``, never a pass or a fail. A
-    case that relies on this check belongs in
-    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    Fails closed: a run that could not say (the api transport, which no CI
+    lane uses, or a door older than the field) is ``status="error"``, never
+    a pass or a fail.
     """
 
     type: Literal["delegated_to"]
@@ -4403,12 +4402,19 @@ def _forge_rate_limit_budget() -> float:
 
 def _forge_rate_limit_wait(headers: Any) -> float:
     """Seconds to wait before reading again under a rate limit: the
-    Retry-After GitHub asks, else until its X-RateLimit-Reset, else the
-    default; at most one slice and what is left of the budget. Zero once the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset when
+    X-RateLimit-Remaining is 0, else the default; at most one slice and what
+    is left of the budget. Zero once the
     budget is spent."""
     get = headers.get if headers is not None else (lambda _key: None)
     wait = _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    # The reset is when the hourly budget comes back, so it is the wait only
+    # when that budget is spent (remaining 0); a secondary limit with budget
+    # left waits the default instead (#6177).
+    spent = str(get(_RATELIMIT_REMAINING_HEADER) or "").strip() == "0"
     for header, offset in ((_RETRY_AFTER_HEADER, None), (_RATELIMIT_RESET_HEADER, time.time())):
+        if header == _RATELIMIT_RESET_HEADER and not spent:
+            continue
         try:
             value = float(get(header))
         except (TypeError, ValueError):
@@ -4446,6 +4452,9 @@ def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
     to the App's permissions; None for any other answer (#6105)."""
     if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
         return None
+    if forges.forge_name() != forges.FORGE_GITHUB:
+        # Only GitHub's evals repositories share one installation's budget.
+        return f"GitLab rate-limited {what} (answered {status}), so this check could not be evaluated"
     return (
         f"GitHub rate-limited {what} (answered {status}); the evals repositories share one App "
         "installation's hourly budget, so this check could not be evaluated"
@@ -4468,6 +4477,14 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     transient, and keeps the check's error plain unless the check drops it as
     not behind the error."""
     global _forge_rate_limit_waited
+    # The token this read sends, not the variable: read_token falls back to
+    # BENCH_GITHUB_TOKEN when the file holds no usable token. Read once,
+    # before any wait: the job renews the file every 40 minutes, and a
+    # renewal during a wait must not make the next pass read this token as
+    # someone else's and stop waiting (#6177).
+    grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
+        forges.FORGE_GITHUB, os.environ
+    )
     while True:
         _last_forge_error_headers.set(None)
         try:
@@ -4479,11 +4496,6 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
             return status, payload
         headers = _last_forge_error_headers.get()
         rate_limited = is_rate_limit_answer(status, payload, headers)
-        # The token this read sent, not the variable: read_token falls back
-        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
-        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
-            forges.FORGE_GITHUB, os.environ
-        )
         if rate_limited and grading_app:
             # The shared installation's budget (#6105): wait for its reset
             # rather than grade a check that never ran.
@@ -7511,8 +7523,8 @@ class GitHubWritesVerifier(BaseVerifier):
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
-    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the five first-run audits keep their clock until
+    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): an install that
+    keeps the sweep on has the five first-run audits keep their clock until
     the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
@@ -8582,7 +8594,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "schedule-never-succeeds", "rollout-drops-traffic", "strategy-causes-downtime", "cronjob-runs-overlap",
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
-        "pdb-overlapping", "untargeted-compute-class-workload",
+        "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",

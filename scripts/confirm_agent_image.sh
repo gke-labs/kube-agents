@@ -46,7 +46,11 @@
 # moves with the agent's. It does not when the agent image is digest-pinned:
 # that path falls back to spec.deployment.tag, so the agent freezes at its
 # digest while the proxy rolls forward on every deploy. The operator logs that
-# and carries on.
+# and carries on. Two of the rendered containers the operator can also pin
+# from its own environment, before anything on the CR: CREDENTIAL_PROXY_IMAGE
+# for agent-api-auth and A2A_BRIDGE_IMAGE for the hermes-bridge it renders
+# under mode: next. A container on such a pin is reported and left out of the
+# verdict; the constants below say how the pins are read.
 #
 # The check is that no release image found is off the tag, not that a
 # particular set of them is present. Which containers the operator renders
@@ -165,12 +169,33 @@ readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.a
 # own image, like the other release A2A images (a2aBridgeImage). On that
 # second rung it carries the operator's tag, not the agent's, so a redeploy
 # that moves the agent tag and not the operator's reds here naming
-# hermes-bridge: roll the operator too, or pin A2A_BRIDGE_IMAGE. Read from the
+# hermes-bridge: roll the operator too, or pin A2A_BRIDGE_IMAGE, which takes
+# the bridge out of the verdict (below). Read from the
 # owning CR alone, by the Deployment's owner
 # reference: another agent's sidecar named like one of this agent's rendered
 # containers must not take that container out of the verdict.
 readonly OWNER_JSONPATH='{range .metadata.ownerReferences[?(@.kind=="PlatformAgent")]}{.name}{"\n"}{end}'
 readonly DECLARED_SIDECAR_JSONPATH='{range .spec.deployment.sidecars[*]}{.name}{"\n"}{end}'
+# The two companion images the operator pins from its own environment, before
+# anything on the CR: CREDENTIAL_PROXY_IMAGE (resolveCredentialProxyImage) for
+# the agent-api-auth init container, and A2A_BRIDGE_IMAGE (a2aBridgeImage) for
+# the hermes-bridge it renders. The chart renders them from
+# credentialProxy.image and hermesBridge.image. A pin names its own tag, which
+# no re-tag of the agent moves, so a container whose image equals a pin is
+# reported and left out of the verdict, like a declared sidecar; a container
+# off the pin (a pin set after the operator last rendered, or one it never
+# read) is judged as before. The pins are read from the manager container of
+# the operator Deployment in the same namespace, found by the label the chart
+# (<release>-controller-manager) and the kustomize base
+# (kubeagents-controller-manager) both put on it. Of a name set twice the last
+# entry is the pin, as it is for the container: the chart appends
+# operator.extraEnv after its own entry so that it wins. No operator
+# Deployment, or neither variable set, leaves the verdict as it was.
+readonly OPERATOR_DEPLOYMENT_SELECTOR="app.kubernetes.io/name=kube-agents-operator"
+readonly OPERATOR_MANAGER_CONTAINER="manager"
+readonly CREDENTIAL_PROXY_IMAGE_ENV="CREDENTIAL_PROXY_IMAGE"
+readonly A2A_BRIDGE_IMAGE_ENV="A2A_BRIDGE_IMAGE"
+readonly OPERATOR_ENV_JSONPATH='{range .items[*]}{range .spec.template.spec.containers[?(@.name=="'"${OPERATOR_MANAGER_CONTAINER}"'")].env[*]}{.name}={.value}{"\n"}{end}{end}'
 
 stderr_file="$(mktemp)"
 # Carry the real status through the cleanup. A bare `rm` in an EXIT trap
@@ -208,6 +233,32 @@ is_release_image() {
 # A container the CR declares as a sidecar, by name.
 is_declared_sidecar() {
   [ -n "$declared_sidecars" ] && grep -qxF "$1" <<<"$declared_sidecars"
+}
+
+# Sets credential_proxy_pin and a2a_bridge_pin from the operator's manager
+# env, read as name=value lines. A later entry of the same name replaces an
+# earlier one; an entry with no literal value (valueFrom) reads as empty and
+# pins nothing.
+read_operator_pins() {
+  credential_proxy_pin=""
+  a2a_bridge_pin=""
+  local name value
+  while IFS='=' read -r name value; do
+    case "$name" in
+      "$CREDENTIAL_PROXY_IMAGE_ENV") credential_proxy_pin="$value" ;;
+      "$A2A_BRIDGE_IMAGE_ENV") a2a_bridge_pin="$value" ;;
+    esac
+  done <<<"$1"
+}
+
+# The operator variable whose pin this image is, byte for byte; empty when it
+# is neither.
+operator_pin_of() {
+  if [ -n "$credential_proxy_pin" ] && [ "$1" = "$credential_proxy_pin" ]; then
+    echo "$CREDENTIAL_PROXY_IMAGE_ENV"
+  elif [ -n "$a2a_bridge_pin" ] && [ "$1" = "$a2a_bridge_pin" ]; then
+    echo "$A2A_BRIDGE_IMAGE_ENV"
+  fi
 }
 
 # The first eight hex characters of sha256 of a plugin name, as the operator
@@ -274,7 +325,7 @@ inspect_template() {
   mismatched=""
   skipped=""
 
-  local name image
+  local name image pin
   while IFS='=' read -r name image; do
     [ -n "$image" ] || continue
     is_release_image "$image" || continue
@@ -284,6 +335,11 @@ inspect_template() {
     fi
     if is_declared_sidecar "$name"; then
       skipped="${skipped}  ${name}: ${image} (sidecar declared on the PlatformAgent; its tag is the CR's)"$'\n'
+      continue
+    fi
+    pin="$(operator_pin_of "$image")"
+    if [ -n "$pin" ]; then
+      skipped="${skipped}  ${name}: ${image} (pinned by ${pin} on the operator; its tag is the pin's)"$'\n'
       continue
     fi
     matched=$((matched + 1))
@@ -310,6 +366,9 @@ while true; do
   if [ -n "$owner" ]; then
     declared_sidecars="$(kubectl get "platformagent/${owner}" -n "$namespace" -o jsonpath="$DECLARED_SIDECAR_JSONPATH" 2>/dev/null | grep -v '^$' || true)"
   fi
+  # Errors here are not kept either: no operator Deployment under the label
+  # reads as no pins, and every companion container is judged.
+  read_operator_pins "$(kubectl get deployment -n "$namespace" -l "$OPERATOR_DEPLOYMENT_SELECTOR" -o jsonpath="$OPERATOR_ENV_JSONPATH" 2>/dev/null || true)"
   inspect_template "$listing"
 
   if [ "$matched" -gt 0 ] && [ -z "$mismatched" ]; then

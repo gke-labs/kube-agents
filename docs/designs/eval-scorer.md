@@ -89,7 +89,9 @@ exception: when the inject lane has set aside every objective check (below), the
 correctness is the lane's doing and the repetition is reported not applicable rather than blocked.
 The first has one too: when every errored check's errored leaves lead with
 `KUBE_AGENTS_FORGE_UNAVAILABLE`, no check failed, no catastrophic safeguard errored, the record carries
-`VerificationCoverage`, and rung 3 is met, the repetition is `infra`. A forge-reading check puts that
+`VerificationCoverage`, and rung 3 is met, the repetition is `infra`. When an errored catastrophic
+safeguard is the only thing keeping such a record on rung 2, it stays blocked and its reason leads
+with `KUBE_AGENTS_FORGE_SAFEGUARD`, which the CI-health dashboard reads to name the forge. A forge-reading check puts that
 marker on its reason only when every forge read behind the error that failed did so transiently.
 A read the check answered as control flow (a fallback after a 404, a page that is not there) is not
 behind the error, and neither are the reads of a candidate it rejected when none of them was
@@ -104,8 +106,9 @@ and the verdict gives each errored check's reason, not only its name.
 Before a rate-limited read under that token counts as transient, the grader waits for the limit to
 lift (#6105). The evals repositories share one App installation, so one hourly budget, and when
 concurrent runs spend it every read answers 403 until the reset GitHub names in `X-RateLimit-Reset`.
-The read waits for that reset, or the `Retry-After` it asks, at most five minutes at a time and
-`BENCH_FORGE_RATE_LIMIT_WAIT_SEC` (default ten minutes) in all per grading process, then reads again.
+The read waits the `Retry-After` it asks, else until that reset when the budget is spent, else a
+minute, at most five minutes at a time and `BENCH_FORGE_RATE_LIMIT_WAIT_SEC` (default ten minutes)
+in all per grading process, then reads again.
 A limit that outlasts the wait is transient as above, and its check's reason says GitHub rate-limited
 the read, not that the token lacks a permission. A catastrophic safeguard errored that way still
 keeps the repetition on rung 2: an unchecked safeguard isn't weather. The wait is what lets it run.
@@ -279,7 +282,10 @@ A case not run because the lease-time seeded-fleet scan saw a fixture it needs d
 `kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
 not a wiped case for the floor either: a role is excused only when the lease-time read, after
 the pool verifier's convergence wait, and the hourly scan's last two passes all show it drifted,
-so it is not weather a rerun clears, and nothing in the change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+so it is not weather a rerun clears, and nothing in the change can repair it. One drift needs no
+second scan: the declared-intent note in the pool's GitOps repository (the scan's
+`repository/<path>` subject), which the hourly scan has no credential to read and which no rerun
+changes. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
 named in a note. It still counts toward the all-cases guard, and a case with even one repetition
 lost some other way is weather as before.
 A blocking case outranks the
@@ -955,9 +961,9 @@ The judge model is its own component, pinned independently of the agent model, b
 tracks whatever the agent is running cannot be told apart from an agent that got better — and a
 drifting judge moves every baseline at once.
 
-A sixth component, `mode`, is the `spec.mode` the run graded (`today` or `next`), read off the
-transport (`AGENT_TRANSPORT=inject` is `next`). It is written only when it is not `today`, so the
-lines recorded before it existed match today's key unchanged. `bench/baselines/README.md` is
+A sixth component, `mode`, is the stack the run graded: `next` on every key a run writes, since
+every install runs the A2A stack; `today` is the legacy reading of a key with no `mode`, so the
+lines recorded before the component existed match their own key unchanged. `bench/baselines/README.md` is
 canonical for it.
 
 `fleet` and `verifiers` are hand-bumped integers rather than content hashes: a hash changes on a
@@ -1006,10 +1012,8 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. The today lane (`EVAL_ROLLBACK_LANE=1`) is the fourth condition and the second member of the
-class, enforced in the same two places: its key reads `today`, but it grades an install rolled back
-from `next`, which is not what today's window measures. A next-mode run on `main` is not in the
-class: the key's `mode` files it under a window of its own. `bench/baselines/README.md` is
+moved. A run on `main` is not in the
+class: the key's `mode` files it under the `next` window, apart from the legacy lines. `bench/baselines/README.md` is
 canonical for the rule; this paragraph records why the read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
@@ -1085,8 +1089,8 @@ It is `ci-kube-agents-eval-nightly` in
 export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
-the part that matters. It, its `-main-b` to `-main-e` shards and its three writers thirds grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
-so record under the version key's `next` mode. No job in the file records under `today` now.
+the part that matters. It, its `-main-b` to `-main-e` shards and its three writers thirds grade through the inject door and
+so record under the version key's `next` mode. No job records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the

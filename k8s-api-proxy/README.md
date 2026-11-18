@@ -2,7 +2,7 @@
 
 The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
 `kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
-authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
+authenticates the caller (a `CallerAuthenticator`; the binary uses `pkg/tokenreview`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
 caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), impersonation,
 `Audit-ID` and `Connection`-named headers (`pkg/k8sapiproxy/headers.go`), forwards the request to
@@ -11,7 +11,7 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
 `cmd/k8s-api-proxy` builds the production server binary.
 
-`NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
+`tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's `CallerAuthenticator`: it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
@@ -91,7 +91,9 @@ refetches but never serves one partition another's response.
 
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
-archive against the release's signed `checksums.txt`. Releases published before the pipeline built
+archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
+archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
+prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
 it carry none.
 
 It is a self-contained Go module. Run its checks from this directory:

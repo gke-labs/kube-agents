@@ -10,9 +10,9 @@ The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
   ``BOOTSTRAP_ADMITTED``;
-- the certification suite has no file: ``EVAL_TIER=certification`` runs every
-  task file under ``bench/tasks/`` carrying the bare line ``suite: certification``,
-  in sections by its ``certification_part: N`` line, one periodic each;
+- the validated-capabilities suite has no file: ``EVAL_TIER=validated-capabilities`` runs every
+  task file under ``bench/tasks/`` carrying the bare line ``suite: validated-capabilities``,
+  in sections by its ``suite_part: N`` line, one periodic each;
 - ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
   from the nightlies' recordings, registered cases, gating nothing.
 
@@ -53,31 +53,28 @@ GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
 # same rules as the GitLab lane's.
 GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
-# The certification suite has no roster file: a case is on its lane when its
-# task file carries the bare line `suite: certification`, and in section N
-# (one ci-kube-agents-certification periodic each) when it carries
-# `certification_part: N`; no line is part 1. The two patterns are the
-# whole grammar, the twins of CERTIFICATION_SUITE_LINE_RE and
-# CERTIFICATION_PART_LINE_RE in hack/ci-eval-pr.sh; the validator refuses a
+# The validated-capabilities suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: validated-capabilities`, and in section N
+# (one ci-kube-agents-validated-capabilities periodic each) when it carries
+# `suite_part: N`; no line is part 1. The two patterns are the
+# whole grammar, the twins of VALIDATED_CAPABILITIES_SUITE_LINE_RE and
+# VALIDATED_CAPABILITIES_PART_LINE_RE in hack/ci-eval-pr.sh; the validator refuses a
 # task file whose YAML says the suite or the part in any other spelling, so
 # what this module lists is what the shell runs.
-CERTIFICATION_SUITE = "certification"
+VALIDATED_CAPABILITIES_SUITE = "validated-capabilities"
 # The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
 # step 2): registered cases, replayed from the nightlies' recordings.
 REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
-CERTIFICATION_SUITE_LINE_RE = re.compile(r"^suite: certification$", re.M)
-CERTIFICATION_PART_KEY = "certification_part"
-CERTIFICATION_PART_LINE_RE = re.compile(r"^certification_part: ([1-9][0-9]*)$", re.M)
-CERTIFICATION_DEFAULT_PART = 1
-# The inject lane's exclusions (#2039): case ids the script drops from TASKS
-# under AGENT_TRANSPORT=inject, each with its reason as the comment block
-# directly above it.
+VALIDATED_CAPABILITIES_SUITE_LINE_RE = re.compile(r"^suite: validated-capabilities$", re.M)
+VALIDATED_CAPABILITIES_PART_KEY = "suite_part"
+VALIDATED_CAPABILITIES_PART_LINE_RE = re.compile(r"^suite_part: ([1-9][0-9]*)$", re.M)
+VALIDATED_CAPABILITIES_DEFAULT_PART = 1
+# The inject lane's exclusions (#2039): case ids the script drops from TASKS,
+# each with its reason as the comment block directly above it; every matrix
+# goes through the inject door, so a listed case runs on no lane.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
-# Its mirror (#3263): the cases every lane but the inject one drops, because
-# their premise needs the inject door. Same shape, same reason rule.
-API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
 # The lane safeguards (#2079): the verification_spec entries the script
-# appends to every case it runs, on the api and inject lanes alike (#2611;
+# appends to every case it runs (#2611;
 # the file keeps the inject lane's name). YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
 # reads it; scripts/test_eval_rosters.py pins its shape.
@@ -186,18 +183,18 @@ def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
-def certification_part(text: str) -> int:
+def suite_part(text: str) -> int:
     """The part a task file's text puts its case in: the N of its bare
-    ``certification_part: N`` line, CERTIFICATION_DEFAULT_PART without one."""
-    match = CERTIFICATION_PART_LINE_RE.search(text)
-    return int(match.group(1)) if match else CERTIFICATION_DEFAULT_PART
+    ``suite_part: N`` line, VALIDATED_CAPABILITIES_DEFAULT_PART without one."""
+    match = VALIDATED_CAPABILITIES_PART_LINE_RE.search(text)
+    return int(match.group(1)) if match else VALIDATED_CAPABILITIES_DEFAULT_PART
 
 
 def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
-def certification_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
+def validated_capabilities_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
     """Case ids whose task file carries the bare suite line, in case-id order
     (the order the shell's ``LC_ALL=C sort`` gives the same names). A task
     file that cannot be read is left out here; the validator reports it."""
@@ -210,7 +207,7 @@ def certification_cases(tasks_dir: pathlib.Path | None = None) -> list[str]:
     # as grep does not; the validator reports the spelling.
     for task in sorted(tasks_dir.glob("*/task.yaml"), key=lambda path: path.parent.name):
         text = _task_text(task)
-        if text is not None and CERTIFICATION_SUITE_LINE_RE.search(text):
+        if text is not None and VALIDATED_CAPABILITIES_SUITE_LINE_RE.search(text):
             names.append(task.parent.name)
     return names
 
@@ -225,13 +222,13 @@ def _task_text(task: pathlib.Path) -> str | None:
         return None
 
 
-def certification_parts(tasks_dir: pathlib.Path | None = None) -> dict[int, list[str]]:
+def suite_parts(tasks_dir: pathlib.Path | None = None) -> dict[int, list[str]]:
     """Case ids of the suite by part, each list in case-id order; a part
     nobody names is absent, since the script refuses to run it."""
     tasks_dir = TASKS_DIR if tasks_dir is None else tasks_dir
     parts: dict[int, list[str]] = {}
-    for name in certification_cases(tasks_dir):
-        part = certification_part(_task_text(tasks_dir / name / "task.yaml") or "")
+    for name in validated_capabilities_cases(tasks_dir):
+        part = suite_part(_task_text(tasks_dir / name / "task.yaml") or "")
         parts.setdefault(part, []).append(name)
     return parts
 
@@ -265,10 +262,6 @@ def parse_lane_exclusions(text: str) -> dict[str, str]:
 
 
 def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
-    return parse_lane_exclusions(path.read_text(encoding="utf-8"))
-
-
-def api_lane_exclusions(path: pathlib.Path = API_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
 
 
@@ -482,9 +475,8 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
         "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
-        "api lane exclusions": len(api_lane_exclusions()),
-        "certification cases": len(certification_cases()),
-        "certification parts": len(certification_parts()),
+        "validated-capabilities cases": len(validated_capabilities_cases()),
+        "validated-capabilities parts": len(suite_parts()),
     }
 
 

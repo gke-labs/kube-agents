@@ -1,6 +1,6 @@
 # MCP server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the console page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject.
+A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the console page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject.
 
 It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
@@ -89,6 +89,22 @@ Names are this server's memory only, and they're shared:
 - `session_on`, `session_off`, `help`: send `/session`, `/session off` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `help` is a message to the agent, sent like any other: while the conversation's turn is still running it waits for it to end, as a second `send_message` does.
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.
+
+## Sending a turn to an AgentProfile
+
+`send_message` takes two optional fields that send the turn straight to an AgentProfile instead of the conversation's agent, as the A2A console can:
+
+- `addressee`: the profile's name, for example `cluster`. It must be one subject token: no spaces, dots or wildcards.
+- `parameters`: the profile's task parameters, an object of string values, for `cluster` its `project`, `location` and `cluster`. They are refused without an `addressee`.
+
+Both go into the console frame as the gateway's `ConsoleInFrame` reads them (`addressee`, `parameters`). Without them the frame is the same as before. An `addressee` is refused on a stop word, a bare `/feedback` or `/feedback summary`, and any `/session` text, a message after it included, since those are commands for the conversation rather than tasks. An addressed turn is a new task for the profile, never a session. Everything else is the gateway's to check: it refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, and its notice is the turn's answer. `read_topics` with `action: cards` lists the agent cards on `DIRECTORY` by profile.
+
+The gateway publishes a profile's task on `a2a.submit`, which the console account can't read, so the turn can't find its task from the submission the way a plain turn does. Instead, the gateway's status line for a profile turn (`⏳ submitted…`) names the task, the profile it went to and the inbound frame whose turn started it (`taskId`, `addressee`, `inReplyTo`). The turn takes only the line that answers its own frame, so another turn's line on the same conversation (an earlier turn's that came late, or another client's) is not taken for it, and follows that task's events and terminal on `TASKS`, as it follows its own. A turn still running when the wait ends returns the task as `<profile>/<task-id>`. Read it with `task_control get` under that reference, which always resolves. A bare task id resolves only while this server still holds the task as running, since otherwise it is looked up from the task's submission, which the console can't see.
+
+Two known limits:
+
+- The gateway posts the status line before it publishes the submission. If that publish fails, the turn reports a running task that never existed, until its wait runs out.
+- Against a gateway older than this change, the status line names no task, so an addressed turn returns after the gateway's notice with no task, about ten seconds later.
 
 ## Card reports and poll_events
 

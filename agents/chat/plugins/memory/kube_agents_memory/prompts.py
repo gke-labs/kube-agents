@@ -263,6 +263,15 @@ def tool_schemas(
                     "content": {"type": "string", "description": "The fact to store, phrased to stand on its own."},
                     "scope": scope_write,
                     "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'team standard')."},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "handoff"],
+                        "description": (
+                            "Kind of entry to store: 'fact' (default durable fact or decision) or "
+                            "'handoff' (iteration-budget investigation checkpoint with verified findings, "
+                            "ruled-out hypotheses, and remaining next steps so a follow-up session can resume)."
+                        ),
+                    },
                 },
                 "required": ["content"],
             },
@@ -284,6 +293,13 @@ def tool_schemas(
                 "properties": {
                     "query": {"type": "string", "description": "What to search for."},
                     "scope": scope_read,
+                    "since_hours": {
+                        "type": "integer",
+                        "description": (
+                            "Optional lookback window in hours (e.g. 8, 12, or 24 for shift handover) "
+                            "to filter recalled memories to recent operational events and handoffs."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },

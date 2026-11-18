@@ -238,7 +238,9 @@ admit.
 `name` is `schedule/<name>` or a bare trigger source, `origin` is `builtin` (the only origin
 today, since a user's schedule runs at its creator's tier and carries no trigger), and `stream` is
 the report stream the grant binds, absent when it binds none. A stream is only ever the
-schedule's own name: `schedule/<stream>`, nothing else. The block is read strictly: a key twice,
+schedule's own name: `schedule/<stream>`, nothing else. `script`, absent on a prompt run, names
+the profile script a built-in schedule's run executes (#5622): a DNS-1123 label, never a path,
+and only on a `schedule/<name>` trigger. The block is read strictly: a key twice,
 a key that matches `trigger` or one of its fields only under case folding, or a null inside the
 trigger is refused. The gateway writes it
 on a trigger's submission and nowhere else; it is absent on every other task. It is a claim,
@@ -768,6 +770,15 @@ from what the client or the parent task asked. They never ride the authority blo
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
 to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
+
+The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
+request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
+and only for a turn that arrived as a structured confirm action, never from free text or a
+delegation's arguments. A child task carries its parent's value from the gateway's own record and
+cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
+the field and every profile write is refused. Absent means false, so a
+submission that asks for no change is byte-identical to one written before the field existed. The
+dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never

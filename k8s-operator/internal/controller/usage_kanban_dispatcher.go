@@ -142,8 +142,10 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 	// meets a streak rule too after about an hour, and its cause is still the
 	// lock, so it keeps the stuck message and hint.
 	if stuck != nil {
-		msg := fmt.Sprintf("A kanban dispatcher tick on board %q waited on its database (it ran past %s, or failed on a lock after a busy timeout), and no good tick has followed in the %s since it began; the board may be locked.",
-			kanbanDispatcherLabel(stuck.Board), kanbanDispatcherStuckLimit, time.Duration(stuck.Seconds)*time.Second)
+		// No duration here: the message is written once per reason, and a
+		// duration would be out of date at the next poll.
+		msg := fmt.Sprintf("A kanban dispatcher tick on board %q waited on its database (it ran past %s, or failed on a lock after a busy timeout), and no good tick has followed; the board may be locked.",
+			kanbanDispatcherLabel(stuck.Board), kanbanDispatcherStuckLimit)
 		if failing > 1 {
 			msg += fmt.Sprintf(" %d boards are failing.", failing)
 		}

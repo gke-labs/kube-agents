@@ -276,3 +276,45 @@ func TestWhichRepliesAreTheAnswerBeforeAndAfterTheOlderVerifierGoes(t *testing.T
 		}
 	}
 }
+
+// The two refusals Answer gives before it decides anything are answers too,
+// so they carry the request's id whenever the request carries a well-formed
+// one: a request that doesn't decode (another field of the wrong type, as a
+// newer client's could be after a field changes) and a subject the verifier
+// can't place. Without the id, a client that refuses un-echoed replies drops
+// them and the check ends unreachable, held and retried, rather than refused.
+// A body that isn't JSON at all, or an id that isn't well-formed, has nothing
+// to echo.
+func TestTheEarlyRefusalsEchoTheRequestID(t *testing.T) {
+	s, _, hop := twoHop(t)
+	svc := &Service{Resolver: &Resolver{Store: s}}
+	ctx := context.Background()
+	subj, err := VerifySubject(podB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := testRequestID(t)
+
+	undecodable := []byte(`{"verb": 5, "requestId": "` + id + `"}`)
+	if got := svc.Answer(ctx, subj, undecodable); got.Allowed || got.Reason != "the request is not well-formed" || got.RequestID != id {
+		t.Errorf("an undecodable request with a well-formed id: got %+v, want a malformed-request refusal echoing %s", got, id)
+	}
+
+	b, err := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C", RequestID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.Answer(ctx, "not.a.verify.subject", b); got.Allowed || got.RequestID != id {
+		t.Errorf("an unplaceable subject: got %+v, want a refusal echoing %s", got, id)
+	}
+
+	for name, body := range map[string][]byte{
+		"not json":            []byte(`not json`),
+		"a malformed id":      []byte(`{"verb": 5, "requestId": "abc"}`),
+		"an id of wrong type": []byte(`{"verb": 5, "requestId": 7}`),
+	} {
+		if got := svc.Answer(ctx, subj, body); got.Allowed || got.RequestID != "" {
+			t.Errorf("%s: got %+v, want a refusal with no id", name, got)
+		}
+	}
+}

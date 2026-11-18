@@ -51,7 +51,12 @@ gcloud_core_version() {
 # TERRAFORM_TEST_MIN_VERSION in the Makefile), which is why they live in
 # tftests/: from 1.6 `terraform init` parses a root's tests/ directory, and
 # suites there would break init on the 1.6+ releases this floor admits.
-# validate.yml's floor job holds it.
+# Below 1.12, || and && evaluate both operands, so a validation guarded by
+# its left operand needs a conditional, or try() or can() around the right
+# one.
+# validate.yml's floor job holds it: init and validate on every root, and a
+# plan of full-install at its defaults, which leaves the modules that are off
+# by default unplanned.
 MIN_TERRAFORM_VERSION="1.5.0"
 
 # Echo the Terraform core version, e.g. "1.15.8", from the first line of

@@ -1460,10 +1460,16 @@ class InjectTask:
         token: str,
         author: str = DEFAULT_AUTHOR,
         message_id: str = "",
+        profile: str = "",
+        parameters: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.conversation = conversation
         self.prompt = prompt
+        # The AgentProfile the opening turn is addressed to, and its
+        # parameters (profile_hook, #5945); empty sends the turn as any other.
+        self.profile = profile
+        self.parameters = dict(parameters or {})
         self.token = token
         self.author = author
         # The backend message id, which the gateway's ingress log joins to the
@@ -1547,6 +1553,10 @@ class InjectTask:
         }
         if self.message_id:
             payload["messageId"] = self.message_id
+        if self.profile:
+            payload["profile"] = self.profile
+            if self.parameters:
+                payload["parameters"] = self.parameters
         self.unanswered_post = True
         try:
             body = _request(
