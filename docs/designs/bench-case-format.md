@@ -120,6 +120,13 @@ later reports on a UTC day reply inside its first report's thread (one thread pe
 mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
 own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:reply-after-idle]`, with `opening:`, `idle_seconds:` (60 to 1800) and
+`reply:` lines under it, sends the opening as turn one, waits that long with the conversation
+idle, then sends the reply as a second message on it
+([`bench/kube_agents_bench/idle_reply.py`](../../bench/kube_agents_bench/idle_reply.py)). The
+reply turn's answer is the deliverable. The harness writes `harness_idle_wait`, which completes
+only when the reply ran on a different session pod from the opening's, so a case can grade
+that the reply was rehydrated. Inject transport only.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
