@@ -219,6 +219,7 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 		corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "sub"},
 		corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: "a2a-sub"},
 		corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: "aud"},
+		corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: "system:serviceaccount:ns:a2a-gateway"},
 	)
 	bc.EnvFrom = append(bc.EnvFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "plugin"}}})
 	broker.Spec.Template.Annotations[secretEnvHashAnnotation] = "digest"
@@ -261,6 +262,13 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 		if _, ok := env[name]; ok {
 			t.Errorf("exec pod carries %s", name)
 		}
+	}
+	// The A2A gateway stays an allowed caller on the exec tier while Chat is
+	// armed, so the binding that holds it to the a2a-chat audience (which
+	// this tier never confers) comes along: here it refuses the gateway's
+	// identity every audience (#6090).
+	if got := env[credentialProxyA2AChatCallersEnvVar].Value; got != "system:serviceaccount:ns:a2a-gateway" {
+		t.Errorf("exec pod %s = %q, want the A2A gateway's binding carried over", credentialProxyA2AChatCallersEnvVar, got)
 	}
 	if env[credentialProxyRoleEnv].Value != credentialProxyExecRole {
 		t.Errorf("role %q, want exec", env[credentialProxyRoleEnv].Value)
