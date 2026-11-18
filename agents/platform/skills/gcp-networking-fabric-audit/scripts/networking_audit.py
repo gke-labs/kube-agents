@@ -221,9 +221,9 @@ CLOUD_DNS_PROVIDER = "CLOUD_DNS"
 # A project with the Kubernetes Engine API off holds no cluster to read.
 DNS_CACHE_NO_GKE_REASON = "the Kubernetes Engine API is not enabled in this project, so it holds no cluster"
 # A listing with no `addonsConfig` says nothing about the add-on: unread, not off.
-DNS_CACHE_UNDECIDED_LIMITATION = (
-    "{check} was not decided for {clusters}: the clusters listing carries no addonsConfig for them"
-)
+DNS_CACHE_UNDECIDED_LIMITATION = "{check} was not decided for {clusters}: the clusters listing does not report their add-ons"
+# Between cluster names in that limitation; limitations themselves join with `; `.
+CLUSTER_NAME_SEPARATOR = ", "
 # The project target's limitation when the fleet pass measured its rules
 # without the instances of other projects whose `instances list` failed.
 FLEET_INSTANCES_UNREAD_LIMITATION = (
@@ -2069,7 +2069,7 @@ def collect_project_target(
         if undecided_clusters:
             limitations.append(
                 DNS_CACHE_UNDECIDED_LIMITATION.format(
-                    check=DNS_CACHE_CHECK_SLUG, clusters=NOTE_SEPARATOR.join(undecided_clusters)
+                    check=DNS_CACHE_CHECK_SLUG, clusters=CLUSTER_NAME_SEPARATOR.join(undecided_clusters)
                 )
             )
 

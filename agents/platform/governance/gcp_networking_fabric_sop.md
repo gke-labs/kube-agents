@@ -186,6 +186,10 @@ Every finding must conform to the full findings schema:
           {
             "check": "firewall-world-open-ingress",
             "command": "gcloud compute firewall-rules list --project=proj-1 --format=json && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute forwarding-rules list --project=proj-1 --format=json"
+          },
+          {
+            "check": "missing-nodelocal-dnscache",
+            "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'"
           }
         ]
       }

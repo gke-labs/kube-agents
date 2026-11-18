@@ -5,7 +5,7 @@ description: Audits VPC subnet IPAM capacity, Cloud NAT port exhaustion, Private
 
 # Task
 
-Audit Google Cloud VPC subnet IPAM allocation headroom, Cloud NAT port capacity, Private Service Connect (PSC) reachability, VPC peering MTU mismatches, Cloud Armor WAF policies and world-open management ports, emitting findings for the `fleet-audit` reporting harness.
+Audit Google Cloud VPC subnet IPAM allocation headroom, Cloud NAT port capacity, Private Service Connect (PSC) reachability, VPC peering MTU mismatches, Cloud Armor WAF policies and world-open management ports and Standard clusters without NodeLocal DNSCache, emitting findings for the `fleet-audit` reporting harness.
 
 # Workflow
 
