@@ -1525,7 +1525,7 @@ def probe_gce_universe_domain_status(
 ) -> tuple[str, bool]:
     """Probe the GCE/GKE metadata server, returning `(domain, determined)`.
 
-    Only HTTP 200 (with a valid DNS domain) and HTTP 404 (authoritative non-GCE
+    Only HTTP 200 (with a valid universe domain) and HTTP 404 (authoritative non-GCE
     or older emulator) return `determined=True`; timeouts, connection errors,
     and 5xx responses return `(googleapis.com, False)` so callers never cache a
     transient metadata blip as commercial Google Cloud.

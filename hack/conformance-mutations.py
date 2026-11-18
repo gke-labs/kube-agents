@@ -1669,6 +1669,16 @@ Mutation(
         "credentials cross a universe boundary when route_host also matches",
     ),
     Mutation(
+        "C2-universe-domain-under-googleapis",
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("    if cleaned.endswith(_GOOGLE_API_SUFFIX):\n",
+         "    if False and cleaned.endswith(_GOOGLE_API_SUFFIX):\n"),
+        "test_C2_a_universe_domain_under_googleapis_com_is_refused",
+        "accept every well-formed domain as the universe domain again, so "
+        "mtls.googleapis.com passes as a custom universe and its hosts, "
+        "which are commercial hosts, are relayed",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
