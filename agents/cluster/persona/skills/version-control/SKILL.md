@@ -15,6 +15,10 @@ directory (the base directory the harness gives when it loads the skill), then
 run `python3 "$V" <verb>` from anywhere. Every verb prints one JSON object.
 `--repo` takes `owner/name` or the repository's URL.
 
+**Use the repository the task names. If the task names none, say so in your
+answer and stop; don't guess one.** The broker serves only the install's
+managed repositories, and nothing here lists them for you.
+
 ## When to Use
 
 - **Reading the repository behind a workload**: a manifest's history, who
@@ -126,6 +130,10 @@ python3 "$V" proposal create --title 'Raise the payments memory limit to 1Gi' \
   `CALLER_PERMIT_REQUIRED`, `PROPOSAL_NOT_OURS`, `PROFILE_LABELS_FORBIDDEN`,
   `PROFILE_QUERY_QUALIFIER` and `REPOSITORY_NOT_MANAGED` answer the same way
   every time: report them, don't work around them.
+- **If a verb is refused, report the refusal and stop; don't probe other verbs
+  or repositories.** A 400 or 403 from the broker is its answer, not a puzzle:
+  trying verb names or repository names it didn't offer only spends the task's
+  turns.
 - **Read `truncated`.** A listing with `truncated: true` has more; ask again
   more narrowly. `commentsTruncated: true` means you have the oldest comments,
   not the latest word.

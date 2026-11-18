@@ -303,3 +303,24 @@ func TestPlainWordsRefusalMatchesTheBrokersRule(t *testing.T) {
 		}
 	}
 }
+
+// The skill tells the model to work on the repository the task names, never
+// a guessed one, and to stop at a refusal rather than probe for another verb
+// or repository. Nothing in a profile worker lists the managed repositories,
+// so without these a model asked for a change spends its turns guessing
+// names the broker refuses.
+func TestTheVersionControlSkillUsesTheNamedRepositoryAndStopsAtARefusal(t *testing.T) {
+	b, err := os.ReadFile(path.Join(clusterPersonaDir, "skills", vcsSkill, "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(strings.Fields(string(b)), " ")
+	for _, phrase := range []string{
+		"Use the repository the task names. If the task names none, say so in your answer and stop; don't guess one.",
+		"If a verb is refused, report the refusal and stop; don't probe other verbs or repositories.",
+	} {
+		if !strings.Contains(text, phrase) {
+			t.Errorf("the version-control skill no longer says %q", phrase)
+		}
+	}
+}
