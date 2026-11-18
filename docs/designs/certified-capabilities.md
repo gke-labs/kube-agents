@@ -272,10 +272,8 @@ The page is not checked in; when it is, it shows:
   `main`'s cases grade `main`'s skills, a release ships its own, and a miss would blur a version
   mismatch with a product gap. Not implemented; the one-tree rule above stands.
 - **The Autopilot lane.** The lane's host clusters are Autopilot; the ComputeClass scenarios need
-  a Standard cluster with a class-labelled pool, which only a seeded fleet fixture gives
-  (gke-labs/kube-agents#4943). Until it exists those scenarios are not measurable on the lane.
-- **S01 parked.** `ccc-prefilter-missing-nodeselector-drop` stays on its branch as a
-  `FIXTURE_NOT_READY` entry naming that fixture issue; not opened.
+  a Standard cluster with a class-labelled pool, which the seeded fleet's slot c gives
+  (`bench/tf/fleet/defects-c.tf`); the ComputeClass cases read it by role and plant nothing.
 - **The first graded release.** The first GA release cut after the suite's first baseline case
   (gke-labs/kube-agents#4939) merges; 0.24.0 and every earlier release read "No run". A claim
   appears only once 60 scored repetitions exist for that release.

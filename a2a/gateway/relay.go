@@ -110,6 +110,8 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task naming a script its profile doesn't list (#5622).
+	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
 	// The agent ran and produced no answer.
 	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",
 	"stream-ended-without-result":   "the agent stopped before it produced an answer",

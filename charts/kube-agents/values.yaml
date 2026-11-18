@@ -2168,8 +2168,8 @@ profiles:
       # The GKE Support Agent's persona (agents/tse/persona), which a profile
       # worker pod mounts at /persona. The Hermes `tse` profile the gateway
       # scaffolds from `/opt/tse-template` does not use it. Under the
-      # dispatcher a tse task takes a cluster target (project, location and
-      # cluster, all required); project-wide questions wait on #5424.
+      # dispatcher a tse task takes a cluster target (project, cluster and
+      # location, all required); project-wide questions wait on #5424.
       image:
         repository: ghcr.io/gke-labs/kube-agents/persona-tse
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
@@ -2196,7 +2196,7 @@ profiles:
         cpu: "1"
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
-  # which each task names by its project, location and cluster parameters
+  # which each task names by its project, cluster and location parameters
   # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
   # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.
