@@ -133,7 +133,9 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 	// RaiseReplicas only updates the stream's config: the new replicas catch
 	// up, and the restored consumer reappears on the stream leader, some time
 	// after. On a CI runner a fixed 2s read found the consumer missing (#6174),
-	// so wait for both, and log how long it took so CI timings accumulate.
+	// so wait for both. How long it took is logged as a diagnostic: it prints
+	// with -v, and on a failing run; CI's go test runs without -v, so a
+	// passing run there doesn't keep it.
 	waitStart := time.Now()
 	deadline := waitStart.Add(30 * time.Second)
 	for {
