@@ -2,7 +2,8 @@
 
 Step 2, notice the merge: :func:`notice_merges` reads each waiting record's
 pull request from the forge, one read per record per tick and at most
-:data:`READS_PER_TICK` records, and writes what it found back to the row:
+:func:`reads_per_tick` records (:data:`READS_PER_TICK` unless the install sets
+:data:`READS_PER_TICK_ENV`), and writes what it found back to the row:
 
 - merged: ``merged_at`` (the forge's close time, else now) and ``merge_commit``,
   the commit the merge became (the forge's ``mergeCommit``). The later steps
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -44,8 +46,13 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger("post_merge_check")
 
 RECORDS_TABLE = "post_merge_records"
-#: The most records one tick reads from the forge.
+#: The most records one tick reads, per step, unless :data:`READS_PER_TICK_ENV`
+#: says otherwise.
 READS_PER_TICK = 20
+#: The agent container's variable (``spec.deployment.env``) that sets the per-step
+#: limit: a whole number from 1 to :data:`READS_PER_TICK_MAX`; anything else is the default.
+READS_PER_TICK_ENV = "POST_MERGE_READS_PER_TICK"
+READS_PER_TICK_MAX = 500
 #: The forge read's ceiling, per record, on the agent pod's hop to the sandbox
 #: (``forge.call``); a run with no sandbox reaches the broker without one.
 VIEW_TIMEOUT_SECONDS = 10.0
@@ -513,13 +520,25 @@ SESSION_KV_DB_DEFAULT = "/var/lib/kube-agents/session/session_kv.db"
 SWITCH = "POST_MERGE_CHECK"
 
 
+def reads_per_tick() -> int:
+    """:data:`READS_PER_TICK_ENV` as a whole number from 1 to :data:`READS_PER_TICK_MAX`, else :data:`READS_PER_TICK`."""
+    raw = os.environ.get(READS_PER_TICK_ENV, "").strip()
+    if not raw:
+        return READS_PER_TICK
+    value = int(raw) if raw.isascii() and raw.isdigit() else 0
+    if not 1 <= value <= READS_PER_TICK_MAX:
+        logger.warning("post-merge check: %s=%r is not a whole number from 1 to %d; using %d",
+                       READS_PER_TICK_ENV, raw, READS_PER_TICK_MAX, READS_PER_TICK)
+        return READS_PER_TICK
+    return value
+
+
 def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None) -> int:
     """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply step;
     prints what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
     """
-    import os
     import sys
     from contextlib import closing
 
@@ -535,9 +554,9 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
         if argv == ["notice"]:
-            print(json.dumps(notice_merges(conn, view)))
+            print(json.dumps(notice_merges(conn, view, limit=reads_per_tick())))
         else:
-            print(json.dumps(watch_health(conn, kubectl_json)))
+            print(json.dumps(watch_health(conn, kubectl_json, limit=reads_per_tick())))
     return 0
 
 

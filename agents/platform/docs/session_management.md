@@ -426,7 +426,9 @@ off the pull request url, and the thread is the one the opening card reports to:
 kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it
 (the plugin does not). The merge step is `post_merge_check.py notice`,
 one run of which reads at most `READS_PER_TICK` (20) waiting records' pull requests, least recently
-read first, and reads nothing while the switch is `off`; no job schedules it yet. A merge fills
+read first, and reads nothing while the switch is `off`. `POST_MERGE_READS_PER_TICK` in
+`spec.deployment.env` (a whole number from 1 to 500) sets that cap for every step; no job
+schedules the step yet. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
