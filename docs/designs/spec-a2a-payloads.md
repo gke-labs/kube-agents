@@ -1066,8 +1066,9 @@ changed. Updates published on an agent's own schedule carry a `correlationId` mi
 that run.
 
 `topology-skew` is one artifact, so its report must fit one bus message (NATS's 1 MiB
-`max_payload`, less room for the envelope). A larger report is published capped: the
-fleet's most severe findings that fit, each kept in its cluster; the full report's
+`max_payload`, less 64 KiB held back for the envelope and encoding slack). A larger report
+is published capped: the fleet's most severe findings in order, up to the first that does
+not fit, each kept in its cluster; the full report's
 `summary`; and a `truncated` block counting what was left out and giving the full report's
 path on the Platform Agent's disk. When even the clusters without findings do not fit,
 `clusters` is empty and `truncated.clusters_omitted` counts them. The TextPart summary

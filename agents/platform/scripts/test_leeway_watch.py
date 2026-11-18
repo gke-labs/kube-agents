@@ -2117,6 +2117,13 @@ class TopicPublishCapTests(unittest.TestCase):
         self.assertGreater(short, 100)
         self.assertEqual(long - short, 100)
 
+    def test_the_cap_leaves_room_for_a_large_summary_text(self) -> None:
+        # A summary tens of KB long must come out of the findings' share: the
+        # capped artifact, text included, still fits the budget.
+        report = report_with([[padded_finding(f"c{i}-w{j}") for j in range(30)] for i in range(16)])
+        text, doc = self.capped(*self.publish(report, text="x" * 40000))
+        self.assertLessEqual(watch.topic_artifact_size(text, doc), watch.TOPIC_ARTIFACT_BUDGET_BYTES)
+
     def test_full_report_names_the_timestamped_file_behind_latest_json(self) -> None:
         report = report_with([[padded_finding(f"c{i}-w{j}") for j in range(30)] for i in range(16)])
         target = self.dir / "20261118T000000Z.json"
