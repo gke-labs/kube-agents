@@ -482,6 +482,17 @@ readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
 # gcloud's answer for a cluster that does not exist. Any other describe failure
 # (auth expiry, a 403, a network blip) is a cluster that could not be read.
 readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
+# gcloud's answer when the Kubernetes Engine API is off in the project it
+# names (reason SERVICE_DISABLED). A cluster cannot exist in such a project:
+# disabling the API deletes every cluster in it, and creating one needs it on.
+# So a refusal that names the target project is absence, which a fresh
+# project reaches on its first install; one that names another project (the
+# caller's quota project) says nothing about the target and stays unread.
+# The same grammar scripts/verify_ci_pool_project.py reads for the Gemini key
+# (GEMINI_KEY_SERVICE_DISABLED, GEMINI_KEY_DISABLED_IN); its tests pin the
+# project-extraction pattern equal to this one.
+readonly GKE_API_DISABLED_PATTERN="API has not been used in project [a-z0-9-]+ before or it is disabled|SERVICE_DISABLED"
+readonly GKE_API_DISABLED_PROJECT_PATTERN="API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -4688,6 +4699,28 @@ gke_describe_error_is_not_found() {
   grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN" <<<"${1:-}"
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the Kubernetes Engine API is disabled in the target project ($2, by id;
+# $3 its number when known), and in no other. Read as the cluster being
+# absent: nothing can exist there until the apply's google_project_service
+# turns the API on. A refusal that names only another project, or none, is
+# not this answer.
+gke_describe_error_is_api_disabled_for() {
+  local err="${1:-}" project_id="${2:-}" project_number="${3:-}"
+  grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$err" || return 1
+  local named
+  named="$(grep -oE "$GKE_API_DISABLED_PROJECT_PATTERN" <<<"$err" \
+    | sed -E 's/^API has not been used in project ([a-z0-9-]+) .*$/\1/; s#^consumer: projects/##' | sort -u)"
+  [ -n "$named" ] || return 1
+  local name
+  while IFS= read -r name; do
+    [ "$name" = "$project_id" ] && continue
+    [ -n "$project_number" ] && [ "$name" = "$project_number" ] && continue
+    return 1
+  done <<<"$named"
+  return 0
+}
+
 is_existing_cluster_network_policy_satisfied() {
   local project_id="$1" cluster_name="$2" region="$3"
   local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
@@ -4994,7 +5027,18 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! gke_describe_error_is_not_found "$describe_err"; then
+    # The refusal may name the project by number; the front doors that reach
+    # this generator before main() exports PROJECT_NUMBER (the menu, upgrade,
+    # uninstall) resolve it here, and only for a refusal of that shape.
+    local probe_number="${PROJECT_NUMBER:-}"
+    if [ -z "$probe_number" ] && grep -qiE "$GKE_API_DISABLED_PATTERN" <<<"$describe_err"; then
+      probe_number="$(trap - ERR; gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+    fi
+    if gke_describe_error_is_api_disabled_for "$describe_err" "${PROJECT_ID}" "${probe_number}"; then
+      # A fresh project: the Kubernetes Engine API is off, so no cluster can
+      # be there, and the apply enables the API before it creates one.
+      print_info "The Kubernetes Engine API is not enabled in project '${PROJECT_ID}' yet, so no cluster exists there; the apply enables it."
+    elif ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
