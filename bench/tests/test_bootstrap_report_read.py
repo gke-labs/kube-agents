@@ -38,6 +38,8 @@ REPO = Path(__file__).resolve().parents[2]
 TASK = REPO / "bench" / "tasks" / "bootstrap-inventory-ranking-delivery" / "task.yaml"
 STACK = REPO / "bench" / "tf" / "prebuilt" / "bootstrap-ranking" / "main.tf"
 DELIVERY = REPO / "agents" / "chat" / "scripts" / "bootstrap_delivery.py"
+# The report and marker names have one home, which the delivery script imports.
+NAMES = REPO / "agents" / "platform" / "scripts" / "first_run_report.py"
 
 
 def _objective() -> dict[str, Any]:
@@ -73,11 +75,14 @@ def _verify(timeout: float = 0.0):
 
 
 def test_the_paths_are_the_ones_the_delivery_script_writes() -> None:
-    script = DELIVERY.read_text()
-    assert 'SANDBOX_HOME = "/opt/data"' in script
-    assert f'REPORT_NAME = "{Path(onboarding.REPORT_FILE).name}"' in script
-    assert f'DELIVERED_REPORT_NAME = "{Path(onboarding.DELIVERED_FILE).name}"' in script
-    assert '".bootstrap_completed"' in script
+    # Two files: the names are declared in first_run_report.py and the delivery
+    # script aliases them from there, so the literals are read where they live.
+    names = NAMES.read_text()
+    assert 'SANDBOX_HOME = "/opt/data"' in names
+    assert f'REPORT_NAME = "{Path(onboarding.REPORT_FILE).name}"' in names
+    assert f'DELIVERED_REPORT_NAME = "{Path(onboarding.DELIVERED_FILE).name}"' in names
+    assert 'COMPLETED_FILE = ".bootstrap_completed"' in names
+    assert "import first_run_report" in DELIVERY.read_text()
     for path in (onboarding.COMPLETED_MARKER, onboarding.REPORT_FILE, onboarding.DELIVERED_FILE):
         assert str(Path(path).parent) == "/opt/data"
 
