@@ -9930,6 +9930,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             # another tool's token printer, and another language's print of its environment (#5803)
             "gh auth token",
             "kubectl create token builder",
+            # forms that the rule's second read withholds
+            "find . -exec true \\; -exec env \\;",
+            "env$(true)",
             "python3 -c 'import os; print(os.environ)'",
         ]
         served = [
