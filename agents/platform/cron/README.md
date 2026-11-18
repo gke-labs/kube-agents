@@ -447,40 +447,34 @@ enumerated with `gcloud container clusters list` first, since the sandbox
 relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
 `--timeout` is leeway's per-cluster deadline: each call's sandbox timeout (15
-minutes, less when the tick budget is nearly spent), less 30 seconds, split
-across the call's waves of two clusters, at most five minutes so one stuck
-cluster can't spend the tick, and never below leeway's own one-minute default.
-A project's clusters (or `LEEWAY_WATCH_CLUSTERS`) are read in calls of at most
-14 clusters, sized so a call's clusters fit its 15 minutes at two minutes per
-cluster read, about twice the slowest read measured. No call gives a cluster
-less than those two minutes: a call started with less than 15 minutes of the
-45-minute tick left holds only the waves of two that fit at that read time,
-and no call starts with less than one wave's worth left, so the clusters after
-that point wait for a later run rather than read on a deadline they can miss.
-A call that times out or fails costs only its own clusters, and the calls that
-returned keep their results. Every cluster in a call is stamped in the ledger
-(`cluster_runs`) however the call ended, and the least recently stamped go
-first. Projects go least recently swept first (`project_runs`): a project
-whose turn starts with a full 15 minutes rotates behind the others even if the
-tick ends before all its clusters are read, so a project too big for one tick
-neither starves the rest nor goes unread, and is covered over the next ticks;
-one the tick reaches late keeps its place unless every cluster got a call.
+minutes, less when the tick budget is nearly spent), less 90 seconds for
+start-up and report assembly, split across the call's waves of two clusters,
+at most five minutes so one stuck cluster can't spend the tick, and never below
+leeway's own one-minute default. A project's clusters (or
+`LEEWAY_WATCH_CLUSTERS`) are read in calls of at most 12 clusters, sized so
+each cluster gets at least two minutes, about twice the slowest read measured.
+A call started late in the 45-minute tick holds only the waves of two that fit
+at that read time, and no call starts with less than one wave's worth left;
+the clusters after that point wait for a later run. A call that fails costs
+only its own clusters. Every cluster in a call is stamped in the ledger
+(`cluster_runs`) however the call ended; the least recently stamped go first,
+and clusters stamped together are shuffled by the run's date so batch
+membership changes from run to run. Projects go least recently swept first
+(`project_runs`): a project whose turn starts with a full 15 minutes is
+stamped then and rotates behind the others, so a project too big for one tick
+is covered over the next ticks without starving the rest. A project's turn
+ends at its first sandbox timeout, so a project whose calls hang costs one
+call a tick, and a tick in which no call returned still saves the stamps.
 Each project has at most one scan error, by counts when it took several calls
-(`p1: 72 of 100 clusters read; 14 failed (<cause>), 14 not reached (out of
-time this run)`, where read means answered without an error row). A call that
-times out is a failure, since every call is sized to fit. Clusters no call was
-started for are deferred, not failed: alone they post no partial-scan line, do
-not hold back the report refresh, and are listed under the report's "Not
-Reached This Run". The partial-scan line counts the failures and names the
-deferred projects apart, and its recovery line waits for a run with nothing
-failed and nothing deferred. When a cluster has had no call, or a project no
-turn, for more than three days, one line says part of the fleet has not been
-reached, and one more says when every part has been again. A finding retires
-per cluster: when its cluster is read clean, or when its project's cluster
-list no longer names it. When a tick resolves the whole project list (or
-`LEEWAY_WATCH_CLUSTERS`), findings on projects or clusters no longer in it
-retire and their ledger stamps are dropped; a tick whose scope could not be
-resolved in full retires nothing for scope.
+(`p1: 72 of 100 clusters read; 12 failed (<cause>), 16 not reached (out of
+time this run)`, with error rows folded in). Clusters only the budget kept
+from being read are not a failure: they post nothing, keep their findings,
+and are listed under the report's "Not Reached This Run". The partial-scan
+line posts when a project fails that has no open episode, and names every
+project that failed in that run; an episode closes when its project is read
+again without failing, and one line says so once every announced project
+reads cleanly. A finding on a cluster its project no longer lists retires once
+that list was read.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
@@ -502,13 +496,13 @@ six due subjects with their cause and share when it first appears, when its
 or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
 of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
 clusters are retired with a single resolution line (and a `latest.*` refresh
-once a tick has no cluster whose scan failed; clusters not reached do not hold
-it back), while clusters whose scan failed or that were not reached retain
-their ledger entries so transient errors do not erase state and re-page
-tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
-`topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
-if that write fails, it warns once in chat and retries on later ticks with no
-failed scan until the write recovers.
+once a tick has no failed project; clusters not reached do not hold it back),
+while clusters whose scan failed or that were not reached retain their ledger
+entries so transient errors do not erase state and re-page tomorrow. When
+`NATS_URL` is set, the watch also writes `latest.json` to the `topology-skew`
+(`a2a.topics.agent.platform.topology-skew`) blackboard topic; if that write
+fails, it warns once in chat and retries on later ticks with no failed project
+until the write recovers.
 
 ## `session-retention` gives every profile's history an end
 
