@@ -78,7 +78,8 @@ class SessionResourcesRenderTest(unittest.TestCase):
         # own check refuses it when schema validation is skipped.
         for value in ['"1e.5"', '"2GB"', '"lots"', '"1.5.0"', '"1e99999999999999999999"',
                       '"-1e99999999999999999999"', '"1234567890123456"', '"8Ei"', '"1e-99999999999999999999"',
-                      '"1e-2147483649"', '"+-1"', '"1e400"', '"1e-2147483647"', '"1e-19"']:
+                      '"1e-2147483649"', '"+-1"', '"1e400"', '"1e-2147483647"', '"1e-19"',
+                      '"0e99999999999999999999"', '"0e3000000000"', '"0.0e2147483648"', '"0e19"']:
             for extra in ((), ("--skip-schema-validation",)):
                 with self.subTest(value=value, extra=extra):
                     proc = self._helm(self._one("limits", "memory", value), *extra)
@@ -88,8 +89,10 @@ class SessionResourcesRenderTest(unittest.TestCase):
     def test_an_exponent_is_held_to_minus_18_and_says_so(self):
         # #6196: below -18 the operator decodes a quantity only slowly; -18 itself renders.
         self.assertIn('cpu: "1e-18"', self._render(self._one("requests", "cpu", '"1e-18"')))
+        self.assertIn('cpu: "0e18"', self._render(self._one("requests", "cpu", '"0e18"')))
         for value, says in (('"1e-19"', "whose exponent is below -18"), ('"+1e-19"', "is +1e-19, whose exponent"),
-                            ('"1e400"', "past the range")):
+                            ('"1e400"', "past the range"), ('"0e19"', "a zero whose exponent is past 18"),
+                            ('"+0e99999999999999999999"', "is +0e99999999999999999999, a zero")):
             with self.subTest(value=value):
                 proc = self._helm(self._one("requests", "cpu", value), "--skip-schema-validation")
                 self.assertNotEqual(proc.returncode, 0, proc.stdout[-300:])

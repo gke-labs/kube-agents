@@ -440,6 +440,13 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
                 self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, whose exponent is below -18", err)
         self._render_cr([f"{_VALUE_PATH}.requests.cpu=1e-3"])
         self._render_cr([f"{_VALUE_PATH}.requests.cpu=1e-18"])
+        # A zero escapes every overflow check, so a positive exponent past 18 on one is
+        # refused here; the operator can't decode 0e99999999999999999999 at all.
+        for value in ("0e99999999999999999999", "0.0e2147483648", "0e19"):
+            with self.subTest(value=value):
+                err = self._render_error([f"{_VALUE_PATH}.requests.cpu={value}"])
+                self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, a zero whose exponent is past 18", err)
+        self._render_cr([f"{_VALUE_PATH}.requests.cpu=0e18"])
         # A value outside the grammar is told so, not about its exponent.
         err = self._render_error([f"{_VALUE_PATH}.requests.cpu=abce-19"])
         self.assertIn("which is not a Kubernetes quantity the operator can read", err)

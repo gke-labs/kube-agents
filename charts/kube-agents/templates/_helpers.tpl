@@ -2492,7 +2492,9 @@ these have passed.
        negative one (1e-30000000 took 3.9s, growing faster than the exponent) stalls every
        decode of it. Below -18 a quantity is smaller than the n suffix and rounds to 1n, so
        nothing a pod requests needs one. A positive exponent past 18 is past int64 in bytes
-       or millicores, which the callers' overflow checks already refuse, by name.
+       or millicores, which the callers' overflow checks already refuse, by name, except
+       for a zero, which no overflow check catches: a zero with an exponent past 18 is
+       refused here.
        Args: raw (the value without a leading sign), key (the values path, for the message), and
        optionally shown (the value as written, for the message; raw when unset). */ -}}
 {{- define "kube-agents.quantityExponentCheck" -}}
@@ -2502,6 +2504,9 @@ these have passed.
 {{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
 {{- if and (contains "-" $exp) (or (gt (len $digits) 2) (and $digits (gt (int $digits) 18))) -}}
 {{- fail (printf "%s is %s, whose exponent is below -18: the operator decodes a quantity like this slowly or not at all, and no pod resource needs one. Write it with a unit suffix (m, n) instead" .key $shown) -}}
+{{- end -}}
+{{- if and (not (contains "-" $exp)) (not (regexMatch "[1-9]" (trimSuffix $exp .raw))) (or (gt (len $digits) 2) (and $digits (gt (int $digits) 18))) -}}
+{{- fail (printf "%s is %s, a zero whose exponent is past 18: the operator decodes a quantity like this slowly or not at all. Write it as 0 instead" .key $shown) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
