@@ -8,7 +8,7 @@ Every GCP project registered in the Boskos pool must be provisioned with the pre
 
 Identifiers this page deliberately does not print — the two GitHub App IDs, the Prow runner's service account, and where the ledger App's key is held — are named constants in `scripts/provision_ci_pool_project.sh` and `scripts/verify_ci_pool_project.py`, named inline below where a step needs one. The scripts are the source; a copy here would be one more place to rotate.
 
-Sections 1 to 6 are what a leasable project must end up holding, and section 7 is how you check it. `scripts/provision_ci_pool_project.sh --project-id=<id>` does all of it — grouped differently from the section order, since it enables the APIs, IAM and registry together before building the host cluster. Run the script rather than the individual commands, which are here so a project provisioned by hand does not miss one. Its flags: `--pem-file=PATH` imports the App private key in section 5 (without it the key stays `PENDING_IMPORT` and the run ends amber); `--skip-host-cluster` and `--skip-fleet` skip sections 2 and 6 for a project that already has them; `--allow-unmapped` downgrades the mapping precondition below to a warning; `--app-id` overrides the App the run provisions and verifies against.
+Sections 1 to 6 are what a leasable project must end up holding, and section 7 is how you check it. `scripts/provision_ci_pool_project.sh --project-id=<id>` does all of it — grouped differently from the section order, since it enables the APIs, IAM and registry together before building the host cluster. Run the script rather than the individual commands, which are here so a project provisioned by hand does not miss one. Its flags: `--pem-file=PATH` imports the App private key in section 5 (without it the key stays `PENDING_IMPORT` and the run ends amber); `--skip-host-cluster` skips section 2's host-cluster apply for a project that already has one (the managed OpenTelemetry scope step after it still runs, which is what a resume after a failed scope update needs) and `--skip-fleet` skips section 6; `--allow-unmapped` downgrades the mapping precondition below to a warning; `--app-id` overrides the App the run provisions and verifies against.
 
 ## 0. Preconditions
 
@@ -83,7 +83,7 @@ in `scripts/provision_ci_pool_project.sh` for the set it writes.
 
 `api_server_key` is generated the same way `hack/ci-deploy.sh` generates it when unset. It is regenerated on every apply, which is why section 8 forbids re-running the provisioning script after registration.
 
-The managed OpenTelemetry scope is the one step after the apply. The flag is on the GA `gcloud` surface from the version `MIN_GCLOUD_VERSION` in `scripts/installer/min_versions.sh` names (older SDKs carry it under `gcloud beta`), and the provisioning script checks the installed version in its Step 0 so an old SDK fails before the apply rather than after it:
+The managed OpenTelemetry scope is the one step after the apply. The script first waits for the cluster's running operations, since an Autopilot host is still creating node pools for the pods Helm installed and GKE refuses a second operation (`CLUSTER_ALREADY_HAS_OPERATION`) while one runs; the hand command below meets the same refusal on a busy cluster and is safe to repeat. The flag is on the GA `gcloud` surface from the version `MIN_GCLOUD_VERSION` in `scripts/installer/min_versions.sh` names (older SDKs carry it under `gcloud beta`), and the provisioning script checks the installed version in its Step 0 so an old SDK fails before the apply rather than after it:
 
 ```bash
 gcloud container clusters update platform-agent-host \
@@ -526,6 +526,8 @@ gcloud compute firewall-rules create allow-forge-443 --network=default --directi
 gcloud compute firewall-rules create deny-forge-ingress --network=default --direction=INGRESS --action=DENY --rules=all \
   --priority=1100 --source-ranges=0.0.0.0/0 --target-tags=forge --project="${PROJECT_ID}"
 gcloud iam service-accounts create forge-vm --display-name="kube-agents forge VM" --project="${PROJECT_ID}"
+# IAM can refuse this binding with "does not exist" for up to about a minute
+# after the create; repeat it until it takes (the script retries it).
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:forge-vm@${PROJECT_ID}.iam.gserviceaccount.com" --role=roles/artifactregistry.reader
 for member in "${PROW_RUNNER_SA}" "${NIGHTLY_RUNNER_SA}"; do
