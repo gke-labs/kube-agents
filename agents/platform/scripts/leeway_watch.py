@@ -14,8 +14,8 @@ broken spread constraints before a zone outage or node drain exposes them.
 Which clusters. Target clusters are resolved on the agent pod:
 1. `LEEWAY_WATCH_CLUSTERS` when set (comma-separated `project/location/cluster`
    triples), less any clusters the declared scope excludes
-   (`spec.scope.exclude.clusters`), read in batches as a project's clusters are
-   (one call when they fit one batch, as before batching).
+   (`spec.scope.exclude.clusters`), read in batches as a project's clusters
+   are.
 2. On an install with a declared scope (`spec.scope`), the resolved projects
    from `fleet_scope_targets.py` (`fleet_scope.json` / `ScopeTargets.projects`),
    less any clusters in `ScopeTargets.excluded_clusters`.
@@ -51,51 +51,33 @@ default is one minute, which a large cluster can exceed); it is sized so every
 cluster in the call can use its share of the call's sandbox timeout, capped so
 one stuck cluster cannot spend the tick (`cluster_timeout_seconds`).
 
-Batches. A project's clusters (or `LEEWAY_WATCH_CLUSTERS`) are read in calls
-of at most `CLUSTERS_PER_BATCH` (14), each with its own sandbox timeout (15
-minutes, or what is left of the 45-minute tick) and its own `--timeout`, so a
-call that times out or fails costs only its own clusters; the calls that
-returned keep their results. A project of up to 14 clusters is one call. No
-call gives a cluster less than `CONSERVATIVE_CLUSTER_READ_SECONDS` (two
-minutes): a call started with less than 15 minutes left holds only the waves
-of two that fit at that read time (`batch_size`), and none starts with less
-than one such wave left (`MIN_PROJECT_RUN_SECONDS`); the clusters after that
-point are not reached this run. Every cluster in a call is stamped in
-`cluster_runs` (`ledger.json`) however the call ended, and the least recently
-stamped go first, so a project the run ran out of time for resumes from the
-clusters it did not reach.
+Batches and turns. A project's clusters (or `LEEWAY_WATCH_CLUSTERS`) are read
+in calls of at most `CLUSTERS_PER_BATCH` (12), each with its own 15-minute
+sandbox timeout (or what is left of the 45-minute tick), so a call that fails
+costs only its own clusters. No call gives a cluster less than
+`CONSERVATIVE_CLUSTER_READ_SECONDS` (two minutes), and the last deadline ends
+`LEEWAY_OVERHEAD_SECONDS` or more before the sandbox would kill the call: a call
+started late holds only the waves that fit (`batch_size`), and none starts
+with less than one wave left. Clusters after that point are not reached this
+run. Every cluster in a call is stamped in `cluster_runs` however the call
+ended; the least recently stamped go first, and clusters stamped together are
+shuffled by the run's date so batch membership changes from run to run.
+Projects go least recently swept first (`project_runs`). A project whose turn
+starts with a full call's time is stamped then, so it rotates behind the
+others whatever the turn produces. Its turn ends at its first sandbox timeout,
+so a project whose calls hang costs one call. A tick in which no call returned
+a report still saves the stamps.
 
-Rotation. Projects go least recently swept first (`project_runs`). A project
-whose turn starts with a full call's budget is stamped whatever the turn
-produced, so a project bigger than a tick rotates behind the projects that
-did not get a turn and cannot starve them; its unread clusters go first on its
-next turn, so it is covered over successive ticks. A project the budget
-reaches late is stamped only if every one of its clusters got a call;
-otherwise it keeps its older stamp and goes ahead of this tick's projects.
-
-Scan errors. Each target has at most one scan-error entry. One read in a
-single call keeps that call's message; one read in several is summarised by
-counts (`p1: 72 of 100 clusters read; 14 failed (<cause>), 14 not reached (out
-of time this run)`), where "read" means the clusters a returned call answered
-without an error row. Every started call fits its deadlines, so a call that
-times out is a `timeout` failure. Clusters no call was started for are
-deferred, not failed: an entry with nothing else neither posts the
-partial-scan line nor holds back the report refresh, and is listed under the
-report's "Not Reached This Run". The partial-scan line counts the failures,
-then names the deferred targets apart; its recovery line posts only once a run
-has nothing failed and nothing deferred. When some cluster has had no call
-(or some project no turn) for over `COVERAGE_GAP_DAYS` (3) days, one coverage
-line says so, and its end is said once (`unread_since` in `ledger.json` ages a
-target never reached).
-
-Retirement. Retirement is per cluster: a finding on a cluster read to a result
-can retire; one on a listed cluster that was not read stays; one on a cluster
-its project no longer lists retires once the project's cluster list was read.
-When the tick resolved the fleet's project list (or `LEEWAY_WATCH_CLUSTERS`)
-in full, findings on projects (or configured clusters) no longer in it retire
-and their stamps are dropped; when it did not (an unusable resolved scope, an
-unresolved declared scope, an unreadable Cluster Agent profile), nothing is
-retired or dropped for scope.
+Scan errors and the partial-scan line. Each target (a project, or "the
+configured clusters") has at most one entry. A target read in one call keeps
+that call's message; one read in several is summarised by counts (`p1: 72 of
+100 clusters read; 12 failed (<cause>), 16 not reached (out of time this
+run)`), with error rows folded in. A target only the budget kept from being
+read in full is not a failure: it posts nothing and is listed under the
+report's "Not Reached This Run". The partial-scan line posts when a target
+fails that has no open episode, naming every target that failed this run; an
+episode closes when its target is read again without failing, and the
+recovery line posts when the last one closes.
 
 Threshold filtering and environment knobs. Before ledger gating,
 `filter_report_findings` drops `unknown`-cause topology findings at their
@@ -119,16 +101,14 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   (`<cluster>/<namespace>/<subject_kind>/<subject_name>/<topology_key>/<finding_kind>`)
   with `first_seen`, `last_report_at`, `suspected_cause`, `severity`, `tier`,
   `max_domain_share`, and `observed_skew`; `project_runs` and `cluster_runs`,
-  when each project last had its turn and each cluster was last in a call,
-  which order the sweep; `unread_since`, when a target never reached was first
-  seen; and the last tick's `scan_errors`, deferred entries included.
+  which order the sweep; and the targets with an open partial-scan episode.
 - `reports/<timestamp>.md` and `reports/<timestamp>.json` (with `latest.md` and
   `latest.json` symlinks, keeping the newest 10 pairs): written whenever at
-  least one finding is due, or when findings retired on a tick where no scan
-  failed (deferred clusters do not count as failed). When
+  least one finding is due or when retired findings refresh a sweep in which no
+  target failed (clusters not reached do not count). When
   `NATS_URL` is set, the JSON report is also published to the A2A blackboard
   topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
-  once in chat on failure and retrying on later ticks where no scan failed.
+  once in chat on failure and retrying on later ticks in which no target failed.
 A finding is due for reporting when:
 1. It is **new** (not present in `ledger.json`),
 2. Its **suspected cause changed or severity escalated** since the last report,
@@ -138,15 +118,17 @@ A finding is due for reporting when:
 Chat report lines name up to six due subjects with their cause and share.
 Findings on clusters whose scan succeeded (`status == "ok"`) and that are no
 longer present are retired from `ledger.json` with a single resolution line.
-Clusters whose scan failed (`status == "error"`), that were not reached, or
-whose project could not be scanned retain their existing ledger entries so a
-transient outage does not erase state and re-page as new tomorrow. A quiet
-tick prints nothing.
+A finding on a cluster its project's cluster list no longer names retires once
+that list was read. Clusters whose scan failed (`status == "error"`), that were
+not reached, or whose project could not be scanned retain their existing ledger
+entries so a transient outage does not erase state and re-page as new tomorrow.
+A quiet tick prints nothing.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -242,81 +224,66 @@ MIN_CLUSTER_TIMEOUT_SECONDS = 60
 # this much of the tick: five projects each with one stalled cluster still fit
 # TICK_BUDGET_SECONDS.
 MAX_CLUSTER_TIMEOUT_SECONDS = 300
-# Held back from the call's sandbox timeout for leeway's start-up and report
-# assembly, so the per-cluster deadline fires before the sandbox kills the call.
-LEEWAY_OVERHEAD_SECONDS = 30
+# Held back from the call's sandbox timeout, so the last per-cluster deadline
+# fires this long before the sandbox kills the call. It covers the ssh hop
+# into the sandbox, leeway's start-up under gVisor and its report assembly.
+# Process start-up alone has measured over 30 s under gVisor on a busy node,
+# so this is three times that rather than the bare start-up time.
+LEEWAY_OVERHEAD_SECONDS = 90
 CLUSTER_SEPARATOR = ","
 CLUSTERS_FLAG = "--clusters"
 LIST_CLUSTERS_ARGV = ("gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project")
 LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project} exited {code}: {error}"
-# The sandbox timeout of one `leeway report` call: one batch of a project's
-# clusters (or of LEEWAY_WATCH_CLUSTERS).
+LIST_CLUSTERS_TIMED_OUT_DETAIL = "gcloud container clusters list --project {project} timed out after {seconds}s"
+# The sandbox timeout of one `leeway report` call.
 PROJECT_TIMEOUT_SECONDS = 900
 TICK_BUDGET_SECONDS = 2700
-# A conservative wall time for one cluster's read, to size batches by: about
-# twice the slowest read measured, a ~23k-pod cluster at 44-66 s without gVisor
-# (small real clusters read in 14-43 s each under gVisor), leaving room for
-# gVisor and for a sandbox that other jobs keep busy.
+# A conservative wall time for one cluster's read: about twice the slowest
+# read measured (a ~23k-pod cluster at 44-66 s without gVisor; small clusters
+# read in 14-43 s each under gVisor).
 CONSERVATIVE_CLUSTER_READ_SECONDS = 120
-# Clusters per `leeway report` call: as many waves of PARALLELISM as fit the
-# call's limit at the conservative read time, (900 - 30) // 120 = 7 waves of
-# two, so 14 clusters, each with a 124 s `--timeout`. The deadlines of a full
-# batch then end inside the call's sandbox timeout, so a slow batch ends as
-# per-cluster error rows rather than a killed call, and a killed call costs only
-# its own batch. A project of up to this many clusters is one call, as before.
+# Clusters per `leeway report` call: the waves of PARALLELISM that fit a full
+# call at the conservative read time, (900 - 90) // 120 = 6 waves, so 12
+# clusters with a 135 s `--timeout` each. A project of up to this many
+# clusters is one call.
 CLUSTERS_PER_BATCH = PARALLELISM * (
     (PROJECT_TIMEOUT_SECONDS - LEEWAY_OVERHEAD_SECONDS) // CONSERVATIVE_CLUSTER_READ_SECONDS
 )
-# A target read in more than one call is one scan-error entry, by counts:
-# `p1: 72 of 100 clusters read; 14 failed (<cause>), 14 not reached (...)`.
-# "Read" counts the clusters a returned call answered without an error row;
-# error rows are counted apart (each is also its own entry). The cause is the
-# first failed call's, without the exception's class or leeway's exit
-# preamble, cut to CAUSE_MAX_CHARS so the entry stays short in chat.
-TARGET_SUMMARY_DETAIL = "{read} of {total} clusters read; {gaps}"
-FAILED_PART = "{count} failed ({cause})"
-CLUSTER_ERRORS_PART = "{count} returned an error"
-NOT_REACHED_PART = "{count} not reached (out of time this run)"
-OTHER_CAUSES_SUFFIX = "; {count} other cause(s)"
-GAP_SEPARATOR = ", "
-CAUSE_MAX_CHARS = 160
-CAUSE_ELLIPSIS = "…"
-# How LEEWAY_WATCH_CLUSTERS is named in a scan error when it takes more than
-# one call (one call's failure still fails the tick with its own cause).
-EXPLICIT_TARGET_LABEL = "the configured clusters"
-# The least a `leeway report` call is started with: one wave at the
-# conservative read time plus the overhead. Every started call then gives each
-# of its clusters at least CONSERVATIVE_CLUSTER_READ_SECONDS (`batch_size`),
-# so a call late in the tick reads as well as a full one; with less left, the
-# rest is deferred to a later run rather than read on a deadline it can miss.
+# The least a call is started with: one wave at the conservative read time
+# plus the overhead. With less left, the rest waits for a later run.
 MIN_PROJECT_RUN_SECONDS = CONSERVATIVE_CLUSTER_READ_SECONDS + LEEWAY_OVERHEAD_SECONDS
 STDERR_EXCERPT_CHARS = 300
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 LEEWAY_NO_REPORT_DETAIL = "leeway exited {code} without a report: {excerpt}"
-# The attribute a failed call's exception carries its bare cause on (leeway's
-# stderr excerpt), for the per-target summary.
+# The attribute a failed call's exception carries leeway's bare stderr on.
 SHORT_CAUSE_ATTR = "short_cause"
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
 SCAN_FAILED_DETAIL = "leeway scan for {target} failed: {error}"
-LIST_CLUSTERS_TIMED_OUT_DETAIL = "gcloud container clusters list --project {project} timed out after {seconds}s"
+# A target read in more than one call is one entry, by counts. Causes are
+# leeway's stderr line, cut to CAUSE_MAX_CHARS.
+TARGET_SUMMARY_DETAIL = "{read} of {total} clusters read; {gaps}"
+FAILED_PART = "{count} failed ({cause})"
+CLUSTER_ERRORS_PART = "{count} returned an error ({cause})"
+NOT_REACHED_PART = "{count} not reached (out of time this run)"
+TURN_ENDED_PART = "{count} left for its next turn after the timeout"
+OTHER_CAUSES_SUFFIX = "; {count} other cause(s)"
+GAP_SEPARATOR = ", "
+CAUSE_MAX_CHARS = 160
+CAUSE_ELLIPSIS = "…"
+# How LEEWAY_WATCH_CLUSTERS is named when it takes more than one call.
+EXPLICIT_TARGET_LABEL = "the configured clusters"
 # A project the resolved scope names but holds no cluster list for (spec.mode: next).
 UNREAD_PROJECT_DETAIL = "{target} was not swept: {reason}"
 
-# Partial-scan error kinds (used as deduplication signature keys so rotating
-# project names do not re-page every day for the same underlying condition).
+# Scan-error kinds. A budget_exhausted target was not reached this run: not a
+# failure, so it posts nothing and holds no episode open.
 ERROR_KIND_BUDGET_EXHAUSTED = "budget_exhausted"
-ERROR_KIND_CUT_SHORT = "cut_short"
 ERROR_KIND_TIMEOUT = "timeout"
 ERROR_KIND_SCAN_FAILED = "scan_failed"
 ERROR_KIND_CLUSTER_ERROR = "cluster_error"
-# Kinds the tick budget causes: clusters no call was started for. They are
-# read first on the target's next turn (least recently read first), so they
-# are deferred, not failed: they neither post the partial-scan line nor hold
-# back the report refresh, and are named only beside a real failure and in the
-# report. Every started call fits its deadlines, so a call that times out is a
-# `timeout` failure; `cut_short` is no longer produced and stays here so a
-# stored signature from an older ledger reads as deferred.
-DEFERRED_ERROR_KINDS = frozenset({ERROR_KIND_BUDGET_EXHAUSTED, ERROR_KIND_CUT_SHORT})
+# Kinds an older ledger's `announced.partial` signature held for a budget gap,
+# which is no failure under the per-target episodes.
+LEGACY_NOT_REACHED_KINDS = frozenset({ERROR_KIND_BUDGET_EXHAUSTED, "cut_short"})
 
 # `leeway.report/v1alpha1` schema vocabulary and normalization defaults.
 SCHEMA_VERSION_VALUE = "leeway.report/v1alpha1"
@@ -324,8 +291,6 @@ STATUS_OK = "ok"
 STATUS_ERROR = "error"
 GKE_SOURCE_PREFIX = "gke:"
 CLUSTER_KEY_SEPARATOR = "/"
-# A `<project>/<location>/<cluster>` triple holds two separators.
-CLUSTER_TRIPLE_SEPARATORS = 2
 CLUSTER_WIDE_NAMESPACE = "_cluster"
 DEFAULT_SUBJECT_KIND_CLUSTER = "Cluster"
 DEFAULT_SUBJECT_KIND_COMPUTE_CLASS = "ComputeClass"
@@ -418,24 +383,17 @@ FIRST_SEEN_KEY = "first_seen"
 LAST_REPORT_KEY = "last_report_at"
 LAST_TICK_KEY = "last_tick"
 PROJECT_RUNS_KEY = "project_runs"
-# When each cluster was last in a `leeway report` call, however the call
-# ended: it returned, failed, or timed out (so a batch that always fails
-# rotates behind the rest). Clusters the tick ran out of time for before a
-# call started keep their older stamps, so a target's next turn reads them
-# first. Absent from ledgers written before batching: every cluster then
-# counts as never read.
+# When each cluster was last in a `leeway report` call, however it ended.
 CLUSTER_RUNS_KEY = "cluster_runs"
-# When each target with no stamp yet (a cluster in no call so far, a project
-# with no turn) was first seen without one, so the coverage line can age a
-# target that has never been reached.
-UNREAD_SINCE_KEY = "unread_since"
 SCAN_ERRORS_KEY = "scan_errors"
 ANNOUNCED_KEY = "announced"
+# An older ledger's partial-scan signature: a list of error kinds.
 ANNOUNCED_PARTIAL_KEY = "partial"
+# The targets whose failure was announced and has not read cleanly since.
+ANNOUNCED_FAILED_TARGETS_KEY = "failed_targets"
 ANNOUNCED_TOPIC_PUBLISH_KEY = "topic_publish"
 ANNOUNCED_DEFERRED_REFRESH_KEY = "deferred_report_refresh"
 ANNOUNCED_OVERRIDE_THRESHOLDS_KEY = "override_report_thresholds"
-ANNOUNCED_COVERAGE_KEY = "coverage_gap"
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 
 # Output lines (stdout is `deliver: "chat"`).
@@ -456,26 +414,15 @@ TOPIC_PUBLISH_FAILED_LINE = (
 )
 TOPIC_PUBLISH_CLEARED_LINE = "{prefix} watch: publishing to blackboard topic {topic} succeeded again"
 PARTIAL_LINE = (
-    "{prefix} watch: the fleet scan was partial, {count} with errors: {failures}{deferred}; "
+    "{prefix} watch: the fleet scan was partial ({errors} error(s)): {reasons}; "
     "findings on unreadable clusters are retained until read again"
 )
-PARTIAL_DEFERRED_PART = "; not reached this run: {targets}"
+PARTIAL_CLEARED_LINE = "{prefix} watch: every target that failed reads cleanly again"
 REPORT_NOT_REACHED_HEADING = "## Not Reached This Run"
 REPORT_NOT_REACHED_INTRO = (
     "The run's time ran out before these were read. Their unread clusters go first on their next turn, "
     "and their findings are kept until they are read."
 )
-PARTIAL_CLEARED_LINE = "{prefix} watch: the fleet scan reads every target again"
-# Coverage: a part of the fleet no call has reached for longer than this (a
-# cluster in no call, or a project with no turn) is said once in chat, and its
-# end said once. The slack keeps a read at the same time of day
-# COVERAGE_GAP_DAYS runs ago from counting as over the limit.
-COVERAGE_GAP_DAYS = 3
-COVERAGE_LINE = (
-    "{prefix} watch: part of the fleet has not been reached in over {days} days ({names}); "
-    "its findings are kept but may be out of date"
-)
-COVERAGE_CLEARED_LINE = "{prefix} watch: every part of the fleet has been reached in the last {days} days"
 DRY_RUN_WOULD_REPORT = "dry run: would report {count} finding(s) ({reasons}) across {clusters}: {names}"
 DRY_RUN_WOULD_RETIRE = "dry run: would retire {count} resolved finding(s) ({names})"
 DRY_RUN_NOTHING_DUE = "dry run: nothing due; active findings: {count}"
@@ -604,12 +551,6 @@ def roster_clusters_by_project() -> dict[str, list[str]]:
     return {entry.project: [CLUSTER_KEY_SEPARATOR.join(t) for t in entry.clusters or ()] for entry in scope.projects}
 
 
-def roster_unidentified_profiles() -> tuple[str, ...]:
-    """Cluster Agent profiles whose cluster_identity could not be read: while
-    any exists, the roster's project list may be missing a project."""
-    return fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home()).unidentified_profiles
-
-
 def roster_projects() -> set[str]:
     """The projects the Cluster Agent profiles' identities name."""
     return set(roster_clusters_by_project().keys())
@@ -675,13 +616,9 @@ def cluster_timeout_seconds(call_timeout: int, cluster_count: int) -> int:
     the call's sandbox timeout, less `LEEWAY_OVERHEAD_SECONDS`, between
     `MIN_CLUSTER_TIMEOUT_SECONDS` and `MAX_CLUSTER_TIMEOUT_SECONDS`. A slow
     cluster then ends as a per-cluster `error` row instead of the sandbox
-    killing the whole call and discarding the clusters that finished. When the
-    floor wins, a call of several waves can still overrun the sandbox timeout:
-    more than about 28 clusters at the full call timeout, or more waves than
-    fit a call the tick budget has cut short. `batch_size` keeps every call
-    above that floor: each of its clusters gets at least
-    CONSERVATIVE_CLUSTER_READ_SECONDS, and the waves' deadlines end inside the
-    call's sandbox timeout.
+    killing the whole call and discarding the clusters that finished.
+    `batch_size` keeps every call above the floor, so the waves' deadlines end
+    at least LEEWAY_OVERHEAD_SECONDS inside the call's sandbox timeout.
     """
     waves = math.ceil(max(cluster_count, 1) / PARALLELISM)
     share = (call_timeout - LEEWAY_OVERHEAD_SECONDS) // waves
@@ -1489,46 +1426,51 @@ class BatchSweep:
     """What reading one target's clusters in batches produced."""
 
     reports: list[dict[str, Any]] = field(default_factory=list)
-    # The target's one scan-error entry and its kind; None when every call
-    # returned a report.
+    # The target's one scan-error entry and its kind; None when every cluster
+    # was in a call that returned without an error row for it.
     detail: str | None = None
     kind: str | None = None
-    # The first call's failure, for a target where no call returned a report.
+    # The first failure, for a target where no call returned a report.
     first_error: Exception | None = None
-    # False when the tick ran out of time before every cluster had a call.
+    # How many calls were started, and whether every cluster was in one.
+    calls: int = 0
     every_cluster_called: bool = True
 
 
 def batch_size(call_timeout: int) -> int:
-    """Clusters for a call started with `call_timeout` seconds.
-
-    CLUSTERS_PER_BATCH at the full call timeout; on a shorter remaining
-    budget, only the waves of PARALLELISM that fit at
-    CONSERVATIVE_CLUSTER_READ_SECONDS each, so every cluster in the call gets
-    at least that per-cluster deadline (about what a full call gives) and the
-    deadlines still fire before the sandbox kills the call. A call is never
-    started with less than MIN_PROJECT_RUN_SECONDS, one such wave.
-    """
+    """Clusters for a call started with `call_timeout` seconds: CLUSTERS_PER_BATCH
+    at the full call timeout, else only the waves of PARALLELISM that fit at
+    CONSERVATIVE_CLUSTER_READ_SECONDS each."""
     waves = max((call_timeout - LEEWAY_OVERHEAD_SECONDS) // CONSERVATIVE_CLUSTER_READ_SECONDS, 1)
     return min(CLUSTERS_PER_BATCH, PARALLELISM * waves)
 
 
-def failure_cause(exc: Exception) -> str:
-    """A failed call's cause for a target's summary: leeway's own words where
-    it gave them, without the exception's class or leeway's exit preamble, on
-    one line and cut to CAUSE_MAX_CHARS."""
-    raw = getattr(exc, SHORT_CAUSE_ATTR, None) or str(exc) or type(exc).__name__
+def short_cause(raw: object) -> str:
+    """One line of a failure's cause, cut to CAUSE_MAX_CHARS."""
     cause = SPACE_CHAR.join(str(raw).split())
     if len(cause) <= CAUSE_MAX_CHARS:
         return cause
     return cause[: CAUSE_MAX_CHARS - len(CAUSE_ELLIPSIS)] + CAUSE_ELLIPSIS
 
 
-def error_row_count(report: dict[str, Any]) -> int:
-    """How many cluster rows a returned `leeway report` answered with an error."""
-    return sum(
-        1 for row in report.get(CLUSTERS_FIELD, []) if isinstance(row, dict) and row.get(STATUS_FIELD) != STATUS_OK
-    )
+def first_cause(causes: list[str]) -> str:
+    """The first cause, and how many different ones followed it."""
+    others = len(set(causes) - {causes[0]})
+    return causes[0] + (OTHER_CAUSES_SUFFIX.format(count=others) if others else "")
+
+
+def order_clusters(triples: list[str], cluster_runs: dict[str, Any], now: datetime) -> list[str]:
+    """Least recently stamped first. Clusters with the same stamp are shuffled
+    by a hash of the run's date, so batch membership changes from run to run
+    and a cluster that hangs its call does not take the same batch-mates down
+    every time."""
+    salt = now.strftime(DATE_FORMAT)
+
+    def key(triple: str) -> tuple[str, str]:
+        mixed = hashlib.sha256(f"{salt}{CLUSTER_KEY_SEPARATOR}{triple}".encode()).hexdigest()
+        return str(cluster_runs.get(triple) or ""), mixed
+
+    return sorted(triples, key=key)
 
 
 def sweep_in_batches(
@@ -1538,43 +1480,32 @@ def sweep_in_batches(
     cluster_runs: dict[str, Any],
     now: datetime,
 ) -> BatchSweep:
-    """Read `triples` in `leeway report` calls of at most CLUSTERS_PER_BATCH.
+    """Read `triples` in `leeway report` calls of at most `batch_size` clusters.
 
-    The least recently stamped clusters go first, so a target the tick ran
-    out of time for resumes on its next turn from the clusters it did not
-    reach. Each call gets its own sandbox timeout (PROJECT_TIMEOUT_SECONDS, or
-    what is left of the tick), its own per-cluster `--timeout`, and only the
-    clusters that fit at the conservative read time (`batch_size`), so a call
-    that fails costs only its own clusters. No call starts with less than
-    MIN_PROJECT_RUN_SECONDS left: the clusters after that point are not
-    reached, which is the only deferred outcome. Every started call stamps its
-    clusters in `cluster_runs`, however it ended; since each fits its
-    deadlines, one that times out is a `timeout` failure, not a deferral.
-
-    A failure or a gap is one entry for the whole target, named `label`. A
-    target read in one call keeps that call's own message, as before batching;
-    one that took more calls is summarised by counts: clusters read, clusters
-    whose call failed (with the first failure's cause), error rows from calls
-    that returned, and clusters not reached. The entry's kind is the first
-    failure's, else budget exhausted, which `tick` treats as deferred.
+    Every started call stamps its clusters in `cluster_runs`, however it ends.
+    No call starts with less than MIN_PROJECT_RUN_SECONDS left; the clusters
+    after that point are not reached. The target's turn ends at its first
+    sandbox timeout, so a target whose calls hang costs one call. A failure or
+    a gap is one entry named `label`: a target read in one call keeps that
+    call's own message; one read in more is summarised by counts.
     """
     result = BatchSweep()
-    ordered = order_by_least_recent(triples, cluster_runs)
-    position = calls = read = failed = errored = not_reached = 0
+    ordered = order_clusters(triples, cluster_runs, now)
+    position = read = failed = errored = 0
     causes: list[str] = []
-    failure_kind: str | None = None
+    row_causes: list[str] = []
     one_call_detail: str | None = None
-    while position < len(ordered):
+    timed_out = False
+    while position < len(ordered) and not timed_out:
         remaining = int(deadline - time.monotonic())
         if remaining < MIN_PROJECT_RUN_SECONDS:
-            not_reached += len(ordered) - position
             result.first_error = result.first_error or RuntimeError(BUDGET_EXHAUSTED_DETAIL.format(target=label))
             break
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
         batch = ordered[position : position + batch_size(timeout)]
         holds_every_cluster = position == 0 and len(batch) == len(ordered)
         position += len(batch)
-        calls += 1
+        result.calls += 1
         cluster_runs.update(dict.fromkeys(batch, iso(now)))
         try:
             rep = run_leeway_report(CLUSTERS_FLAG, CLUSTER_SEPARATOR.join(sorted(batch)), timeout=timeout)
@@ -1582,83 +1513,57 @@ def sweep_in_batches(
             error: Exception = exc
             detail = TIMED_OUT_DETAIL.format(seconds=timeout)
             kind = ERROR_KIND_TIMEOUT
+            timed_out = True
         except Exception as exc:  # noqa: BLE001
             error = exc
             detail = SCAN_FAILED_DETAIL.format(target=label, error=f"{type(exc).__name__}: {exc}")
             kind = ERROR_KIND_SCAN_FAILED
         else:
             result.reports.append(rep)
-            row_errors = min(error_row_count(rep), len(batch))
-            errored += row_errors
-            read += len(batch) - row_errors
+            rows = [
+                row.get(ERROR_FIELD) or DEFAULT_CLUSTER_SCAN_FAILED
+                for row in rep.get(CLUSTERS_FIELD, [])
+                if isinstance(row, dict) and row.get(STATUS_FIELD) != STATUS_OK
+            ][: len(batch)]
+            errored += len(rows)
+            read += len(batch) - len(rows)
+            row_causes.extend(short_cause(cause) for cause in rows)
             continue
         result.first_error = result.first_error or error
         failed += len(batch)
-        causes.append(failure_cause(error))
-        failure_kind = failure_kind or kind
+        causes.append(short_cause(getattr(error, SHORT_CAUSE_ATTR, None) or error))
+        result.kind = result.kind or kind
         one_call_detail = detail if holds_every_cluster else None
 
-    result.every_cluster_called = not not_reached
-    if not failed and not not_reached:
+    left = len(ordered) - position
+    result.every_cluster_called = not left
+    if not failed and not errored and not left:
         return result
-    result.kind = failure_kind or ERROR_KIND_BUDGET_EXHAUSTED
-    if calls == 0:
+    result.kind = result.kind or (ERROR_KIND_CLUSTER_ERROR if errored else ERROR_KIND_BUDGET_EXHAUSTED)
+    if result.calls == 0:
         result.detail = BUDGET_EXHAUSTED_DETAIL.format(target=label)
     elif one_call_detail is not None:
         result.detail = one_call_detail
     else:
         gaps: list[str] = []
         if failed:
-            cause = causes[0]
-            others = len(set(causes) - {cause})
-            if others:
-                cause += OTHER_CAUSES_SUFFIX.format(count=others)
-            gaps.append(FAILED_PART.format(count=failed, cause=cause))
+            gaps.append(FAILED_PART.format(count=failed, cause=first_cause(causes)))
         if errored:
-            gaps.append(CLUSTER_ERRORS_PART.format(count=errored))
-        if not_reached:
-            gaps.append(NOT_REACHED_PART.format(count=not_reached))
+            gaps.append(CLUSTER_ERRORS_PART.format(count=errored, cause=first_cause(row_causes)))
+        if left:
+            gaps.append((TURN_ENDED_PART if timed_out else NOT_REACHED_PART).format(count=left))
         result.detail = TARGET_SUMMARY_DETAIL.format(read=read, total=len(ordered), gaps=GAP_SEPARATOR.join(gaps))
     return result
 
 
-@dataclass
-class ResolvedScope:
-    """What this tick resolved the fleet to, for retiring and pruning what
-    left it. `resolved` is False when the list may be missing something (an
-    unusable resolved scope, an unresolved declared scope, an unreadable
-    Cluster Agent profile); nothing is retired or pruned for scope then."""
-
-    resolved: bool = False
-    # Project mode: every project in scope, those with no turn this tick and
-    # those that could not be read included.
-    projects: set[str] = field(default_factory=set)
-    # LEEWAY_WATCH_CLUSTERS mode: the configured clusters, less exclusions.
-    clusters: set[str] | None = None
-
-    def admits_cluster(self, cluster: str) -> bool:
-        """Whether a cluster is still in scope: anything when unresolved, and
-        a bare cluster name (an older ledger's), which names no project."""
-        if not self.resolved or cluster.count(CLUSTER_KEY_SEPARATOR) != CLUSTER_TRIPLE_SEPARATORS:
-            return True
-        if self.clusters is not None:
-            return cluster in self.clusters
-        return cluster.split(CLUSTER_KEY_SEPARATOR, 1)[0] in self.projects
-
-    def admits_project(self, project: str) -> bool:
-        """Whether a project is still in scope (anything when unresolved; in
-        LEEWAY_WATCH_CLUSTERS mode project stamps are left alone)."""
-        return not self.resolved or self.clusters is not None or project in self.projects
-
-
 def ledger_cluster_runs(ledger: dict[str, Any]) -> dict[str, Any]:
-    """A copy of the ledger's per-cluster read stamps; empty in a ledger written before batching."""
+    """A copy of the ledger's per-cluster stamps; empty in a ledger written before batching."""
     stamps = ledger.get(CLUSTER_RUNS_KEY)
     return dict(stamps) if isinstance(stamps, dict) else {}
 
 
 def forget_unlisted_clusters(cluster_runs: dict[str, Any], project: str, triples: list[str]) -> None:
-    """Drop the stamps of `project`'s clusters that its current cluster list no longer names."""
+    """Drop the stamps of `project`'s clusters that its cluster list no longer names."""
     prefix = project + CLUSTER_KEY_SEPARATOR
     listed = set(triples)
     for stale in [t for t in cluster_runs if t.startswith(prefix) and t not in listed]:
@@ -1670,28 +1575,25 @@ def sweep_fleet(
     now: datetime,
     deadline: float,
     cluster_runs: dict[str, Any] | None = None,
-    resolved_scope: ResolvedScope | None = None,
+    project_runs: dict[str, Any] | None = None,
+    read_targets: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, str], dict[str, str], set[str], set[str]]:
     """Run `leeway report` across configured clusters or projects.
 
     Each target is read in batches (`sweep_in_batches`) and has at most one
-    scan-error entry. Projects go least recently swept first; a project is
-    stamped in `project_runs` when its turn started with a full call's budget,
-    or when every one of its clusters got a call, so a project bigger than a
-    tick rotates behind the others. A project is counted scanned when its
-    cluster list was read, which lets findings on clusters it no longer lists
-    retire; findings on a listed cluster retire only once that cluster is read
-    (`can_retire_finding`). `cluster_runs`, when given, is updated in place,
-    and so is `resolved_scope` with the fleet this tick resolved.
+    scan-error entry. Projects go least recently swept first; one whose turn
+    starts with a full call's time is stamped then, so it rotates behind the
+    others whatever its turn produces. `scanned_projects` holds the projects
+    whose cluster list was read. `cluster_runs`, `project_runs` and
+    `read_targets` (the targets at least one call was started for, or whose
+    list was empty), when given, are updated in place.
     """
-    if cluster_runs is None:
-        cluster_runs = ledger_cluster_runs(ledger)
-    if resolved_scope is None:
-        resolved_scope = ResolvedScope()
+    cluster_runs = ledger_cluster_runs(ledger) if cluster_runs is None else cluster_runs
+    project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {}) if project_runs is None else project_runs
+    read_targets = set() if read_targets is None else read_targets
     scope = declared_scope()
     excluded = excluded_clusters(scope)
     clusters = [c for c in explicit_clusters() if c not in excluded]
-    project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {})
     scan_errors: dict[str, str] = {}
     error_kinds: dict[str, str] = {}
     reports: list[dict[str, Any]] = []
@@ -1699,14 +1601,13 @@ def sweep_fleet(
     requested_clusters: set[str] = set(clusters)
 
     if clusters:
-        resolved_scope.resolved = True
-        resolved_scope.clusters = set(clusters)
         label = EXPLICIT_TARGET_LABEL if len(clusters) > CLUSTERS_PER_BATCH else CLUSTER_SEPARATOR.join(clusters)
         swept = sweep_in_batches(label, clusters, deadline, cluster_runs, now)
         if not swept.reports and swept.first_error is not None:
             # No call read anything: fail the tick with the cause, as one call did.
             raise swept.first_error
         reports.extend(swept.reports)
+        read_targets.add(EXPLICIT_TARGET_LABEL)
         if swept.detail is not None and swept.kind is not None:
             scan_errors[EXPLICIT_TARGET_LABEL] = swept.detail
             error_kinds[EXPLICIT_TARGET_LABEL] = swept.kind
@@ -1740,23 +1641,9 @@ def sweep_fleet(
             if not explicit or proj in explicit or proj == fleet_scope_targets.UNRESOLVED_SCOPE_ROW
         ]
         target_projects = order_by_least_recent(names, project_runs)
-        resolved_scope.resolved = (
-            cluster_scope.note is None and fleet_scope_targets.UNRESOLVED_SCOPE_ROW not in entries
-        )
-        resolved_scope.projects = set(names)
     else:
         known_triples_by_proj = roster_clusters_by_project()
         target_projects = order_by_least_recent(projects(scope), project_runs)
-        resolved_scope.projects = set(target_projects)
-        if scope is not None:
-            # Declared projects the install could not read stay in scope; a
-            # declaration it could not resolve as a whole leaves it unresolved.
-            unread = {project for project, _ in scope.unread}
-            resolved_scope.resolved = fleet_scope_targets.UNRESOLVED_SCOPE_ROW not in unread
-            resolved_scope.projects |= unread
-        else:
-            explicit_projects = os.environ.get(PROJECTS_ENV, "").strip()
-            resolved_scope.resolved = bool(explicit_projects) or not roster_unidentified_profiles()
     for proj in target_projects:
         entry = entries.get(proj)
         if entry is not None and entry.status == fleet_scope_targets.STATUS_UNREAD:
@@ -1768,13 +1655,9 @@ def sweep_fleet(
             scan_errors[proj] = BUDGET_EXHAUSTED_DETAIL.format(target=proj)
             error_kinds[proj] = ERROR_KIND_BUDGET_EXHAUSTED
             continue
-        # A project that had its turn rotates behind those that have not: one
-        # that started with a full call's budget is stamped whatever the turn
-        # produced, even if the tick ran out before all its clusters were read
-        # (those go first on its next turn), so a project bigger than a tick
-        # cannot hold the head of the queue. One the budget reached late is
-        # stamped only if every cluster got its call; otherwise it keeps its
-        # older stamp and goes ahead of this tick's projects next time.
+        # A turn that starts with a full call's time rotates the project behind
+        # the others, whatever it produces; one the budget reached late is
+        # stamped only if every cluster got a call.
         if remaining >= PROJECT_TIMEOUT_SECONDS:
             project_runs[proj] = iso(now)
         triples = [t for t in (known_triples_by_proj.get(proj) or []) if t not in excluded]
@@ -1782,7 +1665,6 @@ def sweep_fleet(
             if not triples and (entry is None or entry.status == fleet_scope_targets.STATUS_LIST_LIVE):
                 triples = [t for t in project_cluster_triples(proj) if t not in excluded]
         except SandboxTimedOut:
-            # The listing has its own timeout, independent of the tick budget.
             scan_errors[proj] = LIST_CLUSTERS_TIMED_OUT_DETAIL.format(
                 project=proj, seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS
             )
@@ -1793,16 +1675,17 @@ def sweep_fleet(
             error_kinds[proj] = ERROR_KIND_SCAN_FAILED
             continue
         forget_unlisted_clusters(cluster_runs, proj, triples)
-        # Its cluster list is known: findings on clusters it no longer lists may
-        # retire, and those on listed clusters retire once read (can_retire_finding).
         scanned_projects.add(proj)
         if not triples:
             # A project with no clusters is a clean, empty read.
+            read_targets.add(proj)
             project_runs[proj] = iso(now)
             continue
         requested_clusters.update(triples)
         swept = sweep_in_batches(proj, triples, deadline, cluster_runs, now)
         reports.extend(swept.reports)
+        if swept.calls:
+            read_targets.add(proj)
         if swept.detail is not None and swept.kind is not None:
             scan_errors[proj] = swept.detail
             error_kinds[proj] = swept.kind
@@ -1827,12 +1710,10 @@ def can_retire_finding(
 ) -> bool:
     """Return True when a prior finding's absence is backed by a clean read.
 
-    Decided per cluster: a cluster read to a result (`ok_clusters`) retires its
-    absent findings; a listed or requested cluster that was not (`explicit_targets`
-    holds every cluster a call was meant to read) keeps them. A cluster its
-    project's cluster list no longer names retires its findings once that list
-    was read (`scanned_projects`), whatever happened to the project's other
-    clusters: the list is authoritative.
+    A cluster read to a result without an error row retires its absent
+    findings; a cluster a call was meant to read (`explicit_targets`) and that
+    was not keeps them. A cluster its project's cluster list no longer names
+    retires them once that list was read (`scanned_projects`).
     """
     cluster = str(prior_entry.get("cluster") or key.split(CLUSTER_KEY_SEPARATOR, 1)[0])
     is_bare_ledger_cluster = CLUSTER_KEY_SEPARATOR not in cluster
@@ -1862,119 +1743,55 @@ def can_retire_finding(
     return False
 
 
-def announce_partial_scan(
+def announce_failed_targets(
     announced: dict[str, Any],
     failures: dict[str, str],
-    failure_kinds: dict[str, str],
-    deferred: dict[str, str],
+    read_targets: set[str],
+    present: set[str],
 ) -> list[str]:
-    """The partial-scan line or its recovery line, announced once per episode.
+    """The partial-scan line when a target fails that has no open episode, and
+    the recovery line when the last open episode closes.
 
-    Keyed by the failures' kinds, so rotating project names or text jitter do
-    not re-post. The line names the failures first, each with its entry, then
-    the deferred targets by name, so deferred targets never crowd a failure out
-    of the cap. The recovery line posts only once nothing failed and nothing
-    was deferred. A stored signature is read without deferred kinds, so one an
-    older ledger made of them alone counts as never announced.
+    A target's episode opens when its failure is announced and closes when it
+    is read without failing; a target this run did not reach keeps its episode
+    open, and one no longer swept (absent from `present`) drops it silently.
+    An older ledger's signature of error kinds counts today's failures as
+    already announced when it held a failure, and is dropped either way.
     """
-    stored = announced.get(ANNOUNCED_PARTIAL_KEY)
-    stored_failures = sorted(set(stored) - DEFERRED_ERROR_KINDS) if isinstance(stored, list) else []
-    signature = sorted(set(failure_kinds.values()))
-    if signature:
-        announced[ANNOUNCED_PARTIAL_KEY] = signature
-        if stored_failures == signature:
-            return []
-        deferred_part = (
-            PARTIAL_DEFERRED_PART.format(targets=format_name_list(sorted(deferred))) if deferred else ""
-        )
-        return [
-            PARTIAL_LINE.format(
-                prefix=LINE_PREFIX,
-                count=len(failures),
-                failures=format_name_list([f"{k}: {v}" for k, v in sorted(failures.items())]),
-                deferred=deferred_part,
-            )
-        ]
-    if stored_failures and deferred:
-        # The failures cleared but part of the fleet was not reached: the
-        # episode stays open until a run reads every target.
-        announced[ANNOUNCED_PARTIAL_KEY] = stored_failures
-        return []
-    announced.pop(ANNOUNCED_PARTIAL_KEY, None)
-    return [PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX)] if stored_failures else []
+    stored = announced.get(ANNOUNCED_FAILED_TARGETS_KEY)
+    legacy = announced.pop(ANNOUNCED_PARTIAL_KEY, None)
+    if isinstance(stored, list):
+        open_targets = {str(target) for target in stored}
+    elif isinstance(legacy, list) and {str(kind) for kind in legacy} - LEGACY_NOT_REACHED_KINDS:
+        open_targets = set(failures)
+    else:
+        open_targets = set()
+    lines: list[str] = []
+    new = sorted(set(failures) - open_targets)
+    if new:
+        named = new + sorted(set(failures) - set(new))
+        reasons = format_name_list([f"{target}: {failures[target]}" for target in named])
+        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(failures), reasons=reasons))
+    closed = {target for target in open_targets if target in read_targets and target not in failures}
+    still_open = ((open_targets & present) - closed) | set(failures)
+    if closed and not still_open:
+        lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
+    if still_open:
+        announced[ANNOUNCED_FAILED_TARGETS_KEY] = sorted(still_open)
+    else:
+        announced.pop(ANNOUNCED_FAILED_TARGETS_KEY, None)
+    return lines
 
 
-def prune_out_of_scope(
-    scope: ResolvedScope, cluster_runs: dict[str, Any], project_runs: dict[str, Any], unread_since: dict[str, Any]
-) -> None:
-    """Drop the stamps of clusters and projects this tick's resolved scope no longer holds."""
-    for cluster in [c for c in cluster_runs if not scope.admits_cluster(c)]:
-        del cluster_runs[cluster]
-    for project in [p for p in project_runs if not scope.admits_project(p)]:
-        del project_runs[project]
-    for target in list(unread_since):
-        in_scope = scope.admits_cluster(target) if CLUSTER_KEY_SEPARATOR in target else scope.admits_project(target)
-        if not in_scope:
-            del unread_since[target]
-
-
-def coverage_gaps(
-    now: datetime,
-    scope: ResolvedScope,
-    requested_clusters: set[str],
-    cluster_runs: dict[str, Any],
-    project_runs: dict[str, Any],
-    unread_since: dict[str, Any],
-) -> list[str]:
-    """The projects with a part no call has reached for over COVERAGE_GAP_DAYS.
-
-    A cluster counts from its `cluster_runs` stamp, or, never in a call, from
-    when it was first listed (`unread_since`). A project counts from the newest
-    of its turn and its clusters' stamps, or, with neither, from when it was
-    first in scope. `unread_since` is updated in place.
-    """
-    first_seen = iso(now)
-    for cluster in requested_clusters:
-        if cluster in cluster_runs:
-            unread_since.pop(cluster, None)
-        else:
-            unread_since.setdefault(cluster, first_seen)
-    newest_by_project: dict[str, datetime] = {}
-    for cluster, stamp in cluster_runs.items():
-        moment = parse_iso(stamp)
-        project = cluster.split(CLUSTER_KEY_SEPARATOR, 1)[0]
-        if moment is not None and (project not in newest_by_project or moment > newest_by_project[project]):
-            newest_by_project[project] = moment
-    project_level = scope.projects if scope.resolved and scope.clusters is None else set()
-    for project in project_level:
-        moment = parse_iso(project_runs.get(project))
-        if moment is not None and (project not in newest_by_project or moment > newest_by_project[project]):
-            newest_by_project[project] = moment
-        if project in newest_by_project:
-            unread_since.pop(project, None)
-        else:
-            unread_since.setdefault(project, first_seen)
-    limit = timedelta(days=COVERAGE_GAP_DAYS, seconds=REFRESH_SLACK_SECONDS)
-    gaps: set[str] = set()
-    for target, stamp in [*cluster_runs.items(), *unread_since.items()]:
-        moment = parse_iso(stamp)
-        if moment is not None and now - moment > limit:
-            gaps.add(target.split(CLUSTER_KEY_SEPARATOR, 1)[0])
-    gaps.update(p for p in project_level if p in newest_by_project and now - newest_by_project[p] > limit)
-    return sorted(gaps)
-
-
-def announce_coverage(announced: dict[str, Any], gaps: list[str]) -> list[str]:
-    """The coverage line once per episode, and its end once if it was said."""
-    if gaps:
-        said = bool(announced.get(ANNOUNCED_COVERAGE_KEY))
-        announced[ANNOUNCED_COVERAGE_KEY] = True
-        if said:
-            return []
-        return [COVERAGE_LINE.format(prefix=LINE_PREFIX, days=COVERAGE_GAP_DAYS, names=format_name_list(gaps))]
-    if announced.pop(ANNOUNCED_COVERAGE_KEY, None):
-        return [COVERAGE_CLEARED_LINE.format(prefix=LINE_PREFIX, days=COVERAGE_GAP_DAYS)]
-    return []
+def save_stamps(home: Path, ledger: dict[str, Any], project_runs: dict[str, Any], cluster_runs: dict[str, Any]) -> None:
+    """Keep a failed tick's sweep-order stamps, so the target that failed it
+    does not go first again; nothing else in the ledger changes."""
+    if project_runs == (ledger.get(PROJECT_RUNS_KEY) or {}) and cluster_runs == ledger_cluster_runs(ledger):
+        return
+    try:
+        save_ledger(home, {**ledger, PROJECT_RUNS_KEY: project_runs, CLUSTER_RUNS_KEY: cluster_runs})
+    except WriteFailed:
+        pass
 
 
 def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
@@ -1983,15 +1800,21 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     days = refresh_days()
     deadline = time.monotonic() + TICK_BUDGET_SECONDS
 
+    ledger: dict[str, Any] | None = None
+    cluster_runs: dict[str, Any] = {}
+    project_runs: dict[str, Any] = {}
+    read_targets: set[str] = set()
     try:
         ledger = load_ledger(home)
         cluster_runs = ledger_cluster_runs(ledger)
-        resolved_scope = ResolvedScope()
+        project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {})
         report, project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters = sweep_fleet(
-            ledger, moment, deadline, cluster_runs, resolved_scope
+            ledger, moment, deadline, cluster_runs, project_runs, read_targets
         )
     except Exception as exc:  # noqa: BLE001
         detail = f"{type(exc).__name__}: {exc}"
+        if ledger is not None and not dry_run:
+            save_stamps(home, ledger, project_runs, cluster_runs)
         for line in record_tick_failure(home, detail, dry_run=dry_run):
             print(line)
         return 0
@@ -2001,28 +1824,12 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     raw_findings, ok_clusters, cluster_errors = extract_findings(report)
     report = filter_report_findings(report)
     active_findings, _, _ = extract_findings(report)
-    # Targets whose only gap is clusters the tick had no time to start a call
-    # for are deferred, not failed: those clusters go first on the target's
-    # next turn and keep their findings meanwhile.
-    deferred: dict[str, str] = {
-        k: v for k, v in scan_errors.items() if error_kinds.get(k) in DEFERRED_ERROR_KINDS
-    }
-    all_errors: dict[str, str] = {
-        **{k: v for k, v in scan_errors.items() if k not in deferred},
-        **cluster_errors,
-    }
-    all_error_kinds: dict[str, str] = {
-        **{k: kind for k, kind in error_kinds.items() if k not in deferred},
-        **{c: ERROR_KIND_CLUSTER_ERROR for c in cluster_errors},
-    }
-
+    # A target only the budget kept from being read in full is not a failure;
+    # error rows are folded into their target's entry.
+    not_reached = {k: v for k, v in scan_errors.items() if error_kinds.get(k) == ERROR_KIND_BUDGET_EXHAUSTED}
+    all_errors = {k: v for k, v in scan_errors.items() if k not in not_reached}
     announced = dict(ledger.get(ANNOUNCED_KEY) or {})
-    lines.extend(announce_partial_scan(announced, all_errors, all_error_kinds, deferred))
-    stored_unread = ledger.get(UNREAD_SINCE_KEY)
-    unread_since: dict[str, Any] = dict(stored_unread) if isinstance(stored_unread, dict) else {}
-    prune_out_of_scope(resolved_scope, cluster_runs, project_runs, unread_since)
-    gaps = coverage_gaps(moment, resolved_scope, requested_clusters, cluster_runs, project_runs, unread_since)
-    lines.extend(announce_coverage(announced, gaps))
+    lines.extend(announce_failed_targets(announced, all_errors, read_targets, set(scan_errors) | read_targets))
 
     prior_findings: dict[str, Any] = dict(ledger.get(FINDINGS_KEY) or {})
     next_findings: dict[str, Any] = {}
@@ -2080,11 +1887,6 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     #    the cluster/project scan failed.
     for key, prior in sorted(prior_findings.items()):
         if key in active_findings or not isinstance(prior, dict):
-            continue
-        if not resolved_scope.admits_cluster(str(prior.get(CLUSTER_FIELD) or "")):
-            # Its project (or, under LEEWAY_WATCH_CLUSTERS, the cluster) left
-            # the scope this tick resolved.
-            retired_labels.append(short_finding_label(prior))
             continue
         raw_item = raw_findings.get(key)
         if raw_item is not None:
@@ -2173,7 +1975,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             else:
                 announced.pop(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY, None)
             markdown = render_markdown_report(
-                report, active_findings, due_reasons, all_errors, moment, days, not_reached=deferred
+                report, active_findings, due_reasons, all_errors, moment, days, not_reached=not_reached
             )
             md_path = write_report_files(home, report, markdown, moment)
             due_items = [active_findings[k] for k in sorted(due_reasons)]
@@ -2210,7 +2012,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             else:
                 announced.pop(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY, None)
             markdown = render_markdown_report(
-                report, active_findings, due_reasons, all_errors, moment, days, not_reached=deferred
+                report, active_findings, due_reasons, all_errors, moment, days, not_reached=not_reached
             )
             md_path = write_report_files(home, report, markdown, moment)
             summary_line = retired_line if retired_labels else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
@@ -2234,10 +2036,8 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         }
         if cluster_runs:
             updated_ledger[CLUSTER_RUNS_KEY] = cluster_runs
-        if unread_since:
-            updated_ledger[UNREAD_SINCE_KEY] = unread_since
-        if all_errors or deferred:
-            updated_ledger[SCAN_ERRORS_KEY] = {**all_errors, **deferred}
+        if scan_errors:
+            updated_ledger[SCAN_ERRORS_KEY] = scan_errors
         if announced:
             updated_ledger[ANNOUNCED_KEY] = announced
         save_ledger(home, updated_ledger)

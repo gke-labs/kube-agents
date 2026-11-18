@@ -301,7 +301,7 @@ class GateAndReportingTests(unittest.TestCase):
         }
         code_err, out_err = self.run_tick(lambda *a, **kw: completed_json(make_report([c_error], t1)), now=t1)
         self.assertEqual(code_err, 0)
-        self.assertIn("leeway watch: the fleet scan was partial, 1 with errors:", out_err)
+        self.assertIn("leeway watch: the fleet scan was partial (1 error(s))", out_err)
         self.assertNotIn("retired", out_err)
         ledger = watch.load_ledger(self.home)
         self.assertEqual(len(ledger[watch.FINDINGS_KEY]), 1)
@@ -320,7 +320,7 @@ class GateAndReportingTests(unittest.TestCase):
         }
         code_ok, out_ok = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t3)), now=t3)
         self.assertEqual(code_ok, 0)
-        self.assertIn("leeway watch: the fleet scan reads every target again", out_ok)
+        self.assertIn("leeway watch: every target that failed reads cleanly again", out_ok)
         self.assertIn("leeway: 1 finding(s) resolved (seeded-d:shop/checkout-api); retired from the watch", out_ok)
         ledger_after = watch.load_ledger(self.home)
         self.assertEqual(ledger_after[watch.FINDINGS_KEY], {})
@@ -589,32 +589,43 @@ class GateAndReportingTests(unittest.TestCase):
 
             code, out = self.run_tick(fake_run, now=T0)
             self.assertEqual(code, 0)
-            self.assertIn("leeway watch: the fleet scan was partial, 1 with errors:", out)
+            self.assertIn("leeway watch: the fleet scan was partial (1 error(s))", out)
             ledger = watch.load_ledger(self.home)
             self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p1"), watch.iso(T0))
             self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p2"), watch.iso(T0))
 
-    def test_partial_scan_deduplicates_by_error_kind_across_rotating_projects(self) -> None:
+    def test_partial_scan_announces_each_failing_target_once(self) -> None:
+        def failing(*projects: str):
+            def run(argv, **kw):
+                if argv[-1].split("/", 1)[0] in projects:
+                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
+                cluster = argv[-1]
+                return completed_json(make_report([{"cluster": cluster, "status": "ok"}], T0))
+
+            return run
+
+        def entry(project: str) -> str:
+            return f"{project}: leeway scan for {project} failed: RuntimeError: leeway exited 1 without a report: err"
+
+        partial = "leeway watch: the fleet scan was partial ({count} error(s)): {reasons}; " \
+            "findings on unreadable clusters are retained until read again"
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
-            # Day 0: p1 succeeds, p2 fails with scan_failed -> announces partial scan.
-            def day0_run(argv, **kw):
-                if argv[-1].startswith("p2/"):
-                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
-                return completed_json(make_report([{"cluster": "p1/us-central1/seeded-d", "status": "ok"}], T0))
-
-            _, out0 = self.run_tick(day0_run, now=T0)
-            self.assertIn("leeway watch: the fleet scan was partial", out0)
-
-            # Day 1: p1 fails with scan_failed, p2 succeeds -> error kind is still ["scan_failed"], so silent!
-            t1 = T0 + timedelta(days=1)
-
-            def day1_run(argv, **kw):
-                if argv[-1].startswith("p1/"):
-                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
-                return completed_json(make_report([{"cluster": "p2/us-central1/seeded-d", "status": "ok"}], t1))
-
-            _, out1 = self.run_tick(day1_run, now=t1)
-            self.assertEqual(out1, "")
+            outputs = [
+                self.run_tick(outcome, now=T0 + timedelta(days=day))[1].splitlines()
+                for day, outcome in enumerate(
+                    (failing("p2"), failing("p2"), failing("p1"), failing("p1"), failing())
+                )
+            ]
+        self.assertEqual(
+            outputs,
+            [
+                [partial.format(count=1, reasons=entry("p2"))],
+                [],  # the same target failing again is not re-posted
+                [partial.format(count=1, reasons=entry("p1"))],  # a new target posts; p2 read cleanly
+                [],
+                ["leeway watch: every target that failed reads cleanly again"],
+            ],
+        )
 
     def test_retires_resolved_finding_in_clusters_mode_and_with_bare_cluster_names(self) -> None:
         with mock.patch.dict(
@@ -1042,7 +1053,7 @@ class GateAndReportingTests(unittest.TestCase):
             code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_day1_partial), now=t1)
             self.assertEqual(code1, 0)
             self.assertIn("1 finding(s) resolved", out1)
-            self.assertIn("the fleet scan was partial, 1 with errors:", out1)
+            self.assertIn("the fleet scan was partial (1 error(s))", out1)
             self.assertEqual(len(published_payloads), 1)
             ledger1 = watch.load_ledger(self.home)
             self.assertEqual(
@@ -1055,7 +1066,7 @@ class GateAndReportingTests(unittest.TestCase):
             self.assertEqual(code2, 0)
             self.assertEqual(len(published_payloads), 2)
             self.assertEqual(published_payloads[1]["clusters"][0]["topology_findings"], [])
-            self.assertIn("the fleet scan reads every target again", out2)
+            self.assertIn("every target that failed reads cleanly again", out2)
             self.assertIn("publishing to blackboard topic topology-skew succeeded again", out2)
             ledger2 = watch.load_ledger(self.home)
             self.assertNotIn(watch.ANNOUNCED_KEY, ledger2)
@@ -1613,7 +1624,6 @@ class DiscoveryTests(unittest.TestCase):
     def test_declared_scope_drops_excluded_clusters_from_sweep(self) -> None:
         fake_scope = mock.Mock(
             projects=("p-scoped",),
-            unread=(),
             excluded_clusters=(("p-scoped", "us-central1", "c-excluded"),),
         )
         seen_argv: list[list[str]] = []
@@ -1725,13 +1735,13 @@ class ClusterTimeoutTests(unittest.TestCase):
         # Capped: one or two clusters would otherwise get 870 s each.
         self.assertEqual(watch.cluster_timeout_seconds(900, 1), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
         self.assertEqual(watch.cluster_timeout_seconds(900, 2), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
-        self.assertEqual(watch.cluster_timeout_seconds(330, 1), 300)
-        self.assertEqual(watch.cluster_timeout_seconds(200, 1), 170)
+        self.assertEqual(watch.cluster_timeout_seconds(390, 1), 300)
+        self.assertEqual(watch.cluster_timeout_seconds(200, 1), 110)
 
     def test_waves_split_the_call(self) -> None:
         self.assertEqual(watch.cluster_timeout_seconds(900, 3), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
-        self.assertEqual(watch.cluster_timeout_seconds(900, 10), 174)
-        self.assertEqual(watch.cluster_timeout_seconds(600, 5), 190)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 10), 162)
+        self.assertEqual(watch.cluster_timeout_seconds(600, 5), 170)
 
     def test_never_below_leeways_own_default(self) -> None:
         self.assertEqual(watch.cluster_timeout_seconds(900, 100), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
@@ -1754,7 +1764,7 @@ class ClusterTimeoutTests(unittest.TestCase):
             watch.run_leeway_report(watch.CLUSTERS_FLAG, "p/l/a,p/l/b,p/l/c", timeout=300)
 
         argv = seen_argv[0]
-        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "135s")
+        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "105s")
         self.assertEqual(argv[-2:], [watch.CLUSTERS_FLAG, "p/l/a,p/l/b,p/l/c"])
 
     def test_budget_cut_call_shrinks_the_cluster_timeout(self) -> None:
@@ -1773,15 +1783,15 @@ class ClusterTimeoutTests(unittest.TestCase):
         ), mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run), mock.patch.object(
             watch.time, "monotonic", return_value=0.0
         ):
-            watch.sweep_fleet({}, T0, deadline=200.0)
+            watch.sweep_fleet({}, T0, deadline=250.0)
 
         argv = seen_argv[0]
-        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "170s")
+        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "160s")
 
     def test_a_call_starts_only_with_the_floor_plus_overhead_left(self) -> None:
         # One second short of MIN_PROJECT_RUN_SECONDS the tick budget is spent
         # and leeway is not run; at it, the call runs with the conservative
-        # read time (#6370: no call starts on a deadline a cluster can miss).
+        # read time.
         for left, runs in ((watch.MIN_PROJECT_RUN_SECONDS - 1, False), (watch.MIN_PROJECT_RUN_SECONDS, True)):
             with self.subTest(left=left):
                 seen_argv: list[list[str]] = []
@@ -1820,11 +1830,33 @@ def clusters_arg(argv: list[str]) -> list[str]:
     return argv[argv.index(watch.CLUSTERS_FLAG) + 1].split(",")
 
 
+def hangs(*clusters: str):
+    """An outcome whose call times out when it holds any of `clusters`."""
+
+    def outcome(batch, timeout):
+        if set(batch) & set(clusters):
+            raise subprocess.TimeoutExpired(cmd="leeway", timeout=timeout)
+        return None
+
+    return outcome
+
+
+def fails(project: str, stderr: str = "boom"):
+    """An outcome whose call exits 1 without a report when it holds a cluster of `project`."""
+
+    def outcome(batch, _):
+        if batch[0].startswith(project + "/"):
+            return subprocess.CompletedProcess([], 1, "", stderr)
+        return None
+
+    return outcome
+
+
 class BatchTests(unittest.TestCase):
     """#6370: a project's clusters (and LEEWAY_WATCH_CLUSTERS) are read in
-    calls of at most CLUSTERS_PER_BATCH, so a slow call costs only its batch,
-    and the least recently read clusters go first so a project the tick budget
-    cuts off is covered over successive ticks."""
+    calls of at most CLUSTERS_PER_BATCH, so a slow call costs only its batch;
+    a project's turn ends at its first sandbox timeout; and failures are
+    announced per target."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -1843,6 +1875,7 @@ class BatchTests(unittest.TestCase):
         self.clock_patch = mock.patch.object(watch.time, "monotonic", side_effect=lambda: self.clock)
         self.clock_patch.start()
         self.calls: list[tuple[list[str], int]] = []
+        self.ok: set[str] = set()
 
     def tearDown(self) -> None:
         self.clock_patch.stop()
@@ -1853,16 +1886,24 @@ class BatchTests(unittest.TestCase):
     def sandbox(self, outcome=None, *, seconds: float = 0.0, findings: dict | None = None):
         """A sandbox whose `leeway report` returns an ok row per requested cluster
         (with `findings[cluster]` when given), unless `outcome(clusters, timeout)`
-        raises or returns a CompletedProcess. Each call advances the clock."""
+        raises or returns a CompletedProcess. A call advances the clock by
+        `seconds`, or by its timeout when it times out; `self.ok` collects the
+        clusters returned as ok rows."""
 
         def run(argv, **kw):
             clusters = clusters_arg(argv)
             self.calls.append((list(argv), kw["timeout"]))
+            try:
+                result = outcome(clusters, kw["timeout"]) if outcome is not None else None
+            except subprocess.TimeoutExpired:
+                self.clock += kw["timeout"]
+                raise
             self.clock += seconds
-            if outcome is not None:
-                result = outcome(clusters, kw["timeout"])
-                if result is not None:
-                    return result
+            if result is not None:
+                rows = json.loads(result.stdout).get("clusters", []) if result.stdout else []
+                self.ok.update(r["cluster"] for r in rows if r.get("status") == "ok")
+                return result
+            self.ok.update(clusters)
             rows = [
                 {"cluster": c, "status": "ok", "topology_findings": [f] if (f := (findings or {}).get(c)) else []}
                 for c in clusters
@@ -1874,46 +1915,113 @@ class BatchTests(unittest.TestCase):
     def sweep(self, ledger: dict, cluster_runs: dict, deadline: float):
         return watch.sweep_fleet(ledger, T0, deadline, cluster_runs)
 
+    def tick(self, day: int, outcome=None, *, seconds: float = 0.0, findings: dict | None = None) -> list[str]:
+        self.clock = 0.0
+        self.calls.clear()
+        self.ok.clear()
+        buf = io.StringIO()
+        with self.sandbox(outcome, seconds=seconds, findings=findings), redirect_stdout(buf):
+            watch.tick(now=T0 + timedelta(days=day))
+        return buf.getvalue().splitlines()
+
+    def write_ledger(self, finding_clusters: list[str] = (), **extra) -> None:
+        findings = {}
+        for cluster in finding_clusters:
+            item = watch.normalize_topology_finding(cluster, make_topology_finding(name="web"))
+            findings[item["key"]] = {
+                k: item[k] for k in ("cluster", "kind", "namespace", "subject_kind", "subject_name",
+                                     "topology_key", "tier", "severity", "suspected_cause")
+            } | {watch.FIRST_SEEN_KEY: watch.iso(T0), watch.LAST_REPORT_KEY: watch.iso(T0)}
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / watch.LEDGER_FILE_NAME).write_text(
+            json.dumps({watch.FINDINGS_KEY: findings, **extra}), encoding="utf-8"
+        )
+
+    def finding_clusters(self) -> list[str]:
+        return sorted(f["cluster"] for f in watch.load_ledger(self.home)[watch.FINDINGS_KEY].values())
+
+    def partial(self, count: int, *entries: str) -> str:
+        return (f"leeway watch: the fleet scan was partial ({count} error(s)): {', '.join(entries)}; "
+                "findings on unreadable clusters are retained until read again")
+
+    # --- batching ---------------------------------------------------------
+
     def test_the_batch_size_fits_one_call_at_the_conservative_read_time(self) -> None:
         size = watch.CLUSTERS_PER_BATCH
-        self.assertEqual(size, 14)
+        self.assertEqual(size, 12)
         self.assertEqual(size % watch.PARALLELISM, 0)
         per_cluster = watch.cluster_timeout_seconds(watch.PROJECT_TIMEOUT_SECONDS, size)
         self.assertGreaterEqual(per_cluster, watch.CONSERVATIVE_CLUSTER_READ_SECONDS)
         waves = size // watch.PARALLELISM
         self.assertLessEqual(waves * per_cluster + watch.LEEWAY_OVERHEAD_SECONDS, watch.PROJECT_TIMEOUT_SECONDS)
+        # The last deadline of a full batch ends well before the sandbox kills
+        # the call: more than twice the 30 s start-up alone can take.
+        self.assertGreaterEqual(watch.PROJECT_TIMEOUT_SECONDS - waves * per_cluster, 60)
         # The largest such batch: one more wave would fall below the read time.
         self.assertLess(
             watch.cluster_timeout_seconds(watch.PROJECT_TIMEOUT_SECONDS, size + watch.PARALLELISM),
             watch.CONSERVATIVE_CLUSTER_READ_SECONDS,
         )
 
+    def test_every_started_call_fits_its_deadlines_at_every_budget(self) -> None:
+        for remaining in range(watch.MIN_PROJECT_RUN_SECONDS, watch.PROJECT_TIMEOUT_SECONDS + 1):
+            size = watch.batch_size(remaining)
+            for count in range(1, size + 1):
+                per_cluster = watch.cluster_timeout_seconds(remaining, count)
+                waves = -(-count // watch.PARALLELISM)
+                self.assertGreaterEqual(per_cluster, watch.CONSERVATIVE_CLUSTER_READ_SECONDS, (remaining, count))
+                self.assertLessEqual(waves * per_cluster + watch.LEEWAY_OVERHEAD_SECONDS, remaining, (remaining, count))
+
     def test_a_project_of_one_batch_is_one_call_in_name_order(self) -> None:
         self.roster = {"p1": triples("p1", watch.CLUSTERS_PER_BATCH)}
-        # Stamps out of name order choose a batch's members, not its argv order.
         runs = {t: watch.iso(T0 - timedelta(days=i)) for i, t in enumerate(self.roster["p1"])}
         with self.sandbox():
             self.sweep({}, runs, 3600.0)
         self.assertEqual([clusters_arg(a) for a, _ in self.calls], [self.roster["p1"]])
 
     def test_a_larger_project_is_read_in_batches_each_with_its_own_timeouts(self) -> None:
-        self.roster = {"p1": triples("p1", 15)}
+        self.roster = {"p1": triples("p1", watch.CLUSTERS_PER_BATCH + 1)}
         with self.sandbox():
             _, project_runs, scan_errors, _, scanned, requested = self.sweep({}, {}, 3600.0)
-        self.assertEqual([clusters_arg(a) for a, _ in self.calls], [self.roster["p1"][:14], self.roster["p1"][14:]])
+        self.assertEqual([len(clusters_arg(a)) for a, _ in self.calls], [watch.CLUSTERS_PER_BATCH, 1])
+        self.assertEqual({c for a, _ in self.calls for c in clusters_arg(a)}, set(self.roster["p1"]))
         self.assertEqual([t for _, t in self.calls], [watch.PROJECT_TIMEOUT_SECONDS] * 2)
         per_cluster = [a[a.index(watch.CLUSTER_TIMEOUT_FLAG) + 1] for a, _ in self.calls]
-        self.assertEqual(per_cluster, ["124s", "300s"])
+        self.assertEqual(per_cluster, ["135s", "300s"])
         self.assertEqual(scan_errors, {})
         self.assertEqual(scanned, {"p1"})
         self.assertEqual(requested, set(self.roster["p1"]))
         self.assertEqual(project_runs, {"p1": watch.iso(T0)})
 
-    def test_a_single_batch_failure_is_keyed_by_the_project_as_before(self) -> None:
+    def test_a_call_on_a_short_budget_holds_only_the_waves_that_fit(self) -> None:
+        self.assertEqual(watch.batch_size(watch.PROJECT_TIMEOUT_SECONDS), watch.CLUSTERS_PER_BATCH)
+        self.assertEqual(watch.batch_size(330), 4)
+        self.assertEqual(watch.batch_size(watch.MIN_PROJECT_RUN_SECONDS), watch.PARALLELISM)
+        self.assertEqual(watch.batch_size(1), watch.PARALLELISM)
+        with self.sandbox():
+            self.sweep({}, {}, 330.0)
+        self.assertEqual([len(clusters_arg(a)) for a, _ in self.calls], [4] * 5)
+        for argv, timeout in self.calls:
+            per_cluster = int(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1].rstrip("s"))
+            self.assertGreaterEqual(per_cluster, watch.CONSERVATIVE_CLUSTER_READ_SECONDS)
+            self.assertLessEqual(2 * per_cluster + watch.LEEWAY_OVERHEAD_SECONDS, timeout)
+
+    def test_the_budget_running_out_mid_project_leaves_the_rest_for_its_next_turn(self) -> None:
+        deadline = watch.PROJECT_TIMEOUT_SECONDS + watch.MIN_PROJECT_RUN_SECONDS - 10.0
+        runs: dict = {}
+        with self.sandbox(seconds=watch.PROJECT_TIMEOUT_SECONDS):
+            _, project_runs, scan_errors, error_kinds, scanned, requested = self.sweep({}, runs, deadline)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(scan_errors, {"p1": "12 of 20 clusters read; 8 not reached (out of time this run)"})
+        self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_BUDGET_EXHAUSTED})
+        self.assertEqual(scanned, {"p1"})
+        self.assertEqual(requested, set(self.roster["p1"]))
+        self.assertEqual(project_runs, {"p1": watch.iso(T0)}, "its turn started with a full call's time")
+        self.assertEqual(runs, dict.fromkeys(clusters_arg(self.calls[0][0]), watch.iso(T0)))
+
+    def test_a_single_batch_failure_keeps_the_one_call_message(self) -> None:
         self.roster = {"p1": triples("p1", 2), "p2": triples("p2", 1)}
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.sandbox(
-            lambda clusters, _: subprocess.CompletedProcess([], 1, "", "boom") if clusters[0].startswith("p1/") else None
-        ):
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.sandbox(fails("p1")):
             _, _, scan_errors, error_kinds, _, _ = self.sweep({}, {}, 3600.0)
         self.assertEqual(
             scan_errors,
@@ -1923,247 +2031,18 @@ class BatchTests(unittest.TestCase):
         )
         self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_SCAN_FAILED})
 
-    def test_a_timed_out_batch_costs_only_its_own_clusters(self) -> None:
-        # Tick 0 reads every cluster clean and records findings on c00 (first
-        # call), c19 (second call) and a cluster the project later drops.
-        gone = "p1/l/zz-gone"
-        self.roster = {"p1": [*triples("p1", 20), gone]}
-        findings = {c: make_topology_finding(name="web") for c in ("p1/l/c00", "p1/l/c19", gone)}
-        buf = io.StringIO()
-        with self.sandbox(findings=findings), redirect_stdout(buf):
-            watch.tick(now=T0)
-        self.assertEqual(len(watch.load_ledger(self.home)[watch.FINDINGS_KEY]), 3)
-
-        # Tick 1: the first call (c00-c13) times out at the full call timeout;
-        # the second (c14-c19) reads clean, so c19's finding retires, and so
-        # does the dropped cluster's: the project's cluster list no longer
-        # names it. c00's finding stays.
-        self.roster = {"p1": triples("p1", 20)}
-        t1 = T0 + timedelta(days=1)
-
-        def first_batch_times_out(clusters, timeout):
-            if "p1/l/c00" in clusters:
-                raise subprocess.TimeoutExpired(cmd="leeway", timeout=timeout)
-            return None
-
-        buf = io.StringIO()
-        with self.sandbox(first_batch_times_out), redirect_stdout(buf):
-            watch.tick(now=t1)
-        detail = "6 of 20 clusters read; 14 failed (the sandbox run timed out after 900s)"
-        self.assertEqual(
-            buf.getvalue().splitlines(),
-            [
-                f"leeway watch: the fleet scan was partial, 1 with errors: p1: {detail}; "
-                "findings on unreadable clusters are retained until read again",
-                "leeway: 2 finding(s) resolved (c19:shop/web, zz-gone:shop/web); retired from the watch",
-            ],
-        )
-        ledger = watch.load_ledger(self.home)
-        self.assertEqual([f["cluster"] for f in ledger[watch.FINDINGS_KEY].values()], ["p1/l/c00"])
-        self.assertEqual(ledger[watch.SCAN_ERRORS_KEY], {"p1": detail})
-        self.assertEqual(ledger[watch.ANNOUNCED_KEY][watch.ANNOUNCED_PARTIAL_KEY], [watch.ERROR_KIND_TIMEOUT])
-        self.assertEqual(ledger[watch.PROJECT_RUNS_KEY], {"p1": watch.iso(t1)})
-        # A call that timed out at the full call timeout stamps its clusters too,
-        # so a stuck batch rotates behind the rest.
-        self.assertEqual(ledger[watch.CLUSTER_RUNS_KEY], dict.fromkeys(triples("p1", 20), watch.iso(t1)))
-
-    def test_the_budget_running_out_mid_project_defers_the_rest_to_its_next_turn(self) -> None:
-        # The first call starts with a full call's budget and spends the tick.
-        deadline = watch.PROJECT_TIMEOUT_SECONDS + watch.MIN_PROJECT_RUN_SECONDS - 10.0
-        runs: dict = {}
-        with self.sandbox(seconds=watch.PROJECT_TIMEOUT_SECONDS):
-            _, project_runs, scan_errors, error_kinds, scanned, requested = self.sweep({}, runs, deadline)
-        self.assertEqual(len(self.calls), 1)
-        self.assertEqual(scan_errors, {"p1": "14 of 20 clusters read; 6 not reached (out of time this run)"})
-        self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_BUDGET_EXHAUSTED})
-        # Its cluster list was read, so findings on clusters it no longer lists may retire.
-        self.assertEqual(scanned, {"p1"})
-        self.assertEqual(requested, set(self.roster["p1"]))
-        # It had its turn, so it rotates behind projects that did not.
-        self.assertEqual(project_runs, {"p1": watch.iso(T0)})
-        self.assertEqual(runs, dict.fromkeys(self.roster["p1"][:14], watch.iso(T0)))
-
-    def test_a_short_call_that_times_out_is_a_timeout_failure_and_stamps_its_clusters(self) -> None:
-        # Every started call fits its deadlines, so one that times out means
-        # leeway overran them: a failure, not a deferral (it was `cut_short`).
-        short = watch.PROJECT_TIMEOUT_SECONDS + 300.0  # the second call starts with 300 s
-
-        def second_times_out(clusters, timeout):
-            if timeout < watch.PROJECT_TIMEOUT_SECONDS:
-                raise subprocess.TimeoutExpired(cmd="leeway", timeout=timeout)
-            return None
-
-        runs: dict = {}
-        with self.sandbox(second_times_out, seconds=watch.PROJECT_TIMEOUT_SECONDS):
-            _, project_runs, scan_errors, error_kinds, _, _ = self.sweep({}, runs, short)
-        self.assertEqual([t for _, t in self.calls], [watch.PROJECT_TIMEOUT_SECONDS, 300])
-        self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_TIMEOUT})
-        self.assertEqual(
-            scan_errors,
-            {"p1": "14 of 20 clusters read; 4 failed (the sandbox run timed out after 300s), "
-                   "2 not reached (out of time this run)"},
-        )
-        self.assertEqual(project_runs, {"p1": watch.iso(T0)})
-        self.assertEqual(set(runs), set(self.roster["p1"][:18]))
-
-    def test_a_call_on_a_short_budget_holds_only_the_waves_that_fit(self) -> None:
-        self.assertEqual(watch.batch_size(watch.PROJECT_TIMEOUT_SECONDS), watch.CLUSTERS_PER_BATCH)
-        self.assertEqual(watch.batch_size(300), 4)
-        self.assertEqual(watch.batch_size(watch.MIN_PROJECT_RUN_SECONDS), watch.PARALLELISM)
-        self.assertEqual(watch.batch_size(1), watch.PARALLELISM)
-        # 300 s left: two waves of two at 135 s each fit; the 60 s floor would
-        # have fitted four waves, at deadlines a 110 s cluster misses.
-        with self.sandbox():
-            self.sweep({}, {}, 300.0)
-        self.assertEqual([len(clusters_arg(a)) for a, _ in self.calls], [4, 4, 4, 4, 4])
-        for argv, timeout in self.calls:
-            per_cluster = int(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1].rstrip("s"))
-            waves = -(-len(clusters_arg(argv)) // watch.PARALLELISM)
-            self.assertGreaterEqual(per_cluster, watch.CONSERVATIVE_CLUSTER_READ_SECONDS)
-            self.assertLessEqual(waves * per_cluster + watch.LEEWAY_OVERHEAD_SECONDS, timeout)
-
-    def test_a_project_bigger_than_a_tick_does_not_starve_the_projects_after_it(self) -> None:
-        # p-big's 60 clusters at 850 s per call need more than a tick; p-small
-        # sorts after it by name. p-big rotates behind p-small once it has had a
-        # turn, so both are read every other tick at worst, and p-big's unread
-        # clusters go first on its next turn.
-        self.roster = {"p-big": triples("p-big", 60), "p-small": triples("p-small", 1)}
-        ledger: dict = {}
-        runs: dict = {}
-        read: list[dict[str, set[str]]] = []
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p-big,p-small"}):
-            for day in range(6):
-                self.calls.clear()
-                self.clock = 0.0
-                with self.sandbox(seconds=850.0):
-                    _, project_runs, _, _, _, _ = watch.sweep_fleet(
-                        ledger, T0 + timedelta(days=day), float(watch.TICK_BUDGET_SECONDS), runs
-                    )
-                ledger = {watch.PROJECT_RUNS_KEY: project_runs}
-                tick_read: dict[str, set[str]] = {"p-big": set(), "p-small": set()}
-                for argv, _ in self.calls:
-                    for cluster in clusters_arg(argv):
-                        tick_read[cluster.split("/", 1)[0]].add(cluster)
-                read.append(tick_read)
-        small = [bool(r["p-small"]) for r in read]
-        self.assertEqual(small, [False, True, False, True, False, True])
-        self.assertTrue(all(r["p-big"] for r in read), "p-big is read every tick")
-        self.assertEqual(read[0]["p-big"] | read[1]["p-big"], set(triples("p-big", 60)))
-        self.assertLessEqual(set(triples("p-big", 60)) - read[0]["p-big"], read[1]["p-big"])
-
-    def test_a_too_big_project_retires_per_cluster_and_does_not_hold_the_run_in_error(self) -> None:
-        gone = "p1/l/zz-gone"
-        self.roster = {"p1": [*triples("p1", 30), gone]}
-        findings = {c: make_topology_finding(name="web") for c in ("p1/l/c00", "p1/l/c29", gone)}
-        with self.sandbox(findings=findings), redirect_stdout(io.StringIO()):
-            watch.tick(now=T0)
-        self.assertEqual(len(watch.load_ledger(self.home)[watch.FINDINGS_KEY]), 3)
-
-        # Tick 1: two full calls spend the tick; c28 and c29 are not reached.
-        # c00 was read clean and retires; the dropped cluster retires because
-        # the project's list no longer names it; c29's finding stays. Nothing
-        # failed, so no partial-scan line, and the report refreshes.
-        self.roster = {"p1": triples("p1", 30)}
-        t1 = T0 + timedelta(days=1)
-        self.clock = 0.0
-        buf = io.StringIO()
-        with self.sandbox(seconds=watch.TICK_BUDGET_SECONDS / 2), redirect_stdout(buf):
-            watch.tick(now=t1)
-        self.assertEqual(
-            buf.getvalue().splitlines(),
-            ["leeway: 2 finding(s) resolved (c00:shop/web, zz-gone:shop/web); retired from the watch"],
-        )
-        ledger = watch.load_ledger(self.home)
-        self.assertEqual([f["cluster"] for f in ledger[watch.FINDINGS_KEY].values()], ["p1/l/c29"])
-        self.assertNotIn(watch.ANNOUNCED_PARTIAL_KEY, ledger.get(watch.ANNOUNCED_KEY, {}))
-        self.assertNotIn(watch.ANNOUNCED_DEFERRED_REFRESH_KEY, ledger.get(watch.ANNOUNCED_KEY, {}))
-        markdown = (self.home / watch.REPORTS_DIR_NAME / watch.LATEST_MD_LINK_NAME).read_text(encoding="utf-8")
-        self.assertIn(watch.REPORT_NOT_REACHED_HEADING, markdown)
-        self.assertIn("- `p1`: 28 of 30 clusters read; 2 not reached (out of time this run)", markdown)
-        self.assertNotIn("## Scan Errors", markdown)
-        self.assertNotIn("batch", markdown)
-
-        # Tick 2: the clusters not reached go first; c29 reads clean and retires.
-        self.calls.clear()
-        self.clock = 0.0
-        buf = io.StringIO()
-        with self.sandbox(), redirect_stdout(buf):
-            watch.tick(now=T0 + timedelta(days=2))
-        self.assertLessEqual({"p1/l/c28", "p1/l/c29"}, set(clusters_arg(self.calls[0][0])))
-        self.assertEqual(
-            buf.getvalue().splitlines(), ["leeway: 1 finding(s) resolved (c29:shop/web); retired from the watch"]
-        )
-
-    def test_a_big_project_with_failures_is_one_counted_entry_that_does_not_repost(self) -> None:
-        self.roster = {"p1": triples("p1", 100)}
-
-        def second_call_fails(clusters, _):
-            if "p1/l/c14" in clusters:
-                return subprocess.CompletedProcess([], 1, "", "boom")
-            return None
-
-        buf = io.StringIO()
-        with self.sandbox(second_call_fails, seconds=600.0), redirect_stdout(buf):
-            watch.tick(now=T0)
-        self.assertEqual(
-            buf.getvalue().splitlines(),
-            [
-                "leeway watch: the fleet scan was partial, 1 with errors: p1: 46 of 100 clusters read; "
-                "14 failed (boom), 40 not reached (out of time this run); "
-                "findings on unreadable clusters are retained until read again"
-            ],
-        )
-        # The next day the counts differ but the condition is the same: no repost.
-        self.calls.clear()
-        self.clock = 0.0
-        buf = io.StringIO()
-        with self.sandbox(second_call_fails), redirect_stdout(buf):
-            watch.tick(now=T0 + timedelta(days=1))
-        self.assertEqual(buf.getvalue(), "")
-        self.assertEqual(
-            watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY],
-            {"p1": "86 of 100 clusters read; 14 failed (boom)"},
-        )
-
-    def test_two_failing_projects_are_one_entry_each(self) -> None:
-        self.roster = {"p1": triples("p1", 30), "p2": triples("p2", 1)}
-
-        def outcome(clusters, timeout):
-            if "p1/l/c14" in clusters:
-                return subprocess.CompletedProcess([], 1, "", "boom")
-            if "p1/l/c28" in clusters:
-                raise subprocess.TimeoutExpired(cmd="leeway", timeout=timeout)
-            if clusters[0].startswith("p2/"):
-                return subprocess.CompletedProcess([], 1, "", "nope")
-            return None
-
-        buf = io.StringIO()
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.sandbox(outcome), redirect_stdout(buf):
-            watch.tick(now=T0)
-        self.assertEqual(
-            buf.getvalue().splitlines(),
-            [
-                "leeway watch: the fleet scan was partial, 2 with errors: p1: 14 of 30 clusters read; "
-                "16 failed (boom; 1 other cause(s)), "
-                "p2: leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: nope; "
-                "findings on unreadable clusters are retained until read again"
-            ],
-        )
-
     def test_a_long_cause_is_cut_so_the_entry_stays_short(self) -> None:
-        self.roster = {"p1": triples("p1", 28)}
+        self.roster = {"p1": triples("p1", 2 * watch.CLUSTERS_PER_BATCH)}
         stderr = "x" * watch.STDERR_EXCERPT_CHARS
-        with self.sandbox(
-            lambda clusters, _: subprocess.CompletedProcess([], 1, "", stderr) if "p1/l/c00" in clusters else None
-        ):
+        with self.sandbox(lambda clusters, _: subprocess.CompletedProcess([], 1, "", stderr)
+                          if "p1/l/c00" in clusters else None):
             _, _, scan_errors, _, _, _ = self.sweep({}, {}, 3600.0)
-        prefix = "14 of 28 clusters read; 14 failed ("
+        prefix = "12 of 24 clusters read; 12 failed ("
         self.assertTrue(scan_errors["p1"].startswith(prefix + "xxx"))
         self.assertTrue(scan_errors["p1"].endswith(watch.CAUSE_ELLIPSIS + ")"))
         self.assertEqual(len(scan_errors["p1"]), len(prefix) + watch.CAUSE_MAX_CHARS + len(")"))
 
     def test_a_listing_timeout_reports_the_listings_own_timeout(self) -> None:
-        # p1 has no roster triples, so it is listed; the tick budget is short.
         self.roster = {"p2": triples("p2", 1)}
 
         def run(argv, **kw):
@@ -2181,71 +2060,22 @@ class BatchTests(unittest.TestCase):
         )
         self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_TIMEOUT})
 
-    def test_a_project_bigger_than_a_tick_is_covered_over_successive_ticks(self) -> None:
-        # Each tick's budget fits one call of 14; 40 clusters take three ticks.
-        self.roster = {"p1": triples("p1", 40)}
-        runs: dict = {}
-        read: list[list[str]] = []
-        for _ in range(3):
-            self.calls.clear()
-            self.clock = 0.0
-            with self.sandbox(seconds=watch.PROJECT_TIMEOUT_SECONDS):
-                _, project_runs, _, _, _, _ = self.sweep({}, runs, watch.PROJECT_TIMEOUT_SECONDS + 1.0)
-            read.extend(clusters_arg(a) for a, _ in self.calls)
-        self.assertEqual(len(read), 3)
-        self.assertEqual(sorted({c for batch in read for c in batch}), self.roster["p1"])
-        self.assertEqual(read[1], triples("p1", 40)[14:28], "tick 2 starts where tick 1 stopped")
-
-    def test_a_project_the_budget_reached_late_goes_ahead_of_one_swept_this_tick(self) -> None:
-        self.roster = {"p-big": triples("p-big", 20), "p-small": triples("p-small", 1)}
-        ledger = {watch.PROJECT_RUNS_KEY: {"p-small": watch.iso(T0 - timedelta(days=3)),
-                                           "p-big": watch.iso(T0 - timedelta(days=2))}}
-        runs: dict = {}
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p-big,p-small"}):
-            # p-small (oldest) reads; p-big starts with less than a full call's
-            # budget, gets one call, and keeps its older stamp.
-            with self.sandbox(seconds=500.0):
-                _, project_runs, _, _, _, _ = self.sweep(ledger, runs, watch.PROJECT_TIMEOUT_SECONDS + 100.0)
-            self.assertEqual(project_runs["p-small"], watch.iso(T0))
-            self.assertEqual(project_runs["p-big"], watch.iso(T0 - timedelta(days=2)))
-            self.calls.clear()
-            self.clock = 0.0
-            with self.sandbox():
-                self.sweep({watch.PROJECT_RUNS_KEY: project_runs}, runs, 3600.0)
-        first = clusters_arg(self.calls[0][0])
-        self.assertTrue(all(c.startswith("p-big/") for c in first))
-        self.assertLessEqual(set(triples("p-big", 20)[14:]), set(first), "the clusters it did not reach go first")
-
     def test_explicit_clusters_are_batched_and_a_failed_batch_does_not_fail_the_tick(self) -> None:
         explicit = triples("p1", 20)
-        findings = {c: make_topology_finding(name="web") for c in ("p1/l/c00", "p1/l/c19")}
         with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: ",".join(explicit), watch.PROJECTS_ENV: ""}):
-            with self.sandbox(findings=findings), redirect_stdout(io.StringIO()):
-                watch.tick(now=T0)
-            self.calls.clear()
+            self.tick(0, findings={c: make_topology_finding(name="web") for c in explicit})
 
             def first_fails(clusters, _):
                 if "p1/l/c00" in clusters:
                     return subprocess.CompletedProcess([], 255, "", "leeway crashed")
                 return None
 
-            buf = io.StringIO()
-            with self.sandbox(first_fails), redirect_stdout(buf):
-                code = watch.tick(now=T0 + timedelta(days=1))
-        self.assertEqual(code, 0)
-        self.assertEqual([len(clusters_arg(a)) for a, _ in self.calls], [14, 6])
-        detail = "6 of 20 clusters read; 14 failed (leeway crashed)"
-        self.assertEqual(
-            buf.getvalue().splitlines(),
-            [
-                f"leeway watch: the fleet scan was partial, 1 with errors: the configured clusters: {detail}; "
-                "findings on unreadable clusters are retained until read again",
-                "leeway: 1 finding(s) resolved (c19:shop/web); retired from the watch",
-            ],
-        )
-        ledger = watch.load_ledger(self.home)
-        self.assertEqual([f["cluster"] for f in ledger[watch.FINDINGS_KEY].values()], ["p1/l/c00"])
-        self.assertEqual(ledger[watch.SCAN_ERRORS_KEY], {watch.EXPLICIT_TARGET_LABEL: detail})
+            lines = self.tick(1, first_fails)
+        failed = next(clusters_arg(a) for a, _ in self.calls if "p1/l/c00" in clusters_arg(a))
+        detail = f"{20 - len(failed)} of 20 clusters read; {len(failed)} failed (leeway crashed)"
+        self.assertEqual(lines[0], self.partial(1, f"the configured clusters: {detail}"))
+        self.assertEqual(self.finding_clusters(), sorted(failed), "findings retire only on clusters read")
+        self.assertEqual(watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {watch.EXPLICIT_TARGET_LABEL: detail})
 
     def test_explicit_clusters_with_every_batch_failed_fail_the_tick_with_the_first_cause(self) -> None:
         explicit = triples("p1", 20)
@@ -2254,38 +2084,298 @@ class BatchTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError) as raised:
                 self.sweep({}, {}, 3600.0)
-        # The first batch's own exception, as the single call raised it before.
-        self.assertEqual(str(raised.exception), "leeway exited 255 without a report: crash p1/l/c00")
+        first = clusters_arg(self.calls[0][0])[0]
+        self.assertEqual(str(raised.exception), f"leeway exited 255 without a report: crash {first}")
         self.assertEqual(len(self.calls), 2)
 
-    def test_cluster_stamps_are_saved_pruned_and_optional_in_the_ledger(self) -> None:
-        # A ledger written before batching has no cluster_runs; a malformed one is ignored.
+    def test_cluster_stamps_are_saved_pruned_by_the_project_list_and_optional_in_the_ledger(self) -> None:
         self.assertEqual(watch.ledger_cluster_runs({}), {})
         self.assertEqual(watch.ledger_cluster_runs({watch.CLUSTER_RUNS_KEY: ["x"]}), {})
         self.roster = {"p1": triples("p1", 2)}
         old = watch.iso(T0 - timedelta(days=1))
-        self.home.mkdir(parents=True)
-        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({
-            watch.LEDGER_SCHEMA_KEY: watch.LEDGER_SCHEMA_VERSION,
-            watch.FINDINGS_KEY: {},
-            watch.CLUSTER_RUNS_KEY: {"p1/l/dropped": old, "p9/l/other": old},
-        }), encoding="utf-8")
-        with self.sandbox(), redirect_stdout(io.StringIO()):
-            watch.tick(now=T0)
-        # p9 is no longer in scope (the project list resolved to p1), so its
-        # stamp goes too.
+        self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p1/l/dropped": old, "p9/l/other": old}})
+        self.tick(0)
+        # p1's list no longer names p1/l/dropped; p9's list was not read, so its stamp stays.
         self.assertEqual(
             watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
-            {"p1/l/c00": watch.iso(T0), "p1/l/c01": watch.iso(T0)},
+            {"p1/l/c00": watch.iso(T0), "p1/l/c01": watch.iso(T0), "p9/l/other": old},
         )
 
-    # --- round two: every started call fits, deferral, scope, coverage -------
+    # --- one turn per project ---------------------------------------------
 
-    def simulated_leeway(self, durations: dict[str, float], rows_log: list[list[dict]]):
+    def test_a_timed_out_call_ends_the_projects_turn_and_costs_only_its_own_clusters(self) -> None:
+        gone = "p1/l/zz-gone"
+        self.roster = {"p1": [*triples("p1", 30), gone]}
+        self.tick(0, findings={c: make_topology_finding(name="web") for c in self.roster["p1"]})
+        self.assertEqual(len(self.finding_clusters()), 31)
+
+        # Tick 1: the call holding the stuck cluster times out after two calls
+        # returned; the project's turn ends there.
+        self.roster = {"p1": triples("p1", 30)}
+        runs = watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY]
+        stuck = watch.order_clusters(self.roster["p1"], runs, T0 + timedelta(days=1))[watch.CLUSTERS_PER_BATCH * 2]
+        lines = self.tick(1, hangs(stuck))
+        sizes = [len(clusters_arg(a)) for a, _ in self.calls]
+        killed = set(clusters_arg(self.calls[-1][0]))
+        self.assertEqual(len(sizes), 3)
+        self.assertIn(stuck, killed, "no call starts after the timeout")
+        read = len(self.ok)
+        left = 30 - sum(sizes)
+        parts = [f"{len(killed)} failed (the sandbox run timed out after 900s)"]
+        if left:
+            parts.append(f"{left} left for its next turn after the timeout")
+        self.assertEqual(lines[0], self.partial(1, f"p1: {read} of 30 clusters read; {', '.join(parts)}"))
+        # Findings retire on the clusters read and on the cluster p1 no longer lists.
+        self.assertEqual(self.finding_clusters(), sorted(set(self.roster["p1"]) - self.ok))
+        ledger = watch.load_ledger(self.home)
+        self.assertEqual(ledger[watch.PROJECT_RUNS_KEY], {"p1": watch.iso(T0 + timedelta(days=1))})
+        stamped = {c for c, s in ledger[watch.CLUSTER_RUNS_KEY].items() if s == watch.iso(T0 + timedelta(days=1))}
+        self.assertEqual(stamped, self.ok | killed, "every cluster in a call is stamped, however it ended")
+
+    def test_a_hanging_project_costs_one_call_a_tick_and_the_others_are_read(self) -> None:
+        self.roster = {"p-hang": triples("p-hang", 42), "p2": triples("p2", 5), "p3": triples("p3", 5)}
+        outputs = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p-hang,p2,p3"}):
+            for day in range(4):
+                outputs.append(self.tick(day, hangs(*self.roster["p-hang"]), seconds=60.0))
+                hang_calls = [a for a, _ in self.calls if clusters_arg(a)[0].startswith("p-hang/")]
+                self.assertEqual(len(hang_calls), 1, f"day {day}")
+                self.assertEqual(self.ok, set(self.roster["p2"]) | set(self.roster["p3"]), f"day {day}")
+        detail = "0 of 42 clusters read; 12 failed (the sandbox run timed out after 900s), " \
+                 "30 left for its next turn after the timeout"
+        self.assertEqual(outputs, [[self.partial(1, f"p-hang: {detail}")], [], [], []])
+
+    def test_a_tick_where_no_call_returns_still_rotates_the_projects(self) -> None:
+        names = ["p1", "p2", "p3", "p4"]
+        self.roster = {p: triples(p, 2) for p in names}
+        every = [c for p in names for c in self.roster[p]]
+        firsts = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(names)}):
+            for day in range(3):
+                lines = self.tick(day, hangs(*every))
+                self.assertTrue(lines[0].startswith("leeway watch: the tick failed: RuntimeError: "), lines)
+                firsts.append(clusters_arg(self.calls[0][0])[0].split("/")[0])
+                self.assertEqual(len(self.calls), 3, "three hung calls spend the tick")
+        self.assertEqual(firsts, ["p1", "p4", "p3"], "the projects that had a turn rotate behind")
+        ledger = watch.load_ledger(self.home)
+        self.assertEqual(set(ledger[watch.CLUSTER_RUNS_KEY]), set(every))
+
+    def test_a_dry_run_writes_no_stamps_even_when_the_tick_fails(self) -> None:
+        self.roster = {"p1": triples("p1", 2)}
+        self.clock = 0.0
+        with self.sandbox(hangs(*self.roster["p1"])), redirect_stdout(io.StringIO()):
+            watch.tick(now=T0, dry_run=True)
+        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+
+    def test_a_project_bigger_than_a_tick_does_not_starve_the_projects_after_it(self) -> None:
+        self.roster = {"p-big": triples("p-big", 60), "p-small": triples("p-small", 1)}
+        read: list[set[str]] = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p-big,p-small"}):
+            for day in range(6):
+                self.tick(day, seconds=850.0)
+                read.append(set(self.ok))
+        small = [bool(r & set(self.roster["p-small"])) for r in read]
+        self.assertEqual(small, [False, True, False, True, False, True])
+        self.assertTrue(all(r & set(self.roster["p-big"]) for r in read), "p-big is read every tick")
+        self.assertEqual((read[0] | read[1]) & set(self.roster["p-big"]), set(self.roster["p-big"]))
+
+    def test_a_project_bigger_than_a_tick_is_covered_over_successive_ticks(self) -> None:
+        self.roster = {"p1": triples("p1", 36)}
+        read: list[set[str]] = []
+        for day in range(3):
+            self.tick(day, seconds=watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0)
+            read.append(set(self.ok))
+        self.assertEqual([len(r) for r in read], [12, 12, 12])
+        self.assertEqual(read[0] | read[1] | read[2], set(self.roster["p1"]), "each tick starts where the last stopped")
+
+    def test_tied_stamps_rotate_batches_so_a_hanging_clusters_batch_mates_are_read(self) -> None:
+        # Every cluster read in one tick carries the same stamp. Broken by
+        # name, the hanging cluster's batch-mates would share its call, and be
+        # lost with it, on every tick.
+        self.roster = {"p1": triples("p1", 42)}
+        stuck = "p1/l/c00"
+        ever_read: set[str] = set()
+        first_mates = None
+        for day in range(6):
+            self.tick(day, hangs(stuck))
+            if first_mates is None:
+                first_mates = set(clusters_arg(self.calls[-1][0])) - {stuck}
+            ever_read |= self.ok
+        self.assertEqual(len(first_mates), watch.CLUSTERS_PER_BATCH - 1)
+        self.assertEqual(ever_read, set(self.roster["p1"]) - {stuck})
+
+    # --- announcements ----------------------------------------------------
+
+    def test_a_big_project_with_failures_is_one_counted_entry_that_does_not_repost(self) -> None:
+        self.roster = {"p1": triples("p1", 100)}
+
+        def second_call_fails(clusters, _):
+            return subprocess.CompletedProcess([], 1, "", "boom") if len(self.calls) == 2 else None
+
+        self.assertEqual(
+            self.tick(0, second_call_fails, seconds=600.0),
+            [self.partial(1, "p1: 38 of 100 clusters read; 12 failed (boom), 50 not reached (out of time this run)")],
+        )
+        # The next day the counts differ but the target is the same: no repost.
+        self.assertEqual(self.tick(1, second_call_fails), [])
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {"p1": "88 of 100 clusters read; 12 failed (boom)"}
+        )
+
+    def test_two_failing_projects_are_one_entry_each_with_every_cause_counted(self) -> None:
+        self.roster = {"p1": triples("p1", 30), "p2": triples("p2", 1), "p3": triples("p3", 1)}
+
+        def outcome(clusters, timeout):
+            if clusters[0].startswith("p2/"):
+                return subprocess.CompletedProcess([], 1, "", "nope")
+            if len(self.calls) == 2:
+                return subprocess.CompletedProcess([], 1, "", "boom")
+            if len(self.calls) == 3:
+                raise subprocess.TimeoutExpired(cmd="leeway", timeout=timeout)
+            return None
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}):
+            lines = self.tick(0, outcome)
+        self.assertEqual(lines, [self.partial(
+            2,
+            "p1: 12 of 30 clusters read; 18 failed (boom; 1 other cause(s))",
+            "p2: leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: nope",
+        )])
+
+    def test_error_rows_are_folded_into_their_projects_one_entry(self) -> None:
+        self.roster = {"p1": triples("p1", 2)}
+
+        def one_error_row(clusters, _):
+            rows = [{"cluster": c, "status": "error" if c == "p1/l/c01" else "ok", "error": "forbidden"}
+                    for c in clusters]
+            return completed_json(make_report(rows))
+
+        lines = self.tick(0, one_error_row)
+        self.assertEqual(lines, [self.partial(1, "p1: 1 of 2 clusters read; 1 returned an error (forbidden)")])
+
+    def test_a_new_failing_target_posts_while_another_targets_episode_is_open(self) -> None:
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1), "p3": triples("p3", 1)}
+
+        def failing(*projects):
+            def outcome(clusters, _):
+                if clusters[0].split("/")[0] in projects:
+                    return subprocess.CompletedProcess([], 1, "", "boom")
+                return None
+
+            return outcome
+
+        def entry(p):
+            return f"{p}: leeway scan for {p} failed: RuntimeError: leeway exited 1 without a report: boom"
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}):
+            outputs = [self.tick(day, outcome) for day, outcome in enumerate(
+                (failing("p1"), failing("p1", "p3"), failing("p1", "p3"), failing("p3"), failing())
+            )]
+        self.assertEqual(outputs, [
+            [self.partial(1, entry("p1"))],
+            [self.partial(2, entry("p3"), entry("p1"))],  # the new target first
+            [],
+            [],  # p1 reads cleanly; p3 is still failing
+            ["leeway watch: every target that failed reads cleanly again"],
+        ])
+
+    def test_a_target_that_leaves_the_sweep_drops_its_episode(self) -> None:
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.assertEqual(len(self.tick(0, fails("p2"))), 1)
+        # p2 is no longer swept: its episode cannot close by a read, so it is
+        # dropped, and p1's own failure and recovery are said as usual.
+        def error_row(clusters, _):
+            return completed_json(make_report([{"cluster": c, "status": "error", "error": "denied"} for c in clusters]))
+
+        self.assertEqual(self.tick(1, error_row), [self.partial(1, "p1: 0 of 1 clusters read; 1 returned an error (denied)")])
+        self.assertEqual(self.tick(2), ["leeway watch: every target that failed reads cleanly again"])
+
+    def test_recovery_waits_until_every_announced_target_reads_cleanly(self) -> None:
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1), "p3": triples("p3", 1)}
+        spend_tick = watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0
+
+        def two_fail(clusters, _):
+            return subprocess.CompletedProcess([], 1, "", "boom") if clusters[0][:2] in ("p1", "p2") else None
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}):
+            first = self.tick(0, two_fail)
+            # p1 reads cleanly and spends the tick: p2 is not reached, so its episode stays open.
+            second = self.tick(1, seconds=spend_tick)
+            self.assertEqual(self.ok, set(self.roster["p1"]))
+            third = self.tick(2)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertEqual(third, ["leeway watch: every target that failed reads cleanly again"])
+        self.assertNotIn(watch.ANNOUNCED_FAILED_TARGETS_KEY, watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {}))
+
+    def test_clusters_not_reached_alone_post_nothing_and_keep_their_findings(self) -> None:
+        self.roster = {"p1": triples("p1", 30)}
+        self.tick(0, findings={c: make_topology_finding(name="web") for c in self.roster["p1"]})
+        half = watch.TICK_BUDGET_SECONDS / 2
+        lines = self.tick(1, seconds=half)
+        self.assertEqual(len(self.ok), 24)
+        self.assertTrue(lines[0].startswith("leeway: 24 finding(s) resolved"))
+        self.assertEqual(len(lines), 1, "no partial-scan line")
+        self.assertEqual(self.finding_clusters(), sorted(set(self.roster["p1"]) - self.ok))
+        markdown = (self.home / watch.REPORTS_DIR_NAME / watch.LATEST_MD_LINK_NAME).read_text(encoding="utf-8")
+        self.assertIn(watch.REPORT_NOT_REACHED_HEADING, markdown)
+        self.assertIn("- `p1`: 24 of 30 clusters read; 6 not reached (out of time this run)", markdown)
+        self.assertNotIn("## Scan Errors", markdown)
+
+    def test_an_older_ledgers_signature_neither_posts_nor_sticks(self) -> None:
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
+        entry = "p2: leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: boom"
+        cases = (
+            # A failure was announced by kind: today's failures count as announced.
+            ([watch.ERROR_KIND_SCAN_FAILED], fails("p2"), [], ["p2"]),
+            ([watch.ERROR_KIND_CLUSTER_ERROR, watch.ERROR_KIND_TIMEOUT], fails("p2"), [], ["p2"]),
+            # Nothing fails now: the old episode is dropped without a line.
+            ([watch.ERROR_KIND_SCAN_FAILED], None, [], None),
+            # A budget gap alone announced no failure under today's rules.
+            ([watch.ERROR_KIND_BUDGET_EXHAUSTED, "cut_short"], fails("p2"), [self.partial(1, entry)], ["p2"]),
+            ([watch.ERROR_KIND_BUDGET_EXHAUSTED], None, [], None),
+        )
+        for stored, outcome, expected, open_targets in cases:
+            with self.subTest(stored=stored, failing=outcome is not None):
+                self.write_ledger(**{watch.ANNOUNCED_KEY: {watch.ANNOUNCED_PARTIAL_KEY: stored}})
+                with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+                    self.assertEqual(self.tick(0, outcome), expected)
+                announced = watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {})
+                self.assertNotIn(watch.ANNOUNCED_PARTIAL_KEY, announced)
+                self.assertEqual(announced.get(watch.ANNOUNCED_FAILED_TARGETS_KEY), open_targets)
+
+    # --- retirement -------------------------------------------------------
+
+    def test_a_narrowed_or_empty_scope_retires_nothing_beyond_mains_rule(self) -> None:
+        old = watch.iso(T0 - timedelta(days=1))
+        self.roster = {"p1": triples("p1", 2)}
+        # p1 returns an error row: the tick is not clean, so p2's finding
+        # (outside the scope) stays.
+        self.write_ledger(["p2/l/c00"], **{watch.PROJECT_RUNS_KEY: {"p2": old}})
+
+        def error_row(clusters, _):
+            return completed_json(make_report([{"cluster": c, "status": "error", "error": "denied"} for c in clusters]))
+
+        self.tick(1, error_row)
+        self.assertEqual(self.finding_clusters(), ["p2/l/c00"])
+        self.assertEqual(watch.load_ledger(self.home)[watch.PROJECT_RUNS_KEY]["p2"], old)
+        # An empty scope reads nothing, so nothing retires.
+        empty = mock.Mock(projects=(), excluded_clusters=())
+        with mock.patch.object(watch, "declared_scope", return_value=empty):
+            self.tick(2)
+        self.assertEqual(self.finding_clusters(), ["p2/l/c00"])
+        # A clean tick retires it, as on main (the whole sweep read without an error).
+        self.tick(3)
+        self.assertEqual(self.finding_clusters(), [])
+
+    # --- simulated fleets -------------------------------------------------
+
+    def simulated_leeway(self, durations: dict[str, float]):
         """A sandbox that runs `leeway report` as leeway does: the clusters in
-        waves of PARALLELISM in argv order, each wave as long as its slowest
-        read capped at the per-cluster `--timeout`; a read longer than that is
-        an error row, and a call longer than its sandbox timeout is killed."""
+        waves of PARALLELISM, each wave as long as its slowest read capped at
+        the per-cluster `--timeout`; a read longer than that is an error row,
+        and a call longer than its sandbox timeout is killed."""
 
         def run(argv, **kw):
             clusters = clusters_arg(argv)
@@ -2305,281 +2395,39 @@ class BatchTests(unittest.TestCase):
                 self.clock += kw["timeout"]
                 raise subprocess.TimeoutExpired(cmd="leeway", timeout=kw["timeout"])
             self.clock += wall
-            rows_log.append(rows)
+            self.ok.update(r["cluster"] for r in rows if r["status"] == "ok")
+            self.errored.update(r["cluster"] for r in rows if r["status"] != "ok")
             return completed_json(make_report(rows))
 
         return mock.patch.object(watch.sandbox_exec, "run", side_effect=run)
 
     def simulate(self, roster: dict[str, list[str]], days: int) -> list[tuple[list[str], set[str], set[str]]]:
-        """Run `days` daily ticks over `roster` with read times between 30 and
-        114 s (under the conservative read time, many over the old 60 s
-        floor); per tick, the chat lines and the clusters read ok and in error."""
+        """Daily ticks over `roster` with read times between 30 and 114 s; per
+        tick, the chat lines and the clusters read ok and in error."""
         self.roster = roster
         fleet = [c for project in sorted(roster) for c in roster[project]]
         durations = {c: 30.0 + (k * 37) % 85 for k, c in enumerate(fleet)}
-        self.assertTrue(any(60 < d < watch.CONSERVATIVE_CLUSTER_READ_SECONDS for d in durations.values()))
         ticks = []
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(sorted(roster))}):
             for day in range(days):
                 self.clock = 0.0
-                rows_log: list[list[dict]] = []
+                self.ok, self.errored = set(), set()
                 buf = io.StringIO()
-                with self.simulated_leeway(durations, rows_log), redirect_stdout(buf):
+                with self.simulated_leeway(durations), redirect_stdout(buf):
                     watch.tick(now=T0 + timedelta(days=day))
-                rows = [row for call in rows_log for row in call]
-                ticks.append((
-                    buf.getvalue().splitlines(),
-                    {r["cluster"] for r in rows if r["status"] == "ok"},
-                    {r["cluster"] for r in rows if r["status"] != "ok"},
-                ))
+                ticks.append((buf.getvalue().splitlines(), set(self.ok), set(self.errored)))
         return ticks
 
-    def test_every_started_call_gives_each_cluster_the_conservative_read_time(self) -> None:
-        for remaining in range(watch.MIN_PROJECT_RUN_SECONDS, watch.PROJECT_TIMEOUT_SECONDS + 1):
-            size = watch.batch_size(remaining)
-            for count in range(1, size + 1):
-                per_cluster = watch.cluster_timeout_seconds(remaining, count)
-                waves = -(-count // watch.PARALLELISM)
-                self.assertGreaterEqual(per_cluster, watch.CONSERVATIVE_CLUSTER_READ_SECONDS, (remaining, count))
-                self.assertLessEqual(waves * per_cluster + watch.LEEWAY_OVERHEAD_SECONDS, remaining, (remaining, count))
-
-    def test_a_simulated_fleet_reads_every_cluster_within_two_ticks_and_never_errors(self) -> None:
-        # 72 clusters at up to 114 s each: about 48 fit a tick, so every
-        # cluster is read at least once in any two consecutive ticks. Under the
-        # old 60 s floor the tick's last, short call gave 60-67 s deadlines and
-        # the same slow block errored there every cycle.
-        roster = {"pa": triples("pa", 40), "pb": triples("pb", 25), "pc": triples("pc", 7)}
-        ticks = self.simulate(roster, 12)
-        self.assertEqual([sorted(errors) for _, _, errors in ticks], [[]] * 12)
-        fleet = {c for clusters in roster.values() for c in clusters}
-        for day in range(len(ticks) - 1):
-            self.assertEqual(ticks[day][1] | ticks[day + 1][1], fleet, f"ticks {day} and {day + 1}")
-
-    def test_a_simulated_fleet_of_mixed_projects_posts_no_partial_or_recovery_lines(self) -> None:
-        roster = {"pa": triples("pa", 33), "pb": triples("pb", 18), "pc": triples("pc", 9), "pd": triples("pd", 2)}
+    def test_a_simulated_fleet_reads_every_cluster_within_three_ticks_and_posts_nothing(self) -> None:
+        # 74 clusters at up to 114 s each: about 50 fit a tick. No read errors
+        # (every call gives each cluster at least 120 s), and no chat line.
+        roster = {"pa": triples("pa", 40), "pb": triples("pb", 25), "pc": triples("pc", 7), "pd": triples("pd", 2)}
         ticks = self.simulate(roster, 10)
-        posted = [line for lines, _, _ in ticks for line in lines]
-        self.assertFalse([line for line in posted if "fleet scan" in line], "no partial-scan or recovery line")
-        self.assertEqual(posted, [])
-
-    def test_a_failed_call_stamps_its_clusters_and_error_rows_are_counted_apart(self) -> None:
-        self.roster = {"p1": triples("p1", 28)}
-
-        def outcome(clusters, _):
-            if "p1/l/c00" in clusters:
-                rows = [{"cluster": c, "status": "error" if c == "p1/l/c01" else "ok", "error": "denied"}
-                        for c in clusters]
-                return completed_json(make_report(rows))
-            return subprocess.CompletedProcess([], 1, "", "boom")
-
-        runs: dict = {}
-        with self.sandbox(outcome):
-            _, _, scan_errors, error_kinds, _, _ = self.sweep({}, runs, 3600.0)
-        self.assertEqual(scan_errors, {"p1": "13 of 28 clusters read; 14 failed (boom), 1 returned an error"})
-        self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_SCAN_FAILED})
-        self.assertEqual(runs, dict.fromkeys(self.roster["p1"], watch.iso(T0)))
-
-    def test_the_partial_line_names_failures_before_deferred_targets_and_saves_both(self) -> None:
-        # p2 goes first and fails; a-late (sorting before p2) is not reached in full.
-        self.roster = {"a-late": triples("a-late", 30), "p2": triples("p2", 1)}
-        self.home.mkdir(parents=True)
-        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({
-            watch.FINDINGS_KEY: {},
-            watch.PROJECT_RUNS_KEY: {"a-late": watch.iso(T0 - timedelta(days=1)),
-                                     "p2": watch.iso(T0 - timedelta(days=2))},
-        }), encoding="utf-8")
-
-        def p2_fails(clusters, _):
-            return subprocess.CompletedProcess([], 1, "", "nope") if clusters[0].startswith("p2/") else None
-
-        buf = io.StringIO()
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "a-late,p2"}), self.sandbox(
-            p2_fails, seconds=1300.0
-        ), redirect_stdout(buf):
-            watch.tick(now=T0)
-        failed = "leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: nope"
-        self.assertEqual(
-            buf.getvalue().splitlines(),
-            [
-                f"leeway watch: the fleet scan was partial, 1 with errors: p2: {failed}; "
-                "not reached this run: a-late; findings on unreadable clusters are retained until read again"
-            ],
-        )
-        self.assertEqual(
-            watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY],
-            {"p2": failed, "a-late": "14 of 30 clusters read; 16 not reached (out of time this run)"},
-        )
-
-    def test_the_recovery_line_waits_until_nothing_failed_and_nothing_was_deferred(self) -> None:
-        self.roster = {"p1": triples("p1", 30)}
-
-        def first_call_fails(clusters, _):
-            return subprocess.CompletedProcess([], 1, "", "boom") if "p1/l/c00" in clusters else None
-
-        outputs = []
-        for day, outcome, seconds in ((0, first_call_fails, 1350.0), (1, None, 1350.0), (2, None, 0.0)):
-            self.clock = 0.0
-            buf = io.StringIO()
-            with self.sandbox(outcome, seconds=seconds), redirect_stdout(buf):
-                watch.tick(now=T0 + timedelta(days=day))
-            outputs.append(buf.getvalue().splitlines())
-        self.assertEqual(len(outputs[0]), 1)
-        self.assertTrue(outputs[0][0].startswith("leeway watch: the fleet scan was partial, 1 with errors: p1:"))
-        # Day 1: nothing failed, but two clusters were not reached: no recovery line yet.
-        self.assertEqual(outputs[1], [])
-        # Day 2: every cluster read.
-        self.assertEqual(outputs[2], ["leeway watch: the fleet scan reads every target again"])
-        self.assertNotIn(watch.ANNOUNCED_PARTIAL_KEY, watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {}))
-
-    def test_a_stored_signature_of_deferred_kinds_alone_was_never_announced(self) -> None:
-        # A ledger from before deferral stored budget kinds in the signature.
-        self.roster = {"p1": triples("p1", 2), "p2": triples("p2", 1)}
-        for stored, outcome, expected in (
-            ([watch.ERROR_KIND_BUDGET_EXHAUSTED], None, []),
-            ([watch.ERROR_KIND_CUT_SHORT, watch.ERROR_KIND_BUDGET_EXHAUSTED], None, []),
-            # Mixed: the same failure kind as before is not re-posted.
-            ([watch.ERROR_KIND_BUDGET_EXHAUSTED, watch.ERROR_KIND_SCAN_FAILED],
-             lambda clusters, _: subprocess.CompletedProcess([], 1, "", "x") if clusters[0].startswith("p2/") else None,
-             []),
-        ):
-            with self.subTest(stored=stored):
-                self.home.mkdir(parents=True, exist_ok=True)
-                (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps({
-                    watch.FINDINGS_KEY: {}, watch.ANNOUNCED_KEY: {watch.ANNOUNCED_PARTIAL_KEY: stored},
-                }), encoding="utf-8")
-                buf = io.StringIO()
-                with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.sandbox(outcome), redirect_stdout(buf):
-                    watch.tick(now=T0)
-                self.assertEqual(buf.getvalue().splitlines(), expected)
-                announced = watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {})
-                if outcome is None:
-                    self.assertNotIn(watch.ANNOUNCED_PARTIAL_KEY, announced)
-                else:
-                    self.assertEqual(announced[watch.ANNOUNCED_PARTIAL_KEY], [watch.ERROR_KIND_SCAN_FAILED])
-
-    def write_ledger_with_findings(self, clusters: list[str], **extra) -> None:
-        findings = {}
-        for cluster in clusters:
-            item = watch.normalize_topology_finding(cluster, make_topology_finding(name="web"))
-            findings[item["key"]] = {
-                k: item[k] for k in ("cluster", "kind", "namespace", "subject_kind", "subject_name",
-                                     "topology_key", "tier", "severity", "suspected_cause")
-            } | {watch.FIRST_SEEN_KEY: watch.iso(T0), watch.LAST_REPORT_KEY: watch.iso(T0)}
-        self.home.mkdir(parents=True, exist_ok=True)
-        (self.home / watch.LEDGER_FILE_NAME).write_text(
-            json.dumps({watch.FINDINGS_KEY: findings, **extra}), encoding="utf-8"
-        )
-
-    def test_a_project_that_left_the_scope_retires_its_findings_and_stamps_on_a_partial_tick(self) -> None:
-        # p1 is bigger than the tick (two clusters deferred), so the tick is
-        # never clean; p2 left the project list.
-        self.roster = {"p1": triples("p1", 30), "p2": triples("p2", 1)}
-        old = watch.iso(T0 - timedelta(days=1))
-        self.write_ledger_with_findings(
-            ["p2/l/c00", "p1/l/c29"],
-            **{watch.CLUSTER_RUNS_KEY: {"p2/l/c00": old}, watch.PROJECT_RUNS_KEY: {"p2": old},
-               watch.UNREAD_SINCE_KEY: {"p2/l/c01": old}},
-        )
-        buf = io.StringIO()
-        with self.sandbox(seconds=1350.0), redirect_stdout(buf):
-            watch.tick(now=T0 + timedelta(days=1))
-        self.assertEqual(buf.getvalue().splitlines(), ["leeway: 1 finding(s) resolved (c00:shop/web); retired from the watch"])
-        ledger = watch.load_ledger(self.home)
-        self.assertEqual([f["cluster"] for f in ledger[watch.FINDINGS_KEY].values()], ["p1/l/c29"])
-        self.assertFalse([c for c in ledger[watch.CLUSTER_RUNS_KEY] if c.startswith("p2/")])
-        self.assertNotIn("p2", ledger[watch.PROJECT_RUNS_KEY])
-        self.assertFalse([t for t in ledger.get(watch.UNREAD_SINCE_KEY, {}) if t.startswith("p2")])
-
-    def test_a_scope_that_did_not_resolve_retires_and_prunes_nothing(self) -> None:
-        self.roster = {"p1": triples("p1", 30), "p2": triples("p2", 1)}
-        old = watch.iso(T0 - timedelta(days=1))
-        unresolved = mock.Mock(
-            projects=("p1",),
-            unread=((watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW, "unresolved"),),
-            excluded_clusters=(),
-        )
-        cases = {
-            "declared scope unresolved": (
-                {watch.PROJECTS_ENV: ""}, mock.patch.object(watch, "declared_scope", return_value=unresolved)
-            ),
-            "a profile's identity unreadable": (
-                {watch.PROJECTS_ENV: ""},
-                mock.patch.object(watch, "roster_unidentified_profiles", return_value=("broken",)),
-            ),
-        }
-        for name, (env, patch) in cases.items():
-            with self.subTest(name):
-                self.write_ledger_with_findings(
-                    ["p2/l/c00"], **{watch.CLUSTER_RUNS_KEY: {"p2/l/c00": old}, watch.PROJECT_RUNS_KEY: {"p2": old}}
-                )
-                self.roster = {"p1": triples("p1", 30)}
-                self.clock = 0.0
-                buf = io.StringIO()
-                with mock.patch.dict(os.environ, env), patch, self.sandbox(seconds=1350.0), redirect_stdout(buf):
-                    watch.tick(now=T0 + timedelta(days=1))
-                self.assertEqual(buf.getvalue(), "")
-                ledger = watch.load_ledger(self.home)
-                self.assertEqual([f["cluster"] for f in ledger[watch.FINDINGS_KEY].values()], ["p2/l/c00"])
-                self.assertEqual(ledger[watch.CLUSTER_RUNS_KEY]["p2/l/c00"], old)
-                self.assertEqual(ledger[watch.PROJECT_RUNS_KEY]["p2"], old)
-
-    def test_a_cluster_no_longer_configured_retires_its_findings_and_stamp(self) -> None:
-        old = watch.iso(T0 - timedelta(days=1))
-        self.write_ledger_with_findings(["p1/l/c19", "p1/l/c00"], **{watch.CLUSTER_RUNS_KEY: {"p1/l/c19": old}})
-
-        def first_fails(clusters, _):
-            return subprocess.CompletedProcess([], 1, "", "boom") if "p1/l/c00" in clusters else None
-
-        buf = io.StringIO()
-        with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: ",".join(triples("p1", 16)), watch.PROJECTS_ENV: ""}), \
-                self.sandbox(first_fails), redirect_stdout(buf):
-            watch.tick(now=T0 + timedelta(days=1))
-        self.assertIn("leeway: 1 finding(s) resolved (c19:shop/web); retired from the watch", buf.getvalue().splitlines())
-        ledger = watch.load_ledger(self.home)
-        self.assertEqual([f["cluster"] for f in ledger[watch.FINDINGS_KEY].values()], ["p1/l/c00"])
-        self.assertNotIn("p1/l/c19", ledger[watch.CLUSTER_RUNS_KEY])
-
-    def test_the_coverage_line_posts_once_when_part_of_the_fleet_goes_unread_and_once_when_it_clears(self) -> None:
-        # 60 clusters, one call of 14 a tick: a cluster waits five ticks for
-        # its next call, so from day 4 some cluster's last call is over three
-        # days old.
-        self.roster = {"p1": triples("p1", 60)}
-        one_call = watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0
-        outputs = []
-        for day in range(8):
-            self.clock = 0.0
-            buf = io.StringIO()
-            with self.sandbox(seconds=one_call if day < 6 else 0.0), redirect_stdout(buf):
-                watch.tick(now=T0 + timedelta(days=day))
-            outputs.append(buf.getvalue().splitlines())
-        line = ("leeway watch: part of the fleet has not been reached in over 3 days (p1); "
-                "its findings are kept but may be out of date")
-        self.assertEqual(outputs, [[], [], [], [], [line], [], ["leeway watch: every part of the fleet has been "
-                                                               "reached in the last 3 days"], []])
-
-    def test_a_cluster_never_in_a_call_counts_from_when_it_was_first_listed(self) -> None:
-        scope = watch.ResolvedScope(resolved=True, projects={"p1"})
-        listed = {"p1/l/c00", "p1/l/c01"}
-        since: dict = {}
-        runs = {"p1/l/c00": watch.iso(T0)}
-        self.assertEqual(watch.coverage_gaps(T0, scope, listed, runs, {}, since), [])
-        self.assertEqual(since, {"p1/l/c01": watch.iso(T0)})
-        runs = {"p1/l/c00": watch.iso(T0 + timedelta(days=4))}
-        self.assertEqual(watch.coverage_gaps(T0 + timedelta(days=4), scope, listed, runs, {}, since), ["p1"])
-        # Once in a call, it counts from its stamp.
-        runs["p1/l/c01"] = watch.iso(T0 + timedelta(days=4))
-        self.assertEqual(watch.coverage_gaps(T0 + timedelta(days=4), scope, listed, runs, {}, since), [])
-        self.assertEqual(since, {})
-        # A project with no turn and no cluster ever stamped ages from when it was first in scope.
-        since: dict = {}
-        scope = watch.ResolvedScope(resolved=True, projects={"p9"})
-        self.assertEqual(watch.coverage_gaps(T0, scope, set(), {}, {}, since), [])
-        self.assertEqual(since, {"p9": watch.iso(T0)})
-        self.assertEqual(watch.coverage_gaps(T0 + timedelta(days=4), scope, set(), {}, {}, since), ["p9"])
-        # Three days and a few minutes (a read at about the same time of day) is not over the limit.
-        self.assertEqual(
-            watch.coverage_gaps(T0 + timedelta(days=3, minutes=5), scope, set(), {}, {"p9": watch.iso(T0)}, {}), []
-        )
+        self.assertEqual([sorted(errors) for _, _, errors in ticks], [[]] * 10)
+        self.assertEqual([line for lines, _, _ in ticks for line in lines], [])
+        fleet = {c for clusters in roster.values() for c in clusters}
+        for day in range(len(ticks) - 2):
+            self.assertEqual(ticks[day][1] | ticks[day + 1][1] | ticks[day + 2][1], fleet, f"ticks {day} to {day + 2}")
 
 
 class BatchDocsTest(unittest.TestCase):
