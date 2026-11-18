@@ -145,11 +145,13 @@ The entries that share the Platform Agent's roster without being audits. The tab
 
   It reads each project in calls of at most 12 clusters, so a slow call costs only its own clusters. Each cluster gets a share of its call's 15-minute limit: at least two minutes and at most five, rather than leeway's one-minute default. A run has 45 minutes. When too little is left to give the next clusters two minutes each, they wait. They go first on their project's next turn. A project gets one turn per run, and its turn ends at its first call that runs out of time.
 
-  The watch posts one line when a project's read fails, and again only when another project starts failing. The line names up to six projects, then counts the rest. Clusters a run did not reach are not failures, and their findings are kept until they are read.
+  The watch posts one line when a project's read fails, and again only when another project starts failing. The line names up to six projects, then counts the rest. Clusters a run did not reach are not failures, and their findings are kept until they are read. When no read in a run returns, the watch posts a failure line once. Unless the fleet is one project read in one call, that line names no project, so the rotation does not change it.
 
   The watch remembers which clusters failed in each project. It says so once when every one of them has read cleanly since, or left its project. A project that leaves the sweep is dropped without a line. A finding is resolved when its cluster reads clean, or when its project no longer lists the cluster.
 
   When the A2A bus is configured, the watch also writes the JSON report to the `topology-skew` blackboard topic (`a2a.topics.agent.platform.topology-skew`). If that write fails — as when an upgraded install's `TOPICS-STATE` stream lacks the subject and `PlatformAgent` records `TopicsStateSubjectMissing` — it warns once naming `nats stream edit TOPICS-STATE`. It retries on a later run that reads every project in full without a failure.
+
+  A run with a finding due writes its report to `latest.json` and the topic, even when it read only part of the fleet. Any other refresh waits for a run that reads every project in full without a failure. On a fleet too big for one run, the report and the topic change only when a finding comes due. Otherwise they keep the previous report.
 
 - `chat-delivery-watch`: keeps a per-job count of scheduled reports that failed to reach chat and, past a threshold, opens a GitHub ledger issue and writes an `ALERT` line that fluent-bit ships to Cloud Logging, the two channels that still work when chat does not. [The relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) explains why it uses neither chat nor a `PlatformAgent` condition yet.
 
