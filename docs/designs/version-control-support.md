@@ -991,7 +991,7 @@ a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
 than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
 requires. `issue-list`'s `query?` is free text each forge composes into
-its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own search grammar (plain words only for the profile role, above), and its `excludeLabels?` is what a sweep that must skip
 its own claim marker asks with. `proposal-list` filters on the branches instead
 — `source?` and `target?` — because "is there already a proposal for this
 branch" is the question every write flow opens with. A comment carries `id` and

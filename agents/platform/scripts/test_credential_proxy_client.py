@@ -1080,8 +1080,11 @@ class VcsCallErrorTest(unittest.TestCase):
         return calls, patch.object(credential_proxy_client, "open_broker_request", answer)
 
     @staticmethod
-    def _busy(bound):
-        return json.dumps({"error": "busy", "code": credential_proxy_client.BUSY_CODE, "bound": bound}).encode()
+    def _busy(bound, before_admission=True):
+        answer = {"error": "busy", "code": credential_proxy_client.BUSY_CODE, "bound": bound}
+        if before_admission:
+            answer["before_admission"] = True
+        return json.dumps(answer).encode()
 
     def _call(self, verb="proposal-create"):
         sleeps = []
@@ -1106,7 +1109,11 @@ class VcsCallErrorTest(unittest.TestCase):
             "the slot cap": (503, self._busy("slot"), {}),
             "the background cap": (503, self._busy("background"), {}),
             "draining": (503, self._busy("draining"), {}),
-            "memory pressure": (429, b'{"error": "pressure", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE"}', {}),
+            "memory pressure": (
+                429,
+                b'{"error": "pressure", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE", "before_admission": true}',
+                {},
+            ),
             "an Envoy overload 503": (503, b"overloaded", {credential_proxy_client.ENVOY_OVERLOADED_HEADER: "true"}),
         }
         for name, refusal in cases.items():
@@ -1123,6 +1130,14 @@ class VcsCallErrorTest(unittest.TestCase):
             "a bare non-JSON 503": (503, b"upstream reset", {}),
             "a conflict": (409, b'{"error": "the base branch moved", "code": "BASE_MOVED"}', {}),
             "a permit refusal": (403, b'{"error": "no permit", "code": "CALLER_PERMIT_REQUIRED"}', {}),
+            # A write that reached the forge and then failed is never sent again.
+            "a git failure after the push": (502, b'{"error": "vcs publish failed", "code": "GIT_FAILED"}', {}),
+            "the forge's own rate limit": (429, b'{"error": "rate limited", "code": "FORGE_RATE_LIMITED"}', {}),
+            "the forge unavailable": (503, b'{"error": "forge down", "code": "FORGE_UNAVAILABLE"}', {}),
+            "a busy answer from inside the route": (503, self._busy("budget", before_admission=False), {}),
+            "memory pressure not marked as before admission": (
+                429, b'{"error": "pressure", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE"}', {},
+            ),
         }
         for name, refusal in cases.items():
             with self.subTest(name):

@@ -1637,6 +1637,34 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.assertEqual([credential_proxy.CALLER_ROLE_PROFILE], sessions)
         self.assertEqual([credential_proxy.CLASS_BACKGROUND], classes)
 
+    def test_a_busy_answer_says_whether_it_came_before_admission(self):
+        """vcs_call sends a request again only on a refusal that ran nothing (#6247)."""
+        busy = credential_proxy.CommandSlotUnavailable("at the profile share", bound="profile")
+
+        def refusing_slot(handler, role):
+            raise busy
+
+        with mock.patch.object(CredentialProxyHandler, "_session_slot", refusing_slot):
+            status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(503, status, body)
+        self.assertIs(True, body.get(credential_proxy.BUSY_BEFORE_ADMISSION_KEY), body)
+        self.routes["proposal-create"].assert_not_called()
+
+        # Past admission -- a credential refresh's wait inside the route, after
+        # the forge may have been called -- the answer does not say so.
+        self.reset()
+        self.routes["proposal-create"].side_effect = credential_proxy.CommandSlotUnavailable(
+            "waiting on the refresh", bound="budget"
+        )
+        status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(503, status, body)
+        self.assertNotIn(credential_proxy.BUSY_BEFORE_ADMISSION_KEY, body)
+        import credential_proxy_client
+
+        self.assertEqual(
+            credential_proxy.BUSY_BEFORE_ADMISSION_KEY, credential_proxy_client.BUSY_BEFORE_ADMISSION_KEY
+        )
+
     def test_every_read_verb_runs_with_the_permit_too(self):
         for verb in sorted(PROFILE_VCS_READS):
             with self.subTest(verb=verb):
@@ -1709,6 +1737,7 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 "repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x",
                 # No colon, yet each would change what GitHub reads after it.
                 '"crash', "crash (", "crash\\", "crash OR", "NOT crash", "a AND b",
+                "crash\x00", "crash\nmore", "x" * 257,
             )
         ]
         fields += [

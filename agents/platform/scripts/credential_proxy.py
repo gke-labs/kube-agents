@@ -483,6 +483,12 @@ RETRY_AFTER_MIN_SECONDS = 5
 RETRY_AFTER_MAX_SECONDS = 30
 RETRY_AFTER_HEADER = "Retry-After"
 RESOURCE_PRESSURE_CODE = "CREDENTIAL_PROXY_RESOURCE_PRESSURE"
+# Set, true, on a busy answer given before the request was admitted -- before
+# its body was read and before anything it asked for ran (#6247). A caller may
+# send such a request again knowing nothing ran twice; a busy answer without it
+# may come from inside a route (a credential refresh's wait, after a forge call)
+# and is not sent again by `vcs_call`.
+BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 # What the tick's relief step calls: the C allocator's trim, where libc has it.
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
@@ -2565,6 +2571,10 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
 # an alternative rather than a narrowing.
 PROFILE_QUERY_REFUSED_CHARACTERS = frozenset(':"\\()')
 PROFILE_QUERY_REFUSED_WORDS = frozenset({"OR", "AND", "NOT"})
+# And it is printable and short: a control character or a query past a
+# forge's length limit could cut the composed search before the qualifier
+# appended after it.
+PROFILE_QUERY_MAX_LENGTH = 256
 
 
 def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
@@ -2578,8 +2588,12 @@ def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
     one is refused, as ``LOGIN_RE`` refuses one in ``author``. Nor may ``query``
     reach that qualifier without one: an unclosed quote or parenthesis would
     swallow it, and ``OR`` would make it one alternative of two. So ``query`` is
-    held to plain words, with none of PROFILE_QUERY_REFUSED_CHARACTERS and none
-    of PROFILE_QUERY_REFUSED_WORDS as a word of its own. It quotes each
+    held to plain words, with none of PROFILE_QUERY_REFUSED_CHARACTERS, none
+    of PROFILE_QUERY_REFUSED_WORDS as a word of its own, nothing unprintable,
+    and no more than PROFILE_QUERY_MAX_LENGTH characters. This is an allowlist
+    by design, not a parser of any forge's grammar: a bypass found later is
+    answered by narrowing it further (dropping free-text `query` for the role
+    and keeping labels), not by modelling more syntax. It quotes each
     ``labels`` and ``excludeLabels`` entry as ``label:"<name>"``, so a ``"``
     in a name closes the quote and what follows is a qualifier; a name holding
     ``"`` or ``\\`` is refused. A colon inside a label name stays, since the
@@ -2590,11 +2604,13 @@ def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
     if isinstance(query, str) and (
         PROFILE_QUERY_REFUSED_CHARACTERS.intersection(query)
         or PROFILE_QUERY_REFUSED_WORDS.intersection(query.split())
+        or not query.isprintable()
+        or len(query) > PROFILE_QUERY_MAX_LENGTH
     ):
         return (
-            "a profile caller's issue-list query may hold plain words only: no ':', quote, "
-            "backslash or parenthesis, and no OR, AND or NOT, any of which can change what a "
-            "forge's search reads after it"
+            "a profile caller's issue-list query may hold plain words only: printable, at most "
+            f"{PROFILE_QUERY_MAX_LENGTH} characters, no ':', quote, backslash or parenthesis, and "
+            "no OR, AND or NOT, any of which can change what a forge's search reads after it"
         )
     for field in ("labels", "excludeLabels"):
         names = payload.get(field)
@@ -16296,10 +16312,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # publish must not spend the interactive reserve the shell and the
             # session pods keep. Every other role keeps the interactive slot
             # it had.
+            # Whether the request got past admission: a busy refusal before
+            # it ran nothing and read no body; one after it may have come from
+            # inside the route, past a forge call.
+            admitted = False
             vcs_session_slot = (
                 self._session_slot(role) if role == CALLER_ROLE_PROFILE else contextlib.nullcontext()
             )
             with vcs_session_slot, self._request_slot(admission_class(role)):
+                admitted = True
                 # Read under one deadline for the whole body: the slot is held
                 # from here on, and a caller that stalls or trickles mid-send
                 # would otherwise keep it with nothing running in it. A stalled
@@ -16477,13 +16498,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return TOOL_STATUS_ERROR
         except CommandSlotUnavailable as exc:
-            # Raised before the body was read, so nothing is left half-done --
-            # and the body is drained before the answer, or a caller still
-            # sending a large one would see the connection reset in place of
-            # the 503.
+            # Raised by admission, before the body was read, so nothing is
+            # left half-done -- and the body is drained before the answer, or
+            # a caller still sending a large one would see the connection
+            # reset in place of the 503. Raised past admission instead (a
+            # forge credential refresh's wait inside the route), the body is
+            # read already and the route may have reached the forge, so the
+            # answer does not say it came before admission.
             LOGGER.warning("command %s verb=%s: %s", _busy_phrase(exc), verb, exc)
-            drain_request_body(self, body_limit)
-            self._busy(exc)
+            if not admitted:
+                self._drain_vcs_body(body_limit)
+            self._busy(exc, before_admission=not admitted)
             return TOOL_STATUS_BUSY
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
@@ -16832,7 +16857,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if method == "POST":
             # Read first, so the refusal is not lost to a connection reset.
             drain_request_body(self, self.max_request_bytes)
-        self._busy(CommandSlotUnavailable(SHUTDOWN_DRAINING_ERROR, bound=ADMISSION_BOUND_DRAINING))
+        self._busy(
+            CommandSlotUnavailable(SHUTDOWN_DRAINING_ERROR, bound=ADMISSION_BOUND_DRAINING), before_admission=True
+        )
         return True
 
     def _handle_teams_post(self) -> None:
@@ -17066,7 +17093,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             },
         )
 
-    def _busy(self, exc: CommandSlotUnavailable) -> None:
+    def _busy(self, exc: CommandSlotUnavailable, before_admission: bool = False) -> None:
         """Answer a broker at its concurrency cap or child memory budget, or
         refusing under resource pressure, on whichever route asked.
 
@@ -17083,7 +17110,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         Counted here, once per route that answers it, under the bound the
         exception carries; the 503 names it to the caller too, so the shim can
         tell a bound another exec replica may not hold from one it will.
+        `before_admission` adds BUSY_BEFORE_ADMISSION_KEY, for a refusal given
+        before the request was admitted, when nothing it asked for has run.
         """
+        flag = {BUSY_BEFORE_ADMISSION_KEY: True} if before_admission else {}
         bound = getattr(exc, "bound", ADMISSION_BOUND_OTHER)
         if bound not in ADMISSION_BOUNDS:
             bound = ADMISSION_BOUND_OTHER
@@ -17096,6 +17126,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "code": RESOURCE_PRESSURE_CODE,
                     "error": str(exc),
                     "retry_after": exc.retry_after,
+                    **flag,
                 },
                 headers={RETRY_AFTER_HEADER: str(exc.retry_after)},
             )
@@ -17104,7 +17135,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # stopping broker (`draining`) from one at a cap.
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
-            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound},
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound, **flag},
         )
 
 
