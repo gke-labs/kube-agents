@@ -476,7 +476,11 @@ retain their ledger entries so transient errors do not erase state and re-page
 tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
 `topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
 if that write fails, it warns once in chat and retries on subsequent clean
-ticks until the write recovers.
+ticks until the write recovers. A report too large for one bus message (NATS's
+1 MiB `max_payload`, less room for the envelope) is published capped: the same
+document with each cluster's findings cut to the most severe that fit, the full
+report's `summary`, and a `truncated` block counting what was left out and
+naming the full report's path on disk.
 
 ## `session-retention` gives every profile's history an end
 
