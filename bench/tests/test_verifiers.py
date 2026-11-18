@@ -4743,6 +4743,51 @@ def test_finding_objects_mirrors_the_renderers_reader():
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "no-memory-limit",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "default-sa-automount",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                        "remediation": {
+                            "note": (
+                                f"{renderer.SHARED_ACCOUNT_SHIELD_PREFIX}"
+                                " `Deployment/other` (org/repo:notes/sa.md) — "
+                                "kept `kind: manual` so the namespace-wide ServiceAccount patch is not proposed."
+                            )
+                        },
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
         _ledger_body(
             findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"

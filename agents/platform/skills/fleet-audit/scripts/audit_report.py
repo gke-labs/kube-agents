@@ -1598,9 +1598,10 @@ ID_SCHEME_RE = re.compile(
 FINDING_MARKER_RE = re.compile(
     r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
-# Written on its own line under a finding's heading when this run measured the
-# finding as new since the last one, for the Slack card's "new" tag
-# (`agents/platform/scripts/slack_audit_report.py` reads it). Never written
+# Written on its own line under a finding's heading — or indented beneath its
+# one-line listed bullet (`render_listed_finding`) — when this run measured the
+# finding as new since the last one, for the Slack/Chat card's "new" tag
+# (`agents/platform/scripts/slack_audit_report.py` reads both). Never written
 # when the delta is unknown, so no finding is ever wrongly called new; and on a
 # line of its own because anything after the heading's marker stops
 # `FINDING_MARKER_RE` matching it. Model text cannot forge it: every free-text
@@ -1618,7 +1619,8 @@ LEDGER_STAMP_FORMAT = "%Y-%m-%d %H:%M UTC"
 # such a title, so it never rewrites a body that lists findings.
 COVERAGE_TITLE_RE = re.compile(r" — coverage incomplete \(\d+ gaps?, 0 findings\)$")
 # The renderer's own brackets around the one-line rows `_render_listed`
-# writes, which `parse_finding_locations` reads back with the full blocks.
+# writes, read back by `parse_finding_locations` and by
+# `agents/platform/scripts/slack_audit_report.py` alongside the full blocks.
 # Comments, like the held span's: `publishable_text` escapes `<!--` in every
 # model-written field, so no title or excerpt can spell one.
 LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
@@ -1821,7 +1823,12 @@ ALL_FINDINGS_RE = re.compile(r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n
 DELTA_SLOT_CHARS = 3
 FINDING_ID_FIELD = "id"
 LINE_JOINER = "\n"
+LISTED_CONTINUATION_INDENT = "  "
 OMITTED_BREAKDOWN_WRAP = " ({breakdown})"
+# Margin for uncharged headings and chrome inside `_render_findings`: the
+# summary line, up to three severity headings, section joiners, and the
+# omitted-findings notice with its per-severity breakdown (~512 chars max).
+SECTION_CHROME_CHARS = 600
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -12852,22 +12859,30 @@ def _full_row_cost(
 
 
 def render_listed_finding(
-    finding: dict, *, state: str | None = None, pr_url: str | None = None
+    finding: dict,
+    *,
+    state: str | None = None,
+    pr_url: str | None = None,
+    new: bool = False,
 ) -> str:
     """One line naming a finding the body has no room to show in full.
 
-    A bullet, never a `FINDING_HEADING`: the readers that recover a finding's
-    detail from its heading (`FINDING_MARKER_RE`, the Slack card) must not
-    take a listed one for a finding whose detail is on the ledger.
+    A bullet, never a `FINDING_HEADING`: `FINDING_MARKER_RE`, which recovers a
+    finding's detail from its heading, must not take a listed one for a finding
+    whose detail is on the ledger. `parse_finding_locations` and the chat card
+    (`slack_audit_report.py`) read these bullets inside `LISTED_SECTION_BEGIN`
+    and `LISTED_SECTION_END`.
 
     A state other than open, and its pull request, follow the id: the state
     index covers full rows only, so a listed row is the one place a reader
     finds them.
 
-    A finding the shared-account shield made manual keeps the shield on an
-    indented line under the bullet: it is the instruction not to apply the
-    namespace-wide fix, and without it the row reads like any other 2.7
-    finding. `LISTED_LINE_RE` reads the bullet line alone.
+    When `new` is true, `NEW_MARKER` sits indented on the line beneath the
+    bullet so the chat card tags it like a full row. A finding the
+    shared-account shield made manual keeps the shield on an indented line
+    under the bullet: it is the instruction not to apply the namespace-wide
+    fix, and without it the row reads like any other 2.7 finding.
+    `LISTED_LINE_RE` reads the bullet line alone.
     """
     fid = str(finding.get("id", ""))
     suffix = ""
@@ -12876,13 +12891,17 @@ def render_listed_finding(
     namespace = _ident(str(finding.get("namespace", "")))
     where = f"`{_ident(str(finding.get('cluster', '')))}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
-    line = (
+    lines = [
         f"- **{_cell(str(finding.get('severity', '')))}** — "
         f"{_cell(str(finding.get('title', '')))} — {where} — "
         f"`{_ident(str(finding.get('object', '')))}` (`{fid}`){suffix}"
-    )
+    ]
+    if new:
+        lines.append(f"{LISTED_CONTINUATION_INDENT}{NEW_MARKER}")
     shield = _shared_account_shield(finding)
-    return line + (f"\n  {shield}" if shield else "")
+    if shield:
+        lines.append(f"{LISTED_CONTINUATION_INDENT}{shield}")
+    return LINE_JOINER.join(lines)
 
 
 def _shared_account_shield(finding: dict) -> str:
@@ -12952,14 +12971,18 @@ def _render_listed(
     listed: list[dict],
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
+    *,
+    new_ids: set[str] | None = None,
 ) -> list[str]:
     if not listed:
         return []
+    marked = new_ids or set()
     return _listed_header(len(listed)) + [
         render_listed_finding(
             finding,
-            state=(states or {}).get(str(finding.get("id", ""))),
-            pr_url=(pr_urls or {}).get(str(finding.get("id", ""))),
+            state=(states or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+            pr_url=(pr_urls or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+            new=str(finding.get(FINDING_ID_FIELD, "")) in marked,
         )
         for finding in sort_findings(listed)
     ] + [LISTED_SECTION_END]
@@ -12971,6 +12994,7 @@ def split_findings_for_body(
     *,
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
+    new_ids: set[str] | None = None,
     **render_args,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Split the findings into (shown in full, listed on one line, omitted).
@@ -12992,7 +13016,13 @@ def split_findings_for_body(
         return [], [], []
     idx_costs = _index_prefix_costs(order, states, pr_urls)
     full = [
-        _full_row_cost(finding, states=states, pr_urls=pr_urls, **render_args)
+        _full_row_cost(
+            finding,
+            states=states,
+            pr_urls=pr_urls,
+            new_ids=new_ids,
+            **render_args,
+        )
         for finding in order
     ]
     prefix_full = [0]
@@ -13002,12 +13032,14 @@ def split_findings_for_body(
         return sort_findings(order), [], []
     # + 1 for the newline joining each line to the one before it, and the
     # id's slot in the hidden delta block.
+    marked = new_ids or set()
     line_costs = [
         len(
             render_listed_finding(
                 finding,
                 state=(states or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
                 pr_url=(pr_urls or {}).get(str(finding.get(FINDING_ID_FIELD, ""))),
+                new=str(finding.get(FINDING_ID_FIELD, "")) in marked,
             )
         )
         + 1
@@ -13424,7 +13456,7 @@ def _render_findings(
                 unlinked_paths=unlinked_paths,
             )
 
-    out += _render_listed(listed, states, pr_urls)
+    out += _render_listed(listed, states, pr_urls, new_ids=new_ids)
     if omitted:
         omitted_counts = severity_counts(omitted)
         breakdown = SUMMARY_BREAKDOWN_SEPARATOR.join(
@@ -14042,6 +14074,59 @@ class RenderedIssue(NamedTuple):
         return bool(self.omitted or self.listed)
 
 
+def _group_check_evidence(
+    clusters: list[dict], audit_id: str
+) -> tuple[dict[tuple[str, str], list[str]], dict[tuple[str, str], list[str]]]:
+    """Group `(check, command)` and `(check, reason)` across clusters in appearance order."""
+    if not audit_checks(audit_id):
+        return {}, {}
+    grouped: dict[tuple[str, str], list[str]] = {}
+    na_grouped: dict[tuple[str, str], list[str]] = {}
+    for cluster in clusters:
+        name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
+        for entry in cluster.get("checks_run") or []:
+            if not isinstance(entry, dict):
+                continue
+            check = str(entry.get("check", "")).strip()
+            command = str(entry.get("command", "")).strip()
+            if check and command:
+                grouped.setdefault((check, command), []).append(name)
+        for entry in cluster.get("checks_not_applicable") or []:
+            if not isinstance(entry, dict):
+                continue
+            check = str(entry.get("check", "")).strip()
+            reason = str(entry.get("reason", "")).strip()
+            if check and reason:
+                na_grouped.setdefault((check, reason), []).append(name)
+    return grouped, na_grouped
+
+
+def _format_check_evidence_notice(ran: int, declared: int) -> list[str]:
+    """One-line notice emitted when the check-evidence table is dropped for space."""
+    excluded = f" and the {declared} exclusion(s)" if declared else ""
+    return [
+        "",
+        f"_The commands behind this run's {ran} check(s){excluded} do not "
+        "fit GitHub's body limit and are omitted here. They are kept in full in "
+        "this run's stored report; ask the agent for that report to re-run any "
+        "of them._",
+    ]
+
+
+def _check_evidence_notice(clusters: list[dict], audit_id: str) -> list[str]:
+    """The dropped-table notice when check evidence exists, else `[]`.
+
+    Shared with `_render_check_evidence` and measured before finding selection
+    so an overflowing body never drops the check-evidence table silently.
+    """
+    grouped, na_grouped = _group_check_evidence(clusters, audit_id)
+    if not grouped and not na_grouped:
+        return []
+    ran = sum(len(names) for names in grouped.values())
+    declared = sum(len(names) for names in na_grouped.values())
+    return _format_check_evidence_notice(ran, declared)
+
+
 def _render_check_evidence(
     clusters: list[dict], audit_id: str, budget: int
 ) -> list[str]:
@@ -14067,29 +14152,7 @@ def _render_check_evidence(
     same words. The row names every cluster it answers for. A command that
     names its own cluster (`kubectl --context <cluster>`) collapses nothing.
     """
-    if not audit_checks(audit_id):
-        return []
-    # Keyed by (check, command) and (check, reason), in order of first
-    # appearance, so a run where each command is different gives the same
-    # rows as one row per cluster.
-    grouped: dict[tuple[str, str], list[str]] = {}
-    na_grouped: dict[tuple[str, str], list[str]] = {}
-    for cluster in clusters:
-        name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
-        for entry in cluster.get("checks_run") or []:
-            if not isinstance(entry, dict):
-                continue
-            check = str(entry.get("check", "")).strip()
-            command = str(entry.get("command", "")).strip()
-            if check and command:
-                grouped.setdefault((check, command), []).append(name)
-        for entry in cluster.get("checks_not_applicable") or []:
-            if not isinstance(entry, dict):
-                continue
-            check = str(entry.get("check", "")).strip()
-            reason = str(entry.get("reason", "")).strip()
-            if check and reason:
-                na_grouped.setdefault((check, reason), []).append(name)
+    grouped, na_grouped = _group_check_evidence(clusters, audit_id)
     # Counted before the rows collapse: the reader is owed the number of
     # (cluster, check) pairs, not the number of different commands.
     ran = sum(len(names) for names in grouped.values())
@@ -14150,14 +14213,7 @@ def _render_check_evidence(
     # runs whose findings crowded it out, which are the runs where a fabricated
     # check would matter most, and silence there leaves a document that looks
     # complete. Name the omission and say where the commands survive.
-    excluded = f" and the {declared} exclusion(s)" if na_grouped else ""
-    notice = [
-        "",
-        f"_The commands behind this run's {ran} check(s){excluded} do not "
-        "fit GitHub's body limit and are omitted here. They are kept in full in "
-        "this run's stored report; ask the agent for that report to re-run any "
-        "of them._",
-    ]
+    notice = _format_check_evidence_notice(ran, declared)
     return notice if len("\n".join(notice)) <= budget else []
 
 
@@ -14269,12 +14325,21 @@ def render_issue_body(
     all_block = all_findings_block(finding_ids(findings) + held_ids)
     overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
     # And the held span's smallest form, so the list the next run carries
-    # from is never the thing the findings squeeze out. The state index is
-    # charged inside `_render_findings` against the full-row prefix
+    # from is never the thing the findings squeeze out. The dropped
+    # check-evidence notice is reserved here too so a body that drops the
+    # evidence table always names where the commands survive. The state index
+    # is charged inside `_render_findings` against the full-row prefix
     # `split_findings_for_body` chooses rather than reserved here for fifty
     # full rows.
+    evidence_notice = _check_evidence_notice(clusters, audit_id)
+    evidence_notice_cost = (
+        len(LINE_JOINER) + len(LINE_JOINER.join(evidence_notice))
+        if evidence_notice
+        else 0
+    )
     overhead += len("\n".join(_render_held_ids_only(held_entries)))
-    overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
+    overhead += evidence_notice_cost
+    overhead += len("\n".join(["", "## Findings", "", ""])) + SECTION_CHROME_CHARS
 
     def select(extra: int) -> tuple[list[str], list[dict], list[dict]]:
         return _render_findings(
@@ -14321,6 +14386,7 @@ def render_issue_body(
     # first finding renders whatever it costs, and a tier that had to compete
     # for the remainder could lose to it and drop the hold.
     held_section: list[str] = _render_held_ids_only(held_entries)
+    held_room = max(BODY_BUDGET - spent - evidence_notice_cost - len(LINE_JOINER), 0)
     for candidate_section in (
         _render_collector_held(
             held_entries,
@@ -14348,14 +14414,23 @@ def render_issue_body(
             unread_overflow=unread_overflow,
         ),
     ):
-        if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
+        if len(LINE_JOINER.join(candidate_section)) <= held_room:
             held_section = candidate_section
             break
-    spent += len("\n".join(held_section))
+    spent = len(
+        LINE_JOINER.join(
+            fixed + findings_lines + held_section + declared_section + withheld_section + footer
+        )
+    )
     # Whatever the findings did not need. The evidence appendix is the last
     # claim on the budget, never a competitor for it — a run with 400 findings
-    # publishes the findings and drops the appendix, not the reverse.
-    evidence = _render_check_evidence(clusters, audit_id, max(BODY_BUDGET - spent, 0))
+    # publishes the findings and drops the appendix, not the reverse. Its
+    # dropped-table notice was reserved before finding selection so a dropped
+    # table always carries the notice.
+    evidence_budget = max(BODY_BUDGET - spent - len(LINE_JOINER), 0)
+    evidence = _render_check_evidence(clusters, audit_id, evidence_budget)
+    if not evidence and evidence_notice and spent + evidence_notice_cost <= MAX_BODY_CHARS:
+        evidence = evidence_notice
 
     body = "\n".join(
         fixed

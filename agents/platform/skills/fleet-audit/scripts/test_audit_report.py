@@ -10873,6 +10873,11 @@ class TestRenderBudget(BaseTestCase):
                     {fid: loc["object"] for fid, loc in locations.items()},
                     {f["id"]: f["object"] for f in findings},
                 )
+                if "</details>" not in rendered.body:
+                    self.assertRegex(
+                        rendered.body,
+                        r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+                    )
                 self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
 
         doc_300 = compliance_doc(50, 120, 130)
@@ -10892,7 +10897,99 @@ class TestRenderBudget(BaseTestCase):
             rendered_300.body,
             r"omitted findings \(\d+ major, \d+ minor\) are the least severe",
         )
+        self.assertNotIn("</details>", rendered_300.body)
+        self.assertRegex(
+            rendered_300.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
         self.assertLessEqual(len(rendered_300.body), GITHUB_BODY_LIMIT)
+
+    def test_dropped_check_evidence_notice_survives_omission_and_held_sections(self):
+        # Even when omitted findings AND collector-held rows compete for the
+        # remaining body budget, reserving the dropped-table notice up front
+        # guarantees the notice is never silently dropped.
+        doc = make_doc(findings=bulk_findings(500, severity="minor", prefix="m"))
+        held = [
+            {
+                "id": f"held.prod-us-east.ns.deploy-{i}",
+                "title": f"Held finding {i}",
+                "cluster": "prod-us-east",
+                "namespace": "ns",
+                "object": f"Deployment/held-{i}",
+                "check": "netpol-missing",
+                "commands": ["kubectl get netpol -A"],
+            }
+            for i in range(15)
+        ]
+        rendered = audit_report.render_issue_body(
+            doc, generated_at=NOW, audit_id=AUDIT, held=held
+        )
+        self.assertTrue(rendered.omitted)
+        self.assertNotIn("</details>", rendered.body)
+        self.assertRegex(
+            rendered.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        # Even if the guaranteed first finding pushes `spent` past BODY_BUDGET
+        # (while still fitting under MAX_BODY_CHARS), the dropped-table notice
+        # is still emitted.
+        one_finding_doc = make_doc(findings=[bulk_findings(1, severity="critical", prefix="c")[0]])
+        with mock.patch.object(audit_report, "BODY_BUDGET", 1000):
+            squeezed = audit_report.render_issue_body(
+                one_finding_doc, generated_at=NOW, audit_id=AUDIT
+            )
+        self.assertNotIn("</details>", squeezed.body)
+        self.assertRegex(
+            squeezed.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(squeezed.body), GITHUB_BODY_LIMIT)
+
+    def test_listed_finding_marks_new_and_charges_it_against_budget(self):
+        self.assertEqual(audit_report.split_findings_for_body([], 1000), ([], [], []))
+        finding = make_finding(fid="f-0001", severity="critical", title="Critical listed finding")
+        plain = audit_report.render_listed_finding(finding)
+        marked = audit_report.render_listed_finding(finding, new=True)
+        self.assertEqual(
+            marked,
+            f"{plain}\n{audit_report.LISTED_CONTINUATION_INDENT}{audit_report.NEW_MARKER}",
+        )
+        body = (
+            f"### Listed without detail (1)\n\n{audit_report.LISTED_SECTION_BEGIN}\n"
+            f"{marked}\n{audit_report.LISTED_SECTION_END}\n"
+        )
+        self.assertEqual(
+            audit_report._listed_locations(body)["f-0001"]["title"],
+            "Critical listed finding",
+        )
+        # Charging `NEW_MARKER` on listed rows keeps the last row out when
+        # marking it pushes it past the remaining budget.
+        items = bulk_findings(3, severity="critical", prefix="c")
+        header = len("\n".join(audit_report._listed_header(len(items)))) + len(
+            "\n" + audit_report.LISTED_SECTION_END
+        )
+        line_cost = lambda f, is_new=False: (
+            len(audit_report.render_listed_finding(f, new=is_new))
+            + 1
+            + len(f["id"])
+            + audit_report.DELTA_SLOT_CHARS
+        )
+        budget = (
+            audit_report._full_row_cost(items[0])
+            + header
+            + line_cost(items[1])
+            + line_cost(items[2])
+        )
+        _, listed_plain, omitted_plain = audit_report.split_findings_for_body(items, budget)
+        self.assertEqual(len(listed_plain), 2)
+        self.assertEqual(omitted_plain, [])
+        _, listed_new, omitted_new = audit_report.split_findings_for_body(
+            items, budget, new_ids={items[1]["id"]}
+        )
+        self.assertEqual(len(listed_new), 1)
+        self.assertEqual(len(omitted_new), 1)
 
     def test_majors_give_up_full_blocks_so_every_minor_is_named(self):
         # The live shape that left 49 minors as a count: the major band's full

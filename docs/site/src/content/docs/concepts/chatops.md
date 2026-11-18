@@ -617,7 +617,7 @@ An alert goes to **one** of them, not both: it opens a thread that the triage tu
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
-With `KAGE_SLACK_UX` on, Slack and Google Chat get a card built from the open ledger issue. Its headline counts the most severe level on the issue ("Security & RBAC Posture Audit: 2 critical findings"). Up to ten critical findings shown in full appear under it, each led by its severity and tagged "new" when it was not there on the last run. With none critical, the headline counts the highest level and lists up to two full findings.
+With `KAGE_SLACK_UX` on, Slack gets a card built from the open ledger issue, and so does Google Chat. Its headline carries one number, how many findings of the most severe level the issue lists ("Security & RBAC Posture Audit: 2 critical findings"). Up to ten critical findings are listed under it, each led by its severity and tagged "new" when it was not there on the last run. With none critical listed, the headline counts the most severe level listed and lists the top two.
 
 A line under them counts the rest by severity ("5 more (1 major, 4 minor) are in the ledger issue."), and another names any clusters the run could not check, since a silent gap reads as clean. Then come a "Look at the first one" button and a button that opens the issue.
 
