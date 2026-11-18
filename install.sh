@@ -1038,7 +1038,8 @@ Flags for AI Agents & Automation:
                                 Against an existing install.env, --enable-slack,
                                 --enable-google-chat, --google-chat and the
                                 --slack-*, --google-chat-allowed-users,
-                                --google-chat-home-channel, --google-chat-mode and
+                                --google-chat-home-channel,
+                                --google-chat-home-channel-policy, --google-chat-mode and
                                 --chat-topic-name flags must agree with the key the file
                                 assigns (a disagreement is refused: edit the key); a key
                                 the file lacks is recorded there, tokens excepted
@@ -7389,7 +7390,7 @@ main() {
     # The chat flags likewise: the menu applies the keys install.env records
     # and edits them on its own screens, so a flag here would be dropped.
     if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
-      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
+      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-home-channel-policy, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
       print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
       exit 1
     fi

@@ -1391,11 +1391,11 @@ gateway_home_channel_unset_key() {
 # four arguments. Google Chat first, as the agent picks where home posts go
 # (chat_notify.routed_platforms). A Chat home counts only as a space name, and
 # a Slack home only as a channel id: the gateway arms no route for anything
-# else (the operator's slackChannelID). It cannot see a Slack channel
-# the gateway learned from a mention, which only the cluster records: with
-# that channel learned, the warning for Google Chat still says the gateway
-# keeps its posts, while the agent sends them to Slack. Called when a key is
-# unset, so the platform it prints is the other one.
+# else (the operator's slackChannelID). It cannot see a Slack channel or a
+# Chat space the gateway learned from a mention, which only the cluster
+# records: with one learned, the warning for the other platform still says the
+# gateway keeps its posts, while the agent sends them to the learned home.
+# Called when a key is unset, so the platform it prints is the other one.
 gateway_home_channel_set_platform() {
   local home
   if google_chat_moves_to_a2a_gateway "${2:-}"; then
@@ -1437,7 +1437,7 @@ gateway_home_channel_unset_remedy() {
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
-      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want."
       ;;
   esac
 }

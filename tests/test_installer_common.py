@@ -6161,6 +6161,8 @@ class GatewayHomeChannelUnsetWarningTest(unittest.TestCase):
         proc = self._run(slack="false", chat="true")
         self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+        # As for Slack: the learn is offered beside the key.
+        self.assertIn("under homeChannelPolicy auto (the default), mention the agent once, top-level, in the named space you want", proc.stdout)
 
     def test_both_platforms_share_the_gateway(self):
         # Each backend needs its own home; with both unset both keys are named, Chat first.
