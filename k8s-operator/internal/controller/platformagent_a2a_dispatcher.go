@@ -139,7 +139,11 @@ func a2aDispatcherBucketedGrants() bool {
 // control connection, plus the draining profiles' names. The callout derives
 // every per-profile subject from the profile entries (lib.DispatcherGrants),
 // so the entry's size no longer grows with the profile count.
-func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+// held names the bound profiles kept out of the dispatcher
+// (a2aHeldProfileNames). Unbucketed, the entry is built from the dispatchable
+// profiles alone and leaves them out already; bucketed, the callout derives
+// grants from every profile entry, so the entry lists them for it to skip.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile, held []string) a2aAuthMapIdentity {
 	if !a2aDispatcherBucketedGrants() {
 		entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
 		return entry
@@ -158,7 +162,30 @@ func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1al
 		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
 		Narrowing:      a2aNarrowingDispatcher,
 		Draining:       drainingNames,
+		Held:           held,
 	}
+}
+
+// a2aHeldProfileNames is the profiles the map renders entries for that are
+// not dispatchable, sorted: the ones the profile hold keeps out of the
+// dispatcher. Read off the rendered profile entries rather than the bound
+// list, so a refused profile (no entry, and out of dispatchable too) is never
+// listed, every name listed has passed its entry's checks, and the list lasts
+// only as long as a hold does. Sorted, so the map's version doesn't move with
+// the order the cache lists profiles in.
+func a2aHeldProfileNames(entries []a2aAuthMapIdentity, dispatchable []agentv1alpha1.AgentProfile) []string {
+	var held []string
+	for _, e := range entries {
+		if e.Narrowing != a2aNarrowingProfile || e.Profile == "" || slices.Contains(held, e.Profile) {
+			continue
+		}
+		if slices.ContainsFunc(dispatchable, func(d agentv1alpha1.AgentProfile) bool { return d.Name == e.Profile }) {
+			continue
+		}
+		held = append(held, e.Profile)
+	}
+	slices.Sort(held)
+	return held
 }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
