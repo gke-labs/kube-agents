@@ -32,6 +32,9 @@ PLATFORM_SCRIPTS = REPO_ROOT / "agents" / "platform" / "scripts"
 # GIT_CONFIG_SYSTEM arrived in git 2.32.
 MIN_GIT = (2, 32)
 
+# What a hostile repository's config prints if git ever runs it.
+BARE_MARKER = "WORKER-GITCONFIG-HOSTILE-CONFIG-RAN"
+
 # Remote URLs of every transport git has, and the transport name git's refusal
 # names. example.invalid never resolves, so each of these fails whatever the
 # config says; the message is what shows the config refused it.
@@ -167,7 +170,67 @@ class WorkerGitConfigTest(unittest.TestCase):
         bare = self.tmp / "bare.git"
         self.git("init", "-q", "--bare", str(bare))
         self.git("-C", str(self.repo), "push", "-q", f"file://{bare}", "HEAD:refs/heads/main")
-        self.assertIn("refs/heads/main", self.git("-C", str(bare), "show-ref").stdout)
+        # A bare repository opens only when named (safe.bareRepository=explicit).
+        self.assertIn("refs/heads/main", self.git(f"--git-dir={bare}", "show-ref").stdout)
+
+    def embedded_bare_repository(self) -> Path:
+        """A clone whose tree holds a committed bare repository with a hostile config.
+
+        The inner repository's `diff.external` prints a marker, standing in for
+        any command a repository's own config could name. Returns that
+        directory inside the clone, as the model would find it.
+        """
+        inner = self.tmp / "inner.git"
+        self.git("init", "-q", "--bare", str(inner))
+        (self.repo / "a.txt").write_text("b\n")
+        self.git("-C", str(self.repo), "commit", "-q", "-am", "b")
+        self.git("-C", str(self.repo), "push", "-q", str(inner), "HEAD:refs/heads/main")
+        self.git(f"--git-dir={inner}", "config", "diff.external", f"sh -c 'echo {BARE_MARKER} >&2' --")
+        outer = self.tmp / "outer"
+        self.git("init", "-q", str(outer))
+        shutil.copytree(inner, outer / "evil")
+        self.git("-C", str(outer), "add", "evil")
+        self.git("-C", str(outer), "commit", "-q", "-m", "outer")
+        bundle = self.tmp / "outer.bundle"
+        self.git("-C", str(outer), "bundle", "create", str(bundle), "--all")
+        clone = self.tmp / "outer-clone"
+        self.git("clone", "-q", str(bundle), str(clone))
+        evil = clone / "evil"
+        self.assertTrue((evil / "config").is_file(), "the clone did not check out the embedded repository")
+        return evil
+
+    def run_inside(self, where: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=60, env=env or self.env, cwd=str(where)
+        )
+
+    def test_a_bare_repository_committed_inside_a_clone_is_not_opened(self):
+        evil = self.embedded_bare_repository()
+        for args in (("diff", "main~1", "main"), ("log", "-p", "--ext-diff", "-1", "main")):
+            with self.subTest(args=args):
+                result = self.run_inside(evil, *args)
+                self.assertNotIn(BARE_MARKER, result.stdout + result.stderr)
+        # Asked for the repository it stands in, git names the refusal.
+        found = self.run_inside(evil, "rev-parse", "--absolute-git-dir")
+        self.assertNotEqual(0, found.returncode, found.stdout)
+        self.assertIn("cannot use bare repository", found.stderr)
+
+    def test_without_the_bare_setting_the_embedded_config_runs(self):
+        """The case above holds because of the file's `safe.bareRepository`."""
+        evil = self.embedded_bare_repository()
+        env = dict(self.env)
+        env["GIT_CONFIG_PARAMETERS"] = "'safe.bareRepository'='all'"
+        result = self.run_inside(evil, "diff", "main~1", "main", env=env)
+        self.assertIn(BARE_MARKER, result.stdout + result.stderr)
+
+    def test_hooks_are_read_from_nowhere(self):
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\necho {BARE_MARKER} >&2\n")
+        hook.chmod(0o755)
+        (self.repo / "a.txt").write_text("c\n")
+        result = self.git("-C", str(self.repo), "commit", "-am", "c")
+        self.assertNotIn(BARE_MARKER, result.stdout + result.stderr)
+        self.assertEqual("/dev/null", self.git("config", "--get", "core.hooksPath").stdout.strip())
 
     def test_without_the_file_git_does_not_refuse_by_config(self):
         """The refusal above is the file's doing, not this machine's defaults."""
@@ -213,6 +276,11 @@ class WorkerDockerfileTest(unittest.TestCase):
         helpers = next(i for i in self.instructions if "git-remote-https" in i and i.startswith("RUN "))
         for helper in ("http", "https", "ftp", "ftps"):
             self.assertIn(f"/usr/lib/git-core/git-remote-{helper}", helpers)
+        # The programs that call curl themselves, not through a remote helper.
+        for program in ("git-http-fetch", "git-http-push", "git-imap-send"):
+            self.assertIn(f"/usr/lib/git-core/{program}", helpers)
+        self.assertIn("for program in git-http-fetch git-http-push git-imap-send; do", helpers)
+        self.assertIn("safe.bareRepository)\" = explicit", helpers)
         self.assertIn("transport '${helper}' not allowed", helpers)
 
     def test_the_guard_still_refuses_gcloud_and_gh(self):

@@ -135,12 +135,16 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/repo_ref.py \
      /opt/credential-proxy/libexec/
 # git for that skill's local half: the working copy `clone` unpacks from a
-# bundle, and `commit` and `publish` on it. It holds no credential and reaches
-# no remote. deploy/shared/worker-gitconfig, the system config, sets no
-# credential helper and refuses every transport but `file`. That is a default
-# the model can override, so the HTTP remote helpers are deleted too, as in the
+# bundle, and `commit` and `publish` on it. It holds no credential; the profile
+# namespace's NetworkPolicy bounds the pod's egress. deploy/shared/worker-gitconfig,
+# the system config, sets no credential helper, refuses every transport but
+# `file`, opens a bare repository only when named, and runs no hooks. That is a
+# default the model can override, so git's curl-based helpers (the HTTP remote
+# helpers, http-fetch, http-push and imap-send) are deleted too, as in the
 # sandbox image (deploy/sandbox/Dockerfile says why deletion and not config is
-# what holds there), and no ssh client is installed. The probes match git's
+# what holds there), and no ssh client is installed. With the config overridden,
+# git:// and ext:: still work: those are git's own code, and egress is the
+# NetworkPolicy's to bound. The probes match git's
 # message rather than its exit status, since example.invalid fails to resolve
 # whatever the image holds: refused by the config, then, with the config
 # overridden, no helper to run. The last probe is the file transport working,
@@ -148,6 +152,13 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 COPY --chmod=0644 deploy/shared/worker-gitconfig /etc/gitconfig
 RUN rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
           /usr/lib/git-core/git-remote-ftp /usr/lib/git-core/git-remote-ftps \
+          /usr/lib/git-core/git-http-fetch /usr/lib/git-core/git-http-push \
+          /usr/lib/git-core/git-imap-send \
+    && for program in git-http-fetch git-http-push git-imap-send; do \
+         if [ -e "/usr/lib/git-core/${program}" ]; then \
+           echo "worker git still has a curl-based program: ${program}" >&2; exit 1; \
+         fi; \
+       done \
     && for helper in http https ftp ftps; do \
          if [ -e "/usr/lib/git-core/git-remote-${helper}" ]; then \
            echo "worker git still has a remote transport: ${helper}" >&2; exit 1; \
@@ -166,6 +177,8 @@ RUN rm -f /usr/lib/git-core/git-remote-http /usr/lib/git-core/git-remote-https \
        done \
     && git ls-remote ssh://example.invalid/x 2>&1 | grep -q "transport 'ssh' not allowed" \
     && test -z "$(git config --system --get-all credential.helper)" \
+    && test "$(git config --system --get safe.bareRepository)" = explicit \
+    && test "$(git config --system --get core.hooksPath)" = /dev/null \
     && git init -q /tmp/vcs-guard \
     && git -C /tmp/vcs-guard -c user.name=g -c user.email=g@x commit -q --allow-empty -m g \
     && git -C /tmp/vcs-guard bundle create /tmp/vcs-guard.bundle --all \

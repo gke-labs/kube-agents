@@ -2,21 +2,31 @@
 #
 # git here works on local working copies only. A profile's version-control
 # skill clones and publishes through scripts/vcs.py, which asks the credential
-# broker; this git never talks to a remote and never holds a credential:
+# broker; this git is not meant to talk to a remote and holds no credential:
 #
 #   - no credential helper, so git has nowhere to store or fetch one;
 #   - every transport refused but `file`, so fetch, push, clone and ls-remote
 #     against an https, http, ssh, git or ext URL fail with
-#     "transport '<name>' not allowed", while a local path or bundle works.
+#     "transport '<name>' not allowed", while a local path or bundle works;
+#   - a bare repository opens only when named (`--git-dir`). A cloned
+#     repository can commit a directory laid out as a bare repository, with a
+#     `config` of its own (a `diff.external`, a `core.fsmonitor`); a plain
+#     `git diff` or `git log` run inside that directory would otherwise open it
+#     and run what its config names;
+#   - hooks read from /dev/null, so no hook a working copy carries ever runs.
 #
 # This is a default, not the boundary: the model owns its environment and can
-# point git at another config. The image also deletes git's HTTP remote helpers
+# point git at another config. The image also deletes git's curl-based helpers
 # and ships no ssh client, the pod holds no forge credential, and the profile
-# namespace's NetworkPolicy lets a worker reach only DNS, the bus, LiteLLM and
-# the broker. tests/test_worker_git_config.py runs git under this file.
+# namespace's NetworkPolicy bounds the worker's egress to DNS, the bus, LiteLLM
+# and the broker. tests/test_worker_git_config.py runs git under this file.
 [credential]
 	helper =
 [protocol]
 	allow = never
 [protocol "file"]
 	allow = always
+[safe]
+	bareRepository = explicit
+[core]
+	hooksPath = /dev/null

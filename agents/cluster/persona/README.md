@@ -41,8 +41,8 @@ is a byte-identical copy: the assets of the same path under
 `agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh` and
 `agents/platform/skills/version-control/scripts/vcs.py`. The same test checks
 both. `vcs.py` imports its client from the `a2a-worker` image
-(`a2a/Dockerfile.worker`), which also carries a git that holds no credential
-and reaches no remote. The skills run their scripts by skill-relative paths
+(`a2a/Dockerfile.worker`), which also carries a git that holds no credential;
+the profile namespace's NetworkPolicy bounds the worker's egress. The skills run their scripts by skill-relative paths
 (`scripts/...`), from the skill's directory.
 
 What it holds:
