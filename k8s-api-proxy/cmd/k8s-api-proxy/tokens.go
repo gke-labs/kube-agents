@@ -42,6 +42,7 @@ const (
 	iamServicePathSuffix     = "/v1"
 	containerHostPrefix      = "https://container."
 	maxUniverseDomainLength  = 253
+	commercialUniverseSuffix = "." + defaultUniverse
 	gceMetadataUniverseURL   = "http://169.254.169.254/computeMetadata/v1/universe/universe-domain"
 	gceMetadataHeaderName    = "Metadata-Flavor"
 	gceMetadataHeaderValue   = "Google"
@@ -66,9 +67,14 @@ var (
 	universeDomainRE       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 )
 
+// normalizeKubeProxyUniverseDomain is the operator's NormalizeUniverseDomain
+// (k8s-operator/api/v1alpha1), kept here because this module does not import
+// that one. A name under the commercial domain, such as mtls.googleapis.com,
+// is a host of the commercial universe and no other universe's domain.
 func normalizeKubeProxyUniverseDomain(raw string) (string, bool) {
 	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
-	if candidate == "" || len(candidate) > maxUniverseDomainLength || !universeDomainRE.MatchString(candidate) {
+	if candidate == "" || len(candidate) > maxUniverseDomainLength || !universeDomainRE.MatchString(candidate) ||
+		strings.HasSuffix(candidate, commercialUniverseSuffix) {
 		return "", false
 	}
 	return candidate, true
@@ -78,7 +84,7 @@ func resolveKubeProxyUniverseDomain(ctx context.Context, explicit string, probeM
 	if strings.TrimSpace(explicit) != "" {
 		normalized, ok := normalizeKubeProxyUniverseDomain(explicit)
 		if !ok {
-			return "", fmt.Errorf("invalid universe domain %q: must be a lower-case DNS hostname", explicit)
+			return "", fmt.Errorf("invalid universe domain %q: must be a lower-case DNS hostname that is not under %s", explicit, defaultUniverse)
 		}
 		return normalized, nil
 	}

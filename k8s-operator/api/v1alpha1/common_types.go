@@ -73,23 +73,37 @@ const (
 	CloudSDKEndpointOverridesEnvPrefix = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
 )
 
+// commercialUniverseSuffix ends every name under the commercial universe
+// domain. <service>.mtls.googleapis.com and the like are hosts of that
+// universe, so such a name is no other universe's domain.
+const commercialUniverseSuffix = "." + DefaultUniverseDomain
+
 var universeDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
 // NormalizeUniverseDomain trims whitespace and a single trailing DNS dot,
 // lowercases the candidate, and validates it as a multi-label DNS hostname of
-// at most MaxUniverseDomainLength bytes.
+// at most MaxUniverseDomainLength bytes that is not under
+// DefaultUniverseDomain.
 func NormalizeUniverseDomain(raw string) (string, bool) {
 	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
-	if candidate == "" || len(candidate) > MaxUniverseDomainLength || !universeDomainRegex.MatchString(candidate) {
+	if !IsValidUniverseDomain(candidate) {
 		return "", false
 	}
 	return candidate, true
 }
 
 // IsValidUniverseDomain reports whether raw is already a canonical lower-case
-// multi-label DNS hostname within MaxUniverseDomainLength.
+// multi-label DNS hostname within MaxUniverseDomainLength, and not a name
+// under DefaultUniverseDomain.
 func IsValidUniverseDomain(raw string) bool {
-	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw)
+	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw) &&
+		!IsUnderCommercialUniverseDomain(raw)
+}
+
+// IsUnderCommercialUniverseDomain reports whether domain is a name under
+// DefaultUniverseDomain, such as mtls.googleapis.com.
+func IsUnderCommercialUniverseDomain(domain string) bool {
+	return strings.HasSuffix(domain, commercialUniverseSuffix)
 }
 
 // A2ANATSName is the name of the NATS objects the operator renders for a

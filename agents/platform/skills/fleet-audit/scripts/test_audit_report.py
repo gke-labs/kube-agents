@@ -5175,12 +5175,16 @@ class TestNewMarker(HarnessTestCase):
         def cost(f):
             return len("\n".join(audit_report.render_finding(f))) + 2 + len(str(f["id"])) + 3
 
-        # Room for both unmarked; marking the first leaves no room for the second.
+        # Room for both unmarked; marking the first demotes the second from full.
         budget = sum(cost(f) for f in both)
-        _, omitted = audit_report.select_rendered_findings(both, budget)
-        self.assertEqual(omitted, [])
-        _, omitted = audit_report.select_rendered_findings(both, budget, new_ids={str(finding["id"])})
-        self.assertEqual(len(omitted), 1)
+        full, listed, omitted = audit_report.split_findings_for_body(both, budget)
+        self.assertEqual(len(full), 2)
+        self.assertEqual(listed + omitted, [])
+        full, listed, omitted = audit_report.split_findings_for_body(
+            both, budget, new_ids={str(finding["id"])}
+        )
+        self.assertEqual(len(full), 1)
+        self.assertEqual(len(listed) + len(omitted), 1)
 
 
 class TestFinishClean(HarnessTestCase):
@@ -10758,17 +10762,235 @@ class TestRenderBudget(BaseTestCase):
             listed_seen = listed_seen or bool(rendered.listed)
         self.assertTrue(listed_seen, "the sweep never reached a listed body")
 
-    def test_criticals_keep_their_full_blocks_over_names_of_minors(self):
+    def test_criticals_give_up_full_blocks_so_lower_bands_are_named(self):
+        # When every finding can be named alongside all critical full blocks,
+        # criticals keep their full blocks; when not, critical full blocks past
+        # the first yield to one-line names so lower bands stay visible.
+        fits = bulk_findings(5, severity="critical", prefix="c") + bulk_findings(
+            100, prefix="m"
+        )
+        whole = audit_report.render_issue_body(make_doc(findings=fits), generated_at=NOW)
+        self.assertEqual(whole.omitted, [])
+        self.assertEqual({f["severity"] for f in whole.listed}, {"minor"})
+
         criticals = bulk_findings(20, severity="critical", prefix="c")
         minors = bulk_findings(380, prefix="m")
         rendered = audit_report.render_issue_body(
             make_doc(findings=criticals + minors), generated_at=NOW
         )
-        for finding in criticals:
-            self.assertIn(finding["id"], rendered.rendered_ids)
-        self.assertTrue(rendered.listed)
-        self.assertEqual({f["severity"] for f in rendered.listed + rendered.omitted}, {"minor"})
+        self.assertEqual(rendered.omitted, [])
+        self.assertEqual(len(rendered.rendered_ids), len(criticals) + len(minors))
+        self.assertIn(f"<!-- finding:{criticals[0]['id']} -->", rendered.body)
+        self.assertEqual({f["severity"] for f in rendered.listed}, {"critical", "minor"})
         self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        overflow = audit_report.render_issue_body(
+            make_doc(findings=criticals + bulk_findings(600, prefix="m")), generated_at=NOW
+        )
+        for finding in criticals:
+            self.assertIn(finding["id"], overflow.rendered_ids)
+        self.assertEqual({f["severity"] for f in overflow.omitted}, {"minor"})
+        self.assertLessEqual(len(overflow.body), GITHUB_BODY_LIMIT)
+
+    def test_compliance_boundaries_at_80_120_and_300_findings_with_states(self):
+        # Realistic compliance shape (#5052): eight clusters, ~100-char derived
+        # ids, multi-line excerpts, and `states` populated for every finding as
+        # `handle_finish` passes it.
+        clusters = [
+            {
+                "name": f"seeded-cluster-{i}",
+                "location": "us-central1",
+                "project": "acme-prod",
+                "checks_run": [
+                    {
+                        "check": slug,
+                        "command": f"kubectl --context seeded-cluster-{i} get pods -A -o json",
+                    }
+                    for slug in audit_report.AUDITS[AUDIT].checks
+                ],
+            }
+            for i in range(8)
+        ]
+
+        def compliance_doc(n_crit: int, n_maj: int, n_min: int) -> dict:
+            raw: list[dict] = []
+            idx = 0
+            bands = (
+                ("critical", n_crit, "privileged-container"),
+                ("major", n_maj, "default-sa-automount"),
+                ("minor", n_min, "image-floating-tag"),
+            )
+            for sev, count, check in bands:
+                for _ in range(count):
+                    cluster = clusters[idx % len(clusters)]["name"]
+                    ns = f"seeded-workload-ns-{idx:03d}"
+                    obj = f"Deployment/metrics-agent-deploy-{idx:03d}"
+                    raw.append(
+                        make_finding(
+                            fid=f"placeholder-{idx:04d}",
+                            severity=sev,
+                            check=check,
+                            title=f"{obj} in {ns} deviates from the {check} posture baseline",
+                            cluster=cluster,
+                            namespace=ns,
+                            obj=obj,
+                            command=(
+                                f"kubectl --context {cluster} -n {ns} get deployment "
+                                f"metrics-agent-deploy-{idx:03d} -o jsonpath='{{.spec.template.spec}}'"
+                            ),
+                            excerpt="\n".join(
+                                f"container[{k}]: securityContext.privileged=true"
+                                for k in range(18)
+                            ),
+                            remediation={
+                                "kind": "manual",
+                                "path": "",
+                                "note": "Update the workload pod template in the owning manifest.",
+                            },
+                        )
+                    )
+                    idx += 1
+            return audit_report.validate_findings(
+                {"audit": AUDIT, "scope": {"clusters": clusters, "skipped": []}, "findings": raw},
+                AUDIT,
+            )
+
+        for total, counts in ((80, (20, 35, 25)), (120, (30, 50, 40))):
+            with self.subTest(total=total):
+                doc = compliance_doc(*counts)
+                findings = doc["findings"]
+                states = {f["id"]: audit_report.STATE_OPEN for f in findings}
+                rendered = audit_report.render_issue_body(
+                    doc, generated_at=NOW, audit_id=AUDIT, states=states
+                )
+                self.assertEqual(rendered.omitted, [])
+                self.assertEqual(len(rendered.rendered_ids), total)
+                self.assertEqual(
+                    {f["severity"] for f in rendered.listed},
+                    {"critical", "major", "minor"},
+                )
+                locations = audit_report.parse_finding_locations(rendered.body)
+                self.assertEqual(
+                    {fid: loc["object"] for fid, loc in locations.items()},
+                    {f["id"]: f["object"] for f in findings},
+                )
+                if "</details>" not in rendered.body:
+                    self.assertRegex(
+                        rendered.body,
+                        r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+                    )
+                self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        doc_300 = compliance_doc(50, 120, 130)
+        findings_300 = doc_300["findings"]
+        states_300 = {f["id"]: audit_report.STATE_OPEN for f in findings_300}
+        rendered_300 = audit_report.render_issue_body(
+            doc_300, generated_at=NOW, audit_id=AUDIT, states=states_300
+        )
+        self.assertTrue(rendered_300.omitted)
+        crit_ids = {f["id"] for f in findings_300 if f["severity"] == "critical"}
+        self.assertLessEqual(crit_ids, set(rendered_300.rendered_ids))
+        self.assertIn("major", {f["severity"] for f in rendered_300.listed})
+        self.assertNotIn("critical", {f["severity"] for f in rendered_300.omitted})
+        locations_300 = audit_report.parse_finding_locations(rendered_300.body)
+        self.assertEqual(set(locations_300), set(rendered_300.rendered_ids))
+        self.assertRegex(
+            rendered_300.body,
+            r"omitted findings \(\d+ major, \d+ minor\) are the least severe",
+        )
+        self.assertNotIn("</details>", rendered_300.body)
+        self.assertRegex(
+            rendered_300.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered_300.body), GITHUB_BODY_LIMIT)
+
+    def test_dropped_check_evidence_notice_survives_omission_and_held_sections(self):
+        # Even when omitted findings AND collector-held rows compete for the
+        # remaining body budget, reserving the dropped-table notice up front
+        # guarantees the notice is never silently dropped.
+        doc = make_doc(findings=bulk_findings(500, severity="minor", prefix="m"))
+        held = [
+            {
+                "id": f"held.prod-us-east.ns.deploy-{i}",
+                "title": f"Held finding {i}",
+                "cluster": "prod-us-east",
+                "namespace": "ns",
+                "object": f"Deployment/held-{i}",
+                "check": "netpol-missing",
+                "commands": ["kubectl get netpol -A"],
+            }
+            for i in range(15)
+        ]
+        rendered = audit_report.render_issue_body(
+            doc, generated_at=NOW, audit_id=AUDIT, held=held
+        )
+        self.assertTrue(rendered.omitted)
+        self.assertNotIn("</details>", rendered.body)
+        self.assertRegex(
+            rendered.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        # Even if the guaranteed first finding pushes `spent` past BODY_BUDGET
+        # (while still fitting under MAX_BODY_CHARS), the dropped-table notice
+        # is still emitted.
+        one_finding_doc = make_doc(findings=[bulk_findings(1, severity="critical", prefix="c")[0]])
+        with mock.patch.object(audit_report, "BODY_BUDGET", 1000):
+            squeezed = audit_report.render_issue_body(
+                one_finding_doc, generated_at=NOW, audit_id=AUDIT
+            )
+        self.assertNotIn("</details>", squeezed.body)
+        self.assertRegex(
+            squeezed.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(squeezed.body), GITHUB_BODY_LIMIT)
+
+    def test_listed_finding_marks_new_and_charges_it_against_budget(self):
+        self.assertEqual(audit_report.split_findings_for_body([], 1000), ([], [], []))
+        finding = make_finding(fid="f-0001", severity="critical", title="Critical listed finding")
+        plain = audit_report.render_listed_finding(finding)
+        marked = audit_report.render_listed_finding(finding, new=True)
+        self.assertEqual(
+            marked,
+            f"{plain}\n{audit_report.LISTED_CONTINUATION_INDENT}{audit_report.NEW_MARKER}",
+        )
+        body = (
+            f"### Listed without detail (1)\n\n{audit_report.LISTED_SECTION_BEGIN}\n"
+            f"{marked}\n{audit_report.LISTED_SECTION_END}\n"
+        )
+        self.assertEqual(
+            audit_report._listed_locations(body)["f-0001"]["title"],
+            "Critical listed finding",
+        )
+        # Charging `NEW_MARKER` on listed rows keeps the last row out when
+        # marking it pushes it past the remaining budget.
+        items = bulk_findings(3, severity="critical", prefix="c")
+        header = len("\n".join(audit_report._listed_header(len(items)))) + len(
+            "\n" + audit_report.LISTED_SECTION_END
+        )
+        line_cost = lambda f, is_new=False: (
+            len(audit_report.render_listed_finding(f, new=is_new))
+            + 1
+            + len(f["id"])
+            + audit_report.DELTA_SLOT_CHARS
+        )
+        budget = (
+            audit_report._full_row_cost(items[0])
+            + header
+            + line_cost(items[1])
+            + line_cost(items[2])
+        )
+        _, listed_plain, omitted_plain = audit_report.split_findings_for_body(items, budget)
+        self.assertEqual(len(listed_plain), 2)
+        self.assertEqual(omitted_plain, [])
+        _, listed_new, omitted_new = audit_report.split_findings_for_body(
+            items, budget, new_ids={items[1]["id"]}
+        )
+        self.assertEqual(len(listed_new), 1)
+        self.assertEqual(len(omitted_new), 1)
 
     def test_majors_give_up_full_blocks_so_every_minor_is_named(self):
         # The live shape that left 49 minors as a count: the major band's full
@@ -11021,13 +11243,14 @@ class TestRenderBudget(BaseTestCase):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
-        rendered, omitted = audit_report.select_rendered_findings(findings, 1)
+        rendered, listed, omitted = audit_report.split_findings_for_body(findings, 1)
         self.assertEqual(len(rendered), 1)
         self.assertEqual(rendered[0]["severity"], "critical")
+        self.assertEqual(listed, [])
         self.assertEqual(len(omitted), 4)
 
     def test_at_least_one_finding_always_renders(self):
-        rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
+        rendered, _, _ = audit_report.split_findings_for_body(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
 
     def test_a_target_late_in_the_alphabet_keeps_a_row_when_the_body_truncates(self):
@@ -11039,13 +11262,15 @@ class TestRenderBudget(BaseTestCase):
         late = [{**f, "cluster": "zulu"} for f in bulk_findings(2, prefix="zulu")]
         findings = early + late
         one = len("\n".join(audit_report.render_finding(early[0]))) + 2 + len(early[0]["id"]) + 3
-        rendered, omitted = audit_report.select_rendered_findings(findings, one * 4)
+        rendered, listed, omitted = audit_report.split_findings_for_body(findings, one * 6)
         clusters = [f["cluster"] for f in rendered]
         self.assertIn("zulu", clusters)
-        self.assertEqual(len(rendered) + len(omitted), len(findings))
-        # The fair-share order decides membership only. Both lists keep the
-        # display order.
+        self.assertLess(len(rendered), len(findings))
+        self.assertEqual(len(rendered) + len(listed) + len(omitted), len(findings))
+        # The fair-share order decides membership only. Every partition keeps
+        # the display order.
         self.assertEqual(rendered, audit_report.sort_findings(rendered))
+        self.assertEqual(listed, audit_report.sort_findings(listed))
         self.assertEqual(omitted, audit_report.sort_findings(omitted))
 
     def test_fair_share_never_moves_a_finding_across_a_severity_band(self):
@@ -11283,12 +11508,13 @@ class TestScopePhrase(BaseTestCase):
 
 
 class TestIndexOverhead(BaseTestCase):
-    """The index is reserved out of the budget, not charged to a finding.
+    """The state index is charged per full-row prefix via `_index_prefix_costs`.
 
-    It replaced a flat per-row allowance of 160 characters that a real id had
-    already outgrown: ids run to 100 characters and the state cell can carry a
-    full pull request URL. Under-reserving spends budget the findings were
-    promised, and the body only fails once it crosses GitHub's hard limit.
+    It replaced both a flat 160-character per-row allowance (outgrown by
+    100-character ids with pull-request URLs) and a worst-case 50-row upfront
+    reservation (which starved overflowing bodies that show only a few full
+    rows). Under-charging spends budget the findings were promised; gating on a
+    truthy state keeps stateless prefixes at zero.
     """
 
     def rendered_table(self, body):
@@ -11307,7 +11533,7 @@ class TestIndexOverhead(BaseTestCase):
             rows.append(line)
         return "\n".join(rows)
 
-    def test_the_reservation_covers_what_the_table_actually_costs(self):
+    def test_prefix_cost_covers_what_the_table_actually_costs_and_gates_on_state(self):
         # Worst realistic row: a 100-character id (the charset ceiling) and a
         # state cell carrying a pull request URL.
         fid = "f" + "-long" * 19 + "-end"
@@ -11316,6 +11542,15 @@ class TestIndexOverhead(BaseTestCase):
             make_finding(fid=f"{fid[:95]}-{i:03d}", severity="critical")
             for i in range(10)
         ]
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        self.assertEqual(
+            audit_report._index_prefix_costs(order, None, None),
+            [0] * (len(order) + 1),
+        )
+        self.assertEqual(
+            audit_report._index_prefix_costs(order, {order[-1]["id"]: audit_report.STATE_OPEN}, None)[:-1],
+            [0] * len(order),
+        )
         states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
         urls = {
             f["id"]: "https://github.com/an-org/a-repository/pull/12345"
@@ -11327,44 +11562,101 @@ class TestIndexOverhead(BaseTestCase):
             states=states,
             pr_urls=urls,
         )
-        reserved = audit_report.index_overhead(findings, states, urls)
-        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+        costs = audit_report._index_prefix_costs(order, states, urls)
+        self.assertGreaterEqual(costs[len(order)], len(self.rendered_table(body)))
 
-    def test_the_reservation_bounds_the_table_of_a_fair_share_selection(self):
+    def test_prefix_costs_bound_every_fair_share_selection_including_past_cap(self):
         # A rendered set is a prefix of the fair-share order, not of the
-        # display order. Here the display order puts the short `alpha` rows
-        # first, but a truncated selection alternates alpha and zulu, so the
-        # table shows the wide zulu rows too. The reservation must cover each
-        # table that a selection can show.
+        # display order. Check both display orders — narrow `alpha` ahead of
+        # wide `zulu`, and wide `alpha` ahead of narrow `zulu` — across
+        # selections below, at, and past `MAX_DELTA_ROWS` (`cap + 10 > 50`) so
+        # past-cap eviction (`shown.pop()`) and the overflow row are exercised.
         cap = audit_report.MAX_DELTA_ROWS
-        wide = "z" + "-wide" * 18
-        alpha = [{**f, "cluster": "alpha"} for f in bulk_findings(cap + 10, prefix="a")]
-        zulu = [
-            {**f, "id": f"{wide}-{i:03d}", "cluster": "zulu"}
-            for i, f in enumerate(bulk_findings(cap + 10, prefix="z"))
-        ]
-        findings = alpha + zulu
-        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
-        urls = {f["id"]: "https://github.com/an-org/a-repository/pull/12345" for f in zulu}
-        reserved = audit_report.index_overhead(findings, states, urls)
-        one = len("\n".join(audit_report.render_finding(alpha[0], state=audit_report.STATE_PR_OPEN)))
-        for count in (cap // 2, cap, cap + cap // 2):
-            with self.subTest(count=count):
-                rendered, _ = audit_report.select_rendered_findings(
-                    findings, one * count, states=states, pr_urls=urls
+        for wide_cluster in ("zulu", "alpha"):
+            alpha_base = bulk_findings(cap + 10, prefix="a")
+            zulu_base = bulk_findings(cap + 10, prefix="z")
+            alpha = [
+                {
+                    **f,
+                    "id": f"{'a' + '-wide' * 18}-{i:03d}" if wide_cluster == "alpha" else f["id"],
+                    "cluster": "alpha",
+                }
+                for i, f in enumerate(alpha_base)
+            ]
+            zulu = [
+                {
+                    **f,
+                    "id": f"{'z' + '-wide' * 18}-{i:03d}" if wide_cluster == "zulu" else f["id"],
+                    "cluster": "zulu",
+                }
+                for i, f in enumerate(zulu_base)
+            ]
+            findings = alpha + zulu
+            order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+            states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+            wide_rows = alpha if wide_cluster == "alpha" else zulu
+            urls = {
+                f["id"]: "https://github.com/an-org/a-repository/pull/12345"
+                for f in wide_rows
+            }
+            costs = audit_report._index_prefix_costs(order, states, urls)
+            full_costs = [
+                audit_report._full_row_cost(f, states=states, pr_urls=urls) for f in order
+            ]
+            line_costs = [
+                len(
+                    audit_report.render_listed_finding(
+                        f, state=states.get(f["id"]), pr_url=urls.get(f["id"])
+                    )
                 )
-                table = sum(
-                    len(audit_report._index_row(f, states[f["id"]], urls.get(f["id"]))) + 1
-                    for f in rendered[:cap]
+                + 1
+                + len(f["id"])
+                + audit_report.DELTA_SLOT_CHARS
+                for f in order
+            ]
+            header = len("\n".join(audit_report._listed_header(len(order)))) + len(
+                "\n" + audit_report.LISTED_SECTION_END
+            )
+            for target_full in (cap // 2, cap, cap + 10):
+                budget = (
+                    sum(full_costs[:target_full])
+                    + costs[target_full]
+                    + header
+                    + sum(line_costs[target_full:])
                 )
-                self.assertGreaterEqual(reserved, table)
+                with self.subTest(wide_cluster=wide_cluster, target_full=target_full):
+                    lines, listed, omitted = audit_report._render_findings(
+                        findings, budget, states=states, pr_urls=urls
+                    )
+                    full_count = len(findings) - len(listed) - len(omitted)
+                    self.assertEqual(full_count, target_full)
+                    self.assertEqual(omitted, [])
+                    rendered_table = self.rendered_table("\n".join(lines))
+                    if target_full > cap:
+                        self.assertIn(f"…and {target_full - cap} more below", rendered_table)
+                    self.assertGreaterEqual(costs[full_count], len(rendered_table))
+                    without_states, _, _ = audit_report.split_findings_for_body(
+                        findings, budget
+                    )
+                    self.assertGreaterEqual(len(without_states), full_count)
 
-    def test_the_reservation_bounds_a_table_that_hits_the_row_cap(self):
-        findings = bulk_findings(audit_report.MAX_DELTA_ROWS + 20)
+    def test_prefix_cost_bounds_a_table_that_hits_the_row_cap(self):
+        cap = audit_report.MAX_DELTA_ROWS
+        findings = bulk_findings(cap + 20)
         states = {f["id"]: audit_report.STATE_OPEN for f in findings}
-        reserved = audit_report.index_overhead(findings, states, {})
-        body = render_body(make_doc(findings=findings), generated_at=NOW, states=states)
-        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        costs = audit_report._index_prefix_costs(order, states, {})
+        all_full_budget = (
+            sum(audit_report._full_row_cost(f, states=states) for f in order)
+            + costs[len(order)]
+        )
+        lines, listed, omitted = audit_report._render_findings(
+            findings, all_full_budget, states=states
+        )
+        self.assertEqual(listed + omitted, [])
+        table = self.rendered_table("\n".join(lines))
+        self.assertIn("…and 20 more below", table)
+        self.assertGreaterEqual(costs[len(order)], len(table))
 
 
 # --------------------------------------------------------------------------- #
@@ -33053,7 +33345,7 @@ class TestManifestRemediationLinks(HarnessTestCase):
         ).body
         self.assertIn(f"[`{self.PATH}`]({self.PATH})", body)
 
-    def test_select_rendered_findings_charges_the_expanded_url_against_the_budget(self):
+    def test_split_findings_for_body_charges_the_expanded_url_against_the_budget(self):
         findings = [
             make_finding(
                 fid=f"netpol-missing.prod-us-east.payments.namespace-p{i}",
@@ -33062,14 +33354,17 @@ class TestManifestRemediationLinks(HarnessTestCase):
             )
             for i in range(25)
         ]
-        bare_rendered, _ = audit_report.select_rendered_findings(findings, 8000)
-        expanded_rendered, _ = audit_report.select_rendered_findings(
-            findings,
-            8000,
-            file_url=self.GITHUB_TEMPLATE,
-            file_ref=self.SHA,
-        )
-        self.assertLess(len(expanded_rendered), len(bare_rendered))
+        bare_total = sum(audit_report._full_row_cost(f) for f in findings)
+        for budget in (bare_total, bare_total // 2):
+            with self.subTest(budget=budget):
+                bare_rendered, _, _ = audit_report.split_findings_for_body(findings, budget)
+                expanded_rendered, _, _ = audit_report.split_findings_for_body(
+                    findings,
+                    budget,
+                    file_url=self.GITHUB_TEMPLATE,
+                    file_ref=self.SHA,
+                )
+                self.assertLess(len(expanded_rendered), len(bare_rendered))
 
     def test_finish_reads_capabilities_once_and_fills_links_including_relink(self):
         self.touch(self.PATH)

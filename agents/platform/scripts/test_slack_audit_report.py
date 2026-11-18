@@ -783,6 +783,209 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertEqual(row.count("`") % 2, 0)
         self.assertLessEqual(len(row), len("`critical` ") + sar.FINDING_ROW_MAX)
 
+    def test_listed_without_detail_rows_keep_ten_criticals_on_overflowing_ledgers(self):
+        # Compliance shape across 80, 120, and 300 findings with states set:
+        # criticals past the first move into `### Listed without detail`, and
+        # the chat card still lists up to CRITICAL_ROWS_MAX (10) critical rows.
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 17, 6, 0, tzinfo=timezone.utc)
+        audit_id = "compliance-audit"
+        clusters = [
+            {
+                "name": f"seeded-cluster-{i}",
+                "location": "us-central1",
+                "project": "acme-prod",
+                "checks_run": [
+                    {
+                        "check": slug,
+                        "command": f"kubectl --context seeded-cluster-{i} get pods -A -o json",
+                    }
+                    for slug in audit_report.AUDITS[audit_id].checks
+                ],
+            }
+            for i in range(8)
+        ]
+
+        def compliance_doc(n_crit, n_maj, n_min):
+            raw = []
+            idx = 0
+            for sev, count, check in (
+                ("critical", n_crit, "privileged-container"),
+                ("major", n_maj, "default-sa-automount"),
+                ("minor", n_min, "image-floating-tag"),
+            ):
+                for _ in range(count):
+                    cluster = clusters[idx % len(clusters)]["name"]
+                    ns = f"seeded-workload-ns-{idx:03d}"
+                    obj = f"Deployment/metrics-agent-deploy-{idx:03d}"
+                    raw.append(
+                        {
+                            "id": f"placeholder-{idx:04d}",
+                            "severity": sev,
+                            "check": check,
+                            "title": f"{obj} in {ns} deviates from the {check} posture baseline",
+                            "cluster": cluster,
+                            "namespace": ns,
+                            "object": obj,
+                            "impact": "Workload violates the compliance posture baseline.",
+                            "evidence": {
+                                "command": (
+                                    f"kubectl --context {cluster} -n {ns} get deployment "
+                                    f"metrics-agent-deploy-{idx:03d} -o jsonpath='{{.spec.template.spec}}'"
+                                ),
+                                "excerpt": "\n".join(
+                                    f"container[{k}]: securityContext.privileged=true"
+                                    for k in range(18)
+                                ),
+                            },
+                            "recommendation": {
+                                "action": "Update the workload pod template in GitOps.",
+                                "rationale": "Enforces baseline pod security.",
+                                "risk": "Review workload capability requirements before merging.",
+                            },
+                            "remediation": {
+                                "kind": "manual",
+                                "path": "",
+                                "note": "Update the workload pod template in the owning manifest.",
+                            },
+                        }
+                    )
+                    idx += 1
+            return audit_report.validate_findings(
+                {"audit": audit_id, "scope": {"clusters": clusters, "skipped": []}, "findings": raw},
+                audit_id,
+            )
+
+        for total, counts in ((80, (20, 35, 25)), (120, (30, 50, 40)), (300, (50, 120, 130))):
+            with self.subTest(total=total):
+                doc = compliance_doc(*counts)
+                findings = doc["findings"]
+                states = {f["id"]: audit_report.STATE_OPEN for f in findings}
+                # 2nd critical on seeded-cluster-0 (idx=8): listed at 120 and 300, in top 10.
+                new_id = findings[8]["id"]
+                rendered = audit_report.render_issue_body(
+                    doc, generated_at=now, audit_id=audit_id, states=states, new_ids={new_id}
+                )
+                issue = {
+                    "title": audit_report.issue_title(audit_id, findings),
+                    "body": rendered.body,
+                    "state": "open",
+                    "labels": ["agent:audit", "severity:critical"],
+                }
+                headline = sar.headline_from_issue(issue, REF)
+                self.assertIsNotNone(headline)
+                crit_rows = [l for l in headline.splitlines() if l.startswith("`critical` ")]
+                self.assertEqual(len(crit_rows), sar.CRITICAL_ROWS_MAX)
+                self.assertEqual(sum(1 for r in crit_rows if r.endswith(sar.NEW_TAG)), 1)
+                blocks_built = sar.blocks_from_issue(issue, REF)
+                self.assertIsNotNone(blocks_built)
+                chat_built = sar.chat_from_issue(issue, REF)
+                self.assertIsNotNone(chat_built)
+                self.assertEqual(len(chat_built[0]["rows"]), sar.CRITICAL_ROWS_MAX)
+
+    def test_listed_rows_keep_top_two_non_criticals_and_strip_suffixes_and_links(self):
+        body = (
+            "5 findings: 0 critical, 3 major, 2 minor.\n\n"
+            "### Major (1 of 3)\n\n"
+            + finding("First full major", "maj-1")
+            + "\n### Listed without detail (4)\n\n"
+            + f"{sar.LISTED_SECTION_BEGIN}\n"
+            + "- **major** — [Second major](https://evil.example/x) · _new_ — `seeded-a` / _cluster-scoped_ "
+            + "— `ClusterRole/r` (`maj-2`) — fix proposed — https://github.com/acme/fleet/pull/9\n"
+            + "  <!-- finding-new -->\n"
+            + "  Shared default ServiceAccount note.\n"
+            + "- **major** — Third major — `seeded-b` / `payments` — `Deployment/d` (`maj-3`)\n"
+            + "- **minor** — Minor one — `seeded-b` / `payments` — `Deployment/m` (`min-1`)\n"
+            + f"{sar.LISTED_SECTION_END}\n"
+        )
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 5 findings (0 critical)", body=body)
+        lines = sar.headline_from_issue(issue, REF).splitlines()
+        self.assertEqual(
+            lines,
+            [
+                "**Security & RBAC Posture Audit: 3 major findings**",
+                "`major` First full major",
+                "`major` Second major · _new_",
+                "3 more (1 major, 2 minor) are in the ledger issue.",
+                LINK,
+            ],
+        )
+
+    def test_listed_section_brackets_are_enforced_and_fail_closed(self):
+        row = "- **critical** — Listed critical — `seeded-a` / `ns` — `Pod/a` (`crit-2`)\n"
+        for label, extra in (
+            ("unbracketed", f"\n### Listed without detail (1)\n\n{row}"),
+            (
+                "duplicate_begin",
+                f"\n{sar.LISTED_SECTION_BEGIN}\n{row}{sar.LISTED_SECTION_END}\n{sar.LISTED_SECTION_BEGIN}\n",
+            ),
+            ("inverted", f"\n{sar.LISTED_SECTION_END}\n{row}{sar.LISTED_SECTION_BEGIN}\n"),
+            ("inside_fence", f"\n```\n{sar.LISTED_SECTION_BEGIN}\n{row}{sar.LISTED_SECTION_END}\n```\n"),
+            (
+                "inside_held",
+                f"\n<!-- audit-held:begin -->\n{sar.LISTED_SECTION_BEGIN}\n{row}{sar.LISTED_SECTION_END}\n<!-- audit-held:end -->\n",
+            ),
+        ):
+            with self.subTest(label=label):
+                body = "### Critical (1 of 2)\n\n" + finding("Full critical", "crit-1") + extra
+                self.assertEqual(sar._severity_findings(body), [("critical", "Full critical", False)])
+
+    def test_an_unbalanced_fence_ends_before_the_listed_section(self):
+        body = (
+            "### Critical (1 of 2)\n\n"
+            + finding("Full critical", "crit-1")
+            + "- **Impact:** stray fence\n```\n\n"
+            + "### Listed without detail (1)\n\n"
+            + f"{sar.LISTED_SECTION_BEGIN}\n"
+            + "- **critical** — Listed critical — `seeded-a` / `ns` — `Pod/a` (`crit-2`)\n"
+            + f"{sar.LISTED_SECTION_END}\n"
+        )
+        self.assertEqual(
+            sar._severity_findings(body),
+            [("critical", "Full critical", False), ("critical", "Listed critical", False)],
+        )
+
+    def test_listed_rows_handle_crlf_and_stay_linear_on_hostile_lines(self):
+        body = (
+            "### Critical (1 of 2)\n\n"
+            + finding("Full critical", "crit-1")
+            + f"\n{sar.LISTED_SECTION_BEGIN}\n"
+            + "- **critical** — Listed critical — `seeded-a` / `ns` — `Pod/a` (`crit-2`)\n"
+            + "  <!-- finding-new -->\n"
+            + f"{sar.LISTED_SECTION_END}\n"
+        )
+        self.assertEqual(
+            sar._severity_findings(body.replace("\n", "\r\n")),
+            [("critical", "Full critical", False), ("critical", "Listed critical", True)],
+        )
+        pipe_body = (
+            "1 findings: 1 critical, 0 major, 0 minor.\n\n"
+            f"{sar.LISTED_SECTION_BEGIN}\n"
+            "- **critical** — Pod/a \\| container b runs privileged — `seeded-a` / `ns` — `Pod/a` (`crit-pipe`)\n"
+            f"{sar.LISTED_SECTION_END}\n"
+        )
+        pipe_issue = {
+            "title": audit_report.issue_title("compliance-audit", [{"severity": "critical"}]),
+            "body": pipe_body,
+            "state": "open",
+            "labels": ["agent:audit", "severity:critical"],
+        }
+        self.assertIn("Pod/a | container b runs privileged", sar.headline_from_issue(pipe_issue, REF))
+        self.assertNotIn(r"\|", sar.headline_from_issue(pipe_issue, REF))
+        pipe_chat = sar.chat_from_issue(pipe_issue, REF)
+        self.assertIsNotNone(pipe_chat)
+        self.assertEqual(pipe_chat[0]["rows"][0]["text"], "Pod/a | container b runs privileged")
+        hostile_cases = [
+            ("- **critical** — " + " — `" * 400 + "\n") * 25,
+            ("- **critical** — a — `b` / `c` — `d` (`e`) — " + (" " * 2920) + "x\n") * 25,
+        ]
+        for payload in hostile_cases:
+            hostile = f"{sar.LISTED_SECTION_BEGIN}\n{payload}{sar.LISTED_SECTION_END}\n"
+            start = time.monotonic()
+            self.assertEqual(sar._severity_findings(hostile), [])
+            self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
 
 class HeadlineFallbackTest(unittest.TestCase):
     def test_the_sop_line_in_bold_with_the_ledger_link(self):

@@ -1023,7 +1023,7 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
         elif argv == ["report"]:
             import post_merge_report
 
-            print(json.dumps(post_merge_report.report_outcomes(conn, mode)))
+            print(json.dumps(post_merge_report.report_outcomes(conn, mode, limit=reads_per_tick())))
         else:
             import post_merge_outcome
 

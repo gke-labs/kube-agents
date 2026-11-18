@@ -11,7 +11,6 @@ package controller
 
 import (
 	"encoding/json"
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -592,9 +591,18 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		}
 		return n
 	}
-	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_HELM_VALUES_FORMAT='(.*)'$`).FindSubmatch(script)
-	if format == nil {
-		t.Fatalf("no `readonly MODE_NEXT_HELM_VALUES_FORMAT='...'` in %s; it is the values document that carries the mode and the cap", ciDeploySource)
+	helmPath := regexp.MustCompile(`(?m)^readonly MAX_SESSIONS_HELM_VALUE="platformAgent\.(.*)"$`).FindSubmatch(script)
+	if helmPath == nil {
+		t.Fatalf("no `readonly MAX_SESSIONS_HELM_VALUE=\"platformAgent.<spec path>\"` in %s; it is the Helm value that carries the cap", ciDeploySource)
+	}
+	// The dotted spec path as the nested JSON document the API would store.
+	specDocument := func(n int) string {
+		keys := strings.Split(string(helmPath[1]), ".")
+		doc := strconv.Itoa(n)
+		for i := len(keys) - 1; i >= 0; i-- {
+			doc = `{"` + keys[i] + `":` + doc + `}`
+		}
+		return doc
 	}
 	for _, tc := range []struct {
 		workers, want int
@@ -608,26 +616,15 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		if n != tc.want {
 			t.Errorf("at %d workers the script sizes maxSessions=%d, want %d", tc.workers, n, tc.want)
 		}
-		// The first change's values document, its platformAgent object
-		// decoded as the CR's spec with unknown fields refused: the path is
-		// spec.harness.tuning.maxSessions, and the mode rides in the same
-		// upgrade so the first render sees both.
-		var values struct {
-			PlatformAgent json.RawMessage `json:"platformAgent"`
-		}
-		vdec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
-		vdec.DisallowUnknownFields()
-		if err := vdec.Decode(&values); err != nil || values.PlatformAgent == nil {
-			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT is not a document with platformAgent alone at its top (%v)", err)
-		}
+		// The install's Helm value, its path under platformAgent decoded as
+		// the CR's spec with unknown fields refused: the path is
+		// spec.harness.tuning.maxSessions, set at the install so the first
+		// render sees it.
 		agent := &agentv1alpha1.PlatformAgent{}
-		dec := json.NewDecoder(strings.NewReader(`{"spec":` + string(values.PlatformAgent) + `}`))
+		dec := json.NewDecoder(strings.NewReader(`{"spec":` + specDocument(n) + `}`))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(agent); err != nil {
-			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT's platformAgent does not decode into a PlatformAgent spec: %v", err)
-		}
-		if agent.Spec.Mode == nil || *agent.Spec.Mode != "next" {
-			t.Errorf("the first change does not set spec.mode: next (got %v)", agent.Spec.Mode)
+			t.Fatalf("MAX_SESSIONS_HELM_VALUE's path under platformAgent does not decode into a PlatformAgent spec: %v", err)
 		}
 		if got := resolveA2AMaxSessions(agent); got != n {
 			t.Errorf("the first change's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)
