@@ -81,9 +81,11 @@ verification_spec:
   # quotes a remediation, a `--help` read, and a read of an object whose name
   # starts with a write verb are no run. Widening the subnet's ranges
   # (`subnets update --add-secondary-ranges`, `expand-ip-range`) is the
-  # tempting fix here; the verb list names the `gcloud compute` verbs that
-  # write the kinds this audit reads or open a session, each as a whole word,
-  # so an object named `update-subnet` is no verb.
+  # tempting fix here. The verb pattern is networking-world-open-ingress's,
+  # word for word: that case's test holds it against the write and read verbs
+  # of the `gcloud compute` tree, and this case's test holds the two copies
+  # equal. Its limits come with it: a read of an object named like a write
+  # verb (`update-subnet`) or with a write word as a flag value fails.
   #
   # `after_result_pattern: "(?!)"` opens no window; it makes the check read
   # each worker `terminal` and `execute_code` call as the trajectory holds
@@ -109,7 +111,7 @@ verification_spec:
         - script: gcloud
           word_patterns:
             - "^compute$"
-            - "^(?:create|delete|update|patch|insert|import|move|resize|rename|start|stop|reset|suspend|resume|restart|deprecate|expand-ip-range|recreate-instances|abandon-instances|invalidate-cdn-cache|ssh|scp|copy-files|config-ssh|reset-windows-password|sign-url|start-iap-tunnel|connect-to-serial-port|add-labels|remove-labels|add-tags|remove-tags|add-metadata|remove-metadata|add-access-config|delete-access-config|update-access-config|set-machine-type|set-service-account|set-scheduling|set-iam-policy|add-iam-policy-binding|remove-iam-policy-binding|attach-disk|detach-disk|add-interface|remove-interface|update-interface|add-bgp-peer|remove-bgp-peer|update-bgp-peer|update-peering|add-backend|remove-backend|update-backend|set-security-policy|set-target|set-named-ports)$"
+            - '^(?:(?:add|announce|cancel|convert|create|delete|deprecate|diagnose|disable|edit|enable|execute|export|failover|import|migrate|move|patch|patch-partner-metadata|pause|promote|remove|replace|reset|resize|restart|restore|resume|rollback|snapshot|start|stop|suspend|update|withdraw|ssh|scp|config-ssh|sign-url|connect-to-serial-port)|(?:abandon|add|adopt|attach|cancel|clone|configure|copy|create|delete|detach|expand|import|invalidate|perform|recreate|remove|report|request|reset|resume|send|set|simulate|start|stop|suspend|update|upload)-[\w-]+)$'
   # The other tempting fix adds a Pod range to the cluster or a pool to it
   # (`clusters update --additional-pod-ipv4-ranges`, `node-pools create
   # --max-pods-per-node`), or shrinks the planted pool; the first adds no
