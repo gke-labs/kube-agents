@@ -1932,9 +1932,12 @@ class TopicPublishCapTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
 
-    def publish(self, report: dict, text: str = "leeway: report") -> tuple[list[str], str | None]:
-        path = self.dir / "report.json"
-        path.write_text(json.dumps(report, indent=watch.JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
+    def publish(
+        self, report: dict, text: str = "leeway: report", path: Path | None = None
+    ) -> tuple[list[str], str | None]:
+        if path is None:
+            path = self.dir / "report.json"
+            path.write_text(json.dumps(report, indent=watch.JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
         calls: list[tuple[list[str], str | None]] = []
 
         def fake_run(argv, **kw):
@@ -2074,6 +2077,57 @@ class TopicPublishCapTests(unittest.TestCase):
         self.assertEqual(truncated[watch.TRUNCATED_CLUSTERS_OMITTED_FIELD], 40)
         self.assertEqual(truncated[watch.TRUNCATED_FINDINGS_PUBLISHED_FIELD], 0)
         self.assertEqual(truncated[watch.TRUNCATED_FINDINGS_OMITTED_FIELD], 40)
+
+    def test_a_smaller_less_severe_finding_never_takes_the_place_of_a_more_severe_one(self) -> None:
+        small_critical = padded_finding("small-crit", "critical", "A")
+        large_critical = padded_finding("large-crit", "critical", "B")
+        large_critical["contributingFactors"].append("z" * 50000)
+        small_warning = padded_finding("small-warn", "warning", "A")
+        report = report_with([[small_critical, large_critical, small_warning]])
+        # Room for both small findings and the truncated block, not the large one.
+        both_small = report_with([[small_critical, small_warning]])
+        budget = watch.topic_artifact_size("t", both_small) + 5000
+        self.assertGreater(watch.topic_artifact_size("t", report), budget)
+        with mock.patch.object(watch, "TOPIC_ARTIFACT_BUDGET_BYTES", budget):
+            text, doc = self.capped(*self.publish(report, "t"))
+            self.assertLessEqual(watch.topic_artifact_size(text, doc), budget)
+        self.assertEqual([f["subject"]["name"] for f in report_findings(doc)], ["small-crit"])
+        self.assertEqual(
+            doc[watch.TRUNCATED_FIELD][watch.TRUNCATED_OMITTED_BY_SEVERITY_FIELD], {"critical": 1, "warning": 1}
+        )
+
+    def test_one_severity_is_kept_tier_a_then_b_then_c(self) -> None:
+        report = report_with([[padded_finding(f"tier-{t}", "warning", t)] for t in "CBA"])
+        bare = report_with([[] for _ in "CBA"])
+        full = watch.topic_artifact_size("t", report) + 2000
+        admitted: list[str] = []
+        for budget in range(watch.topic_artifact_size("t", bare), full, 100):
+            with mock.patch.object(watch, "TOPIC_ARTIFACT_BUDGET_BYTES", budget):
+                _, doc = watch.cap_topic_report(report, "t", self.dir / "report.json")
+            for f in report_findings(doc):
+                if f["tier"] not in admitted:
+                    admitted.append(f["tier"])
+        self.assertEqual(admitted, ["A", "B", "C"])
+
+    def test_the_text_part_counts_toward_the_size(self) -> None:
+        doc = report_with([[padded_finding("w0")]])
+        base = watch.topic_artifact_size("", doc)
+        short = watch.topic_artifact_size("x" * 100, doc) - base
+        long = watch.topic_artifact_size("x" * 200, doc) - base
+        self.assertGreater(short, 100)
+        self.assertEqual(long - short, 100)
+
+    def test_full_report_names_the_timestamped_file_behind_latest_json(self) -> None:
+        report = report_with([[padded_finding(f"c{i}-w{j}") for j in range(30)] for i in range(16)])
+        target = self.dir / "20261118T000000Z.json"
+        target.write_text(json.dumps(report, indent=watch.JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
+        link = self.dir / watch.LATEST_JSON_LINK_NAME
+        link.symlink_to(target.name)
+        text, doc = self.capped(*self.publish(report, path=link))
+        full_report = doc[watch.TRUNCATED_FIELD][watch.TRUNCATED_FULL_REPORT_FIELD]
+        self.assertEqual(full_report, str(target.resolve()))
+        self.assertNotEqual(full_report, str(link))
+        self.assertIn(str(target.resolve()), text)
 
     def test_the_size_counts_what_gos_encoder_escapes(self) -> None:
         self.assertEqual(watch.a2a_encoded_size({"a": "x"}), len('{"a":"x"}'))
