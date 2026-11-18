@@ -40,6 +40,9 @@ Check **Autoscaler Visibility logs**
 | `scale.up.no.scale.up`              | No priority       | Check Pod requests |
 :                                     : matched           : vs shapes.         :
 
+No `messageId` at all (empty `NotTriggerScaleUp` reason, no rejected or skipped
+pool) on a pool that carries the compute-class label: see Symptom 13.
+
 ## Symptom 3: Trapped in Pending (GPU Tolerations Missing)
 
 -   **Symptom:** Pod requesting a GPU ComputeClass is stuck in `Pending` with
@@ -146,6 +149,47 @@ Check **Autoscaler Visibility logs**
     2.  **PriorityClass:** Use native K8s PriorityClass for pod-level
         preemption.
     3.  **Kueue:** Use Kueue for complex batch/AI/ML fair-sharing and queueing.
+
+## Symptom 13: Pods With No Class Stay Pending, Labelled Pool Does Not Grow
+
+-   **Symptom:** Pods are `Pending` with `Insufficient cpu`, and a node pool
+    that could hold them stays below its maximum. The `cluster-autoscaler`
+    event on each Pod is `NotTriggerScaleUp` with the message `Pod didn't
+    trigger scale-up:` and **nothing after the colon**, repeated. In the
+    visibility log the Pods sit in `noScaleUp.unhandledPodGroups` with no
+    `rejectedMigs` and no `skippedMigs`, and no `scaleUp` decision follows.
+-   **Cause:** The pool carries the node label
+    `cloud.google.com/compute-class=<NAME>` with **no matching taint** (the
+    ComputeClass status shows `NodepoolMisconfigured`, reason `TaintMissing`),
+    so Pods that name no class ran on its existing nodes while those had room.
+    On the affected GKE versions the Cluster Autoscaler does not scale such a
+    pool up for a Pod that names no class.
+-   **Versions:** Seen on `1.35.8-gke.1796000`. **Not** seen on
+    `1.36.4-gke.2377000`, where the same Pods scaled the same kind of pool up.
+    Other versions were not tested (one small zonal cluster per version, one
+    try per case), so read the cluster's version first and do not assume the
+    behaviour for a version that is not one of these two.
+-   **Confirm all four** before naming this cause: (1) the Pod spec has no
+    `nodeSelector` and no required `nodeAffinity` on
+    `cloud.google.com/compute-class`, and no namespace or cluster default
+    class applies; (2) every pool that could grow carries the compute-class
+    label; (3) the `NotTriggerScaleUp` message stays empty and the visibility
+    log names no rejected or skipped pool, while the pool is below its maximum;
+    (4) the cluster's version is one where the behaviour was seen.
+-   **Not this cause:** an empty `unhandledPodGroups` record **alone**. The
+    autoscaler can write one for a new group of waiting Pods before it gives a
+    reason (for a pool at its maximum, `no.scale.up.mig.skipped` with `max node
+    group size reached` followed). And **not a stockout**: no scale-up was
+    tried, so there is no `scale.up.error.out.of.resources` and no quota
+    message.
+-   **Fix:** Name the class on the workload: `nodeSelector:
+    cloud.google.com/compute-class: <NAME>`, or a required `nodeAffinity` on
+    that key (with either form the pool grew on both versions). For workloads
+    that no manifest in Git describes, the namespace default
+    (`cloud.google.com/default-compute-class=<NAME>`) is the route; it was not
+    part of the test, and it applies only to Pods created after the label is
+    set, so recreate the Pods. Adding the missing taint does not start these
+    Pods: a tainted pool takes only Pods that name the class.
 
 ## Useful Commands
 
