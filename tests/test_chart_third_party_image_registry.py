@@ -14,6 +14,7 @@ registries.
 Run: python3 -m unittest discover -s tests -p 'test_chart_third_party_image_registry.py' -v
 """
 
+import json
 import pathlib
 import re
 import shutil
@@ -57,6 +58,19 @@ _BUS_IMAGES = {
     "nats-box": "docker.io/natsio/nats-box:0.14.5",
     "nats-server-config-reloader": "docker.io/natsio/nats-server-config-reloader:0.25.0@sha256:",
     "prometheus-nats-exporter": "docker.io/natsio/prometheus-nats-exporter:0.20.3@sha256:",
+}
+
+
+# The images.json entry each bus env var's default render must equal, as
+# `<repository>:<tag>`: the pin `make mirror-images` copies, and the one
+# hack/check-image-inventory.sh holds the operator's compiled defaults to, so
+# the chart setting the four changes nothing on a stock install.
+_INVENTORY = _REPO_ROOT / "images.json"
+_BUS_ENV_INVENTORY_NAMES = {
+    "A2A_NATS_IMAGE": "nats",
+    "A2A_PROVISION_IMAGE": "nats-box",
+    "A2A_NATS_RELOADER_IMAGE": "nats-server-config-reloader",
+    "A2A_NATS_EXPORTER_IMAGE": "prometheus-nats-exporter",
 }
 
 
@@ -250,15 +264,81 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
                 self.assertTrue(env[name].startswith(f"{third_mirror}/"), env[name])
                 self.assertNotIn("@sha256:", env[name])
 
-    def test_a_render_without_a2a_bus_values_omits_the_four_and_still_renders(self):
+    def test_a_render_without_a2a_bus_values_renders_the_four_from_the_chart_defaults(self):
         """`helm upgrade --reuse-values` from a release before a2aBus existed
-        renders against values with no a2aBus key; the template must not
-        abort on it. The operator then runs on its compiled defaults, the same
-        pins, as that release already did."""
-        env = self._operator_env(_render_chart("--set", "a2aBus=null"))
+        renders against values with no a2aBus key. The four still render, from
+        the template's own copy of the pins, and equal the default render's:
+        skipping them would leave the operator on its compiled Docker Hub
+        defaults, which is the pull an admission policy refused on a mirrored
+        install upgraded that way."""
+        reused = self._operator_env(_render_chart("--set", "a2aBus=null"))
+        default = self._operator_env(_render_chart())
         for name in _IMAGE_ENV_NAMES[4:]:
-            self.assertNotIn(name, env)
-        self.assertIn("FLUENT_BIT_IMAGE", env)
+            with self.subTest(name=name):
+                self.assertEqual(reused[name], default[name])
+        self.assertIn("FLUENT_BIT_IMAGE", reused)
+
+    def test_a_mirrored_render_without_a2a_bus_values_pulls_the_four_from_the_mirror(self):
+        """The customer's path: global.thirdPartyImageRegistry carried over by
+        --reuse-values from the old release, no a2aBus key, and the bus pulls
+        from the mirror all the same."""
+        third_mirror = "registry.example.invalid/mirror"
+        env = self._operator_env(_render_chart(
+            "--set", "a2aBus=null",
+            "--set", f"global.thirdPartyImageRegistry={third_mirror}",
+        ))
+        self.assertEqual(env["A2A_NATS_IMAGE"], f"{third_mirror}/nats:2.10.29-alpine")
+        self.assertEqual(env["A2A_PROVISION_IMAGE"], f"{third_mirror}/nats-box:0.14.5")
+        self.assertEqual(env["A2A_NATS_RELOADER_IMAGE"], f"{third_mirror}/nats-server-config-reloader:0.25.0")
+        self.assertEqual(env["A2A_NATS_EXPORTER_IMAGE"], f"{third_mirror}/prometheus-nats-exporter:0.20.3")
+
+    def test_a_partial_a2a_bus_value_falls_back_per_field(self):
+        """A values file that names a repository and no tag, or the reverse,
+        takes the chart's pin for the field it leaves out rather than
+        rendering an empty one."""
+        env = self._operator_env(_render_chart(
+            "--set", "a2aBus.images.nats=null",
+            "--set", "a2aBus.images.natsBox.repository=registry.example.invalid/two/nats-box",
+            "--set-string", "a2aBus.images.natsBox.tag=",
+        ))
+        self.assertTrue(env["A2A_NATS_IMAGE"].startswith(_BUS_IMAGES["nats"]), env["A2A_NATS_IMAGE"])
+        self.assertEqual(env["A2A_PROVISION_IMAGE"], "registry.example.invalid/two/nats-box:0.14.5")
+
+    def test_the_default_render_matches_the_inventory_pins(self):
+        """With no registry set, each of the four equals its images.json pin,
+        so a stock install's bus is unchanged by the chart setting them."""
+        inventory = {
+            entry["name"]: f"{entry['repository']}:{entry['tag']}"
+            for entry in json.loads(_INVENTORY.read_text())["images"]
+            if entry["name"] in _BUS_ENV_INVENTORY_NAMES.values()
+        }
+        env = self._operator_env(_render_chart())
+        for name, entry in _BUS_ENV_INVENTORY_NAMES.items():
+            with self.subTest(name=name):
+                self.assertEqual(env[name], inventory[entry])
+
+    def test_extra_env_for_a_bus_image_is_appended_after_the_chart_entry(self):
+        """operator.extraEnv wins by coming later in the container's env, the
+        rule Kubernetes applies to a repeated name."""
+        names = self._operator_env_names(_render_chart(
+            "--set", "operator.extraEnv[0].name=A2A_PROVISION_IMAGE",
+            "--set", "operator.extraEnv[0].value=registry.example.invalid/mirror/nats-box:0.14.5",
+        ))
+        self.assertEqual(names.count("A2A_PROVISION_IMAGE"), 2)
+        chart_entry = names.index("A2A_PROVISION_IMAGE")
+        extra_entry = len(names) - 1 - names[::-1].index("A2A_PROVISION_IMAGE")
+        self.assertLess(chart_entry, extra_entry)
+        self.assertGreater(extra_entry, names.index("A2A_NATS_EXPORTER_IMAGE"))
+
+    def _operator_env_names(self, docs: list[dict]) -> list[str]:
+        """The controller manager's env var names, in container order."""
+        for doc in docs:
+            if doc.get("kind") != "Deployment":
+                continue
+            for c in doc["spec"]["template"]["spec"]["containers"]:
+                if c.get("name") == "manager":
+                    return [e["name"] for e in c.get("env", [])]
+        self.fail("no manager container in the render")
 
     def _operator_env(self, docs: list[dict]) -> dict[str, str]:
         """The controller manager's env, last entry for a name winning as it
