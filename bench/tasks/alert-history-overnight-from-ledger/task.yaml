@@ -70,9 +70,13 @@ verification_spec:
     mode: assert
     check:
       type: tool_called
-      # Whichever door reads the ledger: the front door carries the same
-      # platform_control tools, so a turn that answers without delegating
-      # counts. Both spellings the harness has recorded for such a tool.
+      # `all`, not the `router` default and not `workers`: on the api lane
+      # the platform profile is the router itself, so its call lands as a
+      # router-scope entry; on the inject lane the front door (no runtime
+      # tools of its own, agents/chat/config.yaml) delegates and the call is
+      # a worker's. The verifier reads worker MCP calls only under `workers`
+      # or `all`, and `all` reads both doors. Both spellings the harness has
+      # recorded for such a tool.
       scope: all
       tool_names:
         [
