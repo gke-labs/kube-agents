@@ -4957,6 +4957,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
 	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
 	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
+	envVars = append(envVars, a2aCuratorBrokerEnv(agent)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
 	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
@@ -5167,6 +5168,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		credentialProxyCuratorAudienceEnvVar,
+		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// The profile role's four, by name because each is rendered only
