@@ -1609,6 +1609,21 @@ class ProfileTaskWritesTest(unittest.TestCase):
         self.assertEqual([(False, False), False], seen)
         self.assertFalse(record.owns_branch("t1", "r", "platform-agent/x"))
 
+    def test_a_lookup_never_confirms_a_claim_that_replaced_its_own(self):
+        # The first claim expires while its remote lookup is in flight, and the
+        # same task claims the name afresh (and has it confirmed). The first
+        # lookup returning must not count the replacement as its own.
+        now = [1000.0]
+        record = credential_proxy.ProfileTaskWrites(clock=lambda: now[0])
+
+        def expire_and_replace():
+            now[0] = 1200.0
+            self.assertEqual((True, True), record.claim_branch("t", 5000.0, "r", "b", lambda: False))
+            return False
+
+        self.assertEqual((False, False), record.claim_branch("t", 1100.0, "r", "b", expire_and_replace))
+        self.assertTrue(record.owns_branch("t", "r", "b"))
+
     def test_a_release_drops_only_the_holders_claim(self):
         record = credential_proxy.ProfileTaskWrites()
         record.claim_branch("t1", FAR, "r", "b", lambda: False)
