@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import Transcript, { fencedBlock } from "./Transcript.tsx";
+import Transcript, { fencedBlock, replyLabel } from "./Transcript.tsx";
 import type { ChatEntry } from "./model.ts";
 
 afterEach(cleanup);
@@ -50,6 +50,59 @@ describe("fencedBlock", () => {
     expect(fencedBlock("```text\nL1\n```")).toBe("L1");
     expect(fencedBlock("```\na ``` b\nc\n```")).toBe("a ``` b\nc");
     expect(fencedBlock("```\r\nL1\r\nL2\r\n```")).toBe("L1\nL2");
+  });
+});
+
+describe("replyLabel", () => {
+  it("names a report by its first non-blank line with the Markdown marks stripped", () => {
+    expect(replyLabel("\n\n## **Pods** on `seeded-a`\nmore")).toBe("Pods on seeded-a");
+    expect(replyLabel("- __one__ pod is *pending*")).toBe("one pod is pending");
+    expect(replyLabel("> quoted line")).toBe("quoted line");
+    expect(replyLabel("1. first item")).toBe("first item");
+    // An underscore inside a name is not an emphasis mark.
+    expect(replyLabel("`kanban_notifier.py` saw _two_ pods in payments_api")).toBe("kanban_notifier.py saw two pods in payments_api");
+    // A line that is only marks is skipped, not stripped to an empty label.
+    expect(replyLabel("```\nkubectl get pods\n```")).toBe("kubectl get pods");
+    // A fence with a language tag is still a fence, not a line named after the tag.
+    expect(replyLabel("```yaml\napiVersion: v1\n```")).toBe("apiVersion: v1");
+    expect(replyLabel("***\n> **payments_api** is down")).toBe("payments_api is down");
+    expect(replyLabel(">\n---\nreal line")).toBe("real line");
+    // The cut applies after the strip, so marks never eat the budget.
+    expect(replyLabel("**" + "p".repeat(70) + "**")).toBe("p".repeat(60) + "…");
+    expect(replyLabel("   \n\t")).toBe("");
+  });
+});
+
+describe("Transcript reply button", () => {
+  it("offers a reply only on a report with a root task, and only to a pane that takes replies", async () => {
+    const report = { ...notice("n1", "two pods pending"), replyTo: "task-root" };
+    const onReply = vi.fn();
+    const stale = { ...notice("n3", "an older report"), replyTo: "task-old", correlationId: "corr-old" };
+    const { unmount } = render(
+      <Transcript
+        entries={[report, notice("n2", "⏳ submitted…"), stale]}
+        empty=""
+        reply={{ conversation: report.correlationId, onReply }}
+      />,
+    );
+    const buttons = screen.getAllByRole("button", { name: /^reply under: / });
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].getAttribute("aria-label")).toBe("reply under: two pods pending");
+    // Presentation: the button sits in the entry's body under the text, not as a flex sibling in the
+    // meta gutter beside it, and it is not the footer's uppercase pill.
+    const body = buttons[0].parentElement!;
+    expect(body.classList.contains("chat-body")).toBe(true);
+    expect(body.querySelector(".chat-text")?.textContent).toBe("two pods pending");
+    expect(buttons[0].closest(".chat-usage, .chat-note")).toBeNull();
+    expect(buttons[0].classList.contains("chat-reply")).toBe(true);
+    expect(buttons[0].classList.contains("probe-button")).toBe(false);
+    expect(buttons[0].textContent).toBe("↩ reply");
+    await userEvent.click(buttons[0]);
+    expect(onReply).toHaveBeenCalledWith(report);
+    unmount();
+    // The session view renders the same list without a reply target.
+    render(<Transcript entries={[report]} empty="" />);
+    expect(screen.queryByRole("button", { name: /^reply under: / })).toBeNull();
   });
 });
 
