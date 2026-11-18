@@ -57,7 +57,8 @@ below say where violations hide; the paragraph is the test.
   line, a gateway notice longer than that line, a failure that does not say what would work instead,
   a retry or re-route offered as text rather than a button, or a retry promise; for each promise, find the code that retries and flag it when none runs on that path.
 - **Speak up only when it matters**: Flag a new message of its own that is not the
-  acknowledgement, a pull request opened, a question only the user can answer, a failure, or done.
+  acknowledgement, a pull request opened, a question only the user can answer, a failure, done, or
+  the once-per-learn notice that a channel or space became the home channel.
 - **A destructive action needs the asker's confirm**: Flag a destructive action reachable without
   stating the resolved target back and the asker's explicit confirm, or a confirm another
   participant can satisfy.

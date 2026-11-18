@@ -146,7 +146,8 @@ detail the dispatcher or the verifier wrote for the person (`reasonDetailShown`)
 
 Beyond the acknowledgement, a message of its own, one that notifies, is for a pull request opened,
 a question only the user can answer, a failure, or done. Everything else updates the live line or
-stays silent.
+stays silent. One more is permitted, on Slack and on Google Chat: the notice that a channel or space
+became the home channel, posted once per learn in the thread that set it.
 
 Why: every extra post notifies, and noise trains the user to ignore the thread.
 

@@ -24,7 +24,7 @@ The binary has a second caller: the agent-side notification callers
 (`agents/platform/scripts/chat_notify.py`) run `a2a notify` to post proactive messages
 through the gateway, and so does the Hermes kanban notifier for card events
 (`deploy/docker/patches/kanban_chat_notify.py`). Both run it where the gateway routes: proactive posts
-when `routed_platforms()` names a platform (either variable rendered; a learned Slack channel adds Slack),
+when `routed_platforms()` names a platform (either variable rendered; a learned Slack channel or Chat space adds its platform),
 and the report of a card filed in a gateway conversation, back to that conversation, when the
 operator renders `A2A_NOTIFY_CONVERSATIONS`. Each variable
 holds a comma-separated list of platform names; a single name is a list of one. The operator
