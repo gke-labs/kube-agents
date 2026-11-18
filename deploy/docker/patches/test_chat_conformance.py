@@ -1,4 +1,4 @@
-"""Every shared kube-agents.chat/v1 case through the next-mode emitter. No Hermes install required.
+"""Every shared kube-agents.chat/v1 case through the chat-message emitter. No Hermes install required.
 
 Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 
@@ -33,7 +33,7 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
-#: The Slack renderer's golden files under next, one per shared case it lays out.
+#: The Slack renderer's golden files through the gateway, one per shared case it lays out.
 SLACK_GOLDEN = HERE.parents[2] / "a2a" / "gateway" / "testdata" / "slack-chat"
 CHAT_SCRIPTS = HERE.parents[2] / "agents" / "chat" / "scripts"
 sys.path.insert(0, str(HERE))
@@ -312,7 +312,7 @@ class SharedCasesTest(unittest.TestCase):
 
 
 class QuestionDrawnOnceTest(unittest.TestCase):
-    """A question case's headline is not repeated in its detail, under next or today.
+    """A question case's headline is not repeated in its detail, on the gateway or the Hermes Slack UX.
 
     The headline is plain text, so the detail is read as plain too: a code span's
     backticks, a link's url and paired markup do not hide a repeat."""

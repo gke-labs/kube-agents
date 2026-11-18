@@ -396,6 +396,7 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     KUBEAGENTS_RESOLVED_SCOPE_FILE=/etc/kube-agents-resolved/resolved-scope.json
     RECONCILE_PROJECT=
+    KUBEAGENTS_DIAL_ADMINS=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
     STALL_WATCH_MIN_AGE_MINUTES=
@@ -1490,6 +1491,8 @@ spec:
                 gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" $GKE_DNS_FLAG &&
                 kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
                 kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
             - name: AUDIT_REPORT_STORE_URL
               value: http://platformagent-report-store.kubeagents-system.svc:8700
             - name: AUDIT_REPORT_STORE_TOKEN_FILE
@@ -1555,6 +1558,9 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
               readOnly: true
       dnsConfig:
         options:
@@ -1632,6 +1638,10 @@ spec:
                   audience: kubeagents-audit-report-store
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: policy/v1
@@ -4367,7 +4377,6 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
-        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -5432,6 +5441,8 @@ spec:
               value: 6h0m0s
             - name: A2A_DISPATCHER_BUCKETED_GRANTS
               value: "true"
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-dispatcher:latest
           livenessProbe:
             failureThreshold: 6
@@ -5474,6 +5485,9 @@ spec:
             - mountPath: /var/run/kube-agents/task-signing
               name: task-signing-seed
               readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
           workingDir: /
       securityContext:
         fsGroup: 1000
@@ -5500,6 +5514,10 @@ spec:
               - key: task-signing-seed
                 path: seed
             secretName: platformagent-a2a-task-signing-key
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: v1

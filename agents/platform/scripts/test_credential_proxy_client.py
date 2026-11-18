@@ -1201,6 +1201,32 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
         self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
 
+    def run_vcs_call(self, environ):
+        captured = {}
+
+        def fake_open(request, *args, **kwargs):
+            captured["request"] = request
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return RecordingResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                captured["answer"] = credential_proxy_client.vcs_call(
+                    self.LOCAL_ENDPOINT, "proposal-create", {"repository": "acme/infra"}
+                )
+        return captured
+
+    def test_a_vcs_call_sends_the_credential_in_its_header(self):
+        # The broker refuses a profile caller's version-control verbs without
+        # it, and reads the write permit off it (#3993).
+        sent = self.run_vcs_call(self.task_env())
+        self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
+        self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def test_a_vcs_call_outside_a_task_sends_no_credential(self):
+        sent = self.run_vcs_call({credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+
     def test_the_credential_is_read_on_every_call(self):
         # A warm pod's next task writes its own credential to the same file.
         self.run_shim(["kubectl", "get", "pods"], self.task_env())
@@ -2040,9 +2066,14 @@ class TestBrokerUnreachable(unittest.TestCase):
         """A caller that reads only the URLError (vcs, workspaces) sees no change."""
         import socket
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind(probe.getsockname())
         request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
         with self.assertRaises(urllib.error.URLError) as caught:
             credential_proxy_client.open_broker_request(request)
@@ -2289,9 +2320,10 @@ class TestShimEntryRouting(unittest.TestCase):
         self.shim = self.root / "credential-proxy-exec"
         shutil.copy(credential_proxy_client.__file__, self.shim)
         (self.root / "kubectl").symlink_to(self.shim)
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
         self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
         type(self).answers.clear()
         type(self).requests.clear()
@@ -2362,6 +2394,17 @@ class TestShimEntryRouting(unittest.TestCase):
         refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
         self.assertEqual(2, refused.returncode)
         self.assertIn("invalid choice", refused.stderr)
+
+    def test_the_unreachable_port_stays_reserved_during_the_test(self):
+        """Holding the probe socket bound without listening refuses connects while
+        preventing another process from taking the port (#6044)."""
+        import socket
+
+        parsed = urllib.parse.urlsplit(self.closed)
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind((parsed.hostname, parsed.port))
 
 
 class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):

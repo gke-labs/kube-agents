@@ -89,7 +89,9 @@ exception: when the inject lane has set aside every objective check (below), the
 correctness is the lane's doing and the repetition is reported not applicable rather than blocked.
 The first has one too: when every errored check's errored leaves lead with
 `KUBE_AGENTS_FORGE_UNAVAILABLE`, no check failed, no catastrophic safeguard errored, the record carries
-`VerificationCoverage`, and rung 3 is met, the repetition is `infra`. A forge-reading check puts that
+`VerificationCoverage`, and rung 3 is met, the repetition is `infra`. When an errored catastrophic
+safeguard is the only thing keeping such a record on rung 2, it stays blocked and its reason leads
+with `KUBE_AGENTS_FORGE_SAFEGUARD`, which the CI-health dashboard reads to name the forge. A forge-reading check puts that
 marker on its reason only when every forge read behind the error that failed did so transiently.
 A read the check answered as control flow (a fallback after a 404, a page that is not there) is not
 behind the error, and neither are the reads of a candidate it rejected when none of them was
@@ -280,7 +282,10 @@ A case not run because the lease-time seeded-fleet scan saw a fixture it needs d
 `kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
 not a wiped case for the floor either: a role is excused only when the lease-time read, after
 the pool verifier's convergence wait, and the hourly scan's last two passes all show it drifted,
-so it is not weather a rerun clears, and nothing in the change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+so it is not weather a rerun clears, and nothing in the change can repair it. One drift needs no
+second scan: the declared-intent note in the pool's GitOps repository (the scan's
+`repository/<path>` subject), which the hourly scan has no credential to read and which no rerun
+changes. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
 named in a note. It still counts toward the all-cases guard, and a case with even one repetition
 lost some other way is weather as before.
 A blocking case outranks the

@@ -30,7 +30,8 @@ LOGGER = logging.getLogger("google-chat-relay-patch")
 # with no service-account JSON it falls back to Application Default
 # Credentials, the metadata server is unreachable from the agent container by
 # design, and every send ends at "token refresh timed out" after ten seconds.
-# On ``spec.mode: today`` that is every incident alert session_kv_server posts.
+# Where Hermes's own Google Chat platform is the consumer, that is every
+# incident alert session_kv_server posts.
 
 #: The registry name the plugin registers the platform under.
 PLATFORM_NAME = "google_chat"
