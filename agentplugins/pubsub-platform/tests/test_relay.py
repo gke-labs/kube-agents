@@ -153,9 +153,6 @@ class RelayTestCase(unittest.TestCase):
             "PUBSUB_RELAY_URL": self.broker.url,
             "CREDENTIAL_PROXY_TOKEN_FILE": self.token_file.name,
             "GCP_PROJECT_ID": PROJECT,
-            # The adapter's opener takes a proxy from the shell's variables. With this value it
-            # uses none, so the calls go to the fake broker.
-            "no_proxy": "*",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
