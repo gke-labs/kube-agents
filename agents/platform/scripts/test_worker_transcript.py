@@ -5,11 +5,16 @@ wrappers and routes; these call the module's public API directly with the
 redactor loaded by path, as the bench's in-pod script loads it.
 """
 
+import ast
 import importlib.util
 import json
+import os
 import shlex
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -2620,6 +2625,129 @@ class TestSecretReadDetector(unittest.TestCase):
         self.assertTrue(worker_transcript.is_secret_read_tool_call(cmd))
         self.assertFalse(worker_transcript.is_secret_read_tool_call({"path": cmd}))
         self.assertFalse(worker_transcript.is_secret_read_tool_call(None))
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODULE_SOURCE = "agents/platform/scripts/worker_transcript.py"
+MODULE_FOLDER_SOURCE = "agents/platform/scripts"
+READER_SOURCE = "bench/kube_agents_bench/shell_words.py"
+READER_FILENAME = "shell_words.py"
+# The build stages that ship the module today, as (Dockerfile, stage name). The scan must find these.
+SHIPPING_STAGES = (
+    ("deploy/docker/Dockerfile", "platform"),
+    ("deploy/docker/Dockerfile", "credential-proxy"),
+    ("hack/replay-proxy/Dockerfile", ""),
+)
+
+
+def _load_module_copy(folder):
+    spec = importlib.util.spec_from_file_location("worker_transcript_copy", Path(folder) / "worker_transcript.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _copy_instructions(dockerfile):
+    """Each COPY of a Dockerfile as (stage, sources, destination), with line continuations joined.
+
+    The stage is the name of the last FROM line above the COPY (`FROM x AS name`, or "" with no
+    name): two stages of one file are two images.
+    """
+    lines = [line for line in dockerfile.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#")]
+    copies = []
+    stage = ""
+    for line in "\n".join(lines).replace("\\\n", " ").splitlines():
+        words = line.split()
+        if words and words[0] == "FROM":
+            stage = words[-1] if len(words) > 2 and words[-2].upper() == "AS" else ""
+        if words and words[0] == "COPY":
+            paths = [word for word in words[1:] if not word.startswith("--")]
+            copies.append((stage, paths[:-1], paths[-1]))
+    return copies
+
+
+def _destination_folder(destination):
+    return destination if destination.endswith("/") else os.path.dirname(destination) + "/"
+
+
+class TestShellReader(unittest.TestCase):
+    """The module loads the bench's shell reader, and each image holds that reader beside it."""
+
+    def test_a_checkout_loads_the_reader_of_the_bench(self):
+        self.assertEqual(Path(worker_transcript.SHELL_READER_PATH).resolve(), REPO_ROOT / READER_SOURCE)
+        self.assertEqual(
+            worker_transcript.SHELL_READER._shell_argvs("echo 'a; b' | wc -l; ls $(pwd)"),
+            [["echo", "a; b"], ["wc", "-l"], ["ls", "$(pwd)"], ["pwd"]],
+        )
+
+    def _image_folder(self):
+        # As deep as the image's /opt/defaults/scripts, so the repository's place of the reader is
+        # inside the temporary folder too, and is empty.
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        folder = Path(root.name).resolve() / "opt" / "defaults" / "scripts"
+        folder.mkdir(parents=True)
+        shutil.copy(REPO_ROOT / MODULE_SOURCE, folder)
+        return folder
+
+    def test_the_reader_beside_the_module_is_the_one_it_loads(self):
+        folder = self._image_folder()
+        shutil.copy(REPO_ROOT / READER_SOURCE, folder)
+        # A file at the repository's place too: the folder of the module is the first place to look.
+        second = folder.parents[2] / READER_SOURCE
+        second.parent.mkdir(parents=True)
+        second.write_text("raise RuntimeError('the second place was loaded')\n", encoding="utf-8")
+        copy = _load_module_copy(folder)
+        self.assertEqual(Path(copy.SHELL_READER_PATH), folder / READER_FILENAME)
+        self.assertEqual(copy.SHELL_READER._shell_argvs("a; b"), [["a"], ["b"]])
+
+    def test_a_module_with_no_reader_fails_at_import(self):
+        folder = self._image_folder()
+        with self.assertRaises(ImportError) as raised:
+            _load_module_copy(folder)
+        self.assertIn(str(folder / READER_FILENAME), str(raised.exception))
+
+    def test_the_reader_imports_only_the_standard_library(self):
+        # The images copy this one file, with no package around it and nothing installed for it.
+        tree = ast.parse((REPO_ROOT / READER_SOURCE).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "a relative import at line %d" % node.lineno)
+                names = [node.module]
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            else:
+                continue
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name.split(".")[0], sys.stdlib_module_names)
+
+    def test_each_dockerfile_that_ships_the_module_ships_the_reader_beside_it(self):
+        # Tracked files only: a checkout can hold other checkouts in folders that git ignores.
+        listed = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+        shipping = []
+        for relative in listed.stdout.splitlines():
+            if not os.path.basename(relative).startswith("Dockerfile"):
+                continue
+            copies = _copy_instructions(REPO_ROOT / relative)
+            for stage, sources, destination in copies:
+                plain = [source.rstrip("/") for source in sources]
+                if MODULE_SOURCE not in plain and MODULE_FOLDER_SOURCE not in plain:
+                    continue
+                shipping.append((relative, stage))
+                with self.subTest(dockerfile=relative, stage=stage):
+                    target = _destination_folder(destination) + READER_FILENAME
+                    reader_targets = [
+                        to if not to.endswith("/") else to + READER_FILENAME
+                        for other_stage, froms, to in copies
+                        if other_stage == stage and READER_SOURCE in froms
+                    ]
+                    self.assertIn(target, reader_targets)
+                    # A file of this name in a folder of the same COPY would take the reader's place.
+                    for source in sources:
+                        self.assertFalse((REPO_ROOT / source / READER_FILENAME).exists(), source)
+        for site in SHIPPING_STAGES:
+            self.assertIn(site, shipping)
 
 
 class TestCardToSession(unittest.TestCase):

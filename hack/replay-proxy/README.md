@@ -41,7 +41,7 @@ Every line carries `mode` and `served`. A served line has `served_from`, the job
 | `REPLAY_LITELLM_IMAGE`            | empty                                 | The LiteLLM container image                                             |
 | `REPLAY_STORE_DIR`                | `/data/shadow`                        | Where scrubbed request text is written                                  |
 | `REPLAY_REDACTOR_PATH`            | `/app/scrubbers/redactor.py`          | The install's `AuditRedactor`                                           |
-| `REPLAY_TRANSCRIPT_RULES_PATH`    | `/app/scrubbers/worker_transcript.py` | The shared transcript scrubbing rules                                   |
+| `REPLAY_TRANSCRIPT_RULES_PATH`    | `/app/scrubbers/worker_transcript.py` | The shared transcript rules, with `shell_words.py` beside them          |
 | `REPLAY_JOB_KIND`                 | empty                                 | The job kind ([In CI](#in-ci)), stamped on every line                   |
 | `REPLAY_JOB_PR`                   | empty                                 | The pull request number, stamped on every line                          |
 | `REPLAY_JOB_PROJECT`              | empty                                 | The eval project, stamped on every line                                 |
@@ -55,7 +55,7 @@ Every line carries `mode` and `served`. A served line has `served_from`, the job
 
 With `REPLAY_LOG_DIR` set, `spool.py` appends each line to `<pod>-<start ms>-<seq>.jsonl.open` and renames it to `.jsonl` once it is 8 MiB or `REPLAY_LOG_SEGMENT_SECONDS` old, so a closed segment never changes. At start it closes the segments a previous run of the container left open, cut to their last whole line. On TERM or INT the proxy stops serving, spends at most 10 seconds logging what is queued, and closes the open segment before it exits. stdout still gets every line. With `REPLAY_DATA_MAX_BYTES` set, the store and the segments stop writing once the files under `REPLAY_STORE_DIR` and `REPLAY_LOG_DIR` hold that many bytes, and start again when the collector has emptied files; the line still goes to stdout and the store reports `budget_spent`.
 
-The image is built from the repository root (`docker build -f hack/replay-proxy/Dockerfile .`), because it copies the scrubbers from `agents/`.
+The image is built from the repository root (`docker build -f hack/replay-proxy/Dockerfile .`), because it copies the scrubbers from `agents/` and the shell reader they load from `bench/`.
 
 ## In CI
 
