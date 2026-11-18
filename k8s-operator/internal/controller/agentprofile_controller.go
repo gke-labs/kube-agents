@@ -144,7 +144,7 @@ type AgentProfileReconciler struct {
 // owner-references admission never asks for it, and the finalizer itself is a field of the
 // main resource, written by the merge patch above. The one `get` on the
 // bus StatefulSet's ControllerRevisions reads which profiles every server has
-// loaded (a2aClusterLoadedProfiles).
+// loaded (a2aRevisionLoadedProfiles).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
