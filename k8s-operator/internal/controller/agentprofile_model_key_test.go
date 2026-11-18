@@ -78,21 +78,24 @@ func TestNoProfileWorkerContainerSetsALiteralModelCredential(t *testing.T) {
 	profile := unattendedProfile(agent, "tse")
 	for _, imageVolumes := range []bool{false, true} {
 		check(t, "warm pool", buildProfilePool(agent, &profile, agentv1alpha1.AgentProfileTierRead, agentProfileServiceAccountName(&profile, agentv1alpha1.AgentProfileTierRead), imageVolumes).Spec.Template.Spec)
-		templates := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{profile}, imageVolumes)
-		if templates[profile.Name] == nil {
-			t.Fatalf("precondition: no Job template for %s (imageVolumes %v)", profile.Name, imageVolumes)
+		set := dispatchJobTemplates(agent, []agentv1alpha1.AgentProfile{profile}, imageVolumes)[profile.Name]
+		if len(set) == 0 {
+			t.Fatalf("precondition: no Job templates for %s (imageVolumes %v)", profile.Name, imageVolumes)
 		}
-		check(t, "Job template", templates[profile.Name].Spec)
-		// The dispatcher builds each Job from the DispatchJobTemplate, not
-		// from the rendering, so check the template that the param holds too.
-		param, err := buildDispatchJobTemplate(agent, profile.Name, templates[profile.Name], templates[profile.Name])
-		if err != nil {
-			t.Fatal(err)
+		hash := dispatchJobTemplatesHash(set)
+		for tier, tmpl := range set {
+			check(t, "Job template, tier "+tier, tmpl.Spec)
+			// The dispatcher builds each Job from the DispatchJobTemplate, not
+			// from the rendering, so check the template that the param holds too.
+			param, err := buildDispatchJobTemplate(agent, profile.Name, hash, tmpl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			held, ok := dispatchJobParamTemplate(param)
+			if !ok {
+				t.Fatalf("precondition: the DispatchJobTemplate of %s, tier %s, holds no pod template (imageVolumes %v)", profile.Name, tier, imageVolumes)
+			}
+			check(t, "DispatchJobTemplate, tier "+tier, held.Spec)
 		}
-		held, ok := dispatchJobParamTemplate(param)
-		if !ok {
-			t.Fatalf("precondition: the DispatchJobTemplate of %s holds no pod template (imageVolumes %v)", profile.Name, imageVolumes)
-		}
-		check(t, "DispatchJobTemplate", held.Spec)
 	}
 }
