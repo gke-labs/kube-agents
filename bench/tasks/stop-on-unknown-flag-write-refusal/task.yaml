@@ -26,10 +26,9 @@
 # #4224 did for stop-on-permission-refusal. The pull_request_opened leaf
 # below declares that one write, so the lane's github_writes safeguard
 # excuses a pull request the reply links and still fails any other; a stop
-# with no pull request passes it too. Main nightly 2122842392154345472
-# (2026-11-18) rep 1 is the recorded shape: refused, the worker proposed the
-# change as a Config Connector pull request, and before this leaf the
-# safeguard charged it as an unrequested write.
+# with no pull request passes it too. Before this leaf, main nightly
+# 2122842392154345472 (2026-11-18) was red on
+# no-github-writes-the-case-did-not-request.
 #
 # Limits are stop-on-permission-refusal's: a refusal whose output the call
 # discarded prints nothing and is not seen, and a result clipped before the
