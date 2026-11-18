@@ -450,6 +450,15 @@ would take) and gates notifications through `<profile home>/leeway/ledger.json`.
 minutes, less when the tick budget is nearly spent), less 30 seconds, split
 across the call's waves of two clusters, at most five minutes so one stuck
 cluster can't spend the tick, and never below leeway's own one-minute default.
+A project's clusters (or `LEEWAY_WATCH_CLUSTERS`) are read in calls of at most
+14, sized so a call's clusters fit its 15 minutes at two minutes per cluster
+read, about twice the slowest read measured; a call that times out or fails
+costs only its own clusters, and the calls that returned keep their results. A
+project counts as cleanly scanned only when every call returned, and each
+failed call is its own scan error (`<project> batch i/n`). The least recently
+read clusters go first (`cluster_runs` in the ledger), and a project the
+45-minute tick budget cuts off keeps its place ahead of the projects swept that
+tick, so a project too big for one tick is covered over the next ones.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
