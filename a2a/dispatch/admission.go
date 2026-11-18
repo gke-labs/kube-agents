@@ -79,7 +79,8 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 }
 
 // admit runs the admission checks in order, cheapest first: the tier, a runner
-// for it, the queue age, the parameters, then the verifier. A nil refusal
+// for it, the queue age, the parameters, the trigger's script against the
+// profile's list, then the verifier. A nil refusal
 // admits, and then cluster is the cluster the verifier permitted the task on
 // (nil when the task names none and was checked against the namespace): the
 // target a task credential for the credential proxy confines it to (#3889). An
@@ -145,6 +146,14 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		return admitted{}, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
 	case d.verifier == nil:
 		return admitted{}, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
+	}
+	// A script-run task's script must be one the profile allowlists
+	// (#5622). The verifier holds the script to the grant's; this holds it to
+	// the profile, whose list is where the path comes from.
+	if trigger != nil && trigger.Script != "" {
+		if _, ok := prof.Script(trigger.Script); !ok {
+			return admitted{}, &refusal{ReasonScriptNotAllowed, fmt.Sprintf("profile %s allowlists no script %q", prof.Name, trigger.Script)}, nil
+		}
 	}
 	// The permit is for what the verifier was asked: this ref, this target.
 	// The stream keeps one submission per subject and a newer one replaces
