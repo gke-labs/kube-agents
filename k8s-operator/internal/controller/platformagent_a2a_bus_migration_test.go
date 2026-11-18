@@ -2851,3 +2851,13 @@ func TestAGivenUpShrinkClaimsNoFreezeOrRecreatedStreams(t *testing.T) {
 		t.Errorf("given-up grow says %q, want the recreated streams named", got)
 	}
 }
+
+// The clear deletes streams last to first so a partial clear never leaves
+// PROFILE_SUBMITS without the KV_PROFILE_LEASES that marks its claimed
+// submits. That holds only while the index is listed first.
+func TestTheLeasesAreProvisionedBeforeTheSubmitsTheyIndex(t *testing.T) {
+	leases, submits := slices.Index(a2aProvisionedStreams, "KV_PROFILE_LEASES"), slices.Index(a2aProvisionedStreams, "PROFILE_SUBMITS")
+	if leases < 0 || submits < 0 || leases > submits {
+		t.Errorf("a2aProvisionedStreams %v: KV_PROFILE_LEASES at %d, PROFILE_SUBMITS at %d; the index must come first", a2aProvisionedStreams, leases, submits)
+	}
+}
