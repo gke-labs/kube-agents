@@ -1572,6 +1572,15 @@ class ProfileTaskWritesTest(unittest.TestCase):
         self.assertFalse(record.owns_proposal("t", "r", 1))
         self.assertTrue(record.owns_proposal("t", "r", 2) and record.owns_proposal("t", "r", 3))
 
+    def test_ownership_is_per_repository(self):
+        # The same number or branch name in another repository is another task's question.
+        record = credential_proxy.ProfileTaskWrites()
+        record.record_proposal("t", FAR, "acme/infra", 5)
+        record.claim_branch("t", FAR, "acme/infra", "platform-agent/x", lambda: False)
+        self.assertTrue(record.owns_proposal("t", "acme/infra", 5))
+        self.assertFalse(record.owns_proposal("t", "acme/other", 5))
+        self.assertFalse(record.owns_branch("t", "acme/other", "platform-agent/x"))
+
     def test_a_release_drops_only_the_holders_claim(self):
         record = credential_proxy.ProfileTaskWrites()
         record.claim_branch("t1", FAR, "r", "b", lambda: False)
