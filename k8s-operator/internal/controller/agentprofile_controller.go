@@ -792,9 +792,7 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 	// the bus refused, as during a bus migration's write freeze, leaves the
 	// record of durables that existed in place (#6283).
 	if verdict != nil && cardReason == reasonAgentProfilePublished && a2aDispatcherEnabled() {
-		tiers := append(append([]string(nil), verdict.renderable...), verdict.drainingTiers()...)
-		slices.Sort(tiers)
-		p.Status.DurableTiers = slices.Compact(tiers)
+		p.Status.DurableTiers = durableTiersOf(*verdict)
 	}
 	// A withdrawn card (IdentityNotRendered, from withdrawCard) deleted the
 	// profile's durables, so none existed any more: when the profile

@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -507,5 +510,46 @@ func TestADroppedTiersWaitIsCleared(t *testing.T) {
 	now = now.Add(2 * durableRecreateDelay)
 	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); !errors.Is(err, errDurableAwaitingRecheck) {
 		t.Fatalf("added back: %v, want a fresh wait", err)
+	}
+}
+
+// Draining tiers have no cap of their own, so the record is bounded in code:
+// rendered tiers always kept, draining ones filled in by name up to the CRD's
+// MaxItems, so the status write is never refused (#6292 review).
+func TestDurableTiersStayWithinTheCRDCap(t *testing.T) {
+	v := tierVerdict{renderable: []string{"zeta", "read"}, draining: map[string]time.Time{}}
+	for i := 0; i < 2*maxDurableTiers; i++ {
+		v.draining[fmt.Sprintf("d%03d", i)] = time.Now()
+	}
+	got := durableTiersOf(v)
+	if len(got) != maxDurableTiers {
+		t.Fatalf("durableTiers has %d entries, want the cap %d", len(got), maxDurableTiers)
+	}
+	for _, tier := range []string{"read", "zeta", "d000"} {
+		if !slices.Contains(got, tier) {
+			t.Errorf("durableTiers %v lacks %q", got, tier)
+		}
+	}
+	if slices.Contains(got, fmt.Sprintf("d%03d", maxDurableTiers)) {
+		t.Errorf("durableTiers %v kept a draining tier past the cap", got)
+	}
+	if !slices.IsSorted(got) {
+		t.Errorf("durableTiers %v is not sorted", got)
+	}
+	small := durableTiersOf(tierVerdict{renderable: []string{"read"}, draining: map[string]time.Time{"oncall": time.Now()}})
+	if !slices.Equal(small, []string{"oncall", "read"}) {
+		t.Errorf("durableTiers = %v, want [oncall read]", small)
+	}
+}
+
+// The code cap and the CRD's MaxItems must agree.
+func TestMaxDurableTiersMatchesTheCRD(t *testing.T) {
+	src, err := os.ReadFile("../../api/v1alpha1/agentprofile_types.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("// +kubebuilder:validation:MaxItems=%d\n\t// +kubebuilder:validation:items:MaxLength=10\n\t// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`\n\t// +optional\n\tDurableTiers", maxDurableTiers)
+	if !strings.Contains(string(src), want) {
+		t.Errorf("DurableTiers' MaxItems is not %d (maxDurableTiers)", maxDurableTiers)
 	}
 }

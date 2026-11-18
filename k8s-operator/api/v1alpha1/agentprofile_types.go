@@ -406,8 +406,11 @@ type AgentProfileStatus struct {
 	// tell a durable that existed, which it re-creates only once it is
 	// still missing a pass later, from one it never made, which it makes at
 	// once. A hint like renderedTiers: absent, every durable counts as new.
+	// It holds at most 32: the rendered tiers first, then the draining ones
+	// by name. A draining tier left out counts as new, re-created on its
+	// first miss as before #6283.
 	// +listType=set
-	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:MaxItems=32
 	// +kubebuilder:validation:items:MaxLength=10
 	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
 	// +optional

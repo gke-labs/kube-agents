@@ -336,3 +336,29 @@ func syncDurablesGated(ctx context.Context, js jetstream.JetStream, profile stri
 	}
 	return held
 }
+
+// maxDurableTiers is status.durableTiers' MaxItems. Draining tiers have no
+// cap of their own (every owned tier still inside the drain window drains),
+// so the record is bounded here rather than left for the API server to
+// refuse, which would fail every status write for the profile.
+const maxDurableTiers = 32
+
+// durableTiersOf is the status.durableTiers record for v: the renderable
+// tiers, then the draining ones by name, at most maxDurableTiers, sorted. A
+// draining tier past the cap counts as new, re-created on its first miss.
+func durableTiersOf(v tierVerdict) []string {
+	tiers := append([]string(nil), v.renderable...)
+	for _, tier := range v.drainingTiers() {
+		if len(tiers) >= maxDurableTiers {
+			break
+		}
+		if !slices.Contains(tiers, tier) {
+			tiers = append(tiers, tier)
+		}
+	}
+	if len(tiers) > maxDurableTiers {
+		tiers = tiers[:maxDurableTiers]
+	}
+	slices.Sort(tiers)
+	return slices.Compact(tiers)
+}
