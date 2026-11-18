@@ -6,28 +6,30 @@ directories passed on the command line) against the Open Knowledge Format v0.2
 specification and the ``kube-agents`` contract in
 ``docs/architecture/06-api-and-data-contracts.md`` §5:
 
-* Root ``index.md`` (navigation) and ``log.md`` (history) are reserved at the
-  ``knowledge/`` root: they do not require YAML frontmatter, and if they carry
-  frontmatter it must be a valid YAML mapping without a ``type`` key.
+* Root ``index.md`` (navigation) and ``log.md`` (history) are reserved by OKF
+  v0.2 at the ``knowledge/`` root (alongside ``kube-agents`` root overview files
+  ``STATE_OF_BEING.md`` and ``README.md``): they do not require YAML
+  frontmatter, and if they carry frontmatter it must be a valid YAML mapping
+  without a ``type`` key.
 * Entry files (every other ``.md`` file under ``knowledge/``) must not be named
-  ``index.md`` or ``log.md``, must carry valid YAML frontmatter that parses to
-  a mapping, and must declare a non-empty string ``type`` that is not ``index``
-  or ``log``.
+  ``index.md`` or ``log.md`` (case-insensitively), must not be symlinks, must
+  carry valid YAML frontmatter that parses to a mapping, and must declare a
+  non-empty string ``type`` that is not ``index`` or ``log``.
 * Recommended OKF v0.2 trust and lifecycle fields (``sources``, ``generated``,
   ``verified``, ``status``, ``stale_after``) and tolerated legacy ``timestamp``
   are optional, and are shape-checked when present:
   - ``sources``: non-empty list of non-empty strings or source mappings;
   - ``generated``: mapping with non-empty string ``by`` and ISO-8601 date or
-    timestamp ``at``;
+    timezone-qualified timestamp ``at``;
   - ``verified``: mapping (or non-empty list of mappings) with non-empty string
-    ``by`` and ISO-8601 date or timestamp ``at``;
+    ``by`` and ISO-8601 date or timezone-qualified timestamp ``at``;
   - ``status``: ``proposed``, ``active``, ``rejected``, ``superseded``, or
     ``retired`` on ``decision`` and ``lesson`` entries, and ``draft``,
     ``stable``, or ``deprecated`` on all other OKF types;
   - ``stale_after`` and legacy ``timestamp``: ISO-8601 date (``YYYY-MM-DD``) or
     timestamp (``YYYY-MM-DDTHH:MM:SS...`` with timezone).
-* Relative Markdown links and ``#fragment`` anchors inside ``knowledge/`` files
-  must resolve.
+* Relative Markdown links and ``#fragment`` anchors inside the Markdown body of
+  ``knowledge/`` files must resolve.
 
 Usage::
 
@@ -41,9 +43,9 @@ import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -55,13 +57,22 @@ import yaml  # noqa: E402
 from check_docs_links import (  # noqa: E402
     AnchorCache,
     FRAGMENT_MARK,
+    HEADING_RE,
+    HTML_ANCHOR_RE,
+    HTML_COMMENT,
     MARKDOWN_SUFFIXES,
+    MDX_COMMENT,
+    MDX_SUFFIX,
     REPO_BLOB_URL_PREFIXES,
     SKIP_PREFIXES,
     fragment_part,
+    heading_slug,
+    line_links,
     link_target,
-    markdown_links,
-    page_anchors,
+    strip_code_fences,
+    strip_specimens,
+    tracked_paths,
+    unique_slug,
 )
 
 REPO = SCRIPT_DIR.parent
@@ -71,10 +82,8 @@ UTF8_BOM = "\ufeff"
 CRLF = "\r\n"
 CR = "\r"
 LF = "\n"
-NUL_SEPARATOR = "\0"
 LIST_JOIN_SEPARATOR = ", "
 
-GIT_LS_FILES_CMD = ("git", "ls-files", "-z")
 CLI_DESCRIPTION = "Validate OKF v0.2 knowledge/ files."
 CLI_ROOTS_ARG = "roots"
 CLI_ZERO_OR_MORE = "*"
@@ -83,13 +92,17 @@ CLI_ROOTS_HELP = (
 )
 
 KNOWLEDGE_DIR_NAME = "knowledge"
+MARKDOWN_EXT = ".md"
 MARKDOWN_GLOB = "*.md"
-GIT_KNOWLEDGE_GLOBS = ("knowledge/*.md", "knowledge/**/*.md", "**/knowledge/*.md", "**/knowledge/**/*.md")
+HEADING_TEXT_GROUP = "text"
+HTML_ANCHOR_GROUP = "anchor"
 
 FRONTMATTER_OPEN = "---"
 FRONTMATTER_CLOSERS = frozenset({"---", "..."})
 
 RESERVED_ROOT_FILENAMES = frozenset({"index.md", "log.md"})
+EXTRA_UNTYPED_ROOT_FILENAMES = frozenset({"state_of_being.md", "readme.md"})
+ALLOWED_UNTYPED_ROOT_FILENAMES = RESERVED_ROOT_FILENAMES | EXTRA_UNTYPED_ROOT_FILENAMES
 RESERVED_TYPES = frozenset({"index", "log"})
 
 KEY_TYPE = "type"
@@ -118,6 +131,7 @@ FRONTMATTER_UNCLOSED = "unclosed"
 FRONTMATTER_CLOSED = "closed"
 
 MSG_NO_KNOWLEDGE_FILES = "no knowledge/ Markdown files found to validate"
+MSG_SYMLINK_NOT_ALLOWED = "knowledge/ Markdown file or parent directory must not be a symlink"
 MSG_UNCLOSED_FRONTMATTER = "frontmatter opens with '---' on line 1 but is never closed by '---' or '...'"
 MSG_MISSING_FRONTMATTER = "missing YAML frontmatter (must open with '---' on line 1 and close with '---')"
 MSG_INVALID_YAML_PREFIX = "frontmatter is not valid YAML"
@@ -153,6 +167,7 @@ class SplitFrontmatter:
     state: str
     frontmatter: str
     body: str
+    body_with_leading_blanks: str
 
 
 def split_frontmatter(text: str) -> SplitFrontmatter:
@@ -160,22 +175,27 @@ def split_frontmatter(text: str) -> SplitFrontmatter:
     normalised = text.replace(CRLF, LF).replace(CR, LF).lstrip(UTF8_BOM)
     lines = normalised.split(LF)
     if not lines or lines[0].rstrip() != FRONTMATTER_OPEN:
-        return SplitFrontmatter(FRONTMATTER_NONE, "", normalised)
+        return SplitFrontmatter(FRONTMATTER_NONE, "", normalised, normalised)
     for index in range(1, len(lines)):
         if lines[index].rstrip() in FRONTMATTER_CLOSERS:
+            body = LF.join(lines[index + 1 :])
+            blanked = (LF * (index + 1)) + body
             return SplitFrontmatter(
                 FRONTMATTER_CLOSED,
                 LF.join(lines[1:index]),
-                LF.join(lines[index + 1 :]),
+                body,
+                blanked,
             )
-    return SplitFrontmatter(FRONTMATTER_UNCLOSED, "", normalised)
+    return SplitFrontmatter(FRONTMATTER_UNCLOSED, "", normalised, normalised)
 
 
 def is_valid_date_or_timestamp(value: object) -> bool:
-    """True when ``value`` is a valid ISO-8601 date (YYYY-MM-DD) or timestamp."""
+    """True when ``value`` is a valid ISO-8601 date (YYYY-MM-DD) or timezone-qualified timestamp."""
     if isinstance(value, bool):
         return False
-    if isinstance(value, (date, datetime)):
+    if isinstance(value, datetime):
+        return value.tzinfo is not None
+    if isinstance(value, date):
         return True
     if not isinstance(value, str):
         return False
@@ -229,6 +249,7 @@ def is_valid_provenance_stamp(mapping: object) -> bool:
 def validate_optional_fields(front: dict[str, object], entry_type: str) -> list[str]:
     """Validate OKF v0.2 recommended fields and legacy ``timestamp`` when present."""
     errors: list[str] = []
+    normalized_type = entry_type.strip().lower()
 
     if KEY_SOURCES in front:
         sources = front[KEY_SOURCES]
@@ -264,19 +285,54 @@ def validate_optional_fields(front: dict[str, object], entry_type: str) -> list[
         if not isinstance(status, str) or not status.strip():
             errors.append(MSG_INVALID_STATUS_TYPE)
         else:
+            status_val = status.strip()
             allowed = (
                 DECISION_LESSON_STATUSES
-                if entry_type in DECISION_LESSON_TYPES
+                if normalized_type in DECISION_LESSON_TYPES
                 else STANDARD_OKF_STATUSES
             )
-            if status not in allowed:
+            if status_val not in allowed:
                 allowed_list = LIST_JOIN_SEPARATOR.join(sorted(allowed))
                 errors.append(
-                    f"frontmatter 'status' value '{status}' is not allowed for type '{entry_type}' "
+                    f"frontmatter 'status' value '{status_val}' is not allowed for type '{entry_type}' "
                     f"(expected one of: {allowed_list})"
                 )
 
     return errors
+
+
+def body_markdown_links(path: Path, body_with_blanks: str) -> list[tuple[int, str]]:
+    """Return ``(line_number, link_target)`` for every navigable link in ``body_with_blanks``."""
+    comments = (HTML_COMMENT, MDX_COMMENT) if path.suffix == MDX_SUFFIX else (HTML_COMMENT,)
+    found: list[tuple[int, str]] = []
+    for lineno, line in strip_specimens(strip_code_fences(body_with_blanks), comments):
+        for raw in line_links(line):
+            target = raw.strip()
+            if target:
+                found.append((lineno, target))
+    return found
+
+
+def okf_page_anchors(path: Path, cache: AnchorCache) -> frozenset[str]:
+    """Return GitHub-style heading and HTML anchors for ``path`` after stripping YAML frontmatter."""
+    cache_key = (path, False)
+    if cache_key in cache:
+        return cache[cache_key]
+    comments = (HTML_COMMENT, MDX_COMMENT) if path.suffix == MDX_SUFFIX else (HTML_COMMENT,)
+    split = split_frontmatter(path.read_text(encoding=UTF8_ENCODING))
+    kept = strip_code_fences(split.body_with_leading_blanks)
+    original = dict(kept)
+    slugs: list[str] = []
+    explicit: set[str] = set()
+    occurrences: dict[str, int] = {}
+    for lineno, visible in strip_specimens(kept, comments):
+        if HEADING_RE.match(visible) and (heading := HEADING_RE.match(original[lineno])):
+            slugs.append(unique_slug(heading_slug(heading.group(HEADING_TEXT_GROUP) or ""), occurrences))
+        for match in HTML_ANCHOR_RE.finditer(visible):
+            explicit.add(match.group(HTML_ANCHOR_GROUP))
+    anchors = frozenset(slugs) | explicit
+    cache[cache_key] = anchors
+    return anchors
 
 
 def validate_file_links(
@@ -284,13 +340,18 @@ def validate_file_links(
     *,
     tracked: set[Path] | None,
     anchors: AnchorCache,
+    body_with_blanks: str | None = None,
 ) -> list[str]:
     """Validate navigable relative links and ``#fragment`` anchors in ``path``."""
+    if body_with_blanks is None:
+        body_with_blanks = split_frontmatter(
+            path.read_text(encoding=UTF8_ENCODING)
+        ).body_with_leading_blanks
     errors: list[str] = []
-    for lineno, target in markdown_links(path):
+    for lineno, target in body_markdown_links(path, body_with_blanks):
         fragment = fragment_part(target)
         if target.startswith(FRAGMENT_MARK):
-            if fragment and fragment not in page_anchors(path, anchors):
+            if fragment and fragment not in okf_page_anchors(path, anchors):
                 errors.append(f"line {lineno}: {MSG_BROKEN_ANCHOR_PREFIX} '{target}'")
             continue
         if target.startswith(SKIP_PREFIXES) or target.startswith(REPO_BLOB_URL_PREFIXES):
@@ -306,7 +367,7 @@ def validate_file_links(
             is_tracked = resolved in tracked or (
                 resolved.is_dir()
                 and any(
-                     resolved == parent
+                    resolved == parent
                     for tracked_file in tracked
                     for parent in tracked_file.parents
                 )
@@ -315,9 +376,23 @@ def validate_file_links(
                 errors.append(f"line {lineno}: {MSG_UNTRACKED_LINK_PREFIX} '{target}'")
                 continue
         if fragment and resolved.is_file() and resolved.suffix in MARKDOWN_SUFFIXES:
-            if fragment not in page_anchors(resolved, anchors):
+            if fragment not in okf_page_anchors(resolved, anchors):
                 errors.append(f"line {lineno}: {MSG_BROKEN_ANCHOR_PREFIX} '{target}'")
     return errors
+
+
+def relative_without_deref(path: Path, root: Path) -> tuple[Path, bool]:
+    """Return ``(rel_path, has_symlink)`` from ``root`` to ``path`` without dereferencing symlinks."""
+    abs_root = Path(os.path.abspath(root))
+    abs_path = Path(os.path.abspath(path))
+    rel = abs_path.relative_to(abs_root)
+    current = abs_root
+    has_symlink = abs_root.is_symlink()
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            has_symlink = True
+    return rel, has_symlink
 
 
 def validate_knowledge_file(
@@ -329,15 +404,20 @@ def validate_knowledge_file(
 ) -> list[str]:
     """Validate one Markdown file inside ``knowledge_root``."""
     anchor_cache: AnchorCache = {} if anchors is None else anchors
-    rel = path.resolve().relative_to(knowledge_root.resolve())
+    rel, has_symlink = relative_without_deref(path, knowledge_root)
+    if has_symlink:
+        return [MSG_SYMLINK_NOT_ALLOWED]
+
     is_root_file = len(rel.parts) == 1
-    is_reserved_name = path.name in RESERVED_ROOT_FILENAMES
+    lower_name = path.name.lower()
+    is_reserved_name = lower_name in RESERVED_ROOT_FILENAMES
+    is_untyped_root_name = lower_name in ALLOWED_UNTYPED_ROOT_FILENAMES
 
     text = path.read_text(encoding=UTF8_ENCODING)
     split = split_frontmatter(text)
     errors: list[str] = []
 
-    if is_root_file and is_reserved_name:
+    if is_root_file and is_untyped_root_name:
         if split.state == FRONTMATTER_UNCLOSED:
             errors.append(MSG_UNCLOSED_FRONTMATTER)
         elif split.state == FRONTMATTER_CLOSED:
@@ -345,13 +425,21 @@ def validate_knowledge_file(
                 front = yaml.safe_load(split.frontmatter)
             except (yaml.YAMLError, ValueError, RecursionError) as exc:
                 errors.append(f"{MSG_INVALID_YAML_PREFIX}: {type(exc).__name__}")
-                front = None
-            if front is not None:
+            else:
                 if not isinstance(front, dict):
                     errors.append(MSG_FRONTMATTER_NOT_MAPPING)
-                elif KEY_TYPE in front:
+                elif any(
+                    isinstance(key, str) and key.strip().lower() == KEY_TYPE for key in front
+                ):
                     errors.append(MSG_ROOT_HAS_TYPE)
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     if is_reserved_name:
@@ -359,35 +447,77 @@ def validate_knowledge_file(
 
     if split.state == FRONTMATTER_NONE:
         errors.append(MSG_MISSING_FRONTMATTER)
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     if split.state == FRONTMATTER_UNCLOSED:
         errors.append(MSG_UNCLOSED_FRONTMATTER)
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     try:
         front = yaml.safe_load(split.frontmatter)
     except (yaml.YAMLError, ValueError, RecursionError) as exc:
         errors.append(f"{MSG_INVALID_YAML_PREFIX}: {type(exc).__name__}")
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     if not isinstance(front, dict):
         errors.append(MSG_FRONTMATTER_NOT_MAPPING)
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     if KEY_TYPE not in front:
         errors.append(MSG_MISSING_TYPE)
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     raw_type = front[KEY_TYPE]
     if not isinstance(raw_type, str) or not raw_type.strip():
         errors.append(MSG_EMPTY_TYPE)
-        errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+        errors.extend(
+            validate_file_links(
+                path,
+                tracked=tracked,
+                anchors=anchor_cache,
+                body_with_blanks=split.body_with_leading_blanks,
+            )
+        )
         return errors
 
     entry_type = raw_type.strip()
@@ -396,7 +526,14 @@ def validate_knowledge_file(
     else:
         errors.extend(validate_optional_fields(front, entry_type))
 
-    errors.extend(validate_file_links(path, tracked=tracked, anchors=anchor_cache))
+    errors.extend(
+        validate_file_links(
+            path,
+            tracked=tracked,
+            anchors=anchor_cache,
+            body_with_blanks=split.body_with_leading_blanks,
+        )
+    )
     return errors
 
 
@@ -410,15 +547,20 @@ def validate_knowledge_root(
 
     Returns ``(file_count, formatted_errors)``.
     """
-    resolved_root = knowledge_root.resolve()
-    base = resolved_root.parent if display_root is None else display_root.resolve()
-    if not resolved_root.is_dir():
+    abs_root = Path(os.path.abspath(knowledge_root))
+    base = abs_root.parent if display_root is None else Path(os.path.abspath(display_root))
+    if not abs_root.is_dir():
         return 0, [f"{knowledge_root}: {MSG_NO_KNOWLEDGE_FILES}"]
 
     files = sorted(
         path
-        for path in resolved_root.rglob(MARKDOWN_GLOB)
-        if path.is_file() and (tracked is None or path.resolve() in tracked)
+        for path in abs_root.rglob(MARKDOWN_GLOB)
+        if (path.is_file() or path.is_symlink())
+        and (
+            tracked is None
+            or Path(os.path.abspath(path)) in tracked
+            or path.resolve() in tracked
+        )
     )
     if not files:
         return 0, [f"{knowledge_root}: {MSG_NO_KNOWLEDGE_FILES}"]
@@ -427,12 +569,12 @@ def validate_knowledge_root(
     all_errors: list[str] = []
     for path in files:
         try:
-            label = path.resolve().relative_to(base).as_posix()
+            label = Path(os.path.abspath(path)).relative_to(base).as_posix()
         except ValueError:
             label = path.as_posix()
         for err in validate_knowledge_file(
             path,
-            resolved_root,
+            abs_root,
             tracked=tracked,
             anchors=anchors,
         ):
@@ -440,35 +582,25 @@ def validate_knowledge_root(
     return len(files), all_errors
 
 
-def tracked_paths(repo: Path = REPO) -> set[Path]:
-    """Return every git-tracked file path under ``repo``."""
-    out = subprocess.run(
-        [*GIT_LS_FILES_CMD],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split(NUL_SEPARATOR)
-    return {(repo / rel).resolve() for rel in out if rel and (repo / rel).is_file()}
-
-
-def discover_knowledge_roots(repo: Path = REPO) -> list[Path]:
+def discover_knowledge_roots(
+    repo: Path = REPO,
+    *,
+    tracked: set[Path] | None = None,
+) -> list[Path]:
     """Discover every git-tracked ``knowledge/`` root directory under ``repo``."""
-    out = subprocess.run(
-        [*GIT_LS_FILES_CMD, *GIT_KNOWLEDGE_GLOBS],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split(NUL_SEPARATOR)
+    resolved_repo = repo.resolve()
+    paths = tracked_paths() if tracked is None else tracked
     roots: set[Path] = set()
-    for rel in out:
-        if not rel:
+    for tracked_file in paths:
+        if tracked_file.suffix != MARKDOWN_EXT:
             continue
-        path = Path(rel)
-        for index, part in enumerate(path.parts):
+        try:
+            rel = tracked_file.relative_to(resolved_repo)
+        except ValueError:
+            continue
+        for index, part in enumerate(rel.parts[:-1]):
             if part == KNOWLEDGE_DIR_NAME:
-                roots.add((repo / Path(*path.parts[: index + 1])).resolve())
+                roots.add((resolved_repo / Path(*rel.parts[: index + 1])).resolve())
                 break
     return sorted(roots)
 
@@ -484,12 +616,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.roots:
-        roots = [root.resolve() for root in args.roots]
+        roots = [Path(os.path.abspath(root)) for root in args.roots]
         tracked = None
         display_root = None
     else:
-        roots = discover_knowledge_roots(REPO)
-        tracked = tracked_paths(REPO)
+        tracked = tracked_paths()
+        roots = discover_knowledge_roots(REPO, tracked=tracked)
         display_root = REPO
 
     if not roots:

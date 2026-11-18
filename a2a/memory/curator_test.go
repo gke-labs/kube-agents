@@ -2372,6 +2372,64 @@ func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testi
 	}
 }
 
+func TestLoadRecordsSkipsReservedLogAndStateOfBeingFiles(t *testing.T) {
+	repoDir := t.TempDir()
+	knowledgeDir := filepath.Join(repoDir, "knowledge")
+	decisionDir := filepath.Join(knowledgeDir, "decision")
+	runbookDir := filepath.Join(knowledgeDir, "runbook")
+	for _, dir := range []string{decisionDir, runbookDir} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rootFiles := map[string]string{
+		"index.md":          "---\ntitle: Knowledge Index\n---\n\n# Index\n",
+		"log.md":            "---\ntitle: Knowledge Change Log\n---\n\n# Log\n",
+		"STATE_OF_BEING.md": "---\ntitle: State of Being\n---\n\n# State of Being\n",
+		"README.md":         "---\ntitle: Knowledge Readme\n---\n\n# Readme\n",
+	}
+	for name, content := range rootFiles {
+		if err := os.WriteFile(filepath.Join(knowledgeDir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(runbookDir, "log.md"), []byte("---\ntitle: Ignored log\n---\n\n# Log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	validDecision := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Valid decision",
+			Date:   "2026-11-18",
+			Scope:  RecordScope{Paths: []string{"clusters/**"}},
+		},
+		Body: "## Context\n\nValid decision record.\n",
+	}
+	if err := SaveRecord(repoDir, &validDecision); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := LoadRecords(repoDir)
+	if err != nil {
+		t.Fatalf("LoadRecords: %v", err)
+	}
+	if len(records) != 1 || records[0].Meta.ID != "DEC-2026-001" {
+		t.Fatalf("expected only DEC-2026-001 from LoadRecords, got %+v", records)
+	}
+
+	extRecords, err := LoadExternalDocRecords(repoDir)
+	if err != nil {
+		t.Fatalf("LoadExternalDocRecords: %v", err)
+	}
+	if len(extRecords) != 0 {
+		t.Fatalf("expected LoadExternalDocRecords to skip log.md, got %+v", extRecords)
+	}
+}
+
 func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 	ctx := context.Background()
 	dir1 := t.TempDir()
