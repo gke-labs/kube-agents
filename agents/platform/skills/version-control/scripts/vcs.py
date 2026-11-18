@@ -48,9 +48,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Where the profile worker image (a2a/Dockerfile.worker) keeps the broker
+# client and vcs_client's import closure, root-owned. A profile persona ships
+# a byte-identical copy of this script in its own skill directory, which has
+# no sibling scripts, so this is how that copy finds them. Last, so the agent
+# and sandbox images keep resolving from the directories above.
+PROFILE_WORKER_LIBEXEC = "/opt/credential-proxy/libexec"
+
 sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
+sys.path.append(PROFILE_WORKER_LIBEXEC)
 
 import credential_proxy_client  # noqa: E402
 import vcs_client as client  # noqa: E402

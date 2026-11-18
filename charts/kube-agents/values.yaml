@@ -2249,12 +2249,13 @@ profiles:
   cluster:
     enabled: false
     description: >-
-      Read-only SRE for one GKE cluster, named per task: live runtime state and
-      workload debugging (crash loops, OOMKills, pending pods, image-pull and
-      mount errors, connectivity and DNS timeouts, autoscaling, storage binding,
-      silent reconciliation stalls, observability gaps). Returns a grounded root
-      cause analysis and a proposed manifest patch; never mutates cluster state
-      and never opens pull requests.
+      SRE for one GKE cluster, named per task, read-only on that cluster: live
+      runtime state and workload debugging (crash loops, OOMKills, pending pods,
+      image-pull and mount errors, connectivity and DNS timeouts, autoscaling,
+      storage binding, silent reconciliation stalls, observability gaps).
+      Returns a grounded root cause analysis and a proposed manifest patch;
+      never mutates cluster state. Opens a pull request on the install's managed
+      repository only when the task asks for that change.
     persona:
       image:
         repository: ghcr.io/gke-labs/kube-agents/persona-cluster
@@ -2266,7 +2267,9 @@ profiles:
       model: model-default
       maxTurns: 90
     # Tier is authority, so it lives here and never in the persona. The cluster
-    # agent is read-only; unattended runs it as a Job per task.
+    # agent is read-only on its cluster; unattended runs it as a Job per task,
+    # and so does a task that asks for a change, whose pull request the broker
+    # admits only under that task's permit.
     allowedTiers:
       - read
     lifecycle:

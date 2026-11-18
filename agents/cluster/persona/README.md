@@ -1,8 +1,11 @@
 # Cluster agent persona
 
 The cluster agent written in the [persona format](../../../a2a/lib/persona/README.md):
-a read-only SRE for one GKE cluster, which each task names through the
-`project`, `cluster` and `location` parameters. It is the example persona for
+an SRE for one GKE cluster, read-only on that cluster, which each task names
+through the `project`, `cluster` and `location` parameters. It opens a pull
+request on the install's managed repository only when the task asks for that
+change, and the credential broker admits that write only under the task's
+permit. It is the example persona for
 #3656, for the profile dispatcher (#3655) to run.
 
 It ships as its own image, `persona-cluster` (`a2a/Dockerfile.persona-cluster`,
@@ -27,12 +30,19 @@ reads the target from them.
 
 Each skill's `SKILL.md` (and `workload-triage-scan/references/reporting.md`) is
 its `agents/cluster/skills` source with only the edits
-`a2a/lib/persona/claudecode/cluster_persona_test.go` lists. Every other file is
-a byte-identical copy: the assets of the same path under `agents/cluster/skills`,
-and the three scripts of `agents/platform/scripts/stall_report.py`,
-`agents/platform/scripts/workload_triage.py` and
-`agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh`. The
-same test checks both. The skills run their scripts by skill-relative paths
+`a2a/lib/persona/claudecode/cluster_persona_test.go` lists, except
+`version-control`, which has no cluster source: its `SKILL.md` is written for a
+profile, which reaches a narrower set of the broker's verbs than the platform
+agent, and `cluster_persona_vcs_test.go` holds it to that set. Every other file
+is a byte-identical copy: the assets of the same path under
+`agents/cluster/skills`, and the four scripts of
+`agents/platform/scripts/stall_report.py`,
+`agents/platform/scripts/workload_triage.py`,
+`agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh` and
+`agents/platform/skills/version-control/scripts/vcs.py`. The same test checks
+both. `vcs.py` imports its client from the `a2a-worker` image
+(`a2a/Dockerfile.worker`), which also carries a git that holds no credential
+and reaches no remote. The skills run their scripts by skill-relative paths
 (`scripts/...`), from the skill's directory.
 
 What it holds:
@@ -56,7 +66,8 @@ What it holds:
   [`pod-container-creating`](skills/pod-container-creating/SKILL.md),
   [`pod-crashloop-oom`](skills/pod-crashloop-oom/SKILL.md),
   [`pod-pending-scheduling`](skills/pod-pending-scheduling/SKILL.md),
-  [`service-connectivity`](skills/service-connectivity/SKILL.md) and
+  [`service-connectivity`](skills/service-connectivity/SKILL.md),
+  [`version-control`](skills/version-control/SKILL.md) and
   [`workload-triage-scan`](skills/workload-triage-scan/SKILL.md).
 
 Check it from `a2a/`:
