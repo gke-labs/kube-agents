@@ -1645,8 +1645,14 @@ class ProfileVcsRouteTest(unittest.TestCase):
 
     def test_a_profile_identity_with_no_repository_answers_the_managed_list(self):
         # The gate's own keys, provider type first, as managed_repositories() reads them.
-        managed = frozenset({"github:github.com/acme/infra", "gitlab:gitlab.example.com/ops/fleet"})
-        names = ["github.com/acme/infra", "gitlab.example.com/ops/fleet"]
+        managed = frozenset({
+            "github:github.com/zeta/apps", "gitlab:gitlab.example.com/ops/fleet", "github:github.com/acme/infra",
+            "github:github.com/mid/svc", "gitlab:gitlab.example.com/aa/first",
+        })
+        names = [
+            "github.com/acme/infra", "github.com/mid/svc", "github.com/zeta/apps",
+            "gitlab.example.com/aa/first", "gitlab.example.com/ops/fleet",
+        ]
         for payload in ({}, {"repository": ""}, {"repository": None}, {"login": "someone"}):
             with self.subTest(payload=payload):
                 self.reset()
