@@ -1644,6 +1644,27 @@ func TestADurableReCheckKeepsTheBusConnection(t *testing.T) {
 	}
 }
 
+// status.durableTiers is written by a pass whose durable sync succeeded,
+// and left as it was by one the bus refused, as during a bus migration's
+// write freeze: a refused pass must not erase the record that the durables
+// existed (#6283).
+func TestDurableTiersAreWrittenOnlyBySuccessfulSync(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Fatalf("after a successful sync durableTiers = %v, want [read]", got)
+	}
+	h.dir.durablesRefused = true
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Errorf("after a refused sync durableTiers = %v, want [read] kept", got)
+	}
+}
+
 // Dropping the unattended tier deletes the profile's unattended
 // ServiceAccount, and keeps its read one. The dispatcher Job policy's params
 // can be frozen by an upstream bug (kubernetes/kubernetes#141015); an index

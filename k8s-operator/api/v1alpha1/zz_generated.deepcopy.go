@@ -503,6 +503,11 @@ func (in *AgentProfileStatus) DeepCopyInto(out *AgentProfileStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.DurableTiers != nil {
+		in, out := &in.DurableTiers, &out.DurableTiers
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))
