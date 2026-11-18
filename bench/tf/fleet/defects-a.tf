@@ -357,7 +357,8 @@ resource "kubernetes_deployment_v1" "token_sidecar" {
 # default-deny policy and the restricted container settings so no other
 # stream names the namespace. The one declarable cost posture observable
 # on apply day: the other seven are age-gated by a week or more. Its case
-# still needs a ledger to read, which the idle pool supplies from day 7.
+# still needs a ledger to read, which the generated-name family below
+# supplies from its first hour, before the idle pool's day 7.
 resource "kubernetes_namespace_v1" "seeded_headroom" {
   metadata {
     name   = "seeded-headroom"
