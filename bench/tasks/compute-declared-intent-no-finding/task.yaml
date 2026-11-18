@@ -55,14 +55,19 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
 
-# The seeded-fleet fixtures this scenario rests on, named by ROLE rather than
+# The seeded-fleet fixture this scenario rests on, named by ROLE rather than
 # by project (docs/designs/bench-fleet-catalog.md). Project-scoped: no
-# kubeconfig, so no check reads them by `fixture_role:`; the runner probes
-# the two snapshots with gcloud and hack/fleet-fixture-state.py reads their
-# source disk, schedule fields and age.
+# kubeconfig, so no check reads it by `fixture_role:`; the runner probes the
+# snapshot with gcloud and hack/fleet-fixture-state.py reads its source disk,
+# schedule fields, age and the note's blob sha. One role, as the other
+# declared-intent cases list: the lease-time fixture-drift excusal
+# (bench/kube_agents_bench/fixture_drift.py, case_roles) reads a one-role
+# list and nothing from a longer one, and the declared role is the one that
+# carries the note assertion. The control, orphan-snap-seeded (role
+# orphan-snapshot), is planted by the same planter and ages on the same
+# clock, so it is not listed here; its drift fails the second objective.
 fixtures:
   - declared-orphan-snapshot
-  - orphan-snapshot
 
 verification_spec:
   - name: the-posture-is-not-a-finding
