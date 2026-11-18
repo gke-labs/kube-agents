@@ -168,9 +168,8 @@ class FetchTest(unittest.TestCase):
         self.assertEqual((CERT.logs_root, CERT.artifact, CERT.runbook), (CERT_2.logs_root, CERT_2.artifact, CERT_2.runbook))
 
     def test_the_first_slice_stays_watched_under_the_name_its_job_still_has(self):
-        # oss-test-infra renames the job only once a release admits the new
-        # name; until then the old name is the job that runs, and a failed
-        # build of it must still write a note.
+        # Until oss-test-infra renames the job, the old name is the job
+        # that runs, and a failed build of it must still write a note.
         self.assertEqual(CERT_OLD.job, periodics.VALIDATED_CAPABILITIES_SLICE_1_OLD_JOB)
         self.assertEqual(dataclasses.replace(CERT_OLD, job=CERT.job), CERT)
         objects = archive_at(f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT_OLD.job}", {"300": finished(NOW - timedelta(days=1), passed=False)})
@@ -182,9 +181,8 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(notes[CERT_OLD.job][periodics.KEY_VERDICT], periodics.VERDICT_FAILED)
 
     def test_a_lane_slice_with_no_build_yet_writes_no_note(self):
-        # A slice is admitted here before its job has run once (its first
-        # build waits for a release that admits its name): nothing to read
-        # is not a stale run, and the slice that has builds is still read.
+        # A slice is watched here before its job has run once: nothing to
+        # read is not a stale run, and the slice that has builds is still read.
         objects = archive_at(f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT.job}", {"300": finished(NOW - timedelta(days=2))})
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(CERT, CERT_2), runner=FakeGcloud(objects))

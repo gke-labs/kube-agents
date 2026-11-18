@@ -237,7 +237,7 @@ RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
 VALIDATED_CAPABILITIES_SLICE_JOBS = {1: "ci-kube-agents-validated-capabilities-1", 2: "ci-kube-agents-validated-capabilities-2"}
 # The name the first slice's job has until oss-test-infra renames it. It is
 # the job that runs until then, so it stays watched; it leaves this file
-# with its name in hack/ci-deploy.sh's EVAL_MODE_NEXT_JOB_NAMES.
+# once the job is renamed there.
 VALIDATED_CAPABILITIES_SLICE_1_OLD_JOB = "ci-kube-agents-certification-1"
 # A week between runs, plus a day: a Saturday run that never started (no
 # cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
