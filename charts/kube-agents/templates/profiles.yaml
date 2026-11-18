@@ -54,7 +54,7 @@ spec:
 {{- end }}
 {{- /*
 The generic cluster agent (#3658): one AgentProfile for every cluster in scope,
-with the target named per task by the project, location and cluster
+with the target named per task by the project, cluster and location
 parameters. Its persona is agents/cluster/persona, published as the
 persona-cluster image, and its worker pods come from the profile dispatcher,
 so no pod runs it until the dispatcher, the worker and the pool land (#4148,
