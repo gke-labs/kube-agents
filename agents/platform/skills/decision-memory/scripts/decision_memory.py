@@ -7,7 +7,7 @@ REST API only, and reads and writes git. Every subcommand prints JSON on stdout
 so any harness (a Hermes skill, a mode-next worker, a Kubernetes CronJob, a CI
 step) can drive it.
 
-System of record: Operational Knowledge Framework (OKF) records in the GitOps
+System of record: Open Knowledge Format (OKF) records in the GitOps
 repository, ``knowledge/decision/*.md`` / ``knowledge/decisions/*.md`` and
 ``knowledge/lesson/*.md`` / ``knowledge/lessons/*.md`` (Markdown + YAML
 frontmatter). The Hindsight bank is a derived index of them and can be rebuilt
