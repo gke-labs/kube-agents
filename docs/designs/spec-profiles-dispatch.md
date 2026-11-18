@@ -510,7 +510,10 @@ leave open:
   grace is never shorter than a renewal and two ticks, so one silent since before the stop is
   always past the count's threshold when it ends). The
   state is in memory, and the dispatcher's health lists open and half-open breakers. A held
-  task isn't told it is held yet (#4362).
+  task isn't told it is held yet (#4362). The breaker guards the tier's runner: at an
+  unattended tier that is Job mode, and at any other tier the warm pool. A permit-carrying
+  task's own Job at a pool's tier (#5646) stays clear of that breaker: it doesn't wait on it,
+  is never its probe, and its finish or lost worker neither opens nor closes it.
 - **Job mode (#3655 PR 6b).** With a Job runner, an unattended task runs on a Job of its own:
   the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
   Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm

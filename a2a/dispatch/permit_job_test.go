@@ -529,3 +529,115 @@ func TestAJobFoundByNameMustBeTheTasksOwn(t *testing.T) {
 		t.Errorf("a Job swapped after Launch: %v, want ErrJobNotOurs", err)
 	}
 }
+
+// permitBreakerBus runs readPermitInstall with a Job runner, a pool pod and a
+// Job pod for task id, and gives back the dispatcher, so a test can set the
+// read tier's breaker. The pool's tier breaker guards the pool; a
+// permit-carrying task's own Job at that tier (#5646) stays clear of it.
+func permitBreakerBus(t *testing.T, id string, jobAnswer time.Duration, noRenew bool) (*bus, *Dispatcher, *fakeWorker) {
+	t.Helper()
+	b := newBus(t, "tse-0", "job-"+id)
+	b.ensure("tse", 2, 0, "read")
+	pool := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	job := b.worker("tse", "read", "job-"+id, answerAccept, jobAnswer)
+	job.noRenew = noRenew
+	ti := readPermitInstall(2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 600 })
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	ti.pool.Set("tse", "read", "tse-0", "job-"+id)
+	ti.pool.SetUID("tse", "read", "job-"+id, "uid-1")
+	kp, _ := signingKey(t)
+	var d *Dispatcher
+	b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(dd *Dispatcher) { d = dd; d.UseJobs(newFakeJobs(0)) })
+	return b, d, pool
+}
+
+func readBreaker(d *Dispatcher) (br breaker, ok bool) {
+	d.breakers.mu.Lock()
+	defer d.breakers.mu.Unlock()
+	p, ok := d.breakers.m[ptKey{"tse", "read"}]
+	if ok {
+		br = *p
+	}
+	return br, ok
+}
+
+// An open read breaker doesn't hold back a permit-carrying task's own Job,
+// and that task's finish doesn't close the pool's breaker: a pool task still
+// waits.
+func TestAPermitJobRunsPastAnOpenPoolBreakerAndLeavesItOpen(t *testing.T) {
+	b, d, pool := permitBreakerBus(t, "task-1", time.Second, false)
+	d.breakers.expired(d.src.Config(), "tse", "read", time.Now())
+	if got := d.Health().OpenBreakers; len(got) != 1 {
+		t.Fatalf("open breakers %v, want the read tier's", got)
+	}
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", clusterParams)
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("permit task under an open pool breaker: terminal %+v, want completed", ts)
+	}
+	if got := d.Health().OpenBreakers; len(got) != 1 || got[0] != "tse/read" {
+		t.Errorf("open breakers after the permit task = %v, want tse/read still open", got)
+	}
+	b.submitWith("tse", "read", lib.SubmitKindTop, "plain", "cap-ok", clusterParams)
+	time.Sleep(2 * time.Second) // several retries
+	if ts := b.terminalsOf("plain"); len(ts) != 0 || pool.startedTask("plain") {
+		t.Errorf("a pool task ran under the open breaker: terminals %+v", ts)
+	}
+}
+
+// A permit-carrying task's own Job is never the pool's half-open probe: its
+// finish leaves the half-open breaker for a pool task to close.
+func TestAPermitJobIsNotTheHalfOpenPoolBreakersProbe(t *testing.T) {
+	b, d, _ := permitBreakerBus(t, "task-1", time.Second, false)
+	d.breakers.expired(d.src.Config(), "tse", "read", time.Now())
+	d.breakers.mu.Lock()
+	d.breakers.m[ptKey{"tse", "read"}].openUntil = time.Now().Add(-time.Second) // past the cooldown: half open
+	d.breakers.mu.Unlock()
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", clusterParams)
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v", ts)
+	}
+	if br, ok := readBreaker(d); !ok || !br.halfOpen {
+		t.Errorf("the read breaker after a permit Job's finish = %+v (present %v), want still half open", br, ok)
+	}
+}
+
+// A permit-carrying task's Job whose worker stops renewing fails the task
+// lease-expired, but isn't counted on the pool's breaker.
+func TestAPermitJobsLostWorkerDoesNotOpenThePoolBreaker(t *testing.T) {
+	b, d, _ := permitBreakerBus(t, "task-1", time.Hour, true)
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", clusterParams)
+	if ts := b.waitTerminal("task-1", 20*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+		t.Fatalf("terminal %+v, want lease-expired", ts)
+	}
+	if br, ok := readBreaker(d); ok {
+		t.Errorf("the read breaker after a permit Job's lost worker = %+v, want none", br)
+	}
+}
+
+// A permit-carrying task's Job re-adopted after a restart still stays clear
+// of the pool's breaker: its lost worker fails it lease-expired without
+// opening the read tier's breaker.
+func TestAReadoptedPermitJobsLostWorkerDoesNotOpenThePoolBreaker(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "job-task-1", answerAccept, time.Hour)
+	ti := readPermitInstall(2, "job-task-1")
+	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 600 })
+	ti.pool.SetUID("tse", "read", "job-task-1", "uid-1")
+	jobs := newFakeJobs(0)
+	kp, _ := signingKey(t)
+	_, _, stop1 := b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) { d.UseJobs(jobs) })
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-1", clusterParams)
+	waitFor(t, 10*time.Second, "task-1 started", func() bool { return w.startedTask("task-1") })
+	stop1()
+	w.killed.Store(true)
+	var d *Dispatcher
+	b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(dd *Dispatcher) { d = dd; d.UseJobs(jobs) })
+	if ts := b.waitTerminal("task-1", 30*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+		t.Fatalf("terminal %+v, want lease-expired", ts)
+	}
+	if br, ok := readBreaker(d); ok {
+		t.Errorf("the read breaker after a re-adopted permit Job's lost worker = %+v, want none", br)
+	}
+}

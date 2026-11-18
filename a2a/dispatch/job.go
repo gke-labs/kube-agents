@@ -93,7 +93,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		// The breaker guards the tier's runner. At an unattended tier that is
 		// Job mode; a permit-carrying task's Job at any other tier is not that
 		// tier's warm pool, so its failure doesn't hold back the pool's tasks.
-		if h.unattended {
+		if !h.permitJob {
 			d.breakers.expired(snap, h.profile, h.tier, d.now())
 		}
 		d.endUnstarted(ctx, log, del, h.key(), lib.StateFailed, &refusal{ReasonNoWorker, detail})
