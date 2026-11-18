@@ -5841,6 +5841,22 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
       return 0
     fi
   fi
+  # A case graded by post_merge_outcome (bench/kube_agents_bench/post_merge.py)
+  # merges the agent's fix pull request itself, as no reconciler or reviewer
+  # does inside a run. The ledger App mints it a token narrowed to this
+  # repository with only the two permissions a merge needs; the agent never
+  # sees it. Without one the check errors, which grades the repetition MISSING.
+  unset EVAL_POST_MERGE_WRITE_TOKEN
+  # GitHub only: on GitLab forge_write_token hands back the agent's own token.
+  # Minted at launch and good for an hour, which covers the agent's turn plus
+  # the check's ten minutes of ticks; a unit that outlasts it errors its cleanup
+  # into the log rather than silently.
+  if [ "${EVAL_FORGE_KIND:-github}" = "github" ] && grep -q 'type: post_merge_outcome' "${BENCH_DIR}/${task#./}" 2>/dev/null && [ -n "${EVAL_LEDGER_REPO:-}" ]; then
+    local merge_token=""
+    merge_token="$(forge_write_token "${EVAL_LEDGER_REPO}" '{"pull_requests":"write","contents":"write"}')" ||
+      echo "WARNING: ${name} rep ${rep}: no merge token for ${EVAL_LEDGER_REPO}; post_merge_outcome will error" >&2
+    [ -n "${merge_token}" ] && export EVAL_POST_MERGE_WRITE_TOKEN="${merge_token}"
+  fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
     export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
