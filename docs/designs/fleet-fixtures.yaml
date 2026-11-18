@@ -271,9 +271,9 @@ fixtures:
       deletes it, and no snapshot schedule took the snapshot. The GCE compute
       audit's orphaned-snapshots check flags it once
       (now - creationTimestamp).days > 90, so the role is not ready, rather
-      than drifted, until day 91. The posture the pool project's GitOps
-      knowledge/ note is to declare on purpose once the check is ruled
-      declarable, so the compute audit lists it under Declared intent.
+      than drifted, until day 91. The pool project's GitOps knowledge/ note
+      declares the snapshot on purpose, so the compute audit lists it under
+      Declared intent rather than as a finding.
 
   - role: orphan-snapshot
     slot: null # Project-scoped, a global object; not attached to any cluster.

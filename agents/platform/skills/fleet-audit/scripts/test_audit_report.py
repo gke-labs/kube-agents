@@ -6809,7 +6809,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Four streams have no declared-intent step. A worker on one of them that writes a
+        # The streams with no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6821,7 +6821,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 6)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -8111,6 +8111,114 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         self.assertEqual(rc, 2, self.err)
         self.assertIn("declared[]: NodePool/zonal-full", self.err)
         self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
+
+
+class TestComputeDeclaredShapes(HarnessTestCase):
+    """The compute stream's one posture: a snapshot kept after its source disk is gone. One arm, one object kind."""
+
+    COMPUTE = "gce-compute-fleet-audit"
+    PROJECT = "project/acme-prod"
+    # The collector's excerpt for 2.5 (compute_fleet_audit.py
+    # check_orphaned_snapshot): the snapshot, its gone source disk and the
+    # server-set timestamp.
+    SNAPSHOT_EXCERPT = '{"name": "legal-hold-2025", "sourceDisk": "ledger-disk", "creationTimestamp": "2025-01-10T09:00:00.000-08:00"}'
+
+    def _snapshot_finding(self, fid="snap", obj="Snapshot/legal-hold-2025", namespace=""):
+        return make_finding(fid=fid, check="orphaned-snapshots", severity="minor", cluster=self.PROJECT, namespace=namespace, obj=obj, excerpt=self.SNAPSHOT_EXCERPT, command="gcloud compute snapshots list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _startup_finding(self):
+        return make_finding(fid="boot", check="gce-startup-script-status", severity="critical", cluster=self.PROJECT, namespace="", obj="ComputeInstance/us-central1-a/vm-1", excerpt="startup-script exit status 1", command="gcloud compute instances get-serial-port-output vm-1 --zone=us-central1-a --project=acme-prod --port=1", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [{"name": self.PROJECT, "location": "global", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.COMPUTE, self.PROJECT))}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.COMPUTE, clusters=clusters), self.COMPUTE)
+
+    def _declaration(self, obj, check="orphaned-snapshots", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/legal-hold.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_orphaned_snapshot(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.COMPUTE), frozenset({"orphaned-snapshots"}))
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.COMPUTE))
+
+    def test_a_declaration_moves_the_snapshot_and_leaves_the_failed_startup_script(self):
+        # One note names the snapshot and the instance. The snapshot moves;
+        # the failed boot is a fault and is never looked up, whatever the
+        # note says.
+        doc = self._doc([self._snapshot_finding(), self._startup_finding()])
+        declarations = [self._declaration("Snapshot/legal-hold-2025"), self._declaration("ComputeInstance/us-central1-a/vm-1", check="gce-startup-script-status")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ComputeInstance/us-central1-a/vm-1"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Snapshot/legal-hold-2025"])
+        self.assertEqual(doc["declared"][0]["declaration"]["path"], "knowledge/legal-hold.md")
+        self.assertNotIn("DECLARATION NOT APPLIED", err.getvalue())
+
+    def test_a_scoped_declaration_covers_its_project_alone(self):
+        # `cluster` on the item is the finding's `project/<id>`; a note scoped
+        # to another project leaves this one's snapshot a finding.
+        doc = self._doc([self._snapshot_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025", cluster="project/other-prod")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Snapshot/legal-hold-2025"])
+        doc = self._doc([self._snapshot_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025", cluster=self.PROJECT)])
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+
+    def test_the_manifest_route_declares_a_covered_candidate(self):
+        candidate = {"check": "orphaned-snapshots", "cluster": self.PROJECT, "namespace": "", "object": "Snapshot/legal-hold-2025", "severity": "minor", "excerpt": self.SNAPSHOT_EXCERPT}
+        manifest = {"clusters": [{"name": self.PROJECT, "candidates": [candidate]}]}
+        doc = self._doc([])
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, [self._declaration("Snapshot/legal-hold-2025")], manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(candidate))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Snapshot/legal-hold-2025"])
+
+    def test_an_incomplete_search_withholds_the_snapshot_and_publishes_the_faults(self):
+        doc = self._doc([self._snapshot_finding(), self._startup_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["Snapshot/legal-hold-2025"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ComputeInstance/us-central1-a/vm-1"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_snapshot(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="orphaned-snapshots", cluster=self.PROJECT, namespace="", obj="Snapshot/legal-hold-2025", title="legal-hold-2025 is kept under a legal hold by design", repo="acme/fleet", path="knowledge/legal-hold.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "orphaned-snapshots"
+        for obj in ("Disk/ledger-disk", "Project/acme-prod", "ComputeInstance/us-central1-a/vm-1"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("snapshot", str(cm.exception))
+
+    def test_a_namespace_a_worker_wrote_onto_the_snapshot_is_folded_before_the_join(self):
+        # The collector files the snapshot with no namespace on a project
+        # target and the note writes `namespace: ""`; a worker's namespace
+        # would give the snapshot a second identity, so the validator empties
+        # it (UNNAMESPACED_CHECKS) and the declaration still joins.
+        doc = self._doc([self._snapshot_finding(namespace="default")])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.snapshot-legal-hold-2025", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025")])
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):

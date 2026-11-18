@@ -65,7 +65,7 @@ ffs = _load_module()
 verifier = _load_module(_VERIFIER, "verify_ci_pool_project")
 
 # The declared-intent note as the fixture gate reads it: its path in the pool
-# repository, the blob sha of the six-item content provisioning seeds, and
+# repository, the blob sha of the content provisioning seeds, and
 # the blob the forty registered projects carried after the sixth declaration
 # landed (#5827), which the gate must read as drift.
 _NOTE_PATH = verifier.GITOPS_INTENT_NOTE_PATH
@@ -74,7 +74,7 @@ _SEEDED_NOTE_SHA = verifier.gitops_seeded_blob_sha(_NOTE_PATH)
 _FIVE_ITEM_NOTE_SHA = "3c5790d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
 _POOL_REPO = "gke-agentic/kube-agents-evals-infra"
 # The catalog roles that carry the note assertion: every declared-* role.
-_NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+_NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering", "declared-orphan-snapshot"}
 
 
 class _SteppedClock:

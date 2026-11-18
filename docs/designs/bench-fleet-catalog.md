@@ -138,7 +138,7 @@ its roles are never published.
 | `startup-fail-vm`                   | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                                                                                                                                       |
 | `world-open-ingress`                | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                                                                                                                               |
 | `declared-mtu-peering`              | project | 0   | `mtu-peer-declared`, a custom-mode VPC at MTU 8896, no subnet, peered both ways with `default` (MTU 1460); not a defect, the networking SOP's 2.4 peered-MTU posture, graded by no case until the stream's declared-intent slice lands                                                                                                        |
-| `declared-orphan-snapshot`          | project | 91  | `declared-orphan-snap-<prefix>`, a snapshot of a throwaway disk the planter deleted, taken by no schedule: the GCE compute audit's orphaned-snapshots posture once it is more than 90 full days old, to be declared on purpose in the GitOps repository's `knowledge/` once the check is ruled declarable; not ready, not drifted, until then |
+| `declared-orphan-snapshot`          | project | 91  | `declared-orphan-snap-<prefix>`, a snapshot of a throwaway disk the planter deleted, taken by no schedule: the GCE compute audit's orphaned-snapshots posture once it is more than 90 full days old, declared on purpose in the GitOps repository's `knowledge/` note and so listed under Declared intent; not ready, not drifted, until then |
 | `orphan-snapshot`                   | project | 91  | `orphan-snap-<prefix>`, the second snapshot of the same disk, undeclared: the control the compute audit keeps filing beside the declared one                                                                                                                                                                                                  |
 | `version-laggard`                   | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                                                                                                                                    |
 | `drift-outlier`                     | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                                                                                                                                       |
@@ -338,9 +338,9 @@ the longest gate in the fleet: the GCE compute audit's orphaned-snapshots check 
 only when `(now - creationTimestamp).days > 90`, and the snapshot's timestamp is as immutable as
 the disk's. They are the one pair the fixture-state scan reports **not ready**, with the date,
 rather than drifted until then (`ready_after_hours` in `fixtures.json`), so a project applied
-today is registrable; the compute stream's declared-intent case, once the check is ruled
-declarable, is parked until the scan reads both roles healthy on every project, which is day 91
-of the last applied project. `cost-declared-intent-no-finding`'s posture is
+today is registrable; the compute stream's declared-intent case,
+`compute-declared-intent-no-finding`, is parked `FIXTURE_NOT_READY` until the scan reads both roles
+healthy on every project, which is day 91 of the last applied project. `cost-declared-intent-no-finding`'s posture is
 observable on apply day, but the case reads the cost ledger, which exists only once some other
 cost finding does, so it waits for the idle pool's day 7.
 

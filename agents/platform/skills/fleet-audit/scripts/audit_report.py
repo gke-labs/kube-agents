@@ -492,6 +492,16 @@ AUDITS: dict[str, AuditSpec] = {
                 ),
             ),
         ),
+        # §2a of the SOP: the one check that judges a retained object an
+        # owner may keep on purpose, a snapshot whose source disk is gone
+        # (a legal hold, a pre-migration copy), and so the only one a
+        # repository declaration may keep off the ledger; the waste audit
+        # already lets an owner declare the same shape for a kept disk. One
+        # arm, one object kind (`Snapshot/<name>`), so no arm rule. The other
+        # three are live faults no declaration excuses: a startup script that
+        # failed on the last boot, a group creating and deleting at once, a
+        # reservation with less than one host free.
+        declarable=("orphaned-snapshots",),
     ),
     "upgrade-retrospective": AuditSpec(
         "Upgrade Retrospective",
@@ -2060,13 +2070,24 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
 STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     ZONE_ARM_CHECK: frozenset({"nodepool"}),
 }
+# The compute stream's one declarable check, 2.5 `orphaned-snapshots`, names
+# the snapshot and nothing else: the collector files `Snapshot/<name>` (a
+# global object, no zone segment), and a `Disk/` or a `Project/` covers no
+# snapshot. One arm: the excerpt carries nothing live, so the join needs no
+# arm rule and the plain `_declaration_covers` path moves it.
+ORPHANED_SNAPSHOT_CHECK = "orphaned-snapshots"
+COMPUTE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    ORPHANED_SNAPSHOT_CHECK: frozenset({"snapshot"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
-# reads it for the measured-size title, which a stockout row does not carry.
+# reads it for the measured-size title, which a stockout or a compute row
+# does not carry.
 DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **COST_DECLARABLE_OBJECT_KINDS,
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+    **COMPUTE_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -2086,9 +2107,11 @@ COST_DECLARED_MINOR = "minor"
 # stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
 # its collector files `NodePool/<pool>` with no namespace, and a worker's
 # namespace on the finding would give the pool an identity no declaration and
-# no candidate matches. Every slug here belongs to one stream, so no stream
-# test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK})
+# no candidate matches. So does the compute snapshot check
+# (`ORPHANED_SNAPSHOT_CHECK`), filed on a `project/<id>` target with no
+# namespace. Every slug here belongs to one stream, so no stream test is
+# needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
