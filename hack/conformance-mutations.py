@@ -372,6 +372,25 @@ MUTATIONS: list[Mutation] = [
         "gateway -- its token is projected beside a Chat adapter that reads untrusted input",
     ),
     Mutation(
+        "A3-report-a2a-reports-caller-any-audience",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if username in self.a2a_reports_callers and role not in (CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_A2A_CHAT):\n",
+         "        if False:\n"),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader's account present any audience, since its pod "
+        "projects only the a2a-reports and a2a-chat ones -- the binding then holds "
+        "in one direction only, and the gateway's identity reaches the shell's role",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-any-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if role == CALLER_ROLE_A2A_REPORTS and username not in self.a2a_reports_callers:\n",
+         "        if False:\n"),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "leave the a2a-reports audience to decide, since only the A2A gateway's pod "
+        "projects it -- the role is then bound to no identity at all",
+    ),
+    Mutation(
         "A3-a2a-reports-reaches-exec",
         "agents/platform/scripts/credential_proxy.py",
         ('    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),\n',
