@@ -74,6 +74,13 @@ class FillTest(unittest.TestCase):
         self.assertIsNone(self.edited_value(2))
         self.assertIsNone(self.edited_value(4))
 
+    def test_the_deadline_runs_from_when_the_merge_was_noticed(self):
+        old = (NOW - post_merge_edited.EDITED_DEADLINE - timedelta(days=3)).isoformat()
+        self.add(1, merged_at=old, merge_checked_at=(NOW - timedelta(minutes=5)).isoformat())
+        self.add(2, merged_at=old, merge_checked_at=old)
+        post_merge_edited.fill_human_edited(self.conn, self.edited({1: False}), NOW)
+        self.assertEqual(self.asked, [1])
+
     def test_at_most_limit_reads_newest_merge_first(self):
         for n in (1, 2, 3):
             self.add(n, merged_at=(NOW - timedelta(minutes=10 * n)).isoformat())

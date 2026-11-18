@@ -77,12 +77,17 @@ def fill_environments(conn: sqlite3.Connection, environment_of: EnvironmentOf = 
     now = now or datetime.now(timezone.utc)
     seen: dict[str, list[str]] = {"filled": [], "unreadable": [], "given-up": [], "errors": []}
     read: dict[tuple[str, str, str], str | None] = {}
+    reads = 0
     for url, project, location, cluster, outcome_at in conn.execute(FILL_SQL).fetchall():
         record = {"url": url, "project": project, "location": location, "cluster": cluster}
         key = post_merge_check.cluster_coordinates(record)
+        if key not in read and not all(key):
+            # Named too little to read: no sandbox call, so none of ``limit``.
+            read[key] = None
         if key not in read:
-            if len(read) >= limit:
+            if reads >= limit:
                 continue
+            reads += 1
             try:
                 read[key] = environment_of(record)
             except Exception as exc:  # noqa: BLE001 — read again next run

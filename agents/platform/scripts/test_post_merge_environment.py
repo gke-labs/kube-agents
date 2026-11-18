@@ -75,6 +75,13 @@ class FillTest(unittest.TestCase):
         pme.fill_environments(self.conn, self.reader(answers), NOW, limit=1)
         self.assertEqual(self.env(3), "prod")
 
+    def test_an_unnamed_cluster_costs_no_read(self):
+        self.add(1, cluster="bare", age=timedelta(minutes=1))
+        self.add(2, cluster="p1/us-central1/a", age=timedelta(minutes=2))
+        seen = pme.fill_environments(self.conn, self.reader({"p1/us-central1/a": "dev"}), NOW, limit=1)
+        self.assertEqual((self.reads, seen["unreadable"], seen["filled"]),
+                         (["p1/us-central1/a"], [f"{REPO}/pull/1"], [f"{REPO}/pull/2"]))
+
     def test_a_failed_read_is_retried_then_given_up(self):
         self.add(1)
         boom = {"p1/us-central1/c1": RuntimeError("denied")}

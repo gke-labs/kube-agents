@@ -9,7 +9,8 @@ or requested changes on it (a person or another automation, such as a
 dependency bot), ``0`` when neither happened, by the pull-request sweep's own
 rule (``vcs_readings.classify_touch``). A record whose commits or reviews cannot
 be read in full stays ``NULL``, which the counter reads as not clean, and is
-asked again next tick until :data:`EDITED_DEADLINE` after its merge; a merge
+asked again next tick until :data:`EDITED_DEADLINE` after the check noticed the
+merge (``merge_checked_at``, stamped by the read that found it); a merge
 time that will not parse is not asked.
 
 ``post_merge_edited.py fill`` is one tick, at most
@@ -31,13 +32,13 @@ import post_merge_check
 
 logger = logging.getLogger(__name__)
 
-#: How long after the merge an unreadable record is still asked about.
+#: How long after the check noticed the merge an unreadable record is still asked about.
 EDITED_DEADLINE = timedelta(days=1)
 
 Edited = Callable[[str, int], "bool | None"]
 
 FILL_SQL = (
-    f"SELECT url, repo, number, merged_at FROM {post_merge_check.RECORDS_TABLE} "
+    f"SELECT url, repo, number, merged_at, merge_checked_at FROM {post_merge_check.RECORDS_TABLE} "
     "WHERE merged_at IS NOT NULL AND human_edited IS NULL ORDER BY merged_at DESC"
 )
 
@@ -97,12 +98,14 @@ def fill_human_edited(conn: sqlite3.Connection, edited: Edited = forge_human_edi
     Returns the urls under ``edited``, ``clean``, ``unknown`` (left NULL, asked
     again next tick) and ``errors``. A record merged more than
     :data:`EDITED_DEADLINE` ago is no longer asked and costs none of ``limit``.
+    The clock starts when the check noticed the merge, not at the forge's merge
+    time, so a merge noticed late is still asked.
     """
     now = now or datetime.now(timezone.utc)
     seen: dict[str, list[str]] = {"edited": [], "clean": [], "unknown": [], "errors": []}
     asked = 0
-    for url, repo, number, merged_at in conn.execute(FILL_SQL).fetchall():
-        merged = post_merge_check._parse_time(merged_at)
+    for url, repo, number, merged_at, noticed_at in conn.execute(FILL_SQL).fetchall():
+        merged = post_merge_check._parse_time(noticed_at) or post_merge_check._parse_time(merged_at)
         if merged is None or now - merged > EDITED_DEADLINE:
             continue
         if asked >= limit:
