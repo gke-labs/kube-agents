@@ -106,6 +106,12 @@ resource "google_service_account" "nodes" {
 # The default pool is the planted pool, created with the cluster, so the
 # apply pays for one pool rather than a throwaway one and its replacement.
 # Its nodes are the smallest shape GKE runs: only their count matters.
+#
+# No authorized-networks list: the harness reads the planted nodes from a
+# runner or a laptop whose address is not known when the stack is written,
+# and the cluster lives for one repetition. The control plane still asks for
+# credentials.
+#trivy:ignore:AVD-GCP-0061
 resource "google_container_cluster" "plant" {
   name     = local.name
   location = var.location
