@@ -105,6 +105,14 @@ jobs:
           # generator's Hindsight probe permanently unable to ask.
           cat > "$RUNNER_TEMP/kube-agents-test-bin/kubectl" <<'EOF'
           #!/usr/bin/env bash
+          # The live Secret read (-o json) answers the way an absent Secret
+          # does: an empty success is no answer at all, and the installer
+          # refuses an applying run on one rather than write its keys empty.
+          case "$*" in
+            *"get secret platform-agent-secrets"*"-o json"*)
+              echo 'Error from server (NotFound): secrets "platform-agent-secrets" not found' >&2
+              exit 1 ;;
+          esac
           if [ "$*" = "config current-context" ]; then
             # What real kubectl does with no context: nothing on stdout, exit 1.
             [ -f "$RUNNER_TEMP/kube-agents-stub-context" ] || exit 1

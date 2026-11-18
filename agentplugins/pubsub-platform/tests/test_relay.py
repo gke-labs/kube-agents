@@ -17,9 +17,22 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from test_dedup import adapter_mod
+import test_dedup
 
-LOGGER_NAME = adapter_mod.__name__
+LOGGER_NAME = test_dedup.ADAPTER_MODULE_NAME
+adapter_mod = None
+_put_back = None
+
+
+def setUpModule():
+    """This file's own load of the adapter; what it changes in the process is put back after."""
+    global adapter_mod, _put_back
+    adapter_mod, _put_back = test_dedup.load_adapter_for_a_test_file()
+
+
+def tearDownModule():
+    _put_back()
+
 PROJECT = "example-project"
 SUB_PATH = f"projects/{PROJECT}/subscriptions/stockout-alerts-sub"
 ROUTE = "gke_stockout_alerts"

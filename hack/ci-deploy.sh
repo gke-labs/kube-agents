@@ -626,6 +626,9 @@ readonly A2A_AGENT_DOOR_ON="true"
 # it must not mount are the operator's, not this script's. The script names
 # the container only to read its log (a2aBridgeContainerName).
 readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
+# How many times steps 6 and 6b read the agent pod template for the bridge
+# before a read that never answers is reported as unreadable (#5973).
+readonly BRIDGE_TEMPLATE_READ_ATTEMPTS=3
 # The lane runs the bridge's shipped default executor, api, the one a customer
 # install runs. Nothing here sets it: with the operator's A2A_BRIDGE_EXECUTOR
 # unset the rendered bridge carries no BRIDGE_EXECUTOR, and the bridge picks
@@ -2517,54 +2520,49 @@ if ! kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" 
   exit 1
 fi
 
-# The gateway's second roll on a fresh install (#5962). The operator adds the
-# bridge sidecar to the agent pod only once it has recorded the bus
-# provisioned (a2aBridgeInPod), a reconcile or two after the provisioning
-# Job, so the rollout above can pass on the first ReplicaSet and the gateway
-# then restarts under whatever check runs next (the web console's, below).
-# Wait for the template to carry the bridge, then for that rollout, as step
-# 6b does for the mode upgrade. Not a gate: an operator that renders no
-# bridge (one before the A2A stack always rendered) never adds it, and that
-# is not this deploy's failure, so the wait is skipped (no callout
-# Deployment) or ends, and the deploy carries on.
-# Once the operator renders the bridge from the first pass, the template
-# already carries it and this costs one read.
-BRIDGE_ROLL_START=$SECONDS
-bridge_in_template=false
-bridge_polls="${MODE_NEXT_GENERATION_ATTEMPTS}"
-# No callout Deployment means this operator rendered no A2A stack, and so no
-# bridge: skip the wait rather than spend its whole budget. Only a NotFound
-# says that; a read that fails any other way waits, since skipping on a
-# transient API error would bring back the restart this wait is for. (The
-# operator holds the gateway until the callout serves, so by the rollout
-# above an operator that renders the stack has created the callout.)
+# The bridge in the agent pod from the first render (#5962). The operator
+# renders the bridge sidecar before the bus is provisioned (a2aBridgeInPod),
+# so the rollout above already carried it and the gateway does not roll a
+# second time under the checks below. One read guards that: an operator that
+# adds the bridge later would restart the gateway under the web console's
+# check, as two runs on 11-15/16 did (HTTP 502 agent_unreachable), so it is
+# named here. A warning, not a gate: a migration given up withholds the
+# bridge on purpose until the bus is provisioned again, and an operator that
+# renders no A2A stack (no callout Deployment) has no bridge to check.
+# Only a NotFound on the callout says there is no A2A stack; any other
+# failed read still checks the template.
+bridge_check=true
 callout_read="$(kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout" -n "${NAMESPACE}" -o name 2>&1)" || {
   case "${callout_read}" in
-    *NotFound*) bridge_polls=0 ;;
+    *NotFound*) bridge_check=false ;;
   esac
 }
-for ((poll = 0; poll < bridge_polls; poll++)); do
-  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null || true) " in
-    *" ${BRIDGE_SIDECAR_NAME} "*)
-      bridge_in_template=true
-      break
-      ;;
-  esac
-  sleep "${MODE_NEXT_POLL_SECONDS}"
-done
-if [ "${bridge_in_template}" = true ]; then
-  if ! kubectl rollout status "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" --timeout="${MODE_NEXT_ROLLOUT_TIMEOUT}"; then
-    echo "ERROR: ${AGENT_DEPLOYMENT_NAME} rollout with the ${BRIDGE_SIDECAR_NAME} sidecar failed"
-    kubectl describe "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" || true
-    kubectl get pods -n "${NAMESPACE}" || true
-    kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
-    exit 1
-  fi
-  echo "✓ ${AGENT_DEPLOYMENT_NAME} rolled out with the ${BRIDGE_SIDECAR_NAME} sidecar ($((SECONDS - BRIDGE_ROLL_START))s after the first rollout)"
-elif [ "${bridge_polls}" -eq 0 ]; then
-  echo "no ${PLATFORM_AGENT_CR_NAME}-a2a-callout Deployment, so this operator renders no A2A stack and no ${BRIDGE_SIDECAR_NAME} sidecar: there is no second roll to wait for"
+if [ "${bridge_check}" = false ]; then
+  echo "no ${PLATFORM_AGENT_CR_NAME}-a2a-callout Deployment, so this operator renders no A2A stack and no ${BRIDGE_SIDECAR_NAME} sidecar to check"
 else
-  echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} sidecar after $((SECONDS - BRIDGE_ROLL_START))s (bus not provisioned yet?); carrying on without the second-roll wait"
+  # A read that fails is retried, and one that never answers is named as
+  # such rather than as a missing bridge.
+  agent_containers=""
+  agent_read=false
+  for ((attempt = 0; attempt < BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if agent_containers="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)"; then
+      agent_read=true
+      break
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if [ "${agent_read}" = false ]; then
+    echo "WARNING: could not read ${AGENT_DEPLOYMENT_NAME}'s template to check for the ${BRIDGE_SIDECAR_NAME} sidecar; carrying on"
+  else
+    case " ${agent_containers} " in
+      *" ${BRIDGE_SIDECAR_NAME} "*)
+        echo "✓ ${AGENT_DEPLOYMENT_NAME} carries the ${BRIDGE_SIDECAR_NAME} sidecar from its first rollout"
+        ;;
+      *)
+        echo "WARNING: the A2A stack is rendered but ${AGENT_DEPLOYMENT_NAME}'s template has no ${BRIDGE_SIDECAR_NAME} sidecar after its rollout; an operator that adds it later rolls the gateway again under the checks below (#5962)"
+        ;;
+    esac
+  fi
 fi
 
 # The shell sandbox is the other half of the agent: everything the model runs
@@ -2808,20 +2806,17 @@ gate_web_console today
 # mode alone does not give it. The inject door's Service and token Secret are
 # waited for (the operator renders them only with the flag step 5 set on it;
 # hack/ci-eval-pr.sh reads that Secret). The bridge sidecar is the
-# operator's: it budgets it from the first next render and adds it to the
-# agent pod once the bus is provisioned, with the image and BRIDGE_CONCURRENCY
+# operator's: it budgets it and puts it in the agent pod from the first
+# render (#5962), with the image and BRIDGE_CONCURRENCY
 # step 5 set on it and the bridge's default executor
 # (a2a/docs/hermes-bridge.md, "Where it runs"), so the mode upgrade is the only
 # change and the first provisioning Job already budgets the bridge's workers:
 # no second render re-measures that budget against the stream the Job
 # created, so the refusal #2077 guarded against cannot arise. The bridge
-# enters the agent pod only once the bus is provisioned (BusProvisioned), so
-# the agent Deployment rolls twice: once for the mode upgrade and once, after
-# the Job, for the bridge. The step gates both rolls. On an operator that
-# renders the A2A stack from its first pass whatever the mode, both rolls
-# already happened before step 6's web console check, which waits for the
-# second (#5962), so here the bridge is in the template on the first read and
-# both gates pass at once. Then the step ends on the bridge's own word that it is
+# waits for the bus instead of exiting, so the agent Deployment rolls once:
+# the step gates that rollout and reads the template once for the bridge,
+# failing without it, since the log loop after needs the container (#5973).
+# Then the step ends on the bridge's own word that it is
 # consuming `platform` tasks; until then the bus has an executor for nobody
 # and every case on the inject transport ends as infrastructure. A rendered
 # bridge leaves with the mode, so a flip back to today needs no CR edit for
@@ -3274,28 +3269,36 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
 
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
 
-  # The second roll: the operator adds the bridge to the agent pod once it has
-  # recorded the bus provisioned, a reconcile or two after the Job completes.
-  # Wait for the template to carry it, then gate that rollout like the first,
-  # so the bridge log loop below starts against a pod that has the container
-  # rather than spending its budget on scheduling (#2414) and image pulls.
-  BRIDGE_TEMPLATE_START=$SECONDS
-  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
-    case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}') " in
-      *" ${BRIDGE_SIDECAR_NAME} "*) break ;;
-    esac
+  # The bridge is in the agent pod from the first render (#5962): the
+  # operator renders it before the bus is provisioned, so the rollout above
+  # already carried it, and the bridge log loop below starts against a pod
+  # that has the container. One read guards that; here it is a gate, since
+  # the loop below needs the container.
+  # A read that fails is retried: only a read that answers without the
+  # container fails the step.
+  agent_containers=""
+  agent_read=false
+  for ((attempt = 0; attempt < BRIDGE_TEMPLATE_READ_ATTEMPTS; attempt++)); do
+    if agent_containers="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}')"; then
+      agent_read=true
+      break
+    fi
     sleep "${MODE_NEXT_POLL_SECONDS}"
   done
-  case " $(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].name}') " in
+  if [ "${agent_read}" = false ]; then
+    echo "ERROR: could not read deployment/${AGENT_DEPLOYMENT_NAME}'s template after its rollout" >&2
+    dump_mode_next_state
+    exit 1
+  fi
+  case " ${agent_containers} " in
     *" ${BRIDGE_SIDECAR_NAME} "*) ;;
     *)
-      echo "ERROR: the operator never added the ${BRIDGE_SIDECAR_NAME} container to deployment/${AGENT_DEPLOYMENT_NAME} after the bus was provisioned" >&2
+      echo "ERROR: deployment/${AGENT_DEPLOYMENT_NAME} has no ${BRIDGE_SIDECAR_NAME} container after its rollout; the operator renders it from the first render (#5962)" >&2
       dump_mode_next_state
       exit 1
       ;;
   esac
-  echo "✓ ${BRIDGE_SIDECAR_NAME} in the agent pod template $((BRIDGE_TEMPLATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
-  gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
+  echo "✓ ${BRIDGE_SIDECAR_NAME} in the agent pod template from the first render, $((SECONDS - MODE_NEXT_START))s after the mode switch"
 
   # The inject door. The operator renders its Service and token Secret on the
   # same reconcile as the gateway, so this is normally immediate; when it is

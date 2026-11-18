@@ -277,6 +277,30 @@ class Shapes(Harness):
         self.assertNotIn(HELD_OUT, body)
         self.assertNotIn("cases passed", body)
 
+    def test_a_hard_failure_during_a_forge_outage_names_it(self):
+        tasks = [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HELD_OUT, "ggg")]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        outage = {"state": "DEGRADED", "condition": "forge_outage", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [],
+                  "cause": "forge outage: grading's GitHub reads failed on 2 PRs 13:15–14:25 UTC",
+                  "incident": {"prs": [1, 2], "runs": 4, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+        self.tick(data(mine, *green_others()), outage)
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> 🔴 **The run failed without a gate case collapsing.**"), box)
+        self.assertIn("🟡 **Gate degraded** since Tue 9:00 AM ET. grading could not read GitHub on 2 PRs 9:15 AM–10:25 AM ET", box)
+        self.assertNotIn("rep", box)
+        # Any other incident, or a hard failure with no forge repetition (a
+        # real trip), leaves the hard box as it was.
+        self.tick(data(dict(mine, build_id="101", pr=1301), *green_others()), dict(outage, condition="storm"))
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+        tripped = run(102, 1302, NOW - timedelta(minutes=5), tasks=tasks[:-1], result="FAILURE")
+        self.tick(data(tripped, *green_others()), outage)
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+        # Below the signature (fewer than one case's three forge reps) is not the outage's either.
+        thin = run(103, 1303, NOW - timedelta(minutes=5), tasks=tasks[:-1] + [task(HELD_OUT, "gpp")], result="FAILURE")
+        tripped = thin
+        self.tick(data(tripped, *green_others()), outage)
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+
     def test_degraded_storm_match(self):
         names = sorted(ADMITTED)
         stormy = [task(names[0], "ffe")] + [task(name, "eee") for name in names[1:3]] + [task(name, "ppp") for name in names[3:]]
