@@ -22,7 +22,7 @@
 # the rules, is never planted: the webhook's one rule names an API group
 # nothing serves, its namespaceSelector matches a label no namespace carries
 # (this stack creates none), and its objectSelector requires a bench label,
-# so the API server never sends it a request. The certification suite's
+# so the API server never sends it a request. The validated-capabilities suite's
 # fixture rules (bench/README.md) ask exactly that of a fail-closed plant
 # with no backend: the check reads the configuration fields.
 #
