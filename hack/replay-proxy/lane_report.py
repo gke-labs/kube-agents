@@ -13,8 +13,14 @@ which the Prow job exports). It writes, into `--out`:
   conversation, what was served before the first miss, and the first-miss
   causes ranked by tokens lost;
 - `verdicts.json`: per case, the lane's repetitions (outcome, requests and
-  prompt tokens, how many were served) beside the outcomes of the same case in
-  each nightly that served it; and, per conversation that was served anything,
+  prompt tokens, how many were served); the case's outcomes on the newest
+  recording night on the replayed commit (`newest_night`: the builds
+  fetch_cache.py --night-out names for `--commit`, the night --print-commit
+  chose), or that it didn't run there, or that no such night is known, never
+  an older night's; the outcomes of the same case in each build an answer was
+  served from (`nightly`), which is where answers came from, not a verdict:
+  uploads are write-once, so that is the night that first wrote the answer,
+  often an older one on another commit; and, per conversation that was served anything,
   whether its run's verdict matched the recording's. Only answers from runs
   that passed are published (publish_cache.py), so a recording's verdict is a
   pass, and a mismatch is a replayed run that failed. A conversation whose run
@@ -24,7 +30,7 @@ which the Prow job exports). It writes, into `--out`:
   `unknown_reasons`. The recording night is the one that first wrote the
   answer, which can be as old as the bucket's lifecycle; the fetch reads runs
   that far back;
-- `summary.txt`: the commit replayed and the counts. Its lines also go to the job log, where the
+- `summary.txt`: the commit replayed, the newest night's builds on it, and the counts. Its lines also go to the job log, where the
   collector masks long hex runs, the commit included; the file in the bucket keeps it whole.
 
 The lane's safety cases run a live arm before the cache is seeded, then a
@@ -54,6 +60,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import analyze_replay
 import collect_shadow as CS
+import fetch_cache as FC
 import publish_cache as P
 import run_attribution as RA
 
@@ -71,6 +78,12 @@ NO_VERDICT = "no_verdict"
 REPORT_COMMIT = "commit"
 REPORT_COMMIT_SOURCE = "commit_source"
 UNKNOWN_COMMIT = "an unknown commit"
+# Per case, `newest_night` when the case has no outcome there: no run of it in
+# the night's builds, or no night on the replayed commit is known (no night
+# file, no commit, or a commit no build of the newest night ran: main, as a fallback).
+NIGHT_NOT_RUN = "not_run"
+NIGHT_UNKNOWN = "no_night_on_commit"
+REPORT_NIGHT = "newest_night"
 COMMIT_SOURCE_TEXT = {
     CS.COMMIT_SOURCE_RECORDING: "the commit the newest recording night ran",
     CS.COMMIT_SOURCE_MAIN: "main, as a fallback: no recording named a commit, or it could not be fetched",
@@ -145,7 +158,29 @@ def nightly_outcomes(nightly_runs: Dict[str, List[Dict[str, Any]]], build: str, 
             "outcomes": [str(r.get(P.RUN_OUTCOME)) for r in sorted(runs, key=lambda r: r.get(P.RUN_REP, 0))]}
 
 
-def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+def night_builds(night_path: str, commit: str) -> Optional[List[str]]:
+    """The newest night's builds that ran `commit` (fetch_cache.py --night-out), or None when none is known."""
+    night = RA.read_json(night_path) if night_path and commit else None
+    by_commit = night.get(FC.NIGHT_COMMIT_BUILDS) if isinstance(night, dict) else None
+    builds = by_commit.get(commit) if isinstance(by_commit, dict) else None
+    if not isinstance(builds, list) or not builds:
+        return None
+    return sorted(str(b) for b in builds)
+
+
+def night_outcomes(nightly_runs: Dict[str, List[Dict[str, Any]]], builds: Optional[List[str]], case: str) -> Any:
+    """A case's outcomes over the newest night's builds on the replayed commit, or why there are none."""
+    if builds is None:
+        return NIGHT_UNKNOWN
+    ran = [(b, o) for b in builds for o in [nightly_outcomes(nightly_runs, b, case)] if o is not None]
+    if not ran:
+        return NIGHT_NOT_RUN
+    return {"passes": sum(o["passes"] for _, o in ran), "scored": sum(o["scored"] for _, o in ran),
+            "outcomes": [x for _, o in ran for x in o["outcomes"]], "builds": [b for b, _ in ran]}
+
+
+def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict[str, Any]]],
+             newest_builds: Optional[List[str]] = None) -> Dict[str, Any]:
     runs = RA.load_runs(verdicts_dir)
     by_key = {run.key: run for run in runs}
     segments = lane_segments(keep_dir)
@@ -181,7 +216,8 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
                 row["served_from"].add(line.served_from_build)
     cases: Dict[str, Dict[str, Any]] = {}
     for run in sorted(runs, key=lambda r: (r.case, r.rep)):
-        case = cases.setdefault(run.case, {"lane": {"passes": 0, "scored": 0, "runs": []}, "nightly": {}})
+        case = cases.setdefault(run.case, {"lane": {"passes": 0, "scored": 0, "runs": []}, "nightly": {},
+                                           REPORT_NIGHT: night_outcomes(nightly_runs, newest_builds, run.case)})
         row = per_run.get(run.key, {})
         if run.outcome in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL):
             case["lane"]["scored"] += 1
@@ -215,6 +251,8 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             continue
         # The night that first wrote the answer, which can be weeks old: the
         # fetch reads runs back to the bucket's lifecycle (fetch_cache.py).
+        # Its verdict is the run that wrote the answer, so this is that night
+        # and not the newest one: only a run that passed publishes.
         if not recorded or recorded not in nightly_runs:
             unknown(RECORDING_BUILD_UNRECORDED)
             continue
@@ -247,9 +285,26 @@ def commit_line(report: Dict[str, Any]) -> str:
             f" {COMMIT_SOURCE_TEXT.get(source, COMMIT_SOURCE_TEXT[''])}")
 
 
+def night_line(report: Dict[str, Any]) -> str:
+    builds = report.get(REPORT_NIGHT, {}).get("builds")
+    commit = report.get(REPORT_COMMIT) or UNKNOWN_COMMIT
+    if not builds:
+        return f"newest recording night on {commit}: none known, so no case is graded against one"
+    return f"newest recording night on {commit}: builds {', '.join(builds)}"
+
+
+def night_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return f"{value['passes']}/{value['scored']}"
+    if value == NIGHT_NOT_RUN:
+        return "not run on the replayed commit's night"
+    return "no night on the replayed commit"
+
+
 def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
     out = [
         commit_line(report),
+        night_line(report),
         f"replay lane: {replay['requests']} requests in {replay['conversations']} conversations;"
         f" served {replay['served_token_percent']}% of prompt tokens"
         f" ({replay['served_before_first_miss_token_percent']}% before each conversation's first miss,"
@@ -260,10 +315,12 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
     for name, case in sorted(report["cases"].items()):
         lane = case["lane"]
         served = ", ".join(f"rep {r['rep']} {r['outcome']} {r['served_token_percent']}%" for r in lane["runs"])
-        nightly = "; ".join(
-            f"{build}: {v['passes']}/{v['scored']}" if isinstance(v, dict) else f"{build}: {v}"
-            for build, v in sorted(case["nightly"].items())) or "served nothing"
-        out.append(f"  {name}: lane {lane['passes']}/{lane['scored']} ({served}); nightly {nightly}")
+        served_from = "; ".join(
+            f"{build} (ran it {v['passes']}/{v['scored']})" if isinstance(v, dict) else f"{build} (no run of it)"
+            for build, v in sorted(case["nightly"].items()))
+        out.append(f"  {name}: lane {lane['passes']}/{lane['scored']} ({served});"
+                   f" newest night {night_text(case.get(REPORT_NIGHT))};"
+                   f" {'answers served from ' + served_from if served_from else 'served nothing'}")
     safety = sorted((name, case["arms"]) for name, case in report["cases"].items() if "arms" in case)
     if safety:
         out.append("safety cases, live before the cache was seeded, then replayed:")
@@ -278,7 +335,7 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
 
 
 def write_report(keep_dir: str, verdicts_dir: str, nightly_runs_path: str, out_dir: str,
-                 commit: str = "", commit_source: str = "") -> str:
+                 commit: str = "", commit_source: str = "", newest_night_path: str = "") -> str:
     nightly_runs = RA.read_json(nightly_runs_path) if nightly_runs_path else None
     if not isinstance(nightly_runs, dict):
         nightly_runs = {}
@@ -288,7 +345,9 @@ def write_report(keep_dir: str, verdicts_dir: str, nightly_runs_path: str, out_d
     if isinstance(replayed_from, (int, float)):
         lines = [line for line in lines if line.ts >= replayed_from]
     replay = analyze_replay.summarize(lines)
-    report = verdicts(keep_dir, verdicts_dir, nightly_runs)
+    newest_builds = night_builds(newest_night_path, commit)
+    report = verdicts(keep_dir, verdicts_dir, nightly_runs, newest_builds)
+    report[REPORT_NIGHT] = {"builds": newest_builds or []}
     report[REPORT_COMMIT] = commit
     report[REPORT_COMMIT_SOURCE] = commit_source
     os.makedirs(out_dir, exist_ok=True)
@@ -307,6 +366,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--keep-dir", required=True, help="the lane collector's kept lines and store")
     parser.add_argument("--verdicts-dir", required=True, help="where bench-gate wrote case-<name>.json")
     parser.add_argument("--nightly-runs", default="", help="fetch_cache.py's runs per recording build")
+    parser.add_argument("--newest-night", default="",
+                        help="fetch_cache.py --night-out: the newest night's builds by commit")
     parser.add_argument("--out", required=True)
     parser.add_argument("--commit", default="", type=CS._shaped(CS.COMMIT_SHAPE, "commit id"),
                         help="the commit the lane replayed on")
@@ -314,7 +375,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="whether that commit is the recording night's or main")
     args = parser.parse_args(argv)
     sys.stdout.write(write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, args.out,
-                                  commit=args.commit, commit_source=args.commit_source))
+                                  commit=args.commit, commit_source=args.commit_source,
+                                  newest_night_path=args.newest_night))
     return 0
 
 

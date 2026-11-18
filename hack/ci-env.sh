@@ -332,6 +332,10 @@ readonly REPLAY_COMMIT_RE='^[0-9a-f]{40}$'
 # stayed on main because no record named one or the fetch failed.
 readonly REPLAY_LANE_COMMIT_SOURCE_RECORDING="recording"
 readonly REPLAY_LANE_COMMIT_SOURCE_MAIN="main"
+# Where prepare_replay_lane_cache has fetch_cache.py write the newest night's
+# builds by commit (--night-out), so the lane's report grades each case against
+# the night that ran the commit it replays (--newest-night).
+readonly REPLAY_LANE_NEWEST_NIGHT_FILE="newest-night.json"
 # The variable the chart stamps the mode into, read back the same way: the
 # deploy decides the mode once, and the eval's collector runs in that mode.
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
@@ -946,6 +950,7 @@ REPLAY_SHADOW_COLLECTOR_WAIT_SECONDS=""
 REPLAY_KEEP_DIR=""
 REPLAY_LANE_SEED_DIR=""
 REPLAY_LANE_NIGHTLY_RUNS=""
+REPLAY_LANE_NEWEST_NIGHT=""
 # The commit this checkout is at, or nothing when git can't say or prints
 # something other than a full SHA-1 (REPLAY_COMMIT_RE).
 _replay_checkout_commit() {
@@ -1076,7 +1081,7 @@ start_replay_shadow_collector() {
   "${REPLAY_MODE_REPLAY}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --seed-dir "${REPLAY_LANE_SEED_DIR:-}" --verdicts-dir "${artifact_dir}"
-      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}"
+      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}" --newest-night "${REPLAY_LANE_NEWEST_NIGHT:-}"
       --lane-commit "$(_replay_checkout_commit)" --lane-commit-source "$(_replay_lane_commit_source)")
     ;;
   esac
@@ -1099,7 +1104,8 @@ start_replay_shadow_collector() {
 # ─── The replay lane: the cache, fetched before any case ─────────────────────
 # A no-op unless EVAL_REPLAY_LANE=true. Downloads what recent
 # trusted nightlies selected from the shared cache (fetch_cache.py, into
-# REPLAY_LANE_SEED_DIR, with their runs in REPLAY_LANE_NIGHTLY_RUNS) and seeds
+# REPLAY_LANE_SEED_DIR, with their runs in REPLAY_LANE_NIGHTLY_RUNS and the
+# newest night's builds in REPLAY_LANE_NEWEST_NIGHT) and seeds
 # no pod: seed_replay_lane_cache does that, after the lane's live arm.
 # Returns 1, with the reason, when there is nothing to replay: the lane would
 # measure nothing, so the caller stops before its cases. Call once
@@ -1119,9 +1125,10 @@ prepare_replay_lane_cache() {
   REPLAY_KEEP_DIR="${work}/keep"
   REPLAY_LANE_SEED_DIR="${work}/cache"
   REPLAY_LANE_NIGHTLY_RUNS="${work}/nightly-runs.json"
+  REPLAY_LANE_NEWEST_NIGHT="${work}/${REPLAY_LANE_NEWEST_NIGHT_FILE}"
   mkdir -p "${REPLAY_KEEP_DIR}" "${REPLAY_LANE_SEED_DIR}" || return 1
   if ! python3 "${REPLAY_CACHE_FETCH_SCRIPT}" --bucket "${REPLAY_CACHE_BUCKET}" --dest "${REPLAY_LANE_SEED_DIR}" \
-    --runs-out "${REPLAY_LANE_NIGHTLY_RUNS}" --max-age-hours "${REPLAY_LANE_CACHE_MAX_AGE_HOURS}" \
+    --runs-out "${REPLAY_LANE_NIGHTLY_RUNS}" --night-out "${REPLAY_LANE_NEWEST_NIGHT}" --max-age-hours "${REPLAY_LANE_CACHE_MAX_AGE_HOURS}" \
     --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}" \
     < /dev/null; then
     echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2

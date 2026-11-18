@@ -868,13 +868,15 @@ class ModeCollectorTest(_LifecycleBase):
 
     def test_the_lane_collects_in_replay_mode_with_its_seed_and_report_inputs(self):
         body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
+                'REPLAY_LANE_NEWEST_NIGHT=/n.json\n'
                 'start_replay_shadow_collector\n' + _AWAIT_ARGV + 'wait_replay_shadow_collector\n')
         self._fake_collector()
         proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv), FAKE_DEPLOYED="replay")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--kind"], pairs["--keep-dir"], pairs["--seed-dir"],
-                          pairs["--nightly-runs"], pairs["--pr"]), ("replay", "replay-lane", "/k", "/s", "/r.json", ""))
+                          pairs["--nightly-runs"], pairs["--newest-night"], pairs["--pr"]),
+                         ("replay", "replay-lane", "/k", "/s", "/r.json", "/n.json", ""))
 
     def test_the_lane_names_the_commit_it_replays_and_where_it_came_from(self):
         head = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -919,6 +921,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         script += lift_function("seed_replay_lane_cache", text, _CI_ENV)
         script += f"REPLAY_CACHE_FETCH_SCRIPT={str(self.fetch)!r}\n"
         script += 'rc=0\nprepare_replay_lane_cache || rc=$?\necho "rc=${rc}"\n'
+        script += 'echo "newest-night=${REPLAY_LANE_NEWEST_NIGHT:-}"\n'
         if seed:
             script += '[ "${rc}" != 0 ] || { seed_replay_lane_cache || rc=$?; echo "seed rc=${rc}"; }\n'
         overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
@@ -957,6 +960,10 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertIn("--max-age-hours 30", calls[0])
         self.assertIn(f"--max-bytes {512 * 1024 * 1024}", calls[0])
         self.assertIn("--eval-mode-next 1 --forge gitlab", calls[0], "the lane's own mode and forge pick the records")
+        # The newest night's builds go where the collector's report reads them (--newest-night).
+        night = re.search(r"^newest-night=(\S+/newest-night\.json)$", proc.stdout, re.M)
+        self.assertIsNotNone(night, proc.stdout)
+        self.assertIn(f"--night-out {night.group(1)} ", calls[0])
         self.assertIn("--seed-once", calls[1])
         self.assertIn("--mode replay", calls[1])
 
