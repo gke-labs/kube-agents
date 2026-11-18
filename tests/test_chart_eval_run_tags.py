@@ -2,7 +2,8 @@
 
 `true` becomes one `KUBEAGENTS_EVAL_RUN_TAGS=1` entry in `spec.deployment.env`;
 `false`, the default, renders nothing, so a default render is unchanged. An
-entry with the same name in `platformAgent.deployment.env` wins. The schema
+literal entry with the same name in `platformAgent.deployment.env` wins; a
+`valueFrom` one with the key `true` fails the render. The schema
 refuses anything but a boolean.
 
 Run: python3 -m unittest discover -s tests -p 'test_chart_eval_run_tags.py' -v
@@ -30,6 +31,7 @@ _REQUIRED = [
     "--set", "platformAgent.deployment.incidentWorkloadDedupSeconds=null",
 ]
 _NAME = "KUBEAGENTS_EVAL_RUN_TAGS"
+_VALUE_FROM = {"secretKeyRef": {"name": "eval-flags", "key": "tags"}}
 
 
 def _values(flag=None, env=None):
@@ -80,6 +82,16 @@ class EvalRunTagsRenderTest(unittest.TestCase):
     def test_an_explicit_env_entry_wins(self):
         deployment = self._deployment(_values(True, [{"name": _NAME, "value": "0"}]))
         self.assertEqual(deployment["env"], [{"name": _NAME, "value": "0"}])
+
+    def test_a_value_from_entry_with_the_key_true_fails_the_render(self):
+        env = [{"name": _NAME, "valueFrom": _VALUE_FROM}]
+        res = self._render(_values(True, env))
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn("evalRunTags is true", res.stderr)
+
+    def test_a_value_from_entry_with_the_key_false_renders(self):
+        env = [{"name": _NAME, "valueFrom": _VALUE_FROM}]
+        self.assertEqual(self._deployment(_values(False, env))["env"], env)
 
     def test_the_schema_refuses_a_non_boolean(self):
         for flag in ("true", 1):

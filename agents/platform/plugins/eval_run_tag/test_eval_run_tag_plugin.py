@@ -64,8 +64,8 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(manifest["name"], "eval_run_tag")
         self.assertEqual(manifest["provides_middleware"], ["llm_request"])
 
-    def test_the_default_platform_and_cluster_profiles_enable_it(self):
-        for profile in ("chat", "platform", "cluster"):
+    def test_every_hermes_profile_template_enables_it(self):
+        for profile in ("chat", "platform", "cluster", "tse"):
             config = yaml.safe_load((REPO / "agents" / profile / "config.yaml").read_text())
             self.assertIn("eval_run_tag", config["plugins"]["enabled"], profile)
 

@@ -152,6 +152,10 @@ var apiRateLimitedReasons = map[string]bool{"rate_limit": true, "billing": true}
 // separator or "..", and the bus does not vouch for a contextId's shape.
 var apiSafeContextID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// apiEvalRunPattern is the tag's shape, as the agent and the replay proxy
+// hold it: a conversation key that is not one sends no header.
+var apiEvalRunPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}$`)
+
 // apiSessionID is the Hermes session a conversation's tasks share: the
 // contextId under apiSessionIDPrefix when it is path-safe, else a hash of
 // it, so a hostile or odd contextId still maps to one stable session and
@@ -516,10 +520,6 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		steer, prompt, prev = next, nextPrompt, text
 	}
 }
-
-// apiEvalRunPattern is the tag's shape, as the agent and the replay proxy
-// hold it: a conversation key that is not one sends no header.
-var apiEvalRunPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}$`)
 
 // apiEvalRunTag is the eval run tag of an inject-door task, "" for any other.
 func apiEvalRunTag(env *lib.Envelope) string {

@@ -1501,8 +1501,9 @@ platformAgent:
     # spec.deployment.env. The agent then tags each model request with the eval
     # run, case and repetition it serves, in HTTP headers the replay proxy logs
     # and strips; nothing the model reads changes. Leave it false anywhere a
-    # replay proxy is not in front of LiteLLM. An entry with the same name in
-    # env above wins.
+    # replay proxy is not in front of LiteLLM. A literal entry with the same
+    # name in env above wins; a valueFrom entry with this key true fails the
+    # render, since the operator drops valueFrom entries.
     evalRunTags: false
     # The event watcher's tuning settings. Each key that you set becomes one
     # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to

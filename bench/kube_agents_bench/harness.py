@@ -3338,6 +3338,7 @@ class KubeAgentsHarness(AgentHarness):
             raise _TransportError(f"A2A door {what}: {last}")
 
         run_id, case_id, repetition = _inject_identity()
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         message_id = inject.message_id(run_id, case_id, repetition)
         # A fixed context, so a retried send (the first reply lost after the
         # door took it) is the same message on the same context, which the
