@@ -453,22 +453,27 @@ RECENT_WORK_ESCAPED_RE = re.compile(
 )
 
 # Hermes ends its system prompt with a runtime environment block, from a probe
-# it runs in the terminal backend (agent/prompt_builder.py
-# `_format_backend_probe`): `  OS: <uname -s> <uname -r>`, then the user, home
+# it runs in the terminal backend (hermes-agent v2026.9.14,
+# agent/prompt_builder.py `_format_backend_probe`): `  OS: <uname -s> <uname -r>`, then the user, home
 # and working directory. The kernel is that of the node the sandbox landed on,
 # so it differs between otherwise identical runs when a pool's nodes do (Nov 18:
 # 3 of 8 nightly shards on 6.12.110+, the rest and the replay lane on
 # 6.12.105+). The key holds a fixed token for it (runtime_kernel_fixed), in a
 # system message's block only: the same kernel in a tool result or a user
 # message is a node the agent may be reasoning about, and stays literal. The
-# token is bound to no value, so no answer is rewritten with it; of 23,086
-# distinct assistant messages in the Nov 17-18 stores, one names a 6.12 kernel,
-# copied from a `kubectl describe nodes` result the key keeps. The block's other
+# token is bound to no value, so no answer is rewritten with it: an answer
+# rarely names a kernel, and then one it read in a tool result the key keeps.
+# Hermes takes the last heading as the block (split_runtime_boundary uses
+# rpartition: prose may quote the heading), so the match starts at the last
+# heading before the end marker. The block's other
 # lines are the same on every node (User, Home) or already keyed (Working
 # directory's card id).
 SYSTEM_ROLE = "system"
 TEXT_PART_FIELD = "text"
-RUNTIME_ENVIRONMENT_BLOCK_RE = re.compile(r"# Hermes runtime environment\n.*?<!-- End Hermes runtime environment -->", re.S)
+RUNTIME_ENVIRONMENT_HEADING = "# Hermes runtime environment\n"
+RUNTIME_ENVIRONMENT_BLOCK_RE = re.compile(
+    re.escape(RUNTIME_ENVIRONMENT_HEADING) + r"(?:(?!" + re.escape(RUNTIME_ENVIRONMENT_HEADING) + r").)*?"
+    r"<!-- End Hermes runtime environment -->", re.S)
 RUNTIME_KERNEL_LINE_RE = re.compile(r"(?m)^(  OS: \S+ )\S+$")
 KERNEL_PLACEHOLDER = f"{OPEN}KERNEL{CLOSE}"
 

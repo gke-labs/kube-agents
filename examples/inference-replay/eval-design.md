@@ -56,8 +56,9 @@ flowchart LR
 Three properties make this sound for grading:
 
 - **A hit means the model saw the same input.** The key covers the whole request: system prompt,
-  tool schemas, the model alias, and every message so far, including every tool result, with one
-  exception (the recent-work digest, below). That includes settings like temperature, max tokens,
+  tool schemas, the model alias, and every message so far, including every tool result, except
+  what the [normalization rules](#normalization) drop or fix (the recent-work digest, the sandbox
+  kernel, and the others listed there). That includes settings like temperature, max tokens,
   reasoning settings and tool choice; only fields that change how the answer is delivered
   (`stream`) or who is asking (`user`, `metadata`) are left out. A stored answer is a real sample from the model for
   that exact input. What serving it loses is independence between samples, and under pass-only
@@ -118,8 +119,8 @@ flowchart LR
 
 The rules that keep this safe:
 
-- **Identifiers only, never state.** Counts, statuses, restart numbers, versions, scores and
-  zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
+- **Identifiers only, never state.** Counts, statuses, restart numbers, versions (bar the sandbox
+  kernel in the system prompt, below), scores and zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
   rises between runs, so cases with a live defect replay less, and that is correct.
 - **Only real ages are treated as ages, and they keep their unit.** `5m` and `3d` get different
   placeholders, because a pod being minutes old instead of days old can be the whole finding. And
@@ -319,8 +320,9 @@ The rules that keep this safe:
   a fixed `⟦KERNEL⟧`. It is the one exception to versions staying literal: a kernel anywhere else,
   in `uname -r`, a node's `Kernel Version` or a `kubectl get nodes -o wide` column, is about a node
   the agent may be debugging and stays literal. The token is bound to no value, so no answer is
-  rewritten with it; of 23,086 distinct assistant messages in the Nov 17–18 stores, one names a
-  6.12 kernel, copied from a tool result the key keeps. The block's other lines (user, home,
+  rewritten with it: an answer rarely names a kernel, and then one it read in a tool result the key
+  keeps. The match starts at the block's last heading, as Hermes reads it, so prose quoting the
+  heading earlier in the prompt is left alone. The block's other lines (user, home,
   working directory) are the same on every node or already keyed.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,

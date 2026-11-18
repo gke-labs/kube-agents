@@ -922,6 +922,13 @@ class RuntimeKernelTest(unittest.TestCase):
         self.assertNotEqual(fp(system_request(runtime_environment(self.KERNELS[0]))),
                             fp(system_request(runtime_environment(self.KERNELS[0]).replace("Linux", "Darwin"))))
 
+    def test_prose_quoting_the_heading_before_the_block_is_left_alone(self):
+        quoted = "Notes: # Hermes runtime environment\n  OS: Linux 5.15.0-1\nmore notes\n\n"
+        walked = normalizer.normalize_request(system_request(quoted + runtime_environment(self.KERNELS[0])), NOW)
+        content = walked.messages[0]["content"]
+        self.assertIn("  OS: Linux 5.15.0-1\n", content)
+        self.assertIn("  OS: Linux ⟦KERNEL⟧\n  User: agent\n", content)
+
     def test_a_kernel_anywhere_else_stays_literal(self):
         # What the agent reads about a node it is debugging: `uname -r`, a KERNEL-VERSION column, a pasted block.
         for kernel in self.KERNELS:
