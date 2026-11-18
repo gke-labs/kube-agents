@@ -968,6 +968,8 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
+
+    ``report`` is one tick of the report step (``post_merge_report``), in the switch's mode.
     """
     import sys
     from contextlib import closing
