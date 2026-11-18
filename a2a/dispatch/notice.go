@@ -26,6 +26,10 @@ const (
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
 	ReasonStopped           = "stopped"
+	// ReasonChangeNeedsJob refuses a task whose confirmed change would put
+	// a write permit on its credential while its tier has no Job runner: a
+	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
+	ReasonChangeNeedsJob = "change-needs-job"
 	// ReasonTierEnded ends a task whose tier an administrator ended the
 	// drain of (lib.DrainingTier.Ending, #5850), held or with its Job still
 	// starting (#6134): canceled, not failed.
