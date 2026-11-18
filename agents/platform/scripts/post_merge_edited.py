@@ -67,15 +67,17 @@ def forge_human_edited(repo: str, number: int) -> bool | None:
 
     def all_commits() -> tuple[list[dict], bool]:
         # Page by page, as the pull-request sweep's `_commits` does. A short
-        # page ends the listing, and says truncated only when the forge's own
-        # cap ended it; a full last page leaves the rest unread.
+        # page ends the listing. It is truncated when the forge says so or,
+        # as `_commits` judges it, when the rows reach the forge cap: GitLab,
+        # Gitea and Bitbucket keep the newest 250 and do not flag the short
+        # page that ends there. A full last page leaves the rest unread.
         rows: list[dict] = []
         for page in range(1, COMMIT_PAGES + 1):
             answer = read("proposal-commits", {"limit": vcs_readings.MAX_PAGE_SIZE, "page": page})
             batch = answer.get("commits") or []
             rows += batch
             if len(batch) < vcs_readings.MAX_PAGE_SIZE:
-                return rows, bool(answer.get("truncated"))
+                return rows, bool(answer.get("truncated")) or len(rows) >= vcs_readings.COMMIT_CAP_FALLBACK
         return rows, True
 
     try:
