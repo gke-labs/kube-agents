@@ -611,7 +611,10 @@ class PreflightDecisionTest(unittest.TestCase):
         small figure a quota would pass."""
         autopilot = ["--api-versions", _AUTOPILOT_API]
         ceiling = 2**63 - 1
-        for cpu in ("10Ei", "9G"):
+        # 10Ei is past int64 millicores, which kube-agents.sessionResourcesCheck refuses
+        # outright (#6178); 9G is admitted and still wraps the 1 GiB-per-vCPU floor
+        # without saturation.
+        for cpu in ("9G",):
             with self.subTest(cpu=cpu):
                 req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
                     "maxSessions": 1, "sessionResources": {"requests": {"cpu": cpu}}}}}},
