@@ -516,6 +516,17 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([b["type"] for b in body].count("Table"), 0)
         self.assertEqual(body[2]["text"], "• item | a")
 
+    def test_split_marker_after_a_delimiter_row_is_detached(self):
+        # A cut right after the delimiter row: the marker comes off it, so
+        # the delimiter is still one and the table keeps its width.
+        body = markdown_to_adaptive_card("| a | b |\n|---|---| (1/2)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(len(body[0]["columns"]), 2)
+        self.assertEqual(body[1]["text"], "(1/2)")
+        body = markdown_to_adaptive_card("a | b\n---|--- (1/2)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(len(body[0]["rows"]), 1)
+
     def test_split_marker_stays_on_a_prose_line_with_pipes(self):
         for text in (
             "|x| + |y| = 1 (1/2)",
@@ -623,6 +634,36 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         # The cron scheduler reads the home channel through this field; a real
         # tenant got no proactive reports while it was missing (2026-11-12).
         self.assertEqual(registered[0]["cron_deliver_env_var"], "TEAMS_HOME_CHANNEL")
+
+    def test_the_build_time_contract_pins_this_senders_shape(self):
+        # deploy/docker/patches/verify_slack_relay_registry_contract.py checks
+        # the sender's shape against the image's Hermes at build time; the pin
+        # it holds is this function's shape, so the two cannot drift apart.
+        import importlib
+        import inspect
+
+        patches_dir = str(Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches")
+        sys.path.insert(0, patches_dir)
+        try:
+            contract = importlib.import_module("verify_slack_relay_registry_contract")
+        finally:
+            sys.path.remove(patches_dir)
+        from gateway.platform_registry import platform_registry
+
+        teams_relay_patch.install()
+        entry = platform_registry.get("teams")
+        self.assertEqual(contract.shape(entry.standalone_sender_fn), contract.UPSTREAM_SIGNATURES["teams._standalone_send"])
+        # And the adapter's overrides take every parameter the fake base's
+        # methods declare, the way the contract check asks of the real base.
+        adapter = entry.adapter_factory({"extra": {}})
+        for name in ("connect", "disconnect", "send", "send_typing", "get_chat_info"):
+            base_method = getattr(type(adapter).__mro__[1], name, None)
+            if base_method is None:  # the fake base declares fewer methods than Hermes'
+                continue
+            base_params = inspect.signature(base_method).parameters
+            over = inspect.signature(getattr(type(adapter), name)).parameters
+            catch_all = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in over.values())
+            self.assertEqual([n for n in base_params if n not in over and not catch_all], [], name)
 
     async def test_teams_relay_adapter_lifecycle_and_message_processing(self):
         from gateway.platform_registry import PlatformRegistry, platform_registry

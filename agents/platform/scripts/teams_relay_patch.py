@@ -326,10 +326,11 @@ def _detach_part_marker(text: str) -> str:
         return text
     body = text[: match.start()]
     body_lines = body.rstrip("\n").split("\n")
-    # The last line is a table row by the renderer's own scan, not by a
-    # pipe heuristic: a lone pipe line, a shell pipeline or a bullet under
-    # a table render as prose and keep their marker where Hermes put it.
-    if _table_line_kinds(body_lines)[-1] != "row":
+    # The last line is a table line by the renderer's own scan (a row, or
+    # the delimiter row a cut can land right after), not by a pipe
+    # heuristic: a lone pipe line, a shell pipeline or a bullet under a
+    # table render as prose and keep their marker where Hermes put it.
+    if not _table_line_kinds(body_lines)[-1]:
         return text
     return f"{body.rstrip()}\n\n({match.group(1)}/{match.group(2)})"
 
