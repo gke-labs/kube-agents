@@ -464,12 +464,12 @@ class FailSafeTest(Harness):
         def opener(status=None, payload=None):
             def call(request, timeout):
                 self.assertEqual(json.loads(request.data)["generationConfig"]["maxOutputTokens"], 10)
-                self.assertIn("/models/gemini-4-argon:generateContent", request.full_url)
+                self.assertIn("/models/model-x:generateContent", request.full_url)
                 if status:
                     raise nightly_triage.urllib.error.HTTPError(request.full_url, status, "no", {}, None)
                 return contextlib.nullcontext(io.BytesIO(json.dumps(payload).encode()))
             return call
-        client = nightly_triage.VertexModel("p", "gemini-4-argon", runner=lambda *a, **k: ok, opener=opener(403))
+        client = nightly_triage.VertexModel("p", "model-x", runner=lambda *a, **k: ok, opener=opener(403))
         with self.assertRaisesRegex(nightly_triage.ModelError, "HTTP 403"):
             client("x", 10)
         client.opener = opener(payload={"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "{"}]}}]})
@@ -505,6 +505,23 @@ class FailSafeTest(Harness):
         self.route(issues, None, model, extra=["--no-model"])
         self.assertEqual(model.prompts, [])
         self.assert_rule(issues, "triage is switched off")
+
+    def test_no_model_name_routes_by_the_rule_and_says_which_state_it_is(self):
+        _, issue = self.file_pending()
+        issues = FakeIssues([issue])
+        with unittest.mock.patch.dict(os.environ, {nightly_triage.MODEL_ENV: "", nightly_triage.LIVE_ENV: "true"}):
+            _, err = self.route(issues, None, None)
+        self.assertIn(nightly_triage.MODEL_MISSING, err)
+        self.assert_rule(issues, nightly_triage.NO_MODEL_NAME_REASON)
+        [comment] = issues.posted()
+        self.assertNotIn("switched off", comment, "armed with no name: the comment names the missing name, not the switch")
+        # Switched off as well: the switch is the thing to flip, name or no name.
+        for name in ("", "model-x"):
+            _, issue = self.file_pending()
+            issues = FakeIssues([issue])
+            with unittest.mock.patch.dict(os.environ, {nightly_triage.MODEL_ENV: name, nightly_triage.LIVE_ENV: "false"}):
+                self.route(issues, None, None, extra=["--no-model"])
+            self.assert_rule(issues, nightly_triage.OFF_REASON)
 
     def test_an_author_github_will_not_assign_falls_back_to_the_rule(self):
         issues, _ = self.triage_with(FakeModel(), refuse=("grader-author",))
@@ -758,19 +775,26 @@ class DryRunTest(Harness):
         bundles = self.prepare(issues, extra=["--issue", "37", "--issue", "38"])
         out, err = self.route(issues, bundles, FakeModel(), live=False, extra=["--issue", "37", "--issue", "38"])
         self.assertEqual(issues.writes(), [])
-        self.assertIn("nightly triage (dry run, gemini-4-argon): 1 issues", out, "an infra issue is not triaged")
+        self.assertIn("nightly triage (dry run, with the model): 1 issues", out, "an infra issue is not triaged")
+        self.assertNotIn("gemini", out + err, "the log is public: it does not name the model")
         self.assertIn(f"#37: grader_or_harness, suspect #{CULPRIT}, fix #{FIX} open, P1, confidence high -> @grader-author", out)
         for text in (out, err):
             for case in nb.MAIN_CASES + nb.MAIN_B_CASES:
                 self.assertNotIn(case, text)
             self.assertNotIn(SAFEGUARD, text)
 
-    def test_the_model_defaults_to_argon_and_a_variable_overrides_it(self):
-        self.assertEqual(nightly_triage.DEFAULT_MODEL, "gemini-4-argon")
-        with unittest.mock.patch.dict(os.environ, {nightly_triage.MODEL_ENV: "gemini-other"}):
-            self.assertEqual(nightly_triage.parse_args(["route"]).model, "gemini-other")
+    def test_the_model_comes_from_the_variable_and_the_file_names_none(self):
+        self.assertFalse(hasattr(nightly_triage, "DEFAULT_MODEL"), "the public file names no model (public_surfaces.md)")
+        with unittest.mock.patch.dict(os.environ, {nightly_triage.MODEL_ENV: "model-other"}):
+            self.assertEqual(nightly_triage.parse_args(["route"]).model, "model-other")
         with unittest.mock.patch.dict(os.environ, {nightly_triage.MODEL_ENV: ""}):
-            self.assertEqual(nightly_triage.parse_args(["route"]).model, "gemini-4-argon")
+            self.assertIsNone(nightly_triage.parse_args(["route"]).model)
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = nightly_triage.main(["route", "--repo-root", str(self.root)], gh_runner=FakeIssues([]))
+            self.assertEqual(rc, 0)
+            self.assertIn(nightly_triage.MODEL_MISSING, err.getvalue(), "a missing name is said, not hidden")
+            self.assertIn("nightly triage (dry run, no model)", out.getvalue(), "and the route falls back to the filer's rule")
 
 
 class WorkflowTest(unittest.TestCase):
@@ -792,26 +816,30 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout, outputs
 
-    def test_the_switches_default_off_and_argon(self):
+    def test_the_switch_defaults_off_and_the_model_has_no_default(self):
         self.assertIn("NIGHTLY_TRIAGE_LIVE: ${{ vars.NIGHTLY_TRIAGE_LIVE || 'false' }}", self.text)
-        self.assertIn("NIGHTLY_TRIAGE_MODEL: ${{ vars.NIGHTLY_TRIAGE_MODEL || 'gemini-4-argon' }}", self.text)
+        self.assertEqual(self.doc["env"]["NIGHTLY_TRIAGE_MODEL"], "${{ vars.NIGHTLY_TRIAGE_MODEL }}", "the variable alone: no fallback name in the public file")
 
     def test_the_filer_files_for_triage_only_when_both_are_armed(self):
         [step] = [s for s in self.doc["jobs"]["refresh-and-adjudicate"]["steps"] if s.get("id") == "nightly_bugs"]
-        for bugs, triage, mute, want in (("true", "true", "false", True), ("true", "false", "false", False),
-                                         ("false", "true", "false", False), ("true", "true", "true", False)):
+        for bugs, triage, mute, model, want in (("true", "true", "false", "model-x", True), ("true", "false", "false", "model-x", False),
+                                                ("false", "true", "false", "model-x", False), ("true", "true", "true", "model-x", False),
+                                                ("true", "true", "false", "", False)):
             out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": bugs, "NIGHTLY_TRIAGE_LIVE": triage, "CI_HEALTH_MUTE": mute,
-                                           "KUBE_AGENTS_ISSUES_REPO": ISSUES_REPO})
-            self.assertEqual("--triage-pending" in out.split(), want, (bugs, triage, mute))
+                                           "NIGHTLY_TRIAGE_MODEL": model, "KUBE_AGENTS_ISSUES_REPO": ISSUES_REPO})
+            self.assertEqual("--triage-pending" in out.split(), want, (bugs, triage, mute, model))
         for public in ("", "gke-labs/kube-agents"):
-            out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "CI_HEALTH_MUTE": "false", "KUBE_AGENTS_ISSUES_REPO": public})
+            out, _ = self.run_step(step, {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "CI_HEALTH_MUTE": "false",
+                                           "NIGHTLY_TRIAGE_MODEL": "model-x", "KUBE_AGENTS_ISSUES_REPO": public})
             self.assertNotIn("--triage-pending", out.split(), f"never for issues filed in the public repository ({public!r})")
 
     def test_the_triage_job_runs_after_the_tick_on_main_with_its_own_identities(self):
         job = self.doc["jobs"]["nightly-triage"]
         self.assertEqual(job["needs"], "refresh-and-adjudicate")
-        for guard in ("github.repository == 'gke-labs/kube-agents'", "github.ref == 'refs/heads/main'", "vars.CI_HEALTH_MUTE != 'true'"):
-            self.assertIn(guard, job["if"])
+        for guard in ("github.repository == 'gke-labs/kube-agents'", "github.ref == 'refs/heads/main'", "vars.CI_HEALTH_MUTE != 'true'",
+                      "(vars.NIGHTLY_TRIAGE_LIVE == 'true' && vars.NIGHTLY_BUGS_LIVE == 'true' && vars.NIGHTLY_TRIAGE_MODEL != '')",
+                      "(needs.refresh-and-adjudicate.outputs.filed != '' && vars.NIGHTLY_TRIAGE_MODEL != '')"):
+            self.assertIn(guard, job["if"], "armed, and the unarmed dry run on filed issues, both need a model named")
         accounts = [s["with"]["service_account"] for s in job["steps"] if "google-github-actions/auth" in str(s.get("uses"))]
         self.assertEqual(accounts, ["${{ env.COLLECT_SA }}", "${{ env.CI_HEALTH_SA }}"], "evidence as the reader, the model as the publisher")
         self.assertNotIn("pull-requests", job["permissions"])
@@ -821,7 +849,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_the_plan_is_live_only_when_armed_and_a_dispatch_is_always_dry(self):
         [step] = [s for s in self.doc["jobs"]["nightly-triage"]["steps"] if s.get("id") == "plan"]
-        base = {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "FILED": "41", "TRIAGE_ISSUES": "", "ISSUES_REPO": ISSUES_REPO}
+        base = {"NIGHTLY_BUGS_LIVE": "true", "NIGHTLY_TRIAGE_LIVE": "true", "NIGHTLY_TRIAGE_MODEL": "model-x", "FILED": "41", "TRIAGE_ISSUES": "", "ISSUES_REPO": ISSUES_REPO}
         for public in ("", "gke-labs/kube-agents", "not a repo"):
             _, outputs = self.run_step(step, dict(base, ISSUES_REPO=public))
             self.assertIn("mode=--dry-run", outputs, f"no private issues repository ({public!r}): never live")
@@ -831,6 +859,9 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("args=\n", outputs, "live: every pending issue")
         _, outputs = self.run_step(step, dict(base, NIGHTLY_TRIAGE_LIVE="false"))
         self.assertIn("mode=--dry-run", outputs)
+        self.assertIn("args= --issue 41", outputs)
+        _, outputs = self.run_step(step, dict(base, NIGHTLY_TRIAGE_MODEL=""))
+        self.assertIn("mode=--dry-run", outputs, "armed without a model name: never live")
         self.assertIn("args= --issue 41", outputs)
         _, outputs = self.run_step(step, dict(base, TRIAGE_ISSUES="37 33"))
         self.assertIn("mode=--dry-run", outputs)
@@ -847,10 +878,12 @@ class WorkflowTest(unittest.TestCase):
         [step] = [s for s in self.doc["jobs"]["refresh-and-adjudicate"]["steps"] if s.get("name", "").startswith("Route issues left waiting")]
         self.assertNotIn("NIGHTLY_TRIAGE_LIVE", step["if"], "it runs whether triage is on or off")
         self.assertTrue(step["continue-on-error"])
-        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "false"})
+        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "false", "NIGHTLY_TRIAGE_MODEL": "model-x"})
         self.assertEqual(out.split(), ["scripts/eval_dashboard/nightly_triage.py", "route", "--no-model", "--live"])
-        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "true"})
+        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "true", "NIGHTLY_TRIAGE_MODEL": "model-x"})
         self.assertEqual(out.split()[-1], "--stale-only")
+        out, _ = self.run_step(step, {"NIGHTLY_TRIAGE_LIVE": "true", "NIGHTLY_TRIAGE_MODEL": ""})
+        self.assertNotIn("--stale-only", out.split(), "armed without a model name: every waiting issue, every tick")
 
     def test_the_triage_job_cannot_write_issues_with_its_own_token(self):
         self.assertNotIn("issues", self.doc["jobs"]["nightly-triage"]["permissions"])
