@@ -177,7 +177,7 @@ own lane and no roster file: a validated-capabilities case is an ordinary case u
 whose `task.yaml` carries the bare line `suite: validated-capabilities`, and that line is its registration.
 `EVAL_TIER=validated-capabilities` in `hack/ci-eval-pr.sh` runs every such case and nothing else, in case-id
 order (a section other than 1 is the bare line `suite_part: N`; `EVAL_VALIDATED_CAPABILITIES_PART=N`
-runs one section, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
+runs one section, one Prow periodic per section, on a Saturday and Sunday cron and on Rerun from Deck),
 and no pull request and no nightly runs a case carrying the line. The lane greps for the two lines,
 so `scripts/validate_bench_cases.py` refuses any other spelling of them (a quoted value, a trailing
 comment), a suite case that a roster file also names, and a parked case (`FIXTURE_NOT_READY`,

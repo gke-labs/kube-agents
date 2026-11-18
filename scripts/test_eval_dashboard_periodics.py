@@ -160,8 +160,9 @@ class FetchTest(unittest.TestCase):
         # stopped recording; the same words on both would hide the second.
         self.assertEqual(periodics.VALIDATED_CAPABILITIES_SLICE_JOBS, {1: CERT.job, 2: CERT_2.job})
         for part, slice_ in ((1, CERT), (2, CERT_2)):
-            for words in (slice_.label, slice_.absence, slice_.presence, slice_.does, slice_.effect):
-                self.assertIn(f"{part}", words)
+            self.assertIn(f"slice {part}", slice_.label)
+            for words in (slice_.absence, slice_.presence, slice_.does, slice_.effect):
+                self.assertIn(f"part {part}", words)
         self.assertEqual((CERT.logs_root, CERT.artifact, CERT.runbook), (CERT_2.logs_root, CERT_2.artifact, CERT_2.runbook))
 
     def test_a_lane_slice_with_no_build_yet_writes_no_note(self):
