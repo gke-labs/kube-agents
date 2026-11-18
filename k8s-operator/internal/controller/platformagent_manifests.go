@@ -287,6 +287,14 @@ const (
 	// entrypoints run with umask 0002 so files created after mount stay
 	// group-writable.
 	agentFSGroup = int64(10000)
+	// sandboxCleanupPluginsDirScript makes <home>/plugins on the data PVC, which
+	// the cleanup init container mounts at /workspace. See
+	// buildSandboxCredentialCleanup for why. The umask keeps the folder
+	// group-writable, as the entrypoints keep what they create. A failure is
+	// reported and not fatal: the script runs under `sh -e`, and a pod whose
+	// folder cannot be made (a file of that name, a volume the group cannot
+	// write) must still start as it did before this step existed.
+	sandboxCleanupPluginsDirScript = "umask 0002\nmkdir -p /workspace/plugins || echo 'WARN: could not make /workspace/plugins' >&2"
 
 	// maxAutopilotContainerNameLen is the maximum container name length that avoids
 	// exceeding Kubernetes 63-byte annotation key limits when GKE Autopilot / gVisor injects
@@ -3107,8 +3115,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
 	}
 	// The data PVC survives upgrades. Remove credential files written by older,
-	// credentialed deployments before the agent sandbox can mount the PVC.
-	initContainers = append([]corev1.Container{buildSandboxCredentialCleanup(image, pullPolicy)}, initContainers...)
+	// credentialed deployments before the agent sandbox can mount the PVC. With
+	// a plugin mounted under the home, the same container also makes
+	// <home>/plugins first: see buildSandboxCredentialCleanup.
+	initContainers = append([]corev1.Container{buildSandboxCredentialCleanup(image, pullPolicy, mountsPluginUnderHome(agentPlugins))}, initContainers...)
 
 	// When ImageVolumeSource is unavailable (GKE Autopilot where Warden blocks image volumes,
 	// or GKE Standard < 1.35 clusters without native image volume support), stage plugin files
@@ -4208,13 +4218,29 @@ func hardenedSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) corev1.Container {
-	return corev1.Container{
-		Name:            "sandbox-credential-cleanup",
-		Image:           image,
-		ImagePullPolicy: pullPolicy,
-		Command:         []string{"sh", "-ec"},
-		Args: []string{`rm -rf -- \
+// mountsPluginUnderHome reports whether a plugin is mounted inside the data PVC:
+// a default-profile plugin, at <home>/plugins/<name> (pluginMountPath).
+func mountsPluginUnderHome(agentPlugins []*agentv1alpha1.AgentPlugin) bool {
+	for _, plugin := range agentPlugins {
+		if plugin.Spec.TargetProfile == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSandboxCredentialCleanup builds the first init container of the agent pod.
+//
+// makePluginsDir also has it make <home>/plugins. With a plugin mounted at
+// <home>/plugins/<name>, the container runtime makes the mount point and each
+// missing parent as root when it creates the agent container. On a new data
+// volume that left <home>/plugins root-owned with no group write, so the
+// entrypoint could not copy the image's plugins into it, and the agent ran
+// without them until a later pod's fsGroup pass repaired the folder. Made
+// here first, as the agent's user, the folder is the agent's, and the runtime
+// makes only the mount point.
+func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy, makePluginsDir bool) corev1.Container {
+	script := `rm -rf -- \
   /workspace/home/.config/gcloud \
   /workspace/home/.config/gh \
   /workspace/home/.aws/credentials \
@@ -4227,7 +4253,16 @@ func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) c
   /workspace/home/.kube/config \
   /workspace/home/.netrc \
   /workspace/home/.npmrc \
-  /workspace/home/.pypirc`},
+  /workspace/home/.pypirc`
+	if makePluginsDir {
+		script += "\n" + sandboxCleanupPluginsDirScript
+	}
+	return corev1.Container{
+		Name:            "sandbox-credential-cleanup",
+		Image:           image,
+		ImagePullPolicy: pullPolicy,
+		Command:         []string{"sh", "-ec"},
+		Args:            []string{script},
 		VolumeMounts:    []corev1.VolumeMount{{Name: "platform-agent-data-vol", MountPath: "/workspace"}},
 		SecurityContext: hardenedSecurityContext(),
 		Resources: corev1.ResourceRequirements{
