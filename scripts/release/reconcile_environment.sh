@@ -33,6 +33,10 @@ set -euo pipefail
 # Long enough to cover a full apply, short enough that a crashed run does not
 # lock the environment out for a working day.
 readonly LEASE_TTL_MINUTES=90
+# About a minute of retries, inside the job's budget, for a release that times
+# out against the cluster (#6381).
+readonly LEASE_RELEASE_ATTEMPTS=4
+readonly LEASE_RELEASE_BACKOFF=10
 
 MODE="${RECONCILE_MODE:-plan}"
 ENV_NAME="${GITHUB_ENVIRONMENT:-unknown}"
@@ -122,10 +126,23 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" \
 # separate "is it free?" read would leave a window between the answer and the
 # apply. A plan takes nothing, because it changes nothing.
 LEASE_HELD="false"
+# The release retries and keeps its token between attempts (#6381): a single
+# kubectl timeout used to drop the token and leave the lease held for its whole
+# TTL, refusing every reconcile behind it. Its output is shown, not discarded,
+# and a release that still fails is a visible warning on a run that otherwise
+# goes green -- the apply did happen. The next reconcile can take that lease
+# over (below), so a leak now costs one run's wait at most, not 90 minutes.
 release_lease() {
   if [ "$LEASE_HELD" = "true" ]; then
-    if ! python3 "${REPO_ROOT}/scripts/live_test_lease.py" release >/dev/null 2>&1; then
-      echo "⚠️ Warning: Failed to release live-test lease." >&2
+    local out
+    if ! out="$(python3 "${REPO_ROOT}/scripts/live_test_lease.py" release \
+        --attempts "${LEASE_RELEASE_ATTEMPTS}" --backoff "${LEASE_RELEASE_BACKOFF}" 2>&1)"; then
+      echo "${out}" >&2
+      echo "::warning title=Live-test lease not released::The live-test lease on '${ENV_NAME}' could not be released, so it stays held until it expires or the next reconcile takes it over. ${out//$'\n'/ }"
+      summary ""
+      summary "⚠️ The live-test lease could not be released (session \`${KUBE_AGENTS_LEASE_SESSION:-?}\`). The next reconcile takes it over; until then it holds off live tests."
+    else
+      echo "${out}"
     fi
     LEASE_HELD="false"
   fi
@@ -147,6 +164,31 @@ if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
     LEASE_HELD="true"
   else
     holder="$(python3 "${REPO_ROOT}/scripts/live_test_lease.py" status --json 2>/dev/null)" || holder="[]"
+    # A lease held by an earlier reconcile run that has since finished is that
+    # run's failed release, not somebody's live test (#6381). The predecessor
+    # check is fail-closed -- any doubt is "no" -- and the takeover is a
+    # compare-and-swap on that run's session, so a person who claims the lease in
+    # between keeps it.
+    if grep -q '"state": "held"' <<<"${holder}"; then
+      predecessor="$(python3 "${REPO_ROOT}/scripts/release/reconcile_lease_predecessor.py" \
+        --env "${ENV_NAME}" <<<"${holder}" 2>/dev/null)" || predecessor='{"takeover": false}'
+      if python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("takeover") is True else 1)' "${predecessor}" 2>/dev/null; then
+        prev_session="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["session"])' "${predecessor}")"
+        prev_run="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["run_id"])' "${predecessor}")"
+        prev_conclusion="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("conclusion",""))' "${predecessor}")"
+        if python3 "${REPO_ROOT}/scripts/live_test_lease.py" takeover \
+            --if-session "${prev_session}" --if-note "scheduled reconcile of ${ENV_NAME}" \
+            --ttl "$LEASE_TTL_MINUTES"; then
+          LEASE_HELD="true"
+          echo "::notice title=Live-test lease taken over::Took over the live-test lease on '${ENV_NAME}' left by reconcile run ${prev_run} (${prev_conclusion}), whose release had failed."
+          summary "Took over the live-test lease left by reconcile run [${prev_run}](${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${prev_run}) (${prev_conclusion}), whose release had failed."
+        else
+          holder="$(python3 "${REPO_ROOT}/scripts/live_test_lease.py" status --json 2>/dev/null)" || holder="[]"
+        fi
+      fi
+    fi
+  fi
+  if [ "$LEASE_HELD" != "true" ]; then
     # A cluster that could not be asked has not answered "no". `acquire` exits
     # non-zero for both, so deferring on the strength of that alone would turn
     # every kind of breakage -- a bad kubeconfig, an API server mid-upgrade, a

@@ -1316,6 +1316,170 @@ class Acquisition(unittest.TestCase):
             self.assertEqual(lease.get_lease(self.install), (None, None))
 
 
+class ReleaseRetries(unittest.TestCase):
+    """#6381: a release that times out keeps its token and tries again."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": self.tmp.name,
+            "KUBE_AGENTS_LEASE_SESSION": "gha-111",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.install = lease._install_from_context(CTX)
+        lease.write_local_token(self.install, "mine")
+        self.mine = _lease_data(token="mine", minutes=60)
+
+    def _flaky(self, failures):
+        """Times out the first `failures` gets, then answers with our lease."""
+        state = {"n": 0}
+
+        def call(install, args, stdin=None):
+            if args[0] == "get":
+                state["n"] += 1
+                if state["n"] <= failures:
+                    return 124, "", "kubectl timed out after 15s"
+                return 0, json.dumps({"data": self.mine,
+                                      "metadata": {"resourceVersion": "7"}}), ""
+            return 0, "", ""
+        return mock.Mock(side_effect=call)
+
+    def test_a_timeout_then_success_releases_and_keeps_the_token_meanwhile(self):
+        logged, slept = [], []
+        with mock.patch.object(lease, "kubectl", self._flaky(2)) as fake:
+            ok, msg = lease.do_release(self.install, attempts=4, backoff=10,
+                                       sleep=slept.append, log=logged.append)
+        self.assertTrue(ok, msg)
+        self.assertEqual(msg, "released")
+        self.assertEqual(_verbs(fake), ["get", "get", "get", "delete"])
+        self.assertEqual(slept, [10, 10])
+        self.assertEqual(len(logged), 2)
+        self.assertIn("attempt 1/4", logged[0])
+        self.assertFalse(os.path.exists(self.install.token_file()))
+
+    def test_every_attempt_failing_gives_up_and_clears_the_token_as_before(self):
+        with mock.patch.object(lease, "kubectl", self._flaky(99)) as fake:
+            ok, msg = lease.do_release(self.install, attempts=3, backoff=0,
+                                       sleep=lambda s: None, log=lambda m: None)
+        self.assertFalse(ok)
+        self.assertIn("after 3 attempts", msg)
+        self.assertEqual(_verbs(fake), ["get", "get", "get"])
+        self.assertFalse(os.path.exists(self.install.token_file()))
+
+    def test_one_attempt_is_still_the_default(self):
+        with mock.patch.object(lease, "kubectl", self._flaky(1)) as fake:
+            ok, _ = lease.do_release(self.install, sleep=lambda s: None, log=lambda m: None)
+        self.assertFalse(ok)
+        self.assertEqual(_verbs(fake), ["get"])
+        self.assertFalse(os.path.exists(self.install.token_file()))
+
+    def test_a_lease_that_is_not_yours_is_not_retried(self):
+        other = _lease_data(token="not-mine", minutes=60)
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(other)) as fake:
+            ok, msg = lease.do_release(self.install, attempts=4, backoff=0,
+                                       sleep=lambda s: None, log=lambda m: None)
+        self.assertFalse(ok)
+        self.assertIn("not yours", msg)
+        self.assertEqual(_verbs(fake), ["get"])
+
+    def test_a_failed_delete_is_retried_with_the_token_kept(self):
+        state = {"deletes": 0}
+
+        def call(install, args, stdin=None):
+            if args[0] == "get":
+                return 0, json.dumps({"data": self.mine,
+                                      "metadata": {"resourceVersion": "7"}}), ""
+            state["deletes"] += 1
+            return (1, "", "etcdserver: request timed out") if state["deletes"] == 1 else (0, "", "")
+        with mock.patch.object(lease, "kubectl", mock.Mock(side_effect=call)) as fake:
+            ok, _ = lease.do_release(self.install, attempts=2, backoff=0,
+                                     sleep=lambda s: None, log=lambda m: None)
+        self.assertTrue(ok)
+        self.assertEqual(_verbs(fake), ["get", "delete", "get", "delete"])
+
+
+class Takeover(unittest.TestCase):
+    """#6381: a finished workflow run's own lease, replaced by compare-and-swap."""
+
+    NOTE = "scheduled reconcile of autopush"
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": self.tmp.name,
+            "KUBE_AGENTS_LEASE_SESSION": "gha-222",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.install = lease._install_from_context(CTX)
+
+    def _held(self, session="gha-111", note=None):
+        data = _lease_data(token="theirs", minutes=60)
+        data["session"] = session
+        data["note"] = self.NOTE if note is None else note
+        return data
+
+    def test_the_named_runs_lease_is_replaced_with_the_read_resource_version(self):
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(self._held(), rv="99")) as fake:
+            ok, msg = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertTrue(ok, msg)
+        self.assertEqual(_verbs(fake), ["get", "replace"])
+        sent = json.loads(fake.call_args_list[-1][1]["stdin"])
+        self.assertEqual(sent["metadata"]["resourceVersion"], "99")
+        self.assertEqual(sent["data"]["session"], "gha-222")
+        self.assertEqual(sent["data"]["takenOverFrom"], "gha-111")
+        self.assertIn("takenOverAt", sent["data"])
+        self.assertTrue(os.path.exists(self.install.token_file()))
+
+    def test_a_claim_between_the_read_and_the_replace_refuses(self):
+        def call(install, args, stdin=None):
+            if args[0] == "get":
+                return 0, json.dumps({"data": self._held(),
+                                      "metadata": {"resourceVersion": "5"}}), ""
+            return 1, "", ('Operation cannot be fulfilled on configmaps "live-test-lease": '
+                           'the object has been modified; please apply your changes to the '
+                           'latest version and try again (Conflict)')
+        with mock.patch.object(lease, "kubectl", mock.Mock(side_effect=call)) as fake:
+            ok, msg = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertFalse(ok)
+        self.assertIn("changed since it was read", msg)
+        self.assertEqual(_verbs(fake), ["get", "replace"])
+        self.assertFalse(os.path.exists(self.install.token_file()))
+
+    def test_a_different_session_is_refused(self):
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(self._held("gha-333"))) as fake:
+            ok, msg = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertFalse(ok)
+        self.assertIn("another session", msg)
+        self.assertEqual(_verbs(fake), ["get"])
+
+    def test_a_person_or_agent_session_is_never_taken_over(self):
+        for session in ("12345", "claude-abc", "nopid-42", "gha-", "gha-12x", ""):
+            with self.subTest(session=session):
+                with mock.patch.object(lease, "kubectl",
+                                       _fake_kubectl(self._held(session))) as fake:
+                    ok, msg = lease.do_takeover(self.install, session, self.NOTE)
+                self.assertFalse(ok)
+                self.assertIn("not a workflow run", msg)
+                fake.assert_not_called()
+
+    def test_a_different_note_is_refused(self):
+        with mock.patch.object(lease, "kubectl",
+                               _fake_kubectl(self._held(note="manual test"))) as fake:
+            ok, msg = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertFalse(ok)
+        self.assertIn("note", msg)
+        self.assertEqual(_verbs(fake), ["get"])
+
+    def test_no_lease_is_refused(self):
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(None)):
+            ok, msg = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertFalse(ok)
+
+
 class HookEntryPoints(unittest.TestCase):
     """The hook is the only thing that enforces anything.
 
