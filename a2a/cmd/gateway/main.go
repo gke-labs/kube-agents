@@ -449,7 +449,7 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 		switch {
 		case cfg.SlackHomeChannel != "":
 		case cfg.HomeLearnArmed():
-			log.Info("chat.notify home posts wait for a home channel: none is configured, and the gateway learns one from the first mention in a channel; conversation posts are armed")
+			log.Info("chat.notify home posts use a learned home channel: none is configured, so they go to the channel the gateway learned, or wait for the first mention in a channel to set one; conversation posts are armed")
 		default:
 			log.Warn("chat.notify home posts not armed: no Slack home channel configured; conversation posts are")
 		}
@@ -468,7 +468,7 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	switch {
 	case cfg.GchatHomeChannel != "":
 	case cfg.GchatHomeLearnArmed():
-		log.Info("chat.notify home posts wait for a home channel: none is configured, and the gateway learns one from the first mention in a space; conversation posts are armed")
+		log.Info("chat.notify home posts use a learned home channel: none is configured, so they go to the space the gateway learned, or wait for the first mention in a space to set one; conversation posts are armed")
 	default:
 		log.Warn("chat.notify home posts not armed: no home channel configured; conversation posts are")
 	}

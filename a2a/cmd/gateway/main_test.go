@@ -742,7 +742,7 @@ func TestARouteArmedToLearnIsLoggedAsWaiting(t *testing.T) {
 				if strings.HasPrefix(msg, "chat.notify home posts not armed") {
 					t.Fatalf("logged %v for a route armed to learn", rec)
 				}
-				if strings.HasPrefix(msg, "chat.notify home posts wait for a home channel") {
+				if strings.HasPrefix(msg, "chat.notify home posts use a learned home channel") {
 					waiting = rec["level"] == "INFO"
 				}
 			}

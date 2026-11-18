@@ -90,8 +90,8 @@ mcp_servers:
       # environment, so nothing else is needed. A2A_NOTIFY_PLATFORM and
       # A2A_NOTIFY_CONVERSATIONS each hold a comma-separated list of platform
       # names, Chat first: every armed route with a CR home channel in the
-      # first, every armed route in the second. routed_platforms() adds Slack
-      # when the projected file names a learned channel, and sends home posts
+      # first, every armed route in the second. routed_platforms() adds a
+      # platform whose projected file names a learned home, and sends home posts
       # to every armed route when no platform has a home, so the child needs
       # both.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"

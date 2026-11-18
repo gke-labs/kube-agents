@@ -44,6 +44,8 @@ import chat_notify
 # move to it. #1094/#1111 settled the same order for the same reason on the sibling
 # in `session_kv_server`, after #855's Slack-first ordering cost autopush a week of
 # governance reports to a Slack leg with no home channel.
+# On an install the A2A gateway serves, chat_notify.in_routed_order then puts a
+# configured home ahead of a learned one.
 CHAT_PLATFORMS = ("google_chat", "slack")
 
 # The managed scope, mounted read-only by the operator and machine-global — one

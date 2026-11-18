@@ -2809,7 +2809,9 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 
 # The chat platforms this harness ships an egress path for, in the order a
 # message is posted to them and in the order a single-destination caller picks
-# one. Google Chat leads, and the ordering is the whole of #1094.
+# one. Google Chat leads, and the ordering is the whole of #1094. On an install
+# the A2A gateway serves, chat_notify.in_routed_order then puts a configured
+# home ahead of a learned one.
 #
 # #855 put Slack first, on the reasoning that a dual-platform install "resolves
 # the same way whichever branch answers". It does — and the answer it resolves

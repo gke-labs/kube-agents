@@ -718,7 +718,8 @@ path — `trigger_agent_troubleshooter`, which drives `_post_initial_alert`. An
 incident alert registers the thread it gets back as the session's routing and
 the triage card's completion is addressed there, so two threads on two platforms
 would leave the report addressable to only one. It returns the first enabled
-platform and logs a warning naming the platforms that will not receive the
+platform (a home channel configured on the PlatformAgent ahead of one the gateway learned, Google
+Chat before Slack when they are alike) and logs a warning naming the platforms that will not receive the
 message — and the alert path then tries each enabled platform in turn until one
 accepts, so a broken first leg costs a retry rather than the alert. Ordering
 alone would have mirrored #1094 onto whichever installs have the _other_
