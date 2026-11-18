@@ -14562,6 +14562,7 @@ class TestProposalOrigin(unittest.TestCase):
                        "followup_state", "followup_attempts", "followup_detail"):
             self.assertIn(column, row)
         self.assertIsNone(row["outcome"])
+        self.assertIsNone(row["environment"])
 
     def test_post_merge_record_leaves_project_empty_for_an_unknown_or_ambiguous_cluster(self):
         import sqlite3
