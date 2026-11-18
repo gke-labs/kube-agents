@@ -27,6 +27,7 @@ import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
 from kube_agents_bench import board, card_wake, harness, transcript, worker_trajectory
+from kube_agents_bench import inject_transport as inject
 from kube_agents_bench.verifiers import ReplayCardVerifier
 from kube_agents_bench.cases import CaseSpec
 from kube_agents_bench.harness import KubeAgentsHarness
@@ -2027,6 +2028,18 @@ def test_every_turn_carries_the_eval_run_tag_of_its_conversation(
     assert json.loads(target.read_text(encoding="utf-8")) == {
         "eval_run": f"{run_id}/some-case/2", "run_id": run_id, "case_id": "some-case", "repetition": "2",
     }
+
+
+def test_the_eval_run_record_is_the_inject_conversation_key() -> None:
+    """Both transports write one shape; the inject path's tag is its conversation key."""
+    record = harness._eval_run_record("devops-bench-0123456789ab", "some-case", "2")
+    assert record == {
+        "eval_run": "devops-bench-0123456789ab/some-case/2",
+        "run_id": "devops-bench-0123456789ab",
+        "case_id": "some-case",
+        "repetition": "2",
+    }
+    assert record["eval_run"] == inject.conversation_key("devops-bench-0123456789ab", "some-case", "2")
 
 
 def test_the_eval_run_tag_falls_back_outside_the_presubmit(

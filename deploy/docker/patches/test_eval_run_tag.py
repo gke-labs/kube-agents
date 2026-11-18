@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -84,6 +85,12 @@ class TagTest(unittest.TestCase):
         ):
             source = path.read_text()
             self.assertIn(f'{name} = re.compile(r"{eval_run_tag.TAG_RE.pattern}")', source, path)
+
+    def test_the_pattern_matches_the_hermes_bridges(self):
+        source = (HERE.parents[2] / "a2a" / "hermes-bridge" / "api.go").read_text()
+        found = re.search(r"apiEvalRunPattern = regexp\.MustCompile\(`\^(.*)\$`\)", source)
+        self.assertIsNotNone(found, "apiEvalRunPattern is gone from a2a/hermes-bridge/api.go")
+        self.assertEqual(found.group(1), eval_run_tag.TAG_RE.pattern)
 
     def test_the_profile(self):
         for home, name in (("/opt/data", "default"), ("/opt/data/profiles/platform", "platform"),

@@ -560,6 +560,9 @@ _SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
 # repetition and copies it beside results.json; unset, nothing is written.
 _EVAL_RUN_FILE_ENV = "KUBE_AGENTS_EVAL_RUN_FILE"
 _EVAL_RUN_KEY = "eval_run"
+_EVAL_RUN_ID_KEY = "run_id"
+_EVAL_RUN_CASE_KEY = "case_id"
+_EVAL_RUN_REPETITION_KEY = "repetition"
 # The api transport sends the tag on each turn. The agent records it for the
 # turn's session and, while the install has KUBEAGENTS_EVAL_RUN_TAGS on, stamps
 # it on every model request the work makes (deploy/docker/patches/eval_run_tag.py),
@@ -2624,11 +2627,20 @@ def _eval_run_identity(run_id: str) -> dict[str, str]:
     """
     case = os.environ.get(_EVAL_CASE_ID_ENV, "").strip() or _EVAL_CASE_FALLBACK
     repetition = os.environ.get(_EVAL_REPETITION_ENV, "").strip() or _EVAL_REPETITION_FALLBACK
+    return _eval_run_record(run_id, case, repetition)
+
+
+def _eval_run_record(run_id: str, case: str, repetition: str) -> dict[str, str]:
+    """What ``KUBE_AGENTS_EVAL_RUN_FILE`` holds: the tag ``<run>/<case>/<rep>`` and its parts.
+
+    The one shape both transports write; the inject path's conversation key
+    is the same triple joined the same way.
+    """
     return {
         _EVAL_RUN_KEY: _EVAL_RUN_SEPARATOR.join((run_id, case, repetition)),
-        "run_id": run_id,
-        "case_id": case,
-        "repetition": repetition,
+        _EVAL_RUN_ID_KEY: run_id,
+        _EVAL_RUN_CASE_KEY: case,
+        _EVAL_RUN_REPETITION_KEY: repetition,
     }
 
 
@@ -4001,7 +4013,7 @@ class KubeAgentsHarness(AgentHarness):
         conversation = inject.conversation_key(run_id, case_id, repetition)
         message_id = inject.message_id(run_id, case_id, repetition)
         # The same triple the bridge sends as the tag (a2a/hermes-bridge/api.go).
-        _write_eval_run({_EVAL_RUN_KEY: conversation, "run_id": run_id, "case_id": case_id, "repetition": repetition})
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
         if follow_up is not None:
             conversation, message_id = follow_up.conversation, message_id + follow_up.suffix
         identity: dict[str, Any] = {
