@@ -2026,6 +2026,11 @@ platformAgent:
       # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
       # false hides the buttons and keeps nothing.
       answerFeedback: true
+      # "auto" (also empty) or "manual". With homeChannel empty, "auto" lets
+      # the A2A gateway make the space of the first top-level mention of the
+      # agent in a named space the home channel; "manual" leaves homeChannel
+      # alone to decide. A set homeChannel wins under either.
+      homeChannelPolicy: ""
     slack:
       # Bot/app tokens are read from credentials.secretName under the
       # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.

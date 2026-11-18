@@ -3853,7 +3853,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
-	if a2aSlackArmed(agent) {
+	if a2aHomeChannelProjected(agent) {
 		// The home-channel projection (platformagent_home_channel_record.go):
 		// Optional and out of the pod-template hashes, so its content rolls
 		// no pod; the agent's readers follow the file within a kubelet sync.
@@ -5791,7 +5791,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
-	if a2aSlackArmed(agent) {
+	if a2aHomeChannelProjected(agent) {
 		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
 	}
 
