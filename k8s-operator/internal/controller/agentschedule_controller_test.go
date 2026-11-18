@@ -422,19 +422,29 @@ func TestAgentScheduleWithNoPlatformAgentFiresNothing(t *testing.T) {
 	}
 }
 
-// A schedule is builtin only when the install's PlatformAgent controls it:
-// the origin label, which its creator sets, unlocks nothing.
-func TestAgentScheduleOriginComesFromTheControllerNotTheLabel(t *testing.T) {
+// A schedule is builtin only when the install's PlatformAgent controls it
+// and its origin label reads builtin: a broker kept to origin: user by the
+// admission policy can add the controller reference but not the label, and a
+// hand-written schedule can set the label but has no controller reference.
+func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		controlled bool
+		label      string
 		want       string
 	}{
-		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginUser},
-		{"controlled by the install", true, agentv1alpha1.AgentScheduleOriginBuiltin},
+		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, agentv1alpha1.AgentScheduleOriginUser},
+		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, agentv1alpha1.AgentScheduleOriginUser},
+		{"controlled, unlabelled", true, "", agentv1alpha1.AgentScheduleOriginUser},
+		{"controlled by the install, labelled builtin", true, agentv1alpha1.AgentScheduleOriginBuiltin, agentv1alpha1.AgentScheduleOriginBuiltin},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+				if tc.label == "" {
+					delete(s.Labels, agentv1alpha1.AgentScheduleOriginLabel)
+				} else {
+					s.Labels[agentv1alpha1.AgentScheduleOriginLabel] = tc.label
+				}
 				if tc.controlled {
 					s.OwnerReferences = []metav1.OwnerReference{{
 						APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",

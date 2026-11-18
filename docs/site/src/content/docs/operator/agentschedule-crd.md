@@ -29,6 +29,7 @@ spec:
     silentWhenClean: true
 ```
 
+- The `kubeagents.x-k8s.io/origin` label says who owns a schedule. A schedule runs as `builtin` only when it reads `builtin` and the install's `PlatformAgent` is its controller, as on the schedules the operator renders. Any other schedule runs as `user`.
 - `schedule` is a standard 5-field cron expression, read in UTC, as a Kubernetes `CronJob` reads it. It takes no time zone prefix.
 - `profileRef` names an `AgentProfile` in the same namespace whose `allowedTiers` includes `unattended`. A schedule whose profile is missing or doesn't allow it reads `Accepted=False` and never fires.
 - `concurrencyPolicy` is `Forbid`, the only value: a slot that comes due while the last run is still going is skipped and counted in `status.skipCounts.alreadyRunning`.
