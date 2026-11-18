@@ -353,7 +353,62 @@ class WatchHealthTest(unittest.TestCase):
                 self.assertTrue(self.row()["health_detail"].startswith("not settled"), self.row()["health_detail"])
                 with self.assertLogs("post_merge_check", level="WARNING"):
                     self.assertEqual(self.tick(40)["failed"], [f"{REPO}/pull/1"])
-                self.assertIn("no healthy reading by 35 minutes", self.row()["health_detail"])
+                self.assertIn("not healthy 35 minutes after the apply", self.row()["health_detail"])
+
+    def test_an_evicted_pod_beside_three_ready_ones_passes(self):
+        # Kept by the pod garbage collector with its owner and hash, but the ReplicaSet no longer counts it.
+        evicted = pods(restarts=(0,), ready=False)["items"][0]
+        evicted["metadata"].update(name="checkout-evicted", uid="ue")
+        evicted["status"].update(phase="Failed", reason="Evicted")
+        for name, with_statuses in (("in the baseline", True), ("no container statuses", False)):
+            with self.subTest(name):
+                self.setUp()
+                pod = json.loads(json.dumps(evicted))
+                if not with_statuses:
+                    pod["status"].pop("containerStatuses")
+                self.cluster.apps = [argo_app()]
+                self.cluster.pod_list = {"items": pods()["items"] + [pod]}
+                self.tick(1)
+                self.assertNotIn("ue/web", json.loads(self.row()["health_baseline"]))
+                self.tick(4)
+                self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+
+    def test_a_pod_starting_at_the_apply_is_waited_for_not_failed(self):
+        self.cluster.apps = [argo_app()]
+        starting = pods(restarts=(0,), ready=False)["items"][0]
+        starting["metadata"].update(name="checkout-new", uid="un")
+        self.cluster.pod_list = {"items": pods()["items"] + [starting]}
+        self.cluster.workload = deployment(replicas=4, updated=4)
+        self.tick(1)
+        self.assertNotIn("un/web", json.loads(self.row()["health_baseline"]))
+        self.assertEqual(self.tick(2)["waiting"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["health_detail"].startswith("not settled"), self.row()["health_detail"])
+        starting["status"]["conditions"][0]["status"] = "True"
+        self.tick(4)
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+
+    def test_one_failed_read_past_the_settle_limit_is_read_again_not_ended(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.workload = deployment(updated=2)
+        self.tick(6)
+        self.cluster.workload = deployment()
+        self.tick(34)  # healthy, one sample
+        self.cluster.fail = post_merge_check.ClusterReadError("i/o timeout")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(35)["unreadable"], [f"{REPO}/pull/1"])
+        self.cluster.fail = None
+        self.assertEqual(self.tick(38)["waiting"], [f"{REPO}/pull/1"], "read, healthy again: counted, not ended")
+        self.assertEqual(self.tick(40)["passed"], [f"{REPO}/pull/1"])
+
+    def test_a_workload_scaled_to_zero_is_healthy(self):
+        self.cluster.apps = [argo_app()]
+        self.cluster.workload = deployment(replicas=0, updated=0, available=0, ready=0)
+        self.cluster.pod_list = {"items": []}
+        self.tick(1)
+        self.tick(4)
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+        self.assertIn("scaled to zero", self.row()["health_detail"])
 
     def test_a_rollout_that_settles_resets_the_count_then_passes(self):
         self.cluster.apps = [argo_app()]

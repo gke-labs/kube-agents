@@ -16,7 +16,7 @@ import kubeagents_switches
 import post_merge_check
 import post_merge_outcome
 import post_merge_scope
-from test_post_merge_check import MERGE, REPO, FakeCluster, FakeForge, argo_app, schema
+from test_post_merge_check import MERGE, REPO, FakeCluster, FakeForge, argo_app, deployment, schema
 
 NOW = datetime(2026, 11, 12, 9, 0, tzinfo=timezone.utc)
 URL = f"{REPO}/pull/1"
@@ -67,7 +67,8 @@ class DecideTest(unittest.TestCase):
 
     def test_each_cannot_judge_reason_maps_to_its_own_outcome(self):
         applied = NOW.isoformat()
-        never = "cannot judge: no healthy reading by 35 minutes after the apply; last: not settled: rollout 1/3"
+        never = "cannot judge: not healthy 35 minutes after the apply; last: not settled: rollout 1/3"
+        unread = "cannot judge: not healthy 35 minutes after the apply; this read failed: Timeout(); before it: x"
         baseline = "cannot judge: the restart baseline is unreadable"
         gone = 'cannot judge: deployments.apps "checkout" not found'
         cases = (
@@ -76,6 +77,8 @@ class DecideTest(unittest.TestCase):
             (record(applied_at=applied, health_result="failed", health_detail=baseline),
              post_merge_outcome.APPLIED_NOT_RECHECKED, "unreadable"),
             (record(health_result="failed", health_detail=gone), post_merge_outcome.NOT_APPLIED, "unreadable"),
+            (record(applied_at=applied, health_result="failed", health_detail=unread),
+             post_merge_outcome.APPLIED_NOT_RECHECKED, "unreadable"),
         )
         for rec, outcome, category in cases:
             with self.subTest(detail=rec["health_detail"]):
@@ -91,8 +94,10 @@ class DecideTest(unittest.TestCase):
             "opened_at, merged_at, merge_commit, applied_at, health_baseline, health_detail) VALUES (?, ?, 1, "
             "'no-pdb', 'p', 'l', 'prod', 'shop', 'Deployment/checkout', ?, ?, ?, ?, '{}', 'not settled: rollout 1/3')",
             (URL, REPO, NOW.isoformat(), NOW.isoformat(), MERGE, NOW.isoformat()))
+        rolling = FakeCluster()
+        rolling.workload = deployment(updated=1)  # this run's own reading is a rollout under way
         with self.assertLogs("post_merge_check", level="WARNING"):
-            post_merge_check.watch_health(conn, FakeCluster(), NOW + timedelta(hours=2))
+            post_merge_check.watch_health(conn, rolling, NOW + timedelta(hours=2))
         detail = conn.execute("SELECT health_detail FROM post_merge_records").fetchone()[0]
         self.assertTrue(detail.startswith(post_merge_outcome.CANNOT_JUDGE + post_merge_outcome.NEVER_SETTLED), detail)
 

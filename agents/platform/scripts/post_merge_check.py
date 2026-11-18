@@ -557,10 +557,16 @@ def _rolled_out(workload: dict) -> bool:
     return int(status.get("updatedReplicas") or 0) == replicas
 
 
+#: Pod phases the workload's controller no longer counts (its active-pod filter): an evicted pod, or one a
+#: Spot or node shutdown ended, stays listed until garbage collection but can never be Ready again.
+ENDED_PHASES = ("Failed", "Succeeded")
+
+
 def _owned_pods(workload: dict, pods: dict) -> list[dict]:
-    # A pod being deleted (a drain, a scale-down) is no longer the workload's to judge.
+    # A pod being deleted (a drain, a scale-down), or one that has ended, is no longer the workload's to judge.
     return [pod for pod in pods.get("items", [])
-            if _owned_by(pod, workload) and not (pod.get("metadata") or {}).get("deletionTimestamp")]
+            if _owned_by(pod, workload) and not (pod.get("metadata") or {}).get("deletionTimestamp")
+            and (pod.get("status") or {}).get("phase") not in ENDED_PHASES]
 
 
 def _is_ready(pod: dict) -> bool:
@@ -631,6 +637,9 @@ def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: d
         if not _is_ready(pod):
             return UNSETTLED, f"pod {(pod.get('metadata') or {}).get('name') or ''} is starting"
     if not items:
+        if int(((workload.get("spec") or {}).get("replicas", 1)) or 0) == 0:
+            # Scaled to zero, by a person or a scaler: no pods is the state asked for.
+            return HEALTHY, "scaled to zero replicas"
         return RED, "no pods belong to the workload"
     return HEALTHY, "rolled out, every pod Ready, no restarts"
 
@@ -760,7 +769,7 @@ def watch_health(
     it, into ``health_result`` and ``health_detail``. A workload that is gone or cannot be judged fails
     with the reason; any other read failure is kept in ``health_detail`` (or
     ``sync_state`` before the apply), resets the count and is retried, until
-    :data:`HEALTH_SETTLE_LIMIT` past the window with no healthy reading fails it. Every read stamps
+    :data:`HEALTH_SETTLE_LIMIT` past the window, when a run's own reading that is not healthy fails it. Every read stamps
     ``health_checked_at``, which orders the next tick, so no record starves the
     rest. Everything lives on the row, so a restart loses nothing. ``paths``
     (default :func:`forge_paths`) reads the files the pull request changed,
@@ -861,7 +870,10 @@ def watch_health(
                 updates["sync_state"] = f"{state}: {detail}"[:500]
                 if applied:
                     updates["applied_at"] = stamp
-                    updates["health_baseline"] = json.dumps(restart_baseline(pods), sort_keys=True)
+                    # Ready pods only, as _join_baseline adds later ones: a pod still starting at the apply
+                    # (a scale-up, a drain) is waited for rather than judged NotReady on the next reading.
+                    ready = [pod for pod in _owned_pods(workload, pods) if _is_ready(pod)]
+                    updates["health_baseline"] = json.dumps(restart_baseline({"items": ready}), sort_keys=True)
                     bucket = "applied"
                 else:
                     bucket = "waiting"
@@ -871,10 +883,18 @@ def watch_health(
                     raise WorkloadGone("the apply time is unreadable")
                 window = max(HEALTH_WINDOW.get(record["kind"] or "", max(HEALTH_WINDOW.values())), HEALTHY_AFTER_SYNC)
                 last = record["health_detail"]
-                if last and not _healthy_samples(last) and now - applied_at >= window + HEALTH_SETTLE_LIMIT:
-                    raise WorkloadGone(f"no healthy reading by {int((window + HEALTH_SETTLE_LIMIT).total_seconds() // 60)} "
-                                       f"minutes after the apply; last: {last}")
-                workload, pods = _read_workload(kubectl_json, record)
+                # The limit is weighed after this tick's reading, never on the last one alone: a record that
+                # read healthy before one failed read is read again rather than ended unread.
+                past_limit = now - applied_at >= window + HEALTH_SETTLE_LIMIT
+                limit_text = f"not healthy {int((window + HEALTH_SETTLE_LIMIT).total_seconds() // 60)} minutes after the apply"
+                try:
+                    workload, pods = _read_workload(kubectl_json, record)
+                except WorkloadGone:
+                    raise
+                except Exception as exc:
+                    if past_limit:
+                        raise WorkloadGone(f"{limit_text}; this read failed: {exc!r}; before it: {last}") from exc
+                    raise
                 try:
                     baseline = json.loads(record["health_baseline"] or "{}")
                 except ValueError:
@@ -887,6 +907,8 @@ def watch_health(
                     joined = _join_baseline(baseline, workload, pods)
                     if joined != baseline:
                         updates["health_baseline"] = json.dumps(joined, sort_keys=True)
+                if verdict == UNSETTLED and past_limit:
+                    raise WorkloadGone(f"{limit_text}; last: {NOT_SETTLED}{detail}")
                 if verdict == UNSETTLED:
                     # A rollout or scale under way (an HPA, someone else's change) is not settled yet, not red;
                     # it resets the count, and HEALTH_SETTLE_LIMIT ends a wait that never settles.

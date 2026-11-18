@@ -61,9 +61,11 @@ OPEN_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster
                 "health_detail", "health_at", "health_checked_at")
 #: What ``watch_health`` writes to ``health_detail`` when it fails a record it cannot judge
 #: (``post_merge_check.WorkloadGone``), and the one such reason that is a judgement: the
-#: workload had no healthy reading by ``HEALTH_SETTLE_LIMIT`` past the window.
+#: workload's own reading was still not settled ``HEALTH_SETTLE_LIMIT`` past the window.
+#: The same limit reached on a read that failed (``READ_FAILED``) judges nothing.
 CANNOT_JUDGE = "cannot judge: "
-NEVER_SETTLED = "no healthy reading by "
+NEVER_SETTLED = "not healthy "
+READ_FAILED = "; this read failed:"
 #: Merged records with no outcome. A pull request closed without a merge never
 #: matches, so it never ends as ``not_applied`` (#5800): the merge step ends it
 #: with no outcome once ``CLOSED_GRACE`` has passed.
@@ -127,7 +129,7 @@ def decide(record: dict, now: datetime, recheck: post_merge_scope.Recheck,
         if refusal:
             return _not_live(record), f"{SCOPE}: {refusal}"
     detail = str(record["health_detail"] or "")
-    if detail.startswith(CANNOT_JUDGE + NEVER_SETTLED):
+    if detail.startswith(CANNOT_JUDGE + NEVER_SETTLED) and READ_FAILED not in detail:
         # Read every run and never healthy: the workload did not stay healthy after the apply.
         return STILL_BROKEN, f"{HEALTH}: {detail}"
     if detail.startswith(CANNOT_JUDGE):

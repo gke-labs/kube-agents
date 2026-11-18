@@ -449,8 +449,8 @@ path narrows the namespace matches and never empties them, and a diff it cannot 
 no file naming the workload, is said as `the workload's files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
-`sync_state`. Once applied it records `applied_at` and the pods' restart counts
-(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted) is Ready, and no container, sidecars and init containers included, restarted past its baseline or was OOMKilled since the apply. A rollout or scale still under way, or a pod that did not exist at the apply and is still starting, is not settled rather than red: the run waits and the count starts again. A pod that was there at the apply, or has been seen Ready since (it then joins `health_baseline`), and is not Ready fails it, even while another pod is starting. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried, until `HEALTH_SETTLE_LIMIT` (30 minutes) past the window with no healthy reading fails it as not settled.
+`sync_state`. Once applied it records `applied_at` and the Ready pods' restart counts
+(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings, each on its own run, with the last one past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under `HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod of the workload (other than one being deleted, or one that has ended in phase `Failed` or `Succeeded`, such as an evicted pod) is Ready, and no container, sidecars and init containers included, restarted past its baseline or was OOMKilled since the apply. A workload scaled to zero replicas is healthy with no pods. A rollout or scale still under way, or a pod that was not Ready at the apply and is still starting, is not settled rather than red: the run waits and the count starts again. A pod that was Ready at the apply, or has been seen Ready since (it then joins `health_baseline`), and is not Ready fails it, even while another pod is starting. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the reason in `health_detail` and the time in `health_at`. A workload that is gone, an unreadable restart baseline or an unreadable apply time fails at once with the reason. Any other read failure is kept, resets the count and is retried. From `HEALTH_SETTLE_LIMIT` (30 minutes) past the window, a run whose own reading is not settled, or fails, fails it as not settled; a healthy reading still counts.
 
 `post_merge_edited.py fill`, under the same switch and per-run cap,
 fills `human_edited` for each merged record without one: `1` when anyone but the install, a person or
@@ -466,9 +466,10 @@ starts with a fixed category (`apply`, `health`, `re-check`, `unreadable`, `out 
 
 - `verified_fixed`: the health window passed and the fleet audit's check (`recheck.py`, imported from
   the image's copy of the skill) no longer fires.
-- `still_broken`: the health window failed, including a workload with no healthy reading by
-  `HEALTH_SETTLE_LIMIT` past the window, or the check still fires.
-- `applied_not_rechecked`: applied, but the workload went away or its baseline could not be read, the
+- `still_broken`: the health window failed, including a workload whose own reading is still not
+  settled `HEALTH_SETTLE_LIMIT` past the window, or the check still fires.
+- `applied_not_rechecked`: applied, but the workload went away, its baseline could not be read or the
+  read failed at the settle limit, the
   re-check could not judge, or the workload or the re-check could not be read for `CHECK_DEADLINE`
   (60 minutes) after the window; or the declared scope leaves the cluster out.
 - `not_applied`: not live `APPLY_DEADLINE` (60 minutes for `no-pdb`) after the merge was noticed, the
