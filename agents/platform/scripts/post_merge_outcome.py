@@ -49,6 +49,9 @@ OUTCOMES = (VERIFIED_FIXED, STILL_BROKEN, APPLIED_NOT_RECHECKED, NOT_APPLIED)
 #: How long after the merge the GitOps tool has to apply it, per kind of fix
 #: (design gke-labs/kube-agents#5054, "Settings per fix").
 APPLY_DEADLINE = {"no-pdb": timedelta(minutes=60)}
+#: How long one cron run may keep starting work, so it ends inside its five-minute schedule
+#: instead of holding the cron lock over the next ticks (a cluster hop can take 45 s).
+RUN_BUDGET = timedelta(minutes=4)
 #: How long after the apply the health window and the re-check may keep
 #: failing to read the cluster before the record ends as not checked.
 CHECK_DEADLINE = timedelta(minutes=60)
@@ -196,7 +199,8 @@ def _stamp(conn: sqlite3.Connection, url: str, stamp: str) -> bool | str:
 
 def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck, now: datetime | None = None,
                     scope_refusal: post_merge_scope.ScopeRefusal | None = None,
-                    limit: int = post_merge_check.READS_PER_TICK) -> dict[str, list[str]]:
+                    limit: int = post_merge_check.READS_PER_TICK,
+                    stop: Callable[[], bool] | None = None) -> dict[str, list[str]]:
     """Reach an outcome for every merged record that has one; ``outcome``, ``outcome_at`` and ``outcome_detail``.
 
     Every open record is weighed each tick; deciding reads nothing but the
@@ -204,7 +208,8 @@ def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck,
     those run a tick. A re-check that did not answer stamps
     ``health_checked_at``, the order records are weighed in, so a record that
     keeps failing goes to the back and retries until :data:`CHECK_DEADLINE`
-    rather than holding the tick's re-checks. An outcome is written only over
+    rather than holding the tick's re-checks. ``stop()`` true starts no further
+    record (``not_reached``). An outcome is written only over
     none, so it is never changed. A record this code fails on is returned
     under ``errors``.
     """
@@ -222,6 +227,10 @@ def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck,
         return recheck(record)
 
     for values in conn.execute(OPEN_SQL).fetchall():
+        if stop is not None and stop():
+            # The run's time budget is spent: the rest are weighed next run.
+            seen.setdefault("not_reached", []).append(values[0])
+            continue
         record = dict(zip(OPEN_COLUMNS, values))
         try:
             reached = decide(record, now, bounded, scope_refusal)
@@ -261,7 +270,8 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
          kubectl_json: post_merge_check.KubectlJson | None = None, recheck: post_merge_scope.Recheck | None = None,
          scope_refusal: post_merge_scope.ScopeRefusal | None = None, fill_edited: Step | None = None,
          fill_environments: Step | None = None, report: Step | None = None, followups: Step | None = None,
-         reverts: Step | None = None, now: datetime | None = None, limit: int | None = None) -> dict[str, dict]:
+         reverts: Step | None = None, now: datetime | None = None, limit: int | None = None,
+         budget: timedelta | None = None, clock: Callable[[], float] | None = None) -> dict[str, dict]:
     """One run of the ``post-merge-check`` cron job, every step in order.
 
     Notice merges (``post_merge_check.notice_merges``) and who edited them
@@ -281,6 +291,14 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
     raises is kept under its name as ``{"errors": [...]}`` and the steps after
     it still run. Each step reads at most ``limit`` records,
     ``post_merge_check.reads_per_tick()`` when not given.
+
+    The run stops starting work once ``budget`` (:data:`RUN_BUDGET`) has passed
+    on ``clock`` (``time.monotonic``), so it ends inside the five-minute
+    schedule rather than holding the cron lock over the next ticks: the apply
+    and health step and the outcomes stop between records, and later steps are
+    not started. What it left goes under ``deadline`` (``skipped`` steps,
+    ``after_seconds``), and :func:`stopped_early` says so in the run's log. It
+    is not an error: everything left waits for the next run.
     """
     import post_merge_edited
     import post_merge_environment
@@ -295,7 +313,20 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
     followups = followups or (lambda c: post_merge_followups.run_followups(c, now=now, limit=limit))
     reverts = reverts or (lambda c: post_merge_followups.notice_reverts(c, now=now, limit=limit))
 
+    import time
+
+    clock = clock or time.monotonic
+    started = clock()
+    budget_s = (budget or RUN_BUDGET).total_seconds()
+
+    def over() -> bool:
+        return clock() - started >= budget_s
+
     def step(name: str, run: Callable[[], dict]) -> None:
+        if over():
+            left = seen.setdefault("deadline", {"after_seconds": [int(budget_s)], "skipped": []})
+            left["skipped"].append(name)
+            return
         try:
             seen[name] = run()
         except Exception as exc:  # noqa: BLE001 — one step's fault must not stop the others
@@ -318,14 +349,30 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
             scope_read = False
     if scope_read:
         refusal, rechecker = scope_refusal, recheck
-        step("health", lambda: post_merge_check.watch_health(conn, kubectl_json, now, limit, scope_refusal=refusal))
-        step("outcomes", lambda: decide_outcomes(conn, rechecker, now, refusal, limit))
+        step("health", lambda: post_merge_check.watch_health(conn, kubectl_json, now, limit, scope_refusal=refusal,
+                                                                  stop=over))
+        step("outcomes", lambda: decide_outcomes(conn, rechecker, now, refusal, limit, stop=over))
         step("environments", lambda: fill_environments(conn))
     step("reports", lambda: report(conn))
     if scope_read:
         step("followups", lambda: followups(conn))
         step("reverts", lambda: reverts(conn))
+    if any(seen.get(name, {}).get("not_reached") for name in ("health", "outcomes")):
+        seen.setdefault("deadline", {"after_seconds": [int(budget_s)], "skipped": []})
     return seen
+
+
+def stopped_early(seen: dict[str, dict]) -> str | None:
+    """One log line when the run hit its time budget, naming what it left for the next run; else None."""
+    left = seen.get("deadline")
+    if not left:
+        return None
+    parts = [f"{len(seen[name]['not_reached'])} {name} record(s)" for name in ("health", "outcomes")
+             if seen.get(name, {}).get("not_reached")]
+    if left.get("skipped"):
+        parts.append("the steps " + ", ".join(left["skipped"]))
+    return (f"post-merge check: stopped early at its {left['after_seconds'][0]} s budget; left for the next run: "
+            + ("; ".join(parts) or "nothing"))
 
 
 def errored(seen: dict[str, dict]) -> list[str]:

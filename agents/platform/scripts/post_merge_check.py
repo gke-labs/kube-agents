@@ -731,8 +731,13 @@ def watch_health(
     contains: Contains = forge_contains,
     paths: Paths = None,
     scope_refusal: Callable[[dict], str | None] | None = None,
+    stop: Callable[[], bool] | None = None,
 ) -> dict[str, list[str]]:
     """Steps 3 and 4 for each merged record: wait for the apply, then hold the health window.
+
+    ``stop()`` true (the cron run's time budget, ``post_merge_outcome.RUN_BUDGET``)
+    starts no further record: the rest wait for the next run, least recently read
+    first as always, and the count of them goes under ``not_reached``.
 
     ``scope_refusal(record)`` (``post_merge_scope.scope_refusal_for``) names
     why the install's declared scope leaves the record's cluster out, or None.
@@ -781,6 +786,9 @@ def watch_health(
     for values in conn.execute(HEALTH_SQL, (-1,)).fetchall():
         if reads >= limit:
             break
+        if stop is not None and stop():
+            seen["not_reached"] = seen.get("not_reached", []) + [values[0]]
+            continue
         record = dict(zip(HEALTH_COLUMNS, values))
         url = record["url"]
         updates: dict[str, object] = {"health_checked_at": stamp}
@@ -994,10 +1002,11 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
 
             seen = post_merge_outcome.tick(conn, mode, view=view, kubectl_json=kubectl_json, **tick_overrides)
             summary = f"post-merge check ({mode}): {json.dumps(seen)}"
+            early = post_merge_outcome.stopped_early(seen)
             try:
                 import script_log
 
-                script_log.append(LOG_FILE, [summary])
+                script_log.append(LOG_FILE, [summary] + ([early] if early else []))
             except Exception as exc:  # noqa: BLE001 — the log is best effort
                 print(f"post-merge check: could not write {LOG_FILE}: {exc!r}", file=sys.stderr)
             failures = post_merge_outcome.failures_to_report(post_merge_outcome.errored(seen),

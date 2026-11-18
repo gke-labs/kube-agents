@@ -306,6 +306,52 @@ class TickTest(unittest.TestCase):
         self.assertIn("outcomes", seen)
 
 
+class RunBudgetTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.execute(schema())
+        for n in range(1, 4):
+            self.conn.execute(
+                "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, "
+                "object, opened_at, merged_at, merge_commit, health_checked_at) VALUES (?, ?, ?, 'no-pdb', 'p', 'l', "
+                "'prod', 'shop', 'Deployment/checkout', ?, ?, ?, ?)",
+                (f"{REPO}/pull/{n}", REPO, n, NOW.isoformat(), NOW.isoformat(), MERGE, f"2026-11-12T08:0{n}:00+00:00"))
+        self.cluster = FakeCluster()
+        self.cluster.apps = [argo_app()]
+        self.ticks = 0
+
+    def clock(self):
+        # Each call is a minute later: the budget of four minutes runs out part-way through the run.
+        self.ticks += 1
+        return self.ticks * 60.0
+
+    def test_a_run_stops_starting_work_at_its_budget_and_says_so(self):
+        ran = []
+        fakes = {name: (lambda c, name=name: ran.append(name) or {})
+                 for name in ("fill_edited", "fill_environments", "report", "followups", "reverts")}
+        seen = post_merge_outcome.tick(self.conn, "silent", view=FakeForge({}), kubectl_json=self.cluster,
+                                       recheck=clean, scope_refusal=lambda r: None, now=NOW, clock=self.clock,
+                                       **fakes)
+        self.assertIn("deadline", seen)
+        self.assertTrue(seen["health"].get("not_reached"), seen["health"])
+        self.assertNotIn("followups", ran)
+        self.assertIn("reverts", seen["deadline"]["skipped"])
+        line = post_merge_outcome.stopped_early(seen)
+        self.assertIn("stopped early at its 240 s budget", line)
+        self.assertIn("health record(s)", line)
+        self.assertEqual(post_merge_outcome.errored(seen), [], "running out of time is not an error")
+
+    def test_a_run_inside_its_budget_says_nothing(self):
+        seen = post_merge_outcome.tick(self.conn, "silent", view=FakeForge({}), kubectl_json=self.cluster,
+                                       recheck=clean, scope_refusal=lambda r: None, now=NOW, clock=lambda: 0.0,
+                                       **{name: (lambda c: {}) for name in ("fill_edited", "fill_environments", "report",
+                                                                        "followups", "reverts")})
+        self.assertNotIn("deadline", seen)
+        self.assertIsNone(post_merge_outcome.stopped_early(seen))
+        self.assertEqual(len(seen["health"]["applied"]), 3)
+
+
 class CronRunTest(unittest.TestCase):
     def run_main(self, switch, **overrides):
         out, err = io.StringIO(), io.StringIO()

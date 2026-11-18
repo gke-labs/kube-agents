@@ -484,7 +484,10 @@ The `post-merge-check` cron job (every 5 minutes, `no_agent`) runs `post_merge_c
 arguments, every step in order: notice merges, fill `human_edited`, the apply and health steps, the
 outcomes, fill `environment`, report, then the follow-ups and the revert watch. When the declared
 scope cannot be read it notices merges, fills `human_edited` and reports outcomes already reached,
-and reads no cluster. A clean run prints nothing and keeps its summary in
+and reads no cluster. A run stops starting work once `RUN_BUDGET` (4 minutes) has passed, between
+records in the apply and health step and the outcomes and before any later step, so it ends inside
+its five-minute schedule. What it left waits for the next run, and the log says the run stopped early.
+A clean run prints nothing and keeps its summary in
 `logs/post_merge_check.log`. A run in which a record or step errored exits non-zero with one line on
 stderr naming them, kept in the run's saved output, and the scheduler posts its failure line to
 chat. A failure already reported in the last day does not do so again

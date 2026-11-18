@@ -51,8 +51,8 @@ and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 `post-merge-check` is a `no_agent` script: the tick prompts no model. Every five minutes it runs
 `post_merge_check.py`, which reads nothing while `KUBEAGENTS_POST_MERGE_CHECK` is `off`. With it on,
 it follows each recorded fix pull request through merge, apply, the health window and the fleet
-audit's re-check to one stored outcome, and then reports and follows up. A clean run is silent and
-keeps its summary in `logs/post_merge_check.log`. A run that errored posts the scheduler's failure
+audit's re-check to one stored outcome, and then reports and follows up. A run stops starting work after four minutes, so it ends inside its
+schedule. A clean run is silent and keeps its summary in `logs/post_merge_check.log`. A run that errored posts the scheduler's failure
 line, at most once a day per failure. The steps and their columns are in
 [`session_management.md`](../docs/session_management.md).
 
