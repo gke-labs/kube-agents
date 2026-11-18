@@ -91,6 +91,19 @@ class TestGates(unittest.TestCase):
         self.assertEqual(run(forge, opener, automerge="off")["action"], "none")
         self.assertEqual(opener.opened, [])
 
+    def test_a_comment_that_fails_keeps_the_pull_requests_it_opened(self):
+        class RefusingForge(FakeForge):
+            def __call__(self, verb, payload):
+                if verb == "proposal-comment":
+                    raise RuntimeError("403")
+                return super().__call__(verb, payload)
+
+        result = run(RefusingForge())
+        self.assertEqual(result["action"], "retry")
+        self.assertTrue(result["revert"].startswith("https://"))
+        self.assertTrue(result["stepDown"].startswith("https://"))
+        self.assertEqual(result["errors"], ["comment: 403"])
+
     def test_the_cli_turns_an_unexpected_forge_error_into_retry(self):
         import io
         from contextlib import redirect_stdout

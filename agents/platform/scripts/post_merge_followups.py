@@ -104,12 +104,17 @@ def last_json_document(text: str) -> dict | None:
     return None
 
 
+#: ``sandbox_exec`` logs in as ``hermes``, which cannot write the agent's own VCS tree under
+#: ``/opt/data``; the scripts clone under hermes's home instead, as ``dial_state.SWITCH_ENV`` does.
+SANDBOX_ENV = {"KUBE_AGENTS_VCS_ROOT": "/home/hermes/kube-agents-vcs"}
+
+
 def sandbox_script(name: str, args: list) -> dict:
     """``python3 -I <sandbox scripts>/<name> <args>`` in the shell sandbox; its last JSON document."""
     import sandbox_exec
 
     done = sandbox_exec.run(["python3", "-I", f"{SANDBOX_SCRIPTS_DIR}/{name}", *map(str, args)],
-                            timeout=SCRIPT_TIMEOUT_SECONDS, check=False)
+                            timeout=SCRIPT_TIMEOUT_SECONDS, check=False, remote_env=SANDBOX_ENV)
     answer = last_json_document(done.stdout or "")
     if answer is None:
         raise RuntimeError(f"{name} exited {done.returncode} without an answer")
@@ -259,6 +264,10 @@ def run_followups(conn: sqlite3.Connection, script: SandboxScript = sandbox_scri
                 action, answer = RETRY, {"reason": str(exc)}
             if action == RETRY:
                 attempts += 1
+                # A revert an earlier attempt opened stays named, whatever this attempt answered.
+                earlier = _load_detail(record["followup_detail"]).get("revert")
+                if isinstance(earlier, str) and earlier and not answer.get("revert"):
+                    answer = {**answer, "revert": earlier}
             give_up = action == RETRY and attempts >= FOLLOWUP_ATTEMPTS
         state = FAILED if give_up else action
         if give_up and record["outcome"] == STILL_BROKEN:
