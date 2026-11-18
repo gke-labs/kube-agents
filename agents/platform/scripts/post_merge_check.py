@@ -24,14 +24,15 @@ little. No model is involved, and nothing here posts: the reporter (a later
 step) decides what to say, under ``KUBEAGENTS_POST_MERGE_CHECK``. Nothing
 schedules it yet; ``post_merge_check.py notice`` is one tick.
 
-Step 3, wait until applied (``post_merge_check.py health``, one tick, also
-unscheduled): :func:`watch_health` reads each merged record's cluster through
-the shell sandbox. The GitOps reconcilers that deliver the repository into the
+Steps 3 and 4, wait until applied and watch health (``post_merge_check.py
+health``, one tick, also unscheduled): :func:`watch_health` reads each merged
+record's cluster through the shell sandbox. The GitOps reconcilers that deliver the repository into the
 record's namespace are read against the merge commit (``reconciler_sync``),
 asking the broker (``revision-contains``) whether a later applied commit
 contains it; with none, or when the broker cannot say, the object the fix adds
-is observed directly. Once applied, the pods' restart counts are the baseline
-for the health window, the next step.
+is observed directly. Once applied, the pods' restart counts are the baseline,
+and every run reads the workload again until :data:`HEALTH_SAMPLES` healthy
+readings, the last past the window; any reading that is not healthy fails it.
 """
 
 from __future__ import annotations
@@ -178,10 +179,31 @@ def notice_merges(
 
 
 # --------------------------------------------------------------------------
-# Step 3, wait until applied: reading reconcilers and selectors
+# Steps 3 and 4: wait until applied, then the health window
 # --------------------------------------------------------------------------
 
+#: The health window after the GitOps tool applies the merge, per kind of fix
+#: (design gke-labs/kube-agents#5054, "Settings per fix").
+HEALTH_WINDOW = {"no-pdb": timedelta(minutes=5)}
+#: However short a kind's window, the workload must stay healthy at least this
+#: long after the GitOps tool reported the fix applied: Argo CD can read synced
+#: and healthy, then a pod fails a minute later.
+HEALTHY_AFTER_SYNC = timedelta(seconds=60)
+#: Healthy readings needed before a pass, each on its own run, the last one
+#: after the window: one reading at the end would miss a pod that went red and
+#: recovered inside the window. Nothing else spaces them; how far apart they
+#: fall is the schedule's cadence.
+HEALTH_SAMPLES = 2
+#: How long past the window a record may go without a healthy reading (reads
+#: failing, or a rollout or scale still under way) before it fails as not settled.
+HEALTH_SETTLE_LIMIT = timedelta(minutes=30)
+#: ``health_detail``'s prefix while the workload is still rolling out or scaling.
+NOT_SETTLED = "not settled: "
+#: ``health_detail``'s prefix while the window is being sampled.
+SAMPLED = "healthy samples: "
+HEALTH_PASSED = "passed"
 HEALTH_FAILED = "failed"
+OOM_KILLED = "OOMKilled"
 #: The reconciler objects that can deliver a merge, as kubectl names them.
 ARGO_APPLICATIONS = "applications.argoproj.io"
 FLUX_KUSTOMIZATIONS = "kustomizations.kustomize.toolkit.fluxcd.io"
@@ -208,14 +230,15 @@ DIRECT_OBJECTS = {"no-pdb": "poddisruptionbudgets.policy"}
 #: ``sync_state``'s reading for a fix observed directly.
 OBSERVED = "observed"
 
-#: Merged records not yet applied, least recently read first.
+#: Merged records the step has not judged, least recently read first.
 HEALTH_SQL = (
-    f"SELECT url, repo, number, kind, project, location, cluster, namespace, object, merge_commit, changed_paths "
-    f"FROM {RECORDS_TABLE} WHERE outcome IS NULL AND merged_at IS NOT NULL "
-    "AND merge_commit IS NOT NULL AND health_result IS NULL AND applied_at IS NULL "
+    f"SELECT url, repo, number, kind, project, location, cluster, namespace, object, merge_commit, applied_at, "
+    f"health_baseline, health_detail, changed_paths FROM {RECORDS_TABLE} WHERE outcome IS NULL "
+    "AND merged_at IS NOT NULL AND merge_commit IS NOT NULL AND health_result IS NULL "
     "ORDER BY health_checked_at IS NOT NULL, health_checked_at, merged_at LIMIT ?"
 )
-HEALTH_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster", "namespace", "object", "merge_commit", "changed_paths")
+HEALTH_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster", "namespace", "object",
+                  "merge_commit", "applied_at", "health_baseline", "health_detail", "changed_paths")
 
 
 class ClusterReadError(RuntimeError):
@@ -486,13 +509,130 @@ def selects(selector: dict, labels: dict) -> bool:
 
 
 def restart_baseline(pods: dict) -> dict[str, int]:
-    """``{"<pod uid>/<container>": restartCount}`` for every container of every pod."""
+    """``{"<pod uid>/<container>": restartCount}`` for every container of every pod, sidecars and init containers included."""
     out = {}
     for pod in pods.get("items", []):
         uid = (pod.get("metadata") or {}).get("uid") or (pod.get("metadata") or {}).get("name") or ""
-        for status in (pod.get("status") or {}).get("containerStatuses") or []:
+        for status in _container_statuses(pod):
             out[f"{uid}/{status.get('name')}"] = int(status.get("restartCount") or 0)
     return out
+
+
+def _container_statuses(pod: dict) -> list[dict]:
+    """Every container's status: the app containers, and the init containers, where a native sidecar reports."""
+    status = pod.get("status") or {}
+    return list(status.get("containerStatuses") or []) + list(status.get("initContainerStatuses") or [])
+
+
+def _rolled_out(workload: dict) -> bool:
+    """Whether the controller has finished changing the pod set: the spec is observed, every pod is at the
+    current template or revision, and the count matches the spec. Readiness is not part of it; the pods are
+    judged one by one (:func:`judge_health`), so a pod that goes NotReady is red rather than "rolling out"."""
+    spec, status, meta = workload.get("spec") or {}, workload.get("status") or {}, workload.get("metadata") or {}
+    replicas = int(spec.get("replicas", 1) or 0)
+    if int(status.get("observedGeneration") or 0) < int(meta.get("generation") or 0):
+        return False
+    if int(status.get("replicas", replicas) or 0) != replicas:
+        return False
+    if workload.get("kind") == "StatefulSet":
+        return not (status.get("updateRevision") and status.get("currentRevision") != status.get("updateRevision"))
+    return int(status.get("updatedReplicas") or 0) == replicas
+
+
+def _owned_pods(workload: dict, pods: dict) -> list[dict]:
+    # A pod being deleted (a drain, a scale-down) is no longer the workload's to judge.
+    return [pod for pod in pods.get("items", [])
+            if _owned_by(pod, workload) and not (pod.get("metadata") or {}).get("deletionTimestamp")]
+
+
+def _is_ready(pod: dict) -> bool:
+    return any(c.get("type") == "Ready" and c.get("status") == "True"
+               for c in (pod.get("status") or {}).get("conditions") or [])
+
+
+def _owned_by(pod: dict, workload: dict) -> bool:
+    """Whether ``pod`` belongs to ``workload``: directly (a StatefulSet) or through a ReplicaSet named after it."""
+    name = (workload.get("metadata") or {}).get("name") or ""
+    for owner in (pod.get("metadata") or {}).get("ownerReferences") or []:
+        if owner.get("kind") == workload.get("kind") and owner.get("name") == name:
+            return True
+        template_hash = ((pod.get("metadata") or {}).get("labels") or {}).get("pod-template-hash")
+        if owner.get("kind") == "ReplicaSet" and template_hash and owner.get("name") == f"{name}-{template_hash}":
+            return True
+    return False
+
+
+def _healthy_samples(detail: object) -> int:
+    """How many healthy readings ``health_detail`` records so far; 0 after a failed read reset it."""
+    text = str(detail or "")
+    if not text.startswith(SAMPLED):
+        return 0
+    count = text[len(SAMPLED):].split(",", 1)[0]
+    return int(count) if count.isdigit() else 0
+
+
+#: :func:`assess_health`'s verdicts for one reading.
+HEALTHY, UNSETTLED, RED = "healthy", "unsettled", "red"
+
+
+def _known_pods(baseline: dict[str, int]) -> set[str]:
+    """The pods the baseline holds: there at the apply, or seen Ready on a later reading."""
+    return {key.split("/", 1)[0] for key in baseline}
+
+
+def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[str, str]:
+    """``(verdict, detail)`` for one reading: :data:`RED`, :data:`UNSETTLED` or :data:`HEALTHY`.
+
+    Red comes first, so nothing settling can hide it: a known pod (in the
+    baseline) that is not Ready, or any container, sidecars and init
+    containers included, that restarted past the baseline or was OOMKilled
+    since ``since``. Then unsettled: a rollout or scale under way, or a pod not
+    yet known that is still starting (not Ready, nothing restarted). Healthy
+    needs every owned pod Ready.
+    """
+    items = _owned_pods(workload, pods)
+    known = _known_pods(baseline)
+    for pod in items:
+        meta = pod.get("metadata") or {}
+        name = meta.get("name") or ""
+        if (meta.get("uid") or name) in known and not _is_ready(pod):
+            return RED, f"pod {name} is not Ready"
+        for container in _container_statuses(pod):
+            key = f"{meta.get('uid') or name}/{container.get('name')}"
+            if int(container.get("restartCount") or 0) > baseline.get(key, 0):
+                return RED, f"container {container.get('name')} in pod {name} restarted"
+            for current, state in ((False, container.get("lastState") or {}), (True, container.get("state") or {})):
+                ended = state.get("terminated") or {}
+                finished = _parse_time(ended.get("finishedAt"))
+                # A past termination with no time cannot be placed after the apply; a current one is red now.
+                if ended.get("reason") == OOM_KILLED and (current if finished is None else finished >= since):
+                    return RED, f"container {container.get('name')} in pod {name} was OOMKilled"
+    if not _rolled_out(workload):
+        return UNSETTLED, "the rollout is not complete"
+    for pod in items:
+        if not _is_ready(pod):
+            return UNSETTLED, f"pod {(pod.get('metadata') or {}).get('name') or ''} is starting"
+    if not items:
+        return RED, "no pods belong to the workload"
+    return HEALTHY, "rolled out, every pod Ready, no restarts"
+
+
+def judge_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[bool, str]:
+    """``(passed, detail)``: :func:`assess_health` as a pass or not; unsettled is not a pass."""
+    verdict, detail = assess_health(workload, pods, baseline, since)
+    return verdict == HEALTHY, detail
+
+
+def _join_baseline(baseline: dict[str, int], workload: dict, pods: dict) -> dict[str, int]:
+    """``baseline`` plus every owned pod now Ready that it did not hold, at its current restart counts: once
+    seen Ready, a pod that came after the apply is judged like one that was there (NotReady is red)."""
+    known = _known_pods(baseline)
+    joined = dict(baseline)
+    for pod in _owned_pods(workload, pods):
+        meta = pod.get("metadata") or {}
+        if (meta.get("uid") or meta.get("name")) not in known and _is_ready(pod):
+            joined.update(restart_baseline({"items": [pod]}))
+    return joined
 
 
 def _read_workload(kubectl_json: KubectlJson, record: dict) -> tuple[dict, dict]:
@@ -577,7 +717,7 @@ def watch_health(
     paths: Paths = None,
     scope_refusal: Callable[[dict], str | None] | None = None,
 ) -> dict[str, list[str]]:
-    """Step 3 for each merged record: wait until the fix is applied.
+    """Steps 3 and 4 for each merged record: wait for the apply, then hold the health window.
 
     ``scope_refusal(record)`` (``post_merge_scope.scope_refusal_for``) names
     why the install's declared scope leaves the record's cluster out, or None.
@@ -590,17 +730,22 @@ def watch_health(
     merge commit, asking the broker whether a later applied commit contains it
     (``contains``); with none, observe the fix's object directly
     (:func:`observed_directly`). The reading goes in ``sync_state``. Applied:
-    ``applied_at`` and the pods' restart counts (``health_baseline``). A
-    workload that is gone or cannot be judged fails with the reason
-    (``health_result``, ``health_detail``); any other read failure is kept in
-    ``sync_state`` and retried. Every read stamps
+    ``applied_at`` and the pods' restart counts (``health_baseline``). Each
+    later run: read the workload (:func:`judge_health`); not healthy fails it
+    at once, a rollout or scale under way waits with the count reset, and :data:`HEALTH_SAMPLES` healthy readings with the last past the
+    window (:data:`HEALTH_WINDOW`, at least :data:`HEALTHY_AFTER_SYNC`) pass
+    it, into ``health_result`` and ``health_detail``. A workload that is gone or cannot be judged fails
+    with the reason; any other read failure is kept in ``health_detail`` (or
+    ``sync_state`` before the apply), resets the count and is retried, until
+    :data:`HEALTH_SETTLE_LIMIT` past the window with no healthy reading fails it. Every read stamps
     ``health_checked_at``, which orders the next tick, so no record starves the
     rest. Everything lives on the row, so a restart loses nothing. ``paths``
     (default :func:`forge_paths`) reads the files the pull request changed,
     only when :func:`reconcilers_for` needs them; a list is kept in
     ``changed_paths`` and never read again, and an unknown one is said in
     ``sync_state`` and read again next tick. Returns urls under ``applied``,
-    ``waiting``, ``failed`` and ``unreadable``.
+    ``waiting``, ``passed``, ``failed``, ``unreadable``, ``out_of_scope`` and
+    ``scope_unknown``.
     """
     paths = paths or forge_paths
     import reconciler_sync
@@ -609,7 +754,8 @@ def watch_health(
     now = now or datetime.now(timezone.utc)
     stamp = _now_text(now)
     seen: dict[str, list[str]] = {
-        "applied": [], "waiting": [], "failed": [], "unreadable": [], "out_of_scope": [], "scope_unknown": [],
+        "applied": [], "waiting": [], "passed": [], "failed": [], "unreadable": [], "out_of_scope": [],
+        "scope_unknown": [],
     }
     # A cluster's reconciler lists, or the error reading them, so a failed read is not repeated per record.
     lists_by_cluster: dict[tuple, dict | Exception] = {}
@@ -637,60 +783,99 @@ def watch_health(
             if not (all(cluster) and record["object"]):
                 raise ClusterReadError("the record names no cluster or workload to read")
             reads += 1
-            if cluster not in lists_by_cluster:
-                try:
-                    lists_by_cluster[cluster] = {
-                        resource: kubectl_json(record, ["get", resource, "-A", "-o", "json", "--chunk-size=500"])
-                        for resource in RECONCILER_RESOURCES
-                    }
-                except Exception as exc:
-                    lists_by_cluster[cluster] = exc
-            lists = lists_by_cluster[cluster]
-            if isinstance(lists, Exception):
-                raise lists
+            if record["applied_at"] is None:
+                if cluster not in lists_by_cluster:
+                    try:
+                        lists_by_cluster[cluster] = {
+                            resource: kubectl_json(record, ["get", resource, "-A", "-o", "json", "--chunk-size=500"])
+                            for resource in RECONCILER_RESOURCES
+                        }
+                    except Exception as exc:
+                        lists_by_cluster[cluster] = exc
+                lists = lists_by_cluster[cluster]
+                if isinstance(lists, Exception):
+                    raise lists
 
-            def asked(ancestor: str, revision: str, repo: str = record["repo"]) -> bool | None:
-                if (repo, ancestor, revision) not in answers:
-                    answers[(repo, ancestor, revision)] = contains(repo, ancestor, revision)
-                return answers[(repo, ancestor, revision)]
+                def asked(ancestor: str, revision: str, repo: str = record["repo"]) -> bool | None:
+                    if (repo, ancestor, revision) not in answers:
+                        answers[(repo, ancestor, revision)] = contains(repo, ancestor, revision)
+                    return answers[(repo, ancestor, revision)]
 
-            unknown: list[bool] = []
+                unknown: list[bool] = []
 
-            def changed(record: dict = record, updates: dict = updates, unknown: list = unknown) -> list[str] | None:
-                # A merged pull request's files never change: read them once and keep them on the row.
-                if record["changed_paths"]:
-                    return json.loads(record["changed_paths"])
-                found = paths(record["repo"], record["number"])
-                if found:
-                    updates["changed_paths"] = json.dumps(found)
+                def changed(record: dict = record, updates: dict = updates, unknown: list = unknown) -> list[str] | None:
+                    # A merged pull request's files never change: read them once and keep them on the row.
+                    if record["changed_paths"]:
+                        return json.loads(record["changed_paths"])
+                    found = paths(record["repo"], record["number"])
+                    if found:
+                        updates["changed_paths"] = json.dumps(found)
+                    else:
+                        unknown.append(True)
+                    return found
+
+                objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists, changed)
+                workload, pods = _read_workload(kubectl_json, record)
+                if objects:
+                    state, detail = combined_sync(objects, record["merge_commit"], asked)
+                    applied = state == reconciler_sync.APPLIED
+                    if state == reconciler_sync.UNCONFIRMED:
+                        # The broker could not say whether the applied commit contains the merge (an
+                        # abbreviated or SHA-256 merge commit, a fetch it refused): look for the fix itself.
+                        applied, direct = observed_directly(kubectl_json, record, workload)
+                        if applied:
+                            state, detail = OBSERVED, f"the reconcilers' commit could not be confirmed; {direct}"
                 else:
-                    unknown.append(True)
-                return found
-
-            objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists, changed)
-            workload, pods = _read_workload(kubectl_json, record)
-            if objects:
-                state, detail = combined_sync(objects, record["merge_commit"], asked)
-                applied = state == reconciler_sync.APPLIED
-                if state == reconciler_sync.UNCONFIRMED:
-                    # The broker could not say whether the applied commit contains the merge (an
-                    # abbreviated or SHA-256 merge commit, a fetch it refused): look for the fix itself.
                     applied, direct = observed_directly(kubectl_json, record, workload)
-                    if applied:
-                        state, detail = OBSERVED, f"the reconcilers' commit could not be confirmed; {direct}"
+                    state = OBSERVED if applied else reconciler_sync.PENDING
+                    detail = f"no reconciler targets {record['namespace'] or 'default'}; {direct}"
+                if unknown:
+                    detail = f"files unknown: no RootSync counts and no path narrows the match; {detail}"
+                updates["sync_state"] = f"{state}: {detail}"[:500]
+                if applied:
+                    updates["applied_at"] = stamp
+                    updates["health_baseline"] = json.dumps(restart_baseline(pods), sort_keys=True)
+                    bucket = "applied"
+                else:
+                    bucket = "waiting"
             else:
-                applied, direct = observed_directly(kubectl_json, record, workload)
-                state = OBSERVED if applied else reconciler_sync.PENDING
-                detail = f"no reconciler targets {record['namespace'] or 'default'}; {direct}"
-            if unknown:
-                detail = f"files unknown: no RootSync counts and no path narrows the match; {detail}"
-            updates["sync_state"] = f"{state}: {detail}"[:500]
-            if applied:
-                updates["applied_at"] = stamp
-                updates["health_baseline"] = json.dumps(restart_baseline(pods), sort_keys=True)
-                bucket = "applied"
-            else:
-                bucket = "waiting"
+                applied_at = _parse_time(record["applied_at"])
+                if applied_at is None:
+                    raise WorkloadGone("the apply time is unreadable")
+                window = max(HEALTH_WINDOW.get(record["kind"] or "", max(HEALTH_WINDOW.values())), HEALTHY_AFTER_SYNC)
+                last = record["health_detail"]
+                if last and not _healthy_samples(last) and now - applied_at >= window + HEALTH_SETTLE_LIMIT:
+                    raise WorkloadGone(f"no healthy reading by {int((window + HEALTH_SETTLE_LIMIT).total_seconds() // 60)} "
+                                       f"minutes after the apply; last: {last}")
+                workload, pods = _read_workload(kubectl_json, record)
+                try:
+                    baseline = json.loads(record["health_baseline"] or "{}")
+                except ValueError:
+                    baseline = None
+                if not isinstance(baseline, dict) or not all(isinstance(v, int) for v in baseline.values()):
+                    raise WorkloadGone("the restart baseline is unreadable")
+                verdict, detail = assess_health(workload, pods, baseline, applied_at)
+                samples = _healthy_samples(last) + 1
+                if verdict != RED:
+                    joined = _join_baseline(baseline, workload, pods)
+                    if joined != baseline:
+                        updates["health_baseline"] = json.dumps(joined, sort_keys=True)
+                if verdict == UNSETTLED:
+                    # A rollout or scale under way (an HPA, someone else's change) is not settled yet, not red;
+                    # it resets the count, and HEALTH_SETTLE_LIMIT ends a wait that never settles.
+                    updates["health_detail"] = f"{NOT_SETTLED}{detail}"
+                    bucket = "waiting"
+                elif verdict == RED:
+                    # Any red reading after the apply fails the window, even one that would recover.
+                    updates.update(health_result=HEALTH_FAILED, health_detail=detail, health_at=stamp)
+                    bucket = "failed"
+                elif now - applied_at >= window and samples >= HEALTH_SAMPLES:
+                    updates.update(health_result=HEALTH_PASSED, health_detail=f"{detail} ({samples} readings)",
+                                   health_at=stamp)
+                    bucket = "passed"
+                else:
+                    updates["health_detail"] = f"{SAMPLED}{samples}, last {stamp}"
+                    bucket = "waiting"
         except ScopeRefused as exc:
             # Not read; the reason goes on the row, and the stamp moves it to the back of the queue.
             unknown = str(exc).startswith(SCOPE_UNKNOWN_PREFIX)
@@ -703,7 +888,7 @@ def watch_health(
             bucket = "failed"
         except Exception as exc:  # noqa: BLE001 — one unreadable cluster must not stop the tick
             logger.warning("post-merge check: could not read the cluster for %s: %r", url, exc)
-            updates["sync_state"] = f"unreadable: {exc}"[:500]
+            updates["sync_state" if record["applied_at"] is None else "health_detail"] = f"unreadable: {exc}"[:500]
             bucket = "unreadable"
         try:
             with conn:
@@ -726,8 +911,8 @@ SWITCH = "POST_MERGE_CHECK"
 
 
 def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None) -> int:
-    """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply step;
-    prints what it saw as JSON.
+    """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply and health
+    steps; prints what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
     """
