@@ -18,8 +18,9 @@ The GCS layout is one immutable object per batch, filed under its version key::
 
     gs://<bucket>/<prefix>/<case-id>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>[-<mode>]/<stamp>-<build>.jsonl
 
-The ``-<mode>`` suffix appears only for a key whose mode is not ``today``, so
-every today-mode directory is the one it always was.
+The ``-<mode>`` suffix appears only for a key whose mode is not ``today``:
+every key a run writes now is ``next``, and the today-mode directories of the
+lines recorded before stay the ones they always were.
 
 never appended to, because the grant this is built for is
 ``roles/storage.objectCreator`` -- create yes, overwrite and delete no. That
@@ -74,8 +75,9 @@ from pathlib import Path
 #: so: a cap that is silent reads as "I considered everything" when it did not.
 DEFAULT_MAX_OBJECTS = 200
 
-#: The version key's default mode (``baselines.MODE_TODAY``, not imported:
-#: baselines imports this module). A key in it adds no path suffix.
+#: The version key's legacy mode (``baselines.MODE_TODAY``, not imported:
+#: baselines imports this module): the reading of a key with no ``mode``,
+#: which adds no path suffix. Every key a run writes now carries ``next``.
 DEFAULT_KEY_MODE = "today"
 
 #: Seconds before a `gcloud storage` call is treated as unreachable.
