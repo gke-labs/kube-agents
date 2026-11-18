@@ -158,6 +158,36 @@ func TestPodsCreateIsTheGatewayAndTheOperatorOnly(t *testing.T) {
 	}
 }
 
+// The agent's cluster-wide audit ClusterRole only reads. Its write grants are
+// namespaced Roles in the install's own namespace. This checks the role, not
+// every binding the agent's ServiceAccount holds, nor GKE IAM.
+//
+// Evals lean on this: bench/tf/prebuilt/triage-start-burst records the pods it
+// plants in a ConfigMap beside them, and the triage_starts check grades from
+// that record, so an agent able to write there could rewrite what it is graded
+// against; this role is the grant that reaches that namespace.
+func TestTheAgentsClusterRoleOnlyReads(t *testing.T) {
+	read := []string{"get", "list", "watch"}
+	agent := a2aTestAgent()
+	roles := []renderedRole{
+		{"buildMinimalPlatformRoleWithSecrets(true)", buildMinimalPlatformRoleWithSecrets(agent, true).Rules},
+		{"buildMinimalPlatformRoleWithSecrets(false)", buildMinimalPlatformRoleWithSecrets(agent, false).Rules},
+	}
+	for _, r := range roles {
+		if len(r.rules) == 0 {
+			t.Fatalf("%s renders no rules; this sweep would check nothing", r.from)
+		}
+		for i, rule := range r.rules {
+			for _, verb := range rule.Verbs {
+				if !slices.Contains(read, verb) {
+					t.Errorf("%s rule %d grants %q on %v in %v; the agent's cluster-wide role must only read",
+						r.from, i, verb, rule.Resources, rule.APIGroups)
+				}
+			}
+		}
+	}
+}
+
 // The sweeps above are only as good as their list. This is the tripwire: it
 // reads the package's own source for role builders and fails when one exists
 // that everyRenderedRole does not name.

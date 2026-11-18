@@ -673,6 +673,17 @@ managed-repository check still applying. `CREDENTIAL_PROXY_MCP_CALLERS` binds
 the role to the MCP pod's own ServiceAccount.
 [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) owns that caller.
 
+And it admits the `profile` role, an AgentProfile worker's pod, for every verb
+only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
+(`clone`, `proposal-view`, `proposal-list`, `proposal-commits`, `branch-view`,
+`identity`, `issue-list`, `issue-view`) and three writes, `publish`,
+`proposal-create` and `proposal-update`, which also need the credential's
+`vcs:proposal-create` permit. Each write is held to the install's own work: a
+`platform-agent/` branch named bare, no branch carrying somebody else's open
+proposal, a proposal opened by the install's login from its own branch in this
+repository, and no label edit. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
+owns that caller.
+
 ### No shallow clones
 
 There is no `depth`. This is a property of the transport rather than an
@@ -920,6 +931,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
+| `proposal-practice-label`            | `{repository, number}`                                               | `{labelled, label, switch, reason, checks}`                                              |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |
 | `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`                 |
@@ -962,12 +974,17 @@ labels serves `label-ensure`, and a forge without them does not: the two say one
 thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
-The rows down to `issue-create` except `snapshot` and `proposal-claim`, and the two branch rows, are the
-version-control skill's. `snapshot`, `proposal-claim` and `revision-contains` are the library verbs (`LIBRARY_VERBS` in
+The rows down to `issue-create` except `snapshot`, `proposal-claim` and `proposal-practice-label`, and the two branch rows, are the
+version-control skill's. `snapshot`, `proposal-claim`, `revision-contains` and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
 `providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
 (`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
 which presents the token from a proposal record line. `revision-contains` is for the
-post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. The rest are the union of
+post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-practice-label` is served to fleet-audit's
+`audit_report.py` after it opens a disruption-budget fix: the broker judges the proposal from its own reads
+and adds or removes the reserved `kube-agents:would-auto-merge` or `kube-agents:auto-merge` label
+([automation rules](../site/src/content/docs/reference/automation-rules.md) says when), and every other
+verb refuses those labels in a label field, or as `label-ensure`'s name, with 403 `RESERVED_LABEL` before it
+calls the forge. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
@@ -3407,6 +3424,13 @@ The MCP pod is the second caller, and its requests come from outside the
 cluster, through the pod. What bounds it is narrower than the `shell` role:
 `ROLE_VCS_VERBS` holds the `mcp` role to `proposal-view`, which writes nothing,
 and only on a repository the install manages.
+
+The profile worker is the third, and it runs model output. What bounds it is the
+task credential the dispatcher signed for its pod: no credential, no verb. The
+reads need nothing more. A write needs the `vcs:proposal-create` permit, which
+the dispatcher mints only for a request that asked for a change through a
+structured confirm, and even then it reaches only the install's own branches and
+proposals, never their labels, on a repository the install manages.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it

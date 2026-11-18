@@ -337,7 +337,8 @@ leave open:
 - **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
   `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
   dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
-  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  concurrency, queue timeout and deadline (the dispatcher derives each profile's durables from
+  its tiers and draining tiers, and the config is written compact; #5479), and four intervals: `leaseSeconds`
   (default 90), `renewSeconds` (20; a lease is at least three renewals),
   `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
   offers. A task already handed out keeps the intervals its offer carried.
@@ -365,10 +366,23 @@ leave open:
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
   admission, and a task that names no cluster gets none. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
-  found equal to the grant's at admission (added 11/11, #4685). The broker also accepts a
+  found equal to the grant's at admission (added 11/11, #4685). A `script` must also be one
+  the profile allowlists in `spec.scripts`, which the operator renders into the dispatch config with
+  each script's path and timeout. A script-run task's path comes from that render, never from the
+  task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
+  worker image. The CRD and the dispatcher's config check both hold paths to it, and
+  `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
+  group- or world-writable (#5622). The broker also accepts a
   `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
   credential, which reaches only the audit-report routes and is refused on every other route,
-  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. Both name the task, its profile and
+  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod: one
+  whose tier has no Job runner is refused at admission (`change-needs-job`), and the permit is
+  minted only for a task on a Job (#5646). Otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
@@ -464,7 +478,9 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid`, `queue-timeout`, and for a child of an AgentProfile task
+  `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`, `parameters-invalid`,
+  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, #5622),
+  and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`
@@ -499,9 +515,10 @@ leave open:
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
-  The dispatch config doesn't carry the Job's pod template. It names the profile's own
-  `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
-  Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
+  The dispatch config doesn't carry the Job's pod template. It carries the hash of the rendering
+  of the profile's own `DispatchJobTemplate` in the profile namespace, the param the Job
+  admission policy holds each Job to (`jobTemplateRef`). The param's name is derived from the
+  profile's (#5479). The dispatcher reads that
   object when it launches the Job, with `get` alone on those objects, and uses it only while
   the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
   missing param, or one with no containers keeps that profile's task queued, shows on the

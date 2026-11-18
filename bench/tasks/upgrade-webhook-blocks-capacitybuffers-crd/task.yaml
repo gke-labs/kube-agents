@@ -59,7 +59,7 @@
 id: upgrade-webhook-blocks-capacitybuffers-crd
 name: "Fail-Closed Admission Webhook With No Backend Whose Rule Reaches the autoscaling.x-k8s.io Group (system CRD webhook check)"
 domain: upgrades
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - security-patch-orchestrator

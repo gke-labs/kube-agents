@@ -46,6 +46,12 @@ because gcloud refuses it beside a timestamp in the filter, and the window is in
 The page is projected to the fields read here (PROJECTED_FIELDS), and a page the credential
 proxy still cut at its output cap is the read's error, naming the cap, with the pages before
 it kept.
+
+Where the credential broker's Cloud API relay serves the read (the shell sandbox, a broker
+with the Logging `entries:list` route), each page is asked of the relay first: the same
+filter, order and limit, without a `gcloud` start in the broker, answered with the same
+entries (whole, not projected; the parser reads the same paths). A page the relay does not
+answer in full is read by the `gcloud` command as before (`logging_reads.read_json`).
 """
 
 import copy
@@ -201,6 +207,10 @@ FILTER_ESCAPE_REPLACEMENT = r"\\\1"
 CACHE_KEY = "audit_log"
 NO_RUNNER_REASON = "no command runner in the readiness context; the audit log was not read"
 NO_SCOPE_REASON = "the readiness context carries no project, location or cluster name for the log filter"
+# The relay's per-call cap when the context names none (the report's own runner default),
+# and what a page that spends the cap reports, in the runner's words for a timed-out call.
+RELAY_TIMEOUT_SECONDS = 60
+RELAY_TIMED_OUT = "timed out after {seconds} seconds"
 READ_FAILED_REASON = "`gcloud logging read` ({read} read, page {page}) failed (rc={rc}): {stderr}"
 UNPARSABLE_REASON = "`gcloud logging read` ({read} read, page {page}) returned output that is not a JSON list of entries (rc=0)"
 OUTPUT_CUT_REASON = "`gcloud logging read` ({read} read, page {page}) output was cut at the credential proxy's output cap, so the page did not fit in one read"
@@ -330,6 +340,25 @@ def build_filter(which: str, cluster: str, location: str, start: str, end: str) 
 
 def build_command(project: str, filter_text: str) -> list[str]:
     return [GCLOUD, *LOGGING_READ, filter_text, PROJECT_FLAG.format(project=project), LIMIT_FLAG.format(limit=tables.AUDIT_LOG_PAGE_LIMIT), JSON_FORMAT_FLAG]
+
+
+def _relay_page(project: str, filter_text: str, timeout) -> tuple[int, str, str] | None:
+    """One page through the broker's Cloud API relay, in the runner's `(rc, stdout, stderr)`
+    shape with the JSON list `gcloud` prints, or None when the relay does not answer it in
+    full and the `gcloud` command is to run. `timeout` is the per-call cap, the relay's own
+    default without it; a page that spends it is the timed-out call the runner reports."""
+    try:
+        # The shared scripts directory, which the report puts on sys.path; absent from a
+        # run that never did, which reads through gcloud.
+        import logging_reads
+    except ImportError:
+        return None
+    cap = timeout or RELAY_TIMEOUT_SECONDS
+    try:
+        stdout = logging_reads.read_json(project, filter_text, tables.AUDIT_LOG_PAGE_LIMIT, timeout_s=cap)
+    except logging_reads.ReadTimedOut:
+        return -1, "", RELAY_TIMED_OUT.format(seconds=cap)
+    return None if stdout is None else (0, stdout, "")
 
 
 def is_google_service_agent(principal: str) -> bool:
@@ -558,8 +587,19 @@ def _read_pages(context: dict, which: str, result: dict) -> None:
         result["commands"].append(" ".join(cmd))
         # The context's `timeout_seconds` is the per-call cap, the runner's own default
         # without it; a timed-out call comes back as a non-zero rc with the reason on
-        # stderr, like any failed read.
-        rc, stdout, stderr = run(cmd, timeout) if timeout else run(cmd)
+        # stderr, like any failed read. The relay is asked first; `cmd` is the same read.
+        asked = time.monotonic()
+        page_read = _relay_page(project, filter_text, timeout)
+        if page_read is None:
+            # A relay that is not there answers at once, and the command runs as it always
+            # did. One that took its time leaves the command the rest of the cap it had
+            # (the context's, or the relay's own without one), so a page is one cap long.
+            spent = int(time.monotonic() - asked)
+            if timeout or spent:
+                page_read = run(cmd, max((timeout or RELAY_TIMEOUT_SECONDS) - spent, 1))
+            else:
+                page_read = run(cmd)
+        rc, stdout, stderr = page_read
         result["pages"] += 1
         # The proxy cuts a page past its output cap and prints the marker (the shim exits 74
         # on it; an older shim returned rc 0); the marker, not the exit code or the parse

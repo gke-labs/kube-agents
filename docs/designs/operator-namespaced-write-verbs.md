@@ -57,8 +57,7 @@ The guard in §3 supplies the pin for the rest: the Role document carries write 
 `dispatchjobtemplates` looked like an exception (no `watch`, read only through the uncached reader
 in the profile namespace, not in the `minimal` ClusterRole), and is not one: the teardown walk
 lists the kind in `<ns>-profiles` on every deletion and every flip to `today`, before any check
-that the namespace or a RoleBinding in it exists, and a Helm install in `mode: today` binds the
-Role in the install namespace only. The API server authorises a namespaced `list` before it looks
+that the namespace or a RoleBinding in it exists. The API server authorises a namespaced `list` before it looks
 for the namespace, so a read in the Role is a 403 there. Its reads stay cluster-wide like every
 other kind's.
 
@@ -130,8 +129,8 @@ each kind stays without `namespace=`.
 Objects. In the install namespace: the Role (`kubeagents-manager-role` under kustomize,
 `<release>-operator-namespaced-role` under Helm) and its RoleBinding, both existing. In the profile
 namespace: a second Role with the same rules and a RoleBinding, new. The chart renders the Role and
-its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace only
-under `mode: next`, where `profiles-namespace.yaml` creates it), with the spliced rules block
+its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace
+whenever `profiles-namespace.yaml` creates it, on every install with a platform agent), with the spliced rules block
 inline rather than in a named template: `hack/sync-chart-manifests.sh` keeps splicing one block
 between the `GENERATED NAMESPACED RULES` markers, and the conformance harness's text reader would
 drop an `include` line (§3 Guard). Kustomize's `config/default` rewrites every namespaced object to
@@ -226,7 +225,7 @@ one.
 
 The self-check. `requiredPermissions` marks every write tuple `Namespaced: true`; `probeRBAC`
 reviews them in the operator's namespace, in each agent namespace it observes, and, new, in the
-profile namespace of each `mode: next` agent whose profile namespace is ready
+profile namespace of each agent whose profile namespace is ready
 (`profileNamespaceReady`). A denial reads `create deployments.apps (in namespace
 kubeagents-system-profiles)` and the cause sentence names the object to add. The probe count grows
 from one namespace to two on a stock install; the reviews are concurrent and bounded by

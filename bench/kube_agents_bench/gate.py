@@ -578,7 +578,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
     # is reported here instead so there is one parser, not two that can
     # disagree about which task provisions infrastructure.
     payload["deployer"] = spec.deployer
-    # The gateway's model setup the run was graded under, for the certification
+    # The gateway's model setup the run was graded under, for the validated-capabilities
     # record: its reader groups repetitions per release and splits a window at
     # a model or effort change, which setup_id alone cannot show (it carries
     # the model, not the provider or the effort).

@@ -35,6 +35,7 @@ from tests.testing.common import (
     create_minimal_tools_bin,
     create_mock_git_repo,
     get_isolated_test_env,
+    installer_report_env,
 )
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
@@ -64,6 +65,11 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 # this is stuck -- on a prompt, if the terminal detach ever slips -- and the
 # bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+# install.sh's variable for the report file, a seam for tests, and the path a
+# real install writes, which INSTALL.md and the install skill tell an agent to
+# read.
+_INSTALL_REPORT_FILE_ENV = "KUBE_AGENTS_INSTALL_REPORT_FILE"
+_INSTALL_REPORT_DEFAULT_FILE = "/tmp/kube-agents-install-report.json"
 # What `gcloud container clusters describe` prints for a cluster that does not
 # exist, and for one it could not read.
 _GCLOUD_CLUSTER_NOT_FOUND = "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: c."
@@ -481,7 +487,12 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             ["bash", "-c", setup],
             capture_output=True,
             text=True,
-            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            env={
+                "HOME": str(home_dir),
+                "PATH": os.environ["PATH"],
+                # A refused checkout ends in the ERR handler, which writes the report.
+                **installer_report_env(),
+            },
             cwd=str(outside_dir),
         )
 
@@ -3282,12 +3293,29 @@ PARAM_GENERATE_ONLY="true"
 PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 write_json_report "GENERATE_ONLY_SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
         self.assertIn('"generate_only": true', proc.stdout)
+
+    def test_the_report_goes_to_the_documented_file_unless_a_test_names_another(self):
+        """A real install writes the one file the docs name; only the variable
+        moves it. Held by the source: a run of write_json_report with the
+        variable unset would write that file."""
+        source = _INSTALL_SH.read_text()
+        self.assertEqual(
+            source.count(_INSTALL_REPORT_DEFAULT_FILE), 1, "install.sh names the report path in one place"
+        )
+        self.assertEqual(
+            source.count(
+                f'  local report_file="${{{_INSTALL_REPORT_FILE_ENV}:-{_INSTALL_REPORT_DEFAULT_FILE}}}"\n'
+            ),
+            1,
+            "write_json_report takes the variable, then the documented path",
+        )
+        self.assertIn(_INSTALL_REPORT_DEFAULT_FILE, (_REPO_ROOT / "INSTALL.md").read_text())
 
     def test_write_json_report_records_network_policy_enforcement(self):
         """The choice to install without enforcement outlives the terminal (#1682)."""
@@ -3298,7 +3326,7 @@ PARAM_NON_INTERACTIVE="true"
 INSTALL_ENV_FILE="/tmp/install.env"
 NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
 write_json_report "SUCCESS" >/dev/null
-cat /tmp/kube-agents-install-report.json
+cat "$KUBE_AGENTS_INSTALL_REPORT_FILE"
 """
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -3694,6 +3722,28 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
             "a generator call site gained or lost the memory opt-in; if the new one "
             "is followed by an apply it needs KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true",
         )
+
+    def test_every_applying_generator_call_refuses_to_blank_a_secret_it_could_not_read(self):
+        """#6126: a generator call whose tfvars get applied must carry
+        KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true, or a failed read of the live
+        Secret writes its keys empty over the live values. install.sh and
+        upgrade.sh only apply, so every call site in either needs it; only
+        uninstall.sh, which destroys, goes without.
+        """
+        unguarded = []
+        for script in (_INSTALL_SH, _INSTALL_SH.parent / "upgrade.sh"):
+            lines = script.read_text().splitlines()
+            for index, line in enumerate(lines):
+                code_line = line.split("#", 1)[0].strip()
+                if not re.search(r"\bwrite_tfvars_from_state\b", code_line) or code_line.startswith("write_tfvars_from_state()"):
+                    continue
+                prefix, back = [line], index - 1
+                while back >= 0 and lines[back].rstrip().endswith("\\"):
+                    prefix.append(lines[back])
+                    back -= 1
+                if "KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true" not in "\n".join(prefix):
+                    unguarded.append(f"{script.name}:{index + 1}")
+        self.assertEqual(unguarded, [], "a generator call site that applies lacks KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true")
 
     def test_accepting_the_memory_prompts_unseeded_default_is_not_an_answer(self):
         """A bare enter on the memory menu must not count as a stated mode.
@@ -7319,6 +7369,7 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
     _GENERATOR = (
         "  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n"
         "    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n"
+        "    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \\\n"
         '    write_tfvars_from_state "$tfvars_file" "$image_tag"\n'
     )
     _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
@@ -9322,8 +9373,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            # One read of the whole Secret (-o json) holding both tokens.
+            f'  *"get secret platform-agent-secrets"*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"SLACK_BOT_TOKEN\": \"{bot_b64}\", \"SLACK_APP_TOKEN\": \"{app_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -9337,6 +9389,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
             env=env,
             kubectl_script=kubectl_stub,
+            # The cluster exists (recovery runs only then); get-credentials succeeds.
+            describe_stub="printf 'False\\n'; exit 0",
+            gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
@@ -9660,6 +9715,8 @@ class RunLifecycleApplyTrapTest(unittest.TestCase):
         self._tmp_path = pathlib.Path(tmp.name)
         self._empty_install_env = self._tmp_path / "install.env"
         self._empty_install_env.write_text("")
+        # Where _run_func sends the report: a file of this test.
+        self._report_file = self._tmp_path / "report.json"
 
     def _run_func(self, func_call, cwd=None):
         setup = f"""
@@ -9669,7 +9726,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 """
         overrides = {
             "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
-            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._report_file),
         }
         full_env = get_isolated_test_env(overrides=overrides)
         return subprocess.run(
@@ -9779,11 +9836,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         """
         lib = self._tmp_path / "helper_lib.sh"
         lib.write_text("library_probe() {\n  false\n}\n")
-        # Same file the other write_json_report tests read, removed first so
-        # the assertions below read this run's report and not the one the
-        # previous test left behind.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
 
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -9917,9 +9970,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         inherited trap in this shape, so there this asserts the contract
         without exercising the check; the unhandled case below does.
         """
-        # Same file the other write_json_report tests read.
-        report = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report.unlink(missing_ok=True)
+        report = self._report_file
         proc = self._run_func(
             "probe() { false; }\n"
             'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
@@ -9942,10 +9993,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         hand the caller a clean exit. The parent's trap then fires at the
         assignment and prints the one banner.
         """
-        # Same file the other write_json_report tests read, removed first so
-        # the report assertion reads this run's and not the previous test's.
-        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
-        report_file.unlink(missing_ok=True)
+        report_file = self._report_file
         proc = self._run_func(
             'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
             'x="$(probe)"\n'
@@ -12227,13 +12275,14 @@ class DomainScopedFlagsTest(unittest.TestCase):
         """The A2A gateway authenticates one bot token, with Google Chat or without,
         so a list fails there with nothing in the PlatformAgent's status. The help
         text is where a caller choosing the tokens reads the flag."""
-        proc = subprocess.run(
-            ["bash", str(_INSTALL_SH), "--help"],
-            capture_output=True,
-            text=True,
-            env=get_isolated_test_env(),
-            cwd=str(_REPO_ROOT),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+                cwd=str(_REPO_ROOT),
+            )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         help_text = " ".join((proc.stdout + proc.stderr).split())
         self.assertIn(
@@ -13233,10 +13282,12 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                     self.assertIn(f"set {key}= (empty) in install.env", out)
 
     def test_the_flags_are_in_the_help_text(self):
-        proc = subprocess.run(
-            ["bash", str(_INSTALL_SH), "--help"],
-            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--help"],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_LOCK_FILE": str(pathlib.Path(tmp) / "test.lock")}),
+            )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
                      "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",

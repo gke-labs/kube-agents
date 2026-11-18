@@ -21,7 +21,7 @@ stricter one.
 
 `fleet-audit/scripts/test_broker_checks_parity.py` holds the verdicts and the
 copied rules to the sandbox's own. Stdlib only: the credential-proxy image ships
-this directory and nothing from the fleet-audit skill. Nothing calls it yet.
+this directory and nothing from the fleet-audit skill.
 """
 
 from __future__ import annotations

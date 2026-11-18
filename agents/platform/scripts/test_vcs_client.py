@@ -256,6 +256,43 @@ class ForgeCallTest(unittest.TestCase):
                 )
                 self.assertIn("issue-update", str(caught.exception))
 
+    def test_a_404_whose_json_body_is_not_an_object_reads_the_same_way(self):
+        """Through the real `vcs_call`: a 404 whose body is valid JSON but no
+        refusal document, from something in front of the wrong pod."""
+
+        def refuse(request, *args, **kwargs):
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(b"[]"))
+
+        # No token file: the call sends no header, whatever the shell exports.
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            vcs_client.credential_proxy_client, "open_broker_request", refuse
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("issue-update", {})
+        self.assertEqual(caught.exception.code, vcs_client.BROKER_ROUTE_UNSUPPORTED)
+        self.assertIn("issue-update", str(caught.exception))
+
+    def test_a_2xx_whose_json_body_is_not_an_object_reads_as_an_answer_that_is_not_json(self):
+        """Through the real `vcs_call`: a 2xx whose body is valid JSON but not an
+        object. The caller gets the error of a 2xx body that is not JSON, and
+        no consumer meets an `AttributeError` on a list or on `None`."""
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        for body in (b"[]", b"null"):
+
+            def answer(request, *args, body=body, **kwargs):
+                return io.BytesIO(body)
+
+            with self.subTest(body=body), mock.patch.dict(os.environ, environment), mock.patch.object(
+                vcs_client.credential_proxy_client, "open_broker_request", answer
+            ):
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.call("capabilities", {"repository": "acme/infra"})
+                self.assertIsNone(caught.exception.code)
+                self.assertIn("not JSON", str(caught.exception))
+                with self.assertRaises(vcs_client.VcsError):
+                    vcs_client.base_branch("acme/infra")
+
     def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
         """The other half: a bare 404 is the only one read as a missing route.
 

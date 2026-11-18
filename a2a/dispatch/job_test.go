@@ -643,3 +643,46 @@ func TestAnUnreadableJobAtItsStartLimitKeepsTheTaskQueued(t *testing.T) {
 		t.Errorf("Health.Waiting %v: the task stays queued, so it shows as waiting", h.Waiting)
 	}
 }
+
+// A tier an administrator ends (#5850) while a task's Job is still coming
+// up ends the task canceled tier-ended at once, its Job deleted and its
+// submission tombstoned, with no breaker count: not failed no-worker when
+// the Job never gets a worker, which it wouldn't once the tier is torn down
+// (#6134).
+func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
+	b := newBus(t)
+	b.ensure("inv", 1, 0, "read", "unattended")
+	jobs := newFakeJobs(-1) // never ready
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) {
+		c.Profiles[0].Tiers = []string{"read", "unattended"}
+		c.Profiles[0].Durables = nil // derived from the tiers (#5649)
+		c.JobStartSeconds, c.BreakerThreshold = 60, 1
+	})
+	d, _ := b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the task's Job launched", func() bool { return jobs.launchCount() > 0 })
+	start := time.Now()
+	ti.update(func(c *lib.DispatchConfig) {
+		c.Profiles[0].Tiers = []string{"read"}
+		c.Profiles[0].Durables = nil // derived from the tiers and the drain (#5649)
+		c.Profiles[0].DrainingTiers = []lib.DrainingTier{{Tier: "unattended", Mode: "unattended", Until: time.Now().Add(2 * time.Minute), Ending: true}}
+	})
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonTierEnded) {
+		t.Fatalf("terminal %+v, want canceled %s", ts, ReasonTierEnded)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("ended %s after the tier was ended; want it within a refresh or two, not the Job's start window", took)
+	}
+	if !jobs.deleted("task-1") {
+		t.Error("the starting Job was not deleted")
+	}
+	waitFor(t, 5*time.Second, "the tombstone", func() bool {
+		_, ok := b.tombstones()[lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")]
+		return ok
+	})
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("breakers %v open; an administrator's end is no worker loss", open)
+	}
+}

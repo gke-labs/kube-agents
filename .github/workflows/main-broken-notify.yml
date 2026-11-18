@@ -56,8 +56,9 @@ name: Notify on Broken Main
 # Structure` has two required jobs -- `validate`, and `prompt-assets`, which
 # reports the `Agent instructions cite assets that exist` context -- and one
 # that is not, `terraform-floor`. Its red on main is wanted for the same
-# reason as the agent-image sweep's: a root that no longer initialises on the
-# Terraform floor the installer promises is a break in the tree.
+# reason as the agent-image sweep's: a root that no longer initialises, or a
+# composition that no longer plans, on the Terraform floor the installer
+# promises is a break in the tree.
 #
 # `Prettier Check` is required and deliberately absent. It scopes itself to the
 # files the push changed, so its green says those files are formatted and
