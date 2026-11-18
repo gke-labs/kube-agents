@@ -4,6 +4,8 @@
 - **Date:** 2026-08-24
 - **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented; `next` is the default for a first `install.sh` install, and `today` is supported as a rollback for one release
 
+- **Status (2026-11-16):** retired. The installer and the chart pass no mode (#5815), the operator defaults `spec.mode` to `next`, migrates a stored `today` and renders the A2A stack on every install (#5752), and the agent image no longer reads `KUBEAGENTS_MODE` (this change). The body below is the design as it was.
+
 ## Purpose
 
 Stage 1 lands the new stack dark: the NATS component, the A2A gateway skeleton, and the
@@ -143,13 +145,14 @@ today's path until something happens to kill its pods.
 
 ## Agent-side rule
 
-Agent-side code asks one helper in the shared settings module - `runtime_mode.is_next()`
-or equivalent - and that helper reads the managed key. No component reads its own env
-var. A grep for `KUBEAGENTS_MODE` should hit exactly two places: the operator builder
-that writes it and the helper that reads it. A third hit is a review comment.
+Agent-side code asked one helper in the shared settings module, `runtime_mode.is_next()`,
+which read the managed key. No component read its own env var, and a grep for
+`KUBEAGENTS_MODE` hit exactly two places: the operator builder that writes it and the helper
+that read it. The reader went with the switch: today a grep hits the operator writer alone,
+which `tests/test_mode_grep.py` pins until the pin itself goes.
 
-"What mode am I in" gets one answer per agent, computed in one place. This also means the
-delivery mechanism can change later without touching call sites.
+"What mode am I in" got one answer per agent, computed in one place, so the delivery
+mechanism could have changed without touching call sites.
 
 ## Choosing it at install
 

@@ -154,8 +154,13 @@ if args[0] == "compute" and args[2] == "list":
     if objects is None:
         print(f"ERROR: (gcloud.compute.{args[1]}.list) Required 'compute.{args[1]}.list' permission for 'projects/{project}'", file=sys.stderr)
         sys.exit(1)
-    prefix = (flag("--filter") or "").split("^", 1)[-1]
-    matched = [o for o in objects if o["name"].startswith(prefix)]
+    # `name ~ ^<prefix>` is a prefix read; `name ~ ^<name>$` (the disk read
+    # behind source_disk_gone) is an exact one.
+    pattern = (flag("--filter") or "").split("^", 1)[-1]
+    if pattern.endswith("$"):
+        matched = [o for o in objects if o["name"] == pattern[:-1]]
+    else:
+        matched = [o for o in objects if o["name"].startswith(pattern)]
     if flag("--format") == "json":
         print(json.dumps(matched))
     else:
@@ -337,6 +342,15 @@ print(json.dumps({"sha": repo[path], "path": path, "type": "file", "encoding": "
 '''
 
 
+# A `compute snapshots list` item: the source disk's URL outlives the disk.
+_SNAPSHOT_CREATED = "2026-06-01T00:00:00.000-07:00"
+_SNAPSHOT_SOURCE_URL = "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/disks/orphan-snap-source-seeded"
+
+
+def _snapshot(name, created=_SNAPSHOT_CREATED):
+    return {"name": name, "status": "READY", "sourceDisk": _SNAPSHOT_SOURCE_URL, "creationTimestamp": created}
+
+
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project, the pool
     repository's declared-intent note included, as a scan holding a
@@ -357,6 +371,10 @@ def healthy_world(*projects):
             {"name": "default", "peerings": [{"name": "default-to-mtu-peer-declared", "state": "ACTIVE"}]},
             {"name": "mtu-peer-declared", "mtu": 8896, "peerings": [{"name": "mtu-peer-declared-to-default", "state": "ACTIVE"}]},
         ],
+        # The two orphaned snapshots (bench/tf/fleet/main.tf): past the compute
+        # audit's 90-day gate, of a source disk the planter deleted.
+        "snapshots": [_snapshot("declared-orphan-snap-seeded"), _snapshot("orphan-snap-seeded")],
+        "disks": [],
     }
     return {
         "clusters": {project: fleet for project in projects},
@@ -658,10 +676,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 51, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 53, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 51, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 53, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -715,7 +733,32 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 101, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 105, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+
+
+    def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
+        world = healthy_world(PROJECT)
+        # From the real clock, as test_the_runners_own_age_gate_line_is_read
+        # does: the verdict comes from hack/fleet-fixture-state.py's own
+        # datetime.now(), not from the NOW this test stamps the document with,
+        # so a date fixed here would pass the gate 91 days after it.
+        taken = (datetime.now(UTC) - timedelta(days=3)).replace(microsecond=0)
+        world["compute"][PROJECT]["snapshots"][0] = _snapshot("declared-orphan-snap-seeded", created=taken.isoformat())
+        doc, err = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["declared-orphan-snapshot"], "not_ready")
+        self.assertEqual({s for r, s in states.items() if r != "declared-orphan-snapshot"}, {"healthy"})
+        detail = doc["projects"][PROJECT]["roles"]["declared-orphan-snapshot"]["detail"]
+        self.assertEqual(len(detail), 1, detail)
+        self.assertIn("ready_after_hours 2184", detail[0])
+        self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 52, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"]["not_ready"], 1)
+        self.assertEqual(doc["summary"]["drifted_projects"], 0)
+        self.assertEqual(fixture_state.drift_map(doc), {})
+        self.assertEqual(fixture_state.read_map(doc)[PROJECT].count("declared-orphan-snapshot"), 1, "a not-ready role was read")
+        self.assertIn(f"{PROJECT}: not yet ready: declared-orphan-snapshot", err)
+
 
 
 class NotChecked(ScanHarness):
@@ -740,7 +783,7 @@ class NotChecked(ScanHarness):
         states = self.states(doc)
         # The project-scoped roles are read with gcloud compute, not through a
         # cluster, so a refused cluster list leaves them readable.
-        project_roles = {"startup-fail-vm", "world-open-ingress", "declared-mtu-peering"}
+        project_roles = {"startup-fail-vm", "world-open-ingress", "declared-mtu-peering", "declared-orphan-snapshot", "orphan-snapshot"}
         self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
         self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
@@ -862,7 +905,7 @@ class NotChecked(ScanHarness):
         del world["github"]
         doc, err = self.scan(world)
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": len(self.roles), "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": len(self.roles), "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(fixture_state.read_map(doc), {PROJECT: sorted(self.roles)})
         self.assertEqual(err, "")
         report = json.loads((self.workdir / PROJECT / fixture_state.REPORT_FILE).read_text())

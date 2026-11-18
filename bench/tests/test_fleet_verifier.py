@@ -1571,7 +1571,7 @@ YAML
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
-  "compute instances list"|"compute firewall-rules list"|"compute networks list")
+  "compute instances list"|"compute firewall-rules list"|"compute networks list"|"compute snapshots list")
     # A project-scoped probe. Planted by default: prints one name with the
     # filter's prefix. STUB_COMPUTE_ABSENT lists `<collection>:<prefix>` pairs
     # that are not there; STUB_COMPUTE_FAIL fails every list.
@@ -1999,7 +1999,7 @@ def test_the_runner_publishes_a_project_role_as_its_confirmed_list_alone(shell, 
         assert not any(line.startswith(f"slot.{role}=") for line in context), role
         for probe in entry["probes"]:
             kind, prefix = probe.split("/", 1)
-            collection = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}[kind]
+            collection = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots"}[kind]
             assert f"compute {collection} list --project kube-agents-evals --filter=name ~ ^{prefix[:-1]} --format=value(name)" in log
 
 
