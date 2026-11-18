@@ -47,6 +47,8 @@ A streamed `get` can re-read a finished turn that delegated, outside the stream 
 
 The bridge offers `poll_events` too and forwards it to this server, so card reports that arrive after a `send_message` answer can be read with the `conversation_token` and `since` the answer gives.
 
+A `send_message` that answers a card's report passes `reply_to`, the task the report's heading gave as `on task`; the agent then reads that report before answering. That read happens on the [platform route](/kube-agents/concepts/chatops/#session), the install's default; a conversation on its own session pod does not read it yet. Without it, a reply under a report starts from the words alone.
+
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 
 ## The tools

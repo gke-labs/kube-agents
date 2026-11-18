@@ -3,8 +3,8 @@
 > **STATUS: design of record, lane job in place, page not checked in.** The suite's tier, roster
 > and first cases are on `main` (`EVAL_TIER=validated-capabilities` in `hack/ci-eval-pr.sh`,
 > the `suite: validated-capabilities` line in each case's task file, the "Validated Capabilities suite" section of
-> [`bench/README.md`](../../bench/README.md#validated-capabilities-suite)). The lane is the Prow periodic
-> `ci-kube-agents-certification-1` in GoogleCloudPlatform/oss-test-infra. The page
+> [`bench/README.md`](../../bench/README.md#validated-capabilities-suite)). The lane is the Prow periodics
+> `ci-kube-agents-validated-capabilities-1` and `-2`, one a suite part, in GoogleCloudPlatform/oss-test-infra. The page
 > and its rating reader exist as a local prototype only; the constants this document cites from
 > it are the ones the check-in carries. Epic: gke-labs/kube-agents#3978.
 
@@ -84,7 +84,7 @@ States of a cell (one scenario, one release):
 
 | Cell reads                           | When                                                                                                                                                                                                                           |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| No run on `<release>`                | the release has no lane build                                                                                                                                                                                                  |
+| No run on `<release>`                | the release has no build of the job that runs the scenario's part                                                                                                                                                              |
 | `n` of 60 scored, not enough runs    | fewer than 60 scored repetitions exist; no claim is made                                                                                                                                                                       |
 | Not validated, infra share           | more than about a third of the window's repetitions are infra or no valid run; the share is shown by cause and no cell is validated                                                                                            |
 | `k` of `n` on `<release>`, validated | `n` is at least 60 and the bound on `k` of `n` is at least 0.85                                                                                                                                                                |
@@ -101,7 +101,7 @@ gaps"). Nothing is inferred from a neighbouring release, from `main`, or from a 
 
 ```mermaid
 flowchart LR
-    GA["GA release published<br/>(version tag, published images)"] --> L["Validated Capabilities lane<br/>ci-kube-agents-certification-1<br/>newest GA, two builds a week, 3 repetitions each for now"]
+    GA["GA release published<br/>(version tag, published images)"] --> L["Validated Capabilities lane<br/>ci-kube-agents-validated-capabilities-1 and -2, one a suite part<br/>newest GA, two builds a week each, 3 repetitions each for now"]
     L --> V["Per-release verdict<br/>k of n scored on release"]
     V --> C["Page cell<br/>count, date, state"]
     C --> G["Gate on the next promotion<br/>holds while the newest GA reads Not validated<br/>without a recorded waiver"]
@@ -134,9 +134,12 @@ item with its cost.
 
 ## The lane
 
-- **Trigger.** Two scheduled builds a week, Saturday and Sunday, plus Rerun from Deck; `max_concurrency: 1`
-  queues a Rerun behind a running build (oss-test-infra#2768, job
-  `ci-kube-agents-certification-1` in `prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`).
+- **Trigger.** One job a suite part, `ci-kube-agents-validated-capabilities-1` and `-2` in
+  `prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`, each with two scheduled builds a
+  week, Saturday and Sunday, plus Rerun from Deck; `max_concurrency: 1` queues a Rerun behind a
+  running build of the same job (oss-test-infra#2768). Each job resolves the newest GA release on
+  its own, so a Rerun of one job is pressed before the next release is cut: after a cut it grades
+  the newer release, and the two parts sit on two releases.
   A per-release trigger on the tag push is held in reserve: it races the image publish and
   multiplies the cost by the release rate.
 - **Image resolution.** `get_latest_ga_tag` then `resolve_source_image_commit` in
@@ -162,7 +165,9 @@ item with its cost.
   one scenario. The sizing is per scenario, and a slice runs every scenario of its roster part
   serially, so a part's size is bounded by the timeout; the rule that bounds it is an open
   item. A Rerun on the same release pools into its window.
-- **Artifacts.** The lane's logs bucket, `logs/ci-kube-agents-certification-1/<build>/`:
+- **Artifacts.** The lane's logs bucket, one path a job, `logs/ci-kube-agents-validated-capabilities-<N>/<build>/`
+  (the first slice's builds under its job's earlier name are in `logs/ci-kube-agents-certification-1/`, and
+  the page's reader lists that folder too):
   `case-<id>.json` per scenario per build, written by `hack/ci-eval-pr.sh` when the scenario's
   last repetition has finished (one result per repetition inside it; a cut build has none for
   the scenario it was inside), and `artifacts/release-under-test.json`
@@ -171,7 +176,10 @@ item with its cost.
 - **What the reader consumes.** The release artifact keys every repetition of the build to a
   release. The page will classify each repetition with the scorer's own per-repetition outcome
   (pass, fail, safety violation, no valid run, infra, not applicable), never with the marker alone, group by release and split at a model change,
-  and apply the rule above. It reads the case files; a cut build contributes nothing.
+  and apply the rule above. It reads the case files; a cut build contributes nothing. A scenario
+  is in one part, so the jobs' builds hold disjoint scenarios: a scenario with no record on a
+  release that the other part's job graded reads "No run on `<release>`", and a row counts its
+  tests from the release's own task files, not from the builds that exist.
 
 ## The roster and case rules
 
@@ -199,7 +207,7 @@ The page is not checked in; when it is, it shows:
 - The page states the cadence: one release a week is graded, so a release between two Saturday
   runs reads "No run".
 - "No run" and "No test" are different badges: "No test" means no scenario grades the row;
-  "No run" means the scenario exists and this release has no lane build.
+  "No run" means the scenario exists and this release has no build of its part's job.
 - "Not enough runs" shows the scored count against 60 and makes no claim.
 - A history of the last releases with a run sits beside the cell.
 - Rows measured only by the nightly carry a "Passes on main" badge with the `main` commit, never

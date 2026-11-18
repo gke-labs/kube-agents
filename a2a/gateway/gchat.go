@@ -20,6 +20,8 @@ import (
 	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
@@ -152,10 +154,10 @@ const (
 // (spec-chatops-gateway.md, "The Google Chat adapter").
 const (
 	gchatKeyPrefix      = "gchat:"
-	gchatDMKeyPrefix    = "gchat:dm/"
+	gchatDMKeyPrefix    = lib.GchatDMKeyPrefix
 	gchatSpaceKeyPrefix = "gchat:space/"
 	gchatSpacesToken    = "spaces/"
-	gchatThreadsToken   = "/threads/"
+	gchatThreadsToken   = lib.GchatThreadsSep
 	// gchatUsersToken prefixes a user resource name ("users/{id}").
 	gchatUsersToken = "users/"
 	// gchatMentionOpen opens the <users/…> mention Chat parses out of

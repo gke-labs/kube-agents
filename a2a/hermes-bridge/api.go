@@ -336,7 +336,8 @@ func apiTurnFailed(out *apiChatResponse) bool {
 // turn before it has answered.
 func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	taskID := run.origin.TaskID
-	prompt, ok := promptFromMessage(run.origin.Payload)
+	parts := messageParts(run.origin.Payload)
+	prompt, ok := promptFromParts(parts)
 	if !ok {
 		b.finalize(run, lib.StateRejected,
 			"reason: no-text-parts - the submission message carries nothing hermes can be asked", nil)
@@ -421,7 +422,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// The opening turn only: a follow-up runs in a session that has already
 	// read the report, and the hook this mirrors reads the thread once per
 	// message a person sends, which the opening turn is.
-	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, parts, prompt)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
