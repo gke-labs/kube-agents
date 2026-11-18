@@ -467,6 +467,9 @@ _RUN_ID_HEX_WIDTH = 12
 # Set while a card-wake replay sends its turns, so they land on one
 # conversation: see KubeAgentsHarness._execute_card_wake.
 _PINNED_RUN_ID: ContextVar[str | None] = ContextVar("pinned_run_id", default=None)
+# Set while a fresh-session answer opens its own conversation, so its eval run
+# tag keeps the repetition's run id: see KubeAgentsHarness._execute_fresh_answer.
+_PINNED_EVAL_RUN_ID: ContextVar[str | None] = ContextVar("pinned_eval_run_id", default=None)
 # How long one injected task may run before the harness reads the record and
 # classifies it. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
 # there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
@@ -3571,7 +3574,7 @@ class KubeAgentsHarness(AgentHarness):
         # v4/v6 mismatch would make the probe and the request disagree.
         url = f"http://127.0.0.1:{local_port}{api_path}"
         run_id = _run_id()
-        eval_run = _eval_run_identity(run_id)
+        eval_run = _eval_run_identity(_PINNED_EVAL_RUN_ID.get() or run_id)
         _write_eval_run(eval_run)
         headers = {"Content-Type": "application/json", _EVAL_RUN_HEADER: eval_run[_EVAL_RUN_KEY]}
         token = os.environ.get("PLATFORM_AGENT_TOKEN")
@@ -3905,11 +3908,14 @@ class KubeAgentsHarness(AgentHarness):
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
             return AgentResult.errored(str(exc))
+        # A new conversation, but the same repetition: the tag keeps the wake's run id.
+        tag = _PINNED_EVAL_RUN_ID.set(_run_id())
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
             return self._execute_api(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
+            _PINNED_EVAL_RUN_ID.reset(tag)
 
     def _execute_inject(self, prompt: str, *, follow_up: _InjectFollowUp | None = None) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.

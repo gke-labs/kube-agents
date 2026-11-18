@@ -81,9 +81,12 @@ def check_call_sites(source: str) -> None:
             fail(f"{name}: expected one await {RECORD}(...), found {len(awaits)}")
             continue
         call = awaits[0].value
-        args = [a.id for a in call.args if isinstance(a, ast.Name)]
-        if args != ["request", "session_id"]:
-            fail(f"{name}: {RECORD} is called with {args}, not (request, session_id)")
+        # Anything but a bare name counts as a mismatch, not as absent, and so
+        # does any keyword: record_request binds exactly (request, session_id).
+        args = [a.id if isinstance(a, ast.Name) else ast.unparse(a) for a in call.args]
+        if args != ["request", "session_id"] or call.keywords:
+            keywords = [ast.unparse(k) for k in call.keywords]
+            fail(f"{name}: {RECORD} is called with {args} {keywords}, not (request, session_id)")
         later = [line for line in _session_assignments(function) if line > awaits[0].lineno]
         if later:
             fail(f"{name}: session_id is reassigned after the record (lines {later}): the tag would land on the wrong session")

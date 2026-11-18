@@ -5232,6 +5232,25 @@ def test_a_fresh_session_replay_sends_the_answer_on_a_new_conversation_after_the
     assert _archived(scripts)
 
 
+def test_a_fresh_session_answer_keeps_the_wake_turns_eval_run_tag(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, tmp_path: Path
+) -> None:
+    """One repetition, one tag: the answer opens a new conversation, not a new run."""
+    target = tmp_path / "eval_run.json"
+    monkeypatch.setenv("KUBE_AGENTS_EVAL_RUN_FILE", str(target))
+    monkeypatch.setenv("EVAL_CASE_ID", "some-case")
+    monkeypatch.setenv("EVAL_REPETITION", "2")
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell([]))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    wake, answer = stub_agent.requests
+    assert wake["conversation"] != answer["conversation"]
+    assert stub_agent.eval_runs == [f"{wake['conversation']}/some-case/2"] * 2
+    assert json.loads(target.read_text(encoding="utf-8"))["run_id"] == wake["conversation"]
+
+
 def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:

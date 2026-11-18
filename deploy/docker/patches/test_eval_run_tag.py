@@ -416,6 +416,21 @@ class ApiServerPatchTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(any("reassigned after the record" in f for f in failures), failures)
 
+    def test_the_verifier_catches_extra_call_arguments(self):
+        call = f"await {applier.RECORD}(request, session_id)"
+        for extra in ("request, None, session_id", "request, session_id, 'x'", "request, self.sid, session_id",
+                      "request, session_id, foo=1"):
+            with self.subTest(extra=extra):
+                self.setUp()
+                applier.apply(self.root)
+                routes = self.root / applier.ROUTES_RELATIVE
+                source = routes.read_text()
+                self.assertEqual(source.count(call), 2)
+                routes.write_text(source.replace(call, f"await {applier.RECORD}({extra})"))
+                rc, failures = self.run_verifier()
+                self.assertEqual(rc, 1)
+                self.assertTrue(any("not (request, session_id)" in f for f in failures), failures)
+
     def test_the_verifier_catches_a_switch_that_does_not_gate(self):
         applier.apply(self.root)
         module = self.root / "hermes_cli" / "eval_run_tag.py"

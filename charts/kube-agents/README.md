@@ -1089,8 +1089,9 @@ says what is counted and what a held triage does.
 `platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
 LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
 agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
-proxy logs and does not forward. `false`, the default, renders nothing. An entry with the same name
-in `platformAgent.deployment.env` wins.
+proxy logs and does not forward. `false`, the default, renders nothing. A literal entry with the
+same name in `platformAgent.deployment.env` wins. A `valueFrom` entry with the key `true` fails the
+render, because the operator forwards only literal values and would drop it.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,

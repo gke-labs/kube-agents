@@ -15,7 +15,7 @@ which the model reads and the proxy keys on, is not touched. Everything lives
 in ``hermes_cli/eval_run_tag.py`` (``deploy/docker/patches/eval_run_tag.py``);
 a failure there leaves the request as it was.
 
-Enabled in the default, platform and cluster profiles' ``plugins.enabled``.
+Enabled in the default, platform, cluster and tse profiles' ``plugins.enabled``.
 Auxiliary calls (titles, compression summaries) do not pass through the turn
 loop's middleware and stay untagged.
 """
