@@ -19,10 +19,17 @@ refuses:
 - a ``RUN`` that changes an owner or a mode (``chown``, ``chmod``, ``chgrp``,
   ``install``, ``setfacl``) and names the root, a path under it, or one of
   its parents (``chown -R 1000 /opt/kube-agents`` reaches it), which this
-  can't read the outcome of.
+  can't read the outcome of;
+- any ``RUN`` while the stage's ``USER`` isn't root that names the root or a
+  path under it, or runs with its ``WORKDIR`` there: what it writes is owned
+  by that user (``USER node`` then ``RUN cp x.py /opt/kube-agents/scripts/``).
+  ``COPY`` and ``ADD`` aren't affected: they create files owned by root
+  whatever the ``USER``, unless a ``--chown`` names someone else, which the
+  first rule refuses.
 
 A relative destination, and a relative path a ``RUN`` names before any
-``cd``, is read against the stage's ``WORKDIR``; ``//``, ``.`` and ``..`` are
+``cd``, is read against the stage's ``WORKDIR``; ``FROM`` resets a stage's
+``WORKDIR`` to ``/`` and its ``USER`` to root; ``//``, ``.`` and ``..`` are
 resolved; the keyword may be followed by a tab; ``install`` counts as a
 command by name or by path, after ``RUN`` flags, but not as an argument
 (``apt-get install``); and an ``ONBUILD`` instruction is read as the one it
@@ -119,15 +126,24 @@ def _reaches_root(path: str) -> bool:
     return _under_root(path) or path == "/" or SCRIPT_ROOT.startswith(path + "/")
 
 
+def _is_root_user(user: str) -> bool:
+    """Whether a USER instruction's argument (``node``, ``1000:1000``, ``root:root``) runs as root."""
+    return user.strip("\"'").split(":", 1)[0] in {"root", "0"}
+
+
 def problems(text: str) -> list[str]:
     """Each instruction in *text* that could leave a file under the root not root-owned, or writable by others."""
     found = []
     workdir = "/"
+    user = "root"
     for keyword, args in instructions(text):
         if keyword == "ONBUILD":
             keyword, args = _split_keyword(args)
         if keyword == "FROM":
             workdir = "/"
+            user = "root"
+        elif keyword == "USER":
+            user = args.split()[0] if args.split() else "root"
         elif keyword == "WORKDIR":
             workdir = posixpath.join(workdir, args.strip("\"'"))
         elif keyword in ("COPY", "ADD"):
@@ -162,6 +178,10 @@ def problems(text: str) -> list[str]:
                 found.append(f"{keyword} {args}: --chmod={chmod} is group- or world-writable, or sets a setuid, setgid or sticky bit")
         elif keyword == "RUN" and _run_changes_modes(args) and _run_reaches_root(args, workdir):
             found.append(f"RUN {args[:120]}: sets an owner or a mode that can reach {SCRIPT_ROOT}, which this can't check")
+        elif keyword == "RUN" and not _is_root_user(user) and (
+            _under_root(workdir) or any(_under_root(p) for p in RUN_PATH.findall(args))
+        ):
+            found.append(f"RUN {args[:120]}: runs as USER {user} and writes into {SCRIPT_ROOT}, so what it writes is owned by {user}")
     return found
 
 
@@ -227,6 +247,12 @@ class ScriptRootOwnershipTest(unittest.TestCase):
             "RUN apt-get install -y curl && pip install x",  # install as an argument
             "WORKDIR /opt/kube-agents\nRUN chown root:root /opt/other && find /opt/other | grep .",  # . is grep's
             f"WORKDIR {SCRIPT_ROOT}\nRUN cd /tmp && find . -type f",  # no mode change
+            "USER node\nRUN mkdir -p /home/node/work",  # not the root
+            f"USER node\nCOPY --chmod=0555 a.py {SCRIPT_ROOT}/a.py",  # COPY is root-owned whatever the USER
+            f"USER node\nFROM scratch\nRUN mkdir -p {SCRIPT_ROOT}",  # FROM resets the stage's USER
+            f"USER node\nUSER root\nRUN mkdir -p {SCRIPT_ROOT}",
+            f"USER 0\nRUN mkdir -p {SCRIPT_ROOT}",
+            f"USER root:root\nRUN cp /tmp/x.py {SCRIPT_ROOT}/",
         ):
             with self.subTest(line=line):
                 self.assertEqual(problems(f"FROM scratch\n{line}\n"), [])
@@ -275,6 +301,12 @@ class ScriptRootOwnershipTest(unittest.TestCase):
             f"WORKDIR {SCRIPT_ROOT}\nRUN chmod 0777 a.py",
             "WORKDIR /opt/kube-agents\nRUN chown -R 1000 .",
             "WORKDIR /opt/kube-agents\nRUN chown -R 1000 scripts/a.py",
+            f"USER node\nRUN mkdir -p {SCRIPT_ROOT} && cp /tmp/x.py {SCRIPT_ROOT}/",  # #6297's case
+            f"USER 1000:1000\nRUN cp /tmp/x.py {SCRIPT_ROOT}/x.py",
+            f"USER node:node\nRUN tee {SCRIPT_ROOT}/a.py < /tmp/a.py",
+            f"USER node\nWORKDIR {SCRIPT_ROOT}\nRUN touch a.py",  # a write into WORKDIR
+            f"USER \"node\"\nRUN cp /tmp/x.py {SCRIPT_ROOT}/",
+            f"FROM scratch AS base\nUSER node\nRUN cp /tmp/x.py {SCRIPT_ROOT}/",
         ):
             with self.subTest(line=line):
                 self.assertNotEqual(problems(f"FROM scratch\n{line}\n"), [])
