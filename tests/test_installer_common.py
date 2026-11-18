@@ -6755,7 +6755,7 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_real_render_prints_the_notes_block_for_the_tfvars(self):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn("      Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
         # which `make docs-generate` renders from the same chart template with these
@@ -6780,9 +6780,11 @@ class FootprintSummaryTest(unittest.TestCase):
                 self.assertIn("rc=0", output.stdout, output.stderr)
             r = profile["requirements"]
             gib = 1024**3
-            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
-            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
-            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            # The summary prints the standing release; the session pods' share, which the
+            # totals carry, is on its own line.
+            self.assertIn(f"CPU requests:        {(r['requestsCpu'] - r['sessionRequestsCpu']) / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {(r['requestsMemory'] - r['sessionRequestsMemory']) / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods'] - r['sessionPods']}\n", output.stdout, key)
             self.assertIn(
                 f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
                 output.stdout, key,
@@ -6793,7 +6795,7 @@ class FootprintSummaryTest(unittest.TestCase):
             profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the session pods", proc.stdout)
+        self.assertIn("Not in these figures or the cost: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

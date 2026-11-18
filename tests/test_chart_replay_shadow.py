@@ -319,14 +319,23 @@ _REPLAY = tuple(s for s in _ON if not s.startswith("litellm.replayShadow.job.kin
     "litellm.replayShadow.job.kind=replay-lane", "litellm.replayShadow.mode=replay",
     "litellm.replayShadow.allowServe=true")
 _MODE_VARS = ("REPLAY_MODE", "REPLAY_CACHE_DIR", "REPLAY_ALLOW_SERVE")
+_SAFE_TO_EVICT = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 
 
-def _proxy_env(sets):
+def _proxy_pod_template(sets):
     res = _render(sets, show_only="templates/litellm.yaml")
     if res.returncode != 0:
         raise AssertionError(res.stderr)
-    container = _find(_docs(res.stdout), "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
+    return _find(_docs(res.stdout), "Deployment", _PROXY)["spec"]["template"]
+
+
+def _proxy_env(sets):
+    container = _proxy_pod_template(sets)["spec"]["containers"][0]
     return {e["name"]: e.get("value") for e in container["env"]}
+
+
+def _proxy_pod_annotations(sets):
+    return _proxy_pod_template(sets)["metadata"].get("annotations") or {}
 
 
 class ModesTest(unittest.TestCase):
@@ -379,6 +388,14 @@ class ModesTest(unittest.TestCase):
                 self.assertIn("/litellm/replayShadow/cacheDir", res.stderr)
         self.assertEqual(_proxy_env([*_RECORD, "litellm.replayShadow.cacheDir=/data/answers"])["REPLAY_CACHE_DIR"],
                          "/data/answers")
+
+    def test_only_a_replay_pod_refuses_autoscaler_scale_down(self):
+        """A replay pod holds the seeded cache in its emptyDir, and a replacement serves nothing
+        until the collector's next pass seeds it. Shadow and record pods have no seeded
+        cache, and lose only what their preStop drain cannot hand the collector."""
+        for mode, sets, expected in (("replay", _REPLAY, "false"), ("record", _RECORD, None), ("shadow", _ON, None)):
+            with self.subTest(mode=mode):
+                self.assertEqual(_proxy_pod_annotations(sets).get(_SAFE_TO_EVICT), expected)
 
     def test_an_unknown_mode_is_refused(self):
         res = _render([*_ON, "litellm.replayShadow.mode=serve"])

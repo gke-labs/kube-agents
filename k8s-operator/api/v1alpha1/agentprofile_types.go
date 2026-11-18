@@ -400,6 +400,22 @@ type AgentProfileStatus struct {
 	// +optional
 	RenderedTiers []string `json:"renderedTiers,omitempty"`
 
+	// DurableTiers are the tiers whose PROFILE_SUBMITS durables the operator
+	// last made or found, written only after a durable sync succeeds and
+	// left as it was by any other pass (#6283). The operator reads it to
+	// tell a durable that existed, which it re-creates only once it is
+	// still missing a pass later, from one it never made, which it makes at
+	// once. A hint like renderedTiers: absent, every durable counts as new.
+	// It holds at most 32: the rendered tiers first, then the draining ones
+	// by name. A draining tier left out counts as new, re-created on its
+	// first miss as before #6283.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
+	// +optional
+	DurableTiers []string `json:"durableTiers,omitempty"`
+
 	// Conditions represent the latest available observations of the profile.
 	// +listType=map
 	// +listMapKey=type

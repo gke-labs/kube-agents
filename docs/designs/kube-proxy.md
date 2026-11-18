@@ -19,6 +19,7 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Go module                                | [`k8s-api-proxy/go.mod`](../../k8s-api-proxy/go.mod) (`github.com/gke-labs/kube-agents/k8s-api-proxy`)                               |
 | Core HTTP handler and L7 policy          | [`k8s-api-proxy/pkg/k8sapiproxy/`](../../k8s-api-proxy/pkg/k8sapiproxy/)                                                             |
 | Pluggable upstream transport interface   | [`k8s-api-proxy/pkg/k8sapiproxy/transport.go`](../../k8s-api-proxy/pkg/k8sapiproxy/transport.go)                                     |
+| Caller authentication (TokenReview)      | [`k8s-api-proxy/pkg/tokenreview/`](../../k8s-api-proxy/pkg/tokenreview/)                                                             |
 | GKE HTTPS upstream transport             | [`k8s-api-proxy/pkg/upstream/`](../../k8s-api-proxy/pkg/upstream/)                                                                   |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
@@ -134,11 +135,12 @@ k8s-api-proxy/
     │   ├── secrets.go            # PartialObjectMetadata rewrite + Secret response redaction
     │   ├── cache.go              # Pluggable CacheStore, MemoryCacheStore, in-flight request coalescing, and RFC 9111/9211 cache
     │   ├── headers.go            # Strip Authorization, Impersonate-*, X-Remote-*, unsafe Upgrade headers
-    │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
     │   ├── audit.go              # AuditSink interface, AuditEvent struct, and slog audit sink
     │   ├── metrics.go            # Closed-vocabulary Prometheus metrics collector
     │   ├── telemetry.go          # OpenTelemetry OTLP HTTP tracer setup
-    │   └── transport.go          # UpstreamTransport interface
+    │   └── transport.go          # CallerAuthenticator and UpstreamTransport interfaces, ErrAuthenticationUnavailable
+    ├── tokenreview/
+    │   └── tokenreview.go        # TokenReview CallerAuthenticator with TTL cache (the binary's)
     └── upstream/
         ├── upstream.go           # GKE HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
         └── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
@@ -160,6 +162,10 @@ type CallerIdentity struct {
 	UID      string
 	Groups   []string
 }
+
+// ErrAuthenticationUnavailable is wrapped by an authenticator that could not decide, so the
+// handler answers 503 rather than 401.
+var ErrAuthenticationUnavailable = errors.New("caller authentication is unavailable")
 
 // CallerAuthenticator verifies that an incoming request comes from an authorized sandbox.
 type CallerAuthenticator interface {
@@ -280,7 +286,7 @@ How multi-cluster context switching works:
 2. **`gcloud container clusters get-credentials`**: When the agent runs `gcloud container clusters get-credentials <cluster> --location=<loc> --project=<proj>`, `credential_proxy_client.py` checks that the cluster exists and is running with one `/v1/gcp/` relay read (a call that does not name the cluster, location and project in full, or any other answer, goes to the broker's `gcloud` as before) and writes a `kubeconfig` entry whose `server:` points to `${KUBE_PROXY_URL}/clusters/gke_<project>_<location>_<cluster>`, whose `certificate-authority:` points to `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and whose `user:` (`kube-proxy-caller`) references `tokenFile` from `CREDENTIAL_PROXY_TOKEN_FILE`. No cluster credentials or GCP tokens ever enter the sandbox.
 3. **Stock `kubectl config` commands**: An agent or script can also register any fleet cluster directly inside the sandbox with `kubectl config set-cluster gke_<project>_<location>_<cluster> --server="${KUBE_PROXY_URL}/clusters/gke_<project>_<location>_<cluster>" --certificate-authority=/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`.
 
-### 5. Caller authentication (`pkg/k8sapiproxy/auth.go`)
+### 5. Caller authentication (`pkg/tokenreview/tokenreview.go`)
 
 `kube-proxy` authenticates every request from the sandbox or session pod before inspecting the Kubernetes API path:
 

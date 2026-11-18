@@ -29,18 +29,32 @@ takes it as an argument, so the server passes the one it loaded lazily and
 the bench's in-pod script passes the one it loaded by path. The agent image
 copies the scripts tree whole, so it ships at
 `/opt/defaults/scripts/worker_transcript.py`; the server imports it as a
-sibling module and the in-pod script loads it from that path.
+sibling module and the in-pod script loads it from that path. The one file it
+loads is the bench's shell reader (`SHELL_READER` below), which each image
+copies beside it.
 """
 
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import re
 import shlex
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+
+# The shell command-line reader of the bench's verifiers. Its one source is
+# `bench/kube_agents_bench/shell_words.py`, which is stdlib only. An image
+# copies that file beside this one. A repository checkout has it only in the
+# bench's package, so that path is the second place to look. The reader is
+# loaded by path because this module is itself loaded by path, with its folder
+# not on `sys.path`. An image that ships this module without the reader fails
+# at import, not at the first command it reads.
+SHELL_READER_FILENAME = "shell_words.py"
+SHELL_READER_REPOSITORY_PARTS = ("..", "..", "..", "bench", "kube_agents_bench", SHELL_READER_FILENAME)
+SHELL_READER_MODULE_NAME = "kube_agents_shell_words"
 
 # The markers the redactor leaves, spelled once so a reader grepping a
 # transcript finds one marker whichever rule masked the value.
@@ -918,6 +932,22 @@ UNSPLIT_LINE_RE = re.compile(
     r"|\$\([ \t]*" + _UNSPLIT_DUMP + r"(?=[;|&<>)])"
     r"|(?<![\w-])(?:" + "|".join(sorted(GCLOUD_TOKEN_PRINTERS)) + r")(?![\w-])"
 )
+
+
+def _load_shell_reader() -> Tuple[Any, str]:
+    """The reader module and the path it came from."""
+    own_folder = Path(__file__).resolve().parent
+    paths = (own_folder / SHELL_READER_FILENAME, own_folder.joinpath(*SHELL_READER_REPOSITORY_PARTS))
+    for path in paths:
+        if path.is_file():
+            spec = importlib.util.spec_from_file_location(SHELL_READER_MODULE_NAME, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module, str(path)
+    raise ImportError("no shell reader at " + " or ".join(str(path) for path in paths))
+
+
+SHELL_READER, SHELL_READER_PATH = _load_shell_reader()
 
 
 def scrub_secret_blocks(redactor: Any, text: str) -> str:
