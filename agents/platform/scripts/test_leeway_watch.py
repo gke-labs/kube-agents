@@ -2012,7 +2012,7 @@ class BatchTests(unittest.TestCase):
         with self.sandbox(seconds=watch.PROJECT_TIMEOUT_SECONDS):
             _, project_runs, scan_errors, error_kinds, scanned, requested = self.sweep({}, runs, deadline)
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(scan_errors, {"p1": "12 of 20 clusters read; 8 not reached (out of time this run)"})
+        self.assertEqual(scan_errors, {"p1": "12 of 20 clusters read — 8 not reached (out of time this run)"})
         self.assertEqual(error_kinds, {"p1": watch.ERROR_KIND_BUDGET_EXHAUSTED})
         self.assertEqual(scanned, {"p1"})
         self.assertEqual(requested, set(self.roster["p1"]))
@@ -2037,7 +2037,7 @@ class BatchTests(unittest.TestCase):
         with self.sandbox(lambda clusters, _: subprocess.CompletedProcess([], 1, "", stderr)
                           if "p1/l/c00" in clusters else None):
             _, _, scan_errors, _, _, _ = self.sweep({}, {}, 3600.0)
-        prefix = "12 of 24 clusters read; 12 failed ("
+        prefix = "12 of 24 clusters read — 12 failed ("
         self.assertTrue(scan_errors["p1"].startswith(prefix + "xxx"))
         self.assertTrue(scan_errors["p1"].endswith(watch.CAUSE_ELLIPSIS + ")"))
         self.assertEqual(len(scan_errors["p1"]), len(prefix) + watch.CAUSE_MAX_CHARS + len(")"))
@@ -2072,7 +2072,7 @@ class BatchTests(unittest.TestCase):
 
             lines = self.tick(1, first_fails)
         failed = next(clusters_arg(a) for a, _ in self.calls if "p1/l/c00" in clusters_arg(a))
-        detail = f"{20 - len(failed)} of 20 clusters read; {len(failed)} failed (leeway crashed)"
+        detail = f"{20 - len(failed)} of 20 clusters read — {len(failed)} failed (leeway crashed)"
         self.assertEqual(lines[0], self.partial(1, f"the configured clusters: {detail}"))
         self.assertEqual(self.finding_clusters(), sorted(failed), "findings retire only on clusters read")
         self.assertEqual(watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {watch.EXPLICIT_TARGET_LABEL: detail})
@@ -2123,8 +2123,8 @@ class BatchTests(unittest.TestCase):
         left = 30 - sum(sizes)
         parts = [f"{len(killed)} failed (the sandbox run timed out after 900s)"]
         if left:
-            parts.append(f"{left} left for its next turn after the timeout")
-        self.assertEqual(lines[0], self.partial(1, f"p1: {read} of 30 clusters read; {', '.join(parts)}"))
+            parts.append(f"{left} not tried this run (reading stops at the first timeout)")
+        self.assertEqual(lines[0], self.partial(1, f"p1: {read} of 30 clusters read — {' — '.join(parts)}"))
         # Findings retire on the clusters read and on the cluster p1 no longer lists.
         self.assertEqual(self.finding_clusters(), sorted(set(self.roster["p1"]) - self.ok))
         ledger = watch.load_ledger(self.home)
@@ -2141,8 +2141,8 @@ class BatchTests(unittest.TestCase):
                 hang_calls = [a for a, _ in self.calls if clusters_arg(a)[0].startswith("p-hang/")]
                 self.assertEqual(len(hang_calls), 1, f"day {day}")
                 self.assertEqual(self.ok, set(self.roster["p2"]) | set(self.roster["p3"]), f"day {day}")
-        detail = "0 of 42 clusters read; 12 failed (the sandbox run timed out after 900s), " \
-                 "30 left for its next turn after the timeout"
+        detail = "0 of 42 clusters read — 12 failed (the sandbox run timed out after 900s) — " \
+                 "30 not tried this run (reading stops at the first timeout)"
         self.assertEqual(outputs, [[self.partial(1, f"p-hang: {detail}")], [], [], []])
 
     def test_a_tick_where_no_call_returns_still_rotates_the_projects(self) -> None:
@@ -2150,13 +2150,19 @@ class BatchTests(unittest.TestCase):
         self.roster = {p: triples(p, 2) for p in names}
         every = [c for p in names for c in self.roster[p]]
         firsts = []
+        outputs = []
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(names)}):
             for day in range(3):
-                lines = self.tick(day, hangs(*every))
-                self.assertTrue(lines[0].startswith("leeway watch: the tick failed: RuntimeError: "), lines)
+                outputs.append(self.tick(day, hangs(*every)))
                 firsts.append(clusters_arg(self.calls[0][0])[0].split("/")[0])
                 self.assertEqual(len(self.calls), 3, "three hung calls spend the tick")
         self.assertEqual(firsts, ["p1", "p4", "p3"], "the projects that had a turn rotate behind")
+        # The failures are counted, not named, so the rotation does not change
+        # the line and it posts once.
+        self.assertEqual(outputs, [[
+            "leeway watch: the tick failed: RuntimeError: 3 target(s) failed "
+            "(the sandbox run timed out after 900s) and the time ran out before the rest"
+        ], [], []])
         ledger = watch.load_ledger(self.home)
         self.assertEqual(set(ledger[watch.CLUSTER_RUNS_KEY]), set(every))
 
@@ -2214,12 +2220,12 @@ class BatchTests(unittest.TestCase):
 
         self.assertEqual(
             self.tick(0, second_call_fails, seconds=600.0),
-            [self.partial(1, "p1: 38 of 100 clusters read; 12 failed (boom), 50 not reached (out of time this run)")],
+            [self.partial(1, "p1: 38 of 100 clusters read — 12 failed (boom) — 50 not reached (out of time this run)")],
         )
         # The next day the counts differ but the target is the same: no repost.
         self.assertEqual(self.tick(1, second_call_fails), [])
         self.assertEqual(
-            watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {"p1": "88 of 100 clusters read; 12 failed (boom)"}
+            watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {"p1": "88 of 100 clusters read — 12 failed (boom)"}
         )
 
     def test_two_failing_projects_are_one_entry_each_with_every_cause_counted(self) -> None:
@@ -2238,7 +2244,7 @@ class BatchTests(unittest.TestCase):
             lines = self.tick(0, outcome)
         self.assertEqual(lines, [self.partial(
             2,
-            "p1: 12 of 30 clusters read; 18 failed (boom; 1 other cause(s))",
+            "p1: 12 of 30 clusters read — 18 failed (boom + 1 other cause(s))",
             "p2: leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: nope",
         )])
 
@@ -2251,7 +2257,7 @@ class BatchTests(unittest.TestCase):
             return completed_json(make_report(rows))
 
         lines = self.tick(0, one_error_row)
-        self.assertEqual(lines, [self.partial(1, "p1: 1 of 2 clusters read; 1 returned an error (forbidden)")])
+        self.assertEqual(lines, [self.partial(1, "p1: 1 of 2 clusters read — c01 returned an error (forbidden)")])
 
     def test_a_new_failing_target_posts_while_another_targets_episode_is_open(self) -> None:
         self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1), "p3": triples("p3", 1)}
@@ -2288,7 +2294,7 @@ class BatchTests(unittest.TestCase):
         def error_row(clusters, _):
             return completed_json(make_report([{"cluster": c, "status": "error", "error": "denied"} for c in clusters]))
 
-        self.assertEqual(self.tick(1, error_row), [self.partial(1, "p1: 0 of 1 clusters read; 1 returned an error (denied)")])
+        self.assertEqual(self.tick(1, error_row), [self.partial(1, "p1: 0 of 1 clusters read — c00 returned an error (denied)")])
         self.assertEqual(self.tick(2), ["leeway watch: every target that failed reads cleanly again"])
 
     def test_recovery_waits_until_every_announced_target_reads_cleanly(self) -> None:
@@ -2313,37 +2319,224 @@ class BatchTests(unittest.TestCase):
         self.roster = {"p1": triples("p1", 30)}
         self.tick(0, findings={c: make_topology_finding(name="web") for c in self.roster["p1"]})
         half = watch.TICK_BUDGET_SECONDS / 2
-        lines = self.tick(1, seconds=half)
+        # A new finding on every cluster read makes the tick write a report.
+        lines = self.tick(1, seconds=half, findings={c: make_topology_finding(name="api") for c in self.roster["p1"]})
         self.assertEqual(len(self.ok), 24)
         self.assertTrue(lines[0].startswith("leeway: 24 finding(s) resolved"))
-        self.assertEqual(len(lines), 1, "no partial-scan line")
-        self.assertEqual(self.finding_clusters(), sorted(set(self.roster["p1"]) - self.ok))
+        self.assertTrue(lines[1].startswith("leeway: 24 finding(s) due"))
+        self.assertEqual(len(lines), 2, "no partial-scan line")
+        web = {f["cluster"] for f in watch.load_ledger(self.home)[watch.FINDINGS_KEY].values() if f["subject_name"] == "web"}
+        self.assertEqual(web, set(self.roster["p1"]) - self.ok)
         markdown = (self.home / watch.REPORTS_DIR_NAME / watch.LATEST_MD_LINK_NAME).read_text(encoding="utf-8")
         self.assertIn(watch.REPORT_NOT_REACHED_HEADING, markdown)
-        self.assertIn("- `p1`: 24 of 30 clusters read; 6 not reached (out of time this run)", markdown)
+        self.assertIn("- `p1`: 24 of 30 clusters read — 6 not reached (out of time this run)", markdown)
         self.assertNotIn("## Scan Errors", markdown)
 
-    def test_an_older_ledgers_signature_neither_posts_nor_sticks(self) -> None:
+    def test_clusters_not_reached_hold_back_the_report_refresh_and_the_topic_retry(self) -> None:
+        self.roster = {"p1": triples("p1", 30)}
+        half = watch.TICK_BUDGET_SECONDS / 2
+        latest = self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME
+        published: list[str] = []
+
+        def publish(summary, path):
+            published.append(summary)
+            return True, None
+
+        with mock.patch.object(watch, "publish_blackboard_topic", side_effect=publish):
+            self.tick(0, findings={c: make_topology_finding(name="web") for c in self.roster["p1"]})
+            first_report = latest.resolve()
+            published.clear()
+            # Findings retire on the 24 clusters read; 6 are not reached, so
+            # `latest.json` and the topic wait for a sweep of the whole fleet.
+            lines = self.tick(1, seconds=half)
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("leeway: 24 finding(s) resolved"))
+            self.assertEqual(latest.resolve(), first_report)
+            self.assertEqual(published, [])
+            self.assertIn(watch.ANNOUNCED_DEFERRED_REFRESH_KEY, watch.load_ledger(self.home)[watch.ANNOUNCED_KEY])
+            # The next tick reads every cluster: the refresh happens then.
+            self.tick(2)
+            self.assertNotEqual(latest.resolve(), first_report)
+            self.assertEqual(len(published), 1)
+            # A failed publish waits the same way.
+            ledger = watch.load_ledger(self.home)
+            ledger[watch.ANNOUNCED_KEY] = {watch.ANNOUNCED_TOPIC_PUBLISH_KEY: "a2a topics write failed"}
+            watch.save_ledger(self.home, ledger)
+            published.clear()
+            self.tick(3, seconds=half)
+            self.assertEqual(published, [], "no retry while clusters were not reached")
+            self.tick(4)
+            self.assertEqual(published, [watch.A2A_RETRY_SUMMARY.format(prefix=watch.LINE_PREFIX)])
+
+    def test_an_older_ledgers_episodes_recover_once_or_announce_anew(self) -> None:
         self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
         entry = "p2: leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: boom"
+        cleared = "leeway watch: every target that failed reads cleanly again"
+        open_p2 = {"p2": ["p2/l/c00"]}
+        signature = watch.ANNOUNCED_PARTIAL_KEY
+        targets = watch.ANNOUNCED_FAILED_TARGETS_KEY
         cases = (
-            # A failure was announced by kind: today's failures count as announced.
-            ([watch.ERROR_KIND_SCAN_FAILED], fails("p2"), [], ["p2"]),
-            ([watch.ERROR_KIND_CLUSTER_ERROR, watch.ERROR_KIND_TIMEOUT], fails("p2"), [], ["p2"]),
-            # Nothing fails now: the old episode is dropped without a line.
-            ([watch.ERROR_KIND_SCAN_FAILED], None, [], None),
+            # A failure was announced by kind: today's failures post as new,
+            # and a tick with none posts the recovery main would have.
+            ({signature: [watch.ERROR_KIND_SCAN_FAILED]}, fails("p2"), [self.partial(1, entry)], open_p2),
+            ({signature: [watch.ERROR_KIND_CLUSTER_ERROR, watch.ERROR_KIND_TIMEOUT]}, fails("p2"),
+             [self.partial(1, entry)], open_p2),
+            ({signature: [watch.ERROR_KIND_SCAN_FAILED]}, None, [cleared], None),
             # A budget gap alone announced no failure under today's rules.
-            ([watch.ERROR_KIND_BUDGET_EXHAUSTED, "cut_short"], fails("p2"), [self.partial(1, entry)], ["p2"]),
-            ([watch.ERROR_KIND_BUDGET_EXHAUSTED], None, [], None),
+            ({signature: [watch.ERROR_KIND_BUDGET_EXHAUSTED, "cut_short"]}, fails("p2"), [self.partial(1, entry)], open_p2),
+            ({signature: [watch.ERROR_KIND_BUDGET_EXHAUSTED]}, None, [], None),
+            # A list of targets: each is open as a whole until read without failing.
+            ({targets: ["p2"]}, fails("p2"), [], open_p2),
+            ({targets: ["p2"]}, None, [cleared], None),
+            # The clusters each target failed on.
+            ({targets: open_p2}, fails("p2"), [], open_p2),
+            ({targets: open_p2}, None, [cleared], None),
         )
         for stored, outcome, expected, open_targets in cases:
             with self.subTest(stored=stored, failing=outcome is not None):
-                self.write_ledger(**{watch.ANNOUNCED_KEY: {watch.ANNOUNCED_PARTIAL_KEY: stored}})
+                self.write_ledger(**{watch.ANNOUNCED_KEY: stored})
                 with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
                     self.assertEqual(self.tick(0, outcome), expected)
                 announced = watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {})
-                self.assertNotIn(watch.ANNOUNCED_PARTIAL_KEY, announced)
-                self.assertEqual(announced.get(watch.ANNOUNCED_FAILED_TARGETS_KEY), open_targets)
+                self.assertNotIn(signature, announced)
+                self.assertEqual(announced.get(targets), open_targets)
+
+    def test_a_big_project_with_an_always_erroring_cluster_posts_once_and_does_not_flap(self) -> None:
+        # 100 clusters at 60 s a read: about 84 are read a tick, so the
+        # erroring cluster is missed on some ticks. Its episode stays open
+        # until that cluster itself reads cleanly.
+        self.roster = {"p1": triples("p1", 100)}
+        stuck = "p1/l/c42"
+        state = {"erroring": True}
+
+        def outcome(clusters, _):
+            rows = [
+                {"cluster": c, "status": "error", "error": "forbidden"}
+                if c == stuck and state["erroring"] else {"cluster": c, "status": "ok"}
+                for c in clusters
+            ]
+            return completed_json(make_report(rows))
+
+        call_seconds = 60.0 * watch.CLUSTERS_PER_BATCH / watch.PARALLELISM
+        days, stuck_called = [], []
+        for day in range(30):
+            state["erroring"] = day < 20
+            days.append(self.tick(day, outcome, seconds=call_seconds))
+            stuck_called.append(any(stuck in clusters_arg(a) for a, _ in self.calls))
+        self.assertIn(False, stuck_called[:20], "the erroring cluster is missed on some ticks")
+        first = stuck_called.index(True)
+        expected = [[] for _ in days]
+        expected[first] = [self.partial(
+            1, "p1: 77 of 100 clusters read — c42 returned an error (forbidden) — 22 not reached (out of time this run)"
+        )]
+        recovered = stuck_called.index(True, 20)
+        expected[recovered] = ["leeway watch: every target that failed reads cleanly again"]
+        self.assertEqual(days, expected)
+
+    def test_a_cluster_the_project_no_longer_lists_closes_its_episode(self) -> None:
+        self.roster = {"p1": triples("p1", 3)}
+
+        def error_row(clusters, _):
+            return completed_json(make_report([
+                {"cluster": c, "status": "error" if c == "p1/l/c02" else "ok", "error": "denied"} for c in clusters
+            ]))
+
+        self.assertEqual(len(self.tick(0, error_row)), 1)
+        self.roster = {"p1": triples("p1", 2)}
+        self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
+
+    def test_error_rows_name_up_to_three_clusters_then_count_them(self) -> None:
+        def errors(names, causes=None):
+            def outcome(clusters, _):
+                rows = [{"cluster": c, "status": "error", "error": (causes or {}).get(name, "forbidden")}
+                        if (name := c.rsplit("/", 1)[-1]) in names else {"cluster": c, "status": "ok"}
+                        for c in clusters]
+                return completed_json(make_report(rows))
+
+            return outcome
+
+        self.roster = {"p1": triples("p1", 5)}
+        cases = (
+            (errors({"c01", "c03"}, {"c03": "timeout"}),
+             "p1: 3 of 5 clusters read — c01 and c03 returned an error (forbidden + 1 other cause(s))"),
+            (errors({"c00", "c01", "c02"}), "p1: 2 of 5 clusters read — c00 and c01 and c02 returned an error (forbidden)"),
+            (errors({"c00", "c01", "c02", "c03"}), "p1: 1 of 5 clusters read — 4 returned an error (forbidden)"),
+        )
+        for outcome, entry in cases:
+            with self.subTest(entry=entry):
+                self.write_ledger()
+                self.assertEqual(self.tick(0, outcome), [self.partial(1, entry)])
+
+    def test_only_ok_rows_count_as_read_and_a_report_never_counts_past_its_call(self) -> None:
+        self.roster = {"p1": triples("p1", 3)}
+
+        def omits_one(clusters, _):
+            # leeway leaves c02 out: neither read nor an error.
+            return completed_json(make_report([
+                {"cluster": "p1/l/c00", "status": "ok"},
+                {"cluster": "p1/l/c01", "status": "error", "error": "forbidden"},
+            ]))
+
+        self.assertEqual(
+            self.tick(0, omits_one), [self.partial(1, "p1: 1 of 3 clusters read — c01 returned an error (forbidden)")]
+        )
+        self.roster = {"p1": triples("p1", 1)}
+
+        def extra_rows(clusters, _):
+            return completed_json(make_report([
+                {"cluster": "p1/l/c00", "status": "error", "error": "forbidden"},
+                {"cluster": "p9/l/stray", "status": "error", "error": "forbidden"},
+            ]))
+
+        self.write_ledger()
+        self.assertEqual(
+            self.tick(0, extra_rows), [self.partial(1, "p1: 0 of 1 clusters read — c00 returned an error (forbidden)")]
+        )
+
+    def test_a_project_reached_late_is_stamped_only_when_every_cluster_got_a_call(self) -> None:
+        # p1's call leaves 600 s: p2's turn starts with less than a full
+        # call's time, and a 600 s call holds 8 clusters.
+        late = float(watch.TICK_BUDGET_SECONDS - 600)
+        for size, stamped in ((8, True), (9, False)):
+            with self.subTest(size=size):
+                self.roster = {"p1": triples("p1", 1), "p2": triples("p2", size)}
+                self.calls.clear()
+                with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.sandbox(seconds=late):
+                    self.clock = 0.0
+                    _, project_runs, _, _, _, _ = self.sweep({}, {}, float(watch.TICK_BUDGET_SECONDS))
+                self.assertEqual([len(clusters_arg(a)) for a, _ in self.calls], [1, 8])
+                self.assertEqual("p2" in project_runs, stamped)
+
+    def test_a_project_no_call_started_for_does_not_count_as_read(self) -> None:
+        # p1's cluster list could not be read: its episode is open as a
+        # whole. The next tick its listing spends the budget and no call
+        # starts, so its episode stays open; a tick that reads it closes it.
+        self.roster = {"p2": triples("p2", 1)}
+        listing = {"code": 1, "seconds": 0.0}
+
+        def run(argv, **kw):
+            if argv[0] == watch.LIST_CLUSTERS_ARGV[0]:
+                self.clock += listing["seconds"]
+                return subprocess.CompletedProcess(argv, listing["code"], "c00\tl\n", "denied")
+            return completed_json(make_report([{"cluster": c, "status": "ok"} for c in clusters_arg(argv)]))
+
+        def tick(day):
+            self.clock = 0.0
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), mock.patch.object(
+                watch.sandbox_exec, "run", side_effect=run
+            ), redirect_stdout(buf):
+                watch.tick(now=T0 + timedelta(days=day))
+            return buf.getvalue().splitlines()
+
+        self.assertEqual(len(tick(0)), 1)
+        listing.update(code=0, seconds=watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0)
+        self.assertEqual(tick(1), [])
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.ANNOUNCED_KEY][watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": None}
+        )
+        listing["seconds"] = 0.0
+        self.assertEqual(tick(2), ["leeway watch: every target that failed reads cleanly again"])
 
     # --- retirement -------------------------------------------------------
 

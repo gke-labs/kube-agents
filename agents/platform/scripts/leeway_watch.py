@@ -69,15 +69,24 @@ so a project whose calls hang costs one call. A tick in which no call returned
 a report still saves the stamps.
 
 Scan errors and the partial-scan line. Each target (a project, or "the
-configured clusters") has at most one entry. A target read in one call keeps
-that call's message; one read in several is summarised by counts (`p1: 72 of
-100 clusters read; 12 failed (<cause>), 16 not reached (out of time this
-run)`), with error rows folded in. A target only the budget kept from being
-read in full is not a failure: it posts nothing and is listed under the
-report's "Not Reached This Run". The partial-scan line posts when a target
-fails that has no open episode, naming every target that failed this run; an
-episode closes when its target is read again without failing, and the
-recovery line posts when the last one closes.
+configured clusters") has at most one entry. A target whose one call held all
+its clusters and raised or timed out keeps that call's message; any other is
+summarised by counts, its parts joined by " — " (`p1: 72 of 100 clusters read
+— 12 failed (<cause>) — 16 not reached (out of time this run)`). Error rows
+are folded in, naming up to MAX_NAMED_ERROR_CLUSTERS clusters (`c01 returned
+an error (forbidden)`) and counting more. Only ok rows count as read. A target
+only the budget kept from being read in full is not a failure: it posts
+nothing and is listed under the report's "Not Reached This Run". The
+partial-scan line posts when a target fails that has no open episode, naming
+the targets that failed this run (up to MAX_NAMES_IN_LINE, then "+N more").
+An episode remembers the clusters that failed (in a call that raised or timed
+out, or as an error row) and closes once each has returned an ok row since or
+left its project's list; a target that failed as a whole (its list could not
+be read) closes once a call for it starts and nothing fails. The recovery
+line posts when the last episode closes; a target that leaves the sweep drops
+its episode without a line. When no call returned a report the tick fails,
+naming only the targets that failed, or counting them when some were not
+reached, so the rotation does not change the line.
 
 Threshold filtering and environment knobs. Before ledger gating,
 `filter_report_findings` drops `unknown`-cause topology findings at their
@@ -104,11 +113,13 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   which order the sweep; and the targets with an open partial-scan episode.
 - `reports/<timestamp>.md` and `reports/<timestamp>.json` (with `latest.md` and
   `latest.json` symlinks, keeping the newest 10 pairs): written whenever at
-  least one finding is due or when retired findings refresh a sweep in which no
-  target failed (clusters not reached do not count). When
+  least one finding is due, or when retired findings refresh a sweep that read
+  every target in full without failing (clusters not reached hold the refresh
+  back too, though they post nothing). When
   `NATS_URL` is set, the JSON report is also published to the A2A blackboard
   topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
-  once in chat on failure and retrying on later ticks in which no target failed.
+  once in chat on failure and retrying on a later tick that reads every target
+  in full without failing.
 A finding is due for reporting when:
 1. It is **new** (not present in `ledger.json`),
 2. Its **suspected cause changed or severity escalated** since the last report,
@@ -259,15 +270,29 @@ LEEWAY_NO_REPORT_DETAIL = "leeway exited {code} without a report: {excerpt}"
 SHORT_CAUSE_ATTR = "short_cause"
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
 SCAN_FAILED_DETAIL = "leeway scan for {target} failed: {error}"
-# A target read in more than one call is one entry, by counts. Causes are
-# leeway's stderr line, cut to CAUSE_MAX_CHARS.
-TARGET_SUMMARY_DETAIL = "{read} of {total} clusters read; {gaps}"
+# A target is one entry by counts, unless one call held all its clusters and
+# raised. Causes are leeway's stderr line, cut to CAUSE_MAX_CHARS. Parts are
+# joined by GAP_SEPARATOR, which the line's list of entries (", ") and its
+# tail ("; ") do not use, so a reader sees where one target ends.
+TARGET_SUMMARY_DETAIL = "{read} of {total} clusters read — {gaps}"
 FAILED_PART = "{count} failed ({cause})"
 CLUSTER_ERRORS_PART = "{count} returned an error ({cause})"
+# Up to this many clusters that returned an error row are named; past it, counted.
+MAX_NAMED_ERROR_CLUSTERS = 3
+NAMED_CLUSTER_ERRORS_PART = "{names} returned an error ({cause})"
+NAMED_CLUSTERS_SEPARATOR = " and "
 NOT_REACHED_PART = "{count} not reached (out of time this run)"
-TURN_ENDED_PART = "{count} left for its next turn after the timeout"
-OTHER_CAUSES_SUFFIX = "; {count} other cause(s)"
-GAP_SEPARATOR = ", "
+TURN_ENDED_PART = "{count} not tried this run (reading stops at the first timeout)"
+OTHER_CAUSES_SUFFIX = " + {count} other cause(s)"
+GAP_SEPARATOR = " — "
+# The tick-failure detail when no call returned and some targets were not
+# reached: which targets fail then changes with the rotation, so they are
+# counted rather than named and the line repeats word for word.
+NO_REPORT_DETAIL = "{count} target(s) failed ({cause}) and the time ran out before the rest"
+# A cluster's kubeconfig context name, as leeway may print it on a row.
+GKE_CONTEXT_FORMAT = "gke_{project}_{location}_{cluster}"
+# The parts of a `<project>/<location>/<cluster>` triple.
+TRIPLE_PART_COUNT = 3
 CAUSE_MAX_CHARS = 160
 CAUSE_ELLIPSIS = "…"
 # How LEEWAY_WATCH_CLUSTERS is named when it takes more than one call.
@@ -389,7 +414,10 @@ SCAN_ERRORS_KEY = "scan_errors"
 ANNOUNCED_KEY = "announced"
 # An older ledger's partial-scan signature: a list of error kinds.
 ANNOUNCED_PARTIAL_KEY = "partial"
-# The targets whose failure was announced and has not read cleanly since.
+# The targets whose failure was announced and has not read cleanly since, each
+# mapped to the clusters that failed (a call that raised or timed out, or an
+# error row), or to null when the target failed as a whole (its cluster list
+# could not be read). An older ledger holds a plain list of targets.
 ANNOUNCED_FAILED_TARGETS_KEY = "failed_targets"
 ANNOUNCED_TOPIC_PUBLISH_KEY = "topic_publish"
 ANNOUNCED_DEFERRED_REFRESH_KEY = "deferred_report_refresh"
@@ -1435,6 +1463,19 @@ class BatchSweep:
     # How many calls were started, and whether every cluster was in one.
     calls: int = 0
     every_cluster_called: bool = True
+    # The clusters returned as ok rows, and those that failed: in a call that
+    # raised or timed out, or returned as an error row.
+    clean: set[str] = field(default_factory=set)
+    failed: set[str] = field(default_factory=set)
+
+
+@dataclass
+class TargetRead:
+    """A target this tick read: its cluster list, and what its calls returned."""
+
+    listed: set[str] = field(default_factory=set)
+    clean: set[str] = field(default_factory=set)
+    failed: set[str] = field(default_factory=set)
 
 
 def batch_size(call_timeout: int) -> int:
@@ -1459,6 +1500,35 @@ def first_cause(causes: list[str]) -> str:
     return causes[0] + (OTHER_CAUSES_SUFFIX.format(count=others) if others else "")
 
 
+def batch_rows(rep: dict[str, Any], batch: list[str]) -> tuple[set[str], dict[str, str]]:
+    """The clusters a report returned as ok rows, and those it returned as error
+    rows with their cause. A row is matched to the batch's triple by its source,
+    its context name or its bare cluster name; one that matches none keeps its
+    own name. A row neither ok nor error is neither."""
+    aliases: dict[str, str] = {}
+    bare: dict[str, list[str]] = {}
+    for triple in batch:
+        aliases[triple] = triple
+        parts = triple.split(CLUSTER_KEY_SEPARATOR)
+        if len(parts) == TRIPLE_PART_COUNT:
+            project, location, cluster = parts
+            aliases[GKE_CONTEXT_FORMAT.format(project=project, location=location, cluster=cluster)] = triple
+        bare.setdefault(parts[-1], []).append(triple)
+    aliases.update({name: triples[0] for name, triples in bare.items() if len(triples) == 1 and name not in aliases})
+    ok: set[str] = set()
+    errors: dict[str, str] = {}
+    for row in rep.get(CLUSTERS_FIELD, []):
+        if not isinstance(row, dict):
+            continue
+        raw = canonical_cluster_name(row) or DEFAULT_UNKNOWN
+        name = aliases.get(raw, raw)
+        if row.get(STATUS_FIELD) == STATUS_OK:
+            ok.add(name)
+        elif row.get(STATUS_FIELD) == STATUS_ERROR:
+            errors.setdefault(name, short_cause(row.get(ERROR_FIELD) or DEFAULT_CLUSTER_SCAN_FAILED))
+    return ok - set(errors), errors
+
+
 def order_clusters(triples: list[str], cluster_runs: dict[str, Any], now: datetime) -> list[str]:
     """Least recently stamped first. Clusters with the same stamp are shuffled
     by a hash of the run's date, so batch membership changes from run to run
@@ -1479,6 +1549,8 @@ def sweep_in_batches(
     deadline: float,
     cluster_runs: dict[str, Any],
     now: datetime,
+    *,
+    full_names: bool = False,
 ) -> BatchSweep:
     """Read `triples` in `leeway report` calls of at most `batch_size` clusters.
 
@@ -1486,14 +1558,16 @@ def sweep_in_batches(
     No call starts with less than MIN_PROJECT_RUN_SECONDS left; the clusters
     after that point are not reached. The target's turn ends at its first
     sandbox timeout, so a target whose calls hang costs one call. A failure or
-    a gap is one entry named `label`: a target read in one call keeps that
-    call's own message; one read in more is summarised by counts.
+    a gap is one entry named `label`: a target whose one call held every
+    cluster and raised keeps that call's own message; any other is summarised
+    by counts, naming up to MAX_NAMED_ERROR_CLUSTERS clusters that returned an
+    error row (by cluster name, or by triple when `full_names`).
     """
     result = BatchSweep()
     ordered = order_clusters(triples, cluster_runs, now)
-    position = read = failed = errored = 0
+    position = read = failed = 0
     causes: list[str] = []
-    row_causes: list[str] = []
+    row_errors: list[tuple[str, str]] = []
     one_call_detail: str | None = None
     timed_out = False
     while position < len(ordered) and not timed_out:
@@ -1520,26 +1594,31 @@ def sweep_in_batches(
             kind = ERROR_KIND_SCAN_FAILED
         else:
             result.reports.append(rep)
-            rows = [
-                row.get(ERROR_FIELD) or DEFAULT_CLUSTER_SCAN_FAILED
-                for row in rep.get(CLUSTERS_FIELD, [])
-                if isinstance(row, dict) and row.get(STATUS_FIELD) != STATUS_OK
-            ][: len(batch)]
-            errored += len(rows)
-            read += len(batch) - len(rows)
-            row_causes.extend(short_cause(cause) for cause in rows)
+            ok, errors = batch_rows(rep, batch)
+            # A report never accounts for more clusters than its call held;
+            # rows matched to the batch come first.
+            held = set(batch)
+            ok_here = sorted(ok, key=lambda name: (name not in held, name))[: len(batch)]
+            errors_here = sorted(errors.items(), key=lambda row: (row[0] not in held, row[0]))[
+                : len(batch) - len(ok_here)
+            ]
+            read += len(ok_here)
+            result.clean.update(ok_here)
+            result.failed.update(name for name, _ in errors_here)
+            row_errors.extend(errors_here)
             continue
         result.first_error = result.first_error or error
         failed += len(batch)
+        result.failed.update(batch)
         causes.append(short_cause(getattr(error, SHORT_CAUSE_ATTR, None) or error))
         result.kind = result.kind or kind
         one_call_detail = detail if holds_every_cluster else None
 
     left = len(ordered) - position
     result.every_cluster_called = not left
-    if not failed and not errored and not left:
+    if not failed and not row_errors and not left:
         return result
-    result.kind = result.kind or (ERROR_KIND_CLUSTER_ERROR if errored else ERROR_KIND_BUDGET_EXHAUSTED)
+    result.kind = result.kind or (ERROR_KIND_CLUSTER_ERROR if row_errors else ERROR_KIND_BUDGET_EXHAUSTED)
     if result.calls == 0:
         result.detail = BUDGET_EXHAUSTED_DETAIL.format(target=label)
     elif one_call_detail is not None:
@@ -1548,8 +1627,13 @@ def sweep_in_batches(
         gaps: list[str] = []
         if failed:
             gaps.append(FAILED_PART.format(count=failed, cause=first_cause(causes)))
-        if errored:
-            gaps.append(CLUSTER_ERRORS_PART.format(count=errored, cause=first_cause(row_causes)))
+        if row_errors:
+            cause = first_cause([row_cause for _, row_cause in row_errors])
+            if len(row_errors) <= MAX_NAMED_ERROR_CLUSTERS:
+                names = [name if full_names else name.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for name, _ in row_errors]
+                gaps.append(NAMED_CLUSTER_ERRORS_PART.format(names=NAMED_CLUSTERS_SEPARATOR.join(names), cause=cause))
+            else:
+                gaps.append(CLUSTER_ERRORS_PART.format(count=len(row_errors), cause=cause))
         if left:
             gaps.append((TURN_ENDED_PART if timed_out else NOT_REACHED_PART).format(count=left))
         result.detail = TARGET_SUMMARY_DETAIL.format(read=read, total=len(ordered), gaps=GAP_SEPARATOR.join(gaps))
@@ -1576,7 +1660,7 @@ def sweep_fleet(
     deadline: float,
     cluster_runs: dict[str, Any] | None = None,
     project_runs: dict[str, Any] | None = None,
-    read_targets: set[str] | None = None,
+    target_reads: dict[str, TargetRead] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, str], dict[str, str], set[str], set[str]]:
     """Run `leeway report` across configured clusters or projects.
 
@@ -1585,12 +1669,13 @@ def sweep_fleet(
     starts with a full call's time is stamped then, so it rotates behind the
     others whatever its turn produces. `scanned_projects` holds the projects
     whose cluster list was read. `cluster_runs`, `project_runs` and
-    `read_targets` (the targets at least one call was started for, or whose
-    list was empty), when given, are updated in place.
+    `target_reads` (the targets at least one call was started for, or whose
+    list was empty, with what their calls returned), when given, are updated
+    in place.
     """
     cluster_runs = ledger_cluster_runs(ledger) if cluster_runs is None else cluster_runs
     project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {}) if project_runs is None else project_runs
-    read_targets = set() if read_targets is None else read_targets
+    target_reads = {} if target_reads is None else target_reads
     scope = declared_scope()
     excluded = excluded_clusters(scope)
     clusters = [c for c in explicit_clusters() if c not in excluded]
@@ -1602,12 +1687,12 @@ def sweep_fleet(
 
     if clusters:
         label = EXPLICIT_TARGET_LABEL if len(clusters) > CLUSTERS_PER_BATCH else CLUSTER_SEPARATOR.join(clusters)
-        swept = sweep_in_batches(label, clusters, deadline, cluster_runs, now)
+        swept = sweep_in_batches(label, clusters, deadline, cluster_runs, now, full_names=True)
         if not swept.reports and swept.first_error is not None:
             # No call read anything: fail the tick with the cause, as one call did.
             raise swept.first_error
         reports.extend(swept.reports)
-        read_targets.add(EXPLICIT_TARGET_LABEL)
+        target_reads[EXPLICIT_TARGET_LABEL] = TargetRead(set(clusters), swept.clean, swept.failed)
         if swept.detail is not None and swept.kind is not None:
             scan_errors[EXPLICIT_TARGET_LABEL] = swept.detail
             error_kinds[EXPLICIT_TARGET_LABEL] = swept.kind
@@ -1678,23 +1763,29 @@ def sweep_fleet(
         scanned_projects.add(proj)
         if not triples:
             # A project with no clusters is a clean, empty read.
-            read_targets.add(proj)
+            target_reads[proj] = TargetRead()
             project_runs[proj] = iso(now)
             continue
         requested_clusters.update(triples)
         swept = sweep_in_batches(proj, triples, deadline, cluster_runs, now)
         reports.extend(swept.reports)
         if swept.calls:
-            read_targets.add(proj)
+            target_reads[proj] = TargetRead(set(triples), swept.clean, swept.failed)
         if swept.detail is not None and swept.kind is not None:
             scan_errors[proj] = swept.detail
             error_kinds[proj] = swept.kind
         if swept.every_cluster_called:
             project_runs[proj] = iso(now)
 
-    if not reports and scan_errors:
-        reasons = format_name_list([f"{k}: {v}" for k, v in sorted(scan_errors.items())])
-        raise RuntimeError(reasons)
+    failures = {k: v for k, v in scan_errors.items() if error_kinds.get(k) != ERROR_KIND_BUDGET_EXHAUSTED}
+    if not reports and failures:
+        # No call returned: fail the tick, naming the failures only. While
+        # some targets were not reached, the rotation changes which ones fail,
+        # so they are counted and the line repeats word for word.
+        if len(failures) < len(scan_errors):
+            cause = first_cause([short_cause(failures[k]) for k in sorted(failures)])
+            raise RuntimeError(NO_REPORT_DETAIL.format(count=len(failures), cause=cause))
+        raise RuntimeError(format_name_list([f"{k}: {v}" for k, v in sorted(failures.items())]))
 
     return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters
 
@@ -1743,41 +1834,80 @@ def can_retire_finding(
     return False
 
 
+def stored_episodes(announced: dict[str, Any]) -> dict[str, set[str] | None]:
+    """The open episodes the ledger holds: each target's failed clusters, or
+    None for a target that failed as a whole. An older ledger's plain list of
+    targets opens each as a whole."""
+    stored = announced.get(ANNOUNCED_FAILED_TARGETS_KEY)
+    if isinstance(stored, dict):
+        return {
+            str(target): {str(c) for c in clusters} if isinstance(clusters, list) else None
+            for target, clusters in stored.items()
+        }
+    if isinstance(stored, list):
+        return dict.fromkeys((str(target) for target in stored), None)
+    return {}
+
+
 def announce_failed_targets(
     announced: dict[str, Any],
     failures: dict[str, str],
-    read_targets: set[str],
+    target_reads: dict[str, TargetRead],
     present: set[str],
 ) -> list[str]:
     """The partial-scan line when a target fails that has no open episode, and
     the recovery line when the last open episode closes.
 
-    A target's episode opens when its failure is announced and closes when it
-    is read without failing; a target this run did not reach keeps its episode
-    open, and one no longer swept (absent from `present`) drops it silently.
-    An older ledger's signature of error kinds counts today's failures as
-    already announced when it held a failure, and is dropped either way.
+    An episode remembers the clusters that failed. It closes once each of them
+    has returned an ok row since, or has left its target's cluster list; a
+    cluster failing again, or not read, keeps it open. A target that failed as
+    a whole (its list could not be read) closes once a call for it is started
+    and nothing fails. A target no longer swept (absent from `present`) drops
+    its episode silently. An older ledger's signature of error kinds that held
+    a failure posts the recovery line when nothing fails now, and otherwise
+    lets today's failures post as new; it is dropped either way.
     """
-    stored = announced.get(ANNOUNCED_FAILED_TARGETS_KEY)
+    episodes = stored_episodes(announced)
     legacy = announced.pop(ANNOUNCED_PARTIAL_KEY, None)
-    if isinstance(stored, list):
-        open_targets = {str(target) for target in stored}
-    elif isinstance(legacy, list) and {str(kind) for kind in legacy} - LEGACY_NOT_REACHED_KINDS:
-        open_targets = set(failures)
-    else:
-        open_targets = set()
+    legacy_failed = (
+        ANNOUNCED_FAILED_TARGETS_KEY not in announced
+        and isinstance(legacy, list)
+        and bool({str(kind) for kind in legacy} - LEGACY_NOT_REACHED_KINDS)
+    )
     lines: list[str] = []
-    new = sorted(set(failures) - open_targets)
+    new = sorted(set(failures) - set(episodes))
     if new:
         named = new + sorted(set(failures) - set(new))
         reasons = format_name_list([f"{target}: {failures[target]}" for target in named])
         lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(failures), reasons=reasons))
-    closed = {target for target in open_targets if target in read_targets and target not in failures}
-    still_open = ((open_targets & present) - closed) | set(failures)
-    if closed and not still_open:
+    still_open: dict[str, set[str] | None] = {}
+    closed = False
+    for target in sorted(set(episodes) | set(failures)):
+        if target not in failures and target not in present:
+            continue
+        read = target_reads.get(target)
+        remembered = episodes.get(target)
+        if remembered is not None and read is not None:
+            unlisted = {c for c in remembered if CLUSTER_KEY_SEPARATOR in c and c not in read.listed}
+            remembered = remembered - read.clean - unlisted
+        if target in failures:
+            attributed = read.failed if read is not None else set()
+            if target not in episodes or episodes[target] is None:
+                still_open[target] = set(attributed) or None
+            else:
+                still_open[target] = (remembered or set()) | attributed or None
+        elif remembered is None and read is None:
+            still_open[target] = None
+        elif remembered:
+            still_open[target] = remembered
+        else:
+            closed = True
+    if (closed or (legacy_failed and not failures)) and not still_open:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     if still_open:
-        announced[ANNOUNCED_FAILED_TARGETS_KEY] = sorted(still_open)
+        announced[ANNOUNCED_FAILED_TARGETS_KEY] = {
+            target: sorted(clusters) if clusters is not None else None for target, clusters in still_open.items()
+        }
     else:
         announced.pop(ANNOUNCED_FAILED_TARGETS_KEY, None)
     return lines
@@ -1803,13 +1933,13 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     ledger: dict[str, Any] | None = None
     cluster_runs: dict[str, Any] = {}
     project_runs: dict[str, Any] = {}
-    read_targets: set[str] = set()
+    target_reads: dict[str, TargetRead] = {}
     try:
         ledger = load_ledger(home)
         cluster_runs = ledger_cluster_runs(ledger)
         project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {})
         report, project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters = sweep_fleet(
-            ledger, moment, deadline, cluster_runs, project_runs, read_targets
+            ledger, moment, deadline, cluster_runs, project_runs, target_reads
         )
     except Exception as exc:  # noqa: BLE001
         detail = f"{type(exc).__name__}: {exc}"
@@ -1824,12 +1954,15 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     raw_findings, ok_clusters, cluster_errors = extract_findings(report)
     report = filter_report_findings(report)
     active_findings, _, _ = extract_findings(report)
-    # A target only the budget kept from being read in full is not a failure;
-    # error rows are folded into their target's entry.
+    # A target only the budget kept from being read in full is not a failure:
+    # it posts nothing and holds no episode open. It still holds back the
+    # report refresh and the topic retry below (`scan_errors`), since the
+    # sweep did not read the whole fleet. Error rows are folded into their
+    # target's entry.
     not_reached = {k: v for k, v in scan_errors.items() if error_kinds.get(k) == ERROR_KIND_BUDGET_EXHAUSTED}
     all_errors = {k: v for k, v in scan_errors.items() if k not in not_reached}
     announced = dict(ledger.get(ANNOUNCED_KEY) or {})
-    lines.extend(announce_failed_targets(announced, all_errors, read_targets, set(scan_errors) | read_targets))
+    lines.extend(announce_failed_targets(announced, all_errors, target_reads, set(scan_errors) | set(target_reads)))
 
     prior_findings: dict[str, Any] = dict(ledger.get(FINDINGS_KEY) or {})
     next_findings: dict[str, Any] = {}
@@ -2001,11 +2134,12 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             lines.append(report_line)
             published, err_detail = publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
             record_topic_publish_result(published, err_detail, announced, lines)
-        elif retired_labels and all_errors:
-            # A finding retired on a readable cluster during a partial scan makes
-            # `latest.json` stale; defer refreshing and re-publishing until the scan is clean.
+        elif retired_labels and scan_errors:
+            # A finding retired on a readable cluster during a partial scan (a
+            # failure, or clusters not reached) makes `latest.json` stale; defer
+            # refreshing and re-publishing until the whole fleet reads cleanly.
             announced[ANNOUNCED_DEFERRED_REFRESH_KEY] = REASON_ALL_RESOLVED
-        elif (retired_labels or ANNOUNCED_DEFERRED_REFRESH_KEY in announced or override_stale) and not all_errors:
+        elif (retired_labels or ANNOUNCED_DEFERRED_REFRESH_KEY in announced or override_stale) and not scan_errors:
             announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
             if thresholds_overridden:
                 announced[ANNOUNCED_OVERRIDE_THRESHOLDS_KEY] = current_thresholds
@@ -2018,7 +2152,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             summary_line = retired_line if retired_labels else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
             published, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
             record_topic_publish_result(published, err_detail, announced, lines)
-        elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not all_errors:
+        elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not scan_errors:
             latest_json = home / REPORTS_DIR_NAME / LATEST_JSON_LINK_NAME
             if latest_json.is_file():
                 published, err_detail = publish_blackboard_topic(
