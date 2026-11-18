@@ -205,3 +205,202 @@ output "scope_lookup_only_hosts" {
   description = "The Shared VPC hosts bound with roles/compute.viewer alone, for the reconcile's lookup of their service projects: every declared host that is neither project_id nor otherwise in scope."
   value       = module.kube_agents_iam.scope_lookup_only_hosts
 }
+
+output "kube_agents_helm_release" {
+  description = "How to install the kube-agents chart from a pipeline of your own when install_helm_releases is false: the release name, namespace, chart directory (relative to the root of this repository or a release bundle) and chart version, with the values in kube_agents_helm_values. Install cert-manager first (cert_manager_helm_release) when enable_cert_manager is true: the chart's Certificate and Issuer need its webhook serving."
+  value = {
+    name      = "kube-agents"
+    namespace = var.namespace
+    chart     = local.kube_agents_chart_repo_path
+    version   = local.kube_agents_chart_version
+  }
+}
+
+output "kube_agents_helm_values" {
+  description = "The values documents helm_release.kube_agents is given, in order (later documents deep-merge over earlier ones, as `helm install -f a.yaml -f b.yaml` does). Sensitive: they carry every credential the install was given (the API server key, the session store's key and salt, the sandbox SSH key, any model provider API key, the Slack tokens), all of which the install's state already holds. Write each to a file for the other pipeline, for example: terraform output -json kube_agents_helm_values | jq -r '.[0]' > values-0.yaml."
+  value       = local.kube_agents_helm_values
+  sensitive   = true
+
+  # The chart refuses to render openai_compatible without these, and a
+  # render failure inside helm_release arrives after the cluster and IAM
+  # have been built; a precondition fails the plan instead. They sit here, on
+  # the output every plan evaluates, rather than on the release, so a plan
+  # with install_helm_releases = false refuses the same values the chart would. The egress rules
+  # (a target port for a Service, CIDRs otherwise) are the chart's to judge.
+  precondition {
+    condition     = !local.use_openai_compatible || var.model_default_name != ""
+    error_message = "model_provider = \"openai_compatible\" requires model_default_name, the model the server serves; the provider has no default."
+  }
+  precondition {
+    condition     = !local.use_openai_compatible || var.openai_compatible_api_base != ""
+    error_message = "model_provider = \"openai_compatible\" requires openai_compatible_api_base, the server's base URL including /v1."
+  }
+  precondition {
+    condition     = local.model_provider_has_default || local.use_openai_compatible || var.model_default_name != ""
+    error_message = "model_provider = \"${var.model_provider}\" is a LiteLLM provider slug outside the chart's table, which has no default model: set model_default_name to the model it serves."
+  }
+
+  precondition {
+    condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
+    error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
+  }
+
+  # A gitlab install has no GitHub App: the minter would mint for a
+  # repository the agent does not use, and github_repo would render the
+  # github alias beside the gitlab lists, which the CRD refuses.
+  precondition {
+    condition     = !local.gitops_is_gitlab || (var.gitlab_repo != "" && var.github_repo == "" && !var.enable_github_minter)
+    error_message = "gitops_forge = \"gitlab\" needs gitlab_repo set, and github_repo and enable_github_minter left unset: a GitLab install has no GitHub App."
+  }
+
+  # A Bitbucket install has no GitHub App either, and names its repository
+  # as workspace/slug (Cloud) or KEY/slug (Data Center), the grammars of the
+  # operator's bitbucketWorkspaceRegex and bitbucketProjectKeyRegex.
+  precondition {
+    condition = !local.gitops_is_bitbucket || (var.github_repo == "" && !var.enable_github_minter && (
+      var.gitops_forge == "bitbucket"
+      ? can(regex("^[a-z0-9][a-z0-9_-]*/[A-Za-z0-9_.-]+$", var.gitops_repo_path))
+      : can(regex("^[A-Za-z][A-Za-z0-9_]*/[A-Za-z0-9_.-]+$", var.gitops_repo_path))
+    ))
+    error_message = "gitops_forge = \"bitbucket\" needs gitops_repo_path as workspace/repo-slug, and \"bitbucket-datacenter\" as PROJECTKEY/repo-slug; github_repo and enable_github_minter stay unset: a Bitbucket install has no GitHub App."
+  }
+
+  # Bitbucket Cloud is bitbucket.org only, with the public CAs; a Data
+  # Center instance names its host, which is never a hosted service's.
+  precondition {
+    condition     = var.gitops_forge != "bitbucket" || (var.gitops_host == "" && var.gitops_ca_secret_name == "")
+    error_message = "gitops_forge = \"bitbucket\" is Bitbucket Cloud at bitbucket.org: leave gitops_host and gitops_ca_secret_name unset. For a Data Center instance, use gitops_forge = \"bitbucket-datacenter\"."
+  }
+  precondition {
+    condition     = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host)))
+    error_message = "gitops_forge = \"bitbucket-datacenter\" needs gitops_host: the instance's own hostname, not bitbucket.org or another hosted service's domain."
+  }
+  precondition {
+    condition     = var.gitops_forge != "bitbucket" || var.gitops_identity == "" || can(regex("^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$", var.gitops_identity))
+    error_message = "gitops_identity on Bitbucket Cloud is the account UUID the access token acts as, with or without braces."
+  }
+  # The CRD's grammar for identity, on both Bitbucket providers.
+  precondition {
+    condition     = var.gitops_identity == "" || can(regex("^[A-Za-z0-9._@+{}-]{1,255}$", var.gitops_identity))
+    error_message = "gitops_identity is 1 to 255 letters, digits and . _ @ + { } -."
+  }
+  # The Bitbucket inputs under another forge would be dropped silently.
+  precondition {
+    condition     = local.gitops_is_bitbucket || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
+    error_message = "gitops_repo_path, gitops_token_secret_name, gitops_ca_secret_name and gitops_identity apply only with gitops_forge = \"bitbucket\" or \"bitbucket-datacenter\"; set it, or leave them unset."
+  }
+
+  # The reverse: GitLab inputs under the default forge would be dropped,
+  # applying a CR with no GitOps repository and no error. gitops_host is
+  # the github forge's too: a GitHub Enterprise Server host.
+  precondition {
+    condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitlab_ca_secret_name == "")
+    error_message = "gitlab_repo and gitlab_ca_secret_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+  }
+
+  # A GitHub Enterprise Server's CA belongs to the github forge at a host:
+  # github.com presents a certificate the public CAs sign, and a private CA
+  # must never vouch for it.
+  precondition {
+    condition     = var.github_ca_secret_name == "" || local.gitops_is_ghes
+    error_message = "github_ca_secret_name is for a GitHub Enterprise Server: set gitops_host to its hostname, with gitops_forge = \"github\". github.com uses the public CAs."
+  }
+
+  # The github forge at gitops_host is a GitHub Enterprise Server. A host
+  # where GitHub runs its own services is refused, as the operator refuses
+  # it; github.com is the default and needs no host; and a GitLab host is
+  # not GitHub's.
+  precondition {
+    condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com|bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net)$", var.gitops_host))
+    error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like), gitlab.com, or a Bitbucket or Atlassian domain is not one."
+  }
+
+  # On a GitHub Enterprise Server, github_repo is required, as owner/name
+  # on the instance: the forge is declared with the owner as its namespace,
+  # and the composition reads a URL on github.com only.
+  precondition {
+    condition     = !local.gitops_is_ghes || can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]+$", var.github_repo))
+    error_message = "With gitops_host set, github_repo is required, as owner/name on the GitHub Enterprise Server, not a URL."
+  }
+
+  # A private CA is for a self-managed GitLab only: gitlab.com presents a
+  # certificate the public CAs sign, and a private CA must never vouch for it.
+  precondition {
+    condition     = var.gitlab_ca_secret_name == "" || !contains(["", "gitlab.com", "www.gitlab.com"], var.gitops_host)
+    error_message = "gitlab_ca_secret_name is for a self-managed GitLab: set gitops_host to its hostname. gitlab.com uses the public CAs."
+  }
+
+  # What this refuses is an install that asks for the detector without the
+  # subscription it reads, which is silent whichever door asked. Through
+  # enable_drift_detector: driftDetector, enabled included, is written inside
+  # the enable_drift_pubsub ternary in main.tf, so with the ingress off the field
+  # is never rendered, the apply succeeds, nothing is provisioned, nothing
+  # starts, and the only evidence is a variable that did nothing. Through
+  # extra_helm_values (local.drift_detector_requested in main.tf): the field is
+  # rendered, the detector starts, and it retries a pull against a
+  # subscription that was never created for the life of a pod that stays
+  # Ready -- k8s-operator/cmd/drift-detector/README.md says the subscription
+  # is not checked at startup. Refused rather than warned about, unlike
+  # check "slack_tokens_present" in main.tf, because a Slack install with no
+  # tokens says so in the pod log and neither of these leaves a trace
+  # anywhere.
+  #
+  # The ternary is what keeps a driftDetector block out of the CR of an
+  # install that never asked for drift detection, and this is what keeps
+  # asking for it half-way from being accepted. Neither replaces the other.
+  precondition {
+    condition     = !local.drift_detector_requested || var.enable_drift_pubsub
+    error_message = "the drift detector requires enable_drift_pubsub, whether it was asked for with enable_drift_detector or with platformAgent.harness.driftDetector.enabled through extra_helm_values: it reads the Pub/Sub subscription that flag provisions. Without it the flag renders no driftDetector block at all and does nothing, and extra_helm_values renders one this composition cannot point at a subscription, leaving the detector pulling one that does not exist with the pod Ready. Neither says anything. Through the installer, ENABLE_DRIFT_DETECTOR=true sets both."
+  }
+
+  # The operator's own gate, brought forward to the plan. A numeric
+  # project_id works everywhere else in this composition -- gcloud resolves
+  # a project number, and the credential proxy and the context name both
+  # take one -- but driftDetectorEnabled() in the operator refuses it
+  # (k8s-operator/internal/controller/platformagent_manifests.go), because
+  # the join matches it against each audit record's project_id, which is
+  # always the ID. Left to run, such an install provisions the whole ingress
+  # -- a sink exporting every GKE cluster in the project into a subscription
+  # that retains 31 days and never expires -- and starts no consumer, with a
+  # Ready pod and no report to tell anyone.
+  precondition {
+    condition     = !local.drift_detector_requested || !can(regex("^[0-9]+$", var.project_id))
+    error_message = "the drift detector requires project_id to be the project ID, not the project number: it matches it against each audit record's project_id, which is always the ID, so the operator refuses to start it and the ingress bills for a stream nothing reads."
+  }
+
+  # The third route to that same ingress-without-a-consumer, and the one the
+  # other two cannot see: here the flag is set, the ingress is asked for by
+  # the same variable that asks for the detector, and the CR is what
+  # disagrees. local.extra_helm_values_countermands_detector in main.tf has the
+  # merge that does it and why false is refused alongside null.
+  #
+  # Refused rather than stripped from the document. Silently dropping the
+  # leaf would give this operator what they almost certainly meant, and it
+  # would also make extra_helm_values the one values document this
+  # composition edits before passing on -- so the next operator to set a
+  # leaf it disagrees with would have no way to tell whether it arrived.
+  # Saying which line to delete costs one apply and keeps that contract.
+  precondition {
+    condition     = !local.extra_helm_values_countermands_detector
+    error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
+  }
+
+  # The web console needs NetworkPolicy enforced (see the local); the release
+  # checks it too, for the case where it is only known at apply.
+  precondition {
+    condition     = local.web_console_network_policy_ok
+    error_message = local.web_console_network_policy_error
+  }
+}
+
+output "cert_manager_helm_release" {
+  description = "How to install cert-manager from a pipeline of your own when install_helm_releases is false, or null when enable_cert_manager is false. Install it, and wait for its Deployments to be Available, before the kube-agents chart."
+  value = var.enable_cert_manager ? {
+    name       = "cert-manager"
+    namespace  = "cert-manager"
+    repository = "https://charts.jetstack.io"
+    chart      = "cert-manager"
+    version    = var.cert_manager_version
+    values     = local.cert_manager_helm_values
+  } : null
+}

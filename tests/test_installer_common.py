@@ -443,7 +443,7 @@ class InstallerCommonTest(unittest.TestCase):
         """The ingress and the consumer travel together, on every truthy
         spelling install.env accepts.
 
-        The composition's helm_release precondition refuses
+        The composition's values-output precondition refuses
         enable_drift_detector without enable_drift_pubsub, so one key here has
         to produce both. The spellings are the point of the loop: every other
         boolean in this generator reaches is_truthy through hcl_bool, and a
@@ -3140,11 +3140,15 @@ class InstallerCommonTest(unittest.TestCase):
         # installed release's version from the cluster: a from-nothing install
         # cannot plan, and a chart version change fails the apply (#4108).
         self.assertIsNotNone(
+            re.search(r"(?m)^  version\s*=\s*local\.kube_agents_chart_version\s*$", release),
+            "helm_release.kube_agents does not pin version to local.kube_agents_chart_version",
+        )
+        self.assertIsNotNone(
             re.search(
-                r'(?m)^  version\s*=\s*yamldecode\(file\("\$\{path\.module\}/\.\./\.\./\.\./charts/kube-agents/Chart\.yaml"\)\)\.version\s*$',
-                release,
+                r'(?m)^  kube_agents_chart_version\s*=\s*yamldecode\(file\("\$\{local\.kube_agents_chart_dir\}/Chart\.yaml"\)\)\.version\s*$',
+                main_tf,
             ),
-            "helm_release.kube_agents does not pin version to the chart's Chart.yaml version",
+            "local.kube_agents_chart_version is not the chart's Chart.yaml version",
         )
         variables_tf = (composition / "variables.tf").read_text()
         block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
@@ -6189,10 +6193,13 @@ def _hcl_chart_vars(src, pos=0):
 
 
 def _composition_chart_vars():
-    """Every (chart key, tfvar) the kube_agents helm_release's first values document assigns."""
+    """Every (chart key, tfvar) the kube_agents release's first values document assigns.
+
+    The documents are local.kube_agents_helm_values, which the release and the
+    kube_agents_helm_values output both read."""
     src = _MAIN_TF.read_text()
-    release = src.index('resource "helm_release" "kube_agents"')
-    return _hcl_chart_vars(src, src.index("values = [yamlencode(", release) + len("values = [yamlencode("))
+    opener = "kube_agents_helm_values = [yamlencode("
+    return _hcl_chart_vars(src, src.index(opener) + len(opener))
 
 
 def _footprint_value_map():
