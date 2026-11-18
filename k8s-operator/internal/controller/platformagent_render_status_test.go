@@ -84,9 +84,10 @@ func TestAOneToThreeStartedThroughReconcileKeepsOneRunID(t *testing.T) {
 	ids := map[string]bool{}
 	for i := 0; i < 4; i++ {
 		// No conflict either: the pass's status writes go against the version
-		// the run's own write made.
-		if _, err := r.Reconcile(context.Background(), req); err != nil {
-			t.Fatalf("Reconcile %d: %v", i+1, err)
+		// the run's own write made. Reconcile turns a PlatformAgent conflict
+		// into a bare Requeue with no error, its only use of Requeue.
+		if res, err := r.Reconcile(context.Background(), req); err != nil || res.Requeue {
+			t.Fatalf("Reconcile %d: res=%+v, err=%v", i+1, res, err)
 		}
 		if run := storedAgent(t, cl, agent).Status.BusMigration; run != nil {
 			ids[run.RunID] = true
@@ -167,5 +168,31 @@ func TestRecordingTheSubmitMaxAgeKeepsThePassesStatus(t *testing.T) {
 	}
 	if agent.ResourceVersion != stored.ResourceVersion {
 		t.Errorf("the pass holds resourceVersion %s, the CR is at %s", agent.ResourceVersion, stored.ResourceVersion)
+	}
+}
+
+// The max-age write is against the version the pass read: over a status
+// someone changed since, it is refused, and the pass keeps its version, so
+// its final full write conflicts instead of going over that change.
+func TestTheSubmitMaxAgeWriteRefusesAChangedStatus(t *testing.T) {
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	read := agent.ResourceVersion
+	moved := storedAgent(t, cl, agent) // a poller's status write after the pass read
+	moved.Status.BusReplicas = 3
+	if err := cl.Status().Update(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	r.recordProfileSubmitMaxAge(ctx, agent, ptr.To[int64](3600))
+	if agent.ResourceVersion != read {
+		t.Errorf("the pass took resourceVersion %s from a write over a changed status, want it kept at %s", agent.ResourceVersion, read)
+	}
+	if got := storedAgent(t, cl, agent).Status.ProfileSubmitMaxAgeSeconds; got != nil {
+		t.Errorf("stored max age %v from a write over a changed status, want none", *got)
 	}
 }

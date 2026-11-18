@@ -4588,8 +4588,11 @@ func (r *PlatformAgentReconciler) recordProfileSubmitMaxAge(ctx context.Context,
 	// The patch goes through a copy: its answer, the stored status, would
 	// otherwise replace this pass's in-memory status, everything resolved
 	// and not yet written (the bus's count, a migration's progress). Only
-	// the field and the version the write made are carried back.
-	patch := client.MergeFrom(agent.DeepCopy())
+	// the field and the version the write made are carried back, and only
+	// from a write against the version this pass read: carried from a write
+	// over a status someone changed since (a poller), the version would let
+	// the pass's final full write go over that change instead of conflicting.
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	written := agent.DeepCopy()
 	written.Status.ProfileSubmitMaxAgeSeconds = live
 	if err := r.Status().Patch(ctx, written, patch); err != nil {
