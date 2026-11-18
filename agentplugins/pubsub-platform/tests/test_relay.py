@@ -355,12 +355,16 @@ class NoProxyTest(RelayTestCase):
         """The relay is an in-cluster Service, and each call to it has the gateway's token on it."""
         proxy = FakeBroker()
         self.addCleanup(proxy.close)
-        # The patch of os.environ in setUp puts these back.
-        for name in ("no_proxy", "NO_PROXY"):
-            os.environ.pop(name, None)
+        # The patch of os.environ in setUp puts these back. urllib reads the name in any case.
+        for name in [name for name in os.environ if name.lower() == "no_proxy"]:
+            del os.environ[name]
         for name in ("http_proxy", "HTTP_PROXY"):
             os.environ[name] = proxy.url
-        relay = adapter_mod.PubsubRelay(self.broker.url, self.token_file.name)
+        # A load of its own, after the variables are set: an opener that the module builds when
+        # it loads takes its proxy at that time.
+        loaded, put_back = test_dedup.load_adapter_for_a_test_file()
+        self.addCleanup(put_back)
+        relay = loaded.PubsubRelay(self.broker.url, self.token_file.name)
         relay.get_subscription(SUB_PATH, timeout=5)
         self.assertEqual(proxy.calls, [])
         self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
