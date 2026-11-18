@@ -154,13 +154,22 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         for text in ("https://github.com/o/r.git", "git@github.com:o/r.git"):
             self.assertEqual(github_token_refresh.redact_url(text), text)
 
-    def test_redact_remote_also_blanks_userinfo_outside_a_url(self):
-        redact = github_token_refresh.redact_remote
-        self.assertEqual(redact("tok:secret@host:o/r"), "[REDACTED]@host:o/r")
-        self.assertEqual(redact("https://a:b@github.com/o/r"), "https://[REDACTED]@github.com/o/r")
-        self.assertEqual(redact("/srv/git/kube-agents.git"), "/srv/git/kube-agents.git")
-        self.assertEqual(redact("https://u:a/b@github.com/o/r"), "https://[REDACTED]@github.com/o/r")
-        self.assertEqual(redact("x_https://u:p@github.com"), "x_https://[REDACTED]@github.com")
+    @patch("github_token_refresh.subprocess.run")
+    def test_a_refused_remote_is_never_quoted_in_the_log(self, run):
+        """The refusal says why, never what: the remote's text stays out of the log."""
+        res = MagicMock()
+        run.return_value = res
+        for url, why in (
+            ("https://github.com/%zz-marker", "not a repository URL"),
+            ("https://gitlab.com/marker-org/marker-repo.git", "not a GitHub host"),
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                err = io.StringIO()
+                with patch("sys.stderr", err):
+                    self.assertIsNone(get_current_git_repo())
+                self.assertIn(why, err.getvalue())
+                self.assertNotIn("marker", err.getvalue())
 
     def test_log_redacts_whatever_its_caller_formatted(self):
         err = io.StringIO()

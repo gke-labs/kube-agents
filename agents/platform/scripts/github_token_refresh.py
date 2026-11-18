@@ -51,26 +51,6 @@ def redact_url(text: str) -> str:
     return _URL_USERINFO.sub(r"\1[REDACTED]@", text)
 
 
-def redact_remote(remote: str) -> str:
-    """A git remote (or part of one) as it may be logged: in every word,
-    everything before its last "@" is masked, keeping a "<scheme>://" prefix.
-
-    Stricter than redact_url, for a value that came from outside the script
-    and may not have parsed: a credential in a shape no URL grammar names still
-    ends before an "@". Costs only an scp remote's user name ("git").
-    """
-
-    def word(token: str) -> str:
-        cut = token.find("://")
-        prefix = token[: cut + 3] if cut >= 0 else ""
-        rest = token[len(prefix) :]
-        if "@" not in rest:
-            return token
-        return prefix + "[REDACTED]@" + rest.rsplit("@", 1)[1]
-
-    return re.sub(r"\S+", lambda m: word(m.group(0)), redact_url(remote))
-
-
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     # Every line is redacted here, whatever its caller formatted into it.
@@ -396,13 +376,16 @@ def github_repo_from_remote(url: str) -> str | None:
     """
     ref = repo_ref.try_parse(url)
     if ref is None:
-        log(f"Ignoring git remote: '{redact_remote(url)}' is not a repository URL.")
+        # A remote that was refused is never quoted: it came from outside the
+        # script and may carry a credential in a shape no redaction names.
+        # The operator reads it from .git/config.
+        log("Ignoring git remote: it is not a repository URL.")
         return None
     if not ref.host_stated:
-        log(f"Ignoring git remote: '{redact_remote(url)}' names no host.")
+        log("Ignoring git remote: it names no host.")
         return None
     if not ref.is_github:
-        log(f"Ignoring git remote: host '{redact_remote(ref.host)}' is not a GitHub host.")
+        log("Ignoring git remote: its host is not a GitHub host.")
         return None
     if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
         log(f"Ignoring git remote: path '{ref.path}' is not an owner/repo slug.")
