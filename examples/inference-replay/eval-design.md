@@ -311,6 +311,17 @@ The rules that keep this safe:
   output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
   difference cost the obtainability case the rest of its conversation in the replay lane. When a text is one JSON document with `WARNING: ` lines before or after it (each with any indented lines that continue it), the key puts the warnings after the JSON. Any other text keeps its order, because there the order can mean something: `WARNING: disk pressure` then `Pod evicted` is not the same story told backwards. The text the agent sees isn't touched.
 - **A skill's file listing doesn't change the key by its order.** Hermes' `skill_view` result lists the skill's `linked_files` (and, for a missing file, `available_files`) in directory order, which differs from pod to pod, so in a tool message answering a `skill_view` call the key sorts each of those lists, also when Hermes has appended a notice after the result, and leaves every other field, and every other tool's output, in its order. A result too large to send whole, which Hermes cuts to a preview, keeps its order.
+- **The sandbox's kernel version in the system prompt doesn't change the key.** Hermes ends its
+  system prompt with a runtime environment block whose `OS: Linux 6.12.105+` line is the kernel of
+  the node the sandbox landed on. Nodes of one pool can run different patch versions: on the Nov 18
+  recording night 3 of 8 nightly shards ran on `6.12.110+`, and their requests could never match a
+  lane on `6.12.105+`. So in a system message, on that block's `OS:` line only, the kernel becomes
+  a fixed `⟦KERNEL⟧`. It is the one exception to versions staying literal: a kernel anywhere else,
+  in `uname -r`, a node's `Kernel Version` or a `kubectl get nodes -o wide` column, is about a node
+  the agent may be debugging and stays literal. The token is bound to no value, so no answer is
+  rewritten with it; of 23,086 distinct assistant messages in the Nov 17–18 stores, one names a
+  6.12 kernel, copied from a tool result the key keeps. The block's other lines (user, home,
+  working directory) are the same on every node or already keyed.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
