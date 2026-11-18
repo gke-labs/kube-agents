@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -1321,6 +1322,10 @@ func TestOneServerBusConversionIsRefused(t *testing.T) {
 		pa.Status.BusReplicas = status
 		return pa
 	}
+	annotated := func(pa *agentv1alpha1.PlatformAgent, run string) *agentv1alpha1.PlatformAgent {
+		pa.Annotations = map[string]string{"kubeagents.x-k8s.io/bus-migration-start": run}
+		return pa
+	}
 	for _, tc := range []struct {
 		name     string
 		old, new *agentv1alpha1.PlatformAgent
@@ -1334,6 +1339,11 @@ func TestOneServerBusConversionIsRefused(t *testing.T) {
 		{"setting a looping 3 back to 1", agent(ptr.To(3), 1), agent(ptr.To(1), 1), false},
 		{"other edits with 3 already set", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
 		{"other edits on a three-server bus", agent(ptr.To(3), 3), agent(ptr.To(3), 3), false},
+		{"the retry annotation with 3 set on a one-server bus", agent(ptr.To(3), 1), annotated(agent(ptr.To(3), 1), "run-1"), true},
+		{"the retry annotation changed with 3 set on a one-server bus", annotated(agent(ptr.To(3), 1), "run-1"), annotated(agent(ptr.To(3), 1), "run-2"), true},
+		{"the retry annotation kept as it was", annotated(agent(ptr.To(3), 1), "run-1"), annotated(agent(ptr.To(3), 1), "run-1"), false},
+		{"the retry annotation removed", annotated(agent(ptr.To(3), 1), "run-1"), agent(ptr.To(3), 1), false},
+		{"the retry annotation on a three-server bus", agent(ptr.To(1), 3), annotated(agent(ptr.To(1), 3), "run-1"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusConversion(tc.old, tc.new)
@@ -1345,6 +1355,17 @@ func TestOneServerBusConversionIsRefused(t *testing.T) {
 	_, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(nil, 1), agent(ptr.To(3), 1))
 	if err == nil || !strings.Contains(err.Error(), "converting a one-server bus is temporarily disabled") || !strings.Contains(err.Error(), "6298") {
 		t.Errorf("ValidateUpdate 1 to 3: %v, want the #6298 refusal", err)
+	}
+}
+
+// The webhook's copy of the retry annotation's name is the controller's.
+func TestBusMigrationStartAnnotationMatchesTheController(t *testing.T) {
+	src, err := os.ReadFile("../controller/platformagent_a2a_manifests.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `a2aBusMigrationStartAnnotation = "`+busMigrationStartAnnotation+`"`) {
+		t.Fatalf("a2aBusMigrationStartAnnotation is not %q", busMigrationStartAnnotation)
 	}
 }
 

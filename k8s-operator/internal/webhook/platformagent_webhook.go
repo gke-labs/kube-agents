@@ -463,16 +463,31 @@ const busConversionDisabledMessage = "converting a one-server bus is temporarily
 // (#6298). A create, a bus whose count is not yet recorded, three to one,
 // and an update that leaves an already-set 3 as it is all pass, so a CR
 // caught mid-loop can still be set back to 1 or edited otherwise.
+//
+// The bus-migration-start annotation, which retries an ended run, is refused
+// the same way when it is added or changed while the spec asks a one-server
+// bus for 3: it would start a fresh one-to-three run.
 func validateBusConversion(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
 	if oldObj == nil || oldObj.Status.BusReplicas != 1 {
 		return nil
 	}
 	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
-	if asked == nil || *asked != 3 || (previous != nil && *previous == 3) {
+	if asked == nil || *asked != 3 {
 		return nil
 	}
-	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"), busConversionDisabledMessage)}
+	if previous == nil || *previous != 3 {
+		return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"), busConversionDisabledMessage)}
+	}
+	if platformAgent.GetAnnotations()[busMigrationStartAnnotation] != oldObj.GetAnnotations()[busMigrationStartAnnotation] &&
+		platformAgent.GetAnnotations()[busMigrationStartAnnotation] != "" {
+		return field.ErrorList{field.Forbidden(field.NewPath("metadata", "annotations").Key(busMigrationStartAnnotation), busConversionDisabledMessage)}
+	}
+	return nil
 }
+
+// busMigrationStartAnnotation retries an ended bus migration
+// (a2aBusMigrationStartAnnotation in the controller).
+const busMigrationStartAnnotation = "kubeagents.x-k8s.io/bus-migration-start"
 
 func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {
 	if pa.Spec.Harness == nil || pa.Spec.Harness.Tuning == nil {

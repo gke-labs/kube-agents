@@ -1366,7 +1366,8 @@ platformAgent:
       # cluster that cannot have them (kind, a one-node Standard pool), before the
       # first install. Changing it on an existing bus migrates the bus between one
       # server and three, keeping its data; one to three freezes writes for its
-      # window.
+      # window, and is temporarily refused until a fix for a migration that can
+      # loop ships.
       # busReplicas: 3
       # admission is the memory admission the kanban dispatcher applies to its
       # own workers, board-wide: past the budget it refuses a card rather than

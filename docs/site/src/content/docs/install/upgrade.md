@@ -503,7 +503,7 @@ runs three NATS servers on separate nodes, each with a 40Gi JetStream claim
 ([Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements)). On a Standard
 cluster that cannot grow to three nodes, set the chart value
 `platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the upgrade. Once the
-bus exists, changing the count migrates it, keeping its data
+bus exists, changing the count migrates it, keeping its data; one server to three is temporarily refused
 ([Changing the bus's server count](/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count)).
 The chart's quota check counts the whole stack
 ([Footprint](/kube-agents/install/prerequisites/#footprint)); under a namespace quota sized for the
