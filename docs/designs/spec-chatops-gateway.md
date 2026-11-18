@@ -2024,11 +2024,10 @@ token, and the row's two buttons gone; a tap that did not land keeps them under 
 so a second tap asks again, and so does one whose patch Chat refused. One tap per row at a time,
 and the edits of one message in turn under its rewrite lock, each from the message's one layout
 record (below); a message posted before a restart is edited from the event's copy of it, text and
-buttons (`gchat_board.go`); a button drawn before the line parameter existed carries none, and its row is
-found through the text's rows block instead, for one release (#5235). The report caps its rows at
-`MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on buttons in
-one list is not documented in a form this spec can cite and has not been measured, and a layout
-Chat refuses falls back to the text as any does.
+buttons (`gchat_board.go`); a tap whose button carries no line is dropped as a tap with no row.
+The report caps its rows at `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons;
+Chat's own ceiling on buttons in one list is not documented in a form this spec can cite and has
+not been measured, and a layout Chat refuses falls back to the text as any does.
 
 The adapter keeps one layout record per message, in this process: the text and the buttons the
 message shows now, rating buttons included, as the adapter last created or patched it
