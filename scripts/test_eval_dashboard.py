@@ -580,8 +580,8 @@ class RenderedPagesTest(unittest.TestCase):
 
     def test_todays_production_shape_without_reps_falls_back_to_single_results(self):
         data = {
-            "schema_version": 1, "generated_at": "2026-08-28T14:02:11Z", "source": "logs",
-            "runs": [{"build_id": "b1", "pr": 998, "started": "2026-08-27T09:00:00Z", "result": "FAILURE", "duration_s": 5793,
+            "schema_version": 1, "generated_at": "2025-08-29T14:02:11Z", "source": "logs",
+            "runs": [{"build_id": "b1", "pr": 102, "started": "2025-08-28T09:00:00Z", "result": "FAILURE", "duration_s": 4105,
                       "tasks": [{"name": "case-x", "result": "pass"}, {"name": "case-y", "result": "fail"}, {"name": "case-z", "result": "infra"}]}],
             "cases": [{"name": "case-x", "active": True}, {"name": "case-y", "active": True}, {"name": "case-z", "active": True}],
         }

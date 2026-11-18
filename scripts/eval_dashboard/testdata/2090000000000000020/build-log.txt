@@ -66,10 +66,10 @@ Task case-23 Result: [FAILED] VerificationCorrectness=0.0 (floor 1.0) | OutcomeV
 --- [PROFILE 2025-08-28T18:20:35Z] step: task case-09: devops-bench run ---
 >>> [2025-08-28T18:20:35Z] Running Task: case-09 (./tasks/case-09/task.yaml) <<<
 Executing with deployer=noop BENCH_NO_INFRA=false
-         41.2s  100.0%  total devops-bench run
+         78.0s  100.0%  total devops-bench run
     (agent latency from results.json: 52.4s)
 ⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task case-09 resource creation, teardown, or agent transport failed! (The evaluation is skipped)
-Saved resource preparation log to artifact: /logs/artifacts/resource_prep_failure_case-11.log
+Saved resource preparation log to artifact: /logs/artifacts/resource_prep_failure_case-09.log
 Task case-09 Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown or agent transport error (Duration: 78s)
 --- [PROFILE 2025-08-28T18:21:16Z] step: task case-19: devops-bench run ---
 >>> [2025-08-28T18:21:16Z] Running Task: case-19 (./tasks/case-19/task.yaml) <<<

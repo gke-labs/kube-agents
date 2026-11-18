@@ -265,8 +265,9 @@ class TestCaseDerivation(unittest.TestCase):
         )
 
     def test_retired_task_is_inactive_but_kept(self):
-        """A case only historical runs mention stays on record, active: false."""
-        case = self.cases["case-26"]
+        """A case only historical runs mention stays on record, active: false
+        (against the synthetic checkout, whose rosters name case-02, case-11 and case-22)."""
+        case = _cases_by_name(collect.collect(from_dir=TESTDATA, repo_root=FAKE_REPO))["case-26"]
         self.assertFalse(case["active"])
         self.assertEqual(case["runs_on_record"], 1)
 

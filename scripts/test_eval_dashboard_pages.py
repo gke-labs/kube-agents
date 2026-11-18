@@ -2190,8 +2190,8 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
 
 # --- the Scenarios page -----------------------------------------------------
 
-SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
-SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="gemini-3-1-pro-preview-kubeagents-mcp", mode=None)
+SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "model-x", "fleet": 1, "verifiers": 1, "mode": "next"}
+SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="setup-x", mode=None)
 SCENARIO_LEAD_IN = "critical requirements:\n- The reply names the cluster.\n  It cites a live read.\n- It says nothing else.\n"
 # The window's clock in the unit tests: records on Sep 1-10 at 05:00Z, the
 # last seven days before this reach back to Sep 4 14:30Z, so Sep 5-10 are in.

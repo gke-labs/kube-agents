@@ -1587,10 +1587,11 @@ words (`PASSED`, `UNSTABLE`, `pass`/`fail`/`infra`/`blocked`, `GREEN`,
 `NOT EVALUATED`), the harness's own fixed sentences, the pool project and
 GitOps repository names, and the ordering of lines and repetitions. Synthetic:
 every score (`OutcomeValidity`, `OutcomeScore`, `VerificationCorrectness`,
-`ChecklistScore`, the store's judged means), every duration and agent latency,
-every wall clock in the six log directories (ISO stamps and Prow epochs sit
-one fixed offset from any real build; the two snapshot directories keep
-their timeline, as their paragraphs say), the build ids (`20900000000000000N0`
+`ChecklistScore`, the store's judged means), every printed duration and agent
+latency, every wall clock in the six log directories (ISO stamps and Prow
+epochs sit one fixed offset from any real build, so a run's stamps keep
+their spacing while no stamp matches a real one; the two snapshot
+directories keep their timeline, as their paragraphs say), the build ids (`20900000000000000N0`
 in the log directories; the snapshots' own numbering is in their
 paragraphs), PR numbers (`101`, `102`, …), commit shas (`0101010…`-patterned), the case ids (`case-NN`, drawn by a
 seeded permutation, not in the order of `bench/tasks/`), the setup and judge
