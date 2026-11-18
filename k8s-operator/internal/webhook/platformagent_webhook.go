@@ -467,12 +467,23 @@ const busConversionDisabledMessage = "converting a one-server bus is temporarily
 // The bus-migration-start annotation, which retries an ended run, is refused
 // the same way when it is added or changed while the spec asks a one-server
 // bus for 3: it would start a fresh one-to-three run.
+//
+// A one-server bus is one whose recorded count is 1, or, with no count
+// recorded (status.busReplicas 0), one whose spec asks for 1: on a release
+// where the recorded count is not written back (#6298), a bus installed at
+// one server carries 0, and an unset spec with no record is a new bus at the
+// default of three.
 func validateBusConversion(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	if oldObj == nil || oldObj.Status.BusReplicas != 1 {
+	if oldObj == nil {
 		return nil
 	}
 	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
 	if asked == nil || *asked != 3 {
+		return nil
+	}
+	recorded := oldObj.Status.BusReplicas
+	oneServer := recorded == 1 || (recorded == 0 && previous != nil && *previous == 1)
+	if !oneServer {
 		return nil
 	}
 	if previous == nil || *previous != 3 {
