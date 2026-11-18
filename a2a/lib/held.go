@@ -86,13 +86,13 @@ const (
 // it for the bind window the way a missing durable is. errors.Is against it.
 var ErrHeldBindRefused = errors.New("held durable refused")
 
-// ErrHeldConsumerNotReCreated is EnsureHeldConsumer declining to re-create a
+// ErrHeldConsumerNotReCreated is EnsureHeldConsumer declining to create a
 // durable its caller says existed, after a lookup answered "not found": a new
 // stream leader can answer that for a durable whose assignment hasn't
 // reached it yet (after a replica change), and a re-created durable starts
-// over from the stream's first message with a fresh ack floor. The caller
-// looks again later and passes Existed false once it means a re-create
-// (#6283).
+// over from the stream's first message with a fresh ack floor. It is a
+// primitive: the caller times the re-check itself, and passes Existed false
+// once it means a re-create (#6283).
 var ErrHeldConsumerNotReCreated = errors.New("held consumer existed and was not found; not re-created on one lookup")
 
 // HeldConsumerConfig is a held durable as the operator creates it.
@@ -114,7 +114,8 @@ type HeldConsumerConfig struct {
 	// Existed says the durable was made before. A lookup that can't find it
 	// then returns ErrHeldConsumerNotReCreated rather than creating it, so a
 	// late assignment on a new stream leader doesn't cost the durable its
-	// ack floor. The operator's profile durables follow the same rule
+	// ack floor. The caller decides when to re-create, as the operator does
+	// for profile durables with its own two-pass wait
 	// (k8s-operator ensureDurableGated).
 	Existed bool
 }

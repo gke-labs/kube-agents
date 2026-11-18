@@ -11,6 +11,8 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -391,18 +393,41 @@ func TestTheDurableSyncNeedsOnlyTheOperatorsGrants(t *testing.T) {
 	}
 }
 
+// withCard sets the profile's stored CardPublished reason.
+func withCard(p *agentv1alpha1.AgentProfile, reason string) {
+	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{Type: agentv1alpha1.AgentProfileConditionCardPublished, Status: metav1.ConditionTrue, Reason: reason})
+}
+
 // A durable is marked as having existed when its tier is in the profile's
-// status.renderedTiers, and not otherwise: a new profile, or a tier new to
-// it, gets its durables at once (#6283).
-func TestADurableExistedWhenItsTierWasRendered(t *testing.T) {
-	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) {
-		p.Spec.AllowedTiers = []string{"read", "oncall"}
-		p.Status.RenderedTiers = []string{"read"}
-	})
-	for _, d := range desiredProfileDurables(&p) {
-		want := strings.Contains(d.name, "-read-")
-		if d.existed != want {
-			t.Errorf("%s existed = %v, want %v", d.name, d.existed, want)
+// status.renderedTiers and the stored card condition proves the durables
+// were made (Published, or DurableRecheck); not otherwise. A newly bound
+// profile's first pass records renderedTiers while it holds for the bus
+// config (BusConfigPending), before any durable exists, and a failed first
+// sync leaves BusUnavailable: neither counts, so those durables are made at
+// once (#6283).
+func TestADurableExistedWhenItsTierWasRenderedAndItsDurablesMade(t *testing.T) {
+	for _, tc := range []struct {
+		card string
+		read bool
+	}{
+		{reasonAgentProfilePublished, true},
+		{reasonAgentProfileDurableRecheck, true},
+		{reasonAgentProfileBusConfigPending, false},
+		{reasonAgentProfileBusError, false},
+		{"", false},
+	} {
+		p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.AllowedTiers = []string{"read", "oncall"}
+			p.Status.RenderedTiers = []string{"read"}
+		})
+		if tc.card != "" {
+			withCard(&p, tc.card)
+		}
+		for _, d := range desiredProfileDurables(&p) {
+			want := tc.read && strings.Contains(d.name, "-read-")
+			if d.existed != want {
+				t.Errorf("card %q: %s existed = %v, want %v", tc.card, d.name, d.existed, want)
+			}
 		}
 	}
 }
@@ -423,6 +448,7 @@ func TestADurableThatExistedIsReCreatedOnlyAfterASecondMiss(t *testing.T) {
 		p.Spec.AllowedTiers = []string{"read", "oncall"}
 		p.Status.RenderedTiers = []string{"read"}
 	})
+	withCard(&p, reasonAgentProfilePublished)
 	want := desiredProfileDurables(&p)
 	exists := func(name string) bool {
 		_, err := js.Consumer(ctx, a2aProfileSubmitStream, name)
@@ -464,6 +490,7 @@ func TestADurableFoundAgainEndsItsWait(t *testing.T) {
 	gate := newDurableRecheck()
 	gate.now = func() time.Time { return now }
 	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Status.RenderedTiers = []string{"read"} })
+	withCard(&p, reasonAgentProfilePublished)
 	d := desiredProfileDurables(&p)[0]
 
 	if err := ensureDurableGated(ctx, js, d, gate); !errors.Is(err, errDurableAwaitingRecheck) {
@@ -482,5 +509,30 @@ func TestADurableFoundAgainEndsItsWait(t *testing.T) {
 	now = now.Add(durableRecreateDelay)
 	if err := ensureDurableGated(ctx, js, d, gate); !errors.Is(err, errDurableAwaitingRecheck) {
 		t.Fatalf("a new miss after being found: %v, want a fresh wait", err)
+	}
+}
+
+// A tier dropped while its durable waits takes the wait with it: added back
+// later with the durable missing, it starts a new wait rather than finding
+// the old miss already due (#6283).
+func TestADroppedTiersWaitIsCleared(t *testing.T) {
+	js := jetStreamWithProfileSubmits(t)
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	gate := newDurableRecheck()
+	gate.now = func() time.Time { return now }
+	p := testAgentProfile("ns", "tse", func(p *agentv1alpha1.AgentProfile) { p.Status.RenderedTiers = []string{"read"} })
+	withCard(&p, reasonAgentProfilePublished)
+	want := desiredProfileDurables(&p)
+	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("first miss: %v", err)
+	}
+	// The tier is dropped: nothing wanted, its names deleted.
+	if err := syncDurablesGated(ctx, js, "tse", nil, a2aBuiltinTierNames, gate); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * durableRecreateDelay)
+	if err := syncDurablesGated(ctx, js, "tse", want, a2aBuiltinTierNames, gate); !errors.Is(err, errDurableAwaitingRecheck) {
+		t.Fatalf("added back: %v, want a fresh wait", err)
 	}
 }

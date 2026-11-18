@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"k8s.io/apimachinery/pkg/api/meta"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -122,6 +123,7 @@ func profileDurableFilter(profile, tier, kind string) string {
 // concurrency. The child durable has the same cap as the top one but its
 // own, so children never queue behind their parents' kind.
 func desiredProfileDurables(p *agentv1alpha1.AgentProfile) []profileDurable {
+	made := durablesMade(p)
 	var out []profileDurable
 	for _, tier := range p.AllowedTierList() {
 		for _, kind := range a2aSubmitKinds {
@@ -129,11 +131,22 @@ func desiredProfileDurables(p *agentv1alpha1.AgentProfile) []profileDurable {
 				name:          profileDurableName(p.Name, tier, kind),
 				filter:        profileDurableFilter(p.Name, tier, kind),
 				maxAckPending: int(p.Spec.Concurrency),
-				existed:       slices.Contains(p.Status.RenderedTiers, tier),
+				existed:       made && slices.Contains(p.Status.RenderedTiers, tier),
 			})
 		}
 	}
 	return out
+}
+
+// durablesMade reports whether the profile's stored status proves its
+// durables were made: its card condition reads Published, which a pass
+// writes only after the durable sync succeeded, or DurableRecheck, which it
+// writes for a profile whose durables existed. renderedTiers alone isn't
+// proof: a newly bound profile's first pass records its tiers while it holds
+// for the bus config, before any durable exists (#6283).
+func durablesMade(p *agentv1alpha1.AgentProfile) bool {
+	c := meta.FindStatusCondition(p.Status.Conditions, agentv1alpha1.AgentProfileConditionCardPublished)
+	return c != nil && (c.Reason == reasonAgentProfilePublished || c.Reason == reasonAgentProfileDurableRecheck)
 }
 
 // profileDurableNamesFor are the durable names a profile could have at
@@ -315,6 +328,11 @@ func syncDurablesGated(ctx context.Context, js jetstream.JetStream, profile stri
 		}
 		if err := deleteDurable(ctx, js, name); err != nil {
 			return err
+		}
+		// A dropped durable's wait goes with it: a tier added back later
+		// starts a new one rather than finding an old miss already due.
+		if gate != nil {
+			gate.clear(name)
 		}
 	}
 	// Every wanted durable is tried: one held back for a re-check doesn't

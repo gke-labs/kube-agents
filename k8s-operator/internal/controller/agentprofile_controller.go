@@ -98,13 +98,17 @@ const (
 
 // Condition reasons.
 const (
-	reasonAgentProfileRendered        = "Rendered"
-	reasonAgentProfileNoAgent         = "NoPlatformAgent"
-	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
-	reasonAgentProfileRefused         = "ServiceAccountRefused"
-	reasonAgentProfileInvalid         = "InvalidProfile"
-	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
-	reasonAgentProfilePublished       = "Published"
+	reasonAgentProfileRendered   = "Rendered"
+	reasonAgentProfileNoAgent    = "NoPlatformAgent"
+	reasonAgentProfileManyAgents = "MultiplePlatformAgents"
+	reasonAgentProfileRefused    = "ServiceAccountRefused"
+	reasonAgentProfileInvalid    = "InvalidProfile"
+	reasonAgentProfileSANotFound = "ServiceAccountNotFound"
+	reasonAgentProfilePublished  = "Published"
+	// reasonAgentProfileDurableRecheck: the card is published and a
+	// durable that existed answered "not found"; the operator looks again
+	// a bus retry later before re-creating it (#6283).
+	reasonAgentProfileDurableRecheck  = "DurableRecheck"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
@@ -500,7 +504,7 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 				// Not the connection's fault: the bus answered. The bus
 				// retry comes back and re-creates the durable if it is
 				// still missing (#6283).
-				return reasonAgentProfileBusError, "the agent card is published; a durable is being re-checked before it is re-created: " + err.Error(), err
+				return reasonAgentProfileDurableRecheck, "the agent card is published; a durable is being re-checked before it is re-created: " + err.Error(), err
 			}
 			// Drop the connection: callout grants are fixed when it opens,
 			// and one opened before the callout served the map that grants

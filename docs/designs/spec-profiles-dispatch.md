@@ -283,6 +283,16 @@ publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so
 a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
 is #4173.
 
+**Re-creating a durable.** The operator re-creates a profile durable only when it is really
+gone. A re-created durable starts from the stream's first message with a fresh ack floor, and a
+new stream leader can answer "not found" before a durable's assignment reaches it, as after a
+replica change. So a durable whose tier is in the profile's `status.renderedTiers`, on a
+profile whose card condition reads `Published` or `DurableRecheck` (proof its durables were
+made), is re-created only if it is still missing a pass later (`durableRecreateDelay`, 30s),
+with the card reading `DurableRecheck` meanwhile. A new profile, or a tier new to it, gets its
+durables at once. `lib.EnsureHeldConsumer` offers the refusal as a primitive
+(`HeldConsumerConfig.Existed`) and leaves the timing to its caller (#6283).
+
 ### Admission and holding
 
 **The dispatcher is the only fetcher and holder** (decided 2026-10-22), on both execution
@@ -398,12 +408,6 @@ leave open:
   and before its `rejected` terminal, so a restart never re-admits a refusal already reported.
   A submission that finds a tombstone is acked and nothing else: it is never offered,
   adopted or given a second terminal, so a grant given since never runs a task once refused.
-  The operator re-creates a profile durable only when it is really gone: a durable whose tier
-  is in the profile's `status.renderedTiers`, found missing, is re-created only if it is still
-  missing on a pass 30s later (`durableRecreateDelay`), since a new stream leader can answer
-  "not found" before the durable's assignment reaches it, as after a replica change (#6283).
-  A tier new to the profile gets its durables at once. `lib.EnsureHeldConsumer` takes the same
-  rule as `HeldConsumerConfig.Existed`.
   A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
   running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
