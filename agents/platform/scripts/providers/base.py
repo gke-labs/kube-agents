@@ -120,15 +120,18 @@ LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "exclude
 # reason `publish` is: which refs a remote holds, and removing one, is git
 # against a URL on every forge. `snapshot` is git against a URL too.
 # `proposal-claim` is the broker's because the claim token it burns is the
-# broker's: no forge has one.
+# broker's: no forge has one. `revision-contains` is git against a URL too.
 BROKER_VERBS: tuple[str, ...] = (
     "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
-    "proposal-claim",
+    "proposal-claim", "revision-contains", "proposal-practice-label",
 )
 # Served to library callers only (`vcs_client.snapshot`, the `pr_opened` hook's
-# claim), so `capabilities` does not advertise them: no `vcs.py` command runs
+# claim, the post-merge check's ancestry read, the fleet audit's auto-merge
+# label), so `capabilities` does not advertise them: no `vcs.py` command runs
 # them, and an advertised verb sends the agent to a command that does not exist.
-LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot", "proposal-claim"})
+LIBRARY_VERBS: frozenset[str] = frozenset(
+    {"snapshot", "proposal-claim", "revision-contains", "proposal-practice-label"}
+)
 
 
 
@@ -311,6 +314,11 @@ class Forge:
     # find their own items by branch prefix and body marker. Off by default,
     # so a new forge that forgets it refuses a label instead of dropping one.
     labels = False
+    # Whether text a caller writes -- a comment, a description -- can itself
+    # set a label on this forge (a `/label` quick action). Where it
+    # can, no label is the broker's alone, so the broker applies none it
+    # reserves (`vcs_broker.VcsBroker.proposal_practice_label`).
+    text_sets_labels = False
     # The routes that spend a separate, smaller search quota, which the
     # readings sweep paces (`vcs_readings.VCS_READINGS_SEARCH_CALLS_PER_MINUTE`).
     search_routes: frozenset[str] = frozenset()

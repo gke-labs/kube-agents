@@ -673,6 +673,17 @@ managed-repository check still applying. `CREDENTIAL_PROXY_MCP_CALLERS` binds
 the role to the MCP pod's own ServiceAccount.
 [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) owns that caller.
 
+And it admits the `profile` role, an AgentProfile worker's pod, for every verb
+only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
+(`clone`, `proposal-view`, `proposal-list`, `proposal-commits`, `branch-view`,
+`identity`, `issue-list`, `issue-view`) and three writes, `publish`,
+`proposal-create` and `proposal-update`, which also need the credential's
+`vcs:proposal-create` permit. Each write is held to the install's own work: a
+`platform-agent/` branch named bare, no branch carrying somebody else's open
+proposal, a proposal opened by the install's login from its own branch in this
+repository, and no label edit. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
+owns that caller.
+
 ### No shallow clones
 
 There is no `depth`. This is a property of the transport rather than an
@@ -692,7 +703,10 @@ The clone stays under `CREDENTIAL_PROXY_MAX_CLONE_BYTES`: it is measured while
 git writes, about every half second, and killed past the ceiling, because the
 repository can be anyone's and a clone left to finish could fill the scratch
 volume first. The tar stays under
-`CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` (32 MiB, refused as `SNAPSHOT_TOO_LARGE`).
+`CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` (32 MiB, refused as `SNAPSHOT_TOO_LARGE`),
+and its files under the request's `maxBytes` when the caller sends one: `vcs_client`
+sends its unpack bound, so a tree it would refuse after the transfer is refused here
+first, with entries.
 The tar is smaller than the bundle ceiling because the answer is base64 inside
 one JSON body, and the broker holds several copies of it. The tar is sized from
 `git ls-tree` before `git archive` writes it, because the clone ceiling measures
@@ -913,10 +927,11 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | ------------------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
-| `snapshot`                           | `{repository, ref?, paths?}`                                         | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
+| `snapshot`                           | `{repository, ref?, paths?, maxBytes?}`                              | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
+| `proposal-practice-label`            | `{repository, number}`                                               | `{labelled, label, switch, reason, checks}`                                              |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |
 | `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`                 |
@@ -930,6 +945,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                                 |
 | `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                                     |
 | `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                                    |
+| `revision-contains`                  | `{repository, ancestor, revision}`                                   | `{contains}` (library callers only, like `snapshot`)                                     |
 
 `baseBranch` is the repository's configured base, or null when it has none.
 Where it is set, `proposal-create`'s `target`, and a first-round `publish`'s,
@@ -958,11 +974,17 @@ labels serves `label-ensure`, and a forge without them does not: the two say one
 thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
-The rows down to `issue-create` except `snapshot` and `proposal-claim`, and the two branch rows, are the
-version-control skill's. `snapshot` and `proposal-claim` are the library verbs (`LIBRARY_VERBS` in
+The rows down to `issue-create` except `snapshot`, `proposal-claim` and `proposal-practice-label`, and the two branch rows, are the
+version-control skill's. `snapshot`, `proposal-claim`, `revision-contains` and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
 `providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
 (`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
-which presents the token from a proposal record line. The rest are the union of
+which presents the token from a proposal record line. `revision-contains` is for the
+post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-practice-label` is served to fleet-audit's
+`audit_report.py` after it opens a disruption-budget fix: the broker judges the proposal from its own reads
+and adds or removes the reserved `kube-agents:would-auto-merge` or `kube-agents:auto-merge` label
+([automation rules](../site/src/content/docs/reference/automation-rules.md) says when), and every other
+verb refuses those labels in a label field, or as `label-ensure`'s name, with 403 `RESERVED_LABEL` before it
+calls the forge. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
@@ -1053,7 +1075,10 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
 `BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE` (when the measure listed the tree, the
 refusal carries `ceiling`, the `revision` it measured, and `entries`: each entry one
 level below what was asked, with its `path`, its `type`, its count of `manifests`, and
-the `bytes` a snapshot of it alone measures; past 4096 entries it carries none),
+the `bytes` a snapshot of it alone measures, and `unnamed`, with the reason, on an entry
+whose name is not UTF-8 and so cannot be asked for; past 4096 entries it carries none; a request's
+`maxBytes`, the bytes the caller unpacks at most, refuses a tree whose files pass it the same
+way, with the install's `ceiling`),
 400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
 carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
@@ -3399,6 +3424,13 @@ The MCP pod is the second caller, and its requests come from outside the
 cluster, through the pod. What bounds it is narrower than the `shell` role:
 `ROLE_VCS_VERBS` holds the `mcp` role to `proposal-view`, which writes nothing,
 and only on a repository the install manages.
+
+The profile worker is the third, and it runs model output. What bounds it is the
+task credential the dispatcher signed for its pod: no credential, no verb. The
+reads need nothing more. A write needs the `vcs:proposal-create` permit, which
+the dispatcher mints only for a request that asked for a change through a
+structured confirm, and even then it reaches only the install's own branches and
+proposals, never their labels, on a repository the install manages.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it

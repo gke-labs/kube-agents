@@ -34,6 +34,10 @@ readonly ELF_MAGIC_HEX=7f454c46
 readonly OLD_SHIPPED_STALE_TIMEOUT_SECONDS=600
 readonly TSE_TEMPLATE="/opt/tse-template"
 readonly DEFAULTS_PLUGINS_DIR="/opt/defaults/plugins"
+# The plugins under DEFAULTS_PLUGINS_DIR that step 2b does not force-sync: installed into
+# the image from outside this repository, and the directory holds the plugin's own state
+# (hermes_otel's config.yaml carries the collector endpoint step 4 writes).
+readonly PINNED_EXTERNAL_PLUGINS="hermes_otel"
 readonly OPTIONAL_PROFILE_STAMP=".optional-profile"
 readonly DELETED_PROFILES_DIR=".deleted"
 # The boot stamp at the root of a cluster profile home: the digest of everything
@@ -517,7 +521,7 @@ fi
 # they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
     for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
-        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
+        onboarding/scan_in_progress.md onboarding/scan_completed.md onboarding/report_filed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
@@ -545,19 +549,48 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
-# 2b, continued: the onboarding plugin is image-owned too, and must come from the same image
-# as the delivery script above: its pre_llm_call hook holds the first report behind the greeting
-# and its post_llm_call hook releases it. A stale plugin beside a new bootstrap_delivery.py
-# writes no hold, so the report races the greeting as before the hold existed.
+# 2b, continued: every plugin the image ships is image-owned too, and must come from the
+# same image as the scripts above. The onboarding plugin showed why first: its pre_llm_call
+# hook holds the first report behind the greeting and its post_llm_call hook releases it, so
+# a stale plugin beside a new bootstrap_delivery.py writes no hold and the report races the
+# greeting. The rest go stale the same way. A roll to an image built earlier than the files
+# on the volume — a rollback, or a shared install that rolls between branches — leaves the
+# previous image's plugin code live beside the new image's operator, gateway and scripts,
+# and a metric series the image added never appears. So every plugin directory under
+# DEFAULTS_PLUGINS_DIR is copied over the volume's, except PINNED_EXTERNAL_PLUGINS. The copy
+# adds and overwrites without pruning, so a plugin's own runtime state on the volume
+# survives, and the loop walks directories only, so the files at the top of the plugins
+# directory are left as they are. A symlinked destination is left alone, as in the cluster
+# loop. An operator-mounted default-profile plugin is a mount at this path, not a symlink;
+# its name is a Kubernetes object name, so it cannot carry the underscore the shipped
+# names do, and only `common` could collide with one.
+#
+# Each file is copied to a temporary name beside its target and renamed over it, as the
+# cluster loop in step 2.6 does: replicas share this volume, and a sibling that imports a
+# module mid-copy must find the old file whole, never a truncated one that stops the plugin
+# loading. A copy that fails part-way leaves the old file whole for the same reason.
 #
 # Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
 # created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
 # the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
 # copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
-if [ -d "/opt/defaults/plugins/bootstrap_onboarding" ]; then
-    { mkdir -p "$TARGET_DIR/plugins/bootstrap_onboarding" \
-        && cp -rf /opt/defaults/plugins/bootstrap_onboarding/. "$TARGET_DIR/plugins/bootstrap_onboarding/"; } \
-        || echo "WARN: could not refresh $TARGET_DIR/plugins/bootstrap_onboarding from the image; the first report may post before the greeting" >&2
+if [ -d "$DEFAULTS_PLUGINS_DIR" ]; then
+    # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
+    _plugin_refresh_tag="${HOSTNAME:-$$}"
+    for _image_plugin_dir in "$DEFAULTS_PLUGINS_DIR"/*/; do
+        [ -d "$_image_plugin_dir" ] || continue
+        _image_plugin=$(basename "$_image_plugin_dir")
+        case " $PINNED_EXTERNAL_PLUGINS " in *" $_image_plugin "*) continue ;; esac
+        _plugin_dst="$TARGET_DIR/plugins/$_image_plugin"
+        [ -L "$_plugin_dst" ] && continue
+        if ! (cd "$_image_plugin_dir" && find . -type f) | while IFS= read -r _file; do
+            _tmp="$_plugin_dst/$_file.refresh.$_plugin_refresh_tag"
+            { mkdir -p "$(dirname "$_plugin_dst/$_file")" && cp -p "$_image_plugin_dir$_file" "$_tmp" && mv -f "$_tmp" "$_plugin_dst/$_file"; } 2>/dev/null \
+                || { rm -f "$_tmp" 2>/dev/null; exit 1; }
+        done; then
+            echo "WARN: could not refresh $_plugin_dst from the image; each file not yet replaced keeps the previous image's copy" >&2
+        fi
+    done
 fi
 
 # 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.
@@ -1417,8 +1450,8 @@ fi
 # there puts the original back rather than leaving the gap.
 #
 # $3 is an OPTIONAL second source directory, overlaid onto the staged copy
-# before the swap. It exists for the A2A skill (step 2.6a-bis's gate decides
-# whether to pass it), and it goes through here rather than writing into the
+# before the swap. It exists for the A2A skill (step 2.6a-bis passes it when
+# the image ships it), and it goes through here rather than writing into the
 # live directory afterwards for the reason the staging exists at all: a
 # non-staged writer that lands in another replica's swap window recreates
 # $_dst holding only ITS files, which sends the other pod down the
@@ -1537,89 +1570,23 @@ sync_profile_skills() {
     rm -rf "$_old" 2>/dev/null || true
     return 0
 }
-# 2.6a-bis The A2A topics skill, overlaid into the platform profile only when
-# this install runs the next stack. The skill ships OUTSIDE the platform
-# template (/opt/a2a-template, see the Dockerfile) so that 2.6a's replace
-# never installs it on a today install: the mode switch's promise is that a
-# normal install cannot tell the feature exists, and a skill file in the
-# template would break it on day one. It rides 2.6a's staging as the overlay
-# argument rather than being copied in afterwards — see the note on $3 — so
-# the composed tree lands in one rename. A flip back to today self-cleans:
-# the next boot stages the template alone and renames that over the profile.
-#
-# The gate asks runtime_mode.py, the one agent-side reader the mode spec
-# allows. The mode rides the managed .env, which Hermes applies at load time
-# — it is NOT in this shell's environment — so the helper hands the managed
-# file to Python and lets runtime_mode read it from there.
-#
-# Parsed as the strict KEY=value lines renderManagedEnv writes, never sourced:
-# `.` in a shell would execute anything a value with a space grew, and this
-# script is pid 1.
-#
-# os.environ is CLEARED first, so the managed file is the only thing that can
-# answer. Without that the inherited container env would be a second delivery
-# path for the mode — an AgentPlugin's spec.env is copied into the container
-# verbatim — and the spec's whole point is that one delivery path means one
-# answer. Clearing also keeps this file from naming the key a third time,
-# which is what the grep rule forbids.
-#
-# Exit meanings: 0 next, 1 today (or no managed scope at all — a compose or
-# `docker run` start, not a fault), 2 the managed scope exists but its .env
-# could not be read or the reader is missing. Only 0 overlays; 2 warns,
-# because on an operator-managed install that is a real fault the skill's
-# silent absence would otherwise hide. Guarded like 2.6a: nothing here ever
-# kills the boot.
-a2a_mode_probe() {
-    [ -n "${HERMES_MANAGED_DIR:-}" ] || return 1
-    "$INSTALL_DIR/.venv/bin/python3" - "$HERMES_MANAGED_DIR/.env" <<'A2A_PYEOF'
-import os, sys
-
-try:
-    with open(sys.argv[1]) as f:
-        lines = f.readlines()
-except OSError:
-    sys.exit(2)
-
-os.environ.clear()
-for line in lines:
-    line = line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, _, value = line.partition("=")
-    key = key.strip()
-    # An empty key is not a pin and os.environ refuses it; skipping keeps a
-    # malformed line from being reported as an unreadable file.
-    if key:
-        os.environ[key] = value.strip()
-
-try:
-    sys.path.insert(0, "/opt/defaults/scripts")
-    import runtime_mode
-except Exception:
-    # A missing or broken reader is not "today" — it is an image fault, and
-    # exit 2 is what says so instead of a bare traceback read as a decision.
-    sys.exit(2)
-
-sys.exit(0 if runtime_mode.is_next() else 1)
-A2A_PYEOF
-}
-
+# 2.6a-bis The A2A topics skill, overlaid into the platform profile. The skill
+# ships OUTSIDE the platform template (/opt/a2a-template, see the Dockerfile)
+# and rides 2.6a's staging as the overlay argument rather than being copied in
+# afterwards — see the note on $3 — so the composed tree lands in one rename.
+# Every install runs the A2A stack, so nothing gates the overlay: an image
+# with the template overlays it, and one without (no /opt/a2a-template/skills)
+# syncs the platform template alone. An image from this change pinned under
+# an operator from before it, with a stored `spec.mode: today`, gets the skill
+# with no bus rendered behind it: the `a2a` CLI refuses every call with
+# "NATS_URL is not set", which is degraded, not broken, and the pairing ends
+# with the operator's upgrade. Guarded like 2.6a: nothing here ever kills the
+# boot.
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
-    # is a return value here, not a failure.
     a2a_overlay=""
     if [ -d /opt/a2a-template/skills ]; then
-        a2a_probe_rc=0
-        a2a_mode_probe || a2a_probe_rc=$?
-        case $a2a_probe_rc in
-            0)
-                a2a_overlay=/opt/a2a-template/skills
-                echo "Next stack: overlaying the A2A topics skill into the platform profile"
-                ;;
-            2)
-                echo "WARN: the managed scope has no readable .env; treating the mode as today and skipping the A2A skill overlay" >&2
-                ;;
-        esac
+        a2a_overlay=/opt/a2a-template/skills
+        echo "Overlaying the A2A topics skill into the platform profile"
     fi
     sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform" "$a2a_overlay"
 fi
@@ -1898,8 +1865,7 @@ fi
 
 # 2.6c Reconcile optional built-in specialist profiles declared in KUBE_AGENTS_ENABLED_PROFILES.
 #
-# In `mode: next` (and when explicitly opted in via KUBE_AGENTS_ENABLED_PROFILES),
-# the operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
+# The operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
 # custom resources whose names match a built-in optional specialist template
 # baked into the image (currently `tse`, backed by /opt/tse-template).
 # Profiles marked with `.optional-profile` that are removed from KUBE_AGENTS_ENABLED_PROFILES

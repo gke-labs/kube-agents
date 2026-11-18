@@ -10,7 +10,7 @@ the route table gains :data:`ROUTE_PATH`) and ``tools/kanban_tools.py``
 
 Why
 ---
-Under ``spec.mode: next`` the hermes-bridge runs each gateway conversation as
+The hermes-bridge runs each gateway conversation as
 turns in the API-server session ``a2a-<contextId>``, POSTed to
 ``/v1/chat/completions`` without streaming. A Stop that lands while a turn runs
 cancels the bridge's request, but upstream interrupts the agent only when a

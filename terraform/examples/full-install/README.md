@@ -58,12 +58,9 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
-  chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
-  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
-  which a first install records as `"next"`. Changing it on a running install is a mode switch
-  ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
+  the gateway spends per period, and `install.sh` sets it from
+  `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
   `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
   so the CR carries no `storage` field) sets the `PlatformAgent`'s
   `spec.storage.size`, the size of the agent's data volume and the shell
@@ -78,6 +75,10 @@ install without the interview.
   those through `platformAgent.deployment.env` in `extra_helm_values`. The
   [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
   gives the buckets, the defaults and a sizing method.
+- With `install_helm_releases = false`, neither chart is installed: the apply
+  builds only the Google Cloud side, and
+  [a separate pipeline installs the charts](#installing-the-charts-from-a-separate-pipeline-install_helm_releases)
+  from the outputs.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -164,7 +165,8 @@ install without the interview.
 - With `create_cluster = false`, a cluster that meets the
   [cluster requirements](../../../docs/site/src/content/docs/install/prerequisites.md#cluster-requirements):
   GKE 1.29+, Workload Identity with `GKE_METADATA` on every node pool,
-  NetworkPolicy enforcement, a control plane reachable from here, and cert-manager
+  NetworkPolicy enforcement, a control plane reachable from here (not with
+  `install_helm_releases = false`), and cert-manager
   either present (`enable_cert_manager = false`) or absent. The module refuses the
   plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
   and checks none of the others; `install.sh` changes an adopted cluster to meet
@@ -176,7 +178,7 @@ install without the interview.
   install ships is then inert, including the ones that confine the agent's shell
   sandbox.
 - Application Default Credentials for the Google, Kubernetes, and Helm
-  providers:
+  providers (the Google provider alone with `install_helm_releases = false`):
 
   ```bash
   gcloud auth application-default login
@@ -199,7 +201,12 @@ run it again after a few minutes and it untaints the key ring or key the first
 run created, where a bare `terraform apply` would plan their replacement and 409.
 Once the project has been destroyed and re-applied even once, `make tf-apply`
 is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
-bare `terraform apply` fails on. The table under
+bare `terraform apply` fails on. For the minter's key ring and key it adopts only
+this install's own, by the owner labels on the key, or the one
+`github_minter_shared_kms_key` names. A key with no owner labels is adopted as
+this install's own, and labelled, when `github_minter_adopt_unlabelled_kms_key`
+names it (the installer sets it when `KMS_KEYRING` and `KMS_KEY` were given). Any
+other, and any key another install's labels claim, refuses the apply. The table under
 [Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state
@@ -234,7 +241,10 @@ installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
 `GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
 front door regenerates `terraform.tfvars` from; every front door that applies
 (`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
-names the key to set. Do not rely on a shell
+names the key to set. The minter's KSA (`github_minter_ksa_name`,
+`GITHUB_MINTER_KSA_NAME`) is the other half of its Workload Identity binding:
+`install.sh` names a new install's after its cluster and records it, so two
+installs sharing the namespace don't bind one member. Do not rely on a shell
 `export` or a hand-edited `terraform.tfvars` instead: the export dies with the
 shell and the file is regenerated on every run, and either way the next run
 resolves the name back to the default and plans the GSA's destroy-and-recreate
@@ -308,9 +318,11 @@ install's own and the state is what went missing, a repointed
 could not establish); delete the leftovers if that is what they are (it prints
 the `gcloud` commands); or leave the detector off for this install with
 `ENABLE_DRIFT_DETECTOR=false`. The stockout trio
-(`stockout_pubsub_*`) has the same shape but is still adopted, because
-`enable_stockout_investigator` stays off unless asked for: a second install
-that turns it on names its own three. Renaming a subscription already in state is a
+(`stockout_pubsub_*`) has the same shape and is refused the same way
+(`guard_stockout_adoption`): it names `TF_VAR_stockout_pubsub_topic`,
+`TF_VAR_stockout_pubsub_subscription`, and `TF_VAR_stockout_pubsub_sink`, the
+`terraform import` and `gcloud` delete commands, or
+`ENABLE_STOCKOUT_INVESTIGATOR=false`. Renaming a subscription already in state is a
 different failure, and `guard_pubsub_subscription` refuses it for the Chat,
 drift and stockout subscriptions alike, while the feature's flag is on: `name`
 and `topic` are ForceNew on `google_pubsub_subscription`, so the apply would
@@ -339,6 +351,13 @@ with the two overrides the BackupPlan recipe below writes — and then re-run
 front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
 rather than 409ing on the cluster halfway through. Through `install.sh` the
 probe derives `create_cluster = false` instead and adopts the cluster.
+
+Every input the guards read goes through the remote state: each `tfvar` read
+is a `terraform console` that opens it, and the pre-apply guards make about
+fifty of them. When Cloud Storage answers a transient 429 or 5xx, or the
+connection drops, the script asks again, up to `STATE_BACKEND_ATTEMPTS` times
+(4) with `STATE_BACKEND_WAIT_SECONDS` (15) between. Any other error fails the
+read at once, as before, with the Terraform error printed.
 
 ### Asking what an apply would change
 
@@ -539,6 +558,76 @@ carries an `appVersion` placeholder that never matches a published image tag —
 chart's usual tag defaulting cannot work here (see the [chart README](../../../charts/kube-agents/README.md)).
 For production, always pin a validated numeric SemVer release tag or full commit SHA.
 
+### Installing the charts from a separate pipeline (`install_helm_releases`)
+
+Set `install_helm_releases = false` when the pipeline that may create Google
+Cloud resources is not the one that deploys to Kubernetes, or cannot reach the
+cluster's control plane. The apply then builds everything on the Google Cloud
+side (APIs, the cluster, IAM, Pub/Sub, the minter) and skips the cert-manager
+and kube-agents Helm releases. The Helm provider is still configured, which
+makes no network call, but nothing uses it.
+
+Your Kubernetes pipeline installs the charts from the outputs:
+
+| Output                      | What it carries                                                                                                                                                   |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cert_manager_helm_release` | Repository, chart, version, namespace and values for cert-manager, or `null` when `enable_cert_manager = false`.                                                  |
+| `kube_agents_helm_release`  | Release name, namespace, chart directory (relative to the repository or release bundle root) and chart version.                                                   |
+| `kube_agents_helm_values`   | The values documents the release would be given, in order. **Sensitive**: they hold every credential the install was given (the output's description lists them). |
+
+The values already name every service account the chart needs, such as the
+agent's Google service account for Workload Identity, so there is nothing to
+copy across by hand. `agent_service_account_email` and the other
+service-account outputs remain for anything else that needs them.
+
+```bash
+terraform output -json kube_agents_helm_values | jq -r '.[0]' > values-0.yaml
+terraform output -json kube_agents_helm_values | jq -r '.[1]' > values-1.yaml
+terraform output -json cert_manager_helm_release > cert-manager.json
+terraform output -json kube_agents_helm_release > kube-agents.json
+
+# In the Kubernetes pipeline, from the root of the same release of this repository
+# (the chart path in kube-agents.json is relative to it):
+helm upgrade --install cert-manager cert-manager --repo https://charts.jetstack.io \
+  --version "$(jq -r .version cert-manager.json)" --namespace cert-manager --create-namespace \
+  -f <(jq -r '.values[0]' cert-manager.json) --wait --timeout 10m
+helm upgrade --install "$(jq -r .name kube-agents.json)" "$(jq -r .chart kube-agents.json)" \
+  --namespace "$(jq -r .namespace kube-agents.json)" --create-namespace \
+  -f values-0.yaml -f values-1.yaml --wait --timeout 10m
+```
+
+Install cert-manager first and wait for it: the kube-agents chart creates a
+Certificate and an Issuer, which the API server refuses until cert-manager's
+webhook is serving. A mirrored install's cert-manager values have a second
+document, which goes after the first. Keep the namespace `kube_agents_helm_release`
+names: the agent's gateway endpoint is fixed to it.
+
+The checks the chart's values must pass, such as `openai_compatible` needing a
+model name or the GitOps forge settings, run on every plan in either mode.
+
+`lifecycle.sh apply` (and `make tf-apply`) works in this mode and never reaches
+the cluster. `lifecycle.sh destroy` does reach it, to delete the PlatformAgent
+before the cluster goes, so either run it where the cluster is reachable or
+uninstall the charts from your pipeline first. `install.sh` and `upgrade.sh`
+always install the charts.
+
+Turning `install_helm_releases` off on an install whose releases Terraform
+already manages uninstalls them on the next apply. To hand existing releases to
+another pipeline instead, remove them from state first, whichever address the
+state holds them at:
+
+```bash
+terraform state list | grep -E '^helm_release\.(kube_agents|cert_manager)(\[0\])?$' | xargs terraform state rm
+```
+
+An install from before this setting holds the kube-agents release at
+`helm_release.kube_agents`, without `[0]`, until an apply moves it (the move
+touches nothing in the cluster). Given several addresses, `terraform state rm`
+removes the ones it finds and exits 0 even when another matches nothing, so
+naming only the `[0]` addresses on such a state would leave the kube-agents
+release in state, and the next apply with `install_helm_releases = false` would
+uninstall it.
+
 ### Installing from a mirrored registry
 
 For a cluster that may only pull from an approved registry, copy the images
@@ -549,7 +638,7 @@ agent Deployment and shell sandbox StatefulSet the operator resolves at reconcil
 time; the fluent-bit logging sidecar follows `third_party_image_registry`); the
 [chart README](../../../charts/kube-agents/README.md) explains how.
 Add `third_party_image_registry` to mirror third-party images (cert-manager,
-LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight); empty leaves them on
 their upstream registries.
 
 `IMAGE_TAG` is not optional here. The first-party images take whatever tag
@@ -813,6 +902,8 @@ For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the 
 
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
 
+With `gitops_forge = "bitbucket"` (Bitbucket Cloud, at `bitbucket.org` only) or `gitops_forge = "bitbucket-datacenter"`, set `gitops_repo_path` to `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center), and, for Data Center, `gitops_host` to the instance's hostname. The instance must serve at the root path on port 443. The CR then declares one forge named after its provider, with the workspace or project key as its namespace and the repository slug as its `gitops` repository, and `credentialsRef` naming `gitops_token_secret_name` (default `bitbucket-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A Data Center instance behind a private CA sets `gitops_ca_secret_name`. A Bitbucket Cloud workspace, project or repository access token cannot name its own account, so set `gitops_identity` to the account UUID it acts as; an API token needs none. A Bitbucket install has no GitHub App, so `github_repo` and `enable_github_minter` stay unset. See [Bitbucket as the GitOps forge](../../../docs/site/src/content/docs/install/bitbucket.md).
+
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
 install.sh collects. Slack needs no GCP resources, so this is
@@ -989,8 +1080,8 @@ detector, the sinks publish every mutating call on every GKE cluster in the
 project and in each project the scope lists (about 60k messages a day after the module's lease filter, per its
 README) into a subscription that retains them for 31 days and never expires:
 Pub/Sub storage cost and a backlog until the detector is enabled. The reverse
-is refused — a `helm_release` precondition fails the apply when
-`enable_drift_detector` is set without `enable_drift_pubsub`. The block
+is refused — a precondition on the `kube_agents_helm_values` output fails the
+plan when `enable_drift_detector` is set without `enable_drift_pubsub`. The block
 carrying `enabled` is written only when the ingress is on, so the failure that
 precondition catches is quieter than the Ready-forever detector the CRD
 field's description warns about: an apply that succeeds, renders no
@@ -1058,9 +1149,9 @@ leaves the ingress running, still exporting and still billing.
   (if it stays blank, Chat silently delivers no events). That address is the
   Workspace Add-ons service agent,
   `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
-  the agent's own GSA. Then DM the bot; on
-  first contact, optionally approve the pairing code via
-  `hermes pairing approve google_chat <CODE>` in the gateway pod.
+  the agent's own GSA. Then DM the bot. The A2A gateway has no pairing: it
+  answers the addresses in `google_chat_allowed_users`, or everyone the app is
+  visible to when that list is empty.
 - **Slack:** create the Slack app and its tokens as the site's Slack app setup
   page describes (`docs/site/src/content/docs/install/slack-app.md`), pass the
   tokens as `slack_bot_token` / `slack_app_token`, and set
@@ -1111,7 +1202,7 @@ What each one does that raw Terraform cannot:
 | `deletion_protection = true` cannot be overridden by a destroy alone                                                                               | `tf-destroy` applies it as `false`, then destroys                                                                                                                                                                                                                                                                                                                                              |
 | The helm provider reports a release destroyed when it cannot reach the cluster                                                                     | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched                                                                                                             |
 | A Pub/Sub topic or subscription that already exists makes the create 409                                                                           | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                                                                                                                                   |
-| The stockout topic, subscription and sink survive a partial teardown and 409 the same way                                                          | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                                                                                                                                              |
+| The stockout topic, subscription and sink survive a partial teardown or collide across installs the same way                                       | `tf-apply` refuses instead of importing (`guard_stockout_adoption`): an import cannot tell a leftover from another live install's trio, and two investigators on one subscription split autoscaler alerts across installs                                                                                                                                                                      |
 | The drift trio does too, but the detector is on by default, so every second install in a project hits it                                           | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio; the source sinks a scoped install owns in the listed projects are not probed, and the refusal prints the import for them                                                                                                                                  |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for

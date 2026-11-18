@@ -94,6 +94,11 @@ const PAGE = {
   gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
+  // A bare "#N" is an issue of the source repository (case-notes.yaml's,
+  // the allowlist's); the bots' own issues arrive as full URLs and may live
+  // in another repository (health.json's issues_repo), which the link text
+  // then names.
+  sourceRepo: "gke-labs/kube-agents",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
   rulesUrl: "https://github.com/gke-labs/kube-agents/blob/main/scripts/eval_dashboard/classify.py",
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
@@ -138,10 +143,12 @@ const PAGE = {
   nightsListed: 14,
   // A night split across jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
-  nightPartWords: { main: "main part", "main-b": "main-b part", writers: "writers part" },
+  nightPartWords: { main: "main part", "main-b": "main-b part", "main-c": "main-c part", "main-d": "main-d part", "main-e": "main-e part", writers: "writers part", "writers-b": "writers-b part", "writers-c": "writers-c part" },
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
+  // The nights an estimated Slack p95 is averaged over (slack_estimate.P95_NIGHTS).
+  slackP95Nights: 7,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -487,8 +494,12 @@ const transcriptUrl = (run, kase, n = 1) => {
 // rep_n); rep 1, as the pages always linked, when the row names none.
 const repOf = (c) => (Number.isInteger(c.rep_n) && c.rep_n > 0 ? c.rep_n : 1);
 const issueLink = (issue) => {
-  const match = /^#(\d+)$/.exec(String(issue).trim());
-  return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
+  const text = String(issue).trim();
+  const bare = /^#(\d+)$/.exec(text);
+  if (bare) return `<a href="${PAGE.issueUrl}/${bare[1]}">${esc(text)}</a>`;
+  const full = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)$/.exec(text);
+  if (full) return `<a href="${esc(text)}">${esc(full[1] === PAGE.sourceRepo ? `#${full[2]}` : `${full[1]}#${full[2]}`)}</a>`;
+  return esc(text);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
 
@@ -833,7 +844,7 @@ function agentSawHtml(inc, inWindow) {
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.cls === (inc.condition === "storm" ? "storm" : "delegation-ceiling") && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -1212,6 +1223,7 @@ function tagFor(c) {
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
+  if (c.cls === "forge-unavailable") return '<span class="tag storm">forge unavailable</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1220,22 +1232,30 @@ function tagFor(c) {
 // (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
 // the total or a three-rep case would read "all 0 reps lost". `fixture` is
 // the repetitions never run because the lease-time scan saw a fixture the
-// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way.
-function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0); }
+// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way,
+// and `forge` the repetitions whose checks errored on a forge read that failed
+// during grading (REP_FORGE).
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0) + (reps.forge || 0); }
 function lostText(reps) {
   const parts = [];
   if (reps.infra) parts.push(`${reps.infra} lost`);
   if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
   if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
   return parts.length ? ` (${parts.join(", ")})` : "";
 }
 function ungradedText(reps) {
   const total = plural(repTotal(reps), "rep");
-  if (reps.fixture && !reps.infra && !reps.ceiling) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
-  if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
-  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}`;
-  if (reps.fixture) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}`;
+  if (reps.fixture && !reps.infra && !reps.ceiling && !reps.forge) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
+  if (reps.ceiling && !reps.infra && !reps.forge) return `all ${total} hit the delegation ceiling with the worker still running`;
+  if (reps.forge && !reps.infra && !reps.ceiling && !reps.fixture) return `all ${total} not graded: a forge read failed during grading`;
+  // A mix: each kind that has repetitions, in lostText's order.
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost before grading`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
+  if (parts.length > 1) return `all ${total} ungraded: ${parts.join(", ")}`;
   return `all ${total} lost before grading`;
 }
 
@@ -1715,7 +1735,7 @@ function partNotes(night, cut = true) {
   const notes = cut ? nightParts(night).filter((p) => p.truncated).map((p) => `${word(p.part)} cut short after ${p.duration_s != null ? minutesText(p.duration_s * 1000) : "an unknown time"}`) : [];
   return notes.concat(list(night.missing_parts).map((p) => `${word(p)} missing`), list(night.running_parts).map((p) => `${word(p)} still running`));
 }
-// The main half (main or main-b) a night lacks, missing or still running,
+// The main shard (main, or main-b to main-e) a night lacks, missing or still running,
 // or null: its cases were never compared, so no verdict on what is newly
 // failing. nightly.py decides it once (verdict_withheld_by) for the page and
 // the digest alike.
@@ -1726,9 +1746,12 @@ const nightCutSeconds = (night) => {
   const main = nightParts(night).find((p) => p.part === "main");
   return main ? main.duration_s : night.duration_s;
 };
-// A night with a main-b part names each part cut short with its own wall
-// clock, as the digest does, rather than one wall clock for the night.
-const nightHasMainB = (night) => nightParts(night).some((p) => p.part === "main-b");
+// A night with a main shard beside the main part names each part cut short
+// with its own wall clock, as the digest does, rather than one for the night.
+// The shards are the main parts other than "main" itself, read from the one
+// list of part words the pages test pins to nightly.py's.
+const MAIN_SHARD_PARTS = Object.keys(PAGE.nightPartWords).filter((part) => part.startsWith("main-"));
+const nightHasMainShards = (night) => nightParts(night).some((p) => MAIN_SHARD_PARTS.includes(p.part));
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
 // The night's headline state, worst first: cut short, failed cases, partial
 // cases, nothing recorded or nothing graded, a pass short of the matrix
@@ -1772,11 +1795,11 @@ function nightlyBriefHtml() {
   if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 11 AM digest.</p>`;
   else {
     const c = night.counts;
-    // With a main-b part, each half cut short is named with its own wall
+    // With another main shard, each shard cut short is named with its own wall
     // clock (as on the Nightly page and in the digest), not one for the night.
-    const notes = partNotes(night, !night.truncated || nightHasMainB(night)).map((n) => ` · ${esc(n)}`).join("");
+    const notes = partNotes(night, !night.truncated || nightHasMainShards(night)).map((n) => ` · ${esc(n)}`).join("");
     const summary = night.truncated
-      ? `truncated${nightHasMainB(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
+      ? `truncated${nightHasMainShards(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
       : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length && !nightWithheldBy(night) ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${notes}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
     body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
   }
@@ -1806,7 +1829,9 @@ function nightCaseRow(night, c, newly) {
   const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`,
     // A name the link grammar refuses could not reach the timing section.
     linkCaseIds([c.case]).length ? `<a href="${esc(nightTimingHref(night, [c.case]))}">timing</a>` : ""].filter(Boolean).join(" · ");
-  const p90 = Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "";
+  const p90 = (Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "") +
+    // The estimated end-to-end Slack time beside the agent time (slack_estimate.py).
+    (Number.isFinite(c.slack_e2e_s) ? `<br><small class="mut" title="estimated: agent time + that night's Slack delivery lag + a Slack post's time per message the reply posted">Slack ≈ ${esc(secText(c.slack_e2e_s))}</small>` : "");
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
     `<td>${nightStatePill(c)}</td>` +
     `<td class="num" title="repetitions passed / graded">${esc(nightRepText(c))}</td>` +
@@ -1814,6 +1839,17 @@ function nightCaseRow(night, c, newly) {
     nightShapeCell(c) +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
+}
+
+// The night's estimated Slack times, when the Slack lane recorded its overhead
+// that night (SCHEMA.md: nights[].slack); nothing otherwise.
+function nightSlackHtml(night) {
+  const s = night.slack;
+  if (!s || !Number.isFinite(s.e2e_p50_s)) return "";
+  const ack = Number.isFinite(s.first_ack_p50_s) ? ` · time to first ack p50 ${secText(s.first_ack_p50_s)}${Number.isFinite(s.first_ack_p95_s) ? `, p95 ${secText(s.first_ack_p95_s)}` : ""}` : "";
+  const p95 = Number.isFinite(s.e2e_p95_7n_s) ? ` (${PAGE.slackP95Nights}-night average ${secText(s.e2e_p95_7n_s)})` : "";
+  return `<p class="small"><b>Slack, estimated:</b> end to end p50 ${secText(s.e2e_p50_s)}, p95 ${secText(s.e2e_p95_s)}${p95}${ack}.</p>` +
+    `<p class="mut small">How: each case's agent time (median) + that night's Slack delivery lag + a Slack post's time for each message its reply posted, from the A2A gateway's metrics on the Slack lane's canaries. It is a lower bound: it misses what a busy workspace adds, such as rate limits under load, other posters in the channel, and a person's client rendering the message.</p>`;
 }
 
 function nightCasesTable(night) {
@@ -1899,10 +1935,10 @@ function nightlyHtml(link) {
   const took = night.duration_s != null ? minutesText(night.duration_s * 1000) : "unknown wall clock";
   // A split night's own notes (a part cut short, missing or running) lead
   // the sentence; a night of one job reads as it always has.
-  const notes = partNotes(night, !night.truncated || nightHasMainB(night));
+  const notes = partNotes(night, !night.truncated || nightHasMainShards(night));
   const notesText = notes.length ? `${esc(notes.join(" · "))}. ` : "";
   let ledeHow;
-  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainB(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
+  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainShards(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
   else if (!night.complete && notes.length) ledeHow = `<b>Incomplete:</b> ${notesText}${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects are recorded.`;
   else if (!night.complete) ledeHow = `<b>Incomplete:</b> the job concluded after ${esc(took)} but recorded ${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects.`;
   else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;
@@ -1929,7 +1965,7 @@ function nightlyHtml(link) {
     tile("Newly failing", `${night.previous_build == null || nightWithheldBy(night) ? "—" : night.newly_failing.length}`, nightWithheldBy(night) ? `no ${PAGE.nightPartWords[nightWithheldBy(night)] || nightWithheldBy(night)} on record` : night.previous_build == null ? "first night on record" : "against the night before") +
     (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     (shape ? tile("Opens on answer", `${pct(shape.opens_on_verdict / shape.n)}`, [`of ${plural(shape.n, "rep")}`, Number.isFinite(shape.answer_words_p50) ? `answer p50 ${plural(shape.answer_words_p50, "word")}` : "", `${shape.apology} with an apology`].filter(Boolean).join(" · ")) : "") +
-    `</div></div>`;
+    `</div>${nightSlackHtml(night)}</div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
     `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. Opens on answer counts the repetitions whose reply opens on its verdict rather than a lead-in or a heading, out of those measured, with the answer's median length under it; it is reported, never graded. The transcript is the first repetition's.</p></div>` +

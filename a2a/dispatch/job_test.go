@@ -158,11 +158,15 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	b := newBus(t)
 	b.ensure("inv", 1, 0, "unattended")
 	key := lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")
-	var seen, tombstoned atomic.Bool
+	// The hook reads the lease bucket at the moment the first task-1 terminal
+	// arrives and hands the answer over only once that read is done; the test
+	// blocks on the answer rather than on a flag the hook sets before reading.
+	var seen atomic.Bool
+	tombstoned := make(chan bool, 1)
 	b.onTerminal = func(taskID string) {
 		if taskID == "task-1" && !seen.Swap(true) {
 			_, ok := b.tombstones()[key]
-			tombstoned.Store(ok)
+			tombstoned <- ok
 		}
 	}
 	jobs := newFakeJobs(-1)
@@ -173,9 +177,13 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateFailed || !hasReason(ts, ReasonNoWorker) {
 		t.Fatalf("terminal %+v, want failed no-worker", ts)
 	}
-	waitFor(t, 5*time.Second, "the terminal hook", seen.Load)
-	if !tombstoned.Load() {
-		t.Error("the failed no-worker terminal went out before the tombstone")
+	select {
+	case ok := <-tombstoned:
+		if !ok {
+			t.Error("the failed no-worker terminal went out before the tombstone")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out after 5s waiting for the terminal hook")
 	}
 }
 
@@ -567,16 +575,25 @@ func TestAnUnsentJobOfferKeepsTheTaskQueued(t *testing.T) {
 	}
 }
 
-// A Job the admission policy refuses is reported in Health (and logged as an
-// error naming the upstream param-cache bug), the task stays queued, and the
-// report clears once a Job is admitted.
+// A Job the admission policy refuses, or one whose template param isn't the
+// rendering the config names, is reported in Health (and logged as an error),
+// the task stays queued, and the report clears once a Job is admitted.
 func TestAJobRefusedByThePolicyIsReported(t *testing.T) {
+	for name, launchErr := range map[string]error{
+		"policy":      fmt.Errorf("%w: forbidden by kube-agents-a2a-dispatcher-job", ErrJobRefusedByPolicy),
+		"stale param": fmt.Errorf("%w: profile inv's param holds rendering \"b\", the config names \"a\"", ErrJobTemplateNotCurrent),
+	} {
+		t.Run(name, func(t *testing.T) { jobRefusalIsReported(t, launchErr) })
+	}
+}
+
+func jobRefusalIsReported(t *testing.T, launchErr error) {
 	b := newBus(t, "job-task-1")
 	b.ensure("inv", 1, 0, "unattended")
 	b.worker("inv", "unattended", "job-task-1", answerAccept, 300*time.Millisecond)
 	jobs := newFakeJobs(0)
 	jobs.mu.Lock()
-	jobs.launchErr = fmt.Errorf("%w: forbidden by kube-agents-a2a-dispatcher-job", ErrJobRefusedByPolicy)
+	jobs.launchErr = launchErr
 	jobs.mu.Unlock()
 	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, nil), &fakeVerifier{}, jobs)
 	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
@@ -624,5 +641,48 @@ func TestAnUnreadableJobAtItsStartLimitKeepsTheTaskQueued(t *testing.T) {
 	}
 	if waiting == 0 {
 		t.Errorf("Health.Waiting %v: the task stays queued, so it shows as waiting", h.Waiting)
+	}
+}
+
+// A tier an administrator ends (#5850) while a task's Job is still coming
+// up ends the task canceled tier-ended at once, its Job deleted and its
+// submission tombstoned, with no breaker count: not failed no-worker when
+// the Job never gets a worker, which it wouldn't once the tier is torn down
+// (#6134).
+func TestATierEndedWhileItsJobStartsEndsTheTaskTierEnded(t *testing.T) {
+	b := newBus(t)
+	b.ensure("inv", 1, 0, "read", "unattended")
+	jobs := newFakeJobs(-1) // never ready
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) {
+		c.Profiles[0].Tiers = []string{"read", "unattended"}
+		c.Profiles[0].Durables = nil // derived from the tiers (#5649)
+		c.JobStartSeconds, c.BreakerThreshold = 60, 1
+	})
+	d, _ := b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the task's Job launched", func() bool { return jobs.launchCount() > 0 })
+	start := time.Now()
+	ti.update(func(c *lib.DispatchConfig) {
+		c.Profiles[0].Tiers = []string{"read"}
+		c.Profiles[0].Durables = nil // derived from the tiers and the drain (#5649)
+		c.Profiles[0].DrainingTiers = []lib.DrainingTier{{Tier: "unattended", Mode: "unattended", Until: time.Now().Add(2 * time.Minute), Ending: true}}
+	})
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonTierEnded) {
+		t.Fatalf("terminal %+v, want canceled %s", ts, ReasonTierEnded)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("ended %s after the tier was ended; want it within a refresh or two, not the Job's start window", took)
+	}
+	if !jobs.deleted("task-1") {
+		t.Error("the starting Job was not deleted")
+	}
+	waitFor(t, 5*time.Second, "the tombstone", func() bool {
+		_, ok := b.tombstones()[lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")]
+		return ok
+	})
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("breakers %v open; an administrator's end is no worker loss", open)
 	}
 }

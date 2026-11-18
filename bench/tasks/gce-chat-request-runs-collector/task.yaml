@@ -1,7 +1,8 @@
 # NIGHTLY-TIER: registered in hack/eval/nightly-cases.txt with
 # gce-startup-script-failure (docs/designs/bench-case-format.md,
-# "Registration"). The VM below is on every pool project: the fixture-state
-# scan of 2026-11-06 reads the startup-fail-vm role healthy on all 40.
+# "Registration"). The VM below is on every pool project. The fixture-state
+# scan checks that its failure line is on the serial console, and the
+# reconcile's reset of the VM keeps it there.
 #
 # What this case grades (#2386): a plain chat question about the fleet's
 # Compute Engine VMs and instance groups, one that names no SOP, gets the
@@ -23,10 +24,13 @@
 # Fixture: the startup-fail-vm role (bench/tf/fleet/fixtures.json), the
 # standalone VM startup-fail-<prefix> from bench/tf/fleet/main.tf
 # `google_compute_instance.startup_fail`. Its startup script exits 1 on every
-# boot, so the collector's gce-startup-script-status check (critical) flags
-# it with no age gate. The role is project-scoped, with no cluster slot.
-# CI: every pool project has the VM (#2483), and the fixture-state scan reads
-# the role healthy on every pool project. Dev: a targeted apply of
+# boot. The collector's gce-startup-script-status check (critical) flags it
+# while the failure line is still in the serial buffer, and the reconcile's
+# reset of the VM prints the line again. The role is project-scoped, with no
+# cluster slot.
+# CI: every pool project has the VM (#2483). The fixture-state scan checks
+# the failure line on its serial console, and the reconcile's reset keeps it
+# there. Dev: a targeted apply of
 # bench/tf/fleet plants it in the dev project. The dev install declares a
 # scope, so the chat command passes the fleet_scope tool's collector_args and
 # the collector sweeps only the declared projects; the VM has to be in one of

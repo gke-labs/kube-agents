@@ -26,7 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key, and, where enabled, the drift detector. Neither calls Google
    on the pod's own identity: both make their Google calls through the
    broker's watcher routes with a token for the `watcher` audience, which is
-   mounted here and in no other container.
+   mounted here and in no other container. And the
+   audit-report store listener on 8700, which renders with the A2A stack on every install.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
@@ -121,10 +122,15 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` limit, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
 roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
-idle-install hold on model-run cron jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` step of the
+catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
-operator normalises to `true` or `false` before it reaches that Pod. A name earns a
+operator normalises to `true` or `false` before it reaches that Pod. The three
+earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
+`KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
+the switch knows or `off`, and the agent pinned in its managed `.env` rather than
+through this list; the site's credential-isolation reference describes them. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -329,6 +335,13 @@ means the server has to hold it. The salt is read by the Chat Agent plugins,
 which also run in the sandbox, before any identity is written to disk; hashing
 it anywhere else would mean shipping the plaintext address out of the sandbox
 first, which is exactly what it exists to prevent.
+
+The sandbox holds one more Secret-backed value, `A2A_ACTIVITY_SECRET`: the key
+hermes signs its tool-call deliveries to the bridge sidecar's loopback door with.
+It is pod-scoped like the two above, and hermes needs it in its own process. The
+activity signing key is withheld from child processes: `_run_env` in
+`agent_common_server.py` drops it from every child it spawns, so the gcloud,
+kubectl and hermes CLI children see only the two Session KV values.
 
 Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
@@ -799,11 +812,27 @@ on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
+With the kube-api proxy in use (`KUBE_PROXY_URL` set in the shell sandbox),
+the shim answers a `get-credentials` that names its cluster, one location and
+`--project` itself (#5447). One `/v1/gcp/` read of the cluster (the relay's
+`gcp.api.container.clusters-get` route, on the broker's identity) checks that
+the cluster exists and is running. Then the shim writes the same kube-proxy
+kubeconfig it builds from a broker answer. No broker command runs, so there is
+no command audit line (the relay's line names the principal and the path) and
+no managed kubeconfig is filed for that cluster. Any other answer, any other
+argv, and a profile task's call go to the broker as above. The read carries the
+`X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
+cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
+`get-credentials`, which refuses that cluster itself. The header only narrows:
+without it the read is unchanged, so other control-plane reads of an excluded
+cluster stay allowed.
+
 Consequences:
 
 - Naming a cluster is not additional authority. `get-credentials` is bound by
   the same Workload Identity the broker already holds, so the sandbox can only
-  name clusters that identity could already reach.
+  name clusters that identity could already reach. The relay read that answers
+  a `get-credentials` in the shim runs on that identity too.
 - Only GKE contexts are supported, because the context name is what makes
   regeneration possible. A pin the proxy cannot regenerate from — no
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
@@ -1028,7 +1057,10 @@ host, method and path against the code allowlist in
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
 unchanged under a response cap and a deadline (a route with a projection, the GKE
-cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
+cluster list and get, returns its 2xx body cut down to the fields it names). One read is a
+`POST`, Logging `entries:list`: its JSON body is read under a size cap, held to the
+table's body check (one `projects/<project>`, no other resource), and forwarded as the
+runtime's own serialisation. The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
@@ -1205,7 +1237,8 @@ gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespa
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
 
 The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
-the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+the envelope keys and, on the records of the exec route, the Cloud API relay and the feedback
+route, the `tool_execution_audit` fields the site's
 [observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
 as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
 mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
@@ -1232,7 +1265,8 @@ needs the same treatment.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
-   normalised to `true` or `false`), secret volume, credential-state
+   normalised to `true` or `false`, and the three earned-autonomy switches,
+   normalised to a known value), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

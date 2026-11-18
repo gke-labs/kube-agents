@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -92,9 +93,10 @@ type filterConfig struct {
 	// excludedNamespaces suppresses events from these namespaces.
 	// Exclude rules take precedence over allowedNamespaces rules.
 	excludedNamespaces map[string]struct{}
-	// alertExclude holds the --alert-exclude rules: an event any of them
-	// matches opens no incident (gateAlertExcluded). Set after
-	// newFilterConfig, from parseAlertExclude.
+	// alertExclude holds the alert-exclude rules in force at start: an event
+	// any of them matches opens no incident (gateAlertExcluded). Set after
+	// newFilterConfig, from parseAlertExclude. The filter holds its own copy,
+	// which --alert-exclude-file replaces (see filter.alertExclude).
 	alertExclude []alertExcludeRule
 	// unhealthyMinCount specifies the minimum repeat threshold count for "Unhealthy"
 	// events before they pass. This prevents transient probe failures from triggering alerts.
@@ -316,6 +318,16 @@ const (
 	// still being started. Matched as a prefix so another writer that quotes
 	// the text mid-message does not match.
 	hostIPUnknownMessage = "Error: host IP unknown; known addresses:"
+	// podEtcHostsOpenPrefix and podEtcHostsMissingSuffix bound kubelet's event
+	// when building a container's config writes the pod's managed hosts file
+	// (makeHostsMount, <root-dir>/pods/<uid>/etc-hosts) after the pod's
+	// directory has been removed: os.WriteFile's PathError, "open <path>: no
+	// such file or directory", inside startContainer's "Error: ". A pod deleted
+	// while kubelet is still starting it, as Autopilot's balloon pods are. The
+	// path between is left open because kubelet's --root-dir moves it; the
+	// suffix names the pod's etc-hosts, not a host-network pod's /etc/hosts.
+	podEtcHostsOpenPrefix    = "Error: open "
+	podEtcHostsMissingSuffix = "/etc-hosts: no such file or directory"
 )
 
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
@@ -454,10 +466,26 @@ type filter struct {
 	fsLogMu     sync.Mutex
 	fsLogged    boundedEntries[filterGate]
 	fsLastSweep time.Time
+	// alertExclude is the alert-exclude rules in force: cfg.alertExclude at
+	// start, replaced whole when --alert-exclude-file changes (see
+	// reloadAlertExcludeFile). Read from every cluster's delivery goroutine.
+	alertExclude atomic.Pointer[[]alertExcludeRule]
 }
 
 func newFilter(cfg filterConfig) *filter {
-	return &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f := &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f.setAlertExclude(cfg.alertExclude)
+	return f
+}
+
+// alertExcludeRules is the alert-exclude rules in force.
+func (f *filter) alertExcludeRules() []alertExcludeRule {
+	return *f.alertExclude.Load()
+}
+
+// setAlertExclude puts rules in force for every event decided after it.
+func (f *filter) setAlertExclude(rules []alertExcludeRule) {
+	f.alertExclude.Store(&rules)
 }
 
 func (f *filter) clock() time.Time {
@@ -562,7 +590,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 			return gateNamespaceNotAllowed
 		}
 	}
-	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.cfg.alertExclude, ev) {
+	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.alertExcludeRules(), ev) {
 		return gateAlertExcluded
 	}
 	if ev.Key.Reason == "Unhealthy" && belowMinCount(ev.Count, f.cfg.unhealthyMinCount) {
@@ -908,11 +936,12 @@ func settleApplies(canonicalReason, message string) bool {
 // starts a container with no status whatever the restartPolicy, so kubelet
 // retries such an error on every pod sync while it lasts and stops only when
 // the pod is deleted: a lasting one crosses the settle period, and one whose
-// pod went with its node is never sighted again. A list of known messages
-// rather than "every Failed but the start errors", so a message not on it
-// still fires on its first sighting.
+// pod went with its node, or was deleted before it started, is never sighted
+// again. A list of known messages rather than "every Failed but the start
+// errors", so a message not on it still fires on its first sighting.
 func retriedConfigError(message string) bool {
-	return strings.HasPrefix(message, hostIPUnknownMessage)
+	return strings.HasPrefix(message, hostIPUnknownMessage) ||
+		(strings.HasPrefix(message, podEtcHostsOpenPrefix) && strings.HasSuffix(message, podEtcHostsMissingSuffix))
 }
 
 // settled reports whether the event's own sightings span the settle period.

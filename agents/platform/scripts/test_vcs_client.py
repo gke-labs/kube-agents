@@ -256,6 +256,23 @@ class ForgeCallTest(unittest.TestCase):
                 )
                 self.assertIn("issue-update", str(caught.exception))
 
+    def test_a_404_whose_json_body_is_not_an_object_reads_the_same_way(self):
+        """Through the real `vcs_call`: a 404 whose body is valid JSON but no
+        refusal document, from something in front of the wrong pod."""
+
+        def refuse(request, *args, **kwargs):
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(b"[]"))
+
+        # No token file: the call sends no header, whatever the shell exports.
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            vcs_client.credential_proxy_client, "open_broker_request", refuse
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("issue-update", {})
+        self.assertEqual(caught.exception.code, vcs_client.BROKER_ROUTE_UNSUPPORTED)
+        self.assertIn("issue-update", str(caught.exception))
+
     def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
         """The other half: a bare 404 is the only one read as a missing route.
 
@@ -471,6 +488,22 @@ class ProposalOpenedRecordTest(unittest.TestCase):
                     record["proposal"],
                     {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM, **expected},
                 )
+
+    TARGET = {"finding_id": "no-pdb.c.ns.Deployment/x", "cluster": "c", "namespace": "ns", "object": "Deployment/x"}
+
+    def test_a_target_goes_on_the_record_and_never_to_the_broker(self):
+        sent = []
+        stderr = io.StringIO()
+
+        def broker(verb, payload):
+            sent.append(dict(payload))
+            return dict(self.OPENED)
+
+        with mock.patch.object(vcs_client, "_call", broker), mock.patch("sys.stderr", stderr):
+            vcs_client.forge("proposal-create", {"title": "t"}, repository="acme/infra", target=self.TARGET)
+        [record] = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        self.assertEqual(record["proposal"]["target"], self.TARGET)
+        self.assertEqual(sent, [{"title": "t", "repository": "acme/infra"}])
 
     def test_the_returned_answer_has_no_claim_field(self):
         with mock.patch.object(vcs_client, "_call", lambda v, p: dict(self.CLAIMED)), \
@@ -1039,7 +1072,8 @@ class SnapshotTest(unittest.TestCase):
         )
         answer = self.snapshot(tar, ref="main", paths=["manifests", "README.md", "link"])
         self.assertEqual(
-            [("snapshot", {"repository": "acme/infra", "ref": "main", "paths": ["manifests", "README.md", "link"]})],
+            [("snapshot", {"repository": "acme/infra", "maxBytes": vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES,
+                           "ref": "main", "paths": ["manifests", "README.md", "link"]})],
             self.sent,
         )
         self.assertEqual("kind: app\n", (self.into / "manifests/app.yaml").read_text())
@@ -1060,6 +1094,19 @@ class SnapshotTest(unittest.TestCase):
 
     def test_no_ref_and_no_paths_send_neither(self):
         self.snapshot(build_tar(regular("a.txt")))
+        self.assertEqual(
+            [("snapshot", {"repository": "acme/infra", "maxBytes": vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES})], self.sent
+        )
+
+    def test_the_unpack_bound_goes_to_the_broker_as_max_bytes(self):
+        # So the broker refuses past it with the entries below, rather than
+        # serving a tree this side would then refuse with none.
+        self.snapshot(build_tar(regular("a.txt")), max_bytes=4096)
+        self.assertEqual([("snapshot", {"repository": "acme/infra", "maxBytes": 4096})], self.sent)
+
+    def test_a_bound_below_zero_stays_on_this_side(self):
+        with self.assertRaises(vcs_client.VcsError):
+            self.snapshot(build_tar(regular("a.txt")), max_bytes=-1)
         self.assertEqual([("snapshot", {"repository": "acme/infra"})], self.sent)
 
     def test_a_destination_that_is_not_empty_is_refused_before_the_call(self):

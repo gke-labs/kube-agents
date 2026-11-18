@@ -164,7 +164,7 @@ func TestReplicasLimitedConditionFollowsTheSpec(t *testing.T) {
 	// The condition is inside the unchanged comparison as well as the write:
 	// a status pass over the same state must not write again (#1392).
 	settled := got.ResourceVersion
-	if _, err := r.updateStatusReady(ctx, got, "", otlpSourceNone, r.resolveNetpolProfile(ctx, got), a2aProvisionState{}); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, got, "", otlpSourceNone, r.resolveNetpolProfile(ctx, got), a2aStateFrom(t, ctx, r, got)); err != nil {
 		t.Fatalf("updateStatusReady (settled) failed: %v", err)
 	}
 	again := &agentv1alpha1.PlatformAgent{}
@@ -217,6 +217,7 @@ func TestTheDegradedPathCarriesReplicasLimitedOnlyAfterARender(t *testing.T) {
 	}{
 		{"after a render", workloadRendered},
 		{"before a render", workloadNotRendered},
+		{"before the broker's reconcile", brokerNotReconciled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := haAgent("cap-degraded", 3)
@@ -233,8 +234,8 @@ func TestTheDegradedPathCarriesReplicasLimitedOnlyAfterARender(t *testing.T) {
 				t.Fatalf("updateStatusDegraded failed: %v", err)
 			}
 			cond := meta.FindStatusCondition(agent.Status.Conditions, replicasLimitedConditionType)
-			if bool(tc.rendered) != (cond != nil) {
-				t.Fatalf("%s present = %v after a pass with rendered=%v", replicasLimitedConditionType, cond != nil, tc.rendered)
+			if (tc.rendered == workloadRendered) != (cond != nil) {
+				t.Fatalf("%s present = %v after a pass %s", replicasLimitedConditionType, cond != nil, tc.name)
 			}
 			if cond != nil && cond.Reason != replicasLimitedReason {
 				t.Errorf("%s reason = %s, want %s", replicasLimitedConditionType, cond.Reason, replicasLimitedReason)

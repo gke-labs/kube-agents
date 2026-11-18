@@ -86,7 +86,7 @@ const (
 	msgBusWrongName  = " - set NATS_TLS_SERVER_NAME to a name it carries"
 	msgBusPlaintext  = "the bus answered without TLS - it may still be restarting onto its TLS listener"
 	msgBusCAFile     = "the console could not use its bus CA (NATS_CA_FILE): %v"
-	msgNoCredential  = "no console credential at %s"
+	msgNoCredential  = "no console credential at %s" // #nosec G101 -- an error message, not a credential
 	healthBody       = "ok\n"
 )
 
@@ -229,7 +229,7 @@ func configHandler(cfg Config, log *slog.Logger) http.HandlerFunc {
 			return
 		}
 		w.Header().Set(headerContentType, valueJSON)
-		if err := json.NewEncoder(w).Encode(servedConfig{User: cfg.User, Pass: pass}); err != nil {
+		if err := json.NewEncoder(w).Encode(servedConfig{User: cfg.User, Pass: pass}); err != nil { // #nosec G117 -- the endpoint hands the page its own bus credential, same-origin; marshalling it is the point
 			log.Error("console config write failed", "err", err)
 		}
 	}
@@ -279,7 +279,7 @@ func busTransport(cfg Config) *http.Transport {
 
 // loadBusCA reads the PEM CA the bus is verified against.
 func loadBusCA(path string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(path)
+	pem, err := os.ReadFile(path) // #nosec G304 -- the operator-set CA path (NATS_CA_FILE), not request data
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errBusCA, err)
 	}

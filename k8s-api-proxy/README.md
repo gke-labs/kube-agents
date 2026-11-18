@@ -1,6 +1,6 @@
 # k8s-api-proxy
 
-The Kubernetes API proxy for the agent sandbox (`<agent>-kube-proxy` deployment). The sandbox's
+The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
 `kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
 authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
@@ -12,10 +12,9 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 `cmd/k8s-api-proxy` builds the production server binary.
 
 `NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
-that a TokenReview on the host cluster finds valid for the configured audience, from a username on
-an allowlist, and caches each acceptance or refusal for ten seconds by default. The audience should
-be one the API server does not accept, so a token sent to the proxy cannot be used against the API
-server directly; the operator picks it. A review that fails is a 503 rather than a 401.
+that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
+be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
+server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
@@ -32,8 +31,9 @@ The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) wh
 ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
 `unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
-`upstream_error`, `canceled` when the caller gives up, or `aborted` when a response fails
-mid-copy otherwise or an upgrade's 101 cannot be written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
+`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap
+answered 429, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
+written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
 returned. The caller never sees that error, because it can name the upstream. A Secret response
@@ -79,6 +79,23 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+Cached responses and coalesced fetches are shared across callers, which is safe while the
+`UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
+transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
+authenticated caller is part of the cache and coalescing keys, so requests share a response or a
+fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
+the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
+partition needs the cache off (`Config.Cache` nil). Invalidation is not partitioned: a `401` or
+`403` in one partition evicts that resource's entries in every partition, which costs the others
+refetches but never serves one partition another's response.
+
+Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
+(`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
+archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
+archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
+prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
+it carry none.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash
@@ -86,3 +103,18 @@ gofmt -l .
 go vet ./...
 go test -race ./...
 ```
+
+`k8sapiproxy-test.yml` runs those and gosec, built from `k8s-operator/go.mod`'s pin (this module
+declares none); `make gosec` at the repository root runs the same scan over this module.
+
+Every kube-agents release `X.Y.Z` tags this module `k8s-api-proxy/vX.Y.Z` at the release commit,
+so a program can embed the handler with its own authenticator, upstream transport and audit sink:
+
+```bash
+go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
+```
+
+The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
+`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
+module until the module's own versioning is decided.

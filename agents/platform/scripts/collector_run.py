@@ -202,6 +202,44 @@ class Run(NamedTuple):
 
 RunFn = Callable[..., Run]
 
+# What a running cluster carries from the `clusters list` item that discovered
+# it, so a collector can take that cluster's node pools from the listing
+# instead of a `node-pools list` of its own. Every gcloud the broker runs costs
+# it most of a CPU-second, and that bounds how fast a sweep goes (#4081); the
+# listing's `nodePools[]` match `node-pools list` on every field the checks
+# read. Held for this run only, never written to the manifest.
+LISTING_ARGV_KEY = "listing_argv"
+LISTED_NODE_POOLS_KEY = "listed_node_pools"
+NODE_POOLS_FIELD = "nodePools"
+
+
+def listing_fields(item: dict, listing_argv: list[str]) -> dict:
+    """The keys a running cluster takes from its `clusters list` item: the
+    argv that listed it, and the item's `nodePools` only where the item has
+    the key, so an absent field stays distinguishable from an empty list."""
+    fields: dict = {LISTING_ARGV_KEY: list(listing_argv)}
+    if NODE_POOLS_FIELD in item:
+        fields[LISTED_NODE_POOLS_KEY] = item[NODE_POOLS_FIELD]
+    return fields
+
+
+def listed_node_pools(cluster: dict) -> tuple[Run | None, str]:
+    """The cluster's `node-pools list` answer from the listing that discovered
+    it, or `(None, why not)`, and the caller runs the real read.
+
+    The answer is the `Run` a successful `node-pools list` printing the same
+    JSON would be, so every gate and failure branch downstream treats the two
+    alike. Its `argv` is the discovery command, the read that produced the
+    pools, so a record built from it names a command a reader can rerun; its
+    stdout is the pools as sorted-key JSON, which is what the record's digest
+    covers."""
+    if LISTED_NODE_POOLS_KEY not in cluster or LISTING_ARGV_KEY not in cluster:
+        return None, "nodePools absent from the discovery listing"
+    pools = cluster[LISTED_NODE_POOLS_KEY]
+    if not isinstance(pools, list):
+        return None, f"nodePools in the discovery listing is a {type(pools).__name__}, not a list"
+    return Run(list(cluster[LISTING_ARGV_KEY]), 0, json.dumps(pools, sort_keys=True), "", 0.0), ""
+
 
 class Discovery(NamedTuple):
     """The projects a collector sweeps, and how complete that list is."""

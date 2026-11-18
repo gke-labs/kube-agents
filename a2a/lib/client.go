@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,29 @@ func TaskEventsSubject(addressee, taskID string) string {
 // one stream sequence. tasks/get folds both in that order.
 func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
+}
+
+// TaskProfileSupervisorToken marks the profile form of a supervisor subject:
+// a2a.tasks.p.{profile}.{taskId}.supervisor (gke-labs/kube-agents#5301). Six
+// tokens, so the gateway's five-token grant on a2a.tasks.*.*.supervisor can
+// never match a profile task's supervisor subject, which the dispatcher alone
+// writes, and the subject stays on TASKS (a2a.tasks.>) beside the task's
+// events, in one stream order for tasks/get. The token count is what keeps the
+// two forms apart (a five-token subject whose addressee is "p" still parses as
+// five tokens); task ids are single subject tokens everywhere they enter.
+const TaskProfileSupervisorToken = "p"
+
+// ProfileSupervisorSubject is a profile task's supervisor subject in its
+// profile form. Nothing publishes it yet: readers accept it beside
+// TaskSupervisorSubject until the dispatcher moves to it (#5301).
+func ProfileSupervisorSubject(profile, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s", TaskProfileSupervisorToken, profile, taskID, TaskClassSupervisor)
+}
+
+// IsTaskSupervisorSubject reports whether subject is the task's supervisor
+// subject in either form.
+func IsTaskSupervisorSubject(subject, addressee, taskID string) bool {
+	return subject == TaskSupervisorSubject(addressee, taskID) || subject == ProfileSupervisorSubject(addressee, taskID)
 }
 
 // TaskSubmitSubject is where a new task for a profile is submitted (added
@@ -95,14 +119,21 @@ func AgentSubject(profile string) string {
 }
 
 // ParseTaskSubject splits a task subject into its addressee, taskId, and
-// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). ok is false for
-// any other subject shape.
+// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). It reads the
+// profile supervisor form (ProfileSupervisorSubject) too, whose addressee is
+// the profile. ok is false for any other subject shape.
 func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool) {
 	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
 	if !found {
 		return "", "", "", false
 	}
 	parts := strings.Split(rest, ".")
+	if len(parts) == 4 && parts[0] == TaskProfileSupervisorToken && parts[3] == TaskClassSupervisor {
+		if parts[1] == "" || parts[2] == "" {
+			return "", "", "", false
+		}
+		return parts[1], parts[2], TaskClassSupervisor, true
+	}
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
 		return "", "", "", false
 	}
@@ -185,7 +216,7 @@ func fullJitterBackoff(attempt int) time.Duration {
 			ceil = d
 		}
 	}
-	return rand.N(ceil)
+	return rand.N(ceil) // #nosec G404 -- backoff jitter, not a secret
 }
 
 // msgIDHeaderOverhead is the wire cost of the Nats-Msg-Id header beyond the
@@ -233,10 +264,13 @@ func (c *Client) ProtocolViolations() int64 {
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	name      string
-	logger    *slog.Logger
-	natsOpts  []nats.Option
-	agreement AgreementPolicy
+	name     string
+	logger   *slog.Logger
+	natsOpts []nats.Option
+	// firstDialOpts apply to Connect's dial alone, never to a rebuild
+	// (WithFirstDialNATSOptions).
+	firstDialOpts []nats.Option
+	agreement     AgreementPolicy
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come
@@ -269,6 +303,16 @@ func WithNATSOptions(opts ...nats.Option) ClientOption {
 	return func(o *clientOptions) { o.natsOpts = append(o.natsOpts, opts...) }
 }
 
+// WithFirstDialNATSOptions adds nats.go options to Connect's first dial
+// only. A rebuild (the ClosedHandler recovery, Reconnect) dials without
+// them. For nats.RetryOnFailedConnect above all: on the first dial it lets
+// Connect return a connection that keeps trying in the background, but on a
+// rebuild it would make a failed dial look like success and skip the
+// rebuild's own backoff.
+func WithFirstDialNATSOptions(opts ...nats.Option) ClientOption {
+	return func(o *clientOptions) { o.firstDialOpts = append(o.firstDialOpts, opts...) }
+}
+
 // Connect dials NATS and establishes JetStream. All four connection callbacks
 // — disconnected, reconnected, closed, error — are registered here and logged
 // with the server error that triggered them (NR-3).
@@ -284,7 +328,7 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 	if c.log == nil {
 		c.log = slog.Default()
 	}
-	nc, js, err := c.dial()
+	nc, js, err := c.dial(c.opts.firstDialOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +339,7 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 // dial builds a fresh connection with the callback set. It never touches
 // existing connection objects, so the rebuild path (NR-2) can call it against
 // a dead predecessor.
-func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
+func (c *Client) dial(extra ...nats.Option) (*nats.Conn, jetstream.JetStream, error) {
 	// Order matters: overridable defaults, then the caller's options, then the
 	// four connection callbacks — last, so nothing can displace them (NR-3).
 	opts := []nats.Option{
@@ -305,6 +349,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	}
 	opts = append(opts, TLSOptions()...)
 	opts = append(opts, c.opts.natsOpts...)
+	opts = append(opts, extra...)
 	opts = append(opts,
 		// NR-6: jittered backoff on every reconnection attempt, library-owned
 		// like the callbacks below.
@@ -658,6 +703,67 @@ type SubscribeConfig struct {
 	// provision Job's TASKS stream can trail by more than the window while a
 	// three-server bus forms). The wait is logged; see startWithRetry.
 	WaitForStream bool
+	// AcceptFilterSets are further filter sets a Precreated durable may
+	// carry and still be bound, while the operator moves it from one set to
+	// another (gke-labs/kube-agents#5301: the gateway's relay gains the profile
+	// supervisor form). The subscriber reads whatever the durable delivers.
+	AcceptFilterSets [][]string
+	// Precreated binds to a durable the operator created and never creates
+	// or updates one (#4173): the subscriber needs no consumer-create grant
+	// for it, and holds none on its name. Until the operator has made it, the
+	// bind waits as WaitForStream waits for the stream.
+	Precreated bool
+}
+
+// ErrPrecreatedBindRefused is a Precreated bind refused because the durable
+// under the name is not the one this subscriber reads: retrying cannot
+// change it, so the bind fails at once.
+var ErrPrecreatedBindRefused = errors.New("pre-created durable refused")
+
+// checkPrecreated refuses a pre-created durable whose stored config is not
+// the one this subscriber would have created: its filters, explicit acks,
+// pull delivery, the MaxAckPending cap when one is set, and no inactivity
+// threshold, which would have the server delete a durable this subscriber
+// never re-creates. The provision Job brings a durable an older reader made
+// to these settings, so one that still differs was made some other way, and
+// would otherwise be bound as found and read with the wrong filter.
+func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
+	want := cfg.filterSubjects()
+	have := got.FilterSubjects
+	if got.FilterSubject != "" {
+		have = []string{got.FilterSubject}
+	}
+	refuse := func(why string) error {
+		return fmt.Errorf("%w: %s on %s %s", ErrPrecreatedBindRefused, cfg.Durable, cfg.Stream, why)
+	}
+	sameSet := func(a, b []string) bool {
+		return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
+	}
+	accepted := sameSet(have, want)
+	for _, alt := range cfg.AcceptFilterSets {
+		accepted = accepted || sameSet(have, alt)
+	}
+	switch {
+	case !accepted:
+		return refuse(fmt.Sprintf("filters %q, not %q", have, want))
+	case got.AckPolicy != jetstream.AckExplicitPolicy:
+		return refuse(fmt.Sprintf("acks %s, not explicit", got.AckPolicy))
+	case got.DeliverSubject != "":
+		return refuse("is a push consumer")
+	case got.DeliverPolicy != jetstream.DeliverAllPolicy || got.OptStartSeq != 0 || got.OptStartTime != nil:
+		return refuse(fmt.Sprintf("starts at %s, not the start of the stream", got.DeliverPolicy))
+	case got.HeadersOnly:
+		return refuse("delivers headers only")
+	case got.ReplayPolicy != jetstream.ReplayInstantPolicy:
+		return refuse(fmt.Sprintf("replays %s, not instantly", got.ReplayPolicy))
+	case got.MaxDeliver > 0:
+		return refuse(fmt.Sprintf("stops redelivering after %d attempts", got.MaxDeliver))
+	case cfg.MaxAckPending > 0 && got.MaxAckPending != cfg.MaxAckPending:
+		return refuse(fmt.Sprintf("caps unacked deliveries at %d, not %d", got.MaxAckPending, cfg.MaxAckPending))
+	case got.InactiveThreshold > 0:
+		return refuse(fmt.Sprintf("is deleted after %s inactive, and this subscriber never re-creates it", got.InactiveThreshold))
+	}
+	return nil
 }
 
 // filterSubjects is the consumer's filter set, however it was spelled.
@@ -812,7 +918,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			}
 			return nil
 		}
-		if errors.Is(err, ErrHeldBindRefused) {
+		if errors.Is(err, ErrHeldBindRefused) || errors.Is(err, ErrPrecreatedBindRefused) {
 			return err
 		}
 		if serverAnswered(err) {
@@ -826,10 +932,12 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		// an attempt on it fails on jetstream's own API timeout, a
 		// context.DeadlineExceeded no error check can tell apart.
 		waitingFor := ""
-		if s.cfg.WaitForStream && ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
+		if (s.cfg.WaitForStream || s.cfg.Precreated) && ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
 			switch {
 			case errors.Is(err, jetstream.ErrStreamNotFound):
 				waitingFor = "stream"
+			case s.cfg.Precreated && errors.Is(err, jetstream.ErrConsumerNotFound):
+				waitingFor = "consumer"
 			case connectionLost(err) || !s.c.Connected():
 				waitingFor = "connection"
 			}
@@ -848,6 +956,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				if waitingFor == "stream" {
 					s.c.log.Warn("still waiting for the stream; nothing has created it",
 						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else if waitingFor == "consumer" {
+					s.c.log.Warn("still waiting for the durable; the operator creates it",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
 				} else {
 					s.c.log.Warn("still waiting for the bus connection to return",
 						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt, "err", err)
@@ -856,6 +967,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				lastLog = now
 				if waitingFor == "stream" {
 					s.c.log.Info("waiting for the stream to be created",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else if waitingFor == "consumer" {
+					s.c.log.Info("waiting for the operator to create the durable",
 						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
 				} else {
 					s.c.log.Info("waiting for the bus connection to return",
@@ -950,6 +1064,19 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 		cons, err := s.held.bind(ctx, js, s.cfg)
 		if err != nil {
 			return err
+		}
+		return s.consume(cons)
+	}
+	if s.cfg.Precreated {
+		cons, err := js.Consumer(ctx, s.cfg.Stream, s.cfg.Durable)
+		if err != nil {
+			return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
+		}
+		if err := s.cfg.checkPrecreated(cons.CachedInfo().Config); err != nil {
+			return err
+		}
+		if s.deferred != nil {
+			s.deferred.bound(cons)
 		}
 		return s.consume(cons)
 	}

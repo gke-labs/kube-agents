@@ -66,7 +66,7 @@ func TestARiggedPublicKeyInTheSecretCannotReachTheConfig(t *testing.T) {
 	}
 
 	agent := identityTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil).Data["nats.conf"])
 	if strings.Contains(conf, "pwned") {
 		t.Errorf("the injected payload reached nats.conf:\n%s", conf)
 	}

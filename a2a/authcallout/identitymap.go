@@ -21,14 +21,16 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // AccountControl and AccountApp are the two NATS accounts the callout will
 // issue a user into: control-plane writers in TRUSTED and runtime workloads in
-// APP. Narrowed identities (session and profile workers) may only be minted
-// into AccountApp.
+// APP. Session and profile workers' narrowed identities are minted only into
+// AccountApp, and the dispatcher's (NarrowingDispatcher) only into
+// AccountControl.
 const (
 	AccountControl = "TRUSTED"
 	AccountApp     = "APP"
@@ -66,6 +68,18 @@ const (
 type Grants struct {
 	Publish   []string `json:"publish"`
 	Subscribe []string `json:"subscribe"`
+	// DenyPublish and DenySubscribe subtract from the allows on their side:
+	// the server enforces a subject only if an allow matches it and no deny
+	// does. They only narrow. An entry still needs a non-empty allow on both
+	// sides (validate), so a deny never stands for "everything but", and an
+	// entry whose grants are derived (a narrowed one) carries none.
+	DenyPublish   []string `json:"denyPublish,omitempty"`
+	DenySubscribe []string `json:"denySubscribe,omitempty"`
+}
+
+// hasAny reports whether g names any subject, allow or deny.
+func (g Grants) hasAny() bool {
+	return len(g.Publish) > 0 || len(g.Subscribe) > 0 || len(g.DenyPublish) > 0 || len(g.DenySubscribe) > 0
 }
 
 // Identity is one entry in the map: a Kubernetes ServiceAccount, the NATS user
@@ -94,7 +108,10 @@ type Identity struct {
 	// NarrowingProfile. Such an entry MUST carry no
 	// grants, and the map is refused if it does — see session.go for why an
 	// entry that could hold real grants AND be narrowed is one skipped code
-	// path away from handing every session everything.
+	// path away from handing every session everything. NarrowingDispatcher
+	// is the exception: its grants are its control connection's and are
+	// required on both sides, and only its bucket connections' per-profile
+	// grants are derived (dispatcher_narrowing.go).
 	Narrowing string `json:"narrowing,omitempty"`
 
 	// Profile is the AgentProfile a NarrowingProfile entry executes for: the
@@ -113,6 +130,23 @@ type Identity struct {
 	// Optional while an operator from before per-tier identities can still
 	// render the map; when set it must be a known tier.
 	Tier string `json:"tier,omitempty"`
+
+	// Draining names the profiles a NarrowingDispatcher entry still holds
+	// grants for after they left the map: removed or refused profiles whose
+	// tasks are still being drained. They have no profile entry to derive
+	// from, so the operator lists them here, by name only. A draining
+	// profile has no durables left, so a tier would select nothing. Set only
+	// with that narrowing.
+	Draining []string `json:"draining,omitempty"`
+	// NotAfter, when set, is the instant this entry stops authenticating
+	// anything, and every JWT minted from it expires by then: the server
+	// closes a connection when its JWT expires, so a connection made just
+	// before NotAfter does not outlive it. The operator sets it on the bus
+	// migration's per-run principals at the run's deadline, so a run that
+	// overstays it, or an operator that never removes the entry, leaves no
+	// working credential behind. Only on an entry that names its grants: a
+	// narrowed entry's lifetime is its pod's and its task credential's.
+	NotAfter *time.Time `json:"notAfter,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -155,10 +189,7 @@ func ParseIdentityMap(raw []byte) (*IdentityMap, error) {
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
-	m.users = make(map[string]struct{}, len(m.Identities))
-	for _, u := range m.Users() {
-		m.users[u] = struct{}{}
-	}
+	m.users = servedUsers(&m)
 	return &m, nil
 }
 
@@ -211,6 +242,40 @@ func validateIdentities(identities []Identity) error {
 		seenSA[id.ServiceAccount] = true
 		seenUser[id.User] = true
 	}
+	// A dispatcher's bucket connections take the users <user>-b<n>, each with
+	// its own inbox. No entry may hold one of those names, and nor may a
+	// profile, whose addressee a bucket user would then share. One
+	// dispatcher entry per map: two would split one profile's grants
+	// between two principals.
+	dispatchers := 0
+	for i, id := range identities {
+		if id.Narrowing != NarrowingDispatcher {
+			continue
+		}
+		if dispatchers++; dispatchers > 1 {
+			return fmt.Errorf("identity %d: a second entry narrows on %q", i, NarrowingDispatcher)
+		}
+		for _, u := range dispatcherBucketUsers(id.User) {
+			if seenUser[u] {
+				return fmt.Errorf("identity %d: user %q is one of dispatcher %q's bucket users", i, u, id.User)
+			}
+		}
+	}
+	if dispatchers == 1 {
+		buckets := map[string]bool{}
+		for _, id := range identities {
+			if id.Narrowing == NarrowingDispatcher {
+				for _, u := range dispatcherBucketUsers(id.User) {
+					buckets[u] = true
+				}
+			}
+		}
+		for i, id := range identities {
+			if id.Narrowing == NarrowingProfile && buckets[id.Profile] {
+				return fmt.Errorf("identity %d: profile %q is the name of a dispatcher bucket user", i, id.Profile)
+			}
+		}
+	}
 	return nil
 }
 
@@ -243,16 +308,31 @@ func (id Identity) validate() error {
 		return fmt.Errorf("user %q names account %q, which this callout will not mint into (allowed: %v)",
 			id.User, id.Account, mintableAccounts)
 	}
-	if id.Narrowing != "" && id.Account != AccountApp {
+	// Narrowed entries land in APP, except the dispatcher's, which is a
+	// control-plane principal and lands in TRUSTED, exactly (#5381).
+	if id.Narrowing == NarrowingDispatcher {
+		if id.Account != AccountControl {
+			return fmt.Errorf("user %q narrows on %q and must land in account %q, not %q",
+				id.User, id.Narrowing, AccountControl, id.Account)
+		}
+	} else if id.Narrowing != "" && id.Account != AccountApp {
 		return fmt.Errorf("user %q narrows on %q and must land in account %q, not %q",
 			id.User, id.Narrowing, AccountApp, id.Account)
 	}
-	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+	if id.Narrowing != NarrowingDispatcher && len(id.Draining) > 0 {
+		return fmt.Errorf("user %q lists draining profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
+	}
+	// Deny entries count: a narrowed entry carrying only a deny would still
+	// be a grant someone wrote into the map.
+	hasGrants := id.Grants.hasAny()
 	// The profile fields mean something only under NarrowingProfile. On any
 	// other entry they would be read by nothing, and a field the callout
 	// silently ignores is a grant someone believes exists.
 	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil || id.Tier != "") {
 		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
+	}
+	if id.NotAfter != nil && id.Narrowing != "" {
+		return fmt.Errorf("user %q carries notAfter but narrows on %q; only an entry that names its grants expires that way", id.User, id.Narrowing)
 	}
 	switch id.Narrowing {
 	case "":
@@ -267,9 +347,10 @@ func (id Identity) validate() error {
 		//
 		// This is checked per side rather than across both because the
 		// server is per side. There is deliberately no way to spell "may
-		// publish nothing" here: Grants carries no deny list, so a
-		// principal that must not publish cannot be expressed as an empty
-		// allow list and has to be refused rather than silently widened.
+		// publish nothing" here: the deny lists only subtract from a
+		// non-empty allow, so a principal that must not publish cannot be
+		// expressed as an empty allow list, with or without a deny, and has
+		// to be refused rather than silently widened.
 		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
 			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
 				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
@@ -283,17 +364,38 @@ func (id Identity) validate() error {
 		// new name. An entry that is unusable without its claim cannot be
 		// widened by editing the map alone.
 		if hasGrants {
-			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
-				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 		}
 	case NarrowingProfile:
 		// The same fail-closed shape as NarrowingPod: the map carries the
 		// profile and its topics, never subjects.
 		if hasGrants {
-			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
-				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish, %d subscribe, %d publish-deny and %d subscribe-deny",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe), len(id.Grants.DenyPublish), len(id.Grants.DenySubscribe))
 		}
 		if err := validateProfileEntry(id); err != nil {
+			return err
+		}
+	case NarrowingDispatcher:
+		// The entry's grants are the control connection's, and are served
+		// as written, so they get the un-narrowed entry's both-sides check.
+		// No per-profile subject is in the map: a bucket connection's grants
+		// come from the profile entries and the draining names. The
+		// draining names are checked here for shape. The callout checks
+		// them against its reserved names at the mint, since the map can't
+		// see those.
+		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
+			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
+				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+		// No deny on the dispatcher's entry for now: its grants are also the
+		// base a bucket connection's are built from, and a deny there would
+		// need its own reasoning about what reaches each bucket.
+		if len(id.Grants.DenyPublish) > 0 || len(id.Grants.DenySubscribe) > 0 {
+			return fmt.Errorf("user %q narrows on %q and may not carry deny lists", id.User, id.Narrowing)
+		}
+		if err := validateDispatcherEntry(id); err != nil {
 			return err
 		}
 	default:
@@ -331,10 +433,7 @@ func AssembleIdentityMap(shards []*IdentityMap) (*IdentityMap, error) {
 		return nil, fmt.Errorf("the assembled identity map: %w", err)
 	}
 	m := &IdentityMap{Version: version, Shard: 0, Shards: 1, Identities: identities}
-	m.users = make(map[string]struct{}, len(m.Identities))
-	for _, u := range m.Users() {
-		m.users[u] = struct{}{}
-	}
+	m.users = servedUsers(m)
 	return m, nil
 }
 
@@ -375,20 +474,34 @@ func (m *IdentityMap) Users() []string {
 	return users
 }
 
-// servesUser reports whether name is a user of one of this map's entries.
+// servedUsers is the set servesUser answers from: every entry's user, and a
+// dispatcher entry's bucket users, whose inboxes no narrowed pod may take.
+func servedUsers(m *IdentityMap) map[string]struct{} {
+	users := make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		users[u] = struct{}{}
+	}
+	for _, id := range m.Identities {
+		if id.Narrowing == NarrowingDispatcher {
+			for _, u := range dispatcherBucketUsers(id.User) {
+				users[u] = struct{}{}
+			}
+		}
+	}
+	return users
+}
+
+// servesUser reports whether name is a user of one of this map's entries, or
+// one of a dispatcher entry's bucket users.
 // ParseIdentityMap builds the set, and Store.Update installs nothing else, but
 // a map built any other way (a test writing the store directly) has no set; it
 // falls back to scanning the entries rather than reporting no users, so the
 // refusal fails closed.
 func (m *IdentityMap) servesUser(name string) bool {
-	if m.users == nil {
-		for _, id := range m.Identities {
-			if id.User == name {
-				return true
-			}
-		}
-		return false
+	users := m.users
+	if users == nil {
+		users = servedUsers(m)
 	}
-	_, ok := m.users[name]
+	_, ok := users[name]
 	return ok
 }

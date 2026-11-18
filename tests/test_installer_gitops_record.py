@@ -61,6 +61,26 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
         )
         self.assertIn("org=acme repo=infra app=5319154", proc.stdout, proc.stderr)
 
+    def test_the_minter_names_this_run_settled_reach_an_existing_install_env(self):
+        """A new install's derived minter names (#3504), or the next upgrade goes back to the project-wide ones."""
+        dest = self._tmp / "install.env"
+        dest.write_text("PROJECT_ID=p\nGITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=7\n")
+        proc = self._bash("export GITOPS_ORG=acme GITOPS_REPO=infra GITHUB_APP_ID=7 "
+                          "KMS_KEYRING=c1-minter-keyring KMS_KEY=c1-minter-key GITHUB_MINTER_GSA_NAME=c1-minter "
+                          "GITHUB_MINTER_KSA_NAME=c1-github-minter "
+                          "MINTER_SHARED_KEY=\n"
+                          f'record_github_gitops_keys "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        text = dest.read_text()
+        for line in ("KMS_KEYRING=c1-minter-keyring", "KMS_KEY=c1-minter-key", "GITHUB_MINTER_GSA_NAME=c1-minter",
+                     "GITHUB_MINTER_KSA_NAME=c1-github-minter"):
+            self.assertIn(line + "\n", text)
+        self.assertNotIn("MINTER_SHARED_KEY", text)
+        # A key shared on purpose is kept beside them.
+        proc = self._bash("export GITOPS_ORG=acme GITOPS_REPO=infra GITHUB_APP_ID=7 MINTER_SHARED_KEY=r/k\n"
+                          f'record_github_gitops_keys "{dest}"\n')
+        self.assertEqual(dest.read_text().count("MINTER_SHARED_KEY=r/k\n"), 1, dest.read_text())
+
     def test_a_value_this_run_changes_replaces_the_recorded_one_and_nothing_else(self):
         # A re-run that points GitOps at a new repository applies it, so the
         # file must follow or the next upgrade puts the old one back.
@@ -508,9 +528,9 @@ class UpgradeRefusalRemovesTheTfvarsTest(unittest.TestCase):
         arm = source[body_start:source.index("\n      ;;\n", body_start)]
         stubs = (
             "print_step() { :; }\nrefuse_apply_over_undeclared_scope() { :; }\n"
-            "announce_platform_agent_mode_for_apply() { :; }\ncheck_scope_container_access() { :; }\n"
-            "check_service_account_ownership() { :; }\nrefuse_full_apply_dropping_next() { :; }\n"
-            "refuse_next_slack_gateway_settings_from_env() { :; }\n"
+            "check_scope_container_access() { :; }\n"
+            "check_service_account_ownership() { :; }\n"
+            "refuse_slack_gateway_settings_from_env() { :; }\n"
             'refuse_apply_dropping_live_gitops() { echo "REFUSED gitops"; return 1; }\n'
             'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle() { echo "APPLIED terraform"; }\n'
         )

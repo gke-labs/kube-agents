@@ -16,13 +16,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // alertExcludeNameWildcard, as the last character of a rule's name, makes the
@@ -33,7 +36,21 @@ const (
 	alertExcludeRuleLogFormat    = "k8s-event-watcher: alert-exclude rule %d of %d: %s"
 	alertExcludeSummaryLogFormat = "k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s"
 	alertExcludeRefusedLogFormat = "k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident"
+	alertExcludeFileLogFormat    = "k8s-event-watcher: read alert-exclude rules from %s: %d in force"
+	alertExcludeKeptLogFormat    = "k8s-event-watcher: ALERT %v — the %d alert-exclude rules in force before this change stay in force"
+	alertExcludeReloadLogFormat  = "k8s-event-watcher: re-reading %s every %s for alert-exclude rule changes (--profiles-rescan)"
 )
+
+// alertExcludeFlag and alertExcludeFileFlag name the two sources of rules in
+// parse errors and log lines.
+const (
+	alertExcludeFlag     = "--alert-exclude"
+	alertExcludeFileFlag = "--alert-exclude-file"
+)
+
+// alertExcludeReadErrorMark starts the text reloadAlertExcludeFile records for
+// a file it could not read, so the record never equals a file's contents.
+const alertExcludeReadErrorMark = "\x00"
 
 // alertExcludeRule is one entry of --alert-exclude: events it matches open no
 // incident, while their cluster stays in scope for reads. Every part is
@@ -71,10 +88,12 @@ type alertExcludeCluster struct {
 }
 
 // parseAlertExclude reads --alert-exclude: a JSON list of rules, or empty for
-// none. Its errors number the rules from 1, as the startup log does. A rule with no parts, or whose only part is a bare wildcard name, is
-// refused, since it would silence every alert; the operator's emergency stop
-// (spec.harness.eventWatcher.enabled) is the tool for that.
-func parseAlertExclude(raw string) ([]alertExcludeRule, error) {
+// none. Its errors name source, where raw came from, and number the rules
+// from 1, as the startup log does. A rule with no parts, or whose only part is
+// a bare wildcard name, is refused, since it would silence every alert; the
+// operator's emergency stop (spec.harness.eventWatcher.enabled) is the tool
+// for that.
+func parseAlertExclude(source, raw string) ([]alertExcludeRule, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
 	}
@@ -82,20 +101,20 @@ func parseAlertExclude(raw string) ([]alertExcludeRule, error) {
 	dec.DisallowUnknownFields()
 	var rules []alertExcludeRule
 	if err := dec.Decode(&rules); err != nil {
-		return nil, fmt.Errorf("--alert-exclude is not a JSON list of rules: %w", err)
+		return nil, fmt.Errorf("%s is not a JSON list of rules: %w", source, err)
 	}
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, errors.New("--alert-exclude is not a JSON list of rules: text follows the list")
+		return nil, fmt.Errorf("%s is not a JSON list of rules: text follows the list", source)
 	}
 	for i, r := range rules {
 		if r.Cluster == nil && r.Namespace == "" && r.Reason == "" && r.Kind == "" && (r.Name == "" || r.Name == alertExcludeNameWildcard) {
-			return nil, fmt.Errorf("--alert-exclude rule %d sets no part, which would silence every alert", i+1)
+			return nil, fmt.Errorf("%s rule %d sets no part, which would silence every alert", source, i+1)
 		}
 		if r.Cluster != nil && r.Cluster.ClusterName == "" {
-			return nil, fmt.Errorf("--alert-exclude rule %d: cluster needs clusterName", i+1)
+			return nil, fmt.Errorf("%s rule %d: cluster needs clusterName", source, i+1)
 		}
 		if strings.Contains(strings.TrimSuffix(r.Name, alertExcludeNameWildcard), alertExcludeNameWildcard) {
-			return nil, fmt.Errorf("--alert-exclude rule %d: name takes %q only as its last character", i+1, alertExcludeNameWildcard)
+			return nil, fmt.Errorf("%s rule %d: name takes %q only as its last character", source, i+1, alertExcludeNameWildcard)
 		}
 	}
 	return rules, nil
@@ -108,13 +127,20 @@ func parseAlertExclude(raw string) ([]alertExcludeRule, error) {
 // never leave a partial list in force while the log says none is, and the
 // refused gauge is 1 so an alert can see it.
 func loadAlertExclude(raw string, m *metrics) []alertExcludeRule {
-	rules, err := parseAlertExclude(raw)
+	rules, err := parseAlertExclude(alertExcludeFlag, raw)
 	if err != nil {
 		log.Printf(alertExcludeRefusedLogFormat, err)
 		m.alertExcludeRules.Set(0)
 		m.alertExcludeRefused.Set(1)
 		return nil
 	}
+	reportAlertExclude(rules, m)
+	return rules
+}
+
+// reportAlertExclude logs each rule in force and sets the two gauges for a
+// list that parsed.
+func reportAlertExclude(rules []alertExcludeRule, m *metrics) {
 	m.alertExcludeRules.Set(float64(len(rules)))
 	m.alertExcludeRefused.Set(0)
 	for i, r := range rules {
@@ -123,7 +149,74 @@ func loadAlertExclude(raw string, m *metrics) []alertExcludeRule {
 	if len(rules) > 0 {
 		log.Printf(alertExcludeSummaryLogFormat, len(rules), gateAlertExcluded)
 	}
-	return rules
+}
+
+// reloadAlertExcludeFile reads --alert-exclude-file and, when its text differs
+// from seen, the text the last call acted on, puts the rules it holds in force
+// in f, logs them and sets the two gauges. A file that does not parse or
+// cannot be read changes no rule: the rules in force stay, an ALERT names the
+// error, and the refused gauge is 1 until a later change parses. Dropping the
+// rules instead would open an incident for every event they hold back, on a
+// typing error. It returns the text it acted on, for the next call's seen.
+//
+// At start f holds no rules and seen is empty, so an empty file logs nothing,
+// and a refused one leaves the watcher with no rules, as a refused
+// --alert-exclude does.
+func reloadAlertExcludeFile(path, seen string, f *filter, m *metrics) string {
+	raw, err := os.ReadFile(path) // #nosec G304 -- the operator-set --alert-exclude-file path, not event data
+	text := string(raw)
+	if err != nil {
+		text = alertExcludeReadErrorMark + err.Error()
+	}
+	if text == seen {
+		return seen
+	}
+	var rules []alertExcludeRule
+	if err == nil {
+		rules, err = parseAlertExclude(alertExcludeFileFlag+" "+path, text)
+	} else {
+		err = fmt.Errorf("%s: %w", alertExcludeFileFlag, err)
+	}
+	if err != nil {
+		// With no rules in force, as at start, the watcher fails open, and
+		// the ALERT says so as a refused --alert-exclude does.
+		if inForce := len(f.alertExcludeRules()); inForce > 0 {
+			log.Printf(alertExcludeKeptLogFormat, err, inForce)
+		} else {
+			log.Printf(alertExcludeRefusedLogFormat, err)
+		}
+		m.alertExcludeRefused.Set(1)
+		return text
+	}
+	f.setAlertExclude(rules)
+	log.Printf(alertExcludeFileLogFormat, path, len(rules))
+	reportAlertExclude(rules, m)
+	return text
+}
+
+// startAlertExcludeFile reads --alert-exclude-file into f now and, when
+// interval is above 0, again every interval until ctx ends, so a change to the
+// file is put in force without a restart (see reloadAlertExcludeFile). The
+// read at start is done before it returns, so the first event decided after
+// it sees the file's rules.
+func startAlertExcludeFile(ctx context.Context, path string, interval time.Duration, f *filter, m *metrics) {
+	seen := reloadAlertExcludeFile(path, "", f, m)
+	if interval <= 0 {
+		return
+	}
+	log.Printf(alertExcludeReloadLogFormat, path, interval)
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				seen = reloadAlertExcludeFile(path, seen, f, m)
+			}
+		}
+	}()
 }
 
 // String is the rule as the startup log names it: each part it sets, and in

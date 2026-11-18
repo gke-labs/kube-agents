@@ -58,6 +58,11 @@ func TestTheOperatorsProfilesMapParses(t *testing.T) {
 	want := map[string]string{
 		"provision": "", "session": NarrowingPod, "agent": "", "verifier": "",
 		"operator": "", "profile-auditor-read": NarrowingProfile, "profile-cluster-a-read": NarrowingProfile,
+		// The AgentProfile dispatcher, rendered by default, with its
+		// per-profile grants bucketed by default (#5381).
+		"dispatcher": NarrowingDispatcher,
+		// The gateway's token entry (#5301), beside its static user.
+		"gateway": "",
 	}
 	for _, id := range m.Identities {
 		narrowing, ok := want[id.User]
@@ -225,5 +230,8 @@ func TestTheOperatorsCardCarriesTheRoutingFieldsLibReads(t *testing.T) {
 	}
 	if card.ClusterRef != nil {
 		t.Errorf("an unpinned profile's card has clusterRef %+v", card.ClusterRef)
+	}
+	if !card.YieldToPinned {
+		t.Error("yieldToPinned didn't decode: the operator's JSON name and lib's differ")
 	}
 }

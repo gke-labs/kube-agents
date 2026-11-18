@@ -64,7 +64,8 @@ const (
 	// deploy/sandbox/sshd_config. Above 1024 so the daemon does not need
 	// CAP_NET_BIND_SERVICE, and not 22 so nothing in the cluster mistakes it for
 	// a node.
-	shellSandboxPort = 2222
+	shellSandboxPort      = 2222
+	shellSandboxComponent = "shell-sandbox"
 
 	// Operator-level override for installs mirroring images into a private
 	// registry, matching the "override" field of the agent-sandbox entry in
@@ -91,6 +92,9 @@ const (
 	shellSandboxSshdVolume     = "sshd"
 	shellSandboxKeysVolume     = "authorized-keys"
 	shellSandboxSettingsVolume = "settings"
+	// Hyperdisk Balanced (hyperdisk-balanced) rejects disks under 4 GB with HTTP 400
+	// InvalidArgument instead of rounding up; shares systemMetadataStorageSize.
+	shellSandboxSshdStorageSize = systemMetadataStorageSize
 
 	// The token the shell presents to the credential runtime. It mounts at
 	// credentialProxyTokenMountPath, the same path the agent pod uses, because a
@@ -118,6 +122,13 @@ const (
 	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
 	// root-owned file the script reads before the session's variable (#3439).
 	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+	// The earned-autonomy switches, each off unless spec.deployment.env names
+	// one of its other values. Forwarded for the same reason and in the same
+	// way as the audits' switch, and read by
+	// agents/platform/scripts/kubeagents_switches.py.
+	envPostMergeCheck = "KUBEAGENTS_POST_MERGE_CHECK"
+	envAutomerge      = "KUBEAGENTS_AUTOMERGE"
+	envDial           = "KUBEAGENTS_DIAL"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -555,6 +566,13 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 			Value: credentialProxyTokenMountPath + "/token",
 		})
+		// The exec tier, while it renders: the shim sends /v1/exec and
+		// /v1/gcp/ there and everything else to CREDENTIAL_PROXY_URL, and
+		// falls back to CREDENTIAL_PROXY_URL when it cannot connect. Read at
+		// start, so a change between 0 and a positive count rolls the sandbox.
+		if credentialProxyExecTierEnabled(agent) {
+			env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+		}
 		env = append(env,
 			corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
 			corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCACertFile},
@@ -567,6 +585,9 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			corev1.EnvVar{Name: envGKELocation, Value: harness.Location},
 			corev1.EnvVar{Name: envKubeContextName, Value: hostClusterContextName(agent)},
 		)
+	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
 	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
@@ -583,6 +604,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			}
 		}
 	}
+	env = append(env, autonomySwitchEnv(agent)...)
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)
@@ -601,6 +623,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	for k, v := range labels {
 		podLabels[k] = v
 	}
+	podLabels["kubeagents.x-k8s.io/component"] = shellSandboxComponent
 	return &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -629,6 +652,8 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
+					// ndots:3, see brokerCallerPodDNSConfig.
+					DNSConfig: brokerCallerPodDNSConfig(),
 					// Unannotated, so the metadata server has no GSA to hand
 					// either container. See shellSandboxServiceAccountName.
 					ServiceAccountName: shellSandboxServiceAccountName(agent),
@@ -701,11 +726,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// claims running throughout.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
-					// Sized from the agent's own /opt/data claim, not independently.
+					// Sized like the agent's own /opt/data claim, not independently.
 					// sandbox_mirror.py copies a subset of that volume into this one
 					// on upgrade, so matching them makes the migration fit by
 					// construction — see agentDataStorageSize. spec.storage.size
-					// moves both, through ResolveDataStorageSize.
+					// moves both, through ResolveDataStorageSize. The agent's claim
+					// alone adds the per-profile budget for
+					// spec.storage.expectedClusterProfiles: it covers the session
+					// stores, which the mirror does not copy.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -717,15 +745,15 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					},
 				},
 				{
-					// Two host keys and nothing else, so this is a minimum-size
-					// request rather than a sized one; the CSI driver rounds it up
-					// to whatever the storage class's disk type allows.
+					// Two host keys and nothing else, sized at the 4Gi Hyperdisk Balanced
+					// minimum because pd.csi.storage.gke.io rejects smaller hyperdisk-balanced
+					// claims with InvalidArgument rather than rounding them up.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxSshdVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
+								corev1.ResourceStorage: resource.MustParse(shellSandboxSshdStorageSize),
 							},
 						},
 					},
@@ -1070,6 +1098,17 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	return container
 }
 
+// sandboxBrokerPeers is the broker, and the exec tier while it renders.
+func sandboxBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+	}}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, credentialProxyExecTierPodPeer(agent))
+	}
+	return peers
+}
+
 // buildShellSandboxNetworkPolicy is deny-by-default in both directions, with
 // three holes: ssh in from the gateway, DNS out, and the broker's Service out.
 //
@@ -1083,7 +1122,8 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 // selects pods, so a broker sharing this pod would make every address it needs —
 // a GKE control plane per registered cluster, googleapis.com, chat.googleapis.com,
 // slack.com, github.com, the token minter — an address the *shell* may reach.
-// Off-pod, the shell's whole outbound world is DNS and one ClusterIP.
+// Off-pod, the shell's whole outbound world is DNS and the broker's pods: the
+// stateful broker, and the exec tier while it renders.
 // dnsIPs is the resolved Cluster DNS VIP list, the same one the gateway policy is
 // built from; an empty slice falls back to the standard VIP inside clusterDNSPeers.
 func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs []string) *networkingv1.NetworkPolicy {
@@ -1118,10 +1158,9 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs [
 
 	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 		// The credential proxy in a pod of its own. This is the connection
-		// every wrapped CLI in the sandbox makes.
-		To: []networkingv1.NetworkPolicyPeer{{
-			PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
-		}},
+		// every wrapped CLI in the sandbox makes; the exec tier, while it
+		// renders, takes its commands.
+		To: sandboxBrokerPeers(agent),
 		Ports: []networkingv1.NetworkPolicyPort{{
 			Protocol: &tcp,
 			Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
@@ -1267,4 +1306,58 @@ func buildShellSandboxClientKeyMount() corev1.VolumeMount {
 		MountPath: shellSandboxClientKeyPath,
 		ReadOnly:  true,
 	}
+}
+
+// autonomySwitchNames are the earned-autonomy switches, in the fixed order
+// they are rendered in; autonomySwitchValues lists the values each may take
+// besides "off", its default.
+var (
+	autonomySwitchNames  = []string{envPostMergeCheck, envAutomerge, envDial}
+	autonomySwitchValues = map[string][]string{
+		envPostMergeCheck: {"silent", "report"},
+		envAutomerge:      {"practice", "on"},
+		envDial:           {"on"},
+	}
+)
+
+// autonomySwitchSet returns spec.deployment.env's literal entry for the named
+// switch, and whether there is one; the last one when it is named twice, as a
+// container's env would take it. A valueFrom entry does not count: it could
+// name a credential neither pod may hold.
+func autonomySwitchSet(agent *agentv1alpha1.PlatformAgent, name string) (value string, ok bool) {
+	if agent.Spec.Deployment == nil {
+		return "", false
+	}
+	for _, v := range agent.Spec.Deployment.Env {
+		if v.Name == name && v.ValueFrom == nil {
+			value, ok = v.Value, true
+		}
+	}
+	return value, ok
+}
+
+// autonomySwitchValue is the named switch's value normalised to one it knows,
+// and "off" for anything else, unset included. The bytes on either pod are then
+// the operator's: a literal with a quote or a backslash would stop the sandbox
+// entrypoint before sshd starts.
+func autonomySwitchValue(agent *agentv1alpha1.PlatformAgent, name string) string {
+	raw, _ := autonomySwitchSet(agent, name)
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if slices.Contains(autonomySwitchValues[name], value) {
+		return value
+	}
+	return "off"
+}
+
+// autonomySwitchEnv returns the switches spec.deployment.env sets, normalised,
+// for the sandbox container. An unset switch is left out; the entrypoint writes
+// "off" for it.
+func autonomySwitchEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	for _, name := range autonomySwitchNames {
+		if _, ok := autonomySwitchSet(agent, name); ok {
+			env = append(env, corev1.EnvVar{Name: name, Value: autonomySwitchValue(agent, name)})
+		}
+	}
+	return env
 }

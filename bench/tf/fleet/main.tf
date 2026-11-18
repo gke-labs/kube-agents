@@ -18,7 +18,7 @@
 # defect-to-scenario map, and the scheduled re-apply of this stack is what
 # keeps the defects planted (GKE auto-upgrade would otherwise quietly heal
 # seeded-b's version lag, and a well-meaning cleanup would delete the orphan
-# disks).
+# disks and snapshots).
 #
 # The label is deliberately NOT managed-by=kube-agents-bench: that label is
 # what the eval orphan sweep in modules/cluster/gke deletes clusters by, and
@@ -129,8 +129,8 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # this account cannot read a Secret on platform-agent-host either. It is
 # project-scoped because IAM is where GKE authorization starts; the fleet
 # stack configures a kubernetes provider only for the clusters it plants
-# objects on, and seeded-c has none, so an RBAC-level grant could not cover
-# every cluster.
+# objects on (seeded-a, seeded-c and seeded-d; seeded-b carries none), so an
+# RBAC-level grant could not cover every cluster.
 #
 # hack/fleet-kubeconfigs.sh binds it by minting an access token
 # (FLEET_READONLY_SA), which is why the token-creator grant below exists.
@@ -150,13 +150,17 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 }
 
 # The project-scoped fixtures (the startup-fail VM, the world-open firewall
-# rule and its VM; fixtures.json roles with cluster_slot null) are Compute
-# Engine objects, which container.viewer cannot read. The CI health bot's scan
-# runs every gcloud read as this account, so the presence probe and the state
-# pass list instances and firewall rules as it (#2483, #2682).
+# rule and its VM, the peered mtu-peer-declared network, the two orphaned
+# snapshots; fixtures.json roles with cluster_slot null) are Compute Engine
+# objects, which container.viewer cannot read. The CI health bot's scan runs
+# every gcloud read as this account, so the presence probe and the state pass
+# list instances, firewall rules, networks and snapshots as it (#2483, #2682),
+# and the state pass reads the startup-fail VM's serial port output and lists
+# the snapshots' source disks as it.
 # roles/compute.viewer is get and list on Compute Engine resources, with no
-# create, update or delete. It does show instance metadata, so no secret goes
-# in this project's instance metadata.
+# create, update or delete. It does show instance metadata and serial port
+# output (compute.instances.getSerialPortOutput), so no secret goes in this
+# project's instance metadata or to a fleet VM's serial console.
 resource "google_project_iam_member" "fleet_reader_compute_viewer" {
   project = var.project_id
   role    = "roles/compute.viewer"
@@ -530,6 +534,57 @@ resource "google_container_node_pool" "pinned_inference_pool" {
   }
 }
 
+# Posture (capacity): a single-zone autoscaling pool that is zone-locked and
+# nothing else -- no NAP on the cluster, tainted so no multi-zone pool counts
+# as its fallback, and held at zero nodes so it never nears its ceiling (the
+# stockout SOP's 3.9 flags a pool at 90% of its ceiling as a second arm, and
+# a declaration covers the zone-locked arm alone). The pool project's GitOps
+# repository declares it on purpose in knowledge/notification-relay-no-pdb.md,
+# so the capacity audit lists it under Declared intent, not as a finding;
+# pinned-inference-pool above cannot play this part because its Pending
+# backlog and its 1/1 ceiling are the defect stockout-pinned-pool grades.
+# Zero nodes cost nothing; the taint keeps the autoscaler from ever adding
+# one for a stray pod. Catalogue role: declared-single-zone-pool.
+resource "google_container_node_pool" "declared_zonal_pool" {
+  name       = "declared-zonal-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 2
+  }
+
+  node_config {
+    machine_type    = "e2-small"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "declared-zonal"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "declared-zonal"
+      effect = "NO_SCHEDULE"
+    }
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's
@@ -628,11 +683,38 @@ resource "google_container_cluster" "seeded_b" {
 }
 
 resource "google_container_node_pool" "seeded_b_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_b.name
-  node_count = 1
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_b.name
+  # Two nodes, so GKE's own kube-system pods have room. seeded-b has a second
+  # node (no-surge-pool, defects-b.tf) that only pinned-batch-runner
+  # tolerates, so kube-dns's autoscaler asks for two replicas and a system
+  # Deployment's rolling update needs surge room; one e2-small at about 92%
+  # requested left kube-dns's second replica and event-exporter Pending,
+  # which workload_triage.py reports as `system unhealthy` and the fleet
+  # health triage case cannot call a healthy cluster. A node_count change is
+  # an in-place resize. No planted fixture reads this pool's node count: the
+  # surge and drain fixtures live on no-surge-pool, and the LB drain fixture
+  # reads the pool's instance group, which keeps its URL.
+  node_count = 2
   version    = local.lagging_version
+
+  # Each node's step waits out the LB drain fixture's 720 seconds
+  # (defects-b.tf), about 18 minutes. GKE's default surge of 1 would roll
+  # the two nodes one after the other, about 36 minutes, which beside a
+  # master update in the same apply can pass the reconcile's one-hour
+  # ceiling. Surging both at once keeps the roll one step. This is not a
+  # node-first pool, so the readiness surge-capacity rule names only
+  # no-surge-pool.
+  upgrade_settings {
+    max_surge       = 2
+    max_unavailable = 0
+  }
+
+  # Headroom over the one-step roll for the provider's 30-minute default.
+  timeouts {
+    update = "45m"
+  }
 
   # The pool takes the SAME derived pin as the master, and is deliberately
   # not ignore_changes'd: min_master_version moves the control plane at a
@@ -723,6 +805,22 @@ resource "google_container_cluster" "seeded_c" {
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
+
+  # Defect (networking): NodeLocal DNSCache off. GKE turns the add-on on by
+  # default on Standard from 1.34.1, and Autopilot cannot turn it off, so this
+  # is the one cluster in a pool project without it; every pod DNS lookup
+  # here crosses a kube-dns conntrack entry. Inert for the fixtures (pods
+  # resolve through kube-dns as before) and not a drift facet. An in-place
+  # cluster update that re-creates the pool's node: GKE documents the roll as
+  # one that honours the maintenance window above; on the dev fleet it ran
+  # during the apply (that apply also moved the pool's disk size, which rolls
+  # nodes too). The slot-c roles read absent for those minutes either way.
+  # Addressed by the no-nodelocal-dnscache role.
+  addons_config {
+    dns_cache_config {
+      enabled = false
+    }
+  }
 }
 
 # Defect (consistency, pool-level): the same cluster's default pool is the
@@ -745,12 +843,50 @@ resource "google_container_node_pool" "seeded_c_default" {
   cluster    = google_container_cluster.seeded_c.name
   node_count = 1
 
+  # Autoscaling held at one node (the pinned-inference-pool shape on slot a):
+  # a ComputeClass `nodepools` rule names only pools with autoscaling on, and
+  # without it GKE marks the class CrdMisconfigured ("Nodepool default-pool
+  # specified by name has autoscaling disabled", read 11-10 on a dev fleet),
+  # which stockout 3.12(b) would file on every project. One to one, so the
+  # autoscaler can neither add a node nor remove the one. Drift's
+  # pool-autoscaling facet flags only a cluster with LESS autoscaling than its
+  # peers (`_flag_less_only`), so the extra vote changes no drift finding.
+  # The stockout audit's 3.9 `single-zone-nodepool` does read a zonal
+  # autoscaled pool with no fallback, as it reads pinned-inference-pool on
+  # slot a; README.md's accepted-background table declares it.
+  autoscaling {
+    min_node_count = 1
+    max_node_count = 1
+  }
+
   node_config {
-    machine_type    = "e2-small"
+    # e2-medium since the ComputeClass fixtures (defects-c.tf): GKE's system
+    # pods request about 99 percent of an e2-small's allocatable memory
+    # (1,420 of 1,424 MiB, read 11-10 on a dev fleet at 1.36), so three of the
+    # five fixture pods sat Pending on it at 8Mi each. Memory, not CPU, is the
+    # binding constraint here, the same wall seeded-a hit (#1278, #3607). The
+    # provider updates machine_type in place and GKE re-creates the one node
+    # under the pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-medium"
     disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    # Defect (stockout): the pool is bound to ComputeClass general-ccc
+    # (defects-c.tf) by this label and carries no matching
+    # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, so the
+    # scheduler places untargeted pods on it until it is full and the
+    # autoscaler's pre-filter then drops them. With this the cluster has no
+    # untainted pool without a class label, which is what lets the
+    # obtainability audit's 3.24 file the untargeted workloads in
+    # defects-c.tf. A label change is an in-place pool update on provider 8.x
+    # (GKE relabels the node without re-creating it); the disk and kubelet
+    # settings around it stay the drift-pool-outlier fixture.
+    # Addressed by the untainted-compute-class-pool role.
+    labels = {
+      "cloud.google.com/compute-class" = "general-ccc"
+    }
 
     kubelet_config {
       cpu_cfs_quota = false
@@ -788,6 +924,97 @@ resource "google_compute_disk" "orphan_pd" {
   zone  = var.zone
 
   labels = local.fleet_labels
+}
+
+# Posture (compute): two Persistent Disk snapshots whose source disk is gone.
+# The GCE compute audit's §2.5 (`orphaned-snapshots`) flags a snapshot whose
+# `sourceDisk` names no live disk, that no snapshot schedule took, and that is
+# more than 90 full days old. Its own exclusion names a legal hold or a
+# compliance retention the collector cannot read, which is why the check is
+# proposed as the stream's one declarable posture: once it is, the pool
+# project's GitOps knowledge/ note declares `declared-orphan-snap-<prefix>`
+# on purpose and the audit lists it under Declared intent, while
+# `orphan-snap-<prefix>`, undeclared, stays a finding beside it (the control
+# that shows a declaration moved one snapshot and not the check). Catalogue
+# roles: declared-orphan-snapshot and orphan-snapshot.
+#
+# No resource can hold the shape: a google_compute_snapshot needs its source
+# disk at create time, and a google_compute_disk the state holds is re-created
+# by the next apply, which un-orphans the snapshot. So orphan_snapshot.py
+# plants it once: a 10 GB throwaway disk, the two snapshots of it, then the
+# disk deleted. The snapshots are the fixture; the disk is scaffolding, and
+# nothing in the state names either, so no plan ever re-creates the disk.
+#
+# AGE-GATED, the longest in the fleet: invisible to the audit for 91 days
+# (`(now - creationTimestamp).days > 90`), and creationTimestamp is
+# server-set and immutable -- backdating is impossible, do not try. The
+# fixture-state scan reports the roles NOT READY, never drifted, until the
+# date, so a project applied today is registrable.
+#
+# With nothing of theirs in the state, the daily re-apply would never notice
+# a snapshot a sweep deleted or a source disk someone re-created, so the
+# probe below reads both at plan time and its result is a trigger: a change
+# in what is missing or in the disk's presence plans a replace of the
+# planter (the standing reconcile-allow.json entry), and the re-run re-takes
+# the missing snapshot, with a fresh clock, or deletes the disk (by name, in
+# any zone, as the audit indexes live disks), and never touches a snapshot
+# that is there. A broken reading carries the time of the
+# read (`read_at`), because the stored trigger is the reading of the plan
+# that replaced the resource, the broken one on a repairing run, and the
+# same breakage recurring before the next clean plan would otherwise read
+# equal to it and plan nothing; a clean reading is the same empty value every
+# time, so the run after a repair plans one more replace, a no-op, and then
+# converges. A changed name below is a new snapshot with a new clock; the
+# old one is deleted by hand. `tofu destroy` leaves the snapshots (a few MB
+# of stored blocks each); they are removed by hand too, and the compute plant
+# sweep does not read them.
+locals {
+  orphan_snapshot_source = "orphan-snap-source-${var.cluster_prefix}"
+  # Each entry's `name =` is the form bench/tests/test_fleet_verifier.py reads
+  # to check that a catalogue probe names an object this stack plants.
+  orphan_snapshots = [
+    { name = "declared-orphan-snap-${var.cluster_prefix}" },
+    { name = "orphan-snap-${var.cluster_prefix}" },
+  ]
+  orphan_snapshot_names = [for snapshot in local.orphan_snapshots : snapshot.name]
+}
+
+# What the planter would repair, read at plan time as the reconciler: the
+# snapshot names not there and whether the source disk is back.
+data "external" "orphan_snapshots" {
+  program = ["python3", "${path.module}/orphan_snapshot.py", "probe"]
+  query = {
+    project = var.project_id
+    zone    = var.zone
+    source  = local.orphan_snapshot_source
+    names   = jsonencode(local.orphan_snapshot_names)
+  }
+}
+
+resource "terraform_data" "orphan_snapshots" {
+  # A changed script, source or name re-runs the planter on every project, and
+  # so does a probe that reads a snapshot missing or the source disk present;
+  # the script leaves what is already planted alone.
+  triggers_replace = [
+    filesha256("${path.module}/orphan_snapshot.py"),
+    local.orphan_snapshot_source,
+    jsonencode(local.orphan_snapshot_names),
+    data.external.orphan_snapshots.result.missing,
+    data.external.orphan_snapshots.result.source_disk,
+    data.external.orphan_snapshots.result.read_at,
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["python3"]
+    command     = "${path.module}/orphan_snapshot.py"
+    environment = {
+      ORPHAN_SNAPSHOT_PROJECT = var.project_id
+      ORPHAN_SNAPSHOT_ZONE    = var.zone
+      ORPHAN_SNAPSHOT_SOURCE  = local.orphan_snapshot_source
+      ORPHAN_SNAPSHOT_NAMES   = jsonencode(local.orphan_snapshot_names)
+      ORPHAN_SNAPSHOT_LABELS  = jsonencode(local.fleet_labels)
+    }
+  }
 }
 
 # Defect (networking): an etcd port open to the whole internet on a VM with an
@@ -866,12 +1093,49 @@ resource "google_compute_firewall" "world_open_deny_remote" {
   }
 }
 
+# Posture (networking): a jumbo-frame VPC peered with `default` (MTU 1460).
+# The networking audit's §2.4 (`mtu-packet-fragmentation`) flags two networks
+# joined by an ACTIVE peering at different MTUs; the SOP calls each network's
+# MTU a choice, not a defect, so the pair is a posture an owner can keep on
+# purpose (a storage or Interconnect network at 8896 beside a 1460 network
+# whose VMs cannot all restart to adopt a new MTU). Custom mode with no
+# subnet: nothing to overlap with `default`, no route exchanged, nothing to
+# bill (a VPC and a peering are free). The name carries no cluster_prefix, so
+# a declaration can spell the object without knowing the prefix, and it sorts
+# after `default`, so the collector's sorted pair reads
+# `NetworkPeering/default--mtu-peer-declared`. Both one-way halves are
+# needed: a peering with one half is INACTIVE, which the check skips. No
+# `labels`: a VPC network and a peering take none, so neither carries
+# fleet_labels. Until the stream's declared-intent slice lands, the finding
+# publishes and no case grades it. Catalogue role: declared-mtu-peering.
+resource "google_compute_network" "mtu_peer_declared" {
+  name                    = "mtu-peer-declared"
+  auto_create_subnetworks = false
+  mtu                     = 8896
+}
+
+resource "google_compute_network_peering" "default_to_mtu_peer_declared" {
+  name         = "default-to-mtu-peer-declared"
+  network      = "projects/${var.project_id}/global/networks/default"
+  peer_network = google_compute_network.mtu_peer_declared.self_link
+}
+
+resource "google_compute_network_peering" "mtu_peer_declared_to_default" {
+  name         = "mtu-peer-declared-to-default"
+  network      = google_compute_network.mtu_peer_declared.self_link
+  peer_network = "projects/${var.project_id}/global/networks/default"
+}
+
 # Defect (compute): a standalone VM whose startup script fails. The GCE
 # compute audit's §2.1 reads the serial console of every RUNNING instance that
 # runs a startup script and flags the guest agent's failure line, which on
 # current images is `Script "startup-script" failed with error: exit status 1`.
-# The script exits 1 on every boot, so the line is on the console from the
-# first boot onward, with no age gate. The audit reads the project, not a
+# The script exits 1 on every boot, and the guest prints the line once per
+# boot. The serial buffer keeps about 1 MiB, and this VM's guest agent logs
+# two errors an hour (it has no service account), so the line rotates out
+# about three weeks after a boot. hack/fleet_reconcile.py resets the VM after
+# each reconcile to print it again, and the fixture-state scan reads the
+# console for it (fixtures.json, startup-fail-vm). The audit reads the project, not a
 # cluster, so this needs no cluster slot. No external IP and no service
 # account: the VM does nothing but fail. The name leads with `startup-fail-`
 # so the case can grade `/startup-fail-`, which only the finding's object path

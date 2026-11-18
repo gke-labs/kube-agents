@@ -1,14 +1,12 @@
-"""The mode spec's grep rule, executable.
+"""The retired mode key has one writer and no reader, executable.
 
-docs/designs/spec-mode-switch.md: "A grep for KUBEAGENTS_MODE should hit
-exactly two places: the operator builder that writes it and the helper that
-reads it. A third hit is a review comment." One answer per agent, computed in
-one place -- a component reading its own env var is the drift this catches.
+The operator still pins KUBEAGENTS_MODE=next into the managed .env for an
+agent image from before spec.mode today was removed; nothing in the current
+tree reads it. A second hit is a new writer or a new reader, which is the
+drift this catches: the key goes away with the pin, not back into use.
 
-Test files are excluded (they cover the two legitimate sites, and there the
-literal is the expected value), as are docs, golden fixtures under testdata/,
-and this file. Everything else that names the key is a new writer or reader
-and fails here until the review conversation has happened.
+Test files are excluded (there the literal is the expected value), as are
+docs, golden fixtures under testdata/, and this file.
 """
 
 import pathlib
@@ -18,7 +16,6 @@ KEY = "KUBEAGENTS_MODE"
 
 ALLOWED = {
     "k8s-operator/internal/controller/platformagent_manifests.go",  # the writer
-    "agents/platform/scripts/runtime_mode.py",  # the reader
 }
 
 # testdata: golden fixtures are recorded render output — the writer's own
@@ -31,7 +28,7 @@ def _is_test_file(path: pathlib.Path) -> bool:
 
 
 class TestModeGrepRule(unittest.TestCase):
-    def test_key_appears_in_exactly_the_writer_and_the_reader(self):
+    def test_key_appears_in_exactly_the_writer(self):
         repo = pathlib.Path(__file__).resolve().parent.parent
         hits = set()
         for path in repo.rglob("*"):
@@ -50,7 +47,7 @@ class TestModeGrepRule(unittest.TestCase):
             hits,
             ALLOWED,
             f"{KEY} must appear in exactly the operator builder that writes it "
-            f"and the helper that reads it (spec-mode-switch.md). A new site is "
+            f"and no reader (the agent image dropped runtime_mode.py). A new site is "
             f"a review conversation, not a grep-test edit made in passing.",
         )
 

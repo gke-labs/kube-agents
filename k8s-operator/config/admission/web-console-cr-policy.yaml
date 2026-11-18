@@ -41,11 +41,17 @@
 #      Enterprise forge moves the host back to github.com, so the console cannot do that either.
 #   7. While the declaration has a forge the operator refuses in a way that lets that fallback
 #      move the GitHub host (GitHub forges at two hosts, a GitHub forge at the host of a forge of
-#      another provider, or a forge with no provider at a host that is not github.com's), the
-#      console may not add, remove or reorder forges, or change one's provider, host or namespace;
-#      it may still change `repositories`. A healthy declaration has none of these, so the check
-#      does not touch it, and the policy does not have to repeat the operator's host rules
-#      (reserved domains, other providers' domains, hostname checks), which would drift.
+#      another provider, or a forge with no provider at a host that is not github.com's), or GitHub
+#      forges that name two different CA bundles (the broker trusts the first one's for the GitHub
+#      host, so removing or reordering forges would switch it), the console may not add, remove or
+#      reorder forges, or change one's provider, host or namespace; it may still change
+#      `repositories`. A healthy declaration has none of these, so the check does not touch it, and
+#      the policy does not have to repeat the operator's host rules (reserved domains, other
+#      providers' domains, hostname checks), which would drift. A known limit: where only one CA
+#      bundle is named, on a GitHub forge the operator refuses for its namespace, a reorder, or a
+#      namespace change on that forge when it has no credentialsRef, can give the broker that
+#      bundle for the host or take it away. Catching it needs the operator's namespace rules. The
+#      console still cannot switch the host from one named bundle to another.
 #
 # Adding a repository on a forge with a credentialsRef still widens that forge's served
 # namespaces, and with them the token's allowed paths: adding repositories is the console's job, so
@@ -166,12 +172,25 @@ spec:
     - name: oldGitHubHosts
       expression: >-
         size(variables.oldGitHubForges) == 0 ? ['github.com'] : variables.oldGitHubForges.map(g, g.host)
+    # Each GitHub forge's CA bundle, as hostConflicts in gitspec.go compares them: the Secret name
+    # and key, trimmed. The operator keeps the first one for the GitHub host and refuses a GitHub
+    # forge that names a different one.
+    - name: oldGitHubCABundles
+      expression: >-
+        variables.oldForges.filter(f, has(f.caBundleRef) &&
+          (has(f.provider) && string(f.provider).trim() != '' ? string(f.provider).trim().lowerAscii() : 'github') == 'github')
+        .map(f, string(f.caBundleRef.name).trim() + '/' + (has(f.caBundleRef.key) ? string(f.caBundleRef.key).trim() : ''))
     # A declaration the operator already refuses in a way that lets GitHubHost fall back to another
     # forge: GitHub forges at two hosts (a healthy install has one), a GitHub forge at the host of a
     # forge of another provider, or a forge with no provider at a host that is not github.com's
-    # (the CRD refuses that now; an older object can hold one). Check 7 freezes forges in it.
+    # (the CRD refuses that now; an older object can hold one). Also GitHub forges that name two
+    # different CA bundles, where the first one's is the bundle the broker trusts for the GitHub
+    # host. This counts every GitHub forge, also one the operator refuses for another field, so it
+    # can freeze a declaration the operator accepts; that only stops the console, never an admin.
+    # Check 7 freezes forges in it.
     - name: oldForgesRefused
       expression: >-
+        variables.oldGitHubCABundles.exists(b, b != variables.oldGitHubCABundles[0]) ||
         variables.oldGitHubForges.exists(g, g.host != variables.oldGitHubForges[0].host) ||
         variables.oldGitHubForges.exists(g, variables.oldForgeHosts.exists(o, o.provider != 'github' && o.host == g.host)) ||
         variables.oldForges.exists(f, (!has(f.provider) || f.provider.trim() == '') && has(f.host) &&
@@ -200,7 +219,7 @@ spec:
     # Comparing these values rather than the raw forges admits the console's own save, which
     # spells out `provider: github` on a forge that left it out.
     - expression: "!variables.oldForgesRefused || variables.newForgeHosts == variables.oldForgeHosts"
-      message: "the web console may not add, remove, reorder or re-point forges while the declaration has a forge the operator refuses (GitHub forges at two hosts, a GitHub forge at another provider's host, or a forge with no provider at a non-GitHub host); an administrator must fix it first"
+      message: "the web console may not add, remove, reorder or re-point forges while the declaration has a forge the operator refuses (GitHub forges at two hosts or naming two CA bundles, a GitHub forge at another provider's host, or a forge with no provider at a non-GitHub host); an administrator must fix it first"
       reason: Forbidden
     # A forge that already existed (matched by name) keeps where its credential goes: its provider
     # and canonical host (oldForgeHosts), port, scheme, credentialsRef, caBundleRef and identity

@@ -31,6 +31,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import cron_catch_up_policy as ccp  # noqa: E402
 import cron_idle_policy as cip  # noqa: E402
 import profile_cron_tick as pct  # noqa: E402
 
@@ -201,6 +202,10 @@ class DispatchTest(unittest.TestCase):
         # PlatformAgent through whatever kubeconfig this machine has. An
         # active install, read from a stub, keeps these tests about dispatch.
         self._patch(cip, "read_signal", lambda environ=None: (datetime.now(timezone.utc), cip.SIGNAL_SOURCE_HUMAN))
+        # The catch-up policy runs next and would skip these fixtures' jobs,
+        # which are model-run entries years overdue on a minute-ly schedule.
+        # Off, so these tests stay about dispatch; the policy has its own.
+        self._patch_env(ccp.STAGGER_MINUTES_ENV, "0")
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
@@ -843,12 +848,12 @@ class HomeTargetEnvTest(unittest.TestCase):
         self.assertNotIn("GOOGLE_CHAT_ALLOWED_USERS", restored)
 
 
-class IdlePolicyThroughMainTest(unittest.TestCase):
-    """The issue's five scenarios, end to end through main().
+class ThroughMainCase(unittest.TestCase):
+    """A scratch install driven through main() with a stub `hermes`.
 
-    The signal reader is stubbed; everything else is the real path: the policy
-    rewrites the store under the lock, then the spawn filter reads it, so a
-    held job neither reaches the stub `hermes` nor stays due.
+    The idle signal reader is stubbed; everything else is the real path: a
+    policy rewrites the store under the lock, then the spawn filter reads it,
+    so a job a policy moved neither reaches the stub `hermes` nor stays due.
     """
 
     IDLE_DAY = datetime(2026, 8, 6, 6, 20, 30, tzinfo=timezone.utc)
@@ -931,6 +936,11 @@ class IdlePolicyThroughMainTest(unittest.TestCase):
         if not self.record.exists():
             return []
         return [line.split("|") for line in self.record.read_text().splitlines()]
+
+
+
+class IdlePolicyThroughMainTest(ThroughMainCase):
+    """The idle policy's five scenarios, end to end."""
 
     def roster(self):
         return (
@@ -1042,6 +1052,100 @@ class IdlePolicyThroughMainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("cron idle policy skipped: RuntimeError: torn state", out)
         self.assertIn("ticked 3 due job(s)", out)
+
+
+class CatchUpPolicyThroughMainTest(ThroughMainCase):
+    """The reported episode end to end through main(): two days at scaleToZero.
+
+    Everything but the `hermes` binary is the real path: the catch-up policy
+    rewrites the store under the lock, then the spawn filter reads it, so a
+    skipped audit neither reaches the stub `hermes` nor stays due, and a
+    deferred one comes back at its turn.
+    """
+
+    # A Wednesday 09:25:30; the install stopped on Monday at the same time.
+    RESUME = datetime(2026, 8, 5, 9, 25, 30, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self.now = self.RESUME
+        self.set_signal(self.now - timedelta(days=3))  # the pause is not idleness
+        self._patch_env(ccp.STAGGER_MINUTES_ENV, None)
+
+    def paused_roster(self):
+        stopped = self.RESUME - timedelta(days=2)
+        return (
+            self.prompt("compliance-audit", "20 6 * * *", datetime(2026, 8, 3, 6, 20, tzinfo=timezone.utc), stopped - timedelta(days=1)),
+            self.prompt("ai-security-audit", "50 8 * * *", datetime(2026, 8, 3, 8, 50, tzinfo=timezone.utc), stopped - timedelta(days=1)),
+            self.prompt("security-patch-orchestrator", "20 7 * * 1", datetime(2026, 8, 3, 7, 20, tzinfo=timezone.utc), stopped - timedelta(days=7)),
+            self.prompt("fleet-wide-cost-analysis", "50 7 * * 1", datetime(2026, 8, 3, 7, 50, tzinfo=timezone.utc), stopped - timedelta(days=7)),
+            self.script("stall-watch", "*/30 * * * *", datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc)),
+        )
+
+    def test_resume_skips_the_dailies_fires_one_weekly_and_defers_the_other(self):
+        self.write(*self.paused_roster())
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("skipped the catch-up of compliance-audit: 3 occurrence(s) missed since 2026-08-03T06:20:00+00:00, 2d 3h overdue on a 1d period; next run 2026-08-06T06:20:00+00:00", out)
+        # Its newest slot, today's 08:50, came inside Hermes' grace: that run
+        # stays and fires on this tick; the two before it are the skip.
+        self.assertIn("skipped the catch-up of ai-security-audit: 2 occurrence(s) missed since 2026-08-03T08:50:00+00:00, 2d overdue on a 1d period; next run 2026-08-05T08:50:00+00:00", out)
+        self.assertIn("deferred the catch-up of fleet-wide-cost-analysis to 2026-08-05T09:55:30+00:00 (1 occurrence(s) missed since 2026-08-03T07:50:00+00:00); held at 2026-08-10T07:50:00+00:00 until then", out)
+        # The tick spawned for what is still due: the oldest weekly and the script.
+        self.assertIn("ticked 3 due job(s) — ai-security-audit, security-patch-orchestrator, stall-watch", out)
+        self.assertEqual(len(self.invocations()), 1)
+        jobs = self.jobs()
+        self.assertEqual(jobs["compliance-audit"]["next_run_at"], "2026-08-06T06:20:00+00:00")
+        self.assertEqual(jobs["ai-security-audit"]["next_run_at"], "2026-08-05T08:50:00+00:00")
+        self.assertEqual(jobs["security-patch-orchestrator"]["next_run_at"], "2026-08-03T07:20:00+00:00")
+        self.assertEqual(jobs["fleet-wide-cost-analysis"]["next_run_at"], "2026-08-10T07:50:00+00:00")
+        state = json.loads((self.platform / "cron" / ccp.STATE_FILE_NAME).read_text())
+        self.assertEqual(list(state["deferred"]), ["fleet-wide-cost-analysis"])
+
+    def test_the_deferred_weekly_comes_back_at_its_turn(self):
+        self.write(*self.paused_roster())
+        self.run_main()
+        # Hermes ran the two it was handed and advanced them.
+        jobs = self.jobs()
+        jobs["security-patch-orchestrator"]["next_run_at"] = "2026-08-10T07:20:00+00:00"
+        jobs["stall-watch"]["next_run_at"] = "2026-08-05T10:00:00+00:00"
+        jobs["ai-security-audit"]["next_run_at"] = "2026-08-06T08:50:00+00:00"
+        self.write(*jobs.values())
+
+        self.now = self.RESUME + timedelta(minutes=29)
+        code, out = self.run_main()
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(len(self.invocations()), 1)
+
+        self.now = self.RESUME + timedelta(minutes=30)
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("released fleet-wide-cost-analysis for its catch-up of 2026-08-03T07:50:00+00:00", out)
+        self.assertIn("ticked 1 due job(s) — fleet-wide-cost-analysis", out)
+        self.assertEqual(self.jobs()["fleet-wide-cost-analysis"]["next_run_at"], "2026-08-03T07:50:00+00:00")
+        state = json.loads((self.platform / "cron" / ccp.STATE_FILE_NAME).read_text())
+        self.assertEqual(state["deferred"], {})
+
+    def test_the_idle_policy_goes_first_so_a_held_job_is_not_a_catch_up(self):
+        self.set_signal(self.now - timedelta(days=15))
+        self.write(*self.paused_roster())
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("stage unset -> hibernate", out)
+        self.assertNotIn("catch-up", out)
+        self.assertIn("ticked 1 due job(s) — stall-watch", out)
+
+    def test_a_policy_fault_is_one_line_and_the_tick_goes_on(self):
+        self.write(*self.paused_roster())
+
+        def explode(home, now):
+            raise RuntimeError("torn state")
+
+        self._patch(ccp, "apply", explode)
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("cron catch-up policy skipped: RuntimeError: torn state", out)
+        self.assertIn("ticked 5 due job(s)", out)
 
 
 class _FrozenClock:

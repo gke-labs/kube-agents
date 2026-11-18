@@ -1532,6 +1532,259 @@ class TestHpaFloorsAtOne(unittest.TestCase):
         self.assertIsNotNone(hits[0]["reconciler"])
 
 
+class TestHpaAggressiveScaledown(unittest.TestCase):
+    """§3.25 — aggressive HPA scale-down with no preStop hook."""
+
+    def ctx(
+        self,
+        *,
+        ns="seeded-autoscaling",
+        workload_kind="Deployment",
+        replicas=2,
+        min_replicas=2,
+        max_replicas=10,
+        stabilization=0,
+        policies="planted",
+        select_policy="Max",
+        containers=None,
+        grace=None,
+        target=None,
+        owned=False,
+        hpa_labels=None,
+        workload_labels=None,
+    ):
+        d = deployment("web-api-server", ns=ns, kind=workload_kind, **{"spec.replicas": replicas})
+        if workload_labels is not None:
+            d["metadata"]["labels"] = workload_labels
+        if containers is not None:
+            d["spec"]["template"]["spec"]["containers"] = containers
+        if grace is not None:
+            d["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = grace
+
+        h = hpa(
+            "web-api-server-hpa",
+            ns=ns,
+            min_replicas=min_replicas if min_replicas is not None else 1,
+            max_replicas=max_replicas,
+            target=target or {"apiVersion": "apps/v1", "kind": workload_kind, "name": "web-api-server"},
+            owned=owned,
+        )
+        if min_replicas is None:
+            del h["spec"]["minReplicas"]
+        if hpa_labels is not None:
+            h["metadata"]["labels"] = hpa_labels
+        if stabilization != "absent_behavior":
+            scale_down = {}
+            if stabilization is not None:
+                scale_down["stabilizationWindowSeconds"] = stabilization
+            if select_policy is not None:
+                scale_down["selectPolicy"] = select_policy
+            if policies == "planted":
+                scale_down["policies"] = [{"type": "Percent", "value": 100, "periodSeconds": 15}]
+            elif policies is not None:
+                scale_down["policies"] = policies
+            h["spec"]["behavior"] = {"scaleDown": scale_down}
+        return context_of(dump_of(d, h))
+
+    def test_zero_stabilization_and_hundred_percent_without_prestop_flags_hpa(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "HorizontalPodAutoscaler/web-api-server-hpa")
+        self.assertEqual(hits[0]["namespace"], "seeded-autoscaling")
+        self.assertIn("stabilizationWindowSeconds=0", hits[0]["excerpt"])
+        self.assertIn("selectPolicy=Max", hits[0]["excerpt"])
+        self.assertIn("policies=100% per 15s", hits[0]["excerpt"])
+        self.assertIn("scaling Deployment/web-api-server (minReplicas=2, maxReplicas=10)", hits[0]["excerpt"])
+        self.assertIn("target containers with no preStop hook: app (terminationGracePeriodSeconds=30)", hits[0]["excerpt"])
+
+    def test_collect_cluster_grades_it_major_without_requiring_a_service(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "hpa-aggressive-scaledown")
+        self.assertEqual(spec.severity, "major")
+        hits = spec.run(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+
+    def test_omitted_policies_with_short_window_use_kubernetes_default_hundred_percent(self):
+        hits = collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=15, policies=None, select_policy=None))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("policies=100% per 15s (API default)", hits[0]["excerpt"])
+
+    def test_default_or_sixty_second_stabilization_window_is_not_flagged(self):
+        for window in ("absent_behavior", None, 60, 300):
+            with self.subTest(window=window):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(stabilization=window)), [])
+
+    def test_disabled_select_policy_is_not_flagged(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(select_policy="Disabled")), [])
+
+    def test_bounded_percent_or_pods_policy_is_not_flagged(self):
+        bounded = [
+            [{"type": "Percent", "value": 25, "periodSeconds": 60}],
+            [{"type": "Percent", "value": 49, "periodSeconds": 15}],
+            [{"type": "Pods", "value": 1, "periodSeconds": 60}],
+        ]
+        for pol in bounded:
+            with self.subTest(policies=pol):
+                self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=pol)), [])
+
+    def test_select_policy_max_vs_min_handles_mixed_policy_lists(self):
+        mixed = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Pods", "value": 1, "periodSeconds": 60},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Max"))), 1)
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(policies=mixed, select_policy="Min")), [])
+        all_aggressive = [
+            {"type": "Percent", "value": 100, "periodSeconds": 15},
+            {"type": "Percent", "value": 50, "periodSeconds": 30},
+        ]
+        self.assertEqual(len(collect.check_hpa_aggressive_scaledown(self.ctx(policies=all_aggressive, select_policy="Min"))), 1)
+
+    def test_container_prestop_hook_clears_it_while_self_health_sidecar_is_ignored(self):
+        containers = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+            {"name": "istio-proxy", "image": "proxyv2"},
+        ]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(containers=containers)), [])
+
+    def test_serving_service_narrows_to_containers_in_its_target_port_path(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "web-api-server"}}
+        d["spec"]["template"]["spec"]["containers"] = [
+            {
+                "name": "app",
+                "image": "pause",
+                "ports": [{"containerPort": 8080}],
+                "lifecycle": {"preStop": {"sleep": {"seconds": 15}}},
+            },
+            {"name": "fluent-bit", "image": "fluent-bit"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        svc = service(
+            "web-api-server",
+            ns="seeded-autoscaling",
+            selector={"app": "web-api-server"},
+            ports=[{"name": "http", "port": 80, "targetPort": 8080}],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h, svc))), [])
+
+    def test_native_sidecar_without_prestop_is_flagged_while_plain_init_container_is_not(self):
+        d = deployment("web-api-server", ns="seeded-autoscaling", **{"spec.replicas": 2})
+        d["spec"]["template"]["spec"]["containers"] = [
+            {"name": "app", "image": "pause", "lifecycle": {"preStop": {"sleep": {"seconds": 10}}}},
+        ]
+        d["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "migrate", "image": "busybox"},
+            {"name": "envoy-proxy", "image": "envoy", "restartPolicy": "Always"},
+        ]
+        h = hpa(
+            "web-api-server-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "web-api-server"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        hits = collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("target containers with no preStop hook: envoy-proxy", hits[0]["excerpt"])
+
+        d["spec"]["template"]["spec"]["initContainers"] = [{"name": "migrate", "image": "busybox"}]
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(d, h))), [])
+
+    def test_daemonset_target_is_not_flagged(self):
+        ds = deployment("node-agent", ns="seeded-autoscaling")
+        ds["kind"] = "DaemonSet"
+        ds["spec"].pop("replicas", None)
+        h = hpa(
+            "node-agent-hpa",
+            ns="seeded-autoscaling",
+            min_replicas=2,
+            max_replicas=10,
+            target={"apiVersion": "apps/v1", "kind": "DaemonSet", "name": "node-agent"},
+        )
+        h["spec"]["behavior"] = {
+            "scaleDown": {
+                "stabilizationWindowSeconds": 0,
+                "selectPolicy": "Max",
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}],
+            }
+        }
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(context_of(dump_of(ds, h))), [])
+
+    def test_omitted_min_replicas_defaults_floor_to_one_and_statefulset_target_is_flagged(self):
+        hits = collect.check_hpa_aggressive_scaledown(
+            self.ctx(min_replicas=None, max_replicas=5, workload_kind="StatefulSet", grace=45)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("scaling StatefulSet/web-api-server (minReplicas=1, maxReplicas=5)", hits[0]["excerpt"])
+        self.assertIn("terminationGracePeriodSeconds=45", hits[0]["excerpt"])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=None, max_replicas=1)), [])
+
+    def test_standard_and_hpa_exclusions_hold(self):
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(ns="kube-system")), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(hpa_labels={collect._ADDON_MANAGER_MODE_LABEL: "Reconcile"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(owned=True)), [])
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(min_replicas=5, max_replicas=5)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(workload_labels={collect.OPT_OUT_KEY: "exempt"})
+            ),
+            [],
+        )
+        self.assertEqual(collect.check_hpa_aggressive_scaledown(self.ctx(replicas=0)), [])
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "missing"})
+            ),
+            [],
+        )
+        self.assertEqual(
+            collect.check_hpa_aggressive_scaledown(
+                self.ctx(target={"apiVersion": "custom.io/v1", "kind": "Deployment", "name": "web-api-server"})
+            ),
+            [],
+        )
+
+
 class TestSingleReplicaDefersToTheHpaCheck(unittest.TestCase):
     """§3.11's new exclusion — the two checks partition one population."""
 
@@ -4213,10 +4466,11 @@ class TestCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
-        # The three cluster-kind checks that grade against the workload set
+        # The four cluster-kind checks that grade against the workload set
         # examined nothing either: a PDB is only graded against the workload
-        # it covers, an HPA's floor only against a Service-backed workload.
-        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one"}
+        # it covers, an HPA's floor or scale-down behavior only against the
+        # workload it scales.
+        anchored = {"blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", "hpa-aggressive-scaledown"}
         self.assertEqual(set(na), workload_slugs | anchored)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, a CronJob that has
@@ -7941,7 +8195,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -7965,6 +8219,12 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
                 if kinds == "svc":
                     return Run(argv, 0, json.dumps(dump_of(*svc_items)), "", 0.1)
+                if kinds == collect.WEBHOOK_DUMP_KINDS:
+                    if webhook_run is not None:
+                        return webhook_run
+                    return Run(argv, 0, json.dumps(dump_of(*webhook_items)), "", 0.1)
+                if kinds == collect.ENDPOINTSLICE_DUMP_KINDS:
+                    return Run(argv, 0, json.dumps(dump_of(*endpointslice_items)), "", 0.1)
                 if kinds == "ccnp":
                     if ccnp_run is not None:
                         return ccnp_run
@@ -8022,7 +8282,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 15)
+        self.assertEqual(len(result["commands"]), 16)
 
     def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
         """The real paging, not the module's adapter: the workload, RBAC,
@@ -8074,6 +8334,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
                 "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings?limit=500", "/apis/rbac.authorization.k8s.io/v1/rolebindings?limit=500",
                 "/apis/networking.k8s.io/v1/networkpolicies?limit=500", "/api/v1/namespaces?limit=500",
                 "/api/v1/services?limit=500",
+                "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?limit=500",
+                "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations?limit=500",
+                "/apis/discovery.k8s.io/v1/endpointslices?limit=500",
                 "/api/v1/serviceaccounts?limit=500",
             ],
             raw,
@@ -8246,7 +8509,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 15)
+        self.assertEqual(len(command_slugs), 16)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -8565,14 +8828,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Seventeen checks minus the three Autopilot rules out and the two no
-        cluster without Config Connector or Config Sync can run is twelve, each
+        Eighteen checks minus the three Autopilot rules out and the two no
+        cluster without Config Connector or Config Sync can run is thirteen, each
         with a command behind it, and the five dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 12)
+        self.assertEqual(len(command_slugs), 13)
         self.assertEqual(len(na_slugs), 5)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
@@ -12481,6 +12744,49 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         self.assertIn("kcc-object-wedged", {e["check"] for e in result["checks_not_applicable"]})
         self.assertNotIn("checks_unevaluated", result)
 
+    # §2.18's two reads, best-effort like `ccnp`: an identity that cannot list
+    # webhook configurations or EndpointSlices keeps its other checks.
+    def test_a_failed_webhook_read_is_unevaluated_and_the_other_checks_still_run(self):
+        result = self.compliance(webhook_run=Run(["x"], 1, "", "Error from server (Forbidden): validatingwebhookconfigurations is forbidden", 0.05))
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated["webhook-backend-unreachable"])
+        self.assertIn("Forbidden", unevaluated["webhook-backend-unreachable"])
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertNotIn("webhook-backend-unreachable", command_slugs)
+        self.assertIn("lb-world-open", command_slugs)
+        self.assertNotIn("webhook-backend-unreachable", {c["check"] for c in result["candidates"]})
+
+    def test_a_failed_import_of_the_readiness_module_is_unevaluated_not_a_crash(self):
+        """The predicate lives in the sibling skill. A packaging fault that drops
+        it must cost this check alone, never the cluster's other seventeen."""
+        with patch.object(collect, "_upgrade_readiness", side_effect=ImportError("No module named 'upgrade_readiness'")):
+            result = self.compliance(webhook_items=[webhook_configuration("strict-policy-webhook")])
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated["webhook-backend-unreachable"])
+        self.assertIn("upgrade_readiness", unevaluated["webhook-backend-unreachable"])
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertNotIn("webhook-backend-unreachable", command_slugs)
+        self.assertEqual(len(command_slugs), 15)
+        self.assertNotIn("webhook-backend-unreachable", {c["check"] for c in result["candidates"]})
+
+    def test_a_planted_fail_closed_webhook_with_no_service_is_a_candidate_with_both_reads_recorded(self):
+        planted = webhook_configuration(
+            "strict-policy-webhook",
+            namespace_selector={"matchLabels": {"created-by-stack": "security-webhook-blocks-config-management-system"}},
+            labels={"managed-by": "kube-agents-bench", "created-by-stack": "security-webhook-blocks-config-management-system"},
+        )
+        result = self.compliance(webhook_items=[planted])
+        candidates = [c for c in result["candidates"] if c["check"] == "webhook-backend-unreachable"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["object"], "ValidatingWebhookConfiguration/strict-policy-webhook")
+        self.assertEqual(candidates[0]["severity"], "major")
+        command = {c["check"]: c["command"] for c in result["commands"]}["webhook-backend-unreachable"]
+        for kinds in (collect.WEBHOOK_DUMP_KINDS, collect.ENDPOINTSLICE_DUMP_KINDS):
+            self.assertIn(kinds.split(",")[0], command)
+        self.assertNotIn("checks_unevaluated", result)
+
     # §2.17's two reads, folded into one disposition.
     def configsync_reason(self, result):
         for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
@@ -13108,6 +13414,275 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
                 self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
                 self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
                 self.assertEqual(text, audit_report.trim_command(text))
+
+
+class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
+    """Both streams that read node pools take them from the `clusters list`
+    item that discovered the cluster, recorded against that listing's command,
+    and run their own `node-pools list` only when the item carries none
+    (#4081)."""
+
+    LISTING_ARGV = ["gcloud", "container", "clusters", "list", "--project", "acme", "--format", "json"]
+    # One legacy-metadata pool, so legacy-metadata fires only if the check saw
+    # the pools; tainted and autoscaled, so obtainability's taint arm fires
+    # only if it saw them.
+    POOLS = [
+        {
+            "name": "legacy",
+            "status": "RUNNING",
+            "autoscaling": {"enabled": True},
+            "config": {
+                "workloadMetadataConfig": {"mode": "GCE_METADATA"},
+                "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}],
+            },
+        }
+    ]
+    COMPUTE_CLASS = {"kind": "ComputeClass", "metadata": {"name": "batch"}}
+
+    def collect(self, audit_id, listed_pools=None, *, listed=True, items=()):
+        item = {"name": "c1", "location": "us-central1", "status": "RUNNING"}
+        if listed:
+            item["nodePools"] = self.POOLS if listed_pools is None else listed_pools
+        self.issued = []
+
+        def run(argv, **kwargs):
+            self.issued.append(list(argv))
+            if discovered := discovery_of_acme(argv):
+                return discovered
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, json.dumps([item]), "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return Run(argv, 0, json.dumps(dump_of(self.COMPUTE_CLASS)), "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.1)
+            if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "x"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, json.dumps(self.POOLS), "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                manifest = collect.collect_fleet(audit_id, run=run)
+        self.log = stderr.getvalue()
+        entry = next(c for c in manifest["clusters"] if c["name"] == QUALIFIED_C1)
+        return manifest, entry
+
+    def node_pools_reads(self):
+        return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
+
+    def legacy_record(self, entry):
+        return next(c for c in entry["commands"] if c["check"] == "legacy-metadata")
+
+    def test_compliance_takes_the_listed_pools_and_records_the_listing(self):
+        manifest, entry = self.collect("compliance-audit")
+        self.assertEqual(self.node_pools_reads(), [])
+        self.assertIn("NodePool/legacy", {c["object"] for c in entry["candidates"] if c["check"] == "legacy-metadata"})
+        record = self.legacy_record(entry)
+        self.assertEqual(record["command"], shlex.join(self.LISTING_ARGV))
+        self.assertEqual(record["rc"], 0)
+        self.assertEqual(record["duration_s"], 0)
+        self.assertEqual(record["output_sha256"], collect.output_digest(json.dumps(self.POOLS, sort_keys=True)))
+        self.assertNotIn(collect.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(manifest))
+        # The record still verifies as the command behind the check.
+        checks_run = [{"check": c["check"], "command": c["command"]} for c in entry["commands"]]
+        doc = {"audit": "compliance-audit", "scope": {"clusters": [{"name": QUALIFIED_C1, "checks_run": checks_run}]}}
+        audit_report.cross_check_manifest(doc, manifest)
+
+    def test_compliance_takes_an_empty_listed_list_as_no_pools(self):
+        _, entry = self.collect("compliance-audit", listed_pools=[])
+        self.assertEqual(self.node_pools_reads(), [])
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == "legacy-metadata"], [])
+        self.assertEqual(self.legacy_record(entry)["output_sha256"], collect.output_digest("[]"))
+
+    def test_compliance_reads_node_pools_when_the_listing_carries_none(self):
+        for listed, pools in ((False, None), (True, {"not": "a list"})):
+            with self.subTest(listed=listed, pools=pools):
+                _, entry = self.collect("compliance-audit", listed_pools=pools, listed=listed)
+                expected = [
+                    "gcloud", "container", "node-pools", "list", "--cluster", "c1", "--location", "us-central1",
+                    "--project", "acme", "--format", "json",
+                ]
+                self.assertEqual(self.node_pools_reads(), [expected])
+                self.assertEqual(self.legacy_record(entry)["command"], shlex.join(expected))
+                self.assertIn("NodePool/legacy", {c["object"] for c in entry["candidates"]})
+                self.assertIn("reading node-pools list", self.log)
+
+    def test_the_discovery_listing_is_unchanged(self):
+        self.collect("compliance-audit")
+        self.assertEqual([a for a in self.issued if a[:4] == ["gcloud", "container", "clusters", "list"]], [self.LISTING_ARGV])
+
+    def test_obtainability_takes_the_listed_pools(self):
+        _, entry = self.collect("obtainability-audit")
+        self.assertEqual(self.node_pools_reads(), [])
+        reasons = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
+        self.assertIn("all node pools carry workload taints", reasons.get("untargeted-compute-class-workload", ""))
+        # The read records no command of its own, listed or not.
+        self.assertNotIn("untargeted-compute-class-workload", {c["check"] for c in entry["commands"]})
+
+    def test_obtainability_takes_untainted_listed_pools_and_keeps_its_record(self):
+        _, entry = self.collect(
+            "obtainability-audit", listed_pools=[{**self.POOLS[0], "config": {}}], items=(deployment("api"),)
+        )
+        self.assertEqual(self.node_pools_reads(), [])
+        record = next(c for c in entry["commands"] if c["check"] == "untargeted-compute-class-workload")
+        self.assertIn("kubectl get computeclasses", record["command"])
+
+    def test_obtainability_reads_node_pools_when_the_listing_carries_none(self):
+        _, entry = self.collect("obtainability-audit", listed=False)
+        self.assertEqual(len(self.node_pools_reads()), 1)
+        reasons = {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
+        self.assertIn("all node pools carry workload taints", reasons.get("untargeted-compute-class-workload", ""))
+        self.assertIn("nodePools absent from the discovery listing; reading node-pools list", self.log)
+
+
+def webhook_configuration(name, kind="ValidatingWebhookConfiguration", policy="Fail", service=("seeded-security", "strict-policy-webhook"),
+                          url=None, rules=None, namespace_selector=None, labels=None, annotations=None, port=None, hooks=None):
+    """One configuration with one webhook entry, shaped as the paged dump stamps it
+    (`kind` on the item). `policy=None` leaves `failurePolicy` out, which the v1 API
+    defaults to Fail. `rules=None` is one rule on an inert bench group; `rules=[]` is a
+    webhook the server never calls."""
+    if hooks is None:
+        hook = {"name": f"{name}.bench.kube-agents.dev", "admissionReviewVersions": ["v1"], "sideEffects": "None"}
+        if policy is not None:
+            hook["failurePolicy"] = policy
+        hook["rules"] = [{"apiGroups": ["bench.kube-agents.dev"], "apiVersions": ["v1"], "resources": ["probes"], "operations": ["CREATE"]}] if rules is None else rules
+        if url is not None:
+            hook["clientConfig"] = {"url": url}
+        else:
+            hook["clientConfig"] = {"service": {"namespace": service[0], "name": service[1], "path": "/validate", **({"port": port} if port else {})}}
+        if namespace_selector is not None:
+            hook["namespaceSelector"] = namespace_selector
+        hooks = [hook]
+    return {
+        "kind": kind,
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "metadata": {"name": name, "labels": labels or {}, "annotations": annotations or {}},
+        "webhooks": hooks,
+    }
+
+
+class TestWebhookBackendUnreachable(unittest.TestCase):
+    """§2.18. A fail-closed admission webhook whose backend the API server cannot reach:
+    the readiness report's predicate, applied to every fail-closed webhook."""
+
+    BACKEND_SERVICE = service("strict-policy-webhook", ns="seeded-security", ports=[{"port": 443, "targetPort": 8443}])
+    SYSTEM_NAMESPACES = [namespace("kube-system"), namespace("config-management-system")]
+
+    def run_on(self, *configs, services=(), slices=(), namespaces=None):
+        return collect.check_webhook_backend_unreachable({
+            "webhook_configurations": list(configs),
+            "services": list(services),
+            "endpointslices": list(slices),
+            "namespaces": self.SYSTEM_NAMESPACES if namespaces is None else namespaces,
+        })
+
+    def test_a_missing_service_is_one_hit_naming_the_configuration(self):
+        hits = self.run_on(webhook_configuration("strict-policy-webhook"))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ValidatingWebhookConfiguration/strict-policy-webhook")
+        self.assertEqual(hits[0]["namespace"], "")
+        self.assertIn("failurePolicy Fail and Service seeded-security/strict-policy-webhook does not exist", hits[0]["excerpt"])
+        self.assertIn("rules: CREATE probes in bench.kube-agents.dev", hits[0]["excerpt"])
+
+    def test_a_service_with_no_port_equal_to_the_webhooks_is_a_hit(self):
+        wrong_port = service("strict-policy-webhook", ns="seeded-security", ports=[{"port": 8443}])
+        hits = self.run_on(webhook_configuration("strict-policy-webhook"), services=[wrong_port])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("has no port 443", hits[0]["excerpt"])
+
+    def test_a_service_with_no_ready_endpoint_is_a_hit(self):
+        hits = self.run_on(
+            webhook_configuration("strict-policy-webhook"),
+            services=[self.BACKEND_SERVICE],
+            slices=[endpointslice("strict-policy-webhook", ns="seeded-security", addresses=0, ports=[""])],
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("has no ready endpoints on port 443", hits[0]["excerpt"])
+
+    def test_a_live_backend_is_not_a_hit(self):
+        hits = self.run_on(
+            webhook_configuration("strict-policy-webhook"),
+            services=[self.BACKEND_SERVICE],
+            slices=[endpointslice("strict-policy-webhook", ns="seeded-security", addresses=1, ports=[""])],
+        )
+        self.assertEqual(hits, [])
+
+    def test_an_absent_failure_policy_reads_as_fail(self):
+        self.assertEqual(len(self.run_on(webhook_configuration("strict-policy-webhook", policy=None))), 1)
+
+    def test_an_ignore_policy_is_skipped(self):
+        self.assertEqual(self.run_on(webhook_configuration("strict-policy-webhook", policy="Ignore")), [])
+
+    def test_a_url_backend_is_skipped(self):
+        self.assertEqual(self.run_on(webhook_configuration("warden", url="https://127.0.0.1:8443/validate")), [])
+
+    def test_a_webhook_with_no_rules_is_skipped(self):
+        self.assertEqual(self.run_on(webhook_configuration("strict-policy-webhook", rules=[])), [])
+
+    def test_the_addon_label_and_the_component_annotation_suppress(self):
+        self.assertEqual(self.run_on(webhook_configuration("gmp-operator", labels={collect._ADDON_MANAGER_MODE_LABEL: "Reconcile"})), [])
+        self.assertEqual(self.run_on(webhook_configuration("gke-vpa", annotations={collect._GKE_COMPONENT_ANNOTATION: "vpa"})), [])
+
+    def test_a_mutating_configuration_is_named_by_its_kind(self):
+        hits = self.run_on(webhook_configuration("strict-policy-webhook", kind="MutatingWebhookConfiguration"))
+        self.assertEqual(hits[0]["object"], "MutatingWebhookConfiguration/strict-policy-webhook")
+
+    def test_no_selector_reaches_the_system_namespaces_and_is_critical(self):
+        hits = self.run_on(webhook_configuration("strict-policy-webhook"))
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertIn("its namespaceSelector admits kube-system, config-management-system", hits[0]["excerpt"])
+
+    def test_a_selector_on_a_bench_label_reaches_neither_and_is_major(self):
+        selector = {"matchLabels": {"created-by-stack": "security-webhook-blocks-config-management-system"}}
+        hits = self.run_on(webhook_configuration("strict-policy-webhook", namespace_selector=selector))
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("admits neither kube-system nor config-management-system", hits[0]["excerpt"])
+
+    def test_an_exclusion_of_both_system_namespaces_is_major(self):
+        selector = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "config-management-system"]}]}
+        hits = self.run_on(webhook_configuration("strict-policy-webhook", namespace_selector=selector))
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_an_exclusion_of_kube_system_alone_is_critical_for_config_management(self):
+        selector = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]}
+        hits = self.run_on(webhook_configuration("strict-policy-webhook", namespace_selector=selector))
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertIn("admits config-management-system", hits[0]["excerpt"])
+
+    def test_an_absent_namespace_is_judged_on_its_name_label(self):
+        """A cluster without Config Sync has no `config-management-system`; a selector
+        that excludes it by name must still read as excluding it, and one that does not
+        as admitting it, the way admission reads the label every namespace carries."""
+        excluded = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "config-management-system"]}]}
+        hits = self.run_on(webhook_configuration("strict-policy-webhook", namespace_selector=excluded), namespaces=[namespace("kube-system")])
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_one_hit_per_configuration_with_every_failing_webhook_in_the_excerpt(self):
+        first = webhook_configuration("multi")["webhooks"][0]
+        second = {**first, "name": "second.bench.kube-agents.dev", "failurePolicy": "Ignore"}
+        third = {**first, "name": "third.bench.kube-agents.dev", "clientConfig": {"service": {"namespace": "seeded-security", "name": "other"}}}
+        hits = self.run_on(webhook_configuration("multi", hooks=[first, second, third]))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("multi.bench.kube-agents.dev: failurePolicy Fail and Service seeded-security/strict-policy-webhook does not exist", hits[0]["excerpt"])
+        self.assertIn("third.bench.kube-agents.dev: failurePolicy Fail and Service seeded-security/other does not exist", hits[0]["excerpt"])
+        self.assertNotIn("second.bench.kube-agents.dev", hits[0]["excerpt"])
+
+    def test_the_check_is_on_the_compliance_roster_as_a_cluster_check(self):
+        spec = next(c for c in collect.COMPLIANCE_CHECKS if c.slug == "webhook-backend-unreachable")
+        self.assertEqual(spec.kind, "cluster")
+        self.assertEqual(spec.severity, "critical")
+        self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-backend-unreachable"], ("webhooks", "services", "endpointslices"))
+
+    def test_the_predicate_is_the_readiness_reports_not_a_copy(self):
+        readiness = collect._upgrade_readiness()
+        self.assertTrue(hasattr(readiness, "backend_problem"))
+        self.assertEqual(readiness.__file__, str(collect.UPGRADE_READINESS_SCRIPTS / "upgrade_readiness.py"))
 
 
 if __name__ == "__main__":

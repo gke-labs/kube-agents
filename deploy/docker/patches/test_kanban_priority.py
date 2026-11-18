@@ -825,6 +825,45 @@ class SaturationAndQueuedTest(unittest.TestCase):
         self.assertEqual(res.queued_noticed, [])
         self.assertEqual(len(b.queued("waiting")), 1, "every tick must not repeat it")
 
+    def test_a_queued_event_records_and_logs_what_held_the_slots(self):
+        """A card queued during a short saturation leaves a record of the holders:
+        the saturation warning only fires after a window of saturated ticks, so
+        without this the wait could not be read back (#3311)."""
+        b = self._full()
+        with self.assertLogs(kp.logger, level="INFO") as logs:
+            _, res = b.tick(cap=2)
+        self.assertEqual(res.queued_noticed, ["waiting"])
+        events = b.queued("waiting")
+        self.assertEqual(events[0][kp.HOLDERS_KEY], ["bg-run", "u-run"])
+        lines = [line for line in logs.output if "waiting queued" in line]
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertIn("(0 user card(s) ahead): 2/2 worker slots busy (1 background, 1 user: ", lines[0])
+        self.assertIn("bg-run @cluster-dev", lines[0])
+        self.assertIn("[k8s-evt-]", lines[0])
+        self.assertIn("u-run @cluster-dev", lines[0])
+        self.assertIn("[user]", lines[0])
+
+    def test_a_card_held_for_triages_slot_records_the_user_holders(self):
+        """The reserved-slot path: the user share is full while a slot stays
+        free for triage. The record names the user cards holding the share."""
+        b = Board(self)
+        b.card("u-run", U, status="running")
+        b.card("waiting", U)
+        with self.assertLogs(kp.logger, level="INFO") as logs:
+            spawned, res = b.tick(cap=2)
+        self.assertEqual(spawned, [])
+        self.assertEqual(res.queued_noticed, ["waiting"])
+        event = b.queued("waiting")[0]
+        self.assertEqual(event[kp.HOLDERS_KEY], ["u-run"])
+        self.assertEqual((event["reserved_user"], event["reserved_background"]), (1, 0))
+        lines = [line for line in logs.output if "waiting queued" in line]
+        self.assertEqual(len(lines), 1, logs.output)
+        self.assertIn("1/2 worker slots busy (0 background, 1 user: u-run", lines[0])
+        self.assertTrue(
+            lines[0].endswith("; 1 user card(s) held back because one slot is reserved for background triage"),
+            lines[0],
+        )
+
     def test_a_new_wait_after_a_claim_is_noticed_again(self):
         b = self._full()
         b.tick(cap=2)

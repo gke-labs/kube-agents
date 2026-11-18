@@ -96,16 +96,17 @@ class D1Attributable(unittest.TestCase):
         The A2A gateway joins a Slack `user_id` to a principal through the
         admin-owned `a2a-slack-principal-map` Secret, so write access to that
         table is an impersonation primitive, and spec-chatops-gateway.md says
-        no product ServiceAccount gets it. The operator reaches that Secret by the
-        kubelet's mount alone: this asserts that no Role or ClusterRole it
-        mints names `secrets` at all, or a wildcard that would.
+        no product ServiceAccount gets it. The gateway reaches that Secret by the
+        kubelet's mount alone: this asserts that only `kubeagents:minimal:*`
+        may reference `secrets` (with read-only verbs `get`/`list`/`watch` for
+        `<agent>-kube-proxy`'s redacted Secret metadata path), and no Role or
+        ClusterRole it mints grants write verbs on `secrets`, names `secrets` on
+        a non-minimal Role, or uses a wildcard that would.
 
-        This reads every Role in the five goldens, which is the legacy product
-        set. The two Roles the next stack adds (`buildA2AGatewayRole`,
-        `buildA2ACalloutRole`) are read structurally by Go's
-        `TestNoRenderedRoleReachesASecret` in `platformagent_a2a_slack_test.go`,
-        because the rendered `mode: next` object set is in no golden (C5's
-        auth-delegator test records that gap).
+        This reads every Role in the five goldens, the A2A gateway's and
+        callout's (`buildA2AGatewayRole`, `buildA2ACalloutRole`) included;
+        Go's `TestNoRenderedRoleReachesASecret` in
+        `platformagent_a2a_slack_test.go` reads the same two structurally.
 
         Outside this assertion: the operator's own ClusterRole holds
         `secrets` write by design (it mints the bus credentials, the callout
@@ -116,15 +117,27 @@ class D1Attributable(unittest.TestCase):
         ServiceAccount writing its identity table through RBAC.
         """
         checked = 0
+        read_only_verbs = {"get", "list", "watch"}
         for name, documents in h.golden_documents().items():
             for kind in ("Role", "ClusterRole"):
                 for role in h.objects_of_kind(documents, kind):
                     checked += 1
+                    role_name = role["metadata"]["name"]
+                    is_minimal = kind == "ClusterRole" and role_name.startswith("kubeagents:minimal:")
                     for rule in role.get("rules") or []:
                         resources = set(rule.get("resources") or [])
-                        with self.subTest(fixture=name, role=role["metadata"]["name"], rule=rule):
-                            self.assertNotIn("secrets", resources)
+                        verbs = set(rule.get("verbs") or [])
+                        with self.subTest(fixture=name, role=role_name, rule=rule):
                             self.assertNotIn("*", resources)
+                            if "secrets" in resources:
+                                self.assertTrue(
+                                    is_minimal,
+                                    f"non-minimal {kind} {role_name} references secrets",
+                                )
+                                self.assertTrue(
+                                    verbs.issubset(read_only_verbs),
+                                    f"{role_name} grants non-read verbs {verbs - read_only_verbs} on secrets",
+                                )
         self.assertGreater(checked, 0, "no rendered Role was examined")
 
     def test_D1_a_log_hint_cannot_forge_a_record(self) -> None:
@@ -380,7 +393,7 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         parser-differential class -- and it only works while the audience is
         set.
 
-        There are three audiences in every golden: #913 split the broker's routes by caller, and #2940 added the watchers' (a fourth, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
+        There are three audiences in every golden: #913 split the broker's routes by caller, and #2940 added the watchers' (a fourth, the A2A gateway's `-a2a-chat`, is rendered only with Google Chat on, which no golden enables; seeing it needs such a golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
         the exec audience for the agent, and a `-chat` one for the gateway, so
         the sandbox cannot reach `/v1/chat/**` and the gateway cannot reach
         `/v1/exec`. A third, `-watcher`, is the gateway's agent-api-auth

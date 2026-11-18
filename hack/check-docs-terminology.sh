@@ -230,11 +230,13 @@ if [ -n "$WRONG_GO" ]; then
 fi
 
 # --- cert-manager version -------------------------------------------------
-# Ground truth: images.json, which the mirror tooling also reads to build the release
-# URL it applies. Three pages quote the version back — two of them inside a
-# copy-pasteable `kubectl apply` URL — and there is nothing else to catch them,
-# because the pin has no other consumer to disagree with. Left unguarded, the
-# next cert-manager bump would hand readers a manifest the install does not use.
+# Ground truth: images.json. Markdown pages quote the version back, one of them
+# inside a copy-pasteable `kubectl apply` URL, and nothing else catches them. The
+# regex below sees only lines that name cert-manager. The variables.tf default
+# and the tfvars example are held to images.json by check 6 of
+# hack/check-image-inventory.sh; the mirror_images.sh comment is not checked.
+# Left unguarded, the next cert-manager bump would hand readers a manifest the
+# install does not use.
 CERT_MANAGER_VERSION=$(jq -r '.images[] | select(.name == "cert-manager-controller") | .tag' images.json)
 if [ -z "$CERT_MANAGER_VERSION" ] || [ "$CERT_MANAGER_VERSION" = "null" ]; then
   echo "ERROR: no cert-manager-controller pin in images.json; the version guard cannot run." >&2

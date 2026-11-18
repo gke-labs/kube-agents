@@ -110,7 +110,6 @@ HELM_UPGRADE_INSTALL:HELM_UPGRADE_INSTALL
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
 NAMESPACE:NAMESPACE
-PLATFORM_AGENT_MODE:PLATFORM_AGENT_MODE
 "
 
 # Always required: without these the script cannot name an install at all, so
@@ -255,16 +254,11 @@ case "${MEMORY_PROVIDER:-}" in
 esac
 export MEMORY
 
-# PLATFORM_AGENT_MODE, the PlatformAgent's spec.mode, is copied rather than
-# translated, but checked first: a value that is neither `today` nor `next` is
-# refused here rather than by the installer later. `today` is written as no
-# key at all, which the installer reads as `today` too, so an environment that
-# says `today` or says nothing renders the same file it rendered before the
-# key was mapped. platform_agent_mode_resolve unsets the variable for both.
-# shellcheck source=scripts/release/platform_agent_mode.sh
-. "$(dirname "${BASH_SOURCE[0]}")/platform_agent_mode.sh"
-platform_agent_mode_resolve
-
+# The token minter's names, by the same rule as provision_environment.sh's
+# rebuild path (minter_environment_names.sh).
+# shellcheck source=scripts/release/minter_environment_names.sh
+. "$(dirname "${BASH_SOURCE[0]}")/minter_environment_names.sh"
+minter_environment_names
 
 # ---------------------------------------------------------------------------
 # Write it
@@ -298,6 +292,10 @@ done
 
 # MEMORY is derived above rather than mapped, so it is emitted on its own.
 emit MEMORY "${MEMORY}"
+# So are the minter's GSA and KSA names, set above only for an environment with
+# the minter.
+emit GITHUB_MINTER_GSA_NAME "${MINTER_ENVIRONMENT_GSA_NAME:-}"
+emit GITHUB_MINTER_KSA_NAME "${MINTER_ENVIRONMENT_KSA_NAME:-}"
 
 chmod 600 "$OUT_PATH"
 

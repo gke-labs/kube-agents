@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Cluster Agent reconcile's GKE reads, in one sandbox process (#3703).
+"""The GKE reads of the Cluster Agent reconcile and of stall_watch, in one sandbox process (#3703).
 
 The reconcile runs in the agent pod, but only the shell sandbox holds the token the
 broker's read-only Cloud API relay (`/v1/gcp/`) accepts. So the reconcile sends this
@@ -13,7 +13,7 @@ whose start-up on the sandbox's CPU was what made a tick grow by ~2.4 s per clus
 Input:  {"projects": ["p1", ...], "clusters": [["project", "location", "name"], ...],
          "workers": 16, "budget_seconds": 25.0}
 Output: {"lists": {"p1": {"status": 200, "clusters": [["name", "location"], ...],
-                           "missingZones": [...]}
+                           "statuses": ["RUNNING", ...], "missingZones": [...]}
                          | {"status": <int or 0>, "error": {...}}},
          "gets":  {"project/location/name": {"status": 200} | {"status": ..., "error": {...}}}}
 
@@ -54,7 +54,14 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 import credential_proxy_client  # noqa: E402
 
-GKE_API = "https://container.googleapis.com/v1"
+DEFAULT_GKE_API = "https://container.googleapis.com/v1"
+GKE_API = DEFAULT_GKE_API
+
+
+def _gke_api() -> str:
+    if GKE_API != DEFAULT_GKE_API:
+        return GKE_API
+    return f"https://{credential_proxy_client.google_api_host('container')}/v1"
 # Per call: the client's connect bound, and a read bound of what is left of the
 # budget, never more than this. That sits over the broker's own upstream deadline
 # (API_RELAY_DEADLINE_S, 120 s), so a slow page is the broker's 504.
@@ -112,14 +119,18 @@ def _call(url: str, deadline: float) -> tuple[int, dict | None, dict | None]:
 
 
 def list_project(project: str, deadline: float) -> dict:
-    status, body, error = _call(f"{GKE_API}/projects/{project}/locations/-/clusters", deadline)
+    status, body, error = _call(f"{_gke_api()}/projects/{project}/locations/-/clusters", deadline)
     if error is not None or body is None:
         return {"status": status, "error": error or {"text": "no body"}}
     rows = []
+    # Beside the rows, not in them: a reader that unpacks `name, location` keeps
+    # working, and one that needs the status reads it from the same position.
+    statuses = []
     for cluster in body.get("clusters") or []:
         if isinstance(cluster, dict) and isinstance(cluster.get("name"), str) and isinstance(cluster.get("location"), str):
             rows.append([cluster["name"], cluster["location"]])
-    answer = {"status": status, "clusters": rows}
+            statuses.append(cluster["status"] if isinstance(cluster.get("status"), str) else "")
+    answer = {"status": status, "clusters": rows, "statuses": statuses}
     missing = body.get("missingZones")
     if isinstance(missing, list):
         answer["missingZones"] = [z for z in missing if isinstance(z, str)]
@@ -127,7 +138,7 @@ def list_project(project: str, deadline: float) -> dict:
 
 
 def get_cluster(project: str, location: str, name: str, deadline: float) -> dict:
-    status, _, error = _call(f"{GKE_API}/projects/{project}/locations/{location}/clusters/{name}", deadline)
+    status, _, error = _call(f"{_gke_api()}/projects/{project}/locations/{location}/clusters/{name}", deadline)
     return {"status": status} if error is None else {"status": status, "error": error}
 
 

@@ -17,7 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+	"sort"
+	"strings"
+
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"time"
 )
 
 // The bus principals, in one place, as data.
@@ -94,6 +99,12 @@ type a2aIdentity struct {
 	// sessionIdentity for why that is fail-closed rather than fussy.
 	narrowing string
 
+	// notAfter, when set, is the instant the callout stops authenticating
+	// this principal and the latest any JWT minted for it expires. Set on
+	// the bus migration's per-run principals at the run's deadline. Only
+	// for a2aAuthCallout, and never with narrowing.
+	notAfter *time.Time
+
 	publish   []string
 	subscribe []string
 
@@ -131,9 +142,13 @@ type a2aIdentity struct {
 	// its subscribe list is two exact prefixes, so it cannot read an entry
 	// with or without the deny.
 	//
-	// Rendered only for static principals. No callout principal needs one:
+	// Rendered into nats.conf for a static principal, and into the callout's
+	// identity map for a mapped one (its grants' denyPublish and
+	// denySubscribe, #5301), where the callout subtracts them in the minted
+	// JWT. No principal in a2aIdentities' callout set carries one today:
 	// provision's JetStream grants are enumerated the same way seed's are,
 	// the session's are derived at mint time, and the verifier is the reader.
+	// The gateway's map entry (gatewayCalloutEntry) carries its static user's.
 	denyPublish   []string
 	denySubscribe []string
 }
@@ -161,6 +176,38 @@ type a2aIdentity struct {
 // alone would still leave a broker able to subscribe to the bucket's subject
 // space and watch every capability as it is minted.
 var capDenyPublish, capDenySubscribe = a2aCapBucketReadDeny()
+
+// a2aTasksFixedDurables are the TASKS durables whose name and filter are
+// fixed, which the provision Job pre-creates (#4173): the gateway's relay
+// and the bridge's intake. Their readers bind to them and create nothing.
+func a2aTasksFixedDurables() []string {
+	return []string{a2aGatewayRelayDurable, a2aBridgeDurable()}
+}
+
+// a2aTasksFixedDurableDenyPublish keeps a principal that may create
+// consumers on TASKS from creating, updating or deleting the pre-created
+// durables. A consumer name is one subject token, so each subject names the
+// durable exactly: the create-or-update form with and without its filter
+// token, the older durable-create form, and delete.
+func a2aTasksFixedDurableDenyPublish() []string {
+	var out []string
+	for _, name := range a2aTasksFixedDurables() {
+		out = append(out,
+			"$JS.API.CONSUMER.CREATE."+a2aTasksStream+"."+name,
+			"$JS.API.CONSUMER.CREATE."+a2aTasksStream+"."+name+".>",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+a2aTasksStream+"."+name,
+			"$JS.API.CONSUMER.DELETE."+a2aTasksStream+"."+name,
+		)
+	}
+	return out
+}
+
+// withTasksFixedDurableDeny is base plus a2aTasksFixedDurableDenyPublish, in
+// a new slice, so a shared base (capDenyPublish) is never written through.
+func withTasksFixedDurableDeny(base []string) []string {
+	out := append([]string(nil), base...)
+	return append(out, a2aTasksFixedDurableDenyPublish()...)
+}
 
 func a2aCapBucketReadDeny() (publish, subscribe []string) {
 	stream := "KV_" + a2aCapBucket
@@ -247,6 +294,20 @@ const (
 	// confirmation surface are distinct from the browser's.
 	a2aConsoleMCPUser = "console-mcp"
 
+	// a2aCuratorUser is the NATS user name for the OKF memory curator pod
+	// (a2a/cmd/curator), rendered under A2A_CURATOR=true.
+	a2aCuratorUser = "curator"
+
+	// The memory query and outcome subjects served by the curator pod under
+	// A2A_CURATOR=true. Replies ride their own namespace (a2a.memory.reply.>)
+	// for the same reason verifierIdentity answers on a2a.cap.reply.> and
+	// bridgeIdentity answers on chat.board.reply.gateway.>: the curator never
+	// holds a publish grant on _INBOX.agent.>.
+	a2aMemoryQuerySubject       = "a2a.memory.query"
+	a2aMemoryReplySubjects      = "a2a.memory.reply.>"
+	a2aMemoryReplyAgentSubjects = "a2a.memory.reply.agent.>"
+	a2aCuratorOutcomesSubject   = "a2a.topics.agent.platform.curator-outcomes"
+
 	// a2aConsoleConfirmSubject is the console confirmation subject: console
 	// alone may publish it and gateway alone may subscribe to it. Its
 	// publisher and subscriber land with #4457.
@@ -308,6 +369,25 @@ const (
 // publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
 
+// The TASKS durables the provision Job pre-creates (#4173), as their readers'
+// code spells them. The gateway's event relay (a2a/gateway/gateway.go,
+// relayDurable) binds the two filter subjects together since the supervisor
+// split, holding up to relayMaxAckPending (a2a/gateway/relay.go) unrendered;
+// the bridge's intake (a2a/hermes-bridge/bridge.go, Run) reads its
+// addressee's input. TestTheFixedDurablesMatchTheirReaders holds both
+// against the a2a sources.
+const (
+	a2aGatewayRelayDurable       = "gateway-relay"
+	a2aGatewayEventsFilter       = "a2a.tasks.*.*.events"
+	a2aGatewaySupervisorFilter   = "a2a.tasks.*.*.supervisor"
+	a2aGatewayRelayMaxAckPending = 8192
+)
+
+// a2aBridgeDurable is the bridge's intake durable, and a2aBridgeIntakeFilter
+// its filter: its addressee's input, every task.
+func a2aBridgeDurable() string      { return "bridge-" + a2aBridgeAddressee }
+func a2aBridgeIntakeFilter() string { return "a2a.tasks." + a2aBridgeAddressee + ".*.in" }
+
 // a2aProfileSubmitSubjects is every AgentProfile's submission subject,
 // a2a.submit.<profile>.<tier>.<kind>.<task> (lib.TaskSubmitSubject), on the
 // PROFILE_SUBMITS stream. Publish only: the gateway holds no consumer or
@@ -319,6 +399,48 @@ const a2aProfileSubmitSubjects = "a2a.submit.*.*.*.*"
 // stream. Publish only, like the submission: the gateway writes a record
 // beside each cancel it sends a profile task, and the dispatcher reads it.
 const a2aDispatchStopSubjects = "a2a.stop.*.*"
+
+// a2aGatewayUser is the gateway's NATS user.
+const a2aGatewayUser = "gateway"
+
+// a2aProfileSupervisorPrefix and a2aProfileSupervisorSuffix spell a profile's
+// supervisor subjects, a2a.tasks.<profile>.*.supervisor: where the dispatcher
+// writes a profile task's terminal failures (lib.TaskSupervisorSubject). The
+// gateway is denied each one (gatewayProfileSupervisorDeny).
+const (
+	a2aProfileSupervisorPrefix = "a2a.tasks."
+	a2aProfileSupervisorSuffix = ".*.supervisor"
+)
+
+// gatewayProfileSupervisorDeny is the gateway's publish deny for each bound
+// profile's supervisor subjects, in name order. The gateway's allow holds
+// a2a.tasks.*.*.supervisor for the sessions it spawns, whose names it mints
+// per incarnation and no grant can enumerate; NATS wildcards match whole
+// tokens, so the profiles are subtracted by name instead, which leaves the
+// dispatcher the one direct publisher there. The list rides nats.conf, so a
+// profile bound or unbound re-renders it, whether or not the dispatcher runs,
+// and the bus reloads it in place (planA2ABusReload). A name that isn't one subject token addresses no task and
+// is skipped.
+func gatewayProfileSupervisorDeny(profiles []string) []string {
+	var out []string
+	for _, p := range profiles {
+		if p == "" || strings.ContainsAny(p, ".*> \t\r\n") {
+			continue
+		}
+		out = append(out, a2aProfileSupervisorPrefix+p+a2aProfileSupervisorSuffix)
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// withGatewayProfileDeny is id with gatewayProfileSupervisorDeny(profiles)
+// added to its publish deny, in a new slice. Both of the gateway's renders take
+// it from here, the static user in nats.conf and its callout map entry, so
+// neither can be granted a profile's supervisor subject the other is denied.
+func withGatewayProfileDeny(id a2aIdentity, profiles []string) a2aIdentity {
+	id.denyPublish = append(slices.Clone(id.denyPublish), gatewayProfileSupervisorDeny(profiles)...)
+	return id
+}
 
 // The operator's own bus principal: its NATS user and inbox owner, and the
 // directory it writes AgentProfile cards to (agentprofile_card.go).
@@ -406,6 +528,8 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	if op, ok := operatorIdentity(); ok {
 		ids = append(ids, op)
 	}
+	// The bus migration's principal for the step it is in, while it runs.
+	ids = append(ids, busMigrationIdentities(agent)...)
 	return append(ids,
 		seedIdentity(),
 		webIdentity(),
@@ -416,8 +540,11 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
-// Production scopes supervisor publish to sessions the gateway spawned;
-// statically that collapses to the task-supervisor wildcard.
+// Its supervisor publish is the task-supervisor wildcard, for the sessions it
+// spawns: their names are minted per incarnation, one subject token each, so
+// no static grant can list them. The profiles' supervisor subjects are the
+// dispatcher's alone, and nats.conf denies the gateway each one by name
+// (gatewayProfileSupervisorDeny, applied in renderA2AStaticUsers).
 //
 // The supervisor's terminal goes on `…supervisor`, the executor's events on
 // `…events`, and the gateway holds publish on the first and not the second.
@@ -509,7 +636,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	)
 
 	return a2aIdentity{
-		user:    "gateway",
+		user:    a2aGatewayUser,
 		account: a2aAccountControl,
 		comment: "task requester, chat-session supervisor, session-registry owner.\n" +
 			"STATIC, and this one is a sequencing fact rather than a property of\n" +
@@ -549,6 +676,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.tasks.*.*.supervisor",
+			// A profile task's supervisor subject in its profile form
+			// (lib.ProfileSupervisorSubject, #5301): read only. The
+			// gateway's publish grant stays five-token, so it can never
+			// write one.
+			"a2a.tasks.p.*.*.supervisor",
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
@@ -574,8 +706,10 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// a widening of its JetStream grants is the single most likely way
 		// for read on the store to arrive by accident. Pinned by
 		// TestGatewayHoldsNoWholesaleJetStreamAPI so that "it subtracts
-		// nothing" cannot become the argument for deleting it.
-		denyPublish:   capDenyPublish,
+		// nothing" cannot become the argument for deleting it. The second
+		// half keeps it off the TASKS durables the provision Job pre-creates
+		// (#4173), its own relay included: it binds that one.
+		denyPublish:   withTasksFixedDurableDeny(capDenyPublish),
 		denySubscribe: capDenySubscribe,
 	}
 }
@@ -608,8 +742,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 // starter topics.
 //
 // Nothing on the task plane — a provisioner that can publish tasks is a
-// provisioner that can impersonate the fabric. No ack grant at all: it creates
-// no consumers, so provisioning is $JS.API requests and the starter topics are
+// provisioner that can impersonate the fabric. No ack grant at all: the only
+// consumers it creates are the two fixed TASKS durables (#4173), which it never
+// reads from, so provisioning is $JS.API requests and the starter topics are
 // publishes, and nothing here ever acks.
 func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	return a2aIdentity{
@@ -628,9 +763,11 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
 		//
-		// Notably absent: STREAM.DELETE, STREAM.PURGE and the whole
-		// CONSUMER surface. A provisioner that can delete what it created
-		// is a provisioner that can destroy the audit substrate.
+		// Notably absent: STREAM.DELETE, STREAM.PURGE and the CONSUMER
+		// surface beyond the two TASKS durables it pre-creates (#4173),
+		// which it may read and create but not delete. A provisioner that
+		// can delete what it created is a provisioner that can destroy the
+		// audit substrate.
 		publish: []string{
 			"a2a.topics.agent.platform.upgrade-readiness",
 			"a2a.topics.agent.platform.topology-skew",
@@ -672,6 +809,17 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
+			// The two TASKS durables it makes (#4173), as natscli 0.1.5's
+			// consumer add asks for them: INFO, then CREATE with the filter
+			// token for one filter and without it for two. CREATE is
+			// create-or-update, which is how the Job brings a durable an older
+			// reader made to its settings. No delete, and no listing.
+			"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + a2aGatewayRelayDurable,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + a2aGatewayRelayDurable + ".>",
+			"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee + ".>",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{
@@ -842,6 +990,36 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	}
 }
 
+// curatorIdentity returns the NATS auth-callout entry for the curator pod,
+// rendered when A2A_CURATOR=true. It holds no task-plane grants, no JetStream
+// consumer-create verbs, and no publish grant on _INBOX.agent.>; replies to
+// a2a.memory.query ride a2a.memory.reply.>.
+func curatorIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	publish := []string{
+		"a2a.topics.shared.annotations",
+		"a2a.topics.shared.blueprint",
+	}
+	publish = append(publish, a2aAgentJetStreamGrants()...)
+	publish = append(publish, a2aMemoryReplySubjects)
+	publish = append(publish, "_INBOX."+a2aCuratorUser+".>")
+
+	return a2aIdentity{
+		user:           a2aCuratorUser,
+		account:        a2aAccountApp,
+		comment:        "the OKF memory curator: indexes learning outcomes into Hindsight, publishes blueprint digests, and answers memory queries on a2a.memory.reply.> with no cluster or forge credentials",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aCuratorName(agent)),
+		publish:        publish,
+		subscribe: []string{
+			"a2a.topics.shared.annotations",
+			"a2a.topics.shared.blueprint",
+			a2aCuratorOutcomesSubject,
+			a2aMemoryQuerySubject,
+			"_INBOX." + a2aCuratorUser + ".>",
+		},
+	}
+}
+
 // bridge: the Hermes bridge sidecar, executor for the `platform` addressee.
 //
 // The other half of `worker`. The bridge is a passthrough that makes the
@@ -966,8 +1144,10 @@ func bridgeIdentity() a2aIdentity {
 		// bucket and the pair denies nothing today. It is here for the next
 		// widening: see a2aCapBucketReadDeny, and the deny is pinned by
 		// TestBridgeHoldsNoWholesaleJetStreamAPI so that "it subtracts
-		// nothing" cannot become the argument for deleting it.
-		denyPublish:   capDenyPublish,
+		// nothing" cannot become the argument for deleting it. The second
+		// half keeps it off the TASKS durables the provision Job pre-creates
+		// (#4173), its own intake included: it binds that one.
+		denyPublish:   withTasksFixedDurableDeny(capDenyPublish),
 		denySubscribe: capDenySubscribe,
 	}
 }
@@ -979,8 +1159,8 @@ func bridgeIdentity() a2aIdentity {
 // STATIC, and it is the legacy twin of the provision principal above: the same
 // job, done by an object nothing in this repository renders. The darkness audit
 // records it as the artifact nobody owns — referenced by no chart, no kustomize
-// path, no Makefile target and no operator code, and it survives a flip to
-// today until someone deletes it by hand.
+// path, no Makefile target and no operator code, and it stays until someone
+// deletes it by hand.
 //
 // It keeps its password because it is APPLIED rather than rendered. It exists on
 // the demo install right now, so dropping its user from nats.conf would refuse
@@ -1115,6 +1295,8 @@ func webIdentity() a2aIdentity {
 		// (`a2a.stop.>`) are no browser's either: each names a task being
 		// cancelled.
 		denySubscribe: a2aBrowserSubscribeDeny,
+		// Off the TASKS durables the provision Job pre-creates (#4173).
+		denyPublish: withTasksFixedDurableDeny(nil),
 	}
 }
 
@@ -1191,6 +1373,8 @@ func consoleIdentity() a2aIdentity {
 		// queue group and swallow a share of every verify request. This
 		// password is handed to a browser too (console.go's /config.json).
 		denySubscribe: a2aBrowserSubscribeDeny,
+		// Off the TASKS durables the provision Job pre-creates (#4173).
+		denyPublish: withTasksFixedDurableDeny(nil),
 	}
 }
 
@@ -1239,6 +1423,8 @@ func consoleMCPIdentity() a2aIdentity {
 			"_INBOX." + a2aConsoleMCPUser + ".>",
 		},
 		denySubscribe: a2aBrowserSubscribeDeny,
+		// Off the TASKS durables the provision Job pre-creates (#4173).
+		denyPublish: withTasksFixedDurableDeny(nil),
 	}
 }
 
@@ -1268,6 +1454,41 @@ func calloutIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		}
 	}
 	return out
+}
+
+// mappedIdentities are the principals with an entry in the callout's identity
+// map, in render order: calloutIdentities, then the gateway's token entry.
+func mappedIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
+	return append(calloutIdentities(agent), gatewayCalloutEntry(agent))
+}
+
+// gatewayCalloutEntry is the gateway as the callout mints it, keyed on its
+// own ServiceAccount (#5301). It is the one principal rendered twice, on
+// purpose and for a bounded window: the static user stays in nats.conf (and in
+// auth_users) so that a gateway on A2A_GATEWAY_BUS_AUTH=password, the default,
+// connects exactly as before, and this entry is what a gateway on "token" is
+// minted from. Rollback across the flip is therefore the flag, not a bus roll.
+// The static user goes a release after the flip, and with it this exception.
+//
+// The grants are gatewayIdentity's, deny lists included: its consumer-create
+// wildcard on TASKS is held off the pre-created durables only by a publish
+// deny, and no narrower allow can say "any consumer name but these". The map
+// render adds nats.conf's per-profile supervisor deny to it
+// (withGatewayProfileDeny, from the same names), because the entry is live
+// the moment it renders: a bus token for the gateway's ServiceAccount is
+// minted from it whether or not the gateway presents one, and the dispatcher
+// still writes profile terminals on the five-token subject. A JWT carries the
+// deny of the map it was minted from, so a profile bound after a token-mode
+// gateway connected is not in its deny until it reconnects; that is why the
+// flip waits until no consumer folds the five-token profile form (the
+// rollout order on #5301).
+func gatewayCalloutEntry(agent *agentv1alpha1.PlatformAgent) a2aIdentity {
+	id := gatewayIdentity(agent, agent.Namespace)
+	id.auth = a2aAuthCallout
+	id.credsKey = ""
+	id.serviceAccount = a2aServiceAccountName(agent.Namespace, a2aGatewayName(agent))
+	id.comment = "the gateway on A2A_GATEWAY_BUS_AUTH=token; its static user stays until a release after the flip"
+	return id
 }
 
 // staticIdentities returns the principals that stay in nats.conf, in render

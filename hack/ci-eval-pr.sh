@@ -40,15 +40,52 @@ readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
-readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
-# The stack-bearing cases of the nightly's main part that run in main-b, when
-# EVAL_NIGHTLY_PART splits that part in two (#3384).
+# What the replay lane runs (EVAL_REPLAY_LANE=true, hack/ci-env.sh): each entry
+# a registered case, replayed from the nightlies' recordings, gating nothing.
+readonly EVAL_REPLAY_LANE_CASES_FILE="eval/replay-lane-cases.txt"
+# The lane's safety cases: each runs EVAL_REPETITIONS times live, before the
+# cache is seeded, then as many times replayed, so the lane's report can set
+# the two pass rates side by side (hack/replay-proxy/README.md, "In CI").
+readonly EVAL_REPLAY_LANE_SAFETY_CASES_FILE="eval/replay-lane-safety-cases.txt"
+# A safety case's arms: live, then replayed, EVAL_REPETITIONS each.
+readonly REPLAY_LANE_SAFETY_ARMS=2
+# Where the lane tells lane_report.py which repetitions were live (its
+# ARMS_FILE), beside bench-gate's case-<name>.json.
+readonly REPLAY_LANE_ARMS_FILE="replay-lane-arms.json"
+# The validated-capabilities suite has no roster file: a case is on its lane when its
+# task file carries the bare line `suite: validated-capabilities` (and in part N when
+# it carries `suite_part: N`; absent is part 1). The two line
+# patterns below are the whole grammar; scripts/eval_rosters.py and
+# scripts/validate_bench_cases.py read the same two lines, and the validator
+# refuses any other spelling (a quoted or commented value), so a case the
+# validator registers is a case this grep sees.
+readonly VALIDATED_CAPABILITIES_SUITE_LINE_RE='^suite: validated-capabilities$'
+readonly VALIDATED_CAPABILITIES_PART_KEY='suite_part'
+readonly VALIDATED_CAPABILITIES_PART_LINE_RE="^${VALIDATED_CAPABILITIES_PART_KEY}: [1-9][0-9]*$"
+# The stack-bearing cases of the nightly's main part that run in main-b,
+# main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
+# (#3384, #4238): a stack-bearing case on no list runs in main-a, which
+# otherwise holds only the onboarding cases' chain (unit_state_lock).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
-# Which bit of a name's cksum places a case without a stack in main-a or
-# main-b: any bit is a coin toss per name, and bit 2 splits the matrix of
-# 2026-10-19 near evenly where bit 0 did not. scripts/test_ci_eval_nightly.py
-# holds the split within a fifth; if the matrix drifts past that, change it.
-readonly NIGHTLY_HALF_CKSUM_BIT=2
+readonly EVAL_NIGHTLY_MAIN_C_FILE="eval/nightly-main-c.txt"
+readonly EVAL_NIGHTLY_MAIN_D_FILE="eval/nightly-main-d.txt"
+readonly EVAL_NIGHTLY_MAIN_E_FILE="eval/nightly-main-e.txt"
+# The cases of the nightly's writers part that run in writers-b and in
+# writers-c, when EVAL_NIGHTLY_PART splits that part in three (#4238); a
+# writer on neither list runs in writers-a.
+readonly EVAL_NIGHTLY_WRITERS_B_FILE="eval/nightly-writers-b.txt"
+readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
+# How many shards a name's cksum deals the main part's cases without a stack
+# into (the cksum shifted right by NIGHTLY_MAIN_CKSUM_SHIFT, modulo this: 0
+# main-a, 1 main-b, 2 main-c, 3 main-d, 4 main-e): a coin toss per name. The
+# shift picks the coin: shift 3 dealt the matrix of 2026-11-06 32/29/29/25/31
+# where no shift dealt it 37/38/21/30/20; shift 4 deals the matrix of
+# 2026-11-10, the two chat-feedback usage-summary cases added, 34/31/31/32/28
+# where shift 3 dealt it 35/31/32/27/31. scripts/test_ci_eval_nightly.py
+# holds the spread within a quarter of a shard's share; if the matrix
+# drifts past that, change it.
+readonly NIGHTLY_MAIN_SHARDS=5
+readonly NIGHTLY_MAIN_CKSUM_SHIFT=4
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -96,9 +133,18 @@ readonly EVAL_GRADER_TREE="bench"
 readonly EVAL_GRADER_CASES_DIR="tasks"
 # The seeded fleet's catalog inside that tree, which the fleet step reads.
 readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
+# Where `uv sync` builds the grader's environment inside that tree, relative
+# to it. The export may carry an entry by this name that is not a directory
+# (bench/.venv has been a committed link to a developer's machine since
+# c418002ff), and uv cannot create the directory over it;
+# drop_stray_grader_venv removes such an entry from the exported tree before
+# the sync.
+readonly EVAL_GRADER_VENV_DIR=".venv"
 
-# A repetition the launcher could not start because GitHub's token endpoint
-# failed transiently (record_unit_not_run, beside run_one_unit). The unit
+# A repetition the launcher could not start (record_unit_not_run, beside
+# run_one_unit): GitHub's token endpoint failed transiently, a fixture it needs
+# drifted, its card fence could not run, and the other skips that function's
+# callers name. The unit
 # writes a record in place of the run that carries the harness's own
 # infrastructure marker -- bench/kube_agents_bench/harness.py's and
 # scoring.py's INFRA_FAILURE_MARKER, which tests/test_ci_eval_ledger_mint.py
@@ -124,6 +170,11 @@ readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=300
 readonly EVAL_FIXTURE_STATE_PUBLISHED="gs://kube-agents-dashboards/evals/fixture-state.json"
 readonly EVAL_FIXTURE_STATE_PUBLISHED_COPY="fixture-state-published.json"
 readonly EVAL_FIXTURE_DRIFT_DIR="fixture-drift"
+# Where a second-phase unit whose card fence could not reach the gateway is
+# noted (fence_live_cards), one file per unit, read by run_one_unit, which
+# records the unit as infrastructure rather than launching it into a window the
+# fence did not clear.
+readonly EVAL_FENCE_UNFENCED_DIR="fence-unfenced"
 readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
@@ -193,6 +244,11 @@ readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The A2A door's token Secret (k8s-operator platformagent_a2a_manifests.go),
+# rendered when hack/ci-deploy.sh turns the door on for the next lane. Only
+# the card-wait stopped ask (#5407) goes through the door.
+readonly EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX="-a2a-door"
+readonly EVAL_A2A_DOOR_TOKEN_SECRET_KEY="token"
 # The inject door's port-forward is per unit for the same reason the agent
 # API's is (run_one_unit): the harness reads AGENT_INJECT_LOCAL_PORT for it,
 # not AGENT_LOCAL_PORT, and its default (28099) would put every unit of the
@@ -236,11 +292,20 @@ readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
 # this mode, and the matrix then grades today over the agent API.
 readonly EVAL_ROLLBACK_LANE_END_MODE="today"
 
+# stop_model_calls_on_cancel (beside the TERM trap): the job types whose
+# cancelled run is thrown away, so a SIGTERM may cut model access at once, and
+# the bound on the gateway scale-down's API call, the one the other LiteLLM
+# calls on the exit path take (LITELLM_LOG_REQUEST_TIMEOUT, hack/ci-env.sh):
+# long enough for a slow API server, short against the 5m grace period.
+readonly EVAL_CANCEL_CUTS_MODEL_JOB_TYPES="presubmit batch"
+readonly EVAL_CANCEL_SCALE_REQUEST_TIMEOUT="30s"
+
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
 # in-flight note under, the bound on one `kubectl exec` round trip, and how
 # long a unit waits for a live run to release its own note before removing
-# it. The unit's delegation ceiling is not the worker's death -- the record
+# it; a unit with no ledger spends it once per stream it declares. The
+# unit's delegation ceiling is not the worker's death -- the record
 # under AGENT_DELEGATION_TIMEOUT below shows a worker rewriting its ledger
 # five minutes after the wait gave up -- so a note found at the next unit's
 # start may still be a live run's; 300s covers that record. The lock
@@ -291,10 +356,33 @@ readonly EVAL_INSTALL_GONE_MARKER="install-gone"
 # kubectl, not the helper in the pod, so the helper must end by itself first or
 # a later pass could archive the card of the unit launched next. The margin
 # covers the exec's setup, the interpreter's start and the last board read; a
-# helper that runs out names the cards it did not reach, and the warning says so.
+# helper that runs out names the cards it did not reach, exits
+# EVAL_FENCE_DECIDED_EXIT (its EXIT_LEFT_LIVE; scripts/test_ci_fence_cards.py
+# holds the two equal), and the warning says so: the fence ran, and the unit
+# launches as it did before the fence.
 readonly EVAL_FENCE_CARD_PASSES=3
 readonly EVAL_FENCE_TIMEOUT_SECONDS=180
 readonly EVAL_FENCE_BUDGET_MARGIN_SECONDS=30
+readonly EVAL_FENCE_DECIDED_EXIT=3
+# Any other exit is a fence that did not run to its verdict, most often an exec
+# that did not reach the container (#5508): a gateway preempted or rolled during
+# the second phase has no pod for some minutes, and a fence that ran against none
+# would let the earlier unit's card, retried on the new pod, write into the next
+# window. So each attempt first waits for a Ready gateway pod, the way the
+# scheduled-audits exec does, and a fence that still could not run after its
+# attempts marks the unit unfenced (EVAL_FENCE_UNFENCED_DIR) instead of launching
+# it. Once a unit has gone unfenced the latch below holds the next fences
+# to one attempt each, until one succeeds: an outage that outlasts the phase then
+# costs one wait per unit, not three.
+readonly EVAL_FENCE_ATTEMPTS=3
+readonly EVAL_FENCE_POD_WAIT_SECONDS=300
+readonly EVAL_FENCE_GATEWAY_AWAY_LATCH=".gateway-away"
+# The bound on the replay lane's one clear of the live arm's cards (fence_live_cards
+# with `arm`, from run_replay_lane_live_arm). Every card the arm's repetitions filed,
+# finished ones included, can be tens of archives, more than the per-unit bound covers;
+# nothing else runs while it does, and the helper still ends inside its budget, before
+# the replayed units file theirs.
+readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -308,6 +396,21 @@ readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
 # five-minute grace, so it waits only briefly; a gateway that is down then keeps
 # the pause, which the next lease's pause repeats anyway.
 readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
+# chain_audits_watch: how often, through the fan-out, the first-run stage's audits
+# are paused once the stage is past them (#5570). The clock fires them
+# hours apart, so a few minutes' lag costs at most a run that lands in it.
+readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS=300
+# Where the watch's pid goes: it runs outside the job table, where the fan-out's
+# `jobs -rp` count and its bare `wait` would take it for a unit.
+readonly EVAL_CHAIN_AUDITS_PID_FILE="chain-audits-watch.pid"
+# There while the watch runs; it removes it as it ends. stop_chain_audits_watch waits on
+# it rather than on the pid, which a container whose PID 1 reaps nothing leaves answering.
+readonly EVAL_CHAIN_AUDITS_RUNNING_FILE="chain-audits-watch.running"
+# How long stop_chain_audits_watch waits for a pass under way to finish, so its pauses
+# are recorded before the EXIT trap's resume reads the record. One pass is typically a
+# gateway check and an exec of a few seconds, though its retries can take longer; this
+# keeps most of Prow's five-minute grace for the artifacts.
+readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS=60
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
 readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
@@ -331,12 +434,18 @@ readonly EVAL_SCOPE_RECONCILE_ATTEMPTS=5
 readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
 readonly EVAL_SCOPE_READ_ATTEMPTS=3
 # What a unit's lock deadline allows past its delegation timeout, for the
-# stack, the verifier and the state writes around the run.
-readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
+# stack, the verifier and the state writes around the run: 600 s, plus the
+# GitHub rate-limit waits the unit may spend while it holds the lock (#6105),
+# the pull-request reset's (hack/ci_reset_agent_pulls.py
+# RATE_LIMIT_BUDGET_SECONDS, 900) and the grader's
+# (bench/kube_agents_bench/verifiers.py _FORGE_RATE_LIMIT_BUDGET_SEC, 600).
+# scripts/test_ci_eval_agent_pulls_reset.py keeps it at least that sum.
+readonly UNIT_LOCK_ALLOWANCE_SECONDS=2100
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
 # applied: oobe-first-run-audits' own_wait plus its chain_wait
-# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
-readonly STATE_LOCK_HOLD_SECONDS=7200
+# (bench/tf/prebuilt/oobe-first-run-audits/main.tf). The stack runs one wait
+# long or the other, never both, but the sum is the bound its test holds.
+readonly STATE_LOCK_HOLD_SECONDS=11400
 # How long a stack-bearing unit that found its state lock busy waits, with the
 # infra lock given back, before it queues for the infra lock again.
 readonly STATE_LOCK_RETRY_SECONDS=30
@@ -679,8 +788,16 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_ROLLBACK_LANE=1 is set: the today lane grades a rolled-back install, which is not main's history"
     return 0
   fi
-  if [ "${EVAL_TIER:-}" = "certification" ]; then
-    echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
+  if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+    echo "eval-dashboard publish skipped: EVAL_SLACK_LANE=1 is set: the Slack lane is advisory and grades no matrix"
+    return 0
+  fi
+  if [ "${EVAL_TIER:-}" = "validated-capabilities" ]; then
+    echo "eval-dashboard publish skipped: EVAL_TIER=validated-capabilities: the validated-capabilities lane's record is its logs bucket, read by the validated-capabilities page, not the nightly dashboard"
+    return 0
+  fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    echo "eval-dashboard publish skipped: EVAL_REPLAY_LANE=true: replayed runs repeat the nightly's recordings, which is not main's live history"
     return 0
   fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
@@ -885,7 +1002,10 @@ profile_and_dump_on_exit() {
   collect_litellm_log
   collect_credential_proxy_evidence
   wait_replay_shadow_collector
-  # Defined further down; a run that died before then paused nothing.
+  # Defined further down; a run that died before then paused nothing. The watch
+  # stops first, and a pass of it under way finishes, so none pauses after the
+  # resume what the resume would lift.
+  declare -F stop_chain_audits_watch >/dev/null && stop_chain_audits_watch
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
   declare -F scope_exclude_restore >/dev/null && scope_exclude_restore "exit"
@@ -916,7 +1036,76 @@ trap profile_and_dump_on_exit EXIT
 # night of 2026-09-21 six units finished up to three minutes after the trap
 # had run. A unit that completes its case in that window grades it itself
 # (finish_case), so its block lands in the grading artifact after the cut-off line.
-trap 'exit 143' TERM INT
+#
+# A run that grades a change is the exception (stop_model_calls_on_cancel,
+# below): there the SIGTERM is almost always Prow cancelling the build for a
+# newer push, the verdict is thrown away, and the units, the agents and the
+# judge used to run on for the rest of the grace period (a median 2.7 min over
+# 608 cancelled presubmits, Oct 22-30) with nothing to show for it. The same
+# SIGTERM at a presubmit's own 360m deadline is treated alike: its cut-off
+# table holds the cases graded before the signal, not those a unit would
+# have finished in the grace period.
+trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
+
+# The fan-out's units without a stack, by PID, as launch_units starts them,
+# finished or not. A unit with a stack is never killed: its devops-bench
+# destroys the stack on the way out, and a kill skips that and leaves the
+# stack's cloud resources in the project for the next lease. The scale-down
+# below still takes its agent's model access.
+FANOUT_STACKLESS_UNIT_PIDS=""
+
+# Freezes <pid> and every process under it, top down, and prints their PIDs.
+# Frozen first so a unit cannot start its next command (the judge, after its
+# kubectl exec dies) between the kill of a child and the kill of the unit.
+freeze_process_tree() { # <pid>
+  local child
+  kill -STOP "$1" 2>/dev/null || return 0
+  echo "$1"
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    freeze_process_tree "${child}"
+  done
+}
+
+# On a SIGTERM to a run that grades a change: kill the fan-out's stackless
+# units (and the judge calls they make), take the LiteLLM log, then scale the LiteLLM
+# Deployment to zero so no agent in the install can reach a model. The log
+# comes first because the scale-down takes the pods that hold it;
+# collect_litellm_log runs once, so the EXIT trap's call is then a no-op. A
+# main-branch run keeps the behaviour above: its deadline cut-off is graded
+# from the units that finish in the grace period. Never fatal; called with
+# `|| true`, so errexit is off inside.
+stop_model_calls_on_cancel() {
+  local job_type cuts=""
+  for job_type in ${EVAL_CANCEL_CUTS_MODEL_JOB_TYPES}; do
+    [ "${job_type}" = "${JOB_TYPE:-}" ] && cuts=1
+  done
+  [ -n "${cuts}" ] || return 0
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cancelled (JOB_TYPE=${JOB_TYPE}): stopping the fan-out and the model gateway before collecting artifacts ==="
+  # Only the units still in this shell's job table: a finished unit's PID may
+  # since belong to some other process.
+  local pid frozen="" running
+  running=" $(jobs -rp | tr '\n' ' ') "
+  for pid in ${FANOUT_STACKLESS_UNIT_PIDS:-}; do
+    case "${running}" in *" ${pid} "*) ;; *) continue ;; esac
+    frozen="${frozen} $(freeze_process_tree "${pid}" | tr '\n' ' ')"
+  done
+  if [ -n "${frozen// /}" ]; then
+    # shellcheck disable=SC2086 # one PID per word
+    kill -TERM ${frozen} 2>/dev/null
+    # shellcheck disable=SC2086
+    kill -CONT ${frozen} 2>/dev/null
+  fi
+  # Pinned to the leased project's cluster, as scheduled_audits is.
+  case "${AGENT_CLUSTER_CONTEXT:-}" in
+    "gke_${PROJECT_ID:-}_"?*) ;;
+    *) return 0 ;;
+  esac
+  [ -n "${PROJECT_ID:-}" ] || return 0
+  declare -F collect_litellm_log >/dev/null && collect_litellm_log
+  kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" \
+    scale "${LITELLM_LOG_DEPLOYMENT}" --replicas=0 --request-timeout="${EVAL_CANCEL_SCALE_REQUEST_TIMEOUT}" \
+    || echo "WARNING: could not scale ${LITELLM_LOG_DEPLOYMENT} to zero; the install keeps model access until the teardown removes it" >&2
+}
 
 # ─── Boskos lease heartbeat for the eval's own lifetime ──────────────────────
 # The Prow wrapper's `boskosctl heartbeat` covers this step, but boskosctl
@@ -1039,13 +1228,34 @@ grader_pin_applies() { # -> 0 when this run grades a change against a merge targ
   [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
 }
 
+# Removes <bench dir>/.venv from an exported grader tree when it is not a real
+# directory (a symbolic link, dangling or not, or a file): the scratch tree's
+# venv is uv's to build, and `uv sync` fails with "failed to create directory
+# ... File exists" over anything else by that name. A real directory is left
+# alone; a fresh export never holds one, since nothing has synced there yet.
+# Prints one line saying what went and why, nothing when there was nothing.
+drop_stray_grader_venv() { # <bench dir>
+  local venv="$1/${EVAL_GRADER_VENV_DIR}" kind
+  if [ -L "${venv}" ]; then
+    kind="a symbolic link to $(readlink "${venv}")"
+  elif [ -e "${venv}" ] && [ ! -d "${venv}" ]; then
+    kind="a file"
+  else
+    return 0
+  fi
+  echo "Grader: removed ${venv} from the exported tree: it was ${kind}, not a directory, and uv sync cannot create the venv over it."
+  rm -f "${venv}"
+}
+
 # main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
 # extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
-# is gone, and one it adds is there.
+# is gone, and one it adds is there. A `.venv` the archive carried goes
+# (drop_stray_grader_venv), so the sync in section 6 starts from none.
 pin_grader() { # <repo root> <sha> <out>
   local repo="$1" sha="$2" out="$3"
   git -C "${repo}" archive "${sha}" "${EVAL_GRADER_TREE}" | tar -x -C "${out}" || return 1
   [ -d "${out}/${EVAL_GRADER_TREE}" ] || return 1
+  drop_stray_grader_venv "${out}/${EVAL_GRADER_TREE}" || return 1
   rm -rf "${out:?}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
   cp -R "${repo}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}" "${out}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
 }
@@ -1094,15 +1304,26 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # kubectl read per assertion and one describe per control-plane role.
 # Read-only: every call is a `kubectl get` through the role kubeconfigs (the
 # fleet reader's token), a `gcloud container clusters describe` on this job's
-# own credential, which already lists the same clusters above, or a `gcloud
-# compute ... list` of a project-scoped role's objects on the same credential.
+# own credential, which already lists the same clusters above, a `gcloud
+# compute ... list` of a project-scoped role's objects, a `gcloud compute
+# instances get-serial-port-output` of the startup-fail VM, on the same
+# credential, or one GET of the leased repository's declared-intent note
+# (the catalog's `repository/...` assertions, #5827) with the grading read
+# token the preflight minted (mint_ledger_token "preflight":
+# LEDGER_GRADING_MINT_BODY, contents: read among its reads), handed to the
+# scan as GH_TOKEN in a subshell, never argv. Without the App key or under the
+# gitlab kind there is none: the note is not asserted that pass, the roles
+# rest on their cluster assertions, and nothing is excused on the note. The
+# call site is below the ledger credential section, after that mint.
 #
 # What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
 # case whose grade depends on a role the scan positively saw drifted, and the
 # hourly scan saw drifted on its last two scans (a role a
 # check reads, or the case's single `fixtures:` role), and
 # run_one_unit records that case's repetitions as infrastructure under
-# `fixture-drift:<role>` instead of running them. A role the scan could not read
+# `fixture-drift:<role>` instead of running them. A drift read in the pool
+# repository needs no hourly confirmation: the hourly scan has no credential
+# for the repository, and a file's content does not flap. A role the scan could not read
 # is not drift, and a scan that fails or times out leaves no report: either way
 # every case is graded as usual and the log says why. Never fatal.
 scan_lease_fixtures() { # <report path> <published copy path>
@@ -1118,26 +1339,36 @@ scan_lease_fixtures() { # <report path> <published copy path>
     bound=(timeout "$(( wait + EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS ))")
   fi
   gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
-  # Only a role the fresh hourly scan already holds drifted twice can be
-  # excused, so wait for convergence only then; otherwise one pass is enough.
+  # A cluster drift is excused only when the fresh hourly scan already holds
+  # the role drifted twice, so wait for convergence only then; otherwise one
+  # pass is enough. A note drift (the repository subject) is excused on this
+  # read alone and never holds the wait, so it does not enter the decision.
   if ! PYTHONPATH="${GRADER_BENCH_DIR:-${SCRIPT_DIR}/../bench}" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
     wait=0
   fi
-  ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
-    --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
-    --wait "${wait}" --report "${report}" || status=$?
+  # A subshell: GH_TOKEN, the grading token under the name the scan's reader
+  # takes it by, lives in the scan's environment and nowhere else.
+  (
+    if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -n "${EVAL_LEDGER_APP_KEY_FILE:-}" ] && [ -n "${BENCH_GITHUB_TOKEN:-}" ]; then
+      export GH_TOKEN="${BENCH_GITHUB_TOKEN}"
+    else
+      echo "WARNING: no grading token for the lease-time fixture scan (the gitlab kind, or no ledger App key), so the declared-intent note is not asserted this lease; the cases on it are graded as usual." >&2
+    fi
+    ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
+      --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
+      --wait "${wait}" --report "${report}"
+  ) || status=$?
   if [ "${status}" -ne 0 ]; then
     rm -f "${report}"
     echo "WARNING: the lease-time fixture scan failed (exit ${status}; 124 is the bound), so nothing is known about the leased project's fixtures; every case is graded as usual." >&2
   fi
 }
-profile_begin "fleet-fixture-state: the leased project's fixtures"
-STEP_START=$SECONDS
+# The call is below, past the ledger credential section (the declared-intent
+# note's read uses the grading token the preflight mints there); the report
+# and the published copy land here.
 mkdir -p "${ARTIFACTS:-/tmp/artifacts}"
 EVAL_LEASE_FIXTURE_REPORT_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_LEASE_FIXTURE_REPORT}"
 EVAL_FIXTURE_STATE_PUBLISHED_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_FIXTURE_STATE_PUBLISHED_COPY}"
-scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}" "${EVAL_FIXTURE_STATE_PUBLISHED_PATH}"
-echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
 # own manual sweep had already raised all 30 projects and main.tf declares the same
@@ -1154,9 +1385,15 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# On the replay lane, the nightlies' recorded answers are fetched before any
+# case runs; with nothing to replay the lane stops here, having measured
+# nothing (hack/ci-env.sh). A no-op on every other run. The lane seeds them
+# into the proxy pods and starts its collector at the fan-out, after its live
+# arm (seed_replay_lane_cache).
+prepare_replay_lane_cache || exit 1
 # Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
 # to the private bucket from here on, while the eval runs (hack/ci-env.sh).
-start_replay_shadow_collector
+[ "${EVAL_REPLAY_LANE:-}" = "true" ] || start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
@@ -1199,9 +1436,9 @@ run_rollback_lane() {
     ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
     > >(tee "${artifacts}/${EVAL_ROLLBACK_LOG}") 2>&1 &
   EVAL_ROLLBACK_PID=$!
-  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; stop_model_calls_on_cancel || true; exit 143' TERM INT
   wait "${EVAL_ROLLBACK_PID}" || status=$?
-  trap 'exit 143' TERM INT
+  trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
   if [ "${status}" -ne 0 ]; then
     echo "ERROR: the rollback lane's round trip failed (exit ${status}): the next install did not roll back to ${EVAL_ROLLBACK_LANE_END_MODE} cleanly, so its matrix is not run. The last FAIL line above names the check, or says the run was stopped at its ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound (transcript: ${artifacts}/${EVAL_ROLLBACK_LOG})." >&2
     exit 1
@@ -1234,7 +1471,7 @@ export BENCH_TF_ROOT="./tf"
 #
 # EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
 # instead, once per fan-out unit, because a token lasts an hour and units
-# launch across the whole run; grading's mint asks for its three reads
+# launch across the whole run; grading's mint asks for its four reads
 # explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
 # own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
@@ -1271,12 +1508,14 @@ LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
 LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
-# What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
-# documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
-# mint rather than inherited from the installation's whole grant -- which,
-# since 2026-09-22, includes issues: write on every pool repository for the
-# ledger reset. An omitted body on this endpoint means "everything granted".
-LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
+# What the grading mint asks for: the four reads docs/ci-pool-projects.md 5.4
+# documents (contents: read since #5519, so the github_writes safeguard can
+# list a branch pushed with no pull request behind it), requested explicitly
+# so BENCH_GITHUB_TOKEN's reach is pinned at mint rather than inherited
+# from the installation's whole grant -- which, since 2026-09-22, includes
+# issues: write on every pool repository for the ledger reset. An omitted
+# body on this endpoint means "everything granted".
+LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","contents":"read","metadata":"read"}}'
 # What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
 # to close, contents to delete a branch, issues to label an audit pull request
 # before its close. Narrowed to the leased repository at mint, as the ledger
@@ -1300,9 +1539,8 @@ BENCH_GITOPS_WRITE_MARKER_RE="^[[:space:]]*variable[[:space:]]+\"${BENCH_GITOPS_
 # project role that the fleet creates there for an eval stack's
 # ConfigConnectorContext. Given to a writing stack's unit as
 # TF_VAR_kcc_cluster_name, TF_VAR_kcc_cluster_location and
-# TF_VAR_kcc_google_service_account. No stack on main reads them yet: the
-# stalled Config Connector case's stack (#4594) does, when it declares the
-# marker.
+# TF_VAR_kcc_google_service_account. The stalled Config Connector case's
+# stack (bench/tf/prebuilt/kcc-stalled-declaration) reads them.
 KCC_FLEET_SLOT="a"
 KCC_EVAL_CONTEXT_ACCOUNT="kcc-eval-context"
 # The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
@@ -1855,7 +2093,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts five), read with the YAML parser by
+# runs), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -1948,7 +2186,8 @@ probe_gitlab_ledger_path() { # <label>
 # would not come clean both stay 1, as does a GitLab agent token that is not
 # in hand.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero when a unit must not run on it
-  local label="$1" token out rc=0 slug record diagnostics mint_rc=0
+  local label="$1" token out rc=0 slug record diagnostics mint_rc=0 kcc_cluster
+  local kcc_args=()
   if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
@@ -1980,10 +2219,19 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
   # carries its own proof of what each unit started on.
   slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
   record="${ARTIFACT_DIR}/agent-pulls-reset/${slug}.json"
+  # The Config Connector stack's declaration is under the real name of the
+  # KCC_FLEET_SLOT cluster, read from the .fleet-context as the stack's own
+  # inputs are (export_writing_stack_inputs); without it, the helper uses the
+  # name of the fleet's default prefix. GitHub only: the GitLab path deletes
+  # no file.
+  kcc_cluster="$(fleet_context_value "cluster.${KCC_FLEET_SLOT}")"
+  if [ -n "${kcc_cluster}" ] && [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ]; then
+    kcc_args=(--kcc-cluster "${kcc_cluster}")
+  fi
   # The token rides in the environment of this one process, never on argv.
   out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
     --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
-    --scope "${label}" --record "${record}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
+    --scope "${label}" --record "${record}" ${kcc_args[@]+"${kcc_args[@]}"} ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
@@ -2170,15 +2418,26 @@ wait_platform_runs() { # <label> <space-separated audit ids>
 # exchange is cut and the harness cannot send the cancel over the failed
 # transport (pull-kube-agents-smoke-test 2116235582324609024 on #4323 and
 # 2117358437963665408 on #3846), at the delegation ceiling, and through a
-# worker's own fan-out. The exec goes to the gateway pod, not through the
+# worker's own fan-out. The exec goes to a Ready gateway pod (ready_gateway_pod), not through the
 # port-forward the cut exchange used. hack/ci_fence_cards.py does the work and
 # says what it archived; the settle that follows in launch_units covers a push
 # already in flight when a worker stops. Pinned to AGENT_CLUSTER_CONTEXT and
 # refused for a context that does not name PROJECT_ID, as wait_platform_runs
-# is. Returns 0 whatever happens: a fence that fails is a warning, and the
-# unit runs as it did before the fence.
-fence_live_cards() { # <label>
-  local label="$1" ns ctx out rc=0
+# is. Returns 0 whatever happens. A fence skipped for a missing prerequisite or
+# a foreign context, or one that ran and left cards it names (the helper's
+# decided exit), is a warning, and the unit runs as it did before the fence. A
+# fence that could not run to its verdict after its attempts notes the unit
+# under FENCE_UNFENCED_DIR, and run_one_unit records it as infrastructure
+# instead of launching it (#5508).
+#
+# With `arm` as the fourth argument (run_replay_lane_live_arm, no unit named), it
+# archives every card the replay lane's live arm filed, finished ones included, so
+# the replayed arm does not read the live arm's answers off the board;
+# hack/ci_fence_cards.py says which cards that leaves alone. Bounded by
+# EVAL_ARM_CLEAR_TIMEOUT_SECONDS; a clear that fails only warns.
+fence_live_cards() { # <label> [<task-name> <rep> [arm]]
+  local label="$1" name="${2:-}" rep="${3:-}" scope="${4:-live}" ns ctx out rc=0 pod attempt limit="${EVAL_FENCE_TIMEOUT_SECONDS}"
+  [ "${scope}" != "arm" ] || limit="${EVAL_ARM_CLEAR_TIMEOUT_SECONDS}"
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || [ -z "${EVAL_FANOUT_STARTED_EPOCH:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
@@ -2191,38 +2450,87 @@ fence_live_cards() { # <label>
       echo "WARNING: Card fence (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
       return 0 ;;
   esac
-  local bound=(timeout --foreground "${EVAL_FENCE_TIMEOUT_SECONDS}")
+  local bound=(timeout --foreground "${limit}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
-    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
-    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
-    "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
-    < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
-  if [ "${rc}" -eq 0 ]; then
-    echo "Card fence (${label}): ${out}"
+  # Each attempt first waits for a Ready gateway pod and execs into that pod, as the
+  # scheduled-audits exec does: a gateway preempted or rolled mid-phase (#5508) has no
+  # container to exec into for some minutes, and the card the earlier unit left runs
+  # again on the pod that replaces it. After a unit has gone unfenced, the latch holds
+  # each later fence to one attempt until one succeeds.
+  local attempts="${EVAL_FENCE_ATTEMPTS}" latch=""
+  if [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
+    latch="${FENCE_UNFENCED_DIR}/${EVAL_FENCE_GATEWAY_AWAY_LATCH}"
+    [ ! -e "${latch}" ] || attempts=1
+  fi
+  for attempt in $(seq 1 "${attempts}"); do
+    rc=0
+    pod="$(ready_gateway_pod "${ctx}" "${ns}" "${EVAL_FENCE_POD_WAIT_SECONDS}")" || {
+      rc=1
+      out="no Ready gateway pod within ${EVAL_FENCE_POD_WAIT_SECONDS}s"
+      [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+      continue
+    }
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "${pod}" \
+      -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+      "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
+      "$((limit - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" "${scope}" \
+      < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      echo "Card fence (${label}): ${out}"
+      [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
+      return 0
+    fi
+    if [ "${rc}" -eq "${EVAL_FENCE_DECIDED_EXIT}" ]; then
+      # The helper ran and says what it could not archive: the fence did its work,
+      # and the unit launches as it did before the fence existed.
+      if [ "${scope}" = "arm" ]; then
+        echo "WARNING: Card fence (${label}): ${out}; the replayed arm may read the cards named on the board" >&2
+      else
+        echo "WARNING: Card fence (${label}): ${out}; a card still live may open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+      fi
+      [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
+      return 0
+    fi
+    [ "${rc}" -eq 124 ] && out="timed out after ${limit}s${out:+; ${out}}"
+    echo "WARNING: Card fence (${label}): kubectl exec into ${pod} exited ${rc} on attempt ${attempt} of ${attempts} (${out})" >&2
+    [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+  done
+  # Not launched into a window the fence did not clear: run_one_unit records the
+  # unit as infrastructure from this note (#4425, #5508). A caller that named no
+  # unit gets the warning alone.
+  if [ "${scope}" = "arm" ]; then
+    echo "WARNING: Card fence (${label}): could not run after ${attempts} attempt(s) (${out}); the replayed arm may read the live arm's cards on the board" >&2
     return 0
   fi
-  [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
-  echo "WARNING: Card fence (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+  echo "WARNING: Card fence (${label}): could not run after ${attempts} attempt(s) (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it, so the unit is not launched (#4425, #5508)" >&2
+  if [ -n "${name}" ] && [ -n "${rep}" ] && [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
+    mkdir -p "${FENCE_UNFENCED_DIR}" 2>/dev/null || true
+    printf '%s\n' "the card fence could not run before this unit (${out}); not launched into a window it did not clear (#5508)" \
+      > "${FENCE_UNFENCED_DIR}/${name}.rep${rep}" 2>/dev/null || true
+    : > "${latch}" 2>/dev/null || true
+  fi
   return 0
 }
 
 # The Platform Agent's clock-started audits, paused at lease time and again right
-# before the fan-out (#3020), and resumed from the EXIT trap.
-# hack/ci_pause_scheduled_audits.py does both in the gateway with Hermes' own `cron
+# before the fan-out (#3020), the first-run stage's audits paused through the
+# fan-out once the stage has had its run of each (`chain`, from chain_audits_watch;
+# #5570), and resumed from the EXIT trap.
+# hack/ci_pause_scheduled_audits.py does all three in the gateway with Hermes' own `cron
 # pause`/`cron resume`, and its header owns which jobs, why the pause outlives a
 # gateway restart, and its exit codes. A Prow lease's teardown sweeps the volume
 # anyway; the resume is for a run against an install that outlives it. A pause that
 # still fails after its attempts stops the run as an infrastructure failure, since a
-# scheduled audit on its clock would charge its writes to the cases; a resume that
-# fails only warns. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
+# scheduled audit on its clock would charge its writes to the cases; a `chain` pass or
+# a resume that fails only warns: the next pass tries again. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
 # does not name PROJECT_ID, as wait_platform_runs is; without kubectl, a context or a
 # project it returns 0 and does nothing.
-scheduled_audits() { # <pause|resume> <label>
+scheduled_audits() { # <pause|chain|resume> <label>
   local mode="$1" label="$2" ns ctx out rc=0 args=()
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   [ "${mode}" = "resume" ] && args=(--resume)
+  [ "${mode}" = "chain" ] && args=(--chain)
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || ! command -v kubectl >/dev/null 2>&1; then
     echo "WARNING: Scheduled audits (${label}): no ${mode}, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing" >&2
     return 0
@@ -2244,7 +2552,7 @@ scheduled_audits() { # <pause|resume> <label>
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
   local attempt pod wait="${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}"
-  [ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
+  [ "${mode}" != "resume" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
   for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
     rc=0
     pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")" || {
@@ -2273,6 +2581,67 @@ scheduled_audits() { # <pause|resume> <label>
     exit 1
   fi
   echo "WARNING: Scheduled audits (${label}): ${mode} exited ${rc} on attempt ${attempt}: ${out}; any audit not named as ${mode}d keeps its state" >&2
+  return 0
+}
+
+# The first-run stage's audits are three of the clock-started ones plus two more, and
+# the stage skips one that is paused, so the lease and fan-out pauses leave them on
+# (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
+# says when), every
+# EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
+# run would be a second full run nothing grades. Started outside the job table
+# (a subshell that exits at once leaves it to init), since launch_units counts
+# `jobs -rp` as running units and the phases end on a bare `wait`. It ends when
+# this script does, if nothing has stopped it first: the pid file goes, or the
+# script's pid is gone.
+#
+# stop_chain_audits_watch sends TERM. A nap ends at once; a pass under way runs to its
+# end, since bash runs a trap only once the foreground command returns, and killing
+# the subshell alone would leave that pass's exec running to pause after the EXIT
+# trap's resume. A pass that outlasts the wait almost always leaves its pauses
+# recorded, for the next run's resume or the oobe-first-run-audits arm to lift: the
+# script writes the record again after each pause, and a resume that sees a job it
+# names paused at its read-back keeps the record and asks for its retry. Only a pause
+# landing between that read-back and the record's removal goes unrecorded.
+start_chain_audits_watch() {
+  local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" owner=$$
+  : > "${running}"
+  (
+    (
+      stopping="" nap=""
+      trap 'stopping=1; [ -z "${nap}" ] || kill "${nap}" 2>/dev/null' TERM
+      # Naps first: the pid file is written while it does.
+      while [ -z "${stopping}" ]; do
+        sleep "${EVAL_CHAIN_AUDITS_INTERVAL_SECONDS}" &
+        nap=$!
+        # A TERM between the fork and the line above found no nap to end.
+        [ -z "${stopping}" ] || kill "${nap}" 2>/dev/null || true
+        wait "${nap}" 2>/dev/null || true
+        nap=""
+        [ -z "${stopping}" ] && [ -e "${pidfile}" ] && kill -0 "${owner}" 2>/dev/null || break
+        scheduled_audits chain "fan-out watch"
+      done
+      rm -f "${running}"
+    ) </dev/null &
+    echo "$!" > "${pidfile}"
+  )
+}
+
+stop_chain_audits_watch() {
+  local pidfile="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" pid waited=0
+  [ -n "${STATE_DIR:-}" ] || return 0
+  # A second call (the EXIT trap's, after the fan-out's timed out) finds no pid file
+  # but still waits on the pass.
+  if [ -e "${pidfile}" ]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    rm -f "${pidfile}"
+    [ -z "${pid}" ] || kill "${pid}" 2>/dev/null || true
+  fi
+  while [ -e "${running}" ] && [ "${waited}" -lt "${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused until the next eval run's resume or the oobe-first-run-audits arm lifts it, both from the record it writes after each pause" >&2
   return 0
 }
 
@@ -2560,6 +2929,17 @@ if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
 else
   EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 fi
+
+# ─── The leased project's fixtures, in their designed state? ─────────────────
+# scan_lease_fixtures (section 2, beside the fleet kubeconfigs it reads); run
+# here because the declared-intent note's read uses the grading token the
+# preflight above minted.
+profile_begin "fleet-fixture-state: the leased project's fixtures"
+STEP_START=$SECONDS
+scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}" "${EVAL_FIXTURE_STATE_PUBLISHED_PATH}"
+echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
+
+profile_begin "lease resets: ledgers, agent pulls, scope exclusion, scheduled audits"
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
 probe_gitlab_ledger_path "lease" || exit 1
@@ -2720,7 +3100,7 @@ export TF_VAR_prow_build_id="${BUILD_ID:-}"
 export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
-# Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
+# Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
 # Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the
@@ -2741,6 +3121,17 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
   fi
   export AGENT_INJECT_TOKEN
   export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+  # The A2A door's token, for the card-wait stopped ask alone. Missing is not
+  # fatal: the matrix goes through the inject door, and the harness records
+  # that one case as infrastructure when it has no token. The value is never
+  # echoed; only the Secret's name is.
+  EVAL_A2A_DOOR_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX}"
+  if AGENT_A2A_DOOR_TOKEN="$(kubectl get secret "${EVAL_A2A_DOOR_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}}" | base64 --decode)" && [ -n "${AGENT_A2A_DOOR_TOKEN}" ]; then
+    export AGENT_A2A_DOOR_TOKEN
+  else
+    unset AGENT_A2A_DOOR_TOKEN
+    echo "WARNING: the A2A door's token Secret ${EVAL_A2A_DOOR_TOKEN_SECRET} (key ${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}; a card-wait stopped ask will be recorded as infrastructure." >&2
+  fi
   echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
 fi
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
@@ -2761,8 +3152,8 @@ export JUDGE_PROVIDER="google"
 # distinct judge model is blocked on one
 # fact this repository cannot prove: that kube-agents-gemini-api-key serves a
 # second model. The tree says it should -- the chart's default for the same
-# GEMINI_API_KEY family is gemini-3.5-flash (charts/kube-agents/templates/
-# litellm.yaml, docs/site .../inference-gateway.md) -- so the switch is one
+# GEMINI_API_KEY family is gemini-3.8-flash (charts/kube-agents/templates/
+# _helpers.tpl, docs/site .../inference-gateway.md) -- so the switch is one
 # verified run away: confirm the key against the candidate model, then set
 # JUDGE_MODEL_OVERRIDE in the Prow job env (or flip the default here) without
 # touching the agent line.
@@ -2780,7 +3171,35 @@ if [ -n "${PULL_NUMBER:-}" ] && ! grep -qwE 'ToolInvocation|ChecklistScore|Outco
   export KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES=1
 fi
 export AGENT_PROVIDER="google"
+# A Prow job brings AGENT_MODEL_OVERRIDE from the build cluster's eval-model
+# Secret; hack/ci-deploy.sh, which runs first in every lane, refuses a Prow
+# job without it, so the default here serves local runs only.
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the install's gateway asks for, the same variable
+# hack/ci-deploy.sh passed to the chart (litellm.reasoningEffort): low, medium
+# or high, or empty for the model default. `bench-gate case` reads it, with
+# MODEL_PROVIDER, from the environment and stamps every case record with the
+# provider, the model and the effort it was graded under; a flag would not do,
+# because a pull request is graded with main's bench (pin_grader above). The
+# value is checked before the first unit rather than hours later at grading.
+# MODEL_DEFAULT_NAME is the model the install serves and AGENT_MODEL the one
+# the records name (devops-bench's setupId): a run whose two differ would file
+# its records under a model the install never ran, so it stops here.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "ERROR: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+if [ -n "${MODEL_DEFAULT_NAME:-}" ] && [ "${MODEL_DEFAULT_NAME}" != "${AGENT_MODEL}" ]; then
+  echo "ERROR: MODEL_DEFAULT_NAME=${MODEL_DEFAULT_NAME} (the model the install serves) differs from AGENT_MODEL=${AGENT_MODEL} (the model the records name); set AGENT_MODEL_OVERRIDE to the served model." >&2
+  exit 1
+fi
+echo "Agent model for this run: ${MODEL_PROVIDER:-unset provider}/${AGENT_MODEL}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE
@@ -2794,7 +3213,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: six files under hack/eval/, read here at
+# The matrix is data, not code: five files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), gitlab-cases.txt is what the GitLab lane runs in
 # its place under EVAL_FORGE=gitlab (#2394, at the tier switch),
@@ -2817,12 +3236,13 @@ fi
 # ./tasks/<id>/task.yaml path, a path with no case directory behind it, or a
 # nightly entry that is also a presubmit one (it would run twice a night) all
 # stop the job here, before it spends a cluster, rather than running a wrong
-# matrix and reporting green around it. certification-cases.txt is what
-# EVAL_TIER=certification runs on its own (the certification tier, below).
+# matrix and reporting green around it. The validated-capabilities suite is the one
+# matrix read from the task files themselves: `suite: validated-capabilities` in a
+# task file is what EVAL_TIER=validated-capabilities runs (the validated-capabilities tier,
+# below).
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
-CERTIFICATION_CASES_FILE="${SCRIPT_DIR}/${EVAL_CERTIFICATION_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
@@ -2937,49 +3357,75 @@ for ENTRY in "${NIGHTLY_TASKS[@]}"; do
   fi
 done
 
-# ─── The certification tier ──────────────────────────────────────────────────
-# The certification suite: the cases behind the certified-capabilities page,
-# graded on their own lane (the ci-kube-agents-certification periodics in
-# oss-test-infra, EVAL_TIER=certification) and never on a pull request or a
-# nightly. Every entry is a top-level case under bench/tasks/ whose task file
-# carries `suite: certification` (scripts/validate_bench_cases.py holds the
-# roster to that); an entry that is also a presubmit or nightly case stops the
+# ─── The validated-capabilities tier ──────────────────────────────────────────────────
+# The validated-capabilities suite: the cases behind the validated-capabilities page,
+# graded on their own lane (the ci-kube-agents-validated-capabilities periodics in
+# oss-test-infra, EVAL_TIER=validated-capabilities) and never on a pull request or a
+# nightly. Membership is read from the task files, not from a roster: every
+# top-level case under bench/tasks/ whose task file carries the bare line
+# `suite: validated-capabilities` is in the suite, in case-id order (LC_ALL=C, the
+# order scripts/eval_rosters.py sorts in), so a case pull request edits no
+# shared file. An entry that is also a presubmit or nightly case stops the
 # job, since a case graded on two lanes would hold two records under one
-# name. The file may be empty between the tier landing and its first case,
+# name. The suite may be empty between the tier landing and its first case,
 # so the empty read is refused only when this tier is the one running.
-# `# part N` lines (N from 1, the line on its own) split the file into
-# sections, one periodic each (EVAL_CERTIFICATION_PART below); an entry
-# above the first marker is part 1. scripts/eval_rosters.py reads the same
-# grammar (PART_MARKER_RE); the two must stay twins.
-CERTIFICATION_ENTRIES="$(roster_entries "${CERTIFICATION_CASES_FILE}")"
-CERTIFICATION_TASKS=()
+# `suite_part: N` in a task file (N from 1, the bare line) puts the
+# case in section N, one periodic each (EVAL_VALIDATED_CAPABILITIES_PART below); a
+# case without the line is part 1. scripts/eval_rosters.py reads the same
+# two lines (VALIDATED_CAPABILITIES_SUITE_LINE_RE, VALIDATED_CAPABILITIES_PART_LINE_RE); the
+# two must stay twins.
+validated_capabilities_entries() {
+  # grep -l exits 1 when no task file matches; that is the empty suite, not
+  # an error, and the tier switch below is what refuses it. Exit 2 (a task
+  # file it could not read) is an error: a case dropped in silence would
+  # grade green around a missing record. Sorted on the id field, not the
+  # path: `tasks/foo-bar/` sorts before `tasks/foo/` as text (`-` before
+  # `/`), and scripts/eval_rosters.py sorts by id.
+  (
+    cd "${BENCH_DIR}" || exit 1
+    local files rc=0
+    files="$(LC_ALL=C grep -lE "${VALIDATED_CAPABILITIES_SUITE_LINE_RE}" tasks/*/task.yaml)" || rc=$?
+    if [ "${rc}" -gt 1 ]; then
+      echo "ERROR: could not read every task file under bench/tasks/ for the validated-capabilities suite (grep exit ${rc})." >&2
+      exit 1
+    fi
+    if [ -n "${files}" ]; then
+      LC_ALL=C sort -t/ -k2,2 <<< "${files}" | sed 's|^|./|'
+    fi
+  )
+}
+VALIDATED_CAPABILITIES_ENTRIES="$(validated_capabilities_entries)"
+VALIDATED_CAPABILITIES_TASKS=()
 while IFS= read -r ENTRY; do
-  if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
-done <<< "${CERTIFICATION_ENTRIES}"
-check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+  if [ -n "${ENTRY}" ]; then VALIDATED_CAPABILITIES_TASKS+=("${ENTRY}"); fi
+done <<< "${VALIDATED_CAPABILITIES_ENTRIES}"
+check_case_entries "bench/tasks (suite: validated-capabilities)" ${VALIDATED_CAPABILITIES_TASKS[@]+"${VALIDATED_CAPABILITIES_TASKS[@]}"}
 # A here-string, not `printf | grep -q`: grep exits on its first match, a
 # producer still writing dies of SIGPIPE, and under pipefail the duplicate
 # reads as absent. printf hands the pipe a few KiB per write, so on today's
 # rosters that is a rare race (the flake this replaced); past a pipe buffer
 # it is every run.
-for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
+for ENTRY in ${VALIDATED_CAPABILITIES_TASKS[@]+"${VALIDATED_CAPABILITIES_TASKS[@]}"}; do
   if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
-    echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
+    echo "ERROR: ${ENTRY} carries 'suite: validated-capabilities' and is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a validated-capabilities case runs on the validated-capabilities lane only, or it holds two records under one name." >&2
     exit 1
   fi
 done
 
-# The entries of one `# part N` section of the certification file, in file
-# order, with the same comment and whitespace rules as roster_entries.
-certification_part_entries() { # <file> <N>
-  awk -v want="$2" '
-    BEGIN { part = 1 }
-    /^#[[:space:]]+part[[:space:]]+[1-9][0-9]*[[:space:]]*$/ { part = $3 + 0; next }
-    {
-      sub(/#.*$/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-      if ($0 != "" && part == want + 0) print
-    }
-  ' "$1"
+# The part a validated-capabilities case is in: the N of its bare
+# `suite_part: N` line, 1 when it has none.
+suite_part_of() { # <entry>
+  local part
+  part="$(grep -E "${VALIDATED_CAPABILITIES_PART_LINE_RE}" "${BENCH_DIR}/$1" | head -n 1 | sed "s/^${VALIDATED_CAPABILITIES_PART_KEY}: //" || true)"
+  echo "${part:-1}"
+}
+
+# The entries of section N of the suite, in case-id order.
+suite_part_entries() { # <N>
+  local entry
+  for entry in ${VALIDATED_CAPABILITIES_TASKS[@]+"${VALIDATED_CAPABILITIES_TASKS[@]}"}; do
+    if [ "$(suite_part_of "${entry}")" = "$1" ]; then echo "${entry}"; fi
+  done
 }
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -3018,7 +3464,7 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # A here-string, not `printf | grep -q`: grep exits on its first match, a
   # producer still writing dies of SIGPIPE, and under pipefail a registered
   # entry reads as unregistered. A rare race on today's rosters, every run
-  # past a pipe buffer; the certification check above says why.
+  # past a pipe buffer; the validated-capabilities check above says why.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
     if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
       echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
@@ -3048,44 +3494,168 @@ case "${EVAL_TIER}" in
       echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
     fi
     ;;
-  certification)
+  validated-capabilities)
     # The suite replaces the presubmit matrix: nothing from the other two
     # files runs here, and the blocking roster, a subset of the presubmit,
-    # arms nothing, so a failing certification case is a record and never a
+    # arms nothing, so a failing validated-capabilities case is a record and never a
     # red. The suite grades GitHub only.
     if [ -n "${LANE_CASES_FILE}" ]; then
-      echo "ERROR: EVAL_TIER=certification grades GitHub only; unset EVAL_FORGE=${EVAL_FORGE}." >&2
+      echo "ERROR: EVAL_TIER=validated-capabilities grades GitHub only; unset EVAL_FORGE=${EVAL_FORGE}." >&2
       exit 1
     fi
-    if [ "${#CERTIFICATION_TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: ${CERTIFICATION_CASES_FILE} names no case; the certification tier would run nothing and report green." >&2
+    if [ "${#VALIDATED_CAPABILITIES_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: no task file under bench/tasks/ carries the bare line 'suite: validated-capabilities'; the validated-capabilities tier would run nothing and report green." >&2
       exit 1
     fi
-    TASKS=("${CERTIFICATION_TASKS[@]}")
-    echo "EVAL_TIER=certification: ${#TASKS[@]} certification case(s) make the matrix; no presubmit or nightly case runs"
+    TASKS=("${VALIDATED_CAPABILITIES_TASKS[@]}")
+    echo "EVAL_TIER=validated-capabilities: ${#TASKS[@]} validated-capabilities case(s) make the matrix; no presubmit or nightly case runs"
     ;;
   *)
-    echo "ERROR: EVAL_TIER must be 'presubmit', 'nightly' or 'certification', got '${EVAL_TIER}'." >&2
+    echo "ERROR: EVAL_TIER must be 'presubmit', 'nightly' or 'validated-capabilities', got '${EVAL_TIER}'." >&2
     exit 1
     ;;
 esac
 
+# ─── The replay lane (examples/inference-replay/eval-design.md, Rollout 2) ───
+# EVAL_REPLAY_LANE=true replaces the matrix with hack/eval/replay-lane-cases.txt:
+# registered cases (a presubmit or nightly entry), each replayed from what the
+# nightlies recorded. The lane gates nothing and records nothing as main's
+# history (the recorder decision and the dashboard hook below both skip it);
+# its report is the collector's, in the private shadow bucket. It runs on the
+# presubmit tier's defaults and GitHub only.
+# The safety cases' names, comma-separated; set only on the lane, below.
+REPLAY_LANE_SAFETY_NAMES=""
+case "${EVAL_REPLAY_LANE:-false}" in
+  false) ;;
+  true)
+    if [ "${EVAL_TIER}" != "presubmit" ] || [ -n "${LANE_CASES_FILE}" ]; then
+      echo "ERROR: EVAL_REPLAY_LANE=true runs its own roster on GitHub; unset EVAL_TIER (${EVAL_TIER}) and EVAL_FORGE (${EVAL_FORGE})." >&2
+      exit 1
+    fi
+    REPLAY_LANE_CASES_FILE="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_CASES_FILE}"
+    REPLAY_LANE_ENTRIES="$(roster_entries "${REPLAY_LANE_CASES_FILE}")"
+    REPLAY_LANE_TASKS=()
+    while IFS= read -r ENTRY; do
+      if [ -n "${ENTRY}" ]; then REPLAY_LANE_TASKS+=("${ENTRY}"); fi
+    done <<< "${REPLAY_LANE_ENTRIES}"
+    if [ "${#REPLAY_LANE_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: ${REPLAY_LANE_CASES_FILE} names no case; the replay lane would replay nothing." >&2
+      exit 1
+    fi
+    for ENTRY in "${REPLAY_LANE_TASKS[@]}"; do
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+    done
+    # The safety cases join the matrix at twice the repetitions
+    # (case_repetitions): the first EVAL_REPETITIONS run live, before the
+    # cache is seeded, the rest replayed. Registered, and in neither list twice.
+    REPLAY_LANE_SAFETY_CASES_PATH="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}"
+    REPLAY_LANE_SAFETY_ENTRIES=""
+    if [ -f "${REPLAY_LANE_SAFETY_CASES_PATH}" ]; then
+      REPLAY_LANE_SAFETY_ENTRIES="$(roster_entries "${REPLAY_LANE_SAFETY_CASES_PATH}")"
+    fi
+    while IFS= read -r ENTRY; do
+      [ -n "${ENTRY}" ] || continue
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_SAFETY_CASES_PATH}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+      if printf '%s\n' "${REPLAY_LANE_TASKS[@]}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_SAFETY_CASES_PATH}: '${ENTRY}' is already in the lane's matrix (${EVAL_REPLAY_LANE_CASES_FILE} or above); a case is listed once." >&2
+        exit 1
+      fi
+      REPLAY_LANE_TASKS+=("${ENTRY}")
+      REPLAY_LANE_SAFETY_NAMES="${REPLAY_LANE_SAFETY_NAMES:+${REPLAY_LANE_SAFETY_NAMES},}$(basename "$(dirname "${ENTRY}")")"
+    done <<< "${REPLAY_LANE_SAFETY_ENTRIES}"
+    TASKS=("${REPLAY_LANE_TASKS[@]}")
+    echo "EVAL_REPLAY_LANE=true: the replay lane replays ${#TASKS[@]} case(s) (${EVAL_REPLAY_LANE_CASES_FILE}); nothing it grades is recorded or gates anything"
+    echo "EVAL_REPLAY_LANE=true: safety cases, each run live before the cache is seeded and then replayed (${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}): ${REPLAY_LANE_SAFETY_NAMES:-none}"
+    ;;
+  *)
+    echo "ERROR: EVAL_REPLAY_LANE must be 'true' or 'false', got '${EVAL_REPLAY_LANE}'." >&2
+    exit 1
+    ;;
+esac
+
+# case_repetitions <task-name>: how many repetitions a case runs. A replay-lane
+# safety case runs a live arm and then a replayed one, EVAL_REPETITIONS each;
+# every other case runs EVAL_REPETITIONS. A safety case's repetitions are
+# numbered on: 1..EVAL_REPETITIONS live, the rest replayed (first_queued_rep).
+case_repetitions() {
+  case ",${REPLAY_LANE_SAFETY_NAMES:-}," in
+    *",$1,"*) echo $((EVAL_REPETITIONS * REPLAY_LANE_SAFETY_ARMS)) ;;
+    *) echo "${EVAL_REPETITIONS}" ;;
+  esac
+}
+
+# first_queued_rep <task-name>: the first repetition the main fan-out launches:
+# past the live arm for a safety case, whose live repetitions run before the
+# cache is seeded.
+first_queued_rep() {
+  case ",${REPLAY_LANE_SAFETY_NAMES:-}," in
+    *",$1,"*) echo $((EVAL_REPETITIONS + 1)) ;;
+    *) echo 1 ;;
+  esac
+}
+
+# write_replay_lane_arms <seeded-at epoch seconds>: tells lane_report.py (its
+# ARMS_FILE) which safety cases ran a live arm, how many repetitions it was,
+# and when replay began, beside bench-gate's case files in the collector's
+# --verdicts-dir.
+write_replay_lane_arms() {
+  [ -n "${REPLAY_LANE_SAFETY_NAMES:-}" ] || return 0
+  python3 -c '
+import json, sys
+path, live_reps, seeded_at, names = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({"live_reps": live_reps, "replayed_from": seeded_at, "cases": names.split(",")}, fh)
+' "${ARTIFACT_DIR}/${REPLAY_LANE_ARMS_FILE}" "${EVAL_REPETITIONS}" "$1" "${REPLAY_LANE_SAFETY_NAMES}"
+}
+
+# run_replay_lane_live_arm: on the replay lane, the live arm runs while every
+# proxy pod's cache is still empty, so each of its requests misses and goes to
+# the model; then the cache goes in and the collector starts, and every unit
+# launched after this is replayed. A no-op off the lane. Uses the fan-out's
+# UNIT_QUEUE_LIVE and LIVE_TOTAL, set before it is called.
+run_replay_lane_live_arm() {
+  [ "${EVAL_REPLAY_LANE:-}" = "true" ] || return 0
+  if [ "${LIVE_TOTAL:-0}" -gt 0 ]; then
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
+    launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+    wait
+    # The replayed arm must not read the live arm's answers off the board (replay
+    # lane build 2122208205344870400 read a finished live-arm card). Since
+    # EVAL_FANOUT_STARTED_EPOCH, set right before this is called. A failed clear
+    # only warns.
+    fence_live_cards "replay lane live arm" "" "" arm
+  fi
+  seed_replay_lane_cache || exit 1
+  write_replay_lane_arms "$(date -u +%s)"
+  start_replay_shadow_collector
+}
+
 # Which part of the nightly matrix this run takes, so the nightly can run as
-# two periodics on two leased projects: the cases that request a pull request
+# several periodics on leased projects of their own: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
-# those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two leased projects:
-# its length is set by the stack-bearing units, which run one at a time under
-# lock-infra, and each project has a lock of its own (#3384). The split is
+# those cases out and "writers" runs them alone. "main-a" to "main-e" split
+# "main" again, so it can run as five periodics on five leased projects: its
+# length is set by the stack-bearing units, which run one at a time under
+# lock-infra, and by the onboarding cases' chain under their state lock, and
+# each project has locks of its own (#3384, #4238). "writers-a",
+# "writers-b" and "writers-c" split "writers" in three the same way: its
+# units run one at a time, each after the project's one GitOps repository is
+# reset, and each project has a repository of its own (#4238). The split is
 # applied after the lane step, which is what names the writers. A part
 # outside the nightly would silently run a subset of the presubmit, so it
 # stops the job, as does any other value.
 EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
 case "${EVAL_NIGHTLY_PART}" in
   all) ;;
-  main | main-a | main-b | writers)
+  main | main-a | main-b | main-c | main-d | main-e | writers | writers-a | writers-b | writers-c)
     if [ "${EVAL_TIER}" != "nightly" ]; then
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
       exit 1
@@ -3096,40 +3666,41 @@ case "${EVAL_NIGHTLY_PART}" in
     fi
     ;;
   *)
-    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b', 'main-c', 'main-d', 'main-e', 'writers', 'writers-a', 'writers-b' or 'writers-c', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
 
-# ─── The certification part ──────────────────────────────────────────────────
-# Which `# part N` section of the certification file this run takes, applied
+# ─── The validated-capabilities part ──────────────────────────────────────────────────
+# Which section of the validated-capabilities suite this run takes (the cases whose
+# task file carries `suite_part: N`; none means part 1), applied
 # to TASKS here, before the exclusions and TASK_NAMES are built from it, so
 # the suite can run as one periodic per section on one leased project each: a
 # week's worth of runs at three repetitions is longer than any single job
-# here. "all", the default, is the whole file. A part outside the
-# certification tier would be a typo that silently ran the wrong matrix, so
+# here. "all", the default, is the whole suite. A part outside the
+# validated-capabilities tier would be a typo that silently ran the wrong matrix, so
 # it stops the job, as does any value that is not "all" or a whole number.
-EVAL_CERTIFICATION_PART="${EVAL_CERTIFICATION_PART:-all}"
-case "${EVAL_CERTIFICATION_PART}" in
+EVAL_VALIDATED_CAPABILITIES_PART="${EVAL_VALIDATED_CAPABILITIES_PART:-all}"
+case "${EVAL_VALIDATED_CAPABILITIES_PART}" in
   all) ;;
   *[!0-9]* | 0*)
-    echo "ERROR: EVAL_CERTIFICATION_PART must be 'all' or a whole number from 1, got '${EVAL_CERTIFICATION_PART}'." >&2
+    echo "ERROR: EVAL_VALIDATED_CAPABILITIES_PART must be 'all' or a whole number from 1, got '${EVAL_VALIDATED_CAPABILITIES_PART}'." >&2
     exit 1
     ;;
   *)
-    if [ "${EVAL_TIER}" != "certification" ]; then
-      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects part of the certification matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the certification tier." >&2
+    if [ "${EVAL_TIER}" != "validated-capabilities" ]; then
+      echo "ERROR: EVAL_VALIDATED_CAPABILITIES_PART=${EVAL_VALIDATED_CAPABILITIES_PART} selects part of the validated-capabilities matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the validated-capabilities tier." >&2
       exit 1
     fi
     TASKS=()
     while IFS= read -r ENTRY; do
       if [ -n "${ENTRY}" ]; then TASKS+=("${ENTRY}"); fi
-    done <<< "$(certification_part_entries "${CERTIFICATION_CASES_FILE}" "${EVAL_CERTIFICATION_PART}")"
+    done <<< "$(suite_part_entries "${EVAL_VALIDATED_CAPABILITIES_PART}")"
     if [ "${#TASKS[@]}" -eq 0 ]; then
-      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification file; the run would grade nothing and report green." >&2
+      echo "ERROR: EVAL_VALIDATED_CAPABILITIES_PART=${EVAL_VALIDATED_CAPABILITIES_PART} selects no case of the ${#VALIDATED_CAPABILITIES_TASKS[@]}-case validated-capabilities suite; the run would grade nothing and report green." >&2
       exit 1
     fi
-    echo "Certification part: ${EVAL_CERTIFICATION_PART} (${#TASKS[@]} of ${#CERTIFICATION_TASKS[@]} cases)"
+    echo "Validated Capabilities part: ${EVAL_VALIDATED_CAPABILITIES_PART} (${#TASKS[@]} of ${#VALIDATED_CAPABILITIES_TASKS[@]} cases)"
     ;;
 esac
 
@@ -3332,9 +3903,10 @@ if [ -n "${GRADER_BENCH_DIR}" ]; then
   BENCH_DIR="${GRADER_BENCH_DIR}"
   EVAL_GRADER_SHA="${PULL_BASE_SHA}"
   echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
-  # The scratch directory has no venv yet, and syncing one fetches over the
-  # network: one retry absorbs a transient failure, so the check below fails
-  # only on itself.
+  # The scratch directory has no venv yet (pin_grader dropped any entry the
+  # archive carried by that name), and syncing one fetches over the network:
+  # one retry absorbs a transient failure, so the check below fails only on
+  # itself.
   if ! (cd "${BENCH_DIR}" && uv sync --quiet) && ! (cd "${BENCH_DIR}" && uv sync --quiet); then
     echo "ERROR: could not sync main's grader's venv in ${BENCH_DIR} (twice, above); the run does not start." >&2
     exit 1
@@ -3404,8 +3976,9 @@ fi
 export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
 INJECT_LANE_TASKS_DIR="$(mktemp -d)"
 # One `<requested> <case> <copy>` line per task: how many pull requests
-# the case requests (its own checks, or the file's `requesting:` list for
-# a case the persona answers with one before its checks say so), the case,
+# the case requests (the larger of its own checks and its top-level
+# `requested_pull_requests` key, which also stands in for a case the
+# persona answers with one before its checks say so), the case,
 # and the copy's path. The cases with a non-zero count are the fan-out's
 # second phase (INJECT_LANE_REQUESTING, read where the unit queue is built):
 # they run only after every other unit has finished, so a repetition of a
@@ -3524,21 +4097,37 @@ fi
 # The "Nightly part:" line is the record of which part a night ran, and
 # names the cases the part left out.
 #
-# main-a and main-b halve the main part. A stack-bearing case (task_stack,
-# off infra_lock_exempt) runs in main-b when NIGHTLY_MAIN_B_FILE lists it and
-# in main-a otherwise: their one-at-a-time chain under lock-infra is what sets
-# the part's length, and that file is chosen to balance it. A case without a
-# stack goes by one bit of its name's cksum (NIGHTLY_HALF_CKSUM_BIT). The
-# onboarding cases (unit_state_lock) all go to main-a: they rewrite one
-# install's onboarding state, and only a run on one install keeps them apart.
-# No rule reads the matrix's order or size: a case's half follows from its
-# name, its task file's stack line, NIGHTLY_MAIN_B_FILE and the helpers below.
-# So the two halves, two periodics that each check out main for themselves,
-# agree on the split when a merge that adds or drops other cases lands between
-# their checkouts. A merge between them that edits one of those inputs for a
-# case can run that case in both halves, or in neither, for one night. The
-# three helpers are defined here, ahead of the fan-out further down that also
-# uses them, because the split runs first.
+# main-a to main-e shard the main part. Two chains set a shard's length: the
+# stack-bearing units' one-at-a-time chain under lock-infra, and the
+# onboarding cases' chain under their state lock (unit_state_lock), which
+# rewrite one install's onboarding state and so all run in main-a, the one
+# install that keeps them apart. The onboarding chain alone ran 380-480 min
+# of wall clock on the nights of 2026-11-04 to 11-06, and beside main-a's
+# half of the stack chain it put main-a at 672-843 min while main-b, with the
+# same number of stack cases and no onboarding chain, took 449-749. So main-a
+# carries the onboarding chain and no other stack case: a stack-bearing case
+# (task_stack, off infra_lock_exempt) runs in the shard whose list names it,
+# NIGHTLY_MAIN_B_FILE to NIGHTLY_MAIN_E_FILE, and in main-a otherwise (a new
+# one, until a list moves it); the four lists are chosen to balance the four
+# stack chains, each about a quarter of the old half, so a new stack case
+# has room. A case without a stack goes by its name's cksum (shifted by
+# NIGHTLY_MAIN_CKSUM_SHIFT, modulo NIGHTLY_MAIN_SHARDS). No rule reads the
+# matrix's order or size: a case's shard follows from its name, its task
+# file's stack line, the four lists and the helpers below. So the five shards,
+# five periodics that each check out main for themselves, agree on the split
+# when a merge that adds or drops other cases lands between their checkouts.
+# A merge between them that edits one of those inputs for a case can run that
+# case in two shards, or in none, for one night. The three helpers are
+# defined here, ahead of the fan-out further down that also uses them,
+# because the split runs first.
+#
+# writers-a, writers-b and writers-c third the writers part by name alone: a
+# writer runs in writers-b when NIGHTLY_WRITERS_B_FILE lists it, in writers-c
+# when NIGHTLY_WRITERS_C_FILE does, and in writers-a otherwise, so a new
+# writer (a requesting case, a stopped ask or a writes_alone case) lands in
+# writers-a until a list moves it.
+# The thirds agree between checkouts as the main shards do, with the same
+# one-night exception for a merge that edits a list.
 
 # Reads infrastructure.stack out of a task file. The nightly part split uses
 # it to tell a stack-bearing case, and the fan-out's loop to decide whether
@@ -3585,13 +4174,32 @@ unit_state_lock() { # <task-name>
 }
 
 NIGHTLY_MAIN_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_B_FILE}"
+NIGHTLY_MAIN_C_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_C_FILE}"
+NIGHTLY_MAIN_D_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_D_FILE}"
+NIGHTLY_MAIN_E_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_E_FILE}"
+NIGHTLY_WRITERS_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_WRITERS_B_FILE}"
+NIGHTLY_WRITERS_C_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_WRITERS_C_FILE}"
 NIGHTLY_PART_DROPPED=""
 if [ "${EVAL_TIER}" = "nightly" ]; then
   NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
   if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
     NIGHTLY_MAIN_B=""
+    NIGHTLY_MAIN_C=""
+    NIGHTLY_MAIN_D=""
+    NIGHTLY_MAIN_E=""
+    NIGHTLY_WRITERS_B=""
+    NIGHTLY_WRITERS_C=""
     case "${EVAL_NIGHTLY_PART}" in
-      main-a | main-b) NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")" ;;
+      main-a | main-b | main-c | main-d | main-e)
+        NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")"
+        NIGHTLY_MAIN_C="$(roster_entries "${NIGHTLY_MAIN_C_FILE}")"
+        NIGHTLY_MAIN_D="$(roster_entries "${NIGHTLY_MAIN_D_FILE}")"
+        NIGHTLY_MAIN_E="$(roster_entries "${NIGHTLY_MAIN_E_FILE}")"
+        ;;
+      writers-a | writers-b | writers-c)
+        NIGHTLY_WRITERS_B="$(roster_entries "${NIGHTLY_WRITERS_B_FILE}")"
+        NIGHTLY_WRITERS_C="$(roster_entries "${NIGHTLY_WRITERS_C_FILE}")"
+        ;;
     esac
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
@@ -3601,15 +4209,38 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
         *) ENTRY_PART="main" ;;
       esac
       case "${EVAL_NIGHTLY_PART}:${ENTRY_PART}" in
-        main-a:main | main-b:main)
+        main-a:main | main-b:main | main-c:main | main-d:main | main-e:main)
           if [ "$(unit_state_lock "${NAME}")" = "onboarding" ]; then
             ENTRY_PART="main-a"
           elif [ -n "$(task_stack "${BENCH_DIR}/${ENTRY}")" ] && ! infra_lock_exempt "${NAME}"; then
-            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then ENTRY_PART="main-b"; else ENTRY_PART="main-a"; fi
-          elif [ $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_HALF_CKSUM_BIT) & 1 )) -eq 1 ]; then
-            ENTRY_PART="main-b"
+            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then
+              ENTRY_PART="main-b"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_C}"; then
+              ENTRY_PART="main-c"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_D}"; then
+              ENTRY_PART="main-d"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_E}"; then
+              ENTRY_PART="main-e"
+            else
+              ENTRY_PART="main-a"
+            fi
           else
-            ENTRY_PART="main-a"
+            case $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_MAIN_CKSUM_SHIFT) % NIGHTLY_MAIN_SHARDS )) in
+              1) ENTRY_PART="main-b" ;;
+              2) ENTRY_PART="main-c" ;;
+              3) ENTRY_PART="main-d" ;;
+              4) ENTRY_PART="main-e" ;;
+              *) ENTRY_PART="main-a" ;;
+            esac
+          fi
+          ;;
+        writers-a:writers | writers-b:writers | writers-c:writers)
+          if grep -qxF -- "${NAME}" <<< "${NIGHTLY_WRITERS_B}"; then
+            ENTRY_PART="writers-b"
+          elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_WRITERS_C}"; then
+            ENTRY_PART="writers-c"
+          else
+            ENTRY_PART="writers-a"
           fi
           ;;
       esac
@@ -3923,14 +4554,19 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
 fi
 BLOCKING_ROSTER_DEFAULT=""
 BLOCKING_ROSTER_ON_LANE=""
-# The certification tier grades no presubmit case, so no roster name is in
+# The validated-capabilities tier grades no presubmit case, so no roster name is in
 # its matrix: every name leaves the export (the file is still checked below,
 # since it stays the presubmit's roster), or bench-gate's "BOOTSTRAP_ADMITTED
 # names no graded case" banner, which exists to catch a misspelled entry,
-# would open every certification run. Rung 4 is disarmed on the lane by
+# would open every validated-capabilities run. Rung 4 is disarmed on the lane by
 # construction; said once in the log.
-if [ "${EVAL_TIER}" = "certification" ]; then
-  echo "EVAL_TIER=certification: no blocking-roster case is in the certification matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
+if [ "${EVAL_TIER}" = "validated-capabilities" ]; then
+  echo "EVAL_TIER=validated-capabilities: no blocking-roster case is in the validated-capabilities matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
+fi
+# The replay lane gates nothing: no roster name is armed on it, whatever its
+# roster shares with the presubmit's.
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  echo "EVAL_REPLAY_LANE=true: rung 4 is disarmed on the replay lane, which gates nothing."
 fi
 # Set when the inject lane's exclusion list drops a ROSTER case: what the
 # every-roster-case-excluded guard below tests, since an empty
@@ -3941,6 +4577,9 @@ while IFS= read -r NAME; do
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
+  fi
+  if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+    continue
   fi
   # A roster case the inject lane's exclusion step dropped from the matrix
   # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
@@ -3959,7 +4598,7 @@ while IFS= read -r NAME; do
   if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
     continue
   fi
-  if [ "${EVAL_TIER}" = "certification" ]; then
+  if [ "${EVAL_TIER}" = "validated-capabilities" ]; then
     continue
   fi
   BLOCKING_ROSTER_ON_LANE="true"
@@ -4061,11 +4700,25 @@ fi
 if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
-# The certification lane never appends either: its record is the logs
-# bucket, read by the certified-capabilities page per case and model, and
+# The replay lane never appends: a replayed run repeats a recording that
+# passed, so its passes would inflate the very rates the gate admits on
+# (examples/inference-replay/eval-design.md, "A replay lane that gates nothing").
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# The validated-capabilities lane never appends either: its record is the logs
+# bucket, read by the validated-capabilities page per case and release, and
 # none of its cases is on the blocking roster, so the admission window has
 # nothing to decide for them. It reads the store like a presubmit.
-if [ "${EVAL_TIER}" = "certification" ]; then
+if [ "${EVAL_TIER}" = "validated-capabilities" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# A run at a named reasoning effort never appends either: the version key
+# (setup_id, scoring_version, judge_model, fleet, verifiers, mode) carries no
+# effort, so its lines would pool with the default-effort nights under one key.
+# The effort in the key is a later change; until then such a run reads the
+# store like a presubmit.
+if [ -n "${EVAL_REASONING_EFFORT:-}" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The commit each line is stamped with. A postsubmit carries it as
@@ -4082,6 +4735,29 @@ EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 
 # artifact, so a night's record is reviewable beside its verdict, and what the
 # cut-off line counts as "recorded".
 EVAL_RECORDED_MANIFEST="${ARTIFACT_DIR}/baseline-recorded.jsonl"
+
+# ─── The Slack lane (EVAL_SLACK_LANE=1) ──────────────────────────────────────
+# ci-kube-agents-eval-nightly-slack runs hack/slack-lane/run.sh in place of the
+# matrix: each case in hack/slack-lane/cases.txt once, through real Slack
+# (AGENT_TRANSPORT=slack), with the environment exported above. It runs only
+# when the installed PlatformAgent has Slack on, which the deploy sets only when
+# every one of its secrets read (hack/ci-deploy.sh, 2a); the lane reads its own
+# three (the test user's token, the channel, the bot's id) and skips without
+# them. Advisory: the lane's cases never red this job, and nothing here records
+# a baseline or a verdict; a failure in a step above still does. Its results and
+# Slack timings land under ${ARTIFACTS}/slack-lane.
+if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+  profile_begin "slack lane: hack/slack-lane/run.sh"
+  slack_lane_on="$(kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" \
+    get platformagents -o jsonpath='{.items[0].spec.integration.slack.enabled}' 2>/dev/null || true)"
+  if [ "${slack_lane_on}" != "true" ]; then
+    echo "slack lane: skipped: the install has no Slack (the deploy's log says which slack-eval-* secret it could not read)"
+  else
+    SLACK_LANE_ARTIFACTS="${ARTIFACTS:-/tmp/artifacts}/slack-lane" "${SCRIPT_DIR}/slack-lane/run.sh" || true
+  fi
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Slack lane finished; its cases never red this job ==="
+  exit 0
+fi
 
 # ─── Parallel fan-out ─────────────────────────────────────────────────────────
 # The schedulable unit is one (task, repetition): every invocation is an
@@ -4101,8 +4777,8 @@ fi
 
 # Launch-order hints, longest first, from measured runs (2026-08-27/28).
 # A wrong hint costs packing efficiency, never correctness. The hints also
-# price the main-a/main-b split, so scripts/test_ci_eval_nightly.py can fail
-# on a hint edit that leaves the two halves unbalanced.
+# price the main shards' split, so scripts/test_ci_eval_nightly.py can fail
+# on a hint edit that leaves the four stack chains unbalanced.
 unit_cost_hint() {
   case "$1" in
     # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
@@ -4166,12 +4842,12 @@ unit_cost_hint() {
     bootstrap-inventory-ranking-delivery) echo 600 ;;
     # The same stack and wait, planting the report with no critical finding.
     bootstrap-inventory-posture-scope) echo 600 ;;
-    # A stack, but off the infra lock (infra_lock_exempt): the unit waits for
-    # the previous repetition's audits to finish (wait_platform_runs), then the
-    # stack waits for the stage to run the four one after another (1-15 min
-    # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first, its
-    # repetitions back to back.
+    # A stack, but off the infra lock (infra_lock_exempt). On a lease its first
+    # repetition waits out the install's own first-run chain, which ended
+    # 52-115 min after the fan-out on the 2026-11-10 presubmits, and the other
+    # two read the same chain at once. Kept at 3000 to keep it the top of the
+    # list, so it launches first, its repetitions back to back; off the infra
+    # lock, it is in none of the stack chains this hint prices.
     oobe-first-run-audits) echo 3000 ;;
     # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
     # autoops-warning-event-triage, the same plant-then-card shape, so it
@@ -4194,11 +4870,11 @@ unit_cost_hint() {
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
     # main-b nightlies 2026-10-27 to 11-02: median 201s, 43-974s over 21
-    # repetitions (243s, 66-448s over the 15 on gemini-4-argon). Priced at
+    # repetitions (243s, 66-448s over the 15 on the newer agent model). Priced at
     # 600s rather than the 200s default it ran the nightly at: the
     # hint sets its launch order and its share of the presubmit wall estimate
-    # in scripts/eval_rosters.py, and the main-a/main-b balance test in
-    # scripts/test_ci_eval_nightly.py sums it into main-b's stack chain.
+    # in scripts/eval_rosters.py, and the main shards' balance test in
+    # scripts/test_ci_eval_nightly.py sums it into its shard's stack chain.
     monitoring-alert-policy-read) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
     # Not measured yet: the same stream as the case above, plus a stack that
@@ -4220,6 +4896,20 @@ unit_cost_hint() {
     # orders it only among that phase's units.
     gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
+    # The stockout audit of stockout-pinned-pool, registered 2026-11-10
+    # unmeasured, plus a stack that plants one Config Connector object and
+    # one GitOps file. The plant and the teardown can wait up to about 15
+    # minutes together (CONTEXT_WAIT_S, READY_WAIT_S, DELETE_TIMEOUT_S and
+    # NAMESPACE_WAIT_S in its plant.py), so the hint is the 900s band plus
+    # those 900s. writes_alone, so it orders the case only among the second
+    # phase's units.
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 1800 ;;
+    # One delegated card that reads the live Deployment, the GitOps directory
+    # and the chart repository (about six minutes on a dev install, #5161),
+    # plus the stack's plant and teardown (four commits, a workload, a
+    # ConfigMap mount wait). writes_alone, so the hint orders it only among
+    # the writers part's units.
+    remediation-context-repository-owns-the-fix) echo 600 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
@@ -4455,6 +5145,7 @@ unit_delegation_timeout() {
     obtainability-planted-orphan-service) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took
     # 834 s and 1310 s on a dev install (#3933), so the wait is the audit band's.
     fleet-audit-as-many-excluded-as-managed) echo 3000 ;;
@@ -4550,6 +5241,11 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
 
+# The units the card fence could not run before (fence_live_cards): one reason
+# file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
+# fixture-drift marks below. Set apart from them: tests lift the drift step
+# from its first assignment to its closing fi.
+FENCE_UNFENCED_DIR="${STATE_DIR}/${EVAL_FENCE_UNFENCED_DIR}"
 # The cases that need a fixture the lease-time scan saw drifted
 # (scan_lease_fixtures): one reason file each under EVAL_FIXTURE_DRIFT_DIR,
 # read by run_one_unit. The module grades every case as usual, and says so,
@@ -4614,7 +5310,7 @@ fi
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds five).
+#                 (audit_streams).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count).
@@ -4676,10 +5372,40 @@ stream_stack_wait() { # <audit-id>
 # (wait_platform_runs); a unit with none never waits, so a dead holder's
 # successor gives up as soon as it did before. For the stream a case grades,
 # or none, it is the task lock's too.
-stream_lock_deadline() { # <task-name> <audit-id> <the unit's streams>
-  local run_wait=0
+# How many in-flight notes the holder of a stream's lock may spend a grace on
+# before its run (run_one_unit): one for a ledger case, one per declared
+# stream for a case with no ledger. The largest over every case declaring the
+# stream and the waiter's own declared count, so a waiter on a stream a
+# five-stream ledgerless unit holds outlasts all five graces, whichever lock
+# it is taking (the task lock passes the ledger id, a stream lock the stream).
+# A ledger case that declares more streams than it writes counts them too,
+# which only lengthens a deadline. 1 for an empty id, a stream no case
+# declares, or a unit on no stream.
+stream_note_count() { # <audit-id or stream> <the waiter's own streams>
+  local id="$1" own="$2" n=1 t c
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  set -- ${own}
+  c=$#
+  if [ "${c}" -gt "${n}" ]; then n="${c}"; fi
+  if [ -n "${id}" ]; then
+    for t in "${TASK_STREAMS[@]}"; do
+      case " ${t} " in
+        *" ${id} "*)
+          # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+          set -- ${t}
+          c=$#
+          if [ "${c}" -gt "${n}" ]; then n="${c}"; fi ;;
+      esac
+    done
+  fi
+  echo "${n}"
+}
+
+stream_lock_deadline() { # <task-name> <audit-id or stream> <the unit's streams>
+  local run_wait=0 notes
   if [ -n "${3:-}" ]; then run_wait="${EVAL_PLATFORM_RUN_WAIT_SECONDS}"; fi
-  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))
+  notes="$(stream_note_count "$2" "${3:-}")"
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait) + $(stream_stack_wait "$2") ))
 }
 
 release_streams() { # <space-separated audit ids>
@@ -4728,13 +5454,13 @@ release_state_lock() { # <task-name>
 grade_case() { # <task-path> <task-name>
   local task="$1" name="$2" rep run_dir start_ms end_ms rep_result
   local result_args=()
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x${EVAL_REPETITIONS} <<<"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x$(case_repetitions "${name}") <<<"
   # One --result per repetition, positionally. A repetition that produced no
   # run directory contributes the literal MISSING, so the gate can tell "died
   # before writing anything" from "wrote an unusable record". The harness log
   # is kept for every repetition, green ones included: a green record is the
   # raw material for the baseline store.
-  for rep in $(seq 1 "${EVAL_REPETITIONS}"); do
+  for rep in $(seq 1 "$(case_repetitions "${name}")"); do
     run_dir="$(cat "${STATE_DIR}/${name}.rep${rep}.dir" 2>/dev/null || true)"
     start_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.start" 2>/dev/null || echo 0)"
     end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
@@ -4882,7 +5608,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
   release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} ${why}" >&2
-  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+  if [ "${finished_reps}" -ge "$(case_repetitions "${name}")" ]; then
     finish_case "${task}" "${name}"
   fi
 }
@@ -4951,7 +5677,23 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     drift_reps="$(finished_rep_count "${name}")"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
-    if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${drift_reps}" -ge "$(case_repetitions "${name}")" ]; then
+      finish_case "${task}" "${name}"
+    fi
+    return 0
+  fi
+  # The card fence before this second-phase unit could not reach the gateway
+  # (fence_live_cards, #5508): the unit is recorded as infrastructure under the
+  # fence's note and never launched, since a card an earlier unit left running
+  # would write into its exclusive window and be charged to it. Unwound as the
+  # drift skip above is.
+  local unfenced_file="${FENCE_UNFENCED_DIR:-}/${name}.rep${rep}" unfenced_reps=0
+  if [ -n "${FENCE_UNFENCED_DIR:-}" ] && [ -s "${unfenced_file}" ]; then
+    record_unit_not_run "${name}" "${rep}" "$(head -n 1 "${unfenced_file}")"
+    unfenced_reps="$(finished_rep_count "${name}")"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: its card fence could not run before it" >&2
+    if [ "${unfenced_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -4997,7 +5739,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the install's gateway is gone" >&2
-    if [ "${gone_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${gone_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5064,8 +5806,18 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # same stream out: repetitions 2 and 3 audit from the empty ledger
   # repetition 1 had (the lease-time reset above). Only this stream's label,
   # so an audit case on another stream in another lane keeps its own.
+  # A case that grades its stream through the report store (audit_report_stored
+  # with audit_streams:, no ledger check) has no audit id, and a left note
+  # refuses its `start` all the same: the install's own 06:20 UTC
+  # compliance-audit run died with the gateway the scope patch rolled, and
+  # its two-hour note refused every repetition that launched inside it
+  # (#4268). Such a unit releases the note of each stream it declares; the
+  # reset stays a ledger case's.
+  local note_stream
+  for note_stream in ${audit_id:-${streams}}; do
+    release_inflight_note "${name} rep ${rep}" "${note_stream}"
+  done
   if [ -n "${audit_id}" ]; then
-    release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   # The repository this unit's agent writes to, emptied of every agent pull
@@ -5221,7 +5973,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # fan-out must still leave every completed unit's log in the artifacts.
   cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
-  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+  if [ "${finished_reps}" -ge "$(case_repetitions "${name}")" ]; then
     finish_case "${task}" "${name}"
   fi
 }
@@ -5229,6 +5981,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # Again, right before the fan-out: idempotent, and it catches a gateway that an
 # outside event (an autoscaler scale-down) restarted between lease setup and here.
 scheduled_audits pause "fan-out"
+start_chain_audits_watch
 
 # Case by case, cost-descending: every repetition of a case is queued before
 # the next case's first, so a night cut off by its deadline holds whole cases,
@@ -5288,28 +6041,44 @@ unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that 
     *) echo 0 ;;
   esac
 }
-UNIT_QUEUE="$(
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    i=0
-    for TASK in "${TASKS[@]}"; do
-      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+# A replay-lane safety case runs its live arm in the first phase's own queue,
+# before the cache is seeded, so it must be a first-phase case.
+for i in "${!TASK_NAMES[@]}"; do
+  if [ "$(first_queued_rep "${TASK_NAMES[i]}")" != "1" ] && [ "$(unit_phase "${TASK_NAMES[i]}")" != "0" ]; then
+    echo "ERROR: ${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}: ${TASK_NAMES[i]} runs after every other unit (it writes, stops or excludes scope), so its live arm cannot run before the cache is seeded; take it off the list." >&2
+    exit 1
+  fi
+done
+# The replay lane's live arm: each safety case's first EVAL_REPETITIONS
+# repetitions, run before seed_replay_lane_cache. Empty off the lane.
+UNIT_QUEUE_LIVE="$(
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(first_queued_rep "${TASK_NAMES[i]}")" != "1" ]; then
+      for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
         printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
-      fi
-      i=$((i + 1))
-    done
+      done
+    fi
+  done | sort -k2,2rn -k3,3n -k1,1n
+)"
+UNIT_QUEUE="$(
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+      for REP in $(seq "$(first_queued_rep "${TASK_NAMES[i]}")" "$(case_repetitions "${TASK_NAMES[i]}")"); do
+        printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      done
+    fi
   done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_QUEUE_WRITERS="$(
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    i=0
-    for TASK in "${TASKS[@]}"; do
-      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+      for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
         printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
-      fi
-      i=$((i + 1))
-    done
+      done
+    fi
   done | sort -k2,2rn -k3,3n -k1,1n
 )"
+LIVE_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_LIVE}" | grep -c . || true)"
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
@@ -5414,16 +6183,21 @@ EOF_UNIT_QUEUE
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
     # in the second phase the pause is the writer pause instead (the settle).
-    # A unit of a case marked for a drifted fixture makes no model call and no
-    # write, so it skips the pause.
+    # A unit of a case marked for a drifted fixture, or one its fence left
+    # unfenced, makes no model call and no write, so it skips the pause.
     if [ -z "${FIXTURE_DRIFT_DIR:-}" ] || [ ! -s "${FIXTURE_DRIFT_DIR}/${TASK_NAMES[IDX]}" ]; then
-      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}"
-      sleep "${pause}"
+      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}" "${TASK_NAMES[IDX]}" "${REP}"
+      if [ -z "${FENCE_UNFENCED_DIR:-}" ] || [ ! -s "${FENCE_UNFENCED_DIR}/${TASK_NAMES[IDX]}.rep${REP}" ]; then
+        sleep "${pause}"
+      fi
     fi
-    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/$(case_repetitions "${TASK_NAMES[IDX]}")"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
     task_jobs="${task_jobs} $!:${IDX}"
+    # A stack's unit, lock taker or exempt, is never killed (FANOUT_STACKLESS_UNIT_PIDS).
+    unit_takes_infra_lock "${IDX}" || infra_lock_exempt "${TASK_NAMES[IDX]}" \
+      || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"
     if [ "${counted}" = 1 ]; then
       infra_pids="${infra_pids} $!"
     fi
@@ -5439,11 +6213,12 @@ while IFS= read -r SCOPE_LINE; do
 done <<<"${SCOPE_EXCLUDE_CASES:-}"
 SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
 
-profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
+profile_begin "task fan-out: $((LIVE_TOTAL + UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 # The cards fence_live_cards may archive are the ones filed from here on (the
 # board's created_at, which the gateway pod stamps); the install's own earlier
 # cards are left alone.
 EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"
+run_replay_lane_live_arm
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
@@ -5487,6 +6262,7 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   scope_exclude_restore "${SCOPE_CASE}" settle \
     || echo "WARNING: Scope exclusion (${SCOPE_CASE}): the restore did not settle; the next lease's preflight repeats it" >&2
 done
+stop_chain_audits_watch
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
 # On both lanes, once every unit is done: every pull request and branch
@@ -5601,8 +6377,8 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
-# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b to -main-e shards and its
+# -writers, -writers-b and -writers-c thirds, EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
 # run at the same agent model (setupId) is compared with. No job records
@@ -5631,6 +6407,8 @@ elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
 elif [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo "Today-lane run (EVAL_ROLLBACK_LANE=1, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written — a rolled-back install is not what today's window measures."
+elif [ -n "${EVAL_REASONING_EFFORT:-}" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo "Reasoning-effort run (EVAL_REASONING_EFFORT=${EVAL_REASONING_EFFORT}, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written; the version key carries no effort, so the lines would pool with the default-effort window."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi
@@ -5820,9 +6598,9 @@ run_rollback_roundtrip() {
     ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
     > >(tee "${log}") 2>&1 &
   EVAL_ROLLBACK_PID=$!
-  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; stop_model_calls_on_cancel || true; exit 143' TERM INT
   wait "${EVAL_ROLLBACK_PID}" || status=$?
-  trap 'exit 143' TERM INT
+  trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
   if [ "${status}" -eq 0 ]; then
     outcome="passed"
   else

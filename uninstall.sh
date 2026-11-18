@@ -52,7 +52,8 @@ KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
 # /dev/null for the rest of the run. The release pipeline's teardown failed
 # that way on every scheduled run for weeks: uninstall.sh exited non-zero with
 # nothing on stderr to say why. Same shape as install.sh's lock, deliberately.
-LOCK_FILE="/tmp/kube-agents-uninstall.lock"
+# KUBE_AGENTS_UNINSTALL_LOCK_FILE is for tests.
+LOCK_FILE="${KUBE_AGENTS_UNINSTALL_LOCK_FILE:-/tmp/kube-agents-uninstall.lock}"
 if command -v flock >/dev/null 2>&1 && ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
   if ! flock -n 200 2>/dev/null; then
     echo -e "  \033[93m⚠ Another instance of kube-agents uninstaller is currently running. Exiting.\033[0m" >&2
@@ -259,7 +260,8 @@ parse_args() {
 
 write_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-uninstall-report.json"
+  # KUBE_AGENTS_UNINSTALL_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_UNINSTALL_REPORT_FILE:-/tmp/kube-agents-uninstall-report.json}"
   cat << EOF > "$report_file"
 {
   "status": "$(json_escape "$status")",
@@ -705,7 +707,10 @@ main() {
     fi
     print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
     TEMP_REPO_DIR=""
-    exec bash "${repo_dir}/uninstall.sh" "${dispatch_args[@]}"
+    # ${dispatch_args[@]+...}: empty on an interactive run that forwards no
+    # coordinates, and bash 3.2 (macOS's /bin/bash) treats an empty array
+    # expansion as unbound under `set -u`.
+    exec bash "${repo_dir}/uninstall.sh" ${dispatch_args[@]+"${dispatch_args[@]}"}
   elif [ -f "${script_dir}/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
     repo_dir="$script_dir"
   elif [ -f "$(pwd)/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
@@ -929,6 +934,9 @@ main() {
   # Gateway redaction, for the same reason: the generator refuses a misspelt
   # toggle or a malformed rule, and the gateway goes with the release.
   export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""
+  # The gateway's spend ceiling, likewise: the generator refuses an amount or
+  # a period it cannot read, and the gateway goes with the release.
+  export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""
   # The scoped service account pool, likewise: the generator refuses a
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
@@ -940,9 +948,6 @@ main() {
   # The release's upgrade_install switch, likewise: the generator refuses a
   # misspelt value, and the destroy removes the release however it renders.
   export HELM_UPGRADE_INSTALL=""
-  # The mode, likewise: the generator refuses a value outside the CRD's enum,
-  # and the destroy removes the release whichever mode it renders.
-  export PLATFORM_AGENT_MODE=""
   # The Slack home channel policy, likewise: the generator refuses a value
   # outside the CRD's enum, and the destroy removes the release whatever it says.
   export SLACK_HOME_CHANNEL_POLICY=""
@@ -971,6 +976,22 @@ main() {
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
   export WEB_CONSOLE_ENABLED="false"
+  # The minter keys a lifecycle.sh refusal asks an operator to type into
+  # install.env by hand: the composition refuses either one in the wrong shape,
+  # and a destroy has no use for them, since both only steer adoption.
+  export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""
+  # The minter's KSA name, for the same reason: the composition validates its
+  # shape (DNS-1123), an operator may set it in install.env by hand, and a
+  # destroy has no use for it. Blank, the generator writes the default name,
+  # which passes; terraform destroys what is in state either way.
+  export GITHUB_MINTER_KSA_NAME=""
+  # The agent's KSA name, for the same reason: the composition validates its
+  # shape (DNS-1123 label ending in -agent), and an operator sets it in
+  # install.env as TF_VAR_agent_ksa_name. Unset rather than blanked because the
+  # generator writes no agent_ksa_name and an empty TF_VAR_ fails both
+  # validations; unset, the variable's default passes and terraform destroys
+  # what is in state either way.
+  unset TF_VAR_agent_ksa_name
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

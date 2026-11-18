@@ -14,7 +14,7 @@ type CommandRunner func(ctx context.Context, name string, args ...string) ([]byt
 
 // DefaultCommandRunner executes a command with process-group termination on context cancellation.
 func DefaultCommandRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- the CLI's runner for its own helpers (gh); callers pass argv, no shell
 	cmd.SysProcAttr = childProcAttr()
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {

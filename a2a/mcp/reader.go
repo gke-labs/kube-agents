@@ -194,7 +194,7 @@ func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jet
 	}
 	defer release(true)
 	pending := cons.CachedInfo().NumPending
-	want := min(pending, uint64(limit))
+	want := min(pending, uint64(limit)) // #nosec G115 -- limit is a caller's positive count
 	var seen uint64
 	if want > 0 {
 		r, err := b.newBudgetReader(cons, int(min(want, drainFetchBatch)), readMaxBytes)

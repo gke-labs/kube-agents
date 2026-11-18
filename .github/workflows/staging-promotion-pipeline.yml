@@ -1,7 +1,6 @@
 name: "Staging: Promotion Pipeline"
 
-# Builds a nightly environment from nothing under `spec.mode: next`, the mode
-# a new install gets, runs the full E2E matrix on it,
+# Builds a nightly environment from nothing, runs the full E2E matrix on it,
 # rolls it back to the previous GA and forward again (reported, not gating),
 # and — if the matrix passes — promotes the candidate to staging. Promotion is
 # two rungs with an eval between them, and the eval is a gate:
@@ -71,9 +70,12 @@ concurrency:
   cancel-in-progress: false
 
 # Step 5's only inputs, and the same two values ci-health.yml declares for the
-# same purpose: the eval's artifacts land in a bucket owned by kube-agents-prow,
-# and github-actions@kube-agents-prow is the read-only identity that project
-# exposes for reading them from GitHub Actions. Literals rather than repository
+# same purpose: the eval's artifacts land in two buckets, the lane's private
+# gs://kube-agents-evals-presubmit-logs (kube-agents-owned) and the Prow
+# cluster's default owned by kube-agents-prow that it logged to before, and
+# github-actions@kube-agents-prow is the read-only identity that reads both
+# from GitHub Actions (objectViewer on the first, that project's own grant on
+# the second). Literals rather than repository
 # variables, matching ci-health.yml — an unset variable resolves to empty in
 # silence, and an empty provider fails with an authentication error that says
 # nothing about which value went missing.
@@ -165,9 +167,6 @@ jobs:
     with:
       github_environment: "nightly"
       rc_tag: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
-      # The mode a new install gets (#2007). The RC pipeline's today leg keeps
-      # today covered; this matrix gates the nomination on next.
-      mode: "next"
     secrets: inherit
 
   step-3-run-e2e-matrix:
@@ -183,7 +182,6 @@ jobs:
     with:
       github_environment: "nightly"
       commit_sha: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
-      mode: "next"
       # The gate is only what has already passed on a real cluster. `rc` — Agent
       # API health, the fleet-audit ledger across all streams, and stockout
       # scenario 04 — runs on every RC pipeline and passes there. Gating on a
@@ -200,7 +198,7 @@ jobs:
       # Up to 74m before the first test runs (see e2e-run.yml: ~5m setup, 64m of
       # wait_for_gke_readiness.sh gates paid twice, and 5m confirm_agent_image.sh),
       # plus ~60m across all five test files rather than the RC gate's single suite,
-      # plus the 30m readiness gate `next` adds (e2e-run.yml's `mode` input).
+      # plus the 30m A2A readiness gate (a2a_readiness.sh).
       # Held by SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
       timeout_minutes: 165
     secrets: inherit
@@ -214,9 +212,9 @@ jobs:
     # gateway rollout agree, then the same pair from the candidate checkout to
     # bring the environment back to the candidate. After the matrix, so what
     # the matrix graded is the fresh install and not an install that has been
-    # moved twice. That install is step 2's, so the leg rolls a
-    # `spec.mode: next` install back to the previous GA: the path a new
-    # install on the next default takes when its owner rolls back.
+    # moved twice. That install is step 2's, so the leg rolls a fresh install
+    # back to the previous GA: the path a new install takes when its owner
+    # rolls back.
     #
     # `continue-on-error` for the reason step 3's optional suites carry it: a
     # leg with no green run behind it cannot gate. Step 4 does not depend on
@@ -448,10 +446,11 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-      # The Prow archive lives in kube-agents-prow, a project this repository does
-      # not own; github-actions@kube-agents-prow is the read-only identity it
-      # exposes for exactly this. ci-health.yml reaches the same bucket the same
-      # way.
+      # The Prow archive is two buckets: the default of kube-agents-prow, a
+      # project this repository does not own, and the lane's private
+      # kube-agents bucket; github-actions@kube-agents-prow is the read-only
+      # identity that reads both. ci-health.yml reaches the same buckets the
+      # same way.
       - name: Authenticate to the Prow archive project
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -460,9 +459,9 @@ jobs:
 
       # The auth step exports GOOGLE_GHA_CREDS_PATH; this login makes that
       # credential the active account for the poller's `gcloud storage ls` and
-      # `cat` calls, the same way ci-health.yml does before its reads. (Those
-      # reads were gsutil's until 2026-10, and gsutil ignored the exported
-      # file: without this line every listing failed on anonymous credentials,
+      # `cat` calls, the same way ci-health.yml does before its reads. (Until
+      # 2026-10 those reads used the legacy storage client, which ignored the
+      # exported file: without this line every listing failed on anonymous credentials,
       # the build never appeared, and the job reported `never_ran`, which
       # reads as a broken eval lane rather than a missing login. That cost
       # ci-health.yml forty failed ticks on 2026-09-10.)

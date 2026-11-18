@@ -1583,7 +1583,11 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
         end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        # Every prompt the image ships, so a new one the entrypoint's list does not name fails here.
+        names = sorted(
+            f"onboarding/{p.name}" for p in (_REPO / "agents" / "chat" / "defaults" / "onboarding").glob("*.md")
+        )
+        self.assertIn("onboarding/report_filed.md", names)
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
             pvc = pathlib.Path(tmp) / "data"
@@ -1604,12 +1608,165 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             for name in names:
                 self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
+    def test_every_plugin_the_image_ships_is_refreshed_from_a_newer_stale_pvc_copy(self):
+        # Step 2's cp -ru skips a destination that looks newer, so a rollback, or a roll to
+        # an image built earlier than the volume's files, kept the previous image's plugin
+        # code live beside the new image's scripts. Every plugin directory the image ships
+        # is force-synced; the pinned external plugin and the top-level files are not, and
+        # a plugin's own runtime state on the volume survives the copy.
+        shipped = sorted(
+            p.name
+            for p in (_REPO / "agents" / "chat" / "defaults" / "plugins").iterdir()
+            if p.is_dir() and not p.name.startswith((".", "_"))
+        )
+        self.assertIn("chat_metrics", shipped)
+        # The pinned list is the set of plugins the Dockerfile installs from outside this
+        # repository, read from its `hermes plugins install` lines rather than pinned here.
+        dockerfile = (_REPO / "deploy" / "docker" / "Dockerfile").read_text(encoding="utf-8")
+        installed = re.findall(r"hermes plugins install\s+(?:--\S+\s+\S+\s+)*(\S+)", dockerfile)
+        installed = sorted({name.rsplit("/", 1)[-1] for name in installed})
+        self.assertEqual(installed, ["hermes_otel"], "the Dockerfile's external plugins changed; update PINNED_EXTERNAL_PLUGINS")
+        pinned = re.fullmatch(r'readonly PINNED_EXTERNAL_PLUGINS="([^"]*)"', _extract_readonly("PINNED_EXTERNAL_PLUGINS")).group(1).split()
+        self.assertEqual(sorted(pinned), installed)
+        external = "hermes_otel"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            future = time.time() + 3600
+            for name in shipped + [external]:
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+                (pvc / "plugins" / name / "plugin.py").write_text("stale\n", encoding="utf-8")
+                (pvc / "plugins" / name / "live.db").write_text("state\n", encoding="utf-8")
+                os.utime(pvc / "plugins" / name / "plugin.py", (future, future))
+            (image / "plugins" / ".install-metadata.json").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / ".install-metadata.json").write_text("volume\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            for name in shipped:
+                self.assertEqual((pvc / "plugins" / name / "plugin.py").read_text(encoding="utf-8"), "image\n", name)
+                self.assertEqual((pvc / "plugins" / name / "live.db").read_text(encoding="utf-8"), "state\n", name)
+            self.assertEqual((pvc / "plugins" / external / "plugin.py").read_text(encoding="utf-8"), "stale\n")
+            self.assertEqual((pvc / "plugins" / ".install-metadata.json").read_text(encoding="utf-8"), "volume\n")
+
+    def test_a_failed_plugin_refresh_in_step_2b_leaves_the_old_file_whole(self):
+        # Replicas share the volume, so a file is copied to a temporary name and renamed over
+        # its target: a plugin folder the copy cannot write into keeps its old module whole,
+        # no temporary file is left behind, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+                (pvc / "plugins" / name).mkdir(parents=True)
+                (pvc / "plugins" / name / "plugin.py").write_text("stale\n", encoding="utf-8")
+            if os.geteuid() == 0:
+                self.skipTest("root writes into a read-only directory")
+            (pvc / "plugins" / "agent_roster").chmod(0o555)
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                kept = (pvc / "plugins" / "agent_roster" / "plugin.py").read_text(encoding="utf-8")
+                leftovers = sorted(p.name for p in (pvc / "plugins" / "agent_roster").iterdir() if ".refresh." in p.name)
+                refreshed = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            finally:
+                (pvc / "plugins" / "agent_roster").chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n", "a failed copy did not leave the old module whole")
+        self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
+        self.assertEqual(refreshed, "image\n", "one failed plugin stopped the loop")
+
+    def test_a_failed_rename_in_step_2b_removes_its_temporary_file(self):
+        # The copy lands first and the rename fails: the temporary file is removed, the old
+        # module stays whole, and the start continues with a warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "mv").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            kept = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            leftovers = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir() if ".refresh." in p.name)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n")
+        self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
+
+    def test_a_symlinked_plugin_destination_is_left_alone(self):
+        # A symlink at the destination is not the image's copy to refresh: the loop
+        # skips it, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            elsewhere = pathlib.Path(tmp) / "mounted"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            elsewhere.mkdir()
+            (elsewhere / "plugin.py").write_text("mounted\n", encoding="utf-8")
+            (pvc / "plugins" / "agent_roster").symlink_to(elsewhere)
+            (pvc / "plugins" / "chat_metrics").mkdir()
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((elsewhere / "plugin.py").read_text(encoding="utf-8"), "mounted\n")
+            self.assertTrue((pvc / "plugins" / "agent_roster").is_symlink())
+            self.assertEqual((pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8"), "image\n")
+
+    def test_a_refreshed_plugin_file_keeps_the_images_mtime(self):
+        # The copy preserves the image file's mtime (cp -p), as the cluster loop's does, so a
+        # later start reads the refreshed file as the image's, not as one written on the volume.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            image_time = time.time() - 86400
+            os.utime(image / "plugins" / "chat_metrics" / "plugin.py", (image_time, image_time))
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual(int((pvc / "plugins" / "chat_metrics" / "plugin.py").stat().st_mtime), int(image_time))
+
     def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
         # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
         # an old plugin beside the new script writes no greeting hold.
-        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
-        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
@@ -1620,7 +1777,7 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             (pvc / name).write_text("stale\n", encoding="utf-8")
             future = time.time() + 3600
             os.utime(pvc / name, (future, future))
-            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            block = _plugin_refresh_block(image)
             subprocess.run(
                 ["bash", "-c", block],
                 env={**os.environ, "TARGET_DIR": str(pvc)},
@@ -1632,9 +1789,6 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
     def test_a_plugins_directory_the_entrypoint_cannot_write_does_not_end_the_start(self):
         # On a fresh volume the kubelet creates $TARGET_DIR/plugins as root when a plugin
         # is mounted beneath it; under `set -e` an unguarded mkdir there ends the container.
-        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
-        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
@@ -1649,7 +1803,7 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             else:
                 plugins.chmod(0o555)
             try:
-                block = "set -e\n" + "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image)) + "\necho reached-the-next-step"
+                block = "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"
                 proc = subprocess.run(
                     ["bash", "-c", block],
                     env={**os.environ, "TARGET_DIR": str(pvc)},
@@ -1738,6 +1892,21 @@ def _extract_readonly(name):
         if line.startswith(f"readonly {name}="):
             return line
     raise AssertionError(f"readonly {name} not found in {_ENTRYPOINT}")
+
+
+# Step 2b's plugin refresh: the comment line that opens it, and the two constants it reads.
+_PLUGIN_REFRESH_MARKER = "# 2b, continued: every plugin the image ships is image-owned too"
+
+
+def _plugin_refresh_block(image):
+    """Return step 2b's plugin refresh as a script that reads the image tree at `image`."""
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(_PLUGIN_REFRESH_MARKER))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+    block = "\n".join(
+        [_extract_readonly("DEFAULTS_PLUGINS_DIR"), _extract_readonly("PINNED_EXTERNAL_PLUGINS")] + lines[start : end + 1]
+    )
+    return block.replace("/opt/defaults", str(image))
 
 
 # The helpers step 2.6's cluster loop calls. A test that runs the loop defines every one,
@@ -1935,7 +2104,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
             self.assertFalse((tmp / "profile" / self.OLD).exists())
 
     def test_no_overlay_leaves_the_template_alone(self):
-        """A today install passes an empty $3 — the flip-back self-clean. The
+        """An image without /opt/a2a-template/skills passes an empty $3. The
         skill is gone because the swap rebuilt skills/ from the template only."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
@@ -3089,132 +3258,91 @@ class NpmCacheShareTest(unittest.TestCase):
         self.assertFalse((target / ".cache").exists())
 
 
-class A2AModeProbeTest(unittest.TestCase):
-    """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
+class A2ASkillOverlayStepTest(unittest.TestCase):
+    """Step 2.6a-bis overlays the A2A topics skill into the platform profile on every boot.
 
-    The probe hands the operator's managed .env to Python and lets runtime_mode —
-    the one agent-side reader the mode spec allows — answer. Exit meanings:
-    0 next (overlay), 1 today or no managed scope (skip silently), 2 no readable
-    managed env (skip with a warning; on an operator-managed install that is a
-    fault the skill's silent absence would otherwise hide).
+    Every install runs the A2A stack, so nothing gates the overlay: no managed
+    .env key, no container environment. The step passes the image's skill tree
+    to sync_profile_skills as $3 whenever the image ships it, and the template
+    alone when it does not.
 
-    The parse is the strict KEY=value renderManagedEnv writes, never `.`-sourced:
-    the entrypoint is pid 1, and sourcing would execute whatever a value that
-    grew a space turned into. That property is asserted here, not just claimed.
+    The shipped block is run as written, with one substitution: the image path
+    of the skill tree (`/opt/a2a-template/skills`) is pointed at a directory
+    under the test's temp root, since the host has no such tree.
     """
 
-    def _probe(self, managed_env, pwned_marker=None, extra_env=None, reader=True):
-        """Run the real probe. `managed_env` is the .env body, or None for no file,
-        or ... (Ellipsis) for HERMES_MANAGED_DIR unset entirely.
+    OPENER = 'if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then'
+    IMAGE_SKILLS = "/opt/a2a-template/skills"
+    OVERLAY_LINE = "Overlaying the A2A topics skill into the platform profile"
 
-        `extra_env` adds process environment the container would have inherited.
-        `reader=False` drops runtime_mode off the path, standing in for a broken
-        image.
+    def _tree(self, root, **files):
+        root = pathlib.Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, body in files.items():
+            (root / name).write_text(body, encoding="utf-8")
+        return root
+
+    def _run(self, tmp, ship_skill=True, managed_env=None, extra_env=None):
+        """Run the shipped step against a template and a profile under `tmp`.
+
+        `ship_skill` plants the image's skill tree; `managed_env` writes an
+        operator-managed .env the old gate used to read; `extra_env` adds
+        container environment. Neither of the last two may change the answer.
         """
-        script = f"{_extract_shell_function('a2a_mode_probe')}\na2a_mode_probe\n"
+        tmp = pathlib.Path(tmp)
+        self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+        self._tree(tmp / "data" / "profiles" / "platform" / "skills", **{"stale.md": "x"})
+        a2a_skills = tmp / "a2a" / "skills"
+        if ship_skill:
+            self._tree(a2a_skills, **{"a2a-topics.md": "bus"})
+        block = _extract_shell_block(self.OPENER).replace(self.IMAGE_SKILLS, str(a2a_skills))
+        script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n{block}echo DONE\n"
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOSTNAME": "test-pod-0",
+            "TARGET_DIR": str(tmp / "data"),
+            "PLATFORM_TEMPLATE": str(tmp / "template"),
+        }
+        if managed_env is not None:
+            managed = tmp / "managed"
+            managed.mkdir()
+            (managed / ".env").write_text(managed_env, encoding="utf-8")
+            env["HERMES_MANAGED_DIR"] = str(managed)
+        if extra_env:
+            env.update(extra_env)
+        proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env)
+        installed = sorted(p.name for p in (tmp / "data" / "profiles" / "platform" / "skills").iterdir())
+        return proc, installed
+
+    def test_the_skill_is_overlaid_with_no_mode_anywhere(self):
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = pathlib.Path(tmp)
-            # The image runs the probe on $INSTALL_DIR's venv Python and imports
-            # runtime_mode from /opt/defaults/scripts; neither exists on a host.
-            # The venv is faked with a symlink and the module comes in through
-            # PYTHONPATH — sys.path.insert of an absent directory is harmless, so
-            # the probe under test is byte-identical to the one the image runs.
-            (tmp / ".venv" / "bin").mkdir(parents=True)
-            (tmp / ".venv" / "bin" / "python3").symlink_to(sys.executable)
-            env = {
-                "PATH": "/usr/bin:/bin",
-                "INSTALL_DIR": str(tmp),
-            }
-            if reader:
-                env["PYTHONPATH"] = str(_REPO / "agents" / "platform" / "scripts")
-            if extra_env:
-                env.update(extra_env)
-            if managed_env is not Ellipsis:
-                managed = tmp / "managed"
-                managed.mkdir()
-                env["HERMES_MANAGED_DIR"] = str(managed)
-                if managed_env is not None:
-                    body = managed_env
-                    if pwned_marker:
-                        body = body.replace("{MARKER}", str(pwned_marker))
-                    (managed / ".env").write_text(body, encoding="utf-8")
-            return subprocess.run(
-                ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
-            )
+            proc, installed = self._run(tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+            self.assertIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
 
-    def test_next_answers_overlay(self):
-        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=next\n")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_today_answers_skip(self):
-        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_an_unrecognized_mode_fails_closed(self):
-        """runtime_mode's own rule, exercised through the probe: the dark stack
-        stays dark from both sides of the boundary."""
-        proc = self._probe("KUBEAGENTS_MODE=quantum\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_pin_free_env_reads_as_today(self):
-        proc = self._probe("API_SERVER_KEY=x\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_missing_managed_env_is_reported_not_conflated(self):
-        proc = self._probe(None)
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-
-    def test_no_managed_scope_at_all_skips_silently(self):
-        """Unset HERMES_MANAGED_DIR is a non-operator start (compose, docker run),
-        not a fault — the same marker every other managed-scope step gates on."""
-        proc = self._probe(Ellipsis)
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_the_inherited_container_env_cannot_decide_the_mode(self):
-        """The managed file is the ONLY delivery path, which is the spec's whole
-        point — one answer per agent, computed in one place.
-
-        This is not hypothetical: an AgentPlugin's spec.env is copied into the
-        agent container verbatim with no allowlist, so a plugin can put this key
-        in the process environment. Before os.environ.clear() the probe read it
-        whenever the file was silent, which made the plugin a second writer of a
-        decision the operator owns. Found by adversarial review before this
-        shipped.
-        """
-        # Key absent from the file entirely: the inherited value must not fill in.
-        proc = self._probe("API_SERVER_KEY=x\n", extra_env={"KUBEAGENTS_MODE": "next"})
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        # And the file still wins when the two disagree.
-        proc = self._probe(
-            "KUBEAGENTS_MODE=today\n", extra_env={"KUBEAGENTS_MODE": "next"}
-        )
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_malformed_line_is_skipped_not_called_unreadable(self):
-        """An empty key is not a pin. os.environ refuses one, and letting that
-        raise reported a perfectly readable file as missing."""
-        proc = self._probe("=x\nKUBEAGENTS_MODE=next\n")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_a_missing_reader_is_a_fault_not_a_decision(self):
-        """A broken image must not read as 'today' behind a bare traceback: the
-        skill would be silently absent with nothing saying why."""
-        proc = self._probe("KUBEAGENTS_MODE=next\n", reader=False)
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-
-    def test_a_hostile_value_is_data_not_shell(self):
-        """The reason this is a parse and not a `.`: a value carrying a space and
-        a command must neither break the gate nor run."""
-        with tempfile.TemporaryDirectory() as outside:
-            marker = pathlib.Path(outside) / "pwned"
-            proc = self._probe(
-                "SLACK_HOME_CHANNEL_NAME=general chat; touch {MARKER}\n"
-                "KUBEAGENTS_MODE=next\n",
-                pwned_marker=marker,
+    def test_a_stored_today_pin_no_longer_holds_the_skill_back(self):
+        """The operator still pins the mode into the managed .env until no
+        supported agent image predates the removal; this image no longer reads
+        it, so a `today` pin, in the file or in the environment, overlays too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, installed = self._run(
+                tmp,
+                managed_env="API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n",
+                extra_env={"KUBEAGENTS_MODE": "today"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertFalse(marker.exists(), "a managed .env value was executed")
+            self.assertIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
 
+    def test_an_image_without_the_skill_tree_syncs_the_template_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, installed = self._run(tmp, ship_skill=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+            self.assertNotIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["platform.md"])
 
 
 def _extract_nested_block(opener, indent, closer="fi"):

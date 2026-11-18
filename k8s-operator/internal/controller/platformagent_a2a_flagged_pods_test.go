@@ -151,7 +151,8 @@ func TestTheChartCountsEveryFlaggedPod(t *testing.T) {
 func TestA2AFlaggedStandingPodsFollowTheFlags(t *testing.T) {
 	agent := a2aTestAgent()
 	t.Setenv(a2aMCPDoorEnvVar, "")
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
+	t.Setenv(a2aCuratorEnvVar, "")
 	if got := a2aFlaggedStandingPods(agent); got != 0 {
 		t.Errorf("every flag off: %d pods, want 0", got)
 	}
@@ -159,12 +160,18 @@ func TestA2AFlaggedStandingPodsFollowTheFlags(t *testing.T) {
 	if got := a2aFlaggedStandingPods(agent); got != 1 {
 		t.Errorf("MCP on: %d pods, want 1", got)
 	}
-	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	// The dispatcher is on by default, so not a flagged workload: switching
+	// it on or off moves a2aStandingPods, not this count.
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	if got := a2aFlaggedStandingPods(agent); got != 1 {
+		t.Errorf("MCP and the dispatcher on: %d flagged pods, want 1", got)
+	}
+	t.Setenv(a2aCuratorEnvVar, "true")
 	if got := a2aFlaggedStandingPods(agent); got != 2 {
-		t.Errorf("MCP and dispatcher on: %d pods, want 2", got)
+		t.Errorf("MCP and curator on: %d flagged pods, want 2", got)
 	}
 	t.Setenv(a2aMCPDoorEnvVar, "")
 	if got := a2aFlaggedStandingPods(agent); got != 1 {
-		t.Errorf("dispatcher on: %d pods, want 1", got)
+		t.Errorf("curator on: %d flagged pods, want 1", got)
 	}
 }

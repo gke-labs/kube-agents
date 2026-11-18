@@ -107,7 +107,13 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	4 -> adds tier (one AgentProfile entry per tier, #3655)
 //	5 -> adds shard and shards (the map is cut into numbered ConfigMaps;
 //	     a callout from before it watches a name no longer rendered)
-const a2aIdentityMapSchema = "5"
+//	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
+//	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
+//	     refuses both
+//	7 -> adds notAfter (the bus migration's per-run principals)
+//	8 -> adds denyPublish and denySubscribe to grants (the gateway's token
+//	     entry, #5301); a callout from before it refuses them
+const a2aIdentityMapSchema = "8"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -458,6 +464,12 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 			a2aNATSCAFileEnvVar(),
 		}
+		// A declared bridge binds its intake durable as the rendered one does:
+		// the provision Job creates it, and the bridge principal is refused
+		// creating it (#4173).
+		if a2aIsBridgeSidecar(c) {
+			switchOverride = append(switchOverride, corev1.EnvVar{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"})
+		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.
@@ -678,7 +690,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 		podLabels[k] = v
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -709,6 +721,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 					},
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets:   resolveImagePullSecrets(agent.Spec.Deployment),
 					ServiceAccountName: name,
 					// Two replicas on two nodes, so that the drain the budget
 					// rate-limits is a drain of one of them. Advisory
@@ -856,6 +869,9 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
+	busMigrationFreezeCallout(agent, dep)
+	return dep
 }
 
 // buildA2ACalloutService fronts the status endpoints. The bus reaches the
@@ -912,9 +928,10 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 			MaxUnavailable: ptr.To(intstr.FromInt32(a2aCalloutPDBMaxUnavailable)),
 			Selector:       &metav1.LabelSelector{MatchLabels: a2aCalloutPodSelector(agent)},
 			// AlwaysAllow rather than the IfHealthyBudget default, for the
-			// verifier's reason. /readyz needs the bus connection, and the
-			// bus is a one-replica StatefulSet, so while it is down, or its
-			// PVC is Pending, BOTH callouts are Running and NotReady. Under
+			// verifier's reason. /readyz needs the bus connection, so while
+			// the bus is down (a single-server bus restarting, or every
+			// server of a cluster gone), or its PVC is Pending, BOTH
+			// callouts are Running and NotReady. Under
 			// the default that is currentHealthy 0 against desiredHealthy
 			// 1, zero disruptions allowed, and every eviction of either pod
 			// refused until the bus returns: a budget holding a node's drain
@@ -945,7 +962,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage
 	// collector, which deletes it immediately. It is reclaimed by name
-	// instead, from both the mode flip and the deletion path.
+	// instead, from the deletion path.
 	owned := []client.Object{
 		buildA2ACalloutServiceAccount(agent),
 		// The provision Job's identity, applied here so it exists before the
@@ -984,7 +1001,7 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 
 	// Cluster-scoped: no owner reference, because the garbage collector
 	// treats a cluster-scoped object owned by a namespaced one as an orphan
-	// and deletes it immediately. cleanupA2A removes it by name.
+	// and deletes it immediately. handleDeletion removes it by name.
 	for _, obj := range []client.Object{
 		buildA2ACalloutClusterRoleBinding(agent),
 	} {

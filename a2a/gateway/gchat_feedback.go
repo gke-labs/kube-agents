@@ -11,7 +11,8 @@ import (
 // Answer feedback on Google Chat (feedback.go): two rating buttons, 👍 then
 // 👎, at the end of the final answer's one button list, after its choice and
 // link buttons. They are drawn only once the gateway has handed over its
-// recorder, and only on an answer in a conversation, never on a home post.
+// recorder: on an answer in a conversation, and on a post the agent made on
+// its own in the home space (an alert, a report, feedback.go).
 // A layout Chat refuses with them is posted once more without them. The
 // buttons each rated message carries are remembered in this process; after
 // a restart a click reads them from the event's copy of the message.
@@ -43,7 +44,7 @@ const (
 	gchatButtonListKey    = "buttonList"
 	gchatButtonsKey       = "buttons"
 	// The keys a drawn button names its action's function under, which
-	// gchatWithoutRating reads to find the rating buttons.
+	// gchatButtonFunction reads to tell the buttons apart.
 	gchatOnClickKey  = "onClick"
 	gchatActionKey   = "action"
 	gchatFunctionKey = "function"
@@ -155,9 +156,10 @@ func gchatRatingButtons(r gchatRating) []map[string]any {
 		}
 		return b
 	}
+	good, bad := feedbackLabels(r.task)
 	return []map[string]any{
-		button(gchatFeedbackUpText, feedbackGoodLabel, FeedbackUp),
-		button(gchatFeedbackDownText, feedbackBadLabel, FeedbackDown),
+		button(gchatFeedbackUpText, good, FeedbackUp),
+		button(gchatFeedbackDownText, bad, FeedbackDown),
 	}
 }
 
@@ -198,15 +200,18 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 	return out
 }
 
-// gchatWithoutRating is layout with its rating buttons removed, and a button
-// list left empty by that removed with them, so gchatWithRating draws one
-// pair on it again (gchatWithoutButtons).
-func gchatWithoutRating(layout gchatChatLayout) gchatChatLayout {
-	unrated := layout
-	unrated.Widgets = gchatWithoutButtons(layout.Widgets, func(b map[string]any) bool {
-		return gchatButtonFunction(b) == gchatFeedbackFunction
-	})
-	return unrated
+// gchatHasRating reports whether widgets already carry rating buttons.
+func gchatHasRating(widgets []map[string]any) bool {
+	for _, w := range widgets {
+		list, _ := w[gchatButtonListKey].(map[string]any)
+		buttons, _ := list[gchatButtonsKey].([]map[string]any)
+		for _, b := range buttons {
+			if gchatButtonFunction(b) == gchatFeedbackFunction {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // classifyGchatButton tells what a decoded button does by its function, or
@@ -355,17 +360,25 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 	if !ok {
 		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
+	message, _, err := a.createRatedText(space, thread, m)
+	return message, err
+}
+
+// createRatedText creates m's text with the rating buttons in space, as a
+// reply on thread when one is given, and returns the message and the thread
+// it landed in. When Chat refuses the buttons the text is created alone.
+func (a *GoogleChatAdapter) createRatedText(space, thread string, m OutMessage) (message, landed string, err error) {
 	rating := gchatRating{task: m.Feedback}
 	body := map[string]any{"text": toGchatText(m.Text), "accessoryWidgets": gchatWithRating(nil, rating)}
-	message, _, err := a.create(space, thread, body)
+	message, landed, err = a.create(space, thread, body)
 	if err != nil {
 		if errors.Is(gchatLayoutError(err, false), ErrLayoutRefused) {
-			return a.Post(conversation, m.Text)
+			return a.create(space, thread, map[string]any{"text": toGchatText(m.Text)})
 		}
-		return "", err
+		return "", "", err
 	}
 	a.rememberRating(message, rating)
-	return message, nil
+	return message, landed, nil
 }
 
 // feedbackClick takes a tap on a rating button. It is never a turn: it
@@ -446,8 +459,11 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 		// A later tap taken while Rate ran patches after this one, under
 		// the same lock, so this patch never outlives it.
 		if a.rememberTap(message, chosen) {
-			if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
+			layout := a.ratedLayout(snapshot, chosen)
+			if err := a.patchRating(message, layout); err != nil {
 				a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
+			} else {
+				a.rememberLayout(message, layout)
 			}
 		}
 		unlock()
@@ -460,42 +476,30 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	return gchatRatingTaken + value
 }
 
-// ratedLayout is the layout a rating tap patches message ev to, with r's
-// buttons at the end. The adapter's record wins when it has one: (a) a
-// remembered question not yet answered keeps its own layout; (b) an
-// answered one keeps the layout its answer put on it, the answered line
-// included (ux.shown), and, while that rewrite has not landed, takes the
-// event's text and its link buttons only, so a tap never restores the
-// choices the answer removed; (c) any other message, one from before a
-// restart, takes the event's text and its choice and link buttons, in the
-// event's order.
+// ratedLayout is the layout a rating tap patches message ev to: the layout
+// the message shows now with r's buttons at the end in place of the rating
+// buttons it carried, every other button and the text as they are. The
+// base is the adapter's record of the message (gchat_layout.go) when it
+// has one, which the answered rewrite and a board tap write too, so a tap
+// keeps the answered line and a tapped row's line; it is the event's copy
+// of the message, text and buttons, for one it has no record of (posted
+// before a restart). An answered message loses its choice buttons either
+// way: a tap taken before the answered rewrite lands, or after a restart
+// lost it, never restores the choices the answer removed.
 func (a *GoogleChatAdapter) ratedLayout(ev *gchatEvent, r gchatRating) gchatChatLayout {
 	a.mu.Lock()
 	ux := a.uxLocked()
 	answered := ux.answered[ev.Message.Name]
-	shown, recorded := ux.shown[ev.Message.Name]
-	q, remembered := ux.questions[ev.Message.Name]
+	base, remembered := ux.layouts[ev.Message.Name]
 	a.mu.Unlock()
-	switch {
-	case answered && recorded:
-		return gchatChatLayout{Text: shown.Text, Widgets: gchatWithRating(shown.Widgets, r)}
-	case remembered && !answered:
-		return gchatChatLayout{Text: q.layout.Text, Widgets: gchatWithRating(q.layout.Widgets, r)}
+	if !remembered {
+		base = gchatEventLayout(ev.Message)
 	}
-	var buttons []map[string]any
-	for _, w := range ev.Message.AccessoryWidgets {
-		for _, b := range w.ButtonList.Buttons {
-			kind := classifyGchatButton(b)
-			if kind == gchatButtonLink || (kind == gchatButtonChoice && !answered) {
-				buttons = append(buttons, gchatButtonWidget(b))
-			}
-		}
-	}
-	var widgets []map[string]any
-	if len(buttons) > 0 {
-		widgets = []map[string]any{{gchatButtonListKey: map[string]any{gchatButtonsKey: buttons}}}
-	}
-	return gchatChatLayout{Text: ev.Message.Text, Widgets: gchatWithRating(widgets, r)}
+	widgets := gchatWithoutButtons(base.Widgets, func(b map[string]any) bool {
+		function := gchatButtonFunction(b)
+		return function == gchatFeedbackFunction || (answered && function == gchatChatFunction)
+	})
+	return gchatChatLayout{Text: base.Text, Widgets: gchatWithRating(widgets, r)}
 }
 
 // cloneGchatWidgets is a deep copy of decoded accessory widgets: no slice
@@ -555,7 +559,7 @@ func gchatNoteCardOf(widgets ...map[string]any) map[string]any {
 // Cancel.
 func gchatNoteCard(task string, days int, askKept bool) map[string]any {
 	return gchatNoteCardOf(
-		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackNoteTitle}},
+		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackNoteTitleFor(task)}},
 		map[string]any{gchatTextInputKey: map[string]any{
 			"name":       gchatNoteInputName,
 			"label":      feedbackNoteLabel,
@@ -563,7 +567,7 @@ func gchatNoteCard(task string, days int, askKept bool) map[string]any {
 			"hintText":   fmt.Sprintf(gchatNoteHint, feedbackNoteChars),
 			"validation": map[string]any{"characterLimit": feedbackNoteChars},
 		}},
-		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackKeptText(days, askKept)}},
+		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackKeptTextFor(task, days, askKept)}},
 		map[string]any{gchatButtonListKey: map[string]any{gchatButtonsKey: []map[string]any{
 			{"text": feedbackNoteSend, "onClick": gchatNoteAction(task)},
 			{"text": feedbackNoteCancel, "onClick": gchatNoteAction(task,
@@ -579,7 +583,13 @@ func gchatCollapsedCard(text string) map[string]any {
 
 // gchatNoteThanks is the line a kept note collapses its card to.
 func gchatNoteThanks() string {
-	return feedbackThanks(fmt.Sprintf(gchatCardLink, feedbackFormURL, feedbackFormURL))
+	return gchatNoteThanksFor("")
+}
+
+// gchatNoteThanksFor is the line a kept note on the message rated under
+// task collapses its card to.
+func gchatNoteThanksFor(task string) string {
+	return feedbackThanksFor(task, fmt.Sprintf(gchatCardLink, feedbackFormURL, feedbackFormURL))
 }
 
 // createCard posts card in space, on thread when set, private to viewer
@@ -676,7 +686,7 @@ func (a *GoogleChatAdapter) feedbackNoteClick(ev *gchatEvent) string {
 	a.goRewrite(func() {
 		switch {
 		case cancel:
-			a.collapseNoteCard(snapshot, gchatNoteThanks())
+			a.collapseNoteCard(snapshot, gchatNoteThanksFor(task))
 			return
 		case !present:
 			a.log.Warn("gchat: a note Send carried no inputs; the 👎 is kept without a note", "message", snapshot.Message.Name, "taskId", task)
@@ -686,7 +696,7 @@ func (a *GoogleChatAdapter) feedbackNoteClick(ev *gchatEvent) string {
 		err := recorder.Note(rating, gchatNoteText(note))
 		switch {
 		case err == nil:
-			a.collapseNoteCard(snapshot, gchatNoteThanks())
+			a.collapseNoteCard(snapshot, gchatNoteThanksFor(task))
 		case errors.Is(err, errFeedbackNotKept):
 			a.collapseNoteCard(snapshot, gchatNoteReplaced)
 		default:

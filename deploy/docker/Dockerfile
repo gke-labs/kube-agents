@@ -49,7 +49,7 @@
 # The defaults are the upstream references, so an ordinary build is unchanged.
 ARG HERMES_AGENT_TAG
 ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
-ARG ENVOY_VERSION=v1.39.1
+ARG ENVOY_VERSION=v1.39.6
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
@@ -108,11 +108,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/drift-detector ./cmd/drift-detector/
 
-# The a2a CLI — the topics reader/writer for the A2A bus (mode: next). Same
-# pattern as the event watcher above. The binary ships UNGATED at
-# /usr/local/bin: it is inert until something invokes it, and the thing that
-# invokes it — the a2a-topics skill — is what ships dark (see the
-# /opt/a2a-template COPY below and docker-entrypoint.sh step 2.6a-bis).
+# The a2a CLI — the topics reader/writer for the A2A bus. Same pattern as
+# the event watcher above. The binary ships at /usr/local/bin and is inert
+# until something invokes it; the thing that invokes it — the a2a-topics
+# skill — ships as its own template (see the /opt/a2a-template COPY below and
+# docker-entrypoint.sh step 2.6a-bis).
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS a2a-builder
 # Repeated for the same reason as watcher-builder above: a substituted
 # GOLANG_IMAGE must not reintroduce GOTOOLCHAIN=auto (#1138).
@@ -123,7 +123,9 @@ WORKDIR /workspace
 COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/ && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/curator ./cmd/curator/
 
 # tirith joins a2a in /workspace/bin, so agent-base copies both with the one
 # COPY it already has and the image gains no layer. The download is verified
@@ -418,7 +420,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope
 # minute-ly ticker evicts a daily watchdog's only row inside 17 hours.
 # Retention becomes per job, with a global ceiling and a per-job floor.
 #
-# Must stay AFTER the cron_tick_lock_scope block: two of the nineteen anchors
+# Must stay AFTER the cron_tick_lock_scope block: two of the twenty anchors
 # are text that patch inserts.
 COPY --chmod=0644 deploy/docker/patches/cron_skip_ledger.py /opt/hermes/tools/cron_skip_ledger.py
 COPY deploy/docker/patches/apply_cron_skip_ledger.py \
@@ -953,6 +955,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_chat_turn_metrics.py \
      deploy/docker/patches/verify_chat_turn_metrics.py \
      deploy/docker/patches/chat_turn_metrics.py \
+     deploy/docker/patches/apply_kanban_dispatch_failures.py \
+     deploy/docker/patches/verify_kanban_dispatch_failures.py \
+     deploy/docker/patches/kanban_dispatch_failures.py \
      agents/platform/scripts/slack_presenter.py \
      agents/platform/scripts/slack_status.py \
      agents/platform/scripts/slack_moments.py \
@@ -1006,6 +1011,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     grep -qF "_kage_chat_turn_metrics.record_turn_error(source)" /opt/hermes/gateway/run_turn.py && \
     grep -qF "_kage_chat_turn_metrics.record_turn_error(ctx.source)" /opt/hermes/gateway/run_turn_runner.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_chat_turn_metrics.py /opt/hermes && \
+    install -m 0644 /tmp/message-surface/kanban_dispatch_failures.py /opt/hermes/gateway/kanban_dispatch_failures.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_kanban_dispatch_failures.py /opt/hermes && \
+    grep -qF "_kage_dispatch_failures.record_tick(slug, exc)" /opt/hermes/gateway/kanban_watchers_dispatcher.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_dispatch_failures.py /opt/hermes && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
@@ -1307,6 +1316,24 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # the latency block further down. See deploy/docker/patches/kanban_priority.py.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
+#
+# kanban_admission rides this step's COPY and RUN, after the scheduling edits
+# and before the fanout reaper's (which anchors on the same reclaim-phase line
+# and inserts after it): the dispatcher admits workers by the pod's memory
+# budget instead of /proc/meminfo, which under GKE Sandbox reports the sandbox's
+# virtual memory and let the kubelet evict the pod three times at 3.1 to 3.5 GiB
+# against a 2 GiB request (#4760). The tick classifies the container's cgroup v1
+# usage (v2, then its own process tree) against kanban.admission.memory_budget_mib
+# with upstream's own thresholds, fails closed when no counter is readable, stops
+# a worker whose process tree is over worker_rss_cap_mib, and refuses a ready
+# card that waited past queue_bound_seconds for memory or a slot; each refusal
+# blocks the card with the new kind "capacity" and a reason the front door can
+# relay. The module is installed with `install -m 0644` inside the RUN, as
+# kanban_priority.py is, because the agent-base -> platform chain is one layer
+# under the budget scripts/check_image_layers.py enforces. The applier is a
+# no-op on a tree that already carries it. verify_kanban_admission.py drives
+# the applied engine through dispatch_once, on a fixture and on this tree.
+# See the module docstring in deploy/docker/patches/kanban_admission.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
 # kanban_scheduling.py and kanban_children_settled.py are here as the applier's
 # import-time cross-check reads them, not to be installed from here. The former
@@ -1317,6 +1344,9 @@ COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/kanban_scheduling.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/kanban_priority.py \
+     deploy/docker/patches/kanban_admission.py \
+     deploy/docker/patches/apply_kanban_admission.py \
+     deploy/docker/patches/verify_kanban_admission.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
 RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes_cli/kanban_priority.py && \
@@ -1341,7 +1371,18 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
     test "$(grep -c '_kanban_record_saturation(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c '_kanban_note_waiting(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    install -m 0644 /tmp/kanban-scheduling/kanban_admission.py /opt/hermes/hermes_cli/kanban_admission.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_admission.py /opt/hermes && \
+    grep -qF "pressure = _kanban_admission.pressure_level_for_tick(result)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -qF "spawn_budget = _kanban_admission.cap_spawn_budget(result, spawn_budget)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -qF "result.auto_blocked.extend(_kanban_admission.enforce_worker_rss_caps(conn))" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    test "$(grep -c '_kanban_admission.refuse_overdue_ready(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "2" && \
+    test "$(grep -c 'from hermes_cli import kanban_admission as _kanban_admission' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    grep -qF '"transient", "capacity"}' /opt/hermes/hermes_cli/kanban_db.py && \
+    test "$(grep -c '    pressure = _memory_pressure_level()' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "0" && \
+    test "$(grep -c '    result.timed_out = enforce_max_runtime(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_admission.py && \
     rm -rf /tmp/kanban-scheduling
 
 # Hotfix: kanban workers leaving `run_conversation` without a board write.
@@ -1420,7 +1461,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s apart. The
 # retryDelay fallback shares the header path's 600s cap and leaves the retry
 # count alone. rate_limit_backoff_floor, applied after it, covers the 429 that
-# names no window at all: gemini-4-argon's dynamic-shared-quota 429 carries no
+# names no window at all: Vertex's dynamic-shared-quota 429 carries no
 # header, no field and no RetryInfo, so the three retries still fell 2-6s apart
 # inside a quota minute that was still closed and the rep was lost as
 # hermes-rate-limited (gke-labs/kube-agents#4238). It waits a jittered 30-60s
@@ -2296,9 +2337,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
-# pinned tirith (see the a2a-tools stage).
-COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
+# The a2a and curator CLIs, ungated (see the a2a-builder stage for why that is
+# safe), and the pinned tirith (see the a2a-tools stage).
+COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/curator /workspace/bin/tirith /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
@@ -2435,14 +2476,12 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
      /opt/platform-template/
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 
-# --- A2A persona content, deliberately OUTSIDE /opt/platform-template ---
-# A skill in the template appears in the agent's skill list on every install,
-# including the ones where the bus does not exist — which breaks the mode
-# switch's promise that a normal install cannot tell this feature exists
-# (a2a/persona/README.md). It lands here instead, and docker-entrypoint.sh
-# step 2.6a-bis overlays it into the platform profile only when
-# runtime_mode.is_next(). Step 2.6a's replace-from-image is also why the PVC
-# is not a place a skill can live: this template is the only route.
+# --- A2A persona content, kept OUTSIDE /opt/platform-template ---
+# The bus persona is maintained in a2a/persona/ (a2a/persona/README.md), so
+# its skill ships as its own template rather than inside the Platform Agent's,
+# and docker-entrypoint.sh step 2.6a-bis overlays it into the platform profile
+# on every boot. Step 2.6a's replace-from-image is also why the PVC is not a
+# place a skill can live: this template is the only route.
 COPY --chown=hermes:hermes a2a/persona/platform/skills/ /opt/a2a-template/skills/
 
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
@@ -2459,8 +2498,9 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
-# scaffolded into the optional `tse` Hermes profile at runtime when enabled.
+# Copy the GKE Support Agent (tse) profile TEMPLATE (SOUL, config, skills),
+# scaffolded into the optional `tse` Hermes profile at runtime when enabled,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
@@ -2507,7 +2547,7 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 #
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2538,6 +2578,7 @@ assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lo
         agents/cluster/skills=/opt/cluster-template/skills \
         agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
         agents/tse/skills=/opt/tse-template/skills \
+        agents/tse/persona/skills=/opt/tse-template/persona/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
 

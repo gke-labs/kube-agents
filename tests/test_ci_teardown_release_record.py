@@ -1,4 +1,4 @@
-"""Step 1's fallback removes the Helm release record when the uninstall fails.
+"""Step 2's fallback removes the Helm release record when the uninstall fails.
 
 #1172: `helm uninstall` in `hack/ci-teardown.sh` can fail and the `|| true`
 discipline then reports the teardown green with the release-record Secrets
@@ -26,7 +26,7 @@ These tests pin the fallback's four properties:
 * a failing kubectl neither stops the steps after the fallback nor changes
   the teardown's exit code, which nothing in the script may do.
 
-Step 2 then asks the same question before deleting the chart's CRDs, and its
+Step 3 then asks the same question before deleting the chart's CRDs, and its
 three branches are pinned here too. Both of Helm's routes over a surviving
 record need those CRDs — `uninstall` resolves a REST mapping for every object
 in the stored manifest, which contains a PlatformAgent, and `upgrade` never
@@ -55,6 +55,12 @@ _CI_TEARDOWN = _REPO_ROOT / "hack" / "ci-teardown.sh"
 # run once the auth and context guards have passed. Asserted present below, so
 # a rename fails here loudly instead of silently shrinking what is tested.
 _STEPS_START = "START_TIME=$SECONDS"
+# The lane values Step 1 hands the bench plant sweep, and the stub that
+# stands in for it under the lift.
+_PROJECT = "kube-agents-evals-7"
+_CLUSTER = "platform-agent-host"
+_REGION = "us-east4"
+_BENCH_SWEEP_STUB = "bench-sweep"
 
 # Repeated here on purpose rather than parsed out of the script: a test that
 # derives the expected selector from the code under test asserts nothing.
@@ -135,8 +141,8 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         defaults red — the poisoned run's record is typically unreadable the
         same way its uninstall failed.
 
-        `kubectl get` is answered separately, from `records`, because Step 2
-        probes the same selector Step 1 deletes by and the two must be able to
+        `kubectl get` is answered separately, from `records`, because Step 3
+        probes the same selector Step 2 deletes by and the two must be able to
         disagree: after a successful uninstall Helm has removed its records,
         so the probe reads empty while the delete would have printed names.
         The default empty matches that — and note the probe is also subject to
@@ -172,7 +178,7 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
                 + f"  exit {kubectl_exit}\n"
                 "fi\n"
                 # The CRD delete answers separately so a test can reach Step
-                # 2's timed-out branch, which needs a readable probe (else the
+                # 3's timed-out branch, which needs a readable probe (else the
                 # keep branch fires first) and a red delete.
                 'if [[ "$1" == "delete" && "$2" == "-f" ]]; then\n'
                 f"  exit {crd_delete_exit}\n"
@@ -183,7 +189,15 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
                 f"exit {kubectl_exit}\n",
                 encoding="utf-8",
             )
-            for stub in (helm_stub, kubectl_stub):
+            # The bench plant sweep (Step 1) runs as a recording stub under
+            # the lift, so the real sibling script never reaches gcloud here;
+            # tests/test_ci_sweep_bench_plants.py covers it.
+            bench_sweep_stub = bin_dir / _BENCH_SWEEP_STUB
+            bench_sweep_stub.write_text(
+                "#!/usr/bin/env bash\n" f'echo "{_BENCH_SWEEP_STUB} $*" >> "{log}"\n' "exit 0\n",
+                encoding="utf-8",
+            )
+            for stub in (helm_stub, kubectl_stub, bench_sweep_stub):
                 stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
             proc = subprocess.run(
                 [
@@ -198,7 +212,14 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
                 text=True,
                 cwd=_REPO_ROOT,
                 env=get_isolated_test_env(
-                    bin_dir=bin_dir, overrides={"NAMESPACE": _NAMESPACE}
+                    bin_dir=bin_dir,
+                    overrides={
+                        "NAMESPACE": _NAMESPACE,
+                        "PROJECT_ID": _PROJECT,
+                        "CLUSTER_NAME": _CLUSTER,
+                        "REGION": _REGION,
+                        "CI_TEARDOWN_BENCH_SWEEP_SCRIPT": str(bench_sweep_stub),
+                    },
                 ),
             )
             calls = log.read_text(encoding="utf-8").splitlines()
@@ -266,7 +287,7 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         self.assertEqual(self._record_deletes(calls), [])
         self.assertIn("leaving the release record", out)
 
-    # --- Step 2 asks the same question before deleting the CRDs -------------
+    # --- Step 3 asks the same question before deleting the CRDs -------------
 
     def test_no_surviving_record_deletes_the_crds(self):
         """The common path, and #1006's: nothing to strand, and the next lease
@@ -288,7 +309,7 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         )
         self.assertEqual(rc, 0, err)
         self.assertEqual(self._crd_deletes(calls), [], out)
-        self.assertIn("release record survived Step 1", out)
+        self.assertIn("release record survived Step 2", out)
 
     def test_an_unreadable_probe_keeps_the_crds(self):
         """Unreadable has to count as "may survive": keeping a CRD costs one
@@ -327,7 +348,7 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         """`kubectl delete` waits forever by default, and a CRD delete blocks
         on customresourcecleanup until every CR of that kind is gone — which a
         PlatformAgent finalizer no live operator can clear never is. Unbounded,
-        that hangs teardown past Prow's job timeout and Steps 3 and 4, whose
+        that hangs teardown past Prow's job timeout and Steps 4 and 5, whose
         own comment says they must stay reachable on every path, never run."""
         rc, calls, out, err = self._run_steps()
         self.assertEqual(rc, 0, err)
@@ -337,12 +358,12 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
 
     def test_a_crd_delete_that_does_not_finish_still_reaches_the_sweeps(self):
         """The point of bounding it: the run continues, says so, and stays
-        green, so the orphans Steps 3 and 4 exist to remove still go."""
+        green, so the orphans Steps 4 and 5 exist to remove still go."""
         rc, calls, out, err = self._run_steps(crd_delete_exit=1)
         self.assertEqual(rc, 0, err)
         self.assertIn("did not finish within", out)
-        self.assertIn("Step 3", out)
         self.assertIn("Step 4", out)
+        self.assertIn("Step 5", out)
 
     def test_the_uninstall_asks_helm_for_the_real_error(self):
         """Without --debug Helm returns only `failed to delete release: <name>`
@@ -370,10 +391,10 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
 
     def test_a_failing_kubectl_neither_stops_teardown_nor_reds_it(self):
         """Fallback delete red, record probe red, sweep red — the teardown
-        still exits 0 and still reaches the steps after Step 1."""
+        still exits 0 and still reaches the steps after Step 2."""
         rc, calls, out, err = self._run_steps(uninstall_exit=1, kubectl_exit=1)
         self.assertEqual(rc, 0, err)
-        # Step 2 ran, and with its probe red it cannot rule out a surviving
+        # Step 3 ran, and with its probe red it cannot rule out a surviving
         # record, so it keeps the CRDs rather than re-arming #1172's trap.
         self.assertIn("could not read", out)
         # And the steps after it ran too.

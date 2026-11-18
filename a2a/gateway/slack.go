@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -259,6 +260,11 @@ type SlackAdapter struct {
 	// as "T…:U…" entries (SetAllowedGuests). foreignSender admits exactly
 	// these; set before Run, read-only after.
 	guests map[string]bool
+	// testUsers are the end-to-end test users' member ids (SetTestUsers),
+	// whose app-attributed posts are read as theirs; set before Run,
+	// read-only after. Meant for CI and eval installs; the allowlist still
+	// decides who is served.
+	testUsers map[string]bool
 
 	// sessionsAPI drives Agent Sessions (slack_sessions.go); nil in a test
 	// that does not fake it, which then sends no status. sessionStates holds
@@ -311,6 +317,25 @@ type SlackAdapter struct {
 	// (slack_feedback.go); nil in a test that does not fake it.
 	feedback    FeedbackRecorder
 	feedbackAPI slackFeedbackAPI
+
+	// metrics is the gateway's counters, where the pump reports the Socket
+	// Mode connection and each event it receives (SetMetrics); nil counts
+	// nothing.
+	metrics *Metrics
+	// apiMetrics is the same counters as the Web API client's transport reads
+	// them (slackAPITransport): the client is built before SetMetrics, so it
+	// holds this pointer rather than the counters. nil in a test adapter.
+	apiMetrics *atomic.Pointer[Metrics]
+}
+
+// SetMetrics gives the adapter the gateway's counters, so the Socket Mode
+// connection's state, the last event's time, the ingress lag and the Web API
+// calls are served beside them. Called once, before Run.
+func (s *SlackAdapter) SetMetrics(m *Metrics) {
+	s.metrics = m
+	if s.apiMetrics != nil {
+		s.apiMetrics.Store(m)
+	}
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -540,10 +565,12 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 	// The bounded client goes LAST so nothing in extra can displace it:
 	// slack-go applies options in order, and a later OptionHTTPClient would
 	// silently put the unbounded default back under every Post and Edit.
+	apiMetrics := &atomic.Pointer[Metrics]{}
 	opts := append([]slack.Option{slack.OptionAppLevelToken(appToken)}, extra...)
-	opts = append(opts, slack.OptionHTTPClient(slackHTTPClient()))
+	opts = append(opts, slack.OptionHTTPClient(slackObservedHTTPClient(apiMetrics)))
 	api := slack.New(botToken, opts...)
 	return &SlackAdapter{
+		apiMetrics:       apiMetrics,
 		api:              api,
 		sm:               socketmode.New(api),
 		log:              log,
@@ -551,7 +578,7 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 		sessionExpiresAt: map[string]time.Time{},
 		seen:             map[string]bool{},
 		now:              time.Now,
-		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackHTTPClient()},
+		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackObservedHTTPClient(apiMetrics)},
 		feedbackAPI:      api,
 	}
 }
@@ -569,6 +596,22 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 // sweepLoop. So "Run returned" means the pump is finished — not that the
 // gateway is.
 func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	// Down from the start until Socket Mode says it is connected, so a
+	// stalled auth.test or a first dial that keeps failing reads as down.
+	// Once Run returns nothing holds the socket: ended by its caller's
+	// context (a replica that lost the lease, or a shutdown), the gauges are
+	// disarmed, since this replica is no longer the one to report Slack;
+	// ended by a failure, they read down. Registered first so it runs last,
+	// after the pump below has exited and can write no state after it.
+	parent := ctx
+	s.metrics.slackDown()
+	defer func() {
+		if parent.Err() != nil {
+			s.metrics.slackStopped()
+			return
+		}
+		s.metrics.slackDown()
+	}()
 	// Deferred calls run LIFO, so the order these two are REGISTERED in is
 	// the reverse of the order they run in, and it matters: wg.Wait is
 	// registered first so that it runs last, after cancel has told the pump
@@ -626,6 +669,18 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			// at-least-once, and Slack redelivers it to whoever is still up.
 			if ctx.Err() != nil {
 				return
+			}
+			// The connection's state rides the same channel as the events,
+			// in order: socketmode sends connecting before every dial, the
+			// first and each one after a drop, a ping timeout or Slack's own
+			// disconnect request alike, and connected once the websocket is up.
+			switch evt.Type {
+			case socketmode.EventTypeConnected:
+				s.metrics.slackUp()
+			case socketmode.EventTypeConnecting, socketmode.EventTypeConnectionError, socketmode.EventTypeInvalidAuth:
+				s.metrics.slackDown()
+			case socketmode.EventTypeEventsAPI, socketmode.EventTypeInteractive:
+				s.metrics.slackEvent(time.Now())
 			}
 			if evt.Type != socketmode.EventTypeEventsAPI && evt.Type != socketmode.EventTypeInteractive {
 				// Everything that is neither an EventsAPI nor an interactive
@@ -764,11 +819,24 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			switch inner := e.InnerEvent.Data.(type) {
 			case *slackevents.MessageEvent:
+				// The arrival is taken before the filter, which may read from
+				// Slack; the lag is observed only for a message that becomes a
+				// turn, so the bot's own posts and edits, and a redelivery the
+				// dedupe drops, stay out of it. event_ts is when Slack raised
+				// the event, which for an edit is the edit and not the
+				// original message's ts.
+				arrived := time.Now()
+				eventTS := inner.EventTimeStamp
+				if eventTS == "" {
+					eventTS = inner.TimeStamp
+				}
 				var parent string
 				if evt.Request != nil {
 					parent = slackParentUserID(evt.Request.Payload)
 				}
 				if msg, ok := s.inboundEvent(ctx, inner, parent); ok {
+					s.metrics.slackIngress(arrived, eventTS)
+					msg.ArrivedAt = arrived
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
@@ -846,11 +914,31 @@ func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed
 // PostNotifyBlocks is PostNotify for a Block Kit message: blocks as given,
 // text as the notification and fallback. The blocks are decoded into
 // slack-go's types to be sent; one it does not know travels as Slack wrote
-// it, and Slack's own refusal (invalid_blocks) comes back as the error.
-func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
+// it, and Slack's own refusal (invalid_blocks) comes back as the error. A
+// post marked for rating (feedback, a post the agent made on its own) ends
+// with the rating controls when the blocks leave room for them.
+func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage, feedback string) (message, landed string, err error) {
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
+	if s.rates(OutMessage{Feedback: feedback}) {
+		// Blocks that do not decode with the controls added post as they
+		// came, and so does a report Slack refuses with them: the rating
+		// must not cost the report its post.
+		var probe slack.Blocks
+		if rated, err := slackWithFeedbackBlock(raw, feedback); err == nil && json.Unmarshal(rated, &probe) == nil {
+			message, landed, err = s.postNotifyBlocks(channel, thread, text, rated)
+			if !errors.Is(slackLayoutError(err), ErrLayoutRefused) {
+				return message, landed, err
+			}
+			s.log.Warn("slack: a rated Block Kit home post was refused; posting it without the rating controls", "channel", channel, "err", err)
+		}
+	}
+	return s.postNotifyBlocks(channel, thread, text, raw)
+}
+
+// postNotifyBlocks is one PostNotifyBlocks attempt with raw as the blocks.
+func (s *SlackAdapter) postNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
 	var blocks slack.Blocks
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return "", "", fmt.Errorf("slack: blocks: %w", err)
@@ -872,14 +960,38 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 
 // PostNotifyMessage is PostNotify for a message value: a chat message laid
 // out as Block Kit (renderSlackChat), its text as the notification and
-// fallback, link and media previews off. A layout the renderer will not send,
-// or that Slack refuses, is an error wrapped in ErrLayoutRefused and nothing
-// is posted; the Notifier posts the text instead.
+// fallback, link and media previews off. A post marked for rating
+// (m.Feedback, a post the agent made on its own) ends with the rating
+// controls, under its action buttons, laid out or as text alone. A layout the
+// renderer will not send, or that Slack refuses, is an error wrapped in
+// ErrLayoutRefused and nothing is posted; the Notifier posts the text instead.
 func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
-	opts, err := slackMessageOptions(m)
+	if !s.rates(m) {
+		m.Feedback = ""
+	}
+	message, landed, err = s.postNotifyMessage(channel, thread, m)
+	if m.Feedback != "" && errors.Is(err, ErrLayoutRefused) {
+		// The rating controls must not cost the post its layout (a drift
+		// alert's own buttons): the same message once more without them.
+		s.log.Warn("slack: a rated home post was refused; posting it without the rating controls", "channel", channel, "err", err)
+		m.Feedback = ""
+		message, landed, err = s.postNotifyMessage(channel, thread, m)
+	}
+	return message, landed, err
+}
+
+// postNotifyMessage is one PostNotifyMessage attempt, with the rating
+// controls when m is marked for rating.
+func (s *SlackAdapter) postNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
+	var opts []slack.MsgOption
+	if m.Feedback != "" {
+		opts, err = slackRatedOptions(m)
+	} else {
+		opts, err = slackMessageOptions(m)
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -1026,13 +1138,43 @@ func slackLayoutError(err error) error {
 
 // EditMessage replaces a posted message with a message value. Without a chat
 // message the text replaces the layout too: the blocks and the side bar are
-// sent empty, since chat.update keeps whatever it is not sent.
+// sent empty, since chat.update keeps whatever it is not sent. A message
+// marked for rating (m.Feedback: a home alert its triage rewrites) keeps its
+// rating controls as the last block.
 func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	channel, _, ok := slackChannelThread(conversation)
 	if !ok {
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts, err := slackMessageOptions(m)
+	if !s.rates(m) {
+		m.Feedback = ""
+	}
+	err := s.editMessage(channel, conversation, messageID, m)
+	if m.Feedback != "" && errors.Is(err, ErrLayoutRefused) {
+		// The rating controls must not cost the edit its layout, or the
+		// keyed edit its message: the same edit once more without them.
+		s.log.Warn("slack: a rated edit was refused; editing without the rating controls", "channel", channel, "err", err)
+		m.Feedback = ""
+		err = s.editMessage(channel, conversation, messageID, m)
+	}
+	return err
+}
+
+// editMessage is one EditMessage attempt, with the rating controls when m
+// is marked for rating.
+func (s *SlackAdapter) editMessage(channel, conversation, messageID string, m OutMessage) error {
+	var opts []slack.MsgOption
+	var err error
+	if m.Feedback != "" {
+		opts, err = slackRatedOptions(m)
+		if m.Chat == nil {
+			// The side bar a laid-out version had is cleared, as
+			// slackMessageOptions clears it for text.
+			opts = append(opts, slack.MsgOptionAttachments([]slack.Attachment{}...))
+		}
+	} else {
+		opts, err = slackMessageOptions(m)
+	}
 	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || !asksQuestion(m.Chat.Choices)) {
 		// An answered question edited again without its choices (the card
 		// settling it on the notify route, laid out or as text) keeps the
@@ -1367,6 +1509,25 @@ func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	}
 }
 
+// SetTestUsers takes the end-to-end test users' member ids (Config.SlackTestUsers).
+// A message from one of them that carries an app's bot_id, as a post with a
+// user token through an app does, is read as the member's rather than dropped
+// as bot traffic; nothing else about it changes, so the allowlist, the
+// foreign-workspace refusal and the dedupe still apply, and the bot's own
+// member id is refused whatever the list says. Call before Run.
+func (s *SlackAdapter) SetTestUsers(ids []string) {
+	s.testUsers = map[string]bool{}
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			s.testUsers[id] = true
+		}
+	}
+	if len(s.testUsers) > 0 {
+		s.log.Warn("slack: end-to-end test users' app-attributed posts are read as theirs; this belongs on CI and eval installs only",
+			"testUsers", len(s.testUsers))
+	}
+}
+
 // SetAllowedGuests takes the Slack allowlist (integration.slack.allowedUsers)
 // and keeps its team-qualified entries, "T…:U…": the members of other
 // workspaces this install serves in a Slack Connect channel. A plain "U…"
@@ -1561,9 +1722,19 @@ func slackParentUserID(payload json.RawMessage) string {
 // inboundEvent is inbound with the thread root's author, when the event
 // carried one (slackParentUserID).
 func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageEvent, parentUserID string) (InboundMessage, bool) {
-	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
+	if !slackTurnSubtypes[m.SubType] || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
+	}
+	if m.BotID != "" {
+		if !s.testUsers[m.User] {
+			return InboundMessage{}, false
+		}
+		// A listed test user's post through their driver app: Slack attributes
+		// it to the app (bot_id), and it is read as the member's own. Logged
+		// every time, so no such turn is ever silent.
+		s.log.Info("slack: reading an app-attributed post from a listed test user as theirs",
+			"user", m.User, "botId", m.BotID, "channel", m.Channel, "ts", m.TimeStamp)
 	}
 	refused, author := s.foreignSender(m)
 	if refused {

@@ -86,6 +86,21 @@ def script_job(job_id, expr, next_run_at):
     }
 
 
+def hermes_reanchors(stored: str, now: datetime) -> bool:
+    """Whether Hermes' due scan moves a due ``next_run_at`` to the next slot
+    without firing it: ``_repair_timezone_shifted_cron`` in ``cron/jobs.py``
+    of the pinned Hermes (v2026.9.14), which reads a stored offset that
+    differs from now's, with a stored wall clock later than now's, as a
+    timezone migration. ``now`` is Hermes' clock, in the profile's zone.
+    """
+    raw = datetime.fromisoformat(stored)
+    return (
+        raw <= now
+        and raw.utcoffset() != now.utcoffset()
+        and raw.replace(tzinfo=None) > now.replace(tzinfo=None)
+    )
+
+
 class Reader:
     """A signal reader that counts its calls and can be told to fail."""
 
@@ -191,6 +206,29 @@ class NextOccurrenceTest(unittest.TestCase):
 
     def test_bad_expression_is_none(self):
         self.assertIsNone(cip.next_occurrence("not cron", NOW, inclusive=False))
+
+    def test_walks_the_wall_clock_across_a_dst_change(self):
+        # Hermes walks the naive wall clock and puts the zone back; a
+        # zone-aware croniter start keeps Saturday's offset into Sunday.
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/New_York")
+        spring = datetime(2026, 3, 7, 14, 25, 30, tzinfo=timezone.utc)  # Sat 09:25:30 EST
+        self.assertEqual(
+            cip.next_occurrence("20 6 * * *", spring, inclusive=False, zone=zone),
+            datetime(2026, 3, 8, 10, 20, tzinfo=timezone.utc),  # 06:20 EDT
+        )
+        autumn = datetime(2026, 10, 31, 13, 25, 30, tzinfo=timezone.utc)  # Sat 09:25:30 EDT
+        self.assertEqual(
+            cip.next_occurrence("20 6 * * *", autumn, inclusive=False, zone=zone),
+            datetime(2026, 11, 1, 11, 20, tzinfo=timezone.utc),  # 06:20 EST
+        )
+        # The hour the clocks skip has no instant: a 02:30 slot on the spring
+        # day resolves to the first instant after it rather than to nothing.
+        self.assertEqual(
+            cip.next_occurrence("30 2 * * *", spring, inclusive=False, zone=zone),
+            datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc),
+        )
 
 
 class ActiveInstallTest(PolicyCase):
@@ -566,12 +604,57 @@ class ScheduleZoneTest(PolicyCase):
 
     def test_a_hold_lands_on_the_zones_slot(self):
         # 06:20 Brussels in August is 04:20 UTC; the due slot and the hold both
-        # sit on that clock, and the stored instant stays UTC.
+        # sit on that clock, and the hold is written in the zone, as Hermes
+        # writes its own.
         (self.profile / "config.yaml").write_text("timezone: Europe/Brussels\n", encoding="utf-8")
         local_due = datetime(2026, 8, 6, 4, 20, tzinfo=timezone.utc)
         self.write(prompt_job("compliance-audit", "20 6 * * *", local_due, days_ago(1)))
         self.run_policy(Reader(days_ago(15)), now=local_due + timedelta(seconds=30))
-        self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T04:20:00+00:00")
+        self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T06:20:00+02:00")
+
+    def test_a_hold_west_of_utc_carries_the_slots_own_offset(self):
+        # A UTC stamp for 06:20 New York reads 11:20, five hours later than
+        # the wall clock when the slot comes, with an offset that is not
+        # now's: the shape Hermes repairs as a timezone migration, by moving
+        # the job a day on without a run. The hold is therefore written in the
+        # zone, and with the slot's own offset: written on a Friday in
+        # daylight time for a Monday after the clocks went back, it reads EST.
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/New_York")
+        (self.profile / "config.yaml").write_text("timezone: America/New_York\n", encoding="utf-8")
+        now = datetime(2026, 10, 30, 10, 20, 30, tzinfo=timezone.utc)  # Fri 06:20:30 EDT
+        self.write(
+            prompt_job("compliance-audit", "20 6 * * *", "2026-10-30T06:20:00-04:00", "2026-10-26T06:20:00-04:00"),
+        )
+        lines = self.run_policy(Reader(days_ago(8, now)), now=now)
+        held = "2026-11-02T06:20:00-05:00"  # Mon, the first slot seven days after the last run
+        self.assertEqual(self.next_run("compliance-audit"), held)
+        self.assertEqual(self.state()["held"]["compliance-audit"]["next_run_at"], held)
+        self.assertIn(f"held compliance-audit until {held} (throttle)", lines[-1])
+        due_tick = datetime(2026, 11, 2, 6, 20, 30, tzinfo=zone)
+        self.assertFalse(hermes_reanchors(held, due_tick))
+        self.assertTrue(hermes_reanchors("2026-11-02T11:20:00+00:00", due_tick))  # the UTC form of the same instant
+
+    def test_a_release_west_of_utc_carries_the_slots_own_offset(self):
+        # The wake rewrite is read by the same scan: the next slot after now is
+        # written in the zone too, here across the Sunday the clocks go back.
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/New_York")
+        (self.profile / "config.yaml").write_text("timezone: America/New_York\n", encoding="utf-8")
+        held = "2026-11-02T06:20:00-05:00"
+        self.write(prompt_job("compliance-audit", "20 6 * * *", held, "2026-10-26T06:20:00-04:00"))
+        state = cip.empty_state()
+        state["stage"] = cip.STAGE_THROTTLE
+        state["held"] = {"compliance-audit": {"next_run_at": held, "stage": cip.STAGE_THROTTLE}}
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        now = datetime(2026, 10, 31, 13, 25, 30, tzinfo=timezone.utc)  # Sat 09:25:30 EDT
+        lines = self.run_policy(Reader(now - timedelta(minutes=1)), now=now)
+        released = "2026-11-01T06:20:00-05:00"  # Sun, the first 06:20 after the clocks went back
+        self.assertIn(f"released compliance-audit; next run {released}", "\n".join(lines))
+        self.assertEqual(self.next_run("compliance-audit"), released)
+        self.assertFalse(hermes_reanchors(released, datetime(2026, 11, 1, 6, 20, 30, tzinfo=zone)))
 
     def test_a_hand_mark_is_read_the_same_on_any_clock(self):
         # The mark, not the timestamp's position on the zone's grid, is what

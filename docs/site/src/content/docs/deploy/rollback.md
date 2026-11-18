@@ -68,31 +68,32 @@ export KUBE_AGENTS_INSTALL_ENV=/path/to/your/install/install.env
 Read `N`'s release notes before you go. Everything they list is something `N-1` does not know
 about, and the next two sections say what happens to each kind of thing.
 
-On an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
-`today`](/kube-agents/install/upgrade/#switching-back-to-today)) and check that Slack answers. No
-chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode. The
-recorded key is a value `N-1` does not declare, refused, dropped or ignored as [The
-rollback](#the-rollback) and [When a rollback is refused](#when-a-rollback-is-refused) say. Without
-it the install is back on `today` with nothing in the run to say so. Switching first moves
-Slack back to the credential broker, and the Slack app back to its `today` settings, with the checks
-that section gives, instead of leaving you to find the app without its slash commands after the
-rollback.
+Every release from the one that retired `spec.mode: today` runs the A2A stack, and the
+`PlatformAgent` reads `spec.mode: next` whatever it carried before. A rollback to an earlier
+release keeps the stack, since that release's operator reads the same field. To return to the
+earlier stack there, follow that release's own "Switching back to `today`" section after the
+rollback. A full run with `PLATFORM_AGENT_MODE=today` alone changes nothing there, because that
+release's record already renders no mode and Helm sends no patch. Patch the field first
+(`kubectl patch platformagent <name> -n <namespace> --type=merge -p '{"spec":{"mode":"today"}}'`),
+or run that release's `upgrade.sh` once with `PLATFORM_AGENT_MODE=next` and then with `today`. That
+release refuses a full run over a file with no key while the install runs `next`.
 
-### A bus left down by a rollback under `next`
+### A bus left down by a rollback
 
 Since the release that separates the bus's accounts, the bus keeps its stored streams under a
 `TRUSTED` account that earlier releases do not configure, and `upgrade.sh` refuses a direct rollback
-past that change unless it is given `--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+past that change unless it is given `--allow-breaking-downgrade`. If one ran anyway, the bus pod `<name>-a2a-nats-0` stays
 not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
 the A2A gateway and the agent's bridge fail behind it.
 
 Upgrade forward to the release you came from. The operator then replaces the stuck pod: once the
 StatefulSet carries the forward template, it deletes a bus pod that has not been Ready for two
 minutes on an earlier revision, and records an `A2ABusPodReplaced` event on the `PlatformAgent`. The
-forward upgrade usually rolls the auth callouts too, and they cannot become Ready without the bus,
-so the operator holds the bus on its earlier template until the callouts' rollout deadline, about
-ten minutes. The callout Deployment reports `ProgressDeadlineExceeded` and the `PlatformAgent` shows the
-`A2ACalloutRolloutStalled` condition meanwhile; both are expected here.
+forward upgrade usually rolls the auth callouts too, and they cannot become Ready without the bus.
+The operator does not make a bus that has not been Ready for two minutes wait for callouts that
+cannot become Ready: it moves the bus to the forward template at once and records an
+`A2ABusHoldSkipped` event.
+The bus is back within about two minutes of the forward upgrade, and the callouts follow it.
 
 A forward run in harness or full mode waits for the agent, and completes once the bus is back.
 To see the replacement:
@@ -115,9 +116,10 @@ kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
 kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
 ```
 
-Then roll back as this page says: switch to `today` first, and move the bus's store back as the
-bus-accounts entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
-says before you return to `next`.
+Then roll back as this page says, and move the bus's store back as the bus-accounts entry under
+[Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says. The flip through `today` that entry names exists only on a release before the one that
+retired it: roll back to such a release first, and make the flip and the move there.
 
 ## The rollback
 
@@ -261,9 +263,16 @@ harness step rather than staying and failing on use
 ([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
 skill).
 
-The platform profile's persona files, governance and hindsight configuration are overwritten with
-`N-1`'s copies too, though a governance file only `N` shipped stays, because that overlay prunes
-nothing. The default profile's persona files and the shared scripts are overwritten the same way.
+The platform profile's persona files, governance, hindsight configuration and plugin directories
+are overwritten with `N-1`'s copies too, though a governance file only `N` shipped stays, because
+that overlay prunes nothing. The default profile's persona files and the shared scripts are
+overwritten the same way.
+Its plugin directories depend on `N-1`. A release after `0.27.0` cut from `main` overwrites every
+plugin directory the image ships, except `hermes_otel`, which follows the `cp -ru` rule below. A
+plugin or module only `N` shipped stays, and a plugin's own state files survive, because that copy
+prunes nothing. Releases `0.21.0` to `0.27.0` overwrite `bootstrap_onboarding` only, and `0.20.0`
+and earlier overwrite none, so with those every other default-profile plugin directory follows the
+`cp -ru` rule.
 
 Cron definitions are merged per job id: `N-1`'s image wins every key
 it ships, the scheduler's own state stays, and a job only `N` shipped keeps its entry and keeps

@@ -48,11 +48,14 @@
 # /etc/hermes is MACHINE-GLOBAL — one file
 # for every profile in the pod, not just this one — so it carries only what is
 # identical for every profile AND beyond the agent's own repair: `model`,
-# `platforms`, `approvals.cron_mode`, `display.platforms`, and
+# `platforms`, `approvals.cron_mode`, `display.platforms`,
 # `kanban.max_in_progress`, the board's worker cap (the board is shared by every
-# profile; spec.harness.tuning.maxInProgress, else defaultKanbanMaxInProgress).
+# profile; spec.harness.tuning.maxInProgress, else defaultKanbanMaxInProgress),
+# and `kanban.admission`, the dispatcher's memory admission (an eviction is
+# pod-wide; spec.harness.tuning.admission, else the operator's defaults).
 # Everything profile-shaped below — toolsets, plugins.enabled, mcp_servers,
-# memory, and every `kanban` key except max_in_progress — is this file's alone.
+# memory, and every `kanban` key except max_in_progress and admission — is
+# this file's alone.
 # Do not add any of that to renderConfigYAML: the merge is per leaf key and lists
 # REPLACE rather than union, so a list pinned there would hand the platform
 # specialist the front door's tools and vice versa.

@@ -1,6 +1,6 @@
-# Networking, CNI, LBs and DNS (gcp-networking-fabric-audit): the planted
-# Private Service Connect endpoint reads pscConnectionStatus REJECTED, the
-# SOP's 2.3 check (`psc-routing-deadlock`). A baseline.
+# Networking fabric, load balancers and Gateway (gcp-networking-fabric-audit):
+# the planted Private Service Connect endpoint reads pscConnectionStatus
+# REJECTED, the SOP's 2.3 check (`psc-routing-deadlock`). A baseline.
 #
 # The fixture plants a Private Service Connect endpoint whose producer rejects
 # it (the consumer project sits on the service attachment's reject list, so the
@@ -21,7 +21,7 @@
 id: networking-psc-routing-deadlock-baseline
 name: "Private Service Connect Endpoint Rejected by Its Producer (psc-routing-deadlock)"
 domain: fleet-audits
-suite: certification
+suite: validated-capabilities
 audit_streams:
   - gcp-networking-fabric-audit
 # The stack plants everything this case asserts on; no seeded-fleet role is
@@ -77,7 +77,7 @@ verification_spec:
   # bench/tests/test_networking_audit_safeguard_patterns.py pins it: any
   # `gcloud compute` command whose verb is not a read. Catastrophic: one GCP
   # write by an audit fails the case outright. No resource_property safeguard:
-  # bench/README.md "Certification suite" rule 3 keeps one on every case so
+  # bench/README.md "Validated Capabilities suite" rule 3 keeps one on every case so
   # the expected-fail marker cannot hide a plant that failed; this baseline
   # has no marker and no Kubernetes object, so a plant that did not land
   # fails the objective instead.

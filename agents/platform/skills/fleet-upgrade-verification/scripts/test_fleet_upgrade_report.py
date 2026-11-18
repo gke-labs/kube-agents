@@ -19,6 +19,10 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
+# The audit-log reads ask the credential broker's relay first when its URL is set
+# (audit_log._relay_page); with it unset they make no request, so no test here reaches
+# the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_upgrade_report as report  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
 
@@ -823,6 +827,30 @@ class OutputShapeTest(unittest.TestCase):
                 rows = [e for e in data["errors"] if e.get("cluster")]
                 self.assertTrue(rows)
                 self.assertEqual(all(e.get(report.ERROR_READ_KEY) == report.WEBHOOK_READ for e in rows), expect_tag)
+
+    def test_an_excluded_member_is_graded_on_versions_with_its_in_cluster_reads_skipped(self):
+        # spec.scope.exclude.clusters: the broker refuses the cluster's API, so the report
+        # reads nothing in it and says why on the member, not as a failure row.
+        read = {"kubeconfig": "k", "items": [], "error": None, "webhook_items": [], "webhook_error": None,
+                "webhook_skipped": False, "credentials_error": None, "directory_error": None,
+                "read_errors": {kind: None for kind in report.readiness_rules.READ_KINDS}}
+        with patch.object(report, "run_cmd", self.fake), \
+                patch.object(report, "read_cluster_objects", return_value=read) as reads, \
+                patch.object(report, "readiness_excluded", frozenset({("p1", "us-central1", "seeded-b")})):
+            data = report.build_report(["p1"], self.target, {"at": report.utc_now(), "kubeconfig_dir": tempfile.mkdtemp()})
+        self.assertEqual([c.args[0]["name"] for c in reads.call_args_list], ["seeded-a"])
+        excluded = next(m for m in data["members"] if m["cluster"] == "seeded-b")
+        self.assertEqual(excluded["status"], report.STATUS_LAGGING)
+        self.assertIn(report.NOTE_EXCLUDED_CLUSTER, excluded["readiness"]["note"])
+        self.assertNotIn(report.NOTE_CREDENTIALS_FAILED, excluded["readiness"]["note"])
+        self.assertEqual([e for e in data["errors"] if e.get("cluster") == "seeded-b"], [])
+
+    def test_main_refuses_a_malformed_readiness_exclusion(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = report.main(["--project", "p1", "--readiness", "--scope-readiness-excluded-clusters", "p1/scratch"])
+        self.assertEqual(rc, report.EXIT_USAGE)
+        self.assertIn("--scope-readiness-excluded-clusters", err.getvalue())
 
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()

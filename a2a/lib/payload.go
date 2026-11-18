@@ -7,6 +7,8 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TaskState is the A2A task state machine, plus rejected. auth-required is
@@ -175,28 +177,107 @@ func UsageTotal(turns []Usage) Usage {
 	return total
 }
 
-// DelegateRequest is the ArtifactDelegate data part's shape: one child task
-// to mint, addressee and the task text. It is also the wire shape the
-// session pod's MCP server sends over the adapter's unix socket (the socket
-// hop is how the call gets from the harness's delegate tool to the adapter
-// that actually publishes the artifact), so it is named here, beside
-// ArtifactDelegate, rather than duplicated per caller.
+// DelegateRequest is the ArtifactDelegate data part's shape: the child tasks
+// to mint, either one (addressee, text and parameters) or a batch (Tasks). It
+// is also the wire shape the session pod's MCP server sends over the
+// adapter's unix socket (the socket hop is how the call gets from the
+// harness's delegate tool to the adapter that actually publishes the
+// artifact), so it is named here, beside ArtifactDelegate, rather than
+// duplicated per caller.
 //
 // Parameters are the child task's parameters (TaskParameters), the target
 // cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
 // and child results"): the gateway carries them into the child's submission
-// and refuses a child whose target is not inside its parent's. No gateway
-// reads them yet.
+// and refuses a child whose target is not inside its parent's. The gateway
+// holds the names to the target profile's declared ones.
+//
+// Tasks is a batch: several children minted from one request, each entry
+// shaped like the single fields (spec-a2a-payloads.md, "Task parameters and
+// child results"). A request sets the single fields or Tasks, never both
+// (ValidateDelegateRequest). An adapter sends Tasks only to a gateway that
+// advertised a width over one on the turn (DelegateTargets.WidthMax), so a
+// gateway built before batches never sees one, and a request without Tasks is
+// the single shape on the wire, unchanged.
 type DelegateRequest struct {
+	Addressee  string            `json:"addressee,omitempty"`
+	Text       string            `json:"text,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+	Tasks      []DelegateTask    `json:"tasks,omitempty"`
+}
+
+// DelegateTask is one entry of a batch delegation: the child's addressee, its
+// text (held to DelegateTextCap, like the single shape's) and its parameters.
+type DelegateTask struct {
 	Addressee  string            `json:"addressee"`
 	Text       string            `json:"text"`
 	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
-// DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
-// longer request before it reaches the bus and the gateway ignores one that
-// arrives anyway, so the two sides cannot disagree on the number.
+// DelegateTextCap bounds DelegateRequest.Text, and each batch entry's text, in
+// bytes: the adapter refuses a longer request before it reaches the bus and
+// the gateway ignores one that arrives anyway, so the two sides cannot
+// disagree on the number.
 const DelegateTextCap = 16 * 1024
+
+// DelegateBatchMax is the ceiling on a batch's length, whatever width a
+// gateway is configured with: the gateway refuses a width setting above it,
+// and every reader refuses a longer batch as malformed. The width a turn may
+// use is the gateway's setting, advertised as DelegateTargets.WidthMax.
+const DelegateBatchMax = 16
+
+// IsBatch reports a request that carries a tasks list (possibly empty, which
+// ValidateDelegateRequest refuses).
+func (r DelegateRequest) IsBatch() bool {
+	return r.Tasks != nil
+}
+
+// Entries is the request as the children it asks for: the single fields as
+// one entry, or each batch entry in order.
+func (r DelegateRequest) Entries() []DelegateTask {
+	if r.IsBatch() {
+		return r.Tasks
+	}
+	return []DelegateTask{{Addressee: r.Addressee, Text: r.Text, Parameters: r.Parameters}}
+}
+
+// ValidateDelegateRequest holds a request to its shape: the single fields or a
+// batch, never both; a batch neither empty nor past DelegateBatchMax; and each
+// entry's text present and within DelegateTextCap. The addressee and the
+// parameters are checked by each side's own rules per entry (the adapter's
+// validateDelegate, the gateway's route and allowlists).
+func ValidateDelegateRequest(r DelegateRequest) error {
+	if r.IsBatch() {
+		if r.Addressee != "" || r.Text != "" || len(r.Parameters) > 0 {
+			return errors.New("delegate: send either addressee and text, or tasks, not both")
+		}
+		if len(r.Tasks) == 0 {
+			return errors.New("delegate: the tasks list is empty")
+		}
+		if len(r.Tasks) > DelegateBatchMax {
+			return fmt.Errorf("delegate: %d tasks, at most %d in one request", len(r.Tasks), DelegateBatchMax)
+		}
+		for i, e := range r.Tasks {
+			if err := validateDelegateText(e.Text); err != nil {
+				return fmt.Errorf("delegate: task %d: %w", i+1, err)
+			}
+		}
+		return nil
+	}
+	if err := validateDelegateText(r.Text); err != nil {
+		return fmt.Errorf("delegate: %w", err)
+	}
+	return nil
+}
+
+func validateDelegateText(text string) error {
+	switch {
+	case strings.TrimSpace(text) == "":
+		return errors.New("text is required")
+	case len(text) > DelegateTextCap:
+		return errors.New("text is too long for a delegation")
+	}
+	return nil
+}
 
 // TaskParameters is the taskParameters data part on a profile task's
 // submission: the parameters its persona declares (the cluster persona's
@@ -207,6 +288,16 @@ const DelegateTextCap = 16 * 1024
 // these message fields authoritative. They never ride the authority block.
 type TaskParameters struct {
 	Parameters map[string]string `json:"parameters"`
+	// ChangeRequested says the requester asked for a change (a pull
+	// request) rather than an answer, and so whether the dispatcher grants
+	// the worker the permit to open one. Only the gateway sets it, and only
+	// true for a turn that arrived as a structured confirm action, never
+	// from free text or from a delegation's arguments, which are the
+	// model's; a child carries its parent's value from the gateway's own
+	// record. Both rules are the gateway's to keep (#4457): the dispatcher
+	// can't tell a parent's value from a raised one. Until the gateway sets
+	// it, nothing does. Absent means false.
+	ChangeRequested bool `json:"changeRequested,omitempty"`
 }
 
 // The bounds ValidateTaskParameters holds a parameter set to. A name is a
@@ -296,6 +387,159 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 	}
 	if found == nil {
 		return TaskParameters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// DelegateTargets is the delegateTargets data part on a session turn's
+// submission: the agents the turn's requester may delegate to, as the gateway
+// resolved them when it submitted the turn (platform, then each AgentProfile
+// whose card admits them). The session pod's delegate tool names them in its
+// addressee description, so the model is told what it can address rather than
+// a fixed name. It's a hint for the model, not a grant: the gateway checks a
+// delegation against the same rules when it arrives, so a stale list costs at
+// most a refused delegation.
+//
+// The part's presence is the marker: a turn that carries one has exactly the
+// agents listed (an empty list is none), and a turn with none reads as
+// platform only. Truncated says the gateway left agents out to stay inside
+// the bounds below.
+//
+// WidthMax is how many children one delegation from this turn may ask for
+// (the gateway's A2A_DELEGATION_WIDTH_MAX). Absent means one: the single
+// shape only, which is all a gateway built before batches takes, so the
+// session's tool offers a batch only when the part says more (Width).
+type DelegateTargets struct {
+	Targets   []DelegateTarget `json:"targets"`
+	Truncated bool             `json:"truncated,omitempty"`
+	WidthMax  int              `json:"widthMax,omitempty"`
+}
+
+// Width is the batch width the part advertises: WidthMax, or one when unset.
+func (t DelegateTargets) Width() int {
+	if t.WidthMax < 1 {
+		return 1
+	}
+	return t.WidthMax
+}
+
+// DelegateTarget is one agent a session may delegate to: its addressee, its
+// card's routing blurb, and the parameters its card declares (a pinned
+// profile's cluster, say), which a delegation may pass.
+type DelegateTarget struct {
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	Parameters  []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// The bounds a delegateTargets part is held to. A name is a subject token (an
+// addressee); a description is one line of at most DelegateTargetDescriptionMax
+// bytes, cut by the gateway (DelegateTargetDescription); a parameter is named
+// by TaskParameterNameRE, at most TaskParametersMax a target. The encoded part
+// is at most DelegateTargetsMaxBytes, so the session pod can hand it to its
+// tool server in one environment variable.
+const (
+	DelegateTargetsMax           = 32
+	DelegateTargetDescriptionMax = 200
+	DelegateTargetsMaxBytes      = 16 * 1024
+)
+
+const delegateTargetsKey = "delegateTargets"
+
+// DelegateTargetDescription is a card's description as a delegate target
+// carries it: control characters and line breaks folded to spaces, runs of
+// space collapsed, and cut to DelegateTargetDescriptionMax bytes on a rune
+// boundary.
+func DelegateTargetDescription(s string) string {
+	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)), " ")
+	if len(s) <= DelegateTargetDescriptionMax {
+		return s
+	}
+	cut := DelegateTargetDescriptionMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	// A cut that lands after a space would leave it trailing, and the
+	// description would no longer read back as itself.
+	return strings.TrimRight(s[:cut], " ")
+}
+
+func validateDelegateTargets(t DelegateTargets) error {
+	if len(t.Targets) > DelegateTargetsMax {
+		return fmt.Errorf("delegate targets: %d, at most %d", len(t.Targets), DelegateTargetsMax)
+	}
+	if t.WidthMax < 0 || t.WidthMax > DelegateBatchMax {
+		return fmt.Errorf("delegate targets: width %d, want 1 to %d", t.WidthMax, DelegateBatchMax)
+	}
+	for _, d := range t.Targets {
+		if !ValidSubjectToken(d.Name) {
+			return fmt.Errorf("delegate target %q is not an addressee", d.Name)
+		}
+		if d.Description != DelegateTargetDescription(d.Description) {
+			return fmt.Errorf("delegate target %s: the description is not one line of at most %d bytes", d.Name, DelegateTargetDescriptionMax)
+		}
+		if len(d.Parameters) > TaskParametersMax {
+			return fmt.Errorf("delegate target %s: %d parameters, at most %d", d.Name, len(d.Parameters), TaskParametersMax)
+		}
+		for _, p := range d.Parameters {
+			if !TaskParameterNameRE.MatchString(p.Name) {
+				return fmt.Errorf("delegate target %s: parameter %q is not a lower-case identifier", d.Name, p.Name)
+			}
+		}
+	}
+	if raw, err := json.Marshal(t); err != nil || len(raw) > DelegateTargetsMaxBytes {
+		return fmt.Errorf("delegate targets: encoded past %d bytes", DelegateTargetsMaxBytes)
+	}
+	return nil
+}
+
+// DelegateTargetsPart is t as a data part, refused when t breaks the bounds.
+func DelegateTargetsPart(t DelegateTargets) (Part, error) {
+	if err := validateDelegateTargets(t); err != nil {
+		return Part{}, err
+	}
+	if t.Targets == nil {
+		t.Targets = []DelegateTarget{}
+	}
+	data, err := json.Marshal(map[string]DelegateTargets{delegateTargetsKey: t})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegateTargetsOf finds the delegateTargets part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader falls back
+// to what it would show with none.
+func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
+	var found *DelegateTargets
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegateTargetsKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: more than one delegateTargets part")
+		}
+		var t DelegateTargets
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return DelegateTargets{}, true, fmt.Errorf("delegate targets: %w", err)
+		}
+		if t.Targets == nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: the part carries no targets list")
+		}
+		if err := validateDelegateTargets(t); err != nil {
+			return DelegateTargets{}, true, err
+		}
+		found = &t
+	}
+	if found == nil {
+		return DelegateTargets{}, false, nil
 	}
 	return *found, true, nil
 }
@@ -642,6 +886,10 @@ type AgentCard struct {
 	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
 	// Parameters are the task parameters the profile's persona declares.
 	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// YieldToPinned hands a task addressed to this profile to the profile
+	// pinned to its target cluster, when there is one: the generic cluster
+	// agent sets it, and a specialist addressed by name keeps the task.
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 }
 
 // ClusterRef names one GKE cluster.

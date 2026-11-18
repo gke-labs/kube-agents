@@ -1144,7 +1144,7 @@ sandbox is on — which is the same condition under which `terminal.backend` bec
 
 The managed scope carries the whole block or none of it. With the sandbox off the
 key is absent, Hermes' own default (`local`) applies, and nothing about an existing
-install changes. With it on, six keys are Hermes' and one is this design's:
+install changes. With it on, seven keys are Hermes' and one is this design's:
 
 | Key                                | Value                                                                                           |
 | ---------------------------------- | ----------------------------------------------------------------------------------------------- |
@@ -1152,6 +1152,7 @@ install changes. With it on, six keys are Hermes' and one is this design's:
 | `ssh_host`, `ssh_user`, `ssh_port` | the sandbox's Service, `agent`, 2222                                                            |
 | `ssh_key`                          | where the init container stages the private half                                                |
 | `lifetime_seconds`                 | 30 days — see [One connection under every environment](#one-connection-under-every-environment) |
+| `timeout`                          | 180, the terminal tool's per-call limit; see below                                              |
 | `workspace_root`                   | `/opt/data`, the sandbox's data path                                                            |
 
 `workspace_root` is not a Hermes key. It is published so that the agent-side
@@ -1170,7 +1171,11 @@ resolves the managed backend without it. The same check reads the terminal tool'
 default call timeout out of that Hermes and fails the build when the Cluster Agent
 preflight's mirror of it (`TERMINAL_TOOL_TIMEOUT_SECONDS` in `cluster_preflight.sh`,
 which budgets the preflight's brokered calls under it) disagrees; the identifier
-sources table in [`docs/README.md`](../README.md) names both.
+sources table in [`docs/README.md`](../README.md) names both. The operator publishes
+that same default as `timeout` because Hermes' first boot seeds `.env` from its
+`.env.example`, whose `TERMINAL_TIMEOUT=60` would otherwise outrank it; the copy
+replaces that line, and `tests/test_terminal_env_pin.py` holds the published value
+to the preflight's mirror.
 
 #### Two sharp edges left
 
@@ -1344,7 +1349,7 @@ the model can rename it aside and put its own in its place until the next start.
 `/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
 one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
 forge verb into this container rather than holding a forge CLI themselves, the Cluster
-Agent reconcile sends its GKE reads to `gke_cluster_reads.py` here, and running
+Agent reconcile and stall_watch send their GKE reads to `gke_cluster_reads.py` here, and running
 the data volume's copy over that session would hand the credential to whatever sits at
 that path. The read-only mount narrows that to the fallback, and the second copy stays
 as defence in depth. The whole import closure is staged, because `sys.path[0]` is the
@@ -2086,7 +2091,7 @@ That split is now the smaller half of what has already happened. `resolver.py` r
 sandbox today; what is left to move is the script around them.
 
 `bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
-`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+`.bootstrap_completed` (and, for a report nobody aligned to, the age of `.bootstrap_scan_filed`), are written agent-side and stay on the PVC, so it checks them
 first; only once they say a delivery is due does it read `INVENTORY.md` out of the
 sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
 and rename it to `INVENTORY.delivered.md` in the sandbox. Before the claim it reads the
@@ -2695,7 +2700,7 @@ apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` 
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and
-within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
+within that route `ROLE_EXECUTABLES` holds the session to `gcloud` while session `kubectl` routes through `<agent>-kube-proxy`. One path
 under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
 the broker admits at once, which the shell's fleet sweeps size their pools by
 (`broker_admission.py`); the session, profile and scope roles don't reach it, and a sweep run under
@@ -2714,7 +2719,20 @@ role. It names the account only while the operator controls it; an account someb
 `mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
-allowlist. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
+allowlist. `/v1/vcs/` admits it too, and every verb there needs a valid task credential:
+`ROLE_VCS_VERBS` gives it the reads (`clone`, `proposal-view`, `proposal-list`,
+`proposal-commits`, `branch-view`, `identity`, `issue-list`, `issue-view`) and three writes,
+`publish`, `proposal-create` and `proposal-update`. Those three also need the
+`vcs:proposal-create` permit in the credential, which the dispatcher mints only for a
+submission that asked for a change. Both checks run before the body is read, and the managed
+list still bounds which repository any verb reaches. Under the permit, `proposal-update`
+reaches only a proposal the install opened from its own `platform-agent/` branch in this
+repository, `publish` only a `platform-agent/` branch, and onto one carrying open proposals
+only when they are all the install's, and `proposal-create` only from the install's own
+`platform-agent/` branch of this repository, each named by its bare branch name (rule
+`caller.vcs-ownership`). A profile `proposal-update` changes only the title and body; a
+label edit is refused under `caller.vcs-labels`. The shell is held to none of this. No
+other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in
 `X-Kube-Agents-Task-Credential`, bound to the caller's pod, and is confined to that

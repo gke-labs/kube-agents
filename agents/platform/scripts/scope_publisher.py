@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# scope_publisher.py - Publish the resolved scope the A2A gateway reads (spec.mode: next).
+# scope_publisher.py - Publish the resolved scope the A2A gateway reads.
 #
 # A folder-, organisation- or selector-scoped install cannot tell from `spec.scope` alone
 # whether a project is inside it; the gateway refuses such a target until something it can
 # trust has resolved the membership. This program is that resolver. The operator starts it
-# as a Job (every 15 minutes, when the membership fields change, and at creation) under
-# `spec.mode: next` only, from the agent image, with a ServiceAccount whose one Kubernetes
+# as a Job (every 15 minutes, when the membership fields change, and at creation),
+# from the agent image, with a ServiceAccount whose one Kubernetes
 # grant is `get` and `patch` on the `<name>-resolved-scope` ConfigMap. Nothing an agent turn
 # runs can write that ConfigMap.
 #
@@ -84,6 +84,18 @@ ROW_CONFIRMED_AT = "confirmedAt"
 # declared source still lists every member it admits.
 DOC_NUMBERS = rec.NUMBERS_KEY
 DOC_CARRIED = "carried"
+# A third optional key the gateway and the operator do not read (#5621): the clusters of each
+# **member project** a probe listed, for the agent's helper scripts (their reader in
+# `fleet_scope_targets.py` comes next, #5621). It counts toward the document's budget, and goes
+# first when the document is over it (encode_document). Member projects only: the management project and explicit projects
+# are never probed here (the broker's `scope` role runs `clusters list` only for a project an
+# earlier lookup returned), so a reader lists those itself. Keyed by project ID:
+# {"at": <when the listing was read>, "clusters": [[location, name], ...]}. A probe that fails
+# keeps the previous entry, `at` included, so a reader can tell its age; it never writes an
+# empty list for a project it could not read, and a project with no entry is unread.
+DOC_CLUSTERS = "clusters"
+CLUSTERS_AT = "at"
+CLUSTERS_LIST = "clusters"
 ROW_NUMBER = rec.NUMBER_KEY
 STATE_OK = "ok"
 STATE_TOO_LARGE = "too-large"
@@ -174,7 +186,8 @@ SCOPE_WORKERS = 1
 # The outcomes `_resolve_projects` gives a member a source listed this run: None for a
 # selector member it named, `ok` for a container member. These are probed. Any other
 # outcome is a member every one of whose sources failed, which keeps its previous row, or a
-# number a Metrics Scope listed that this run could not name, whose row takes that outcome.
+# number a Metrics Scope listed that this run could not name, whose row takes that outcome,
+# or its previous row when the broker refused that naming as not declared.
 LISTED_OUTCOMES = (None, rec.OUTCOME_OK)
 
 
@@ -191,11 +204,14 @@ class _ScopeArgumentWait:
     answered: the broker's scope.json changed during the run, and with it the digest its
     member window is tied to, so the members recorded before the change are gone from it.
     `probe_refused` is set when a probe or a project-number lookup is refused as not
-    declared: the same change, seen after the sources resolved. `gave_up` is set when a
-    source lookup is still refused as not declared when its wait ends. build_document resets
-    all four at the start of a run, resolves the sources again when `caught_up` is set, and
-    resolves and probes again once when `probe_refused` or `gave_up` is set and the budget
-    still leaves SCOPE_RECOVERY_MIN_SECONDS.
+    declared: the same change, seen after the sources resolved. `refused` holds the argument
+    (a project ID or a project number) of each probe and project-number lookup whose last
+    attempt this run was refused that way; a later attempt that is not refused removes it.
+    `gave_up` is set when a source lookup is still refused as not declared when its wait ends.
+    build_document resets them all at the start of a run, resolves the sources again when
+    `caught_up` is set, resolves and probes again once when `probe_refused` or `gave_up` is
+    set and the budget still leaves SCOPE_RECOVERY_MIN_SECONDS, and keeps a member's previous
+    row only when its probe or its naming is in `refused`.
     """
 
     def __init__(self) -> None:
@@ -205,6 +221,7 @@ class _ScopeArgumentWait:
         self.until: float | None = None
         self.caught_up = False
         self.probe_refused = False
+        self.refused: set[str] = set()
         self.gave_up = False
 
 
@@ -242,8 +259,9 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     refuses because its scope.json does not name the argument yet is retried while it
     catches up (SCOPE_ARGUMENT_REFUSAL_LINE, SCOPE_ARGUMENT_UNDECLARED_PREFIX), inside the
     same timeout; one still refused when the wait ends sets `gave_up`. A probe or a
-    project-number lookup refused the same way is not retried; it sets `probe_refused`. Both
-    are for build_document. The client is told the retry deadline the lookups' cap leaves
+    project-number lookup refused the same way is not retried; it sets `probe_refused` and
+    records its argument in `refused`, which any other answer to it removes. All are for
+    build_document. The client is told the retry deadline the lookups' cap leaves
     (cluster_agent_reconcile.SHIM_RETRY_DEADLINE_SECONDS, which admits no retry), as
     `sandbox_exec.run` is told it under the reconciler's own `_run`.
     """
@@ -252,6 +270,9 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     deadline = time.monotonic() + timeout
     shape = scope_policy.match_shape(argv)
     source_lookup = shape is not None and shape[0] in SCOPE_ARGUMENT_SOURCE_SHAPES
+    if shape is not None and not source_lookup:
+        # Only the last attempt counts: a timeout or any other answer is this run's answer.
+        _scope_argument_wait.refused.discard(shape[1])
     shown = " ".join(a for a in argv if not a.startswith(FORMAT_FLAG_PREFIX))
     attempt_timeout = timeout
     waited = False
@@ -275,6 +296,8 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
             # Not waited for: the window it was refused by does not refill by waiting. The
             # run resolves the sources again after its probes instead.
             _scope_argument_wait.probe_refused = True
+            if shape is not None:
+                _scope_argument_wait.refused.add(shape[1])
         if not (undeclared and source_lookup):
             break
         if _scope_argument_wait.until is None:
@@ -353,8 +376,9 @@ def parse_document(raw) -> dict | None:
     numbers = document.get(DOC_NUMBERS)
     clean[DOC_NUMBERS] = ({n: p for n, p in numbers.items() if isinstance(n, str) and isinstance(p, str)}
                           if isinstance(numbers, dict) else {})
-    # The two optional keys stay out when empty, as in the documents this program writes.
-    for key in (DOC_CARRIED, DOC_NUMBERS):
+    clean[DOC_CLUSTERS] = _clean_clusters(document.get(DOC_CLUSTERS))
+    # The optional keys stay out when empty, as in the documents this program writes.
+    for key in (DOC_CARRIED, DOC_NUMBERS, DOC_CLUSTERS):
         if not clean[key]:
             del clean[key]
     return clean
@@ -368,6 +392,47 @@ def _clean_row(row) -> dict | None:
     clean = {key: row[key] for key in (ROW_ID, ROW_VIA, ROW_OUTCOME)}
     clean.update({key: row[key] for key in (ROW_CONFIRMED_AT, ROW_NUMBER) if isinstance(row.get(key), str)})
     return clean
+
+
+def _clean_clusters(value) -> dict:
+    """A previous document's `clusters` map with only its well-formed entries."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for project, entry in value.items():
+        if not (isinstance(project, str) and isinstance(entry, dict) and isinstance(entry.get(CLUSTERS_AT), str)
+                and isinstance(entry.get(CLUSTERS_LIST), list)):
+            continue
+        try:
+            datetime.strptime(entry[CLUSTERS_AT], rec.SNAPSHOT_TIME_FORMAT)
+        except ValueError:
+            continue
+        pairs = entry[CLUSTERS_LIST]
+        if not all(isinstance(p, list) and len(p) == 2 and all(isinstance(v, str) for v in p) for p in pairs):
+            continue
+        clean[project] = {CLUSTERS_AT: entry[CLUSTERS_AT], CLUSTERS_LIST: [list(p) for p in pairs]}
+    return clean
+
+
+def _clusters_map(rows: list, probes: dict, previous: dict | None, resolved_at: str) -> dict:
+    """The `clusters` map for this run's member rows.
+
+    A member this run listed gets its clusters as (location, name) pairs, sorted. One it did
+    not list (its probe failed, or its source failed and it was carried unprobed) keeps the
+    previous document's entry when there is one, and otherwise has none: never an empty list
+    standing in for a listing that did not happen. Projects that are no longer rows drop out.
+    """
+    before = (previous or {}).get(DOC_CLUSTERS) or {}
+    out = {}
+    for row in rows:
+        project = row[ROW_ID]
+        found, outcome = probes.get(project, (None, None))
+        if found is not None and outcome == rec.OUTCOME_OK:
+            out[project] = {CLUSTERS_AT: resolved_at,
+                            CLUSTERS_LIST: sorted([location, name] for _, name, location in found)}
+        elif project in before:
+            out[project] = before[project]
+    return out
 
 
 def read_previous(namespace: str, name: str) -> tuple[dict | None, str | None]:
@@ -391,10 +456,22 @@ def write_document(namespace: str, name: str, text: str, resource_version: str |
 
 
 def encode_document(document: dict) -> str:
-    """The document as compact JSON, or the `too-large` document when it is over the budget."""
+    """The document as compact JSON, or the `too-large` document when it is over the budget.
+
+    The `clusters` map goes first: it is for the helper scripts, and the rows are what the
+    gateway admits on, so a document whose rows fit is published without the map rather than
+    as `too-large` with no rows. A reader then finds every member unread until a run fits.
+    """
     text = json.dumps(document, separators=(",", ":"), ensure_ascii=False)
     if len(text.encode("utf-8")) <= MAX_DOCUMENT_BYTES:
         return text
+    if DOC_CLUSTERS in document:
+        rows_only = {key: value for key, value in document.items() if key != DOC_CLUSTERS}
+        text = json.dumps(rows_only, separators=(",", ":"), ensure_ascii=False)
+        if len(text.encode("utf-8")) <= MAX_DOCUMENT_BYTES:
+            log(f"the resolved scope with the clusters map is over the {MAX_DOCUMENT_BYTES}-byte budget; "
+                f"publishing the rows without it, so every member's cluster list reads unread.")
+            return text
     log(f"the resolved scope is {len(text.encode('utf-8'))} bytes, over the {MAX_DOCUMENT_BYTES}-byte "
         f"budget; publishing {STATE_TOO_LARGE} with no rows.")
     # The number memo rides along: it is what keeps a number entry excluding its project on
@@ -469,29 +546,23 @@ def _excluded_members(searches: dict, selections: dict, previous: dict | None, p
                   and (rec._excluded_by(p, patterns) or ((n := number_of(p)) and rec._excluded_by(n, patterns))))
 
 
-def _merge_pass(earlier: dict, later: dict, kept: set) -> dict:
+def _merge_pass(earlier: dict, later: dict) -> dict:
     """A later resolve pass over an earlier one: a source keeps its earlier answer when its
-    later lookup gave none (a pass on what is left of the budget can run out of it).
-
-    `kept` holds the sources whose answer is an earlier pass's, updated here: its members were
-    recorded under the broker's scope.json as it was then, so a probe of one can be refused.
+    later lookup gave none (a pass on what is left of the budget can run out of it). Its
+    members were recorded under the broker's scope.json as it was then, so a probe of one can
+    be refused.
     """
     merged = dict(earlier)
     for source, answer in later.items():
         if answer[0] is not None or source not in merged:
             merged[source] = answer
-            kept.discard(source)
-        elif merged[source][0] is not None:
-            kept.add(source)
     return merged
 
 
-def _merge_selections(earlier: dict, later: dict, restored: set) -> dict:
+def _merge_selections(earlier: dict, later: dict) -> dict:
     """A later naming pass over an earlier one: a selector member keeps the project ID an
-    earlier pass named its number by when its later naming call gave none.
-
-    Each (selector, project) whose naming is an earlier pass's goes into `restored`: the
-    broker's window holds that project ID only under its scope.json as it was then.
+    earlier pass named its number by when its later naming call gave none. The broker's window
+    holds that project ID only under its scope.json as it was then.
     """
     merged = dict(later)
     for selector, (members, outcome) in later.items():
@@ -506,7 +577,6 @@ def _merge_selections(earlier: dict, later: dict, restored: set) -> dict:
             if member.get(ROW_OUTCOME) is not None and number in named_before:
                 project, earlier_member = named_before[number]
                 fixed.setdefault(project, earlier_member)
-                restored.add((selector, project))
             else:
                 fixed.setdefault(key, member)
         merged[selector] = (fixed, outcome)
@@ -541,7 +611,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
         selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)
         if earlier is not None:
-            selections = _merge_selections(earlier, selections, restored)
+            selections = _merge_selections(earlier, selections)
         # With no management project named, its slot is still reserved: the cap passed on is
         # one smaller, which is what `_resolve_projects` makes of a management project it counts.
         entries, _, _, _ = rec._resolve_projects(management, scope, searches, looked_up, selections,
@@ -563,15 +633,13 @@ def build_document(declared: dict, management: str | None, previous: dict | None
                                 consequence="its row is not confirmed this run")
 
     _scope_argument_wait.reset()
-    kept: set = set()
-    restored: set = set()
     groups = rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget)
     if _scope_argument_wait.caught_up:
         # The broker's scope.json changed while the sources resolved, and the member
         # window went with its old digest: resolve them all again, so the members of every
         # source that answers again are recorded under the new one.
         log("the broker's scope.json changed during the run; resolving every source again")
-        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget), kept)
+        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
     searches, selector_reports, selections, members, carried = place(groups)
     probes = probe(members)
     if ((_scope_argument_wait.probe_refused or _scope_argument_wait.gave_up)
@@ -585,7 +653,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
                   else "a source's wait for the broker's scope.json ran out")
         log(f"{reason}; resolving every source again and probing again")
         _scope_argument_wait.until = time.monotonic()
-        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget), kept)
+        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
         searches, selector_reports, selections, members, carried = place(groups, selections)
         probes.update(probe([e for e in members if probes.get(e[ROW_ID], (None, rec.OUTCOME_UNREACHABLE))[1]
                              == rec.OUTCOME_UNREACHABLE]))
@@ -593,6 +661,11 @@ def build_document(declared: dict, management: str | None, previous: dict | None
                    if isinstance(row, dict) and isinstance(row.get(ROW_ID), str)}
     resolved_at = _now()
     failed_sources = {source for source, (found, _) in groups.items() if found is None}
+    named = rec._numbers_named(selections)
+
+    def number_of(entry: dict) -> str | None:
+        return entry.get(ROW_NUMBER) or named.get(entry[ROW_ID]) or rec._previous_number(looked_up, entry[ROW_ID])
+
     rows = []
     for entry in sorted(members, key=lambda e: e[ROW_ID]):
         before = rows_before.get(entry[ROW_ID], {})
@@ -607,13 +680,14 @@ def build_document(declared: dict, management: str | None, previous: dict | None
             # A source that answered placed it: a Metrics Scope listed its number, which could
             # not be named.
             outcome = entry[ROW_OUTCOME]
-        if (before and outcome == rec.OUTCOME_UNREACHABLE
-                and all(via in failed_sources or via in kept or (via, entry[ROW_ID]) in restored
-                        for via in entry[ROW_VIA])):
-            # Every source of it failed, or placed it with an answer or a naming from before the
-            # broker's scope.json changed, which the window may no longer hold: the previous row
-            # stands, as for a failed source. Only `unreachable` can come from such a refusal;
-            # an answer the probe or the naming gave this run is kept.
+        # A probed member answers by its own probe; one that was not probed, by the naming of
+        # its number.
+        decided_by = entry[ROW_ID] if entry[ROW_OUTCOME] in LISTED_OUTCOMES else number_of(entry)
+        if before and outcome == rec.OUTCOME_UNREACHABLE and decided_by in _scope_argument_wait.refused:
+            # The broker refused that last probe or naming as not declared: its member window no
+            # longer holds the member after its scope.json changed. The previous row stands, as
+            # for a failed source. A timeout or a client failure is this run's answer, and so is
+            # `denied` or `api-disabled`.
             outcome = before.get(ROW_OUTCOME) or outcome
         row = {ROW_ID: entry[ROW_ID], ROW_VIA: entry[ROW_VIA], ROW_OUTCOME: outcome}
         if isinstance(confirmed, str):
@@ -624,9 +698,8 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     # The reconcile also keeps a member's number on its snapshot row for as long as the member
     # stays in the set, after the memo has dropped the pair; these rows carry no number, so the
     # memo keeps the pair instead, and a number entry added later still excludes the project.
-    named = rec._numbers_named(selections)
     for entry in members + carried:
-        number = entry.get(ROW_NUMBER) or named.get(entry[ROW_ID]) or rec._previous_number(looked_up, entry[ROW_ID])
+        number = number_of(entry)
         if number and number != entry[ROW_ID]:
             numbers[number] = entry[ROW_ID]
     numbers = dict(sorted(numbers.items()))
@@ -638,6 +711,9 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         document[DOC_NUMBERS] = numbers
     if carried:
         document[DOC_CARRIED] = carried
+    clusters = _clusters_map(rows, probes, previous, resolved_at)
+    if clusters:
+        document[DOC_CLUSTERS] = clusters
     if groups and all(found is None for found, _ in groups.values()):
         # Every source lookup failed (a broker that refuses the `scope` caller, for one): the
         # run learned nothing, so it does not restamp the document. A short outage then

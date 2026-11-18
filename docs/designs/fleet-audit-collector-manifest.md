@@ -259,8 +259,10 @@ successful command behind it, changes nothing). The command is the candidate's o
 it carries one, otherwise the `commands[]` record for that check. A finding with no matching
 candidate keeps the model's evidence: that is the manual fallback, and it stays legal.
 
-`remediate` renders the document as filed. It accepts `--manifest-file` only to refuse a held id as
-held rather than as unknown (§3.3) and adopts no evidence from it, so a pull request it opens
+`remediate` renders the document as filed. It accepts `--manifest-file` to refuse a held id as held
+rather than as unknown (§3.3), and to write the budget of a declared `no-pdb` finding left `manual`
+([the ledger design's `remediate` section](fleet-audit-issue-ledger.md)). It adopts no evidence
+from it, so a pull request it opens
 carries the model's evidence where one `finish` promoted carries the collector's; a `/remediate`
 answered on a later `finish` run is promoted from the adopted document.
 
@@ -276,7 +278,15 @@ previous run's stored report (`ledger_document` when the previous run held the o
 `impact`. It also keeps the previous `recommendation` and `remediation` together, but not when
 either side is `manifest` or names a path, not when the previous one is `manual` and this run's is
 not, and not when `finish` wrote part of either note, other than the route notes, which are stripped
-and written again. A carried note loses the route notes of the previous run, which `finish` writes
+and written again. The previous pair is also not kept when it would not pass validation (an unknown
+`kind`, a `note` that is not a string), or when one of its commands fails a rule in `CARRY_RULES`
+and this run's commands pass: a `gcloud container clusters update` for another cluster than the
+finding's, or a literal range for a flag whose value the SOP leaves to the cluster's owner
+(`OWNER_SUPPLIED_FLAGS`). A rule gives no verdict on a command it cannot read, and when this run's
+pair fails too the previous pair stays. The rules read what a finding publishes, and nothing else
+judges whether a carried remediation is right. On a scheduled close that replays the stored
+document (§3.7), this run's pair is the stored pair, so a stored remediation stays until the next
+full run. A carried note loses the route notes of the previous run, which `finish` writes
 again from this run's manifest (the issue-ledger design, §6). When the previous run cut the worker's
 note to give the route notes room, the stored `uncut_note` comes back as the note. So the check for
 text that `finish` wrote reads `uncut_note` as well as the note.

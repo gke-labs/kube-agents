@@ -63,14 +63,17 @@ import math
 import pathlib
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, periodics, pool_state, tiers
+    from . import collect, fixture_state, ghcli, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import collect
     import fixture_state
+    import ghcli
     import periodics
     import pool_state
     import tiers
@@ -105,6 +108,9 @@ POOL_DRIFT = "pool_drift"
 # A ceiling wave: enough repetitions across enough pull requests ended at the
 # harness's delegation wait with the worker still running (rule 2b, #1874).
 DELEGATION_CEILING = "delegation_ceiling"
+# A forge outage: enough repetitions across enough pull requests lost their
+# checks to a forge read that failed during grading (rule 2c, #6105).
+FORGE_OUTAGE = "forge_outage"
 # Rule 3d (#1894): runs Prow killed at the job deadline with no verdict.
 DEADLINE_KILL = "deadline_kill"
 # The conditions whose evidence is a count rather than a full run's
@@ -148,6 +154,26 @@ REP_FIXTURE = "fixture"
 # Matched with the opening parenthesis the scorer words it with
 # ("... nothing to grade (fixture-drift:<role>: ...)"), as classify.py does.
 FIXTURE_DRIFT_MARKER = "(fixture-drift:"
+# The sixth kind: an `infra` repetition whose checks errored on a forge read
+# that failed for a while during grading; the scorer leads its reason with
+# this marker (bench/kube_agents_bench/forges.py). Not a storm rep: nothing
+# was lost to the model provider's 429s, and a forge outage is not a verdict.
+# Out of rule 2's count and every pass-rate denominator, as classify.py has it.
+REP_FORGE = "forge"
+FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
+
+# A rung-2 block's reason: the scorer gives each errored check's reason after
+# this phrase, and a check's reason can quote a rate limit or a 429 from the
+# forge it read. The repetition was graded, and blocked, so it is a fail,
+# never a storm rep; STORM_REASON_RE is not asked about it -- unless it leads
+# with FORGE_SAFEGUARD_MARKER (below).
+RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
+# A rung-2 block the scorer would have graded `infra` under
+# FORGE_UNAVAILABLE_MARKER but for an errored catastrophic safeguard leads
+# with this (bench/kube_agents_bench/forges.py, #6105): still blocked, but a
+# forge rep here, so a GitHub App rate limit is named rather than counted as
+# fails. Read out of the bench module by the tests.
+FORGE_SAFEGUARD_MARKER = "KUBE_AGENTS_FORGE_SAFEGUARD"
 
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
@@ -214,6 +240,56 @@ PR_CAUSED_REPEATED = "repeated"
 STORM_WINDOW = timedelta(hours=2)
 STORM_MIN_REPS = 15
 STORM_MIN_PRS = 3
+# The storm's evidence line and Chat sentence end with the repetitions' own
+# words for how they died (2026-10-30: 26 reps said `hermes-rate-limited`
+# and the line said "infra deaths"). Two fixed wrappers are peeled first:
+# the scorer's (bench/kube_agents_bench/scoring.py, "the harness recorded an
+# infrastructure condition ... no answer in it to grade (<detail>)") and,
+# inside it, the harness's "task <id> ended <terminal>: " prefix
+# (bench/kube_agents_bench/harness.py; the terminal is failed, canceled or
+# rejected). What is left is the detail, cut before the harness's "(reason:"
+# echo, scrubbed like the periodics' quoted log line, and cut at a word
+# boundary at a length a Chat line can carry. Nothing maps the words to a
+# meaning: the reader does. test_eval_dashboard_health.py pins the wrapper
+# phrases against the two sources.
+SCORER_INFRA_WRAPPER_RE = re.compile(
+    r"^(?:the harness (?:recorded an infrastructure condition or )?exhausted its retries without reaching the agent"
+    r" \(KUBE_AGENTS_INFRA_FAILURE\):\s*(?:the record is scored, but there is no answer in it to grade(?: \(|$))?"
+    r"|KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade \("
+    r"|KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is"
+    r" .*? because the empty report could not name them \()",
+    re.S,
+)
+# The scorer closes the detail it opened with ")"; the detail keeps its own
+# parentheses, so the wrapper's is the one unmatched close at the end.
+SCORER_WRAPPER_OPEN, SCORER_WRAPPER_CLOSE = "(", ")"
+HARNESS_TERMINAL_PREFIX_RE = re.compile(r"^task \S+ ended (?:failed|canceled|rejected): ")
+# The harness's other task phrasings keep the task id mid-sentence ("task
+# <id> on <conversation> sat queued", "no executor took task <id> on"); the id
+# is the repetition's, so it gives way to a placeholder like the run id.
+HARNESS_TASK_ID_RE = re.compile(r"\btask \S+(?= (?:on|was|did|ended) )")
+HARNESS_TASK_ID_FORM = "task [id]"
+# The board's card ids ("still waiting on: t_3f67a81e"), hermes's "t_" + 8
+# hex, are the repetition's as well.
+KANBAN_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+KANBAN_CARD_ID_FORM = "[card]"
+# The agent API's session id, "a2a-" + the conversation's contextId
+# (bench/kube_agents_bench/board.py API_SESSION_PREFIX), per repetition too;
+# only where the harness writes it ("the session store for <id>"), since
+# "-a2a-" is also inside the inject Service's and Secret's names.
+HERMES_SESSION_ID_RE = re.compile(r"(?<=the session store for )a2a-[A-Za-z0-9_.:-]+")
+HERMES_SESSION_ID_FORM = "[session]"
+# The harness names a run's conversation `devops-bench-<hex>/<case>/<rep>`
+# (bench/kube_agents_bench/harness.py); a phrasing that carries it would be
+# its own phrasing on every repetition, so the run id and the repetition
+# number give way to placeholders and the case stays.
+HARNESS_CONVERSATION_KEY_RE = re.compile(r"\bdevops-bench-[0-9a-f]+/([A-Za-z0-9._-]+)/\d+\b")
+HARNESS_CONVERSATION_KEY_FORM = r"[run]/\1/[rep]"
+SCORER_NO_DETAIL = "no reason given"
+STORM_CAUSE_STOP = " (reason"
+STORM_CAUSE_MAX_CHARS = 80
+STORM_CAUSE_ELLIPSIS = "…"
+STORM_CAUSES_SHOWN = 2
 STORM_REASON_RE = re.compile(
     r"KUBE_AGENTS_INFRA_FAILURE"
     r"|no agent ever ran"
@@ -307,6 +383,33 @@ CEILING_MIN_PRS = STORM_MIN_PRS
 # inside the wave for recovery purposes (rule 6), as STORM_RUN_SIGNATURE_REPS
 # is for a storm.
 CEILING_RUN_SIGNATURE_REPS = STORM_RUN_SIGNATURE_REPS
+
+# --- Rule 2c: forge outage -> DEGRADED (#6105) --------------------------------
+# Incident: 2026-11-16/17. Every evals repository shares one GitHub App
+# installation and so one hourly REST budget. Once it ran out, the inject
+# lane's GitHub-write safeguard errored on every case, and because that
+# safeguard is catastrophic the scorer kept it on rung 2: six pull requests'
+# runs read as hard failures, each repetition a forge rep here
+# (FORGE_SAFEGUARD_MARKER), and nothing named the outage.
+#
+# The rule is rule 2b's shape over forge reps, with lower thresholds:
+# FORGE_MIN_REPS across FORGE_MIN_PRS distinct pull requests among the runs
+# that finished inside FORGE_WINDOW. Two PRs, not three: the budget is one per
+# installation, so forge reps on a second pull request are already the
+# fleet's weather rather than one branch's, where 429s or a slow worker can be
+# one project's, which is why rules 2 and 2b ask for three. Six reps is two
+# cases' three repetitions, so one case's flaky read on two PRs does not fire
+# it; an exhausted budget errors the safeguard on every case of a run. The
+# window is the storm's: the budget refills hourly, so two hours spans one
+# refill and the runs that finished just after it. Ranked below the storm and
+# the ceiling: those lose the agent's run, this loses the grading of a run
+# that happened, and when they fire together theirs is the wait a retest needs.
+FORGE_WINDOW = STORM_WINDOW
+FORGE_MIN_REPS = 6
+FORGE_MIN_PRS = 2
+# A finished run carrying at least this many forge repetitions (one case's
+# full set) is still inside the outage for recovery purposes (rule 6).
+FORGE_RUN_SIGNATURE_REPS = 3
 
 # --- Rule 3: setup deaths -> DEGRADED (#1172, #1176) -------------------------
 # Incident: a stuck Helm release record left by ci-teardown poisoned pool
@@ -617,6 +720,8 @@ CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build no
 CAUSE_FIXTURE_DRIFT = "seeded fixture drift: {roles} out of designed state on {projects} pool project(s)"
 CAUSE_POOL_DRIFT = "pool drift: {findings} on {projects} pool project(s)"
 CAUSE_CEILING = "delegation ceiling: {reps} repetitions on {prs} PRs ended with the worker still running {start}–{end} UTC"
+# No repetition count: the cause can reach a public issue (public_cause).
+CAUSE_FORGE = "forge outage: grading's GitHub reads failed on {prs} PRs {start}–{end} UTC"
 CAUSE_DEADLINE_KILL = "deadline kills: {count} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict {start}–{end} UTC"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
@@ -666,6 +771,10 @@ FIXTURE_NO_REAPPLY_REMEDY = {
         "{roles} reads a master ahead of its release channel, which seeded_b_pin.py holds until the channel ships a newer patch of that minor;"
         " retest once a scan reads it healthy, or sooner re-create seeded-b under a lease (bench/tf/fleet/README.md)."
     ),
+    fixture_state.OP_AS_SEEDED: (
+        "{roles} reads the pool repository's declared-intent note as not the one provisioning seeds;"
+        " the drift line names the command that prints its replacement (`gitops_note_seed_command` in scripts/verify_ci_pool_project.py); run it, then retest."
+    ),
 }
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -687,6 +796,10 @@ ADVICE_POOL_DRIFT_SILENT_TAIL = (
 ADVICE_CEILING = (
     "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
     " platform-agent-gateway.log in a run's artifacts says whether the dispatcher stalled (#1879) or 429s starved the workers."
+)
+ADVICE_FORGE = (
+    "Retest once the GitHub App's hourly rate limit has reset; grading could not read GitHub, so those runs say nothing"
+    " about your change. The evals repositories share one App installation's budget (#6105)."
 )
 ADVICE_DEADLINE_KILL = (
     "Don't retest; runs are being killed at the {minutes}-minute deadline before anything is graded,"
@@ -788,21 +901,83 @@ def rep_kind(rep: dict) -> str:
         return REP_CEILING
     if result == REP_RESULT_INFRA and FIXTURE_DRIFT_MARKER in reason:
         return REP_FIXTURE
+    if result == REP_RESULT_INFRA and reason.startswith(FORGE_UNAVAILABLE_MARKER):
+        return REP_FORGE
+    if result != REP_RESULT_INFRA and reason.startswith(FORGE_SAFEGUARD_MARKER):
+        return REP_FORGE
     if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
         return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
+    if RUNG_2_ERRORED_PHRASE in reason:
+        return REP_FAIL
     if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
 
+def storm_cause(rep: dict) -> str:
+    """A storm repetition's own words for how it died: the reason with the
+    scorer's wrapper and the harness's "task <id> ended <terminal>: " prefix
+    peeled, the task, card and session ids and the conversation key reduced to
+    placeholders, cut
+    before the "(reason:" echo, scrubbed (periodics.quotable) and cut at
+    STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has no words
+    (no reason, or the scorer's "no reason given")."""
+    reason = str(rep.get("reason") or "")
+    wrapper = SCORER_INFRA_WRAPPER_RE.match(reason)
+    detail = reason[wrapper.end() :] if wrapper else reason
+    text = HARNESS_TERMINAL_PREFIX_RE.sub("", detail, count=1)
+    text = HARNESS_TASK_ID_RE.sub(HARNESS_TASK_ID_FORM, text)
+    text = KANBAN_CARD_ID_RE.sub(KANBAN_CARD_ID_FORM, text)
+    text = HERMES_SESSION_ID_RE.sub(HERMES_SESSION_ID_FORM, text)
+    text = HARNESS_CONVERSATION_KEY_RE.sub(HARNESS_CONVERSATION_KEY_FORM, text)
+    whole = STORM_CAUSE_STOP not in text
+    text = text.split(STORM_CAUSE_STOP, 1)[0]
+    # The collector's 300-character cut can land inside the echo: a trailing
+    # " (rea" is the echo's head, not words.
+    tail = text.rfind(STORM_CAUSE_STOP[:2])
+    if tail != -1 and ")" not in text[tail:] and STORM_CAUSE_STOP[2:].startswith(text[tail + 2 :]):
+        text = text[:tail]
+        whole = False
+    text = text.strip()
+    if text.rstrip(")") == SCORER_NO_DETAIL:
+        return ""
+    # The wrapper's own close, when the wrapper opened one and the collector's
+    # cut did not take it: the one ")" more than the detail opened.
+    wrapper_closed = bool(
+        wrapper
+        and wrapper.group(0).endswith(SCORER_WRAPPER_OPEN)
+        and text.endswith(SCORER_WRAPPER_CLOSE)
+        and text.count(SCORER_WRAPPER_CLOSE) > text.count(SCORER_WRAPPER_OPEN)
+    )
+    if wrapper_closed:
+        text = text[: -len(SCORER_WRAPPER_CLOSE)]
+    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
+    # that lands in the words leaves a bare fragment, and in the run id an
+    # unreduced one: the cut word goes and the ellipsis says so. A reason at
+    # the cap that still carries the wrapper's close is whole.
+    cut_by_collector = len(reason) >= collect.REP_REASON_MAX_CHARS and whole and bool(text) and not wrapper_closed
+    text = periodics.quotable(text)
+    if len(text) > STORM_CAUSE_MAX_CHARS:
+        head = text[:STORM_CAUSE_MAX_CHARS]
+        text = (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CAUSE_ELLIPSIS
+    elif cut_by_collector:
+        text = (text[: text.rfind(" ")] if " " in text else text).rstrip() + STORM_CAUSE_ELLIPSIS
+    return text
+
+
 class Task:
-    __slots__ = ("ceilings", "fails", "fixtures", "name", "passes", "storms")
+    __slots__ = ("ceilings", "fails", "fixtures", "forges", "name", "passes", "safeguards", "storm_causes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
-        self.passes = self.fails = self.storms = self.ceilings = self.fixtures = 0
+        self.passes = self.fails = self.storms = self.ceilings = self.fixtures = self.forges = 0
+        # The forge reps that are rung-2 blocks (FORGE_SAFEGUARD_MARKER), not
+        # `infra` ones: each reds the run without being graded.
+        self.safeguards = 0
+        # Each storm repetition's own words, counted (storm_cause).
+        self.storm_causes: Counter = Counter()
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -814,10 +989,17 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+                cause = storm_cause(rep)
+                if cause:
+                    self.storm_causes[cause] += 1
             elif kind == REP_CEILING:
                 self.ceilings += 1
             elif kind == REP_FIXTURE:
                 self.fixtures += 1
+            elif kind == REP_FORGE:
+                self.forges += 1
+                if str(rep.get("result") or "").lower() != REP_RESULT_INFRA:
+                    self.safeguards += 1
             else:
                 self.fails += 1
 
@@ -890,13 +1072,31 @@ class Run:
     def storm_reps(self) -> int:
         return sum(task.storms for task in self.tasks)
 
+    def storm_causes(self) -> Counter:
+        """The run's storm repetitions' own words, counted across its cases."""
+        causes: Counter = Counter()
+        for task in self.tasks:
+            causes.update(task.storm_causes)
+        return causes
+
     @property
     def ceiling_reps(self) -> int:
         return sum(task.ceilings for task in self.tasks)
 
     @property
+    def forge_reps(self) -> int:
+        return sum(task.forges for task in self.tasks)
+
+    @property
+    def safeguard_reps(self) -> int:
+        """The forge reps that red the run: rung-2 safeguard blocks."""
+        return sum(task.safeguards for task in self.tasks)
+
+    @property
     def total_reps(self) -> int:
-        return sum(task.passes + task.fails + task.storms + task.ceilings + task.fixtures for task in self.tasks)
+        return sum(
+            task.passes + task.fails + task.storms + task.ceilings + task.fixtures + task.forges for task in self.tasks
+        )
 
     @property
     def lost_pod(self) -> bool:
@@ -1212,9 +1412,18 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
     rate = vertex_429_rate(vertex, now, start, end)
     confirmed = rate["read"] and rate["peak"] >= STORM_429_MIN_RATE
     fires = reps_fire and (confirmed or not rate["read"])
+    causes: Counter = Counter()
+    for run in hit:
+        causes.update(run.storm_causes())
     evidence = []
     if hit:
         line = f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
+        # The repetitions' own words, commonest first, before any judgement.
+        shown = causes.most_common(STORM_CAUSES_SHOWN)
+        if shown:
+            line += "; the reps say: " + ", ".join(f"{cause} ×{n}" for cause, n in shown)
+            if len(causes) > len(shown):
+                line += f", and {len(causes) - len(shown)} other phrasing(s)"
         if reps_fire and rate["read"]:
             share = f"{rate['peak'] * 100:.1f} % of {rate['requests']} Vertex calls in the hour to {hhmm(rate['hour_end'])} UTC"
             line += f"; the pool's peak 429 share was {share}" + ("" if confirmed else f", under the {STORM_429_MIN_RATE * 100:.0f} % a storm needs: infra deaths, not a quota storm")
@@ -1232,6 +1441,9 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
         "runs": len(hit),
         "rate": rate,
+        # Every phrasing with its count, commonest first, for the incident
+        # the Chat sentence reads (it names each one, short).
+        "causes": [[cause, n] for cause, n in causes.most_common()],
     }
 
 
@@ -1260,6 +1472,24 @@ def delegation_ceiling(full_runs, now: datetime) -> dict:
         "signature_runs": {run.build_id for run in hit if run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS},
         "runs": len(hit),
     }
+
+
+def forge_outage(full_runs, now: datetime) -> dict:
+    """Rule 2c. Returns {fires, reps, prs, start, end, evidence, runs}."""
+    window = _in_window(full_runs, now, FORGE_WINDOW)
+    hit = [run for run in window if run.forge_reps > 0]
+    reps = sum(run.forge_reps for run in hit)
+    prs = _prs(hit)
+    fires = reps >= FORGE_MIN_REPS and len(prs) >= FORGE_MIN_PRS
+    start = min((run.finished for run in hit), default=None)
+    end = max((run.finished for run in hit), default=None)
+    evidence = []
+    if fires:
+        evidence.append(
+            f"forge outage: {reps} reps across {len(prs)} PRs lost their checks to a GitHub read that failed during grading"
+            f" in runs finishing {hhmm(start)}–{hhmm(end)} UTC; nothing counted against a case"
+        )
+    return {"fires": fires, "reps": reps, "prs": prs, "start": start, "end": end, "evidence": evidence, "runs": len(hit)}
 
 
 def setup_deaths(runs, now: datetime) -> dict:
@@ -1996,11 +2226,25 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "lease_failures_hours": _count(recent.get("hours")),
         "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
-        # The cap the newest run in the window ran under. Only the
-        # CONCURRENCY_CAP message quotes it, and without it that message
-        # cannot say what to raise the cap from.
+        # The cap the newest run in the window ran under; the CONCURRENCY_CAP
+        # message names it as the limit the presubmit ran at.
         "max_concurrency": artifact.get("max_concurrency"),
+        # What that message says about the harm: the days the periodic
+        # breached on, the longest wait among them (the window's when none
+        # is a day's), and how many runs are queued right now.
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
+        "worst_s": _worst_breached_s(trend),
+        "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
+
+
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:
@@ -2150,9 +2394,10 @@ def tracking_issues(cases: list[str], notes: dict[str, dict]) -> list[str]:
 
 
 def issue_tag(issue) -> str | None:
-    """"#1278" for the {number, url} the poster filed or adopted; None otherwise."""
-    number = issue.get("number") if isinstance(issue, dict) else None
-    return f"#{number}" if number else None
+    """ghcli.issue_tag for the {number, url} the poster filed or adopted:
+    "#N" for this repository's, the URL for the issues repository's; None
+    otherwise. case-notes.yaml's issues stay the `#N` they are written as."""
+    return ghcli.issue_tag(issue)
 
 
 def issue_for(issue, condition: str | None) -> dict | None:
@@ -2172,7 +2417,7 @@ def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     not already among them."""
     issues = tracking_issues(cases, notes)
     tag = issue_tag(issue)
-    if tag and tag not in issues:
+    if tag and not ghcli.has_issue(issues, tag):
         issues.append(tag)
     return issues
 
@@ -2216,6 +2461,8 @@ def advice_for(
         return ADVICE_STORM.format(when=when)
     if condition == DELEGATION_CEILING:
         return ADVICE_CEILING
+    if condition == FORGE_OUTAGE:
+        return ADVICE_FORGE
     if condition == LOST_PODS:
         incident = incident or {}
         return ADVICE_LOST_PODS.format(
@@ -2341,6 +2588,7 @@ def assess(
         reach = r2["start"] - STORM_429_LOOKBACK
         r1["pr_caused"] = [line for line, latest in zip(r1["pr_caused"], r1["pr_caused_latest"]) if latest < reach]
     r2b = delegation_ceiling(full_runs, now)
+    r2c = forge_outage(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
     scanned_at = parse_iso((fixture_state_doc or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
@@ -2365,6 +2613,9 @@ def assess(
     elif r2b["fires"]:
         state, condition = DEGRADED, DELEGATION_CEILING
         cause = CAUSE_CEILING.format(reps=r2b["reps"], prs=len(r2b["prs"]), start=hhmm(r2b["start"]), end=hhmm(r2b["end"]))
+    elif r2c["fires"]:
+        state, condition = DEGRADED, FORGE_OUTAGE
+        cause = CAUSE_FORGE.format(prs=len(r2c["prs"]), start=hhmm(r2c["start"]), end=hhmm(r2c["end"]))
     elif r3["fires"]:
         state, condition = DEGRADED, SETUP_DEATHS
         cause = CAUSE_SETUP.format(count=len(r3["deaths"]), prs=_pr_list(r3["prs"]))
@@ -2383,7 +2634,7 @@ def assess(
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r3d["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r3e["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3d["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r2c["evidence"] + r3["evidence"] + r3c["evidence"] + r3e["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
@@ -2399,6 +2650,8 @@ def assess(
         signature = {run.build_id for run in full_runs if run.storm_reps > 0}
     elif condition == DELEGATION_CEILING:
         signature = {run.build_id for run in full_runs if run.ceiling_reps > 0}
+    elif condition == FORGE_OUTAGE:
+        signature = {run.build_id for run in full_runs if run.forge_reps > 0}
     else:
         signature = set()
     current = condition in COUNTED_CONDITIONS or any(run.build_id in signature for run in recent)
@@ -2409,11 +2662,13 @@ def assess(
     if condition == SHARED_BREAK:
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
-        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"]), "causes": r2["causes"]}
     elif condition == DELEGATION_CEILING:
         # `reps` beside the storm's keys: the message says how many
         # repetitions ended at the wait, not only how many runs held one.
         incident = {"prs": r2b["prs"], "runs": r2b["runs"], "reps": r2b["reps"], "window_start": iso(r2b["start"]), "window_end": iso(r2b["end"])}
+    elif condition == FORGE_OUTAGE:
+        incident = {"prs": r2c["prs"], "runs": r2c["runs"], "window_start": iso(r2c["start"]), "window_end": iso(r2c["end"])}
     elif condition == SETUP_DEATHS:
         incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
     elif condition == DEADLINE_KILL:
@@ -2500,7 +2755,7 @@ def assess(
         # leaves this list (#3664).
         "open_conditions": [
             name
-            for name, rule in ((SHARED_BREAK, r1), (DEADLINE_KILL, r3d), (LOST_PODS, r3b), (STORM, r2), (DELEGATION_CEILING, r2b), (SETUP_DEATHS, r3), (FIXTURE_DRIFT, r3c), (POOL_DRIFT, r3e))
+            for name, rule in ((SHARED_BREAK, r1), (DEADLINE_KILL, r3d), (LOST_PODS, r3b), (STORM, r2), (DELEGATION_CEILING, r2b), (FORGE_OUTAGE, r2c), (SETUP_DEATHS, r3), (FIXTURE_DRIFT, r3c), (POOL_DRIFT, r3e))
             if _unresolved(rule) or awaiting_runs.get(name, False)
         ],
     }
@@ -2570,6 +2825,7 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
         SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases & roster.at(run.started or run.finished)),
         STORM: lambda run: run.storm_reps >= STORM_RUN_SIGNATURE_REPS,
         DELEGATION_CEILING: lambda run: run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS,
+        FORGE_OUTAGE: lambda run: run.forge_reps >= FORGE_RUN_SIGNATURE_REPS,
         SETUP_DEATHS: lambda run: last_setup_death is not None and run.finished <= last_setup_death,
         LOST_PODS: lambda run: last_lost_pod is not None and run.finished <= last_lost_pod,
     }.get(condition, lambda run: False)
@@ -3000,6 +3256,10 @@ def adjudicate(
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
+        # Where the bots file their issues (ghcli.DEFAULT_REPO): informational,
+        # the pages read nothing from it; a reference above is "#N" for this
+        # repository's issue and a full URL for the issues repository's.
+        "issues_repo": ghcli.DEFAULT_REPO,
         "generated_at": iso(now),
     }
     # Beside the digest's other 24h numbers, but not derived from the runs

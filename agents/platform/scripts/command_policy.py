@@ -671,7 +671,8 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # before the allowlist entry was consulted at all, which is the same
         # trap --zones and --machine-type above were added for.
         "--port",
-        # `billing budgets list` requires it.
+        # `billing budgets list` requires it. Listed here for its arity only:
+        # _BILLING_ACCOUNT_VERB below is the one command that may pass it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud
         # synopsis. --output-path is deliberately absent from this set and
@@ -700,6 +701,22 @@ _GCLOUD_FILE_WRITE_FLAGS = frozenset({"--output-path", "--log-http-log-file"})
 _ASSET_SEARCH_VERB = ("asset", "search-all-resources")
 _ASSET_SEARCH_TYPE_FLAG = "--asset-types"
 _ASSET_SEARCH_REQUIRED_TYPE = "container.googleapis.com/Cluster"
+
+# `--billing-account` names a scope above a project. _GCLOUD_FLAGS_WITH_VALUE is one list for every
+# command, so the flag `billing budgets list` requires was also read on every other allowlisted
+# command, and `logging read` takes it: with it the read is of a billing account's logs, where the
+# selectors beside it (--folder, --organization, --bucket, --view, --resource-names) were never
+# listed and stay refused. So the flag passes on the one command it was listed for and is refused
+# on every other read, which also keeps it from a command allowlisted later that happens to take
+# it. IAM is still the outer bound either way.
+_BILLING_ACCOUNT_FLAG = "--billing-account"
+_BILLING_ACCOUNT_VERB = ("billing", "budgets", "list")
+_BILLING_ACCOUNT_RULE_ID = "gcp.billing-account-forbidden"
+_BILLING_ACCOUNT_REASON = (
+    "--billing-account selects a billing account, a scope above a project, and is allowed on "
+    "`gcloud billing budgets list` only."
+)
+_BILLING_ACCOUNT_REMOVAL = "Remove it; to read one project's logs or resources, pass --project."
 
 # gcloud boolean global flags that do not consume the following argument.
 # These are enumerated from gcloud help and are boolean **at the global parser
@@ -810,6 +827,18 @@ _GCLOUD_FOURTH_WORD_VERBS = frozenset(
 )
 # The one rule whose refusal carries a render flag (``local_render``).
 KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
+KUBERNETES_SECRET_READ_RULE = "kubernetes.secret-read-forbidden"
+_KUBECTL_SECRET_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
+    {("get",), ("describe",), ("events",), ("wait",)}
+)
+_KUBECTL_MANIFEST_INPUT_FLAGS: frozenset[str] = frozenset(
+    {"-f", "--filename", "-k", "--kustomize"}
+)
+_KUBECTL_SECRET_READ_MESSAGE = (
+    "Reading Kubernetes Secrets through the credential broker is refused; "
+    "route kubectl through kube-proxy to read redacted Secret metadata. "
+    + _ACTION_BOUNDARY_NOTICE
+)
 
 # `kubectl get --raw <path>` sends the path to the API server as it stands,
 # which is how the fleet collectors page a large kind 500 objects at a time
@@ -971,6 +1000,12 @@ def _gcloud_writes_a_file(argv: list[str]) -> str | None:
         if name in _GCLOUD_FILE_WRITE_FLAGS:
             return name
     return None
+
+
+def _gcloud_names_flag(argv: list[str], flag: str) -> bool:
+    """Whether any token is `flag` in either spelling. Any token, a flag's value included: gcloud
+    reads a token of that shape as the flag wherever it stands."""
+    return any(token.partition("=")[0] == flag for token in argv[1:])
 
 
 def _asset_search_type(argv: list[str]) -> str | None:
@@ -1505,6 +1540,58 @@ def _kubectl_raw_refusal(argv: list[str], verb: tuple[str, ...]) -> Decision | N
     )
 
 
+def _names_secret_resource(target: str) -> bool:
+    """Return True when any comma-separated segment of target names a Secret resource."""
+    for part in target.split(","):
+        kind = part.partition("/")[0].lower()
+        if kind in ("secret", "secrets") or kind.startswith(("secret.", "secrets.")):
+            return True
+    return False
+
+
+def _kubectl_secret_read_refusal(argv: list[str], verb: tuple[str, ...]) -> Decision | None:
+    """Refuse Secret reads and file-sourced resource targets on brokered kubectl reads.
+
+    The credential broker does not redact Secret payloads when it runs kubectl on
+    behalf of `/v1/exec` callers. Only `kube-proxy` strips `.data` and
+    `.stringData`, so the broker command policy refuses `Secret` reads and
+    `-f`/`-k` manifest inputs on `get`, `describe`, `events`, and `wait`.
+    """
+    if verb[:1] not in _KUBECTL_SECRET_READ_VERBS:
+        return None
+    for token in argv[1:]:
+        name, separator, value = token.partition("=")
+        if name in _KUBECTL_MANIFEST_INPUT_FLAGS:
+            return Decision(
+                allowed=False,
+                rule_id=KUBERNETES_SECRET_READ_RULE,
+                message=_KUBECTL_SECRET_READ_MESSAGE,
+                verb_tuple=verb,
+                offending_flag=name,
+            )
+        if len(token) > 2 and token.startswith("-") and not token.startswith("--"):
+            for character in token[1:]:
+                if character in ("f", "k"):
+                    return Decision(
+                        allowed=False,
+                        rule_id=KUBERNETES_SECRET_READ_RULE,
+                        message=_KUBECTL_SECRET_READ_MESSAGE,
+                        verb_tuple=verb,
+                        offending_flag=f"-{character}",
+                    )
+                if character not in _KUBECTL_BOOLEAN_SHORTHANDS:
+                    break
+        target = value if (separator and name == "--for") else (token if not token.startswith("-") else "")
+        if target and _names_secret_resource(target):
+            return Decision(
+                allowed=False,
+                rule_id=KUBERNETES_SECRET_READ_RULE,
+                message=_KUBECTL_SECRET_READ_MESSAGE,
+                verb_tuple=verb,
+            )
+    return None
+
+
 def _kubectl_refuses_file_write(argv: list[str]) -> str | None:
     """Return the offending sidecar-filesystem-writing flag, or None."""
     for token in argv[1:]:
@@ -1826,7 +1913,10 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
             # A read verb's `--raw` is the one target the verb table cannot
             # see; a write's is refused with the write, below.
             raw_refusal = _kubectl_raw_refusal(argv, verb)
-            return _ALLOWED if raw_refusal is None else raw_refusal
+            if raw_refusal is not None:
+                return raw_refusal
+            secret_refusal = _kubectl_secret_read_refusal(argv, verb)
+            return _ALLOWED if secret_refusal is None else secret_refusal
         return Decision(
             allowed=False,
             rule_id=KUBERNETES_READ_ONLY_RULE,
@@ -1953,6 +2043,20 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                 message=_GCLOUD_READ_ONLY_MESSAGE
                 + (_NEAREST_READ_HINT.format(command=nearest) if nearest else ""),
                 verb_tuple=_gcloud_verb_tuple(words),
+            )
+
+        # Only on a command the lines above found to be an allowed read, so a write keeps its own
+        # refusal.
+        if (
+            _gcloud_names_flag(argv, _BILLING_ACCOUNT_FLAG)
+            and tuple(words[: len(_BILLING_ACCOUNT_VERB)]) != _BILLING_ACCOUNT_VERB
+        ):
+            return _flag_refusal(
+                argv,
+                _BILLING_ACCOUNT_RULE_ID,
+                _BILLING_ACCOUNT_REASON,
+                _BILLING_ACCOUNT_REMOVAL,
+                _BILLING_ACCOUNT_FLAG,
             )
         return _ALLOWED
 

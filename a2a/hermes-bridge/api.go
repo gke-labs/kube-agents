@@ -42,10 +42,11 @@ import (
 // session; bridge.go, queueSteer). On routed chat turns (Slack and Google
 // Chat), a kanban card's completion goes back to the conversation
 // asynchronously through the gateway's chat.notify route, using the route
-// this executor records before a task's first turn (route.go). On console
-// and MCP turns only (waitsForCardsInTurn), runTaskAPI waits in-turn for the
-// session's kanban cards to settle and synthesizes their findings into the
-// task's answer (kanban.go); every other turn ends at its acknowledgement. Both are named in a2a/docs/hermes-bridge.md.
+// this executor records before a task's first turn (route.go). On console,
+// MCP and A2A door turns only (waitsForCardsInTurn), runTaskAPI waits in-turn
+// for the session's kanban cards to settle and synthesizes their findings
+// into the task's answer (kanban.go); every other turn ends at its
+// acknowledgement. Both are named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
 	// through the pod's API server. The daemon's default.
@@ -410,8 +411,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
-	// Only a console or MCP turn waits on its cards in turn (#5170); every
-	// other turn ends at its acknowledgement, as before the in-turn wait.
+	// Only a console, MCP or A2A door turn waits on its cards in turn
+	// (#5170, #5180); every other turn ends at its acknowledgement, as
+	// before the in-turn wait.
 	waitKanbanInTurn := waitsForCardsInTurn(run.origin)
 	if waitKanbanInTurn {
 		b.rememberConsoleSession(sessionID, run.origin)
@@ -442,7 +444,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		b.beginKanbanWait(sessionID)
 		defer func() {
 			if run.canceled.Load() && (act.cardsFiled.Load() || carriedCards) {
-				b.markSessionCanceled(sessionID)
+				b.markRunCanceled(run, sessionID)
 			}
 			b.endKanbanWait(sessionID)
 		}()
@@ -456,9 +458,27 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		if waitKanbanInTurn {
 			act.cardsFiled.Store(false)
 		}
-		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
+		key := apiTurnKey(run.origin.TaskID, steer)
+		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev, key)
 		if !ok {
 			return
+		}
+		if leaksCardID(prompt, text) {
+			// A card id where the user asked about no task (card_id_leak.go):
+			// one more message to the session asks for the reply without
+			// it, under its own key; what comes back is the turn's answer,
+			// id or not.
+			b.cfg.Logger.Warn("answer names a card id outside a board read; asking the agent to restate it",
+				"task", run.origin.TaskID, "turn", turn, "reason", cardIDRestateLog)
+			restated, ok := b.apiTurn(run, taskCtx, sessionID, cardIDRestatePrompt, nil, turn, text, key+cardIDRestateKeySuffix)
+			if !ok {
+				return
+			}
+			if leaksCardID(prompt, restated) {
+				b.cfg.Logger.Warn("the restated answer still names a card id; delivered as it is",
+					"task", run.origin.TaskID, "turn", turn, "reason", cardIDRestateLog)
+			}
+			text = restated
 		}
 		if waitKanbanInTurn {
 			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
@@ -510,7 +530,9 @@ func apiTurnKey(taskID string, steer *lib.Envelope) string {
 // canceled, past its deadline or the bridge stopping, which sends nothing
 // and ends the task with prev still attached as the result
 // (finalizeTurnNotSent).
-func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev string) (string, bool) {
+// key is the turn's Idempotency-Key (apiTurnKey), or that key with a suffix
+// for a second request the same turn makes (card_id_leak.go).
+func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev, key string) (string, bool) {
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
 		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
@@ -528,7 +550,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
 	req.Header.Set(apiSessionKeyHeader, sessionID)
 	req.Header.Set(apiSessionIDHeader, sessionID)
-	req.Header.Set(apiIdempotencyHeader, apiTurnKey(run.origin.TaskID, steer))
+	req.Header.Set(apiIdempotencyHeader, key)
 
 	if steer != nil {
 		run.mu.Lock()
@@ -603,8 +625,10 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// on its own. A 4xx ran nothing and publishes nothing.
 			b.publishTurnUsage(run, &apiChatResponse{}, took)
 		}
+		// A body or error tail can carry the answer's own bytes: scrubbed as
+		// an answer is (scrubAnswer), here and in the arms below.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if len(raw) > b.responseCap {
@@ -619,7 +643,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	var out apiChatResponse
 	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreadable - HTTP %d; session: %s%s; body tail: %s",
-			resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if apiTurnFailed(&out) {
@@ -631,7 +655,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		// ahead of the failed terminal, as the worker adapter's does.
 		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, out.Hermes.Error), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {

@@ -83,8 +83,10 @@ record is for; the gated judged rung compares ``OutcomeValidity`` only, which
 reads the answer, not the trace. And ``metadata["worker_trajectory"]`` on the
 ``AgentResult`` carries the card-to-session map the read used, for the harness
 log and the tests: devops-bench does not copy ``metadata`` into
-``results.json``, so on disk the entries themselves are the record and a read
-problem is a harness-log warning.
+``results.json``, so on disk the entries themselves are the record. A read
+problem is a harness-log warning, and a gap (:func:`gaps`) is also recorded on
+the trajectory as :data:`GAP_ENTRY`, so the scorer can tell an incomplete
+capture from a complete one.
 
 Capture is best effort in the same sense as the artifact read-back: a pod that
 cannot be reached costs the record its worker transcript, never the run. The
@@ -168,13 +170,20 @@ SUPPLEMENT_PATH = "/opt/defaults/scripts/worker_transcript.py"
 # Bounds applied inside the pod, so the exec output stays bounded however much
 # a worker talked. A run's workers make tens to a few hundred calls; the call
 # cap is a runaway guard, and the per-field caps keep a ``kubectl logs`` dump or
-# a manifest read from carrying the whole record with it. A clipped field ends
-# in a marker naming how much was dropped. Clipping follows scrubbing, so a cut
-# never lands inside a Secret block the scrubber then cannot see.
+# a manifest read from carrying the whole record with it. A clipped field
+# carries a marker naming how much was dropped. A clipped result keeps its
+# whole head and its last RESULT_TAIL_CHARS after the marker, and a result
+# no longer than the two together is kept whole: a script's verdict and its warnings
+# come last (a fleet-audit ``finish`` prints its store-write warning at the
+# end of a 10 KB output), so a head-only cut hid the one line a red needed.
+# Arguments stay head-only; their readers close a cut value at the marker.
+# Clipping follows scrubbing, so a cut never lands inside a Secret block the
+# scrubber then cannot see.
 MAX_CARDS = 32
 MAX_CALLS = 2000
 MAX_RESULT_CHARS = 2000
 MAX_ARGS_CHARS = 2000
+RESULT_TAIL_CHARS = 1000
 # What ``gaps`` reports for a read the pod clipped, by the cap that fired: past
 # ``MAX_CARDS`` later cards were never read, and past ``MAX_CALLS`` the walk
 # goes on but later workers' calls are dropped. Either way a profile that
@@ -183,6 +192,25 @@ MAX_ARGS_CHARS = 2000
 TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_CARDS
 CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
 CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
+# The trajectory entry the harness writes when a capture has gaps
+# (``harness.KubeAgentsHarness._settle``), with what :func:`gaps` reported
+# under ``args.gaps``. devops-bench does not copy ``metadata`` into
+# ``results.json``, so this entry is how the scorer learns that a record's
+# worker entries are incomplete (``scoring._inject_lane_view``).
+GAP_ENTRY = "harness_worker_capture_gaps"
+# What ``_settle`` writes when every card it awaited ended by an explicit
+# close (done, or a ``kanban_block`` kind), the capture and the logs are
+# clean, and the capture holds no worker entry: the workers made no call at
+# all, so a check scoped to them grades zero calls rather than an
+# unobservable subject. Harness-written, like GAP_ENTRY.
+NO_WORKER_CALLS_ENTRY = "harness_no_worker_calls"
+# What the inject wait records under it when it keeps a turn's worker
+# entries off the trajectory (``harness.KubeAgentsHarness`` withholds them on
+# a turn whose door showed no trace).
+WITHHELD_ENTRIES_GAP = "the workers' entries were withheld: the door showed no trace"
+# What ``_settle`` records under it when the turn delegated and the read
+# itself did not complete (``capture`` returned ``None``).
+UNREAD_CAPTURE_GAP = "the worker read did not complete"
 # What the in-pod script puts in place of every result and argument when the
 # redactor will not load (a store without the shared rules module reads no
 # session at all). Named here too so a verifier can tell an unreadable capture
@@ -212,8 +240,8 @@ _IN_POD_SCRIPT = r"""
 import importlib.util, json, os, sqlite3, sys
 
 ROOT, SENTINEL, REDACTOR, SUPPLEMENT = sys.argv[1:5]
-MAX_CARDS, MAX_CALLS, MAX_RESULT, MAX_ARGS = [int(a) for a in sys.argv[5:9]]
-roots = [a for a in sys.argv[9:] if a]
+MAX_CARDS, MAX_CALLS, MAX_RESULT, MAX_ARGS, RESULT_TAIL = [int(a) for a in sys.argv[5:10]]
+roots = [a for a in sys.argv[10:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
@@ -329,13 +357,40 @@ def failed(result):
     )
 
 
-def clip(text, limit):
+def clip(text, limit, tail=0):
     if text is None:
         return None
     text = text if isinstance(text, str) else json.dumps(text, default=str)
-    if len(text) <= limit:
+    if len(text) <= limit + max(tail, 0):
         return text
-    return text[:limit] + " ...[clipped %d chars]" % (len(text) - limit)
+    marker = " ...[clipped %d chars]" % (len(text) - limit - max(tail, 0))
+    if tail <= 0:
+        return text[:limit] + marker
+    return text[:limit] + marker + "... " + text[-tail:]
+
+
+# A worker call's arguments, clipped. Arguments too long to fit that are a
+# JSON object keep, in their order, the values that fit before the clip; the
+# rest follow shortest first, so a short argument such as a path after a long
+# one closes before the clip, and the long one is the value it cuts. Anything
+# else is clipped as it stands.
+def clip_args(text, limit):
+    if not isinstance(text, str) or len(text) <= limit:
+        return clip(text, limit)
+    try:
+        args = json.loads(text)
+    except (ValueError, RecursionError):
+        return clip(text, limit)
+    if not isinstance(args, dict):
+        return clip(text, limit)
+    items = list(args.items())
+    head = []
+    for item in items:
+        if len(json.dumps(dict(head + [item]), ensure_ascii=False)) > limit:
+            break
+        head.append(item)
+    rest = sorted(items[len(head):], key=lambda item: len(json.dumps(item[1], ensure_ascii=False)))
+    return clip(json.dumps(dict(head + rest), ensure_ascii=False), limit)
 
 
 def decode(content):
@@ -443,7 +498,7 @@ def read_session(conn, card, profile, sid):
                 arguments = fn.get("arguments")
                 entry = {
                     "name": str(fn.get("name") or ""),
-                    "args": clip(scrub(arguments, CALL_KIND), MAX_ARGS) if arguments is not None else None,
+                    "args": clip_args(scrub(arguments, CALL_KIND), MAX_ARGS) if arguments is not None else None,
                     "result": None,
                     "failed": None,
                     "agent": profile,
@@ -485,7 +540,7 @@ def read_session(conn, card, profile, sid):
             if target["_withhold"] and result is not None and redactor is not None:
                 target["result"] = WITHHELD_READ_RESULT
             else:
-                target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
+                target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT, RESULT_TAIL)
     if orphans:
         out["errors"].append(
             "session %s of %s: %d tool result(s) matched no call" % (sid, profile, orphans)
@@ -691,6 +746,16 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
     return problems
 
 
+def gap_entry(problems: list[str]) -> dict[str, Any]:
+    """The :data:`GAP_ENTRY` trajectory entry for a capture's gaps."""
+    return {"name": GAP_ENTRY, "args": {"gaps": list(problems)}, "status": "completed"}
+
+
+def no_worker_calls_entry(card_ids: list[str]) -> dict[str, Any]:
+    """The :data:`NO_WORKER_CALLS_ENTRY` trajectory entry for the cards that ended with no worker call."""
+    return {"name": NO_WORKER_CALLS_ENTRY, "args": {"cards": list(card_ids)}, "status": "completed"}
+
+
 def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
     """Child card to parent card, from the capture's card walk.
 
@@ -780,6 +845,7 @@ def command(task_ids: list[str]) -> str:
             str(MAX_CALLS),
             str(MAX_RESULT_CHARS),
             str(MAX_ARGS_CHARS),
+            str(RESULT_TAIL_CHARS),
             *task_ids,
         ]
     )

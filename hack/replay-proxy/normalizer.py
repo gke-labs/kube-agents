@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Hex digits of the normalizer source hash kept in NORMALIZER_VERSION.
@@ -75,7 +75,8 @@ PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" +
 # `tool_call_id` still names the same call as the assistant's `id`. The
 # forwarded request is never modified; this is the key only.
 OPAQUE_KEY_RE = re.compile(r"signature|provider_specific_fields", re.I)
-OPAQUE_ALWAYS_KEYS = ("tool_call_id",)
+TOOL_CALL_ID_KEY = "tool_call_id"
+OPAQUE_ALWAYS_KEYS = (TOOL_CALL_ID_KEY,)
 # `id` is opaque only as the `id` of an item in a `tool_calls` list, whatever
 # the provider's prefix (`call_…` from Gemini through LiteLLM, `toolu_…` from
 # Claude). Any other string `id` -- a kanban card, a cluster, a resource --
@@ -85,8 +86,13 @@ ID_KEY = "id"
 TOOL_CALLS_KEY = "tool_calls"
 OPAQUE_CLASS = "OPAQUE"
 
-# Keys whose numeric value is a per-run counter or row id.
-KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
+# Keys whose numeric value is a per-run counter or row id. `comment_id` is the
+# row id `kanban_comment` returns: upstream's `add_comment` returns the
+# comment's `lastrowid` (deploy/docker/patches/kanban_comment_status.py), one
+# counter for the whole install's board, so it counts every comment earlier
+# runs left (the Nov 10 lane trial recorded 41 and replayed 43, 44, 45).
+KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "comment_id", "resourceVersion", "generation",
+                     "observedGeneration")
 # Any key ending in this is a run id too (`current_run_id`, `parent_run_id`).
 RUN_ID_SUFFIX = "_run_id"
 # Kanban card history: heartbeat entries are liveness pings on a timer, so how
@@ -95,6 +101,21 @@ RUN_ID_SUFFIX = "_run_id"
 EVENTS_KEY = "events"
 EVENT_KIND_KEY = "kind"
 HEARTBEAT_KIND = "heartbeat"
+# `queued` is the dispatcher noting that the card waited for a free worker
+# ("Queued: the system is busy", with how many were running): whether a card
+# has one depends on what else was running at that moment. Dropped like a
+# heartbeat. A dropped event's values that cannot be put back in an answer (an
+# epoch `created_at`, a date) still count against one (Normalizer.dropped_guards).
+QUEUED_KIND = "queued"
+DROPPED_EVENT_KINDS = (HEARTBEAT_KIND, QUEUED_KIND)
+EVENT_PAYLOAD_KEY = "payload"
+# A dropped event's payload counts (`running`, `limit`, `ahead`) are plain
+# numbers no placeholder can restore. An answer repeating one counts as
+# repeating a swapped number when it repeats it next to its key, or anywhere in
+# an answer that talks about the queue: no answer quotes the queue without one
+# of these words, and refusing every answer holding a small number would refuse
+# about one answer in five that follows a queued card (Nov 7 shadow data).
+QUEUE_WORDS_RE = re.compile(r"\bqueue[ds]?\b|\bqueu(?:e)?ing\b|\bahead\b|\bbehind\b|system is busy|frees up", re.I)
 # gcloud writes warnings to stderr, and the shell tool merges stderr into the
 # output in whatever order the two streams arrive: the same command's warning
 # came before its JSON in one run and after it in the next. Only that shape is
@@ -105,6 +126,16 @@ LINE_BREAK = "\n"
 # A line that opens a JSON document, and an indented line continuing a warning.
 JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
 CONTINUATION_PREFIXES = (" ", "\t")
+# Hermes' skill_view result lists a skill's files per support directory as
+# glob/rglob returns them, in directory order, which differs from pod to pod:
+# `linked_files` (tools/skills_tool.py `_skill_linked_files`) and, when the
+# asked-for file is missing, `available_files` (tools/skills_tool_plugin.py
+# `_available_skill_files`). Each group's list is sorted for the key
+# (sorted_skill_listings); nothing else in the result is reordered. Read only
+# in a tool message answering a skill_view call, found by its tool_call_id.
+TOOL_ROLE = "tool"
+SKILL_VIEW_TOOL = "skill_view"
+SKILL_LISTING_KEYS = ("linked_files", "available_files")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -112,11 +143,20 @@ NUMBER_CLASS = "NUM"
 # (`2>&1`, "revision 1") is almost never the swapped value, and treating it as
 # one marked about one answer in seven unstorable in the dev-install dry run.
 MIN_STANDALONE_REPEAT_DIGITS = 4
-SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|pid|PID|id)"
+SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|comment_id|pid|PID|id)"
+# A comment id also counts next to the bare word, as "posted comment 41" names
+# it; only a value swapped from `comment_id` does, so "comment: 2 pods" next
+# to a swapped `generation: 2` stays storable.
+COMMENT_ID_KEY = "comment_id"
+COMMENT_WORD = "comment"
 SHORT_NUMBER_KEY_GAP = r"(?:\s+(?:is|was|now|of)\s+|\W{0,4})"
 DIGITS_RE = re.compile(r"^\d+$")
 KEYED_NUMBER_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|[A-Za-z0-9]*_?run_id|pid|PID|id)"
+    r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
+)
+COMMENT_ID_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + COMMENT_ID_KEY + r")"
     r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
 )
 # `pid 4821`, as a process listing or a sentence names one.
@@ -293,10 +333,82 @@ IPV4_OCTET_MAX = 255
 # Kubernetes' random-suffix alphabet (k8s.io/apimachinery rand.SafeEncodeString).
 K8S_SAFE = "bcdfghjklmnpqrstvwxz2456789"
 
+# The eval pool's GCP projects (docs/ci-pool-projects.md): `kube-agents-evals`,
+# then `kube-agents-evals-2` up. Every Prow build leases its own, and the name
+# is in the Cluster Agent's profile (`cluster-kube-agents-evals-31-seeded-a-…`),
+# the front door's specialist list, the GitOps repository
+# (`gke-agentic/kube-agents-evals-31-infra`) and tool results, so it is an
+# identifier. A numbered name is one wherever no letter or digit comes before
+# it and none follows its number (`xkube-agents-evals-31` stays). The bare name is also the start of names that belong to
+# no project and are the same in every run (`kube-agents-evals-token-minter`,
+# `kube-agents-evals-large-gitops`), so it counts only on its own or before a
+# part that pool projects add to their own names. A percent-escape before it is
+# a boundary too (`project_id%3D%22kube-agents-evals-22%22` in a console URL).
+EVAL_POOL_PROJECT = "kube-agents-evals"
+EVAL_POOL_NAME_PARTS = ("infra", "seeded", "platform", "us")
+PERCENT_ESCAPE_BEFORE = r"(?<=%[0-9A-Fa-f]{2})"
+EVAL_POOL_PROJECT_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|" + PERCENT_ESCAPE_BEFORE + r")" + re.escape(EVAL_POOL_PROJECT)
+    + r"(?:-\d+(?![A-Za-z0-9])|(?![A-Za-z0-9-])|(?=-(?:" + "|".join(EVAL_POOL_NAME_PARTS) + r")(?![A-Za-z0-9])))"
+)
+EVAL_POOL_CLASS = "EVALPROJECT"
+# A repository's commit as `owner/repo@<sha>` (`gke-agentic/kube-agents-evals-31-infra@c99b1ab`): each
+# pool project's repository has its own history. The owner and repository may
+# already be placeholders when the pattern runs over a normalized answer.
+COMMIT_CLASS = "COMMIT"
+COMMIT_MIN_HEX = 7
+COMMIT_MAX_HEX = 40
+COMMIT_HEX = r"([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])"
+COMMIT_RE = re.compile(r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@" + COMMIT_HEX)
+# The same commits in a forge URL: `…/blob/<sha>/README.md`, `…/tree/<sha>`, `…/commit/<sha>`.
+COMMIT_URL_RE = re.compile(r"/(?:blob|tree|commit|commits)/" + COMMIT_HEX)
+# A run of hex an answer may hold a bound commit as, anywhere, or abbreviate one to
+# (Mapping.apply_to_answer, Mapping.identifier_left_literal).
+HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
+# A run of hex with a letter in it: one with digits only is a number, not a commit.
+HEX_LETTER_RE = re.compile(r"[a-f]")
+# submit_suggestion's `prepare` says which closed or merged proposal last used
+# the branch name (agents/platform/skills/submit-suggestion/scripts/
+# submit_suggestion.py `clear_spent_branch`): "'<branch>' was the source of
+# <url>, which is closed. That proposal's last revision, <12 hex>, is not in
+# 'main', ..." and, when it deletes the branch, "Deleted the spent branch at
+# <12 hex>". Every eval run opens proposals of its own, so the number and the
+# revision are an earlier run's and differ between otherwise identical runs.
+# `clear_spent_branch`'s refusals name the revision as "The repository held
+# the branch at <12 hex>" and "The repository still holds the branch at <12
+# hex>". The number and revision are read only in those sentences, the number
+# in a GitHub (`/pull/<n>`) or GitLab (`/-/merge_requests/<n>`) proposal URL,
+# the forms the broker's proposals carry. A refusal also quotes the broker's own
+# error in parentheses, which can repeat the revision ("is at <12 hex>"), name
+# another revision or a proposal URL in other words; that text is left as
+# written, so two runs refused alike still key apart there (a miss, not a
+# wrong answer). The revision is bound as a commit. The
+# number gets a placeholder in the key and is never put back in an answer: it
+# is a bare number, and an unrelated `175` in an answer must not become this
+# run's. An answer that holds it with no digit beside it is not saved instead
+# (Mapping.answer_repeats_bare_number).
+SPENT_PROPOSAL_CLASS = "PULL"
+SPENT_PROPOSAL_RE = re.compile(r"was the source of https?://[^\s,]+/(?:pull|-/merge_requests)/(\d+)(?=, which is )")
+SPENT_REVISION_RE = re.compile(
+    r"(?:That proposal's last revision, |(?:held|holds) the branch at |Deleted the spent branch at )" + COMMIT_HEX)
+PROPOSAL_NUMBER_BEFORE = r"(?<!\d)"
+PROPOSAL_NUMBER_AFTER = r"(?!\d)"
+
 # (class, pattern, group): identifier classes in the order they are applied.
 # Longer, more specific shapes go first. `group` is the part replaced; the
 # rest of the match stays literal (a pod keeps its workload name).
 ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
+    # GKE operation: operation-<epoch ms>-<uuid>. Before UID, which would take the uuid alone.
+    ("GKEOP", re.compile(
+        r"\boperation-(1\d{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), 1),
+    (COMMIT_CLASS, COMMIT_RE, 1),
+    (COMMIT_CLASS, COMMIT_URL_RE, 1),
+    (COMMIT_CLASS, SPENT_REVISION_RE, 1),
+    (SPENT_PROPOSAL_CLASS, SPENT_PROPOSAL_RE, 1),
+    (EVAL_POOL_CLASS, EVAL_POOL_PROJECT_RE, 0),
+    # The fleet audit's declared-intent clone directory, a Python tempfile name:
+    # `declared-intent-` (CLONE_TMP_PREFIX in audit_report.py) and 8 random characters.
+    ("TMPNAME", re.compile(r"(?<![A-Za-z0-9])declared-intent-([a-z0-9_]{8})(?![A-Za-z0-9_-])"), 1),
     ("UID", re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), 0),
     # Hermes session id: 20261102_002640_791a68.
     ("SESSION", re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{4,}\b"), 0),
@@ -307,8 +419,10 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
     ("TASK", re.compile(r"\bt_[0-9a-f]{8}\b"), 0),
     ("A2ATASK", re.compile(r"\btask-[0-9a-f]{16}\b"), 0),
     ("INJ", re.compile(r"\binj-\d+\b"), 0),
-    # GKE node: gke-<cluster>-<pool>-<8 hex>-<4>; the cluster and pool stay.
-    ("NODE", re.compile(r"\bgke-[a-z0-9-]+?-([0-9a-f]{8}-[a-z0-9]{4})\b"), 1),
+    # GKE node: gke-<cluster>-<pool>-<8 hex>-<4>; the cluster and pool stay. The
+    # name may hold a placeholder already (`gke-⟦EVALPROJECT_1⟧-default-pool-…`).
+    ("NODE", re.compile(r"\bgke-(?:[a-z0-9-]|" + re.escape(OPEN) + r"[A-Za-z0-9_]+" + re.escape(CLOSE) + r")+?"
+                        r"-([0-9a-f]{8}-[a-z0-9]{4})\b"), 1),
     # Pod of a ReplicaSet: <workload>-<template hash>-<5>; the workload stays.
     ("POD", re.compile(r"\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-([" + K8S_SAFE + r"]{6,10}-[" + K8S_SAFE + r"]{5})\b"), 1),
 ]
@@ -325,11 +439,69 @@ TIMESTAMP_PATTERNS = (ISO_TS_RE, RFC1123_RE, OPENSSL_TS_RE, LS_DATE_RE)
 # Hermes appends `## Recent work by @<assignee>` (the assignee's last runs on
 # other cards, one `- ` line each, then a blank line) to every card view. It
 # differs between otherwise identical runs, so it is dropped from the key
-# (#1730). Matched with real and JSON-escaped newlines.
-RECENT_WORK_RE = re.compile(r"(?m)^## Recent work by @[^\n]*\n(?:- [^\n]*(?:\n|$))*")
-RECENT_WORK_ESCAPED_RE = re.compile(r"## Recent work by @(?:(?!\\n).)*(?:\\n- (?:(?!\\n).)*)*")
-RECENT_WORK_STRIPPED = "## Recent work [stripped]\n"
-RECENT_WORK_ESCAPED_STRIPPED = "## Recent work [stripped]"
+# (#1730). Whether a card view has one at all depends on whether the assignee
+# happened to finish another card first, so the header goes too, with the blank
+# line that separates it from the section before (Hermes joins sections with
+# one): a view with the digest keys as the same view without it. A digest with
+# no blank line before it takes the line breaks after it instead. Matched with
+# real and JSON-escaped newlines.
+RECENT_WORK_SECTION = r"## Recent work by @[^\n]*(?:\n- [^\n]*)*"
+RECENT_WORK_RE = re.compile(r"\n\n" + RECENT_WORK_SECTION + r"(?=\n|\Z)|(?m:^)" + RECENT_WORK_SECTION + r"(?:\n\n?)?")
+RECENT_WORK_ESCAPED_SECTION = r"## Recent work by @(?:(?!\\n).)*(?:\\n- (?:(?!\\n).)*)*"
+RECENT_WORK_ESCAPED_RE = re.compile(
+    r"\\n\\n" + RECENT_WORK_ESCAPED_SECTION + r"(?=\\n|\Z|\")|" + RECENT_WORK_ESCAPED_SECTION + r"(?:\\n(?:\\n)?)?"
+)
+
+# Hermes' read_file answers a missing file with `File not found: <path>` and,
+# when the directory holds names like it, `similar_files`: up to five picked
+# from an `ls` of the directory at that moment (hermes-agent v2026.9.14
+# tools/file_operations.py `_suggest_similar_files`; `ReadResult.to_dict` leaves
+# the key out when the list is empty). Whether another agent has written a file
+# there yet changes the list (`/opt/data/INVENTORY.md` listed in one run and
+# not yet in the next), so the key drops it (without_similar_files): only in a
+# not-found result, in a tool message answering a read_file call, found by its
+# tool_call_id. The model sometimes reads a listed file next (about one answer
+# in twenty after such a result, Nov 12 nightlies), so a file named in either
+# run's list never crosses runs (Mapping.answer_names_dropped_file): an answer
+# naming one of the recording's is not saved, and a saved answer naming one of
+# this run's is not served (replay_proxy lookup), since the answer may act on
+# the file being there, or on it not being there (`write_file INVENTORY.md`
+# would overwrite what another agent wrote).
+READ_FILE_TOOL = "read_file"
+READ_FILE_ERROR_KEY = "error"
+READ_FILE_NOT_FOUND_PREFIX = "File not found:"
+SIMILAR_FILES_KEY = "similar_files"
+# A dropped file's name counts in an answer where no word character, `.` or `-`
+# comes before it and no word character, `-`, or `.` and a word character
+# follows it (`config` is not `config.yaml`; a sentence's closing
+# `INVENTORY.md.` still counts). A JSON escape
+# (`\n`, `\t`, `\r`) also counts as a boundary before it: a tool call's
+# `arguments` is a JSON string, so a name starting a line of a `write_file`'s
+# content is written `...\nINVENTORY.md`, with a word character before it.
+DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
+DROPPED_FILE_AFTER = r"(?![\w-]|\.\w)"
+# The front door's kanban_create result carries `"queued": true, "queue":
+# {"running": N, "limit": M}` when the new card's class has no free dispatcher
+# slot at that moment, and neither key otherwise; being queued doesn't change the
+# card's status, and only a `ready` card can carry the fields
+# (deploy/docker/patches/kanban_priority.py `queue_fields`, empty inside a
+# worker). Whether a slot was free is what else was running, so the key drops
+# both (without_queue_fields): only from a JSON object holding `task_id` and
+# `subscribed`, in a tool message answering a kanban_create call, found by its
+# tool_call_id. The fields are machine-readable only: the thread hears about
+# the wait from the dispatcher's `queued` event, and in 9,780 front-door
+# answers after a create (4,281 queued) none mentioned a queue. `running` and
+# `limit` count like a dropped queued event's payload
+# (Mapping.answer_repeats_dropped_count). When the dropped `queued` was set, an
+# answer talking about a queue or a slot (QUEUE_WORDS_RE, QUEUE_SLOT_WORDS_RE)
+# is not saved either (Mapping.answer_talks_about_dropped_queue): served to a
+# run that had a free slot, it would tell the user of a wait that is not
+# happening, with or without a number.
+KANBAN_CREATE_TOOL = "kanban_create"
+KANBAN_CREATE_RESULT_KEYS = ("task_id", "subscribed")
+QUEUED_FIELD = "queued"
+QUEUE_FIELD = "queue"
+QUEUE_SLOT_WORDS_RE = re.compile(r"\bslots?\b|board is full|in use|waiting for a worker", re.I)
 
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
@@ -344,7 +516,7 @@ TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
 # Classes whose value is the tail of a longer name (`web-` + the pod's hash
 # suffix, `gke-…-` + the node's): in an answer that tail follows a `-` or `_`,
 # so those may border it on the left.
-SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT")
+SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT", "TMPNAME", "GKEOP")
 SUFFIX_TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=])"
 # A bare number is a token when no word character, `.` or `-` precedes it and
 # no word character or `.`+digit follows it: `1` in `1.31`, `node-pool-1` or
@@ -355,8 +527,9 @@ DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
 # Classes keyed apart and never swapped into an answer by value: opaque fields,
-# bare numbers, and timestamp literals (swapped by their own patterns).
-UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, TIME_LITERAL_CLASS)
+# bare numbers, a spent proposal's number, and timestamp literals (swapped by
+# their own patterns).
+UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, SPENT_PROPOSAL_CLASS, TIME_LITERAL_CLASS)
 
 
 def token_class(token: str) -> str:
@@ -410,6 +583,38 @@ def warnings_last(text: str) -> str:
             return LINE_BREAK.join([text[opener.start(): end]] + before + after)
         return text
     return text
+
+
+def sorted_skill_listings(text: str) -> str:
+    """A skill_view result with each SKILL_LISTING_KEYS group's file list sorted; any other text as it is.
+
+    Returns `text` itself when nothing moved, so a result already in order keeps its exact text.
+    A result Hermes appended a notice to (the iteration-budget warning, toolguard guidance)
+    is JSON followed by text: its JSON is sorted and written in canonical form, so two pods'
+    copies key alike whichever needed the sort, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text
+        tail = text.lstrip()[end:]
+    if not isinstance(parsed, dict):
+        return text
+    moved = False
+    for key in SKILL_LISTING_KEYS:
+        groups = parsed.get(key)
+        if not isinstance(groups, dict):
+            continue
+        for group, files in groups.items():
+            if isinstance(files, list) and all(isinstance(f, str) for f in files) and files != sorted(files):
+                groups[group] = sorted(files)
+                moved = True
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail
+    return json.dumps(parsed, ensure_ascii=False) if moved else text
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -502,8 +707,66 @@ def key_timed(key: Any) -> bool:
 
 def strip_recent_work(text: str) -> str:
     """Drop the `## Recent work` digest, which the key leaves out (RECENT_WORK_RE)."""
-    text = RECENT_WORK_RE.sub(RECENT_WORK_STRIPPED, text)
-    return RECENT_WORK_ESCAPED_RE.sub(RECENT_WORK_ESCAPED_STRIPPED, text)
+    text = RECENT_WORK_RE.sub("", text)
+    return RECENT_WORK_ESCAPED_RE.sub("", text)
+
+
+def without_similar_files(text: str) -> Tuple[str, List[str]]:
+    """A read_file not-found result without its `similar_files`, and the files that list held; any other text as it is.
+
+    Returns `text` itself when it holds no list to drop. A result Hermes appended
+    a notice to (its tool-loop warning) is JSON followed by text: its JSON is
+    written in canonical form, with or without a list to drop, so two runs'
+    copies key alike, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text, []
+        tail = text.lstrip()[end:]
+    error = parsed.get(READ_FILE_ERROR_KEY) if isinstance(parsed, dict) else None
+    if not (isinstance(error, str) and error.startswith(READ_FILE_NOT_FOUND_PREFIX)):
+        return text, []
+    listed = parsed.pop(SIMILAR_FILES_KEY, None)
+    files = [f for f in listed if isinstance(f, str)] if isinstance(listed, list) else []
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail, files
+    if listed is None:
+        return text, files
+    return json.dumps(parsed, ensure_ascii=False), files
+
+
+def without_queue_fields(text: str) -> Tuple[str, bool, Any]:
+    """A kanban_create result without its `queued` and `queue`, whether it was queued, and the dropped `queue`.
+
+    Any other text comes back as it is, unqueued. Returns `text` itself when it
+    holds neither key and has no appended notice. Queued means a `queued` that is present and not `false`,
+    or a `queue` block at all: queue_fields writes only `true`, and anything
+    else it might write is read as a wait. A result Hermes appended a notice to
+    is written in canonical form and the notice kept, as without_similar_files does.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text, False, None
+        tail = text.lstrip()[end:]
+    if not (isinstance(parsed, dict) and all(k in parsed for k in KANBAN_CREATE_RESULT_KEYS)):
+        return text, False, None
+    held = QUEUED_FIELD in parsed or QUEUE_FIELD in parsed
+    queued_value = parsed.pop(QUEUED_FIELD, None)
+    queue = parsed.pop(QUEUE_FIELD, None)
+    queued = (queued_value is not None and queued_value is not False) or queue is not None
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail, queued, queue
+    if not held:
+        return text, False, None
+    return json.dumps(parsed, ensure_ascii=False), queued, queue
 
 
 @dataclass
@@ -518,6 +781,9 @@ class Mapping:
     # (keyed numbers) and epoch timestamps, which become an unnumbered
     # how-far-from-now time token.
     bare_numbers: set = field(default_factory=set)
+    # The bare numbers swapped from a `comment_id`, which an answer also
+    # repeats next to the word "comment".
+    comment_numbers: set = field(default_factory=set)
     # Dates swapped for a day-count token. The token can't be put back, so an
     # answer naming one is not saved: replayed on another day it would carry
     # the recording's. `today_dates` are the ones on the request's own day,
@@ -530,6 +796,20 @@ class Mapping:
     # reading of the clock, and a served `--since 5m` must not become this
     # run's `--since 3m`; an answer repeating one is not saved instead.
     ages: set = field(default_factory=set)
+    # What text the key drops held that an answer must not repeat: a dropped
+    # event's payload counts and their keys (QUEUE_WORDS_RE), and the runs of
+    # hex a dropped recent-work digest held outside any identifier (a commit).
+    dropped_counts: set = field(default_factory=set)
+    dropped_count_keys: set = field(default_factory=set)
+    dropped_hex: set = field(default_factory=set)
+    # Spent proposals' numbers (SPENT_PROPOSAL_RE), which an answer must not
+    # hold as a number, and the file names of read_file's dropped
+    # `similar_files` (without_similar_files), which an answer must not name.
+    proposal_numbers: set = field(default_factory=set)
+    dropped_files: set = field(default_factory=set)
+    # Whether a kanban_create result the key dropped `queued` from was queued
+    # (without_queue_fields), which an answer must not talk about.
+    create_queued: bool = False
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -548,13 +828,17 @@ class Mapping:
                 self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
+        if cls == SPENT_PROPOSAL_CLASS:
+            self.proposal_numbers.add(value)
         if age:
             self.ages.add(value)
         return self.to_placeholder[key]
 
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
-                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages))
+                       set(self.comment_numbers), set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
+                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex),
+                       set(self.proposal_numbers), set(self.dropped_files), self.create_queued)
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -569,6 +853,11 @@ class Mapping:
     def bound(self, value: str) -> Optional[str]:
         """The placeholder a swappable value is bound to, if any."""
         return self.to_placeholder.get(MAPPING_KEY_SEPARATOR + value)
+
+    def bound_commit(self, value: str) -> Optional[str]:
+        """The placeholder a bound commit is bound to, if `value` is one: a commit is one wherever it is a whole run of hex."""
+        token = self.bound(value)
+        return token if token is not None and token_class(token) == COMMIT_CLASS else None
 
     def bound_time(self, literal: str) -> Optional[str]:
         """The placeholder for a timestamp's text: every position it held outside assistant messages, if any."""
@@ -608,8 +897,17 @@ class Mapping:
         for cls, pattern, group in ID_CLASSES:
             text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
         text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
+        text = self.swap_bare_commits(text)
         for pattern in TIMESTAMP_PATTERNS:
             text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
+        return self.swap_whole_tokens(text)
+
+    def swap_bare_commits(self, text: str) -> str:
+        """Swap each whole run of hex that is a bound commit for its placeholder."""
+        return HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
+
+    def swap_whole_tokens(self, text: str) -> str:
+        """Swap each bound value where it is a whole token, longest first; a suffix class's may follow `-` or `_`."""
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
@@ -652,25 +950,57 @@ class Mapping:
 
         A backstop for apply_to_answer: such an answer would be served with the
         recording's value. IPs count only where no digit or `.`+digit borders
-        them, so 10.1.2.3 is not found in 10.1.2.30.
+        them, so 10.1.2.3 is not found in 10.1.2.30. A commit counts also as
+        any run of 7 or more hex digits that starts it, or that it starts: an
+        answer may shorten `…@c99b1ab1fee8…` to `c99b1ab`, and no pattern binds that.
         """
+        hex_runs = None
         for key, token in self.to_placeholder.items():
             cls, value = key.split(MAPPING_KEY_SEPARATOR, 1)
-            if cls or token_class(token) not in IDENTIFIER_CLASSES or value not in text:
+            if cls or token_class(token) not in IDENTIFIER_CLASSES:
+                continue
+            if token_class(token) == COMMIT_CLASS:
+                if hex_runs is None:
+                    hex_runs = HEX_RUN_RE.findall(text)
+                if any(run.startswith(value) or value.startswith(run) for run in hex_runs):
+                    return True
+            if value not in text:
                 continue
             if token_class(token) != IP_CLASS or re.search(IP_LITERAL_BEFORE + re.escape(value) + IP_LITERAL_AFTER, text):
                 return True
         return False
 
-    @staticmethod
-    def has_identifier(text: str) -> bool:
-        """Whether a normalized answer still holds an identifier shape (ID_CLASSES).
+    def has_identifier(self, text: str) -> bool:
+        """Whether a normalized answer still holds an identifier shape (ID_CLASSES), or a dropped digest's hex.
 
         After apply_to_answer, any left is one the key never bound (it sat in
         text the key drops, like the recent-work digest, or the model made it),
-        so no placeholder can bring it up to date.
+        so no placeholder can bring it up to date. A commit the digest names has
+        no identifier shape once an answer writes it as plain hex, so the
+        digest's commits are kept to check (dropped_hex). As in
+        identifier_left_literal, a run counts when it starts a kept commit or a
+        kept commit starts it: an answer may shorten or lengthen a SHA.
         """
-        return any(pattern.search(text) for _, pattern, _ in ID_CLASSES)
+        if any(pattern.search(text) for _, pattern, _ in ID_CLASSES):
+            return True
+        if not self.dropped_hex:
+            return False
+        return any(run.startswith(kept) or kept.startswith(run)
+                   for run in HEX_RUN_RE.findall(text) for kept in self.dropped_hex)
+
+    def answer_names_dropped_file(self, text: str) -> bool:
+        """Whether an answer names, by its file name, a file a dropped read_file `similar_files` listed.
+
+        Read on the answer as written, not normalized: a name holding a bound
+        identifier (`kube-agents-evals-22-notes.md`) would otherwise be read
+        as its placeholder. By file name, so a relative path (`cat INVENTORY.md`) counts too.
+        """
+        return any(re.search(DROPPED_FILE_BEFORE + re.escape(name) + DROPPED_FILE_AFTER, text) for name in self.dropped_files)
+
+    def answer_talks_about_dropped_queue(self, text: str) -> bool:
+        """Whether an answer talks about a queue or a slot after a kanban_create result whose dropped `queued` was set."""
+        return self.create_queued and (QUEUE_WORDS_RE.search(text) is not None
+                                       or QUEUE_SLOT_WORDS_RE.search(text) is not None)
 
     @staticmethod
     def has_timestamp(text: str) -> bool:
@@ -712,6 +1042,30 @@ class Mapping:
                 pattern = r"(?<![A-Za-z0-9_])" + SHORT_NUMBER_KEYS + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER
             if re.search(pattern, text):
                 return True
+        for value in self.comment_numbers:
+            # Any case: an answer often starts a sentence or bullet with it ("Comment 41 posted").
+            if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text,
+                         re.IGNORECASE):
+                return True
+        # Any length, anywhere: `PR #175`, `pull/175` and `proposal view 175` all name it.
+        for value in self.proposal_numbers:
+            if re.search(PROPOSAL_NUMBER_BEFORE + re.escape(value) + PROPOSAL_NUMBER_AFTER, text):
+                return True
+        return self.answer_repeats_dropped_count(text)
+
+    def answer_repeats_dropped_count(self, text: str) -> bool:
+        """Whether an answer repeats a dropped event's payload count next to its key, or with the queue (QUEUE_WORDS_RE)."""
+        if not self.dropped_counts:
+            return False
+        queue = QUEUE_WORDS_RE.search(text) is not None
+        keys = "|".join(re.escape(k) for k in sorted(self.dropped_count_keys))
+        for value in self.dropped_counts:
+            token = NUMBER_BEFORE + re.escape(value) + NUMBER_AFTER
+            if queue and re.search(token, text):
+                return True
+            if keys and re.search(r"(?<![A-Za-z0-9_])(?:" + keys + r")" + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER,
+                                  text):
+                return True
         return False
 
 
@@ -734,6 +1088,11 @@ class Normalizer:
         # Whether a value in any object or list enclosing the one being walked
         # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
+        # Whether the message being walked is an assistant message (walk_message):
+        # then text() also swaps bound values as Mapping.apply_to_answer does.
+        self.in_answer = False
+        # The tool_call ids of the read_file calls walked so far (walk_message).
+        self.read_file_calls: Set[str] = set()
         # Per-request caches: a string's parsed JSON document (nested_json),
         # whether a string or container holds a time of day (timed), and a
         # string's TimeIndex, so each is computed once however often it is asked.
@@ -741,6 +1100,10 @@ class Normalizer:
         self.timed_strings: Dict[str, bool] = {}
         self.timed_containers: Dict[Tuple[int, Optional[str], bool], bool] = {}
         self.time_indexes: Dict[str, TimeIndex] = {}
+        # The tool_call ids of the skill_view calls walked so far (walk_message).
+        self.skill_view_calls: Set[str] = set()
+        # The tool_call ids of the kanban_create calls walked so far (walk_message).
+        self.kanban_create_calls: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
     #
@@ -758,6 +1121,7 @@ class Normalizer:
             return self.text(obj)
         if isinstance(obj, (list, dict)):
             items = self.kept_items(obj, key, is_tool_call)
+            self.dropped_guards(obj, key)
             beside = self.siblings_timed(items)
             walked = [self.beside(flag, lambda item=item: self.walk(*item)) for item, flag in zip(items, beside)]
             if isinstance(obj, dict):
@@ -765,12 +1129,96 @@ class Normalizer:
             return walked
         return obj
 
+    def walk_message(self, message: Any) -> Any:
+        """Walk one request message; an assistant message's text also gets the answer-only swaps (text).
+
+        An assistant message's read_file and skill_view calls are noted, so the
+        tool message answering one is walked without a not-found's
+        `similar_files` (without_similar_files), or with its file listings
+        sorted (sorted_skill_listings); and its kanban_create calls, so the
+        result answering one is walked without `queued` and `queue`
+        (without_queue_fields).
+        """
+        outer = self.in_answer
+        self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
+        if self.in_answer:
+            self.note_read_file_calls(message)
+            self.note_skill_view_calls(message)
+            self.note_kanban_create_calls(message)
+        try:
+            return self.walk(self.queue_fields_dropped(self.similar_files_dropped(self.skill_listings_sorted(message))))
+        finally:
+            self.in_answer = outer
+
+    def note_read_file_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == READ_FILE_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.read_file_calls.add(call[ID_KEY])
+
+    def similar_files_dropped(self, message: Any) -> Any:
+        """`message`, without its content's `similar_files` when it is a noted read_file call's not-found result.
+
+        The file name of each dropped entry is noted for the answer guards (Mapping.answer_names_dropped_file).
+        """
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.read_file_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content, files = without_similar_files(message[CONTENT_FIELD])
+        self.mapping.dropped_files.update(name for name in (PurePosixPath(f).name for f in files) if name)
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
+    def note_skill_view_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == SKILL_VIEW_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.skill_view_calls.add(call[ID_KEY])
+
+    def skill_listings_sorted(self, message: Any) -> Any:
+        """`message`, with its content's file listings sorted when it is the result of a noted skill_view call."""
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.skill_view_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content = sorted_skill_listings(message[CONTENT_FIELD])
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
+    def note_kanban_create_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == KANBAN_CREATE_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.kanban_create_calls.add(call[ID_KEY])
+
+    def queue_fields_dropped(self, message: Any) -> Any:
+        """`message`, without its content's `queued` and `queue` when it is a noted kanban_create call's result.
+
+        A dropped `queue`'s counts are noted as a dropped queued event's are
+        (note_counts), and a queued result marks the mapping (Mapping.create_queued).
+        """
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.kanban_create_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content, queued, queue = without_queue_fields(message[CONTENT_FIELD])
+        self.note_counts(queue)
+        self.mapping.create_queued = self.mapping.create_queued or queued
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
         """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""
         if key is not None and self.is_opaque(key, in_tool_call):
             return lambda: self.opaque(obj)
         if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
             return lambda: self.epoch_token(str(obj), self.epoch_value(obj))
+        if key == COMMENT_ID_KEY and self.is_number(obj):
+            return lambda: self.comment_id_number(str(obj))
         if (key in KEYED_NUMBER_KEYS or (key or "").endswith(RUN_ID_SUFFIX)) and self.is_number(obj):
             return lambda: self.keyed_number(str(obj))
         if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
@@ -781,13 +1229,81 @@ class Normalizer:
     def kept_items(obj: Any, key: Optional[str], is_tool_call: bool) -> List[Tuple[Any, Optional[str], bool, bool]]:
         """The children `walk` keeps, as its arguments: (value, key or None, in_tool_call, is_tool_call).
 
-        A dict's keys come sorted; a kanban card's heartbeat events are dropped.
+        A dict's keys come sorted; a kanban card's heartbeat and queued events are dropped.
         """
         if isinstance(obj, dict):
             return [(obj[k], k, is_tool_call, False) for k in sorted(obj)]
         if key == EVENTS_KEY:
-            obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
+            obj = [v for v in obj if not Normalizer.dropped_event(v)]
         return [(v, None, False, key == TOOL_CALLS_KEY and isinstance(v, dict)) for v in obj]
+
+    @staticmethod
+    def dropped_event(value: Any) -> bool:
+        return isinstance(value, dict) and value.get(EVENT_KIND_KEY) in DROPPED_EVENT_KINDS
+
+    def dropped_guards(self, obj: Any, key: Optional[str]) -> None:
+        """Note what an answer must not repeat from the events kept_items drops, without keying them.
+
+        Each is walked by a throwaway normalizer, so no placeholder is numbered
+        for it; its unrestorable values (an epoch `created_at`, a keyed number,
+        an age, a day-counted date) join this request's. An identifier only a
+        dropped event holds is unbound, which has_identifier already refuses.
+        """
+        if key != EVENTS_KEY or not isinstance(obj, list):
+            return
+        for event in obj:
+            if not self.dropped_event(event):
+                continue
+            scratch = Normalizer(self.now, self.keep_ips)
+            scratch.walk(event)
+            self.merge_unrestorable(scratch.mapping)
+            self.note_counts(event.get(EVENT_PAYLOAD_KEY))
+
+    def merge_unrestorable(self, other: "Mapping") -> None:
+        """Add what another (throwaway) mapping noted as unrestorable to this request's."""
+        self.mapping.bare_numbers |= other.bare_numbers
+        self.mapping.comment_numbers |= other.comment_numbers
+        self.mapping.ages |= other.ages
+        self.mapping.dates |= other.dates
+        self.mapping.today_dates |= other.today_dates
+        self.mapping.proposal_numbers |= other.proposal_numbers
+
+    def note_counts(self, payload: Any, key: Optional[str] = None) -> None:
+        """Every integer in a dropped event's payload, with the key it sat under (Mapping.answer_repeats_dropped_count)."""
+        if isinstance(payload, bool):
+            return
+        if isinstance(payload, int):
+            self.mapping.dropped_counts.add(str(payload))
+            if key is not None:
+                self.mapping.dropped_count_keys.add(key)
+        elif isinstance(payload, dict):
+            for k, v in payload.items():
+                self.note_counts(v, k if isinstance(k, str) else None)
+        elif isinstance(payload, list):
+            for v in payload:
+                self.note_counts(v, key)
+
+    def digest_guards(self, text: str) -> None:
+        """Note what an answer must not repeat from the recent-work digests strip_recent_work drops from `text`.
+
+        Each digest is read by a throwaway normalizer, as a dropped event is
+        (dropped_guards): its keyed numbers, epochs, ages and day-counted dates
+        join this request's. Its identifiers are unbound, which has_identifier
+        refuses while they keep their shape. Its commits are kept for it as
+        plain hex too: a run of hex outside any identifier, and every commit the
+        throwaway normalizer bound (`owner/repo@<sha>`, a `/commit/<sha>` URL),
+        since an answer may repeat either as a bare SHA.
+        """
+        for pattern in (RECENT_WORK_RE, RECENT_WORK_ESCAPED_RE):
+            for m in pattern.finditer(text):
+                scratch = Normalizer(self.now, self.keep_ips)
+                digest = scratch.text(m.group(0), strip=False)
+                self.merge_unrestorable(scratch.mapping)
+                self.mapping.dropped_hex.update(run for run in HEX_RUN_RE.findall(PLACEHOLDER_RE.sub(" ", digest))
+                                                if HEX_LETTER_RE.search(run))
+                self.mapping.dropped_hex.update(scratch.mapping.to_value[token]
+                                                for token in scratch.mapping.to_value
+                                                if token_class(token) == COMMIT_CLASS)
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
         """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.
@@ -825,6 +1341,11 @@ class Normalizer:
     def keyed_number(self, value: str) -> str:
         """Swap a keyed number (any length) for a placeholder."""
         return self.mapping.placeholder(NUMBER_CLASS, value)
+
+    def comment_id_number(self, value: str) -> str:
+        """Swap a kanban comment's row id, noting it for the answer guard's bare-word check."""
+        self.mapping.comment_numbers.add(value)
+        return self.keyed_number(value)
 
     def opaque(self, value: Any) -> str:
         whole = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
@@ -875,17 +1396,40 @@ class Normalizer:
             return self.timed_containers[cache_key]
         return False
 
-    def text(self, text: str) -> str:
+    def text(self, text: str, strip: bool = True) -> str:
+        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so).
+
+        In an assistant message (in_answer), the values bound so far are first
+        swapped as Mapping.apply_to_answer swaps them, in its order: identifiers
+        already bound, then a bound commit as a bare run of hex, then a bound
+        value as a whole token outside its pattern (`clone-<tmpname>`). A served
+        answer comes back in the next request's history with this run's values
+        where the recording had its own, so both must key the same. Before the
+        binding identifier pass, which would bind part of such a token afresh
+        (the uuid of `old_<operation>`); after the age columns, which read
+        positions. It binds nothing; a value it swaps is the placeholder the
+        binding pass would have given it.
+        """
         text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
             return json.dumps(self.walk(nested), sort_keys=True, ensure_ascii=False)
-        text = strip_recent_work(text)
+        if strip:
+            self.digest_guards(text)
+            text = strip_recent_work(text)
         text = self.age_columns(text)
+        if self.in_answer:
+            # Mapping.apply_to_answer's order: identifiers already bound first
+            # (looked up, never bound here), then the bare-commit and whole-token
+            # swaps, so a commit equal to one segment of a bound uuid never splits it.
+            for cls, pattern, group in ID_CLASSES:
+                text = self.sub_group(pattern, group, lambda v: self.mapping.bound(v) or v, text)
+            text = self.mapping.swap_whole_tokens(self.mapping.swap_bare_commits(text))
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
         text = self.timestamps(text)
         text = self.sub_group(KEYED_NUMBER_TEXT_RE, 3, self.keyed_number, text)
+        text = self.sub_group(COMMENT_ID_TEXT_RE, 3, self.comment_id_number, text)
         text = self.sub_group(PID_PROSE_RE, 3, self.keyed_number, text)
         text = KEYED_EPOCH_TEXT_RE.sub(self.keyed_epoch, text)
         if not self.keep_ips:
@@ -1165,7 +1709,7 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     # a slot blanks an answer's words, so a position counted there could shift.
     for message in raw_messages if isinstance(raw_messages, list) else []:
         normalizer.time_literals = []
-        messages.append(normalizer.walk(message))
+        messages.append(normalizer.walk_message(message))
         if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
             normalizer.mapping.time_occurrences += normalizer.time_literals
     history_mapping = normalizer.mapping.copy()
@@ -1180,13 +1724,13 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
 class KeyContext:
     """What besides the request goes into the key: the LiteLLM setup and the normalizer."""
 
-    model_behaviour_checksum: str
+    litellm_config_checksum: str
     litellm_image: str
     normalizer_version: str = NORMALIZER_VERSION
 
     def as_dict(self) -> Dict[str, str]:
         return {
-            "model_behaviour_checksum": self.model_behaviour_checksum,
+            "litellm_config_checksum": self.litellm_config_checksum,
             "litellm_image": self.litellm_image,
             "normalizer_version": self.normalizer_version,
         }
@@ -1270,7 +1814,7 @@ def answer_after(normalized: NormalizedRequest, answer: Any) -> str:
     walker = Normalizer(normalized.now, normalized.keep_ips)
     walker.mapping = normalized.history_mapping.copy()
     message = dict(answer, role=ASSISTANT_ROLE) if isinstance(answer, dict) else answer
-    return answer_identity(walker.walk(message))
+    return answer_identity(walker.walk_message(message))
 
 
 def answer_variant(normalized: NormalizedRequest, answer: Any, context: KeyContext) -> Tuple[str, str]:

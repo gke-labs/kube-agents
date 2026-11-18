@@ -304,7 +304,8 @@ const (
 	// figure follows a raised ephemeral-storage override the way the volume
 	// does (credentialProxyEmptyDirSizeLimit), /tmp keeps its cap, and an
 	// override lowered under the two caps together splits the limit between
-	// them (credentialProxyEvictionBytes). In the
+	// them (credentialProxyEvictionBytes). The exec tier rewrites both to its
+	// own fixed caps (credentialProxyExecTierStateSizeLimit). In the
 	// base env list and so reserved in mergeCredentialProxyEnv, because a CR
 	// that could set either would detach the gate from the eviction threshold.
 	credentialProxyStateLimitEnv = "CREDENTIAL_PROXY_STATE_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
@@ -594,6 +595,9 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           saName,
 					AutomountServiceAccountToken: ptr.To(false),
+					// ndots:2, see publicAPICallerPodNdots. The exec tier
+					// copies this pod spec.
+					DNSConfig: publicAPICallerPodDNSConfig(),
 					// See credentialProxyTerminationGraceSeconds: covers the
 					// broker's drain on SIGTERM.
 					TerminationGracePeriodSeconds: ptr.To(credentialProxyTerminationGraceSeconds),
@@ -673,6 +677,10 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
 	// are hosted in this same process, and one listener serves both.
 	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, owned, profiles)
+	// Where the audit-report store listens and the token for it. Appended
+	// after the merge with spec.deployment.env, which reserves both names, as
+	// the federation pair below is.
+	envVars = append(envVars, auditReportStoreBrokerEnv(agent)...)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -785,9 +793,14 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 			ReadOnly:  true,
 		})
 	}
-	if scopePublisherRendered(agent) {
-		mounts = append(mounts, scopeConfigMount(brokerScopeDir))
-	}
+	// The scope declaration in every mode: spec.scope.exclude.clusters is
+	// refused at the broker for every caller (scope_exclude.py).
+	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
+	// The token for the audit-report store and nothing else
+	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
+	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
+	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
+	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -1004,12 +1017,17 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 		}
 	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
-	// The scope declaration under mode next, which the broker reads on every
-	// scope call to bound the role's arguments (CREDENTIAL_PROXY_SCOPE_FILE).
-	if scopePublisherRendered(agent) {
-		volumes = append(volumes, scopeConfigVolume(agent))
-	}
+	// The scope declaration, in every mode (CREDENTIAL_PROXY_SCOPE_FILE): the
+	// broker refuses an excluded cluster for every caller from it, and under
+	// mode next the scope role reads it to bound its arguments.
+	volumes = append(volumes, scopeConfigVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
+	// The token the broker presents to the audit-report store.
+	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
+	// The install's tier table (#6091): the operator's rendered, non-secret
+	// tiers ConfigMap, mounted read-only.
+	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)
+	volumes = append(volumes, tiersVolume)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
@@ -1074,8 +1092,9 @@ func credentialProxyEmptyDirSizeLimit(defaultSize, defaultLimit string, ephemera
 	return &size
 }
 
-// buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume
-// the watcher reads is not here: the gateway pod already declares it.
+// buildAgentAPIAuthVolumes is the gateway pod's remaining share, and the
+// watcher's alert-exclude rules (buildEventWatcherAlertExcludeConfigMap). The
+// data volume the watcher reads is not here: the gateway pod already declares it.
 //
 // The /tmp emptyDir is widened to the sidecar's own merged ephemeral-storage
 // limit, as buildCredentialProxyRuntimeVolumes widens the broker's state: the sidecar
@@ -1093,7 +1112,9 @@ func buildAgentAPIAuthVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volum
 			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, agentAPIAuthEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
-	return volumes
+	return append(volumes, corev1.Volume{Name: eventWatcherAlertExcludeVolume, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+	}}})
 }
 
 func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volume {

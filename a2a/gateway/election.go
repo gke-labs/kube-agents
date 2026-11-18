@@ -37,9 +37,9 @@ const (
 	// relayStopDrainTimeout, sized to the pod's grace period.
 	lostLeaseRelayDrain = 5 * time.Second
 
-	// relayAckWait is the relay durable's AckWait. The relay creates or
-	// updates its durable with none on every bind, so it's always the
-	// server's default.
+	// relayAckWait is the relay durable's AckWait. Nothing sets one: the
+	// provision Job makes the durable without it (and a gateway run without
+	// the operator creates it the same way), so it's the server's default.
 	relayAckWait = 30 * time.Second
 
 	// releasedLeaseSeconds is the duration a released lease records, as
@@ -100,8 +100,9 @@ type Leader interface {
 // instead would put every replica on a down bus into CrashLoopBackOff, and
 // the bus coming back would then wait on the kubelet's backoff.
 //
-// Run returns nil when ctx ended, ErrLeadershipLost when the lease was lost
-// or a write was fenced, and otherwise the error that stopped lead.
+// Run returns nil when ctx ended, ErrLeadershipLost when the lease was lost,
+// a write was fenced or the bus was down mid-term (ErrTermBusLost), and
+// otherwise the error that stopped lead.
 func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Context, RunOptions) error) error {
 	for {
 		err := e.campaign(ctx, leader, lead)
@@ -269,6 +270,11 @@ func (e Election) lead(ctx, leaseCtx context.Context, afterCrash bool, leader Le
 	if afterCrash {
 		opts.RelayBindDelay = relayAckWait
 	}
+	// The term start's bound on the bus applies for the whole term: off the
+	// bus that long, the run ends with ErrTermBusLost, the lease is released,
+	// and the process exits as on a lost lease (a run can't start twice in
+	// one process: its stop closes the adapters and the standby doors).
+	opts.BusDownLimit = termWaitBusMax
 	log.Info("gateway election: leading", "lease", e.Lease, "identity", e.Identity, "term", term, "afterCrash", afterCrash)
 	err = lead(work, opts)
 	if cause := lost(); cause != nil {

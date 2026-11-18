@@ -290,7 +290,7 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 // the block is there: TLS is required of the client listener.
 func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 	agent := a2aTestAgent()
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	for _, want := range []string{
 		"tls {",
 		`cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`,
@@ -300,8 +300,11 @@ func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 			t.Errorf("nats.conf lacks %q", want)
 		}
 	}
-	if strings.Contains(conf, "verify: true") {
-		t.Error("nats.conf requires client certificates; mTLS is not part of this render")
+	// The client listener does not ask clients for a certificate. The one
+	// verify: true in the render is the cluster block's, between the bus's
+	// own servers (TestTheRenderedClusterFormsOverVerifiedRoutes).
+	if strings.Contains(a2aClusterBlockRe.ReplaceAllString(conf, ""), "verify: true") {
+		t.Error("nats.conf requires client certificates of clients; mTLS is not part of the client listener")
 	}
 
 	sts := buildA2ANATSStatefulSet(agent, "hash")
@@ -326,7 +329,7 @@ func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 func TestTheCardPublishersTrustIsReadFromTheBundleOnEachHandshake(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("c", "1")
-	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	s, _ := a2aStartRenderedServer(t, conf)
 	dir, _ := a2aTestTLSMaterial(t)
 	testCA, err := os.ReadFile(filepath.Join(dir, a2aNATSTLSCAKey))

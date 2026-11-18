@@ -106,7 +106,8 @@ The no-forge path and the forge path do not read it as a memory: its `status` is
 `NO_FORGE`, and it names no issue.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
-`audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
+`audit_id`, `repo`, `finished_at` and `started_at` (when the run opened: the stamp `start` wrote
+in the run record, read as `finish` begins, else the in-flight note's, else null), the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
 dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
@@ -194,6 +195,33 @@ shell sandbox enabled that is the sandbox pod's `shell` container, whose `/opt/d
 its own, separate from the gateway's; without it, the gateway pod's `platform-agent` container. The
 in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make fleet-audit-view`
 probes the agent pods for both containers and reads the sandbox first.
+
+A profile worker runs in a pod with no PVC, so the store is also served over the
+network, to the credential broker and to nothing else (#5619; the broker's routes follow). `audit_report_store.py` listens on
+port 8700 in the gateway pod's `agent-api-auth` container, over the same root on the gateway's data
+volume. It is a process of its own rather than more routes on Session KV's 8699, so it serves the
+store routes and nothing else. Each request carries the broker's projected ServiceAccount token,
+bound to the audience `kubeagents-audit-report-store`. The listener verifies that token offline
+against the cluster's JWKS, which it reads with the pod's own API-audience token: the default
+`system:service-account-issuer-discovery` binding allows that, so the listener needs no new RBAC.
+It checks the issuer, the audience, the expiry, that the subject is the broker's ServiceAccount and
+that the token is bound to a pod of the broker's Deployment (the ServiceAccount is shared with the
+exec tier). A failed check is 401, a wrong subject or pod 403, and a JWKS it cannot read 503, never
+an accept. The API server, the token it reads the JWKS with and the store's root are fixed in the
+listener, not read from the environment, which `spec.deployment.env` reaches.
+A rule in the gateway policy `<agent>-gateway-netpol` admits only the broker's pods to the port.
+It is a rule there rather than a policy of its own, so an operator rollback, which renders that
+policy without it, drops it and leaves nothing isolating the pod. With
+`spec.networkPolicy.enabled: false` it goes with the gateway policy, and the token check is the
+whole control. A rollback leaves the `<agent>-report-store` Service behind, which is inert:
+nothing listens on 8700 without this listener. The routes take the store key as one path
+segment, the repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to
+an empty, `.` or `..` part, a control character or a path outside the root. Every file and
+directory step is relative to an open directory and refuses a symlink (409), because the
+`platform-agent` container writes the same volume as the same user; a read opens non-blocking and
+takes regular files of at most 1 MiB alone, and a write holds a lock on its store directory. A ring write prunes to 14, and
+`latest` must be a byte-identical copy of a ring entry. All of this renders with the A2A stack, on
+every install.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it

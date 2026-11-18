@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -86,6 +87,13 @@ func TestGenerateHelmValuesYAML(t *testing.T) {
 	}
 	if !strings.Contains(yaml, "role: gitops") || !strings.Contains(yaml, "role: managed") {
 		t.Fatalf("generateHelmValuesYAML missing roles:\n%s", yaml)
+	}
+}
+
+func TestGenerateHelmValuesYAMLNamesGitHubForAForgeWithNoProvider(t *testing.T) {
+	yaml := generateHelmValuesYAML([]forgeInfo{{Name: "github", Namespace: "org"}}, nil)
+	if !strings.Contains(yaml, "      - name: github\n        provider: github\n") {
+		t.Fatalf("a forge with no provider should read as github:\n%s", yaml)
 	}
 }
 
@@ -620,4 +628,147 @@ func TestASaveFollowsTheClusterOrderOverAnOlderCache(t *testing.T) {
 	if strings.Index(answer.HelmValuesYAML, "name: ghe") > strings.Index(answer.HelmValuesYAML, "name: github") {
 		t.Errorf("Helm values list github before ghe:\n%s", answer.HelmValuesYAML)
 	}
+}
+
+func TestASaveKeepsABitbucketForgeTheClusterDeclares(t *testing.T) {
+	credentials := map[string]any{"name": "bitbucket-token"}
+	s, patched, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "github", "provider": "github", "namespace": "org"},
+			map[string]any{"name": "bb", "provider": "bitbucket", "namespace": "ws", "identity": "bot", "credentialsRef": credentials},
+			map[string]any{"name": "bbdc", "provider": "bitbucket-datacenter", "host": "bitbucket.corp.example", "identity": "bot", "credentialsRef": credentials},
+		},
+		"repositories": []any{
+			map[string]any{"forge": "github", "repository": "org/infra", "role": "gitops"},
+			map[string]any{"forge": "bb", "repository": "ws/app", "role": "managed"},
+			map[string]any{"forge": "bbdc", "repository": "PROJ/svc", "role": "context"},
+		},
+	})
+	get := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/api/repositories", nil)
+	getReq.Host = "localhost"
+	s.handleRepositoriesGet(get, getReq)
+	var current repositoriesResponse
+	if err := json.NewDecoder(get.Body).Decode(&current); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := postJSON(t, s.handleRepositoriesSet, "/api/repositories",
+		repositoriesSetRequest{Repositories: current.Repositories, Forges: current.Forges})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: status %d: %s", rec.Code, rec.Body)
+	}
+	forges := (*patched)[len(*patched)-1]
+	if got := forgeNames(forges); !slices.Equal(got, []string{"github", "bb", "bbdc"}) {
+		t.Fatalf("forges %v, want [github bb bbdc]", got)
+	}
+	for _, f := range forges[1:] {
+		if f["identity"] != "bot" || !reflect.DeepEqual(f["credentialsRef"], credentials) {
+			t.Errorf("forge %v lost its identity or credentialsRef: %v", f["name"], f)
+		}
+	}
+	if forges[1]["provider"] != "bitbucket" || forges[2]["provider"] != "bitbucket-datacenter" {
+		t.Errorf("providers %v and %v, want bitbucket and bitbucket-datacenter", forges[1]["provider"], forges[2]["provider"])
+	}
+}
+
+// connectURL connects repo on forge through the real handler and returns the
+// browse link the answer gives for it.
+func connectURL(t *testing.T, s *server, repo, forge string) string {
+	t.Helper()
+	rec := postJSON(t, s.handleRepositoriesConnect, "/api/repositories/connect",
+		repoConnectRequest{Repository: repo, Role: "managed", Forge: forge})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("connect %s on %s: status %d: %s", repo, forge, rec.Code, rec.Body)
+	}
+	var answer repositoriesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range answer.Repositories {
+		if strings.EqualFold(r.Repository, repo) {
+			return r.URL
+		}
+	}
+	t.Fatalf("connect %s on %s: the answer does not list it: %+v", repo, forge, answer.Repositories)
+	return ""
+}
+
+func TestConnectGivesTheBrowseLinkOnTheDeclaredForgesHost(t *testing.T) {
+	s, _, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "github", "provider": "github", "namespace": "org"},
+			map[string]any{"name": "bbdc", "provider": "bitbucket-datacenter", "host": "bitbucket.corp.example",
+				"namespace": "OPS", "credentialsRef": map[string]any{"name": "bbdc-token"}},
+			map[string]any{"name": "gt", "provider": "gitea", "host": "gitea.example.com",
+				"namespace": "ops", "credentialsRef": map[string]any{"name": "gt-token"}},
+		},
+		"repositories": []any{map[string]any{"forge": "github", "repository": "org/infra", "role": "gitops"}},
+	})
+	// Data Center and Gitea have no default host: the link needs the forge's.
+	if got, want := connectURL(t, s, "OPS/infra", "bbdc"), "https://bitbucket.corp.example/projects/OPS/repos/infra"; got != want {
+		t.Errorf("Data Center link %q, want %q", got, want)
+	}
+	if got, want := connectURL(t, s, "ops/gitops-repo", "gt"), "https://gitea.example.com/ops/gitops-repo"; got != want {
+		t.Errorf("Gitea link %q, want %q", got, want)
+	}
+}
+
+func TestConnectGivesNoLinkForAForgeWithNoHost(t *testing.T) {
+	s, _, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "github", "provider": "github", "namespace": "org"},
+			map[string]any{"name": "gt", "provider": "gitea", "namespace": "ops"},
+		},
+		"repositories": []any{map[string]any{"forge": "github", "repository": "org/infra", "role": "gitops"}},
+	})
+	if got := connectURL(t, s, "ops/gitops-repo", "gt"); got != "" {
+		t.Errorf("link %q for a Gitea forge with no host, want none", got)
+	}
+}
+
+func TestReconnectingOnAnotherForgeTakesThatForgesHost(t *testing.T) {
+	s, _, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "gt1", "provider": "gitea", "host": "gitea-a.example.com",
+				"namespace": "ops", "credentialsRef": map[string]any{"name": "a-token"}},
+			map[string]any{"name": "gt2", "provider": "gitea", "host": "gitea-b.example.com",
+				"namespace": "ops", "credentialsRef": map[string]any{"name": "b-token"}},
+		},
+		"repositories": []any{map[string]any{"forge": "gt1", "repository": "ops/app", "role": "gitops"}},
+	})
+	// The entry already exists on gt1; connecting it on gt2 moves it there.
+	if got, want := connectURL(t, s, "ops/app", "gt2"), "https://gitea-b.example.com/ops/app"; got != want {
+		t.Errorf("link %q after moving to gt2, want %q", got, want)
+	}
+}
+
+func TestConnectTakesTheDeclaredForgesProvider(t *testing.T) {
+	s, _, _ := fakeForgeCluster(t, map[string]any{
+		"forges": []any{
+			map[string]any{"name": "github", "provider": "github", "namespace": "org"},
+			map[string]any{"name": "bbdc", "provider": "bitbucket-datacenter", "host": "bitbucket.corp.example",
+				"namespace": "OPS", "credentialsRef": map[string]any{"name": "bbdc-token"}},
+		},
+		"repositories": []any{map[string]any{"forge": "github", "repository": "org/infra", "role": "gitops"}},
+	})
+	// The request names the Data Center forge but says github: the forge decides.
+	rec := postJSON(t, s.handleRepositoriesConnect, "/api/repositories/connect",
+		repoConnectRequest{Repository: "OPS/infra", Role: "managed", Forge: "bbdc", Provider: "github"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("connect: status %d: %s", rec.Code, rec.Body)
+	}
+	var answer repositoriesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range answer.Repositories {
+		if r.Repository == "OPS/infra" {
+			if r.Provider != "bitbucket-datacenter" || r.URL != "https://bitbucket.corp.example/projects/OPS/repos/infra" {
+				t.Errorf("entry provider %q url %q, want the forge's provider and its Data Center link", r.Provider, r.URL)
+			}
+			return
+		}
+	}
+	t.Fatalf("the answer does not list OPS/infra: %+v", answer.Repositories)
 }

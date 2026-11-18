@@ -458,6 +458,12 @@ class SettlesAsTest(unittest.TestCase):
     def test_a_hard_wall_block_settles_as_a_give_up(self):
         self.assertEqual(kanban_progress_lines.settles_as("blocked", {"kind": "capability"}), "gave_up")
 
+    def test_a_capacity_refusal_settles_as_a_give_up(self):
+        # The dispatcher's own hard wall (kanban_admission): parked for a human like a give-up.
+        self.assertEqual(kanban_progress_lines.settles_as("blocked", {"kind": "capacity"}), "gave_up")
+        self.assertIn("capacity", kanban_progress_lines.HARD_WALL_BLOCK_KINDS)
+        self.assertIn("'capacity'", kanban_progress_lines.GAVE_UP_SQL)
+
     def test_every_other_event_settles_as_itself(self):
         for kind, payload in (
             ("blocked", {"kind": "needs_input"}),

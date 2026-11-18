@@ -29,6 +29,21 @@ import (
 // switch; a setting, not surgery (retarget 8/26).
 const RouteSession = "session"
 
+// sessionPodNdots is the resolver's ndots on a session pod. Kubernetes'
+// default is 5, so the 4-dot broker and kube-api proxy URLs
+// (<svc>.<ns>.svc.cluster.local) would go through all six search domains
+// first: up to 14 A/AAAA queries per lookup (#5590). With 3 they are asked
+// as written first, and the 2-dot NATS_URL host keeps the search list order
+// (musl libc does not fall back to it for a name with ndots or more dots).
+// The operator sets the same value on the pods it renders that dial the
+// broker (brokerCallerPodNdots in k8s-operator/internal/controller/pod_dns.go
+// lists them), and a test in each module reads the other's constant, so the
+// two cannot drift apart.
+const sessionPodNdots = "3"
+
+// resolverNdotsOption is the resolv.conf option sessionPodNdots sets.
+const resolverNdotsOption = "ndots"
+
 const (
 	// sweepInterval paces the orphan sweep; sweepPassTimeout bounds one
 	// pass, so a hung stream or API call cannot make passes pile up.
@@ -86,15 +101,18 @@ const (
 	// workerRunAsUser is the arbitrary non-root UID session pods run as.
 	workerRunAsUser = 1000
 	// Worker requests: the harness spike's per-session footprint, and what
-	// the session cap's sizing math multiplies. The limits exist because a
+	// the session cap's sizing math multiplies. These are the defaults: the
+	// operator renders A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT} from
+	// spec.harness.tuning.sessionResources (#2371), and they must equal its
+	// DefaultSession* constants (TestSessionResourceDefaultsMatchTheOperators). The limits exist because a
 	// namespace ResourceQuota that requires them refuses a pod without
 	// them at admission, and a session pod refused there is a delegation
 	// that never starts; they are the sandbox's (2 CPU, 2Gi), which is
 	// what a headless harness turn has been observed to fit in. On an
 	// Autopilot cluster without Pod bursting the limit is rewritten to the
 	// request, so the request stays a ceiling a turn can live under.
-	workerCPURequest    = "250m"
-	workerMemoryRequest = "512Mi"
+	workerCPURequest    = "150m"
+	workerMemoryRequest = "320Mi"
 	workerCPULimit      = "2"
 	workerMemoryLimit   = "2Gi"
 	// The scratch emptyDir is the harness's working directory (the worker
@@ -129,9 +147,9 @@ const (
 	// 1000 (the shell sandbox's buildShellSandboxCredentialProxyTokenVolume
 	// argues the same). Spelled identically in credential_proxy.py and the
 	// operator's platformagent_broker_split.go.
-	credentialProxySessionAudience        = "kubeagents-credential-proxy-session" // #nosec G101 -- audience name
-	credentialProxyTokenVolume            = "credential-proxy-token"              // #nosec G101 -- volume name
-	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy"
+	credentialProxySessionAudience        = "kubeagents-credential-proxy-session"          // #nosec G101 -- audience name
+	credentialProxyTokenVolume            = "credential-proxy-token"                       // #nosec G101 -- volume name
+	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- mount path
 	credentialProxyTokenFile              = "token"
 	credentialProxyTokenMode              = 0444
 	credentialProxyTokenExpirationSeconds = 3600
@@ -139,6 +157,10 @@ const (
 	// get-credentials returns ($HERMES_HOME/.kubeconfigs); the pod's
 	// scratch emptyDir, the one writable place.
 	sessionHermesHome = "/scratch"
+
+	kubeProxyCAVolume    = "kube-proxy-ca"
+	kubeProxyCAMountPath = "/var/run/secrets/kubeagents/kube-proxy-ca"
+	kubeProxyCAFile      = "ca.crt"
 
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
@@ -332,7 +354,7 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 }
 
 // Spawn creates the session pod: the demo's reference worker shape — no
-// ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests —
+// ambient k8s credentials, scratch on emptyDir, the configured requests —
 // running the headless harness behind the worker adapter (W4's image).
 // Model auth, as shipped (spec-chatops-gateway.md, amended 8/31): the
 // worker talks to the install's own LiteLLM, in-namespace, with no per-pod
@@ -351,8 +373,8 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 // from a session pod.
 func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string, originSeq uint64) (string, error) {
 	name := rec.BusSession
-	// The gateway Deployment owns its sessions: when it goes — cleanupA2A on
-	// a mode flip, or any other deletion — Kubernetes GC reaps the pods it
+	// The gateway Deployment owns its sessions: when it goes — the CR's
+	// deletion, or any other — Kubernetes GC reaps the pods it
 	// spawned, closing the orphaned-session window without an operator
 	// exception to the IsControlledBy refusal. Empty on playground installs
 	// that never configured an owner.
@@ -383,7 +405,13 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			ImagePullSecrets: sessionImagePullRefs(s.cfg.ImagePullRefs),
+			RestartPolicy:    corev1.RestartPolicyNever,
+			// ndots:3, so the broker and kube-api proxy URLs (4 dots) are
+			// asked as written first: 2 DNS queries, not up to 14 (#5590).
+			DNSConfig: &corev1.PodDNSConfig{
+				Options: []corev1.PodDNSConfigOption{{Name: resolverNdotsOption, Value: ptr.To(sessionPodNdots)}},
+			},
 			// The session ServiceAccount, which holds no RBAC at all: it
 			// exists so the kubelet can mint the bus token below against an
 			// identity the callout's map is keyed on.
@@ -472,18 +500,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					{Name: "A2A_AUTHORITY_SCOPE", Value: string(s.cfg.AuthorityScope)},
 					{Name: "A2A_CAPABILITY_REQUIRED", Value: strconv.FormatBool(!s.cfg.CapabilityOptional)},
 				},
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse(workerCPURequest),
-						corev1.ResourceMemory:           resource.MustParse(workerMemoryRequest),
-						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse(workerCPULimit),
-						corev1.ResourceMemory:           resource.MustParse(workerMemoryLimit),
-						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
-					},
-				},
+				Resources: s.workerResources(),
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "scratch", MountPath: "/scratch"},
 					{Name: "bus-token", MountPath: path.Dir(lib.BusTokenPath), ReadOnly: true},
@@ -573,6 +590,12 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			corev1.EnvVar{Name: "HERMES_HOME", Value: sessionHermesHome},
 			corev1.EnvVar{Name: lib.EnvClusterView, Value: "true"},
 		)
+		if s.cfg.CredentialProxyExecURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
+		}
+		if s.cfg.UniverseDomain != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: envGoogleCloudUniverseDomain, Value: s.cfg.UniverseDomain})
+		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: credentialProxyTokenVolume,
@@ -585,6 +608,23 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				}}},
 			}},
 		})
+		if s.cfg.KubeProxyURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: s.cfg.KubeProxyURL})
+			if s.cfg.KubeProxyHostContext != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
+			}
+		}
+		if s.cfg.KubeProxyCAConfigMap != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: kubeProxyCAVolume, MountPath: kubeProxyCAMountPath, ReadOnly: true})
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+				Name: kubeProxyCAVolume,
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.KubeProxyCAConfigMap},
+					Items:                []corev1.KeyToPath{{Key: kubeProxyCAFile, Path: kubeProxyCAFile}},
+				}},
+			})
+		}
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -594,6 +634,17 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		return "", err
 	}
 	return created.Name, nil
+}
+
+func sessionImagePullRefs(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return refs
 }
 
 func (s *podSpawner) Delete(ctx context.Context, podName string) error {
@@ -703,9 +754,16 @@ func (s *podSpawner) Reusable(ctx context.Context, podName string) (bool, error)
 
 // busTransport is the stamp annoBusTransport carries: a digest of the NATS
 // URL and the CA file path the spawner hands a pod, which is what changes when
-// the bus moves to TLS.
+// the bus moves to TLS. The exec tier's address joins it when the spawner
+// hands a pod one: a pod spawned with another address, or none, would keep
+// sending commands where the tier no longer is, or past it. A spawner that
+// hands none keeps the stamp its pods already carry.
 func (s *podSpawner) busTransport() string {
-	sum := sha256.Sum256([]byte(s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile))
+	stamped := s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile
+	if s.cfg.SessionClusterView && s.cfg.CredentialProxyExecURL != "" {
+		stamped += "\n" + s.cfg.CredentialProxyExecURL
+	}
+	sum := sha256.Sum256([]byte(stamped))
 	return hex.EncodeToString(sum[:])[:busTransportLength]
 }
 
@@ -838,6 +896,16 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 		"🚦 not started: %s already running (cap %d). Wait for one to finish or `stop` one you started; an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
 		workers, g.cfg.MaxSessions))
 	return true
+}
+
+// workerResources is the session pod's requests and limits: CPU and memory
+// as the gateway was configured (Config.SessionResources, #2371), ephemeral
+// storage fixed.
+func (s *podSpawner) workerResources() corev1.ResourceRequirements {
+	r := s.cfg.sessionResources()
+	r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(workerEphemeralStorageRequest)
+	r.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(workerEphemeralStorageRequest)
+	return r
 }
 
 // ensureSessionPod spawns (or rehydrates) the session's incarnation for a

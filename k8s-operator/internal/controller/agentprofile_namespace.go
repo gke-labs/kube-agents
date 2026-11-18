@@ -56,6 +56,26 @@ const (
 	profileNetpolComponent = "profile-netpol"
 )
 
+// A deleted PlatformAgent's finalizer retries a refused delete of its
+// profile quota for profileQuotaReleaseAfter from the deletion, every
+// profileQuotaRetryEvery, then releases and leaves the quota for a later
+// PlatformAgent to adopt (adoptLeftoverProfileQuotas). Two minutes clears a
+// transient refusal (an API server restart, a webhook timing out) and is
+// short beside a helm uninstall's own wait; a refusal from RBAC or an
+// admission policy doesn't clear by waiting, so a longer bound only delays
+// the release. A var so tests can shorten it.
+var (
+	profileQuotaReleaseAfter = 2 * time.Minute
+	profileQuotaRetryEvery   = 10 * time.Second
+)
+
+// The Events the profile quota's removal on deletion and its adoption write
+// on the PlatformAgent.
+const (
+	reasonProfileQuotaLeft    = "ProfileQuotaLeft"
+	reasonProfileQuotaAdopted = "ProfileQuotaAdopted"
+)
+
 // The suffixes the profile namespace and the objects in it are named with.
 const (
 	profileNamespaceSuffix = "-profiles"
@@ -66,6 +86,12 @@ const (
 // profileNamespaceName is the namespace profile work runs in.
 func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Namespace + profileNamespaceSuffix
+}
+
+// ProfileNamespaceName is profileNamespaceName for the webhook, which names
+// the namespace in its warning on an agent outside the operator's namespace.
+func ProfileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
+	return profileNamespaceName(agent)
 }
 
 // profileNamespaceOf is the profile namespace for a profile: the one beside
@@ -150,13 +176,12 @@ func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // interactiveProfileTiers counts the warm pools the profiles need: one per
-// (profile, tier) whose tier is interactive. Read is the only interactive
-// tier until tiers are CR data (#3659).
+// (profile, tier) whose tier's mode is interactive (#3659).
 func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 	n := 0
 	for i := range profiles {
 		for _, tier := range profiles[i].AllowedTierList() {
-			if tier == agentv1alpha1.AgentProfileTierRead {
+			if interactiveTier(&profiles[i], tier) {
 				n++
 			}
 		}
@@ -183,7 +208,7 @@ func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	pools := interactiveProfileTiers(profiles)
 	jobs := resolveProfileCeiling(agent)
 	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
-		return slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended)
+		return unattendedTierOf(&p) != ""
 	}) {
 		jobs *= 2
 	}
@@ -264,13 +289,21 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 				},
 				{
 					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, credentialProxySelector(agent)),
-					},
+					To:    profileBrokerPeers(agent),
 				},
 			},
 		},
 	}
+}
+
+// profileBrokerPeers is the broker in the agent's namespace, and the exec
+// tier while it renders: /v1/exec admits the profile role on both.
+func profileBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+	}
+	return peers
 }
 
 // profileNamespacePeer admits every pod in the profile namespace, for the
@@ -330,9 +363,19 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		if err == nil {
 			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
 				"namespace", profileNamespaceName(agent))
+			// Nothing is written there while it is absent (its RoleBinding is
+			// absent with it), so its denials must not stand
+			// against this agent; Observe adds it back the pass it returns.
+			r.RBAC.Forget(profileNamespaceName(agent))
 		}
 		return false, err
 	}
+	// The namespace exists, so the operator's writes there are about to
+	// start: the RBAC self-check probes the namespaced Role's verbs in it
+	// from now on (once inline, then on the ticker), and reportRBACSkew
+	// reads the denials as this agent's. handleDeletion forgets it, and so
+	// does the branch above once the namespace is gone.
+	r.RBAC.Observe(profileNamespaceName(agent))
 	if err := r.applyManaged(ctx, agent, buildProfileNetworkPolicy(agent, dnsClusterIPs)); err != nil {
 		return false, fmt.Errorf("failed to apply the profile NetworkPolicy: %w", err)
 	}
@@ -399,18 +442,87 @@ func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, age
 	if err := r.applyManaged(ctx, agent, buildProfileQuota(agent, profiles)); err != nil {
 		return fmt.Errorf("failed to apply the profile ResourceQuota: %w", err)
 	}
+	r.adoptLeftoverProfileQuotas(ctx, agent)
 	return nil
 }
 
+// removeProfileQuotaOnDeletion deletes this agent's profile quota while its
+// finalizer holds the PlatformAgent. A refused delete is retried until
+// profileQuotaReleaseAfter has passed since the deletion; the answer is how
+// long to wait before the next try, zero to go on releasing. Past the bound
+// it releases with a Warning naming the quota it left, so a deletion never
+// hangs on the profile namespace. The fence is left for the chart's
+// uninstall: the bus fence that admits the namespace is garbage-collected
+// after the PlatformAgent, and removing the profile fence first would admit
+// an unfenced namespace in between.
+func (r *PlatformAgentReconciler) removeProfileQuotaOnDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent, now time.Time) time.Duration {
+	err := r.deleteProfileQuota(ctx, agent)
+	if err == nil {
+		return 0
+	}
+	ns, name := profileNamespaceName(agent), profileQuotaName(agent)
+	if agent.DeletionTimestamp != nil && now.Sub(agent.DeletionTimestamp.Time) < profileQuotaReleaseAfter {
+		logf.FromContext(ctx).Error(err, "profile namespace: the quota's delete was refused on deletion; retrying",
+			"namespace", ns, "quota", name, "releaseAfter", profileQuotaReleaseAfter)
+		return profileQuotaRetryEvery
+	}
+	logf.FromContext(ctx).Error(err, "profile namespace: releasing with the quota left", "namespace", ns, "quota", name)
+	r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileQuotaLeft,
+		fmt.Sprintf("profile namespace %s: left ResourceQuota %s, whose delete was still refused %s after the deletion: %v. A later PlatformAgent in %s removes it.",
+			ns, name, profileQuotaReleaseAfter, err, agent.Namespace))
+	return 0
+}
+
+// adoptLeftoverProfileQuotas removes a profile quota a deleted PlatformAgent
+// left in this agent's profile namespace (removeProfileQuotaOnDeletion), so a
+// successor of another name isn't capped by it: Kubernetes enforces every
+// quota in a namespace. Only an operator-rendered profile quota whose
+// PlatformAgent (<ns>/<name> from <name>-profile-quota in <ns>-profiles) no
+// longer exists is removed. A failure is logged and never stops the pass.
+func (r *PlatformAgentReconciler) adoptLeftoverProfileQuotas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	var quotas corev1.ResourceQuotaList
+	if err := r.a2aReader().List(ctx, &quotas, client.InNamespace(profileNamespaceName(agent)),
+		client.MatchingLabels{a2aComponentLabel: profileQuotaComponent, labelManagedBy: fieldOwner}); err != nil {
+		r.profileNamespaceFailure(ctx, agent, "list the quotas to adopt a leftover one", err)
+		return
+	}
+	for i := range quotas.Items {
+		q := &quotas.Items[i]
+		if renderedByAgent(q, agent, profileQuotaComponent) {
+			continue
+		}
+		owner, ok := strings.CutSuffix(q.Name, profileQuotaSuffix)
+		if !ok || owner == "" {
+			continue
+		}
+		err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: owner}, &agentv1alpha1.PlatformAgent{})
+		if !apierrors.IsNotFound(err) {
+			if err != nil {
+				r.profileNamespaceFailure(ctx, agent, "read the PlatformAgent a leftover quota names", err)
+			}
+			continue
+		}
+		// Preconditioned on what was read, so a PlatformAgent of the old name
+		// created since, which applies over the same quota, keeps it.
+		switch err := r.Delete(ctx, q, client.Preconditions{UID: &q.UID, ResourceVersion: &q.ResourceVersion}); {
+		case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
+			continue
+		case err != nil:
+			r.profileNamespaceFailure(ctx, agent, "remove the leftover quota "+q.Name, err)
+			continue
+		}
+		r.recordEvent(agent, corev1.EventTypeNormal, reasonProfileQuotaAdopted,
+			fmt.Sprintf("profile namespace %s: removed ResourceQuota %s, left by deleted PlatformAgent %s", q.Namespace, q.Name, owner))
+	}
+}
+
 // deleteProfileQuota and deleteProfileFence remove what this agent rendered
-// into the profile namespace, for the flip back to today (deleting the
-// PlatformAgent doesn't remove them yet: #3827). Those objects
-// carry no owner reference, so nothing else reclaims them, and an install
-// that isn't running next should look like it never did. An object of that
-// name that this agent's labels don't mark as its own is left to its owner,
-// like the callout's unowned ClusterRoleBinding. cleanupA2A removes the
-// fence last, after the bus fence that admits the namespace is gone; a pass
-// that dies before then leaves a fence that only restricts.
+// into the profile namespace (deleting the PlatformAgent removes the quota,
+// removeProfileQuotaOnDeletion, and leaves the fence for the chart's
+// uninstall). Those objects carry no owner reference, so nothing else
+// reclaims them. An object of that name that this agent's labels don't mark
+// as its own is left to its owner, like the callout's unowned
+// ClusterRoleBinding.
 func (r *PlatformAgentReconciler) deleteProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), profileQuotaComponent)
 }
@@ -432,10 +544,9 @@ func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent
 	return nil
 }
 
-// profileFenceRendered reports whether this agent's profile fence exists,
-// for cleanupA2A's sentinels: it is the first write of
-// reconcileA2ANetworkFences, and it carries no owner reference, so the
-// owner test the other sentinels use can't see it.
+// profileFenceRendered reports whether this agent's profile fence exists: it
+// is the first write of reconcileA2ANetworkFences, and it carries no owner
+// reference, so an owner test can't see it.
 func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	var np networkingv1.NetworkPolicy
 	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)

@@ -29,7 +29,7 @@ CR = {
         "creationTimestamp": "2026-10-01T12:00:00Z",
     },
     "spec": {
-        "mode": "today",
+        "mode": "next",
         "harness": {"clusterName": CLUSTER, "projectId": PROJECT, "location": "us-central1", "memory": {"memoryEnabled": "false", "provider": "multiuser_memory"}},
         "scope": {"projects": ["acme-scope-dev"], "exclude": {"clusters": ["old-cluster"]}},
         "integration": {"gitops": {"repository": "acme/gitops"}},
@@ -70,6 +70,9 @@ CR = {
             "proposalsFromScheduled": 0,
             "proposalsFromIssue": 0,
             "proposalsFromOther": 0,
+            "inputTokensTotal": 98765432,
+            "outputTokensTotal": 1234567,
+            "spendMicrosUSDTotal": 2512345678,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "lastHumanActiveTime": "2026-10-20T16:10:00Z",
             "activeInterfaces": ["googlechat"],
@@ -202,7 +205,7 @@ class RenderTest(unittest.TestCase):
         # The full fixture fills the block: a new line moves the cap with it.
         self.assertEqual(len(lines), fs.SUMMARY_MAX_LINES)
         self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n", text)
-        self.assertIn("mode: today", text)
+        self.assertIn("mode: next", text)
         self.assertIn(f"version: {TAG}", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
         self.assertIn("kubernetes: v1.33.4-gke.1234000", text)
@@ -246,7 +249,7 @@ class RenderTest(unittest.TestCase):
 
     def test_audit_matches_whole_tokens_only(self):
         text = fs.render(full_snapshot())
-        self.assertEqual(fs.audit(text, ["kube-agents", "today", "usage", "0.14"]), [])
+        self.assertEqual(fs.audit(text, ["kube-agents", "next", "usage", "0.14"]), [])
         self.assertEqual(fs.audit("version: 0.14.0-rc", ["0.14.0"]), [])
         self.assertEqual(fs.audit("cluster prod-eu-1 here", ["prod-eu-1"]), ["prod-eu-1"])
 
@@ -255,12 +258,12 @@ class RenderTest(unittest.TestCase):
         for expected in (CLUSTER, PROJECT, NAMESPACE, "us-central1", "acme-scope-dev", "old-cluster", "acme/gitops", "platform-agent"):
             self.assertIn(expected, ids)
         self.assertNotIn(TAG, ids)
-        self.assertNotIn("today", ids)
+        self.assertNotIn("next", ids)
 
     def test_a_namespace_named_kube_agents_is_not_a_leak(self):
         cr = json.loads(json.dumps(CR))
         cr["metadata"]["namespace"] = "kube-agents"
-        cr["spec"]["harness"]["clusterName"] = "today"
+        cr["spec"]["harness"]["clusterName"] = "next"
         snapshot = full_snapshot(cr=cr)
         self.assertEqual(fs.audit(fs.render(snapshot), snapshot.identifiers), [])
 
@@ -300,6 +303,21 @@ class RenderTest(unittest.TestCase):
         self.assertIn("tokens: in 1200100 / out 34000", text)
         self.assertIn("spend: 2.91 USD", text)
         self.assertIn("latency p50 2.3s / p95 17.5s", text)
+
+    def test_the_totals_since_install_come_from_the_status_above_the_live_lines(self):
+        text = fs.render(full_snapshot())
+        self.assertIn(
+            "performance:\n  tokens (since install): in 98765432 / out 1234567\n  spend (since install): 2512.35 USD\n  tokens: in 1200100 / out 34000\n",
+            text,
+        )
+
+    def test_a_status_without_the_totals_prints_zeroes_and_the_live_lines_still_degrade(self):
+        cr = json.loads(json.dumps(CR))
+        for field in fs.PERFORMANCE_TOTAL_FIELDS:
+            del cr["status"]["usage"][field]
+        text = fs.render(full_snapshot(cr=cr, litellm_metrics=None, sources={"session-kv": True, "litellm-metrics": False}))
+        self.assertIn("  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n  tokens: unavailable\n  spend: unavailable\n", text)
+        self.assertEqual(fs.audit(text, full_snapshot(cr=cr).identifiers), [])
 
     def test_missing_sources_degrade_to_unavailable_lines(self):
         cr = json.loads(json.dumps(CR))
@@ -477,13 +495,19 @@ class RenderTest(unittest.TestCase):
             [f"proposalsFrom{origin}" for origin in ("Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other")],
         )
 
-    def test_next_mode_and_interfaces_are_printed_as_enums(self):
+    def test_the_mode_and_interfaces_are_printed_as_enums(self):
         cr = json.loads(json.dumps(CR))
-        cr["spec"]["mode"] = "next"
         cr["status"]["usage"]["activeInterfaces"] = ["slack", "googlechat"]
         text = fs.render(full_snapshot(cr=cr))
         self.assertIn("mode: next", text)
         self.assertIn("interfaces: googlechat, slack", text)
+
+    def test_an_absent_mode_prints_next(self):
+        # The deprecated field defaults to `next` in the CRD; a CR read before
+        # the default applied prints the same.
+        cr = json.loads(json.dumps(CR))
+        del cr["spec"]["mode"]
+        self.assertIn("mode: next", fs.render(full_snapshot(cr=cr)))
 
 
 class ParsingTest(unittest.TestCase):
@@ -846,7 +870,7 @@ class MainTest(unittest.TestCase):
         self.assertIn(f"hosted_vllm/{CLUSTER}/llama-8b", out.getvalue())
 
     def test_the_audit_skips_the_model_line_and_nothing_else(self):
-        text = f"```\n  mode: today\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
+        text = f"```\n  mode: next\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
         stripped = fs._without_fixed_lines(text)
         self.assertNotIn("model:", stripped)
         self.assertIn(f"  kubernetes: {CLUSTER}", stripped)
@@ -904,6 +928,17 @@ class GatewayCopyTest(unittest.TestCase):
 
     def test_the_gateway_prints_the_same_environment_lines(self):
         self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))
+
+    def test_the_gateway_prints_the_same_totals_since_install(self):
+        """The fields the gateway's render reads, in the order it reads them, through the
+        constants it names; the test reads the render itself, not a list beside it."""
+        source = self.GO_FILE.read_text()
+        start = source.index("func renderUsageSummary(")
+        body = source[start : source.index("\nfunc ", start + 1)]
+        names = re.findall(r"usage\[(usageSummary\w+Field)\]", body)
+        values = [re.search(rf'{name}\s*=\s*"([A-Za-z0-9]+)"', source).group(1) for name in names]
+        self.assertEqual(list(fs.PERFORMANCE_TOTAL_FIELDS), values)
+        self.assertEqual(fs.MICROS_PER_USD, int(float(re.search(r'usageSummaryMicrosPerUSD\s*=\s*([0-9_.]+)', source).group(1).replace("_", ""))))
 
     def test_the_gateway_names_the_same_source_for_each_reading(self):
         source = self.GO_FILE.read_text()

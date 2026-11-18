@@ -32,7 +32,7 @@ _TF_VARIABLES = _REPO_ROOT / "terraform" / "examples" / "full-install" / "variab
 _RECONCILE_SH = _REPO_ROOT / "scripts" / "release" / "reconcile_environment.sh"
 _UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
 
-_LONG_LIVED = ("autopush", "autopush-next", "staging")
+_LONG_LIVED = ("autopush", "staging")
 
 
 def _executable_lines(chunk):
@@ -250,6 +250,29 @@ class LifecyclePlanTest(unittest.TestCase):
                 self.assertIn(branch, guarded, guarded)
         self.assertEqual([name for name, called in guarded.items() if called], ["apply"])
 
+    def test_apply_guards_the_stockout_trio_before_terraform_runs(self):
+        """Like the drift trio, the stockout trio is never adopted by name, so
+        guard_stockout_adoption must run ahead of terraform apply."""
+        apply_branch = _executable_lines(
+            re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                      re.MULTILINE | re.DOTALL).group(1))
+        self.assertIn("guard_stockout_adoption", apply_branch)
+        self.assertLess(apply_branch.index("guard_stockout_adoption"),
+                        apply_branch.index("terraform apply"))
+
+    def test_the_stockout_guard_is_in_no_branch_but_apply(self):
+        """Only apply creates resources, so plan and destroy must not run guard_stockout_adoption."""
+        dispatch = self.text[self.text.index('case "${1:-}" in'):]
+        branches = re.split(r"^  (\w[\w-]*)\)$", dispatch, flags=re.MULTILINE)
+        guarded = {
+            branches[i]: "guard_stockout_adoption" in _executable_lines(branches[i + 1])
+            for i in range(1, len(branches) - 1, 2)
+        }
+        for branch in ("apply", "plan", "destroy"):
+            with self.subTest(branch=branch):
+                self.assertIn(branch, guarded, guarded)
+        self.assertEqual([name for name, called in guarded.items() if called], ["apply"])
+
     def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
         """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""
         destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,
@@ -393,7 +416,7 @@ class ReconcileWorkflowTest(unittest.TestCase):
 
     def test_every_deploy_dispatch_can_pass_the_bypass(self):
         """The deploy workflows' own image_tag dispatch is where a refused rollback is retried."""
-        for name in ("autopush-deploy.yml", "autopush-next-deploy.yml", "staging-deploy.yml"):
+        for name in ("autopush-deploy.yml", "staging-deploy.yml"):
             with self.subTest(workflow=name):
                 doc = _doc(_WORKFLOWS / name)
                 triggers = doc.get("on") or doc.get(True)
@@ -514,7 +537,7 @@ class PreflightLookupTest(unittest.TestCase):
                 "GITHUB_API_URL": "https://api.github.invalid",
                 "GH_TOKEN": "token",
                 "REPOSITORY": "gke-labs/kube-agents",
-                "TARGET": "autopush-next",
+                "TARGET": "unprovisioned",
                 "SKIP_UNCONFIGURED": "true",
             }
             proc = subprocess.run(["bash", "-c", self.script], env=env, capture_output=True, text=True, check=False)
@@ -564,10 +587,9 @@ class DriftWorkflowTest(unittest.TestCase):
         report = self.doc["jobs"]["report"]["strategy"]["matrix"]["environment"]
         self.assertEqual(sorted(report), sorted(plan))
 
-    def test_only_autopush_next_may_skip_while_unprovisioned(self):
+    def test_no_environment_may_skip_while_unprovisioned(self):
         """A missing autopush or staging is a failure, not something to skip."""
-        self.assertEqual(self.doc["jobs"]["plan"]["with"]["skip_unconfigured"],
-                         "${{ matrix.environment == 'autopush-next' }}")
+        self.assertNotIn("skip_unconfigured", self.doc["jobs"]["plan"]["with"])
 
     def test_it_pins_no_image_tag(self):
         """Otherwise the report conflates image lag with infrastructure drift."""
@@ -671,7 +693,7 @@ class RebuildLeaseGuardTest(unittest.TestCase):
                 "FAKE_LEASE": lease,
                 "FAKE_STATE": state,
                 "FAKE_PROJECT_CLUSTERS": project_clusters,
-                "TARGET": "autopush-next",
+                "TARGET": "staging",
                 "GCP_PROJECT_ID": "p",
                 "GCP_REGION": "us-central1",
                 "GKE_CLUSTER_NAME": "platform-agent-host",

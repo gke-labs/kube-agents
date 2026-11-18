@@ -136,8 +136,8 @@
 # Isolation class: namespace-scoped. Eligible tier: nightly.
 #
 # REGISTERED in hack/eval/nightly-cases.txt on 2026-10-20, at the 900s drift
-# band, and listed in hack/eval/nightly-main-b.txt so the two halves' chains
-# stay balanced. It holds lock-infra for its whole run, as every case with a
+# band, and listed in hack/eval/nightly-main-c.txt so the main shards' stack
+# chains stay balanced. It holds lock-infra for its whole run, as every case with a
 # `stack:` does.
 #
 # What it waited for was room on that chain, and what provided it was the

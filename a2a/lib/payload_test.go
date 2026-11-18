@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSteerNoticeRoundTrips(t *testing.T) {
@@ -268,5 +269,241 @@ func TestTaskParametersOfRefusesTwoParts(t *testing.T) {
 	two, _ := TaskParametersPart(TaskParameters{Parameters: map[string]string{"cluster": "prod-1"}})
 	if _, ok, err := TaskParametersOf([]Part{one, two}); !ok || err == nil {
 		t.Fatalf("ok=%v err=%v, want found and refused", ok, err)
+	}
+}
+
+// changeRequested is omitted when false, so a submission that asks for no
+// change is byte-identical to one written before the field existed, and an
+// absent field reads as false.
+func TestTaskParametersChangeRequestedRoundTrip(t *testing.T) {
+	off, err := TaskParametersPart(TaskParameters{})
+	if err != nil || string(off.Data) != `{"taskParameters":{"parameters":{}}}` {
+		t.Fatalf("no change: part = %s, %v", off.Data, err)
+	}
+	on, err := TaskParametersPart(TaskParameters{ChangeRequested: true})
+	if err != nil || string(on.Data) != `{"taskParameters":{"parameters":{},"changeRequested":true}}` {
+		t.Fatalf("change: part = %s, %v", on.Data, err)
+	}
+	for _, tc := range []struct {
+		part Part
+		want bool
+	}{{off, false}, {on, true}} {
+		got, ok, err := TaskParametersOf([]Part{tc.part})
+		if err != nil || !ok || got.ChangeRequested != tc.want {
+			t.Errorf("TaskParametersOf(%s) = %+v, %v, %v; want changeRequested %v", tc.part.Data, got, ok, err, tc.want)
+		}
+	}
+}
+
+func TestDelegateTargetsRoundTrip(t *testing.T) {
+	want := DelegateTargets{Targets: []DelegateTarget{
+		{Name: "platform", Description: "the platform agent"},
+		{Name: "e2e5", Description: "reads one cluster's workloads"},
+	}}
+	part, err := DelegateTargetsPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := Part{Kind: "text", Text: "use e2e5"}
+	got, ok, err := DelegateTargetsOf([]Part{text, part})
+	if err != nil || !ok {
+		t.Fatalf("DelegateTargetsOf = %v %v", ok, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, ok, err := DelegateTargetsOf([]Part{text}); ok || err != nil {
+		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+}
+
+func TestDelegateTargetsRefuseWhatIsNotAnAddresseeOrOneLine(t *testing.T) {
+	for name, tgt := range map[string]DelegateTarget{
+		"a dotted name":         {Name: "a.b"},
+		"a wildcard":            {Name: "*"},
+		"no name":               {Name: ""},
+		"a two-line blurb":      {Name: "p", Description: "first\nsecond"},
+		"a blurb over the cap":  {Name: "p", Description: strings.Repeat("x", DelegateTargetDescriptionMax+1)},
+		"a blurb with a tab":    {Name: "p", Description: "a\tb"},
+		"a blurb padded by two": {Name: "p", Description: "a  b"},
+	} {
+		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{tgt}}); err == nil {
+			t.Errorf("%s: built, want refused", name)
+		}
+		raw, _ := json.Marshal(map[string]DelegateTargets{"delegateTargets": {Targets: []DelegateTarget{tgt}}})
+		if _, ok, err := DelegateTargetsOf([]Part{{Kind: "data", Data: raw}}); !ok || err == nil {
+			t.Errorf("%s: read ok=%v err=%v, want an error", name, ok, err)
+		}
+	}
+	over := make([]DelegateTarget, DelegateTargetsMax+1)
+	for i := range over {
+		over[i] = DelegateTarget{Name: fmt.Sprintf("p%d", i)}
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: over}); err == nil {
+		t.Error("more than the cap: built, want refused")
+	}
+	raw := []byte(`{"delegateTargets":{}}`)
+	if _, ok, err := DelegateTargetsOf([]Part{{Kind: "data", Data: raw}}); !ok || err == nil {
+		t.Errorf("no targets list: ok=%v err=%v, want an error", ok, err)
+	}
+}
+
+func TestDelegateTargetDescriptionFoldsToOneLineUnderTheCap(t *testing.T) {
+	if got := DelegateTargetDescription("  reads\none\tcluster\x00  "); got != "reads one cluster" {
+		t.Fatalf("got %q", got)
+	}
+	long := strings.Repeat("é", DelegateTargetDescriptionMax) // two bytes a rune
+	got := DelegateTargetDescription(long)
+	if len(got) > DelegateTargetDescriptionMax || !utf8.ValidString(got) {
+		t.Fatalf("cut to %d bytes, valid=%v", len(got), utf8.ValidString(got))
+	}
+}
+
+func TestDelegateTargetsHoldParametersAndTheByteBound(t *testing.T) {
+	ok := DelegateTargets{Targets: []DelegateTarget{{Name: "c", Parameters: []ProfileParameter{{Name: "cluster", Required: true}}}}, Truncated: true}
+	part, err := DelegateTargetsPart(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := DelegateTargetsOf([]Part{part}); err != nil || !reflect.DeepEqual(got, ok) {
+		t.Fatalf("round trip = %+v %v", got, err)
+	}
+	bad := DelegateTargets{Targets: []DelegateTarget{{Name: "c", Parameters: []ProfileParameter{{Name: "Cluster"}}}}}
+	if _, err := DelegateTargetsPart(bad); err == nil {
+		t.Error("a parameter that isn't an identifier: built, want refused")
+	}
+	var many []ProfileParameter
+	for i := 0; i <= TaskParametersMax; i++ {
+		many = append(many, ProfileParameter{Name: fmt.Sprintf("p%d", i)})
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "c", Parameters: many}}}); err == nil {
+		t.Error("more parameters than the cap: built, want refused")
+	}
+	var huge []DelegateTarget
+	for i := 0; i < DelegateTargetsMax; i++ {
+		var ps []ProfileParameter
+		for j := 0; j < TaskParametersMax; j++ {
+			ps = append(ps, ProfileParameter{Name: fmt.Sprintf("parameter_number_%02d", j)})
+		}
+		huge = append(huge, DelegateTarget{Name: fmt.Sprintf("p%d", i), Description: strings.Repeat("x", DelegateTargetDescriptionMax), Parameters: ps})
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: huge}); err == nil {
+		t.Errorf("a list past %d bytes: built, want refused", DelegateTargetsMaxBytes)
+	}
+}
+
+// A cut that lands after a space doesn't leave it trailing: the description
+// reads back as itself, so the gateway's own cut never fails the reader.
+func TestDelegateTargetDescriptionIsStableAcrossTheCut(t *testing.T) {
+	s := strings.Repeat("a", DelegateTargetDescriptionMax-1) + " tail words here"
+	got := DelegateTargetDescription(s)
+	if strings.HasSuffix(got, " ") || DelegateTargetDescription(got) != got {
+		t.Fatalf("cut to %q, which doesn't read back as itself", got[len(got)-5:])
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "p", Description: got}}}); err != nil {
+		t.Fatalf("the cut description doesn't build a part: %v", err)
+	}
+}
+
+// A batch rides the optional tasks list, beside the single fields, and a
+// request without one is the single shape on the wire, byte for byte.
+func TestADelegateBatchRoundTripsAndTheSingleShapeIsUnchanged(t *testing.T) {
+	data, err := json.Marshal(DelegateRequest{Tasks: []DelegateTask{
+		{Addressee: "cluster", Text: "look at dev", Parameters: map[string]string{"cluster": "dev"}},
+		{Addressee: "platform", Text: "and the fleet"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"tasks":[{"addressee":"cluster","text":"look at dev","parameters":{"cluster":"dev"}},{"addressee":"platform","text":"and the fleet"}]}`
+	if string(data) != want {
+		t.Fatalf("wire = %s\nwant   %s", data, want)
+	}
+	var got DelegateRequest
+	if err := json.Unmarshal(data, &got); err != nil || len(got.Tasks) != 2 || got.Tasks[0].Parameters["cluster"] != "dev" {
+		t.Fatalf("decoded %+v, %v", got, err)
+	}
+	single, _ := json.Marshal(DelegateRequest{Addressee: "platform", Text: "do it"})
+	if string(single) != `{"addressee":"platform","text":"do it"}` {
+		t.Fatalf("single wire = %s", single)
+	}
+}
+
+// DelegateEntries is the request as entries to mint: one for the single
+// shape, each batch entry for a batch.
+func TestDelegateEntriesReadsEitherShape(t *testing.T) {
+	single := DelegateRequest{Addressee: "platform", Text: "x", Parameters: map[string]string{"a": "b"}}
+	if got := single.Entries(); len(got) != 1 || got[0].Addressee != "platform" || got[0].Text != "x" || got[0].Parameters["a"] != "b" {
+		t.Fatalf("single entries = %+v", got)
+	}
+	batch := DelegateRequest{Tasks: []DelegateTask{{Addressee: "a", Text: "1"}, {Addressee: "b", Text: "2"}}}
+	if got := batch.Entries(); len(got) != 2 || got[1].Addressee != "b" {
+		t.Fatalf("batch entries = %+v", got)
+	}
+	if !batch.IsBatch() || single.IsBatch() {
+		t.Fatal("IsBatch reads the wrong shape")
+	}
+}
+
+func TestValidateDelegateRequest(t *testing.T) {
+	entry := DelegateTask{Addressee: "platform", Text: "x"}
+	many := make([]DelegateTask, DelegateBatchMax+1)
+	for i := range many {
+		many[i] = entry
+	}
+	for name, tc := range map[string]struct {
+		req  DelegateRequest
+		want string
+	}{
+		"the single shape":         {req: DelegateRequest{Addressee: "platform", Text: "x"}},
+		"a batch at the ceiling":   {req: DelegateRequest{Tasks: many[:DelegateBatchMax]}},
+		"both shapes set":          {req: DelegateRequest{Addressee: "platform", Text: "x", Tasks: []DelegateTask{entry}}, want: "either"},
+		"parameters beside tasks":  {req: DelegateRequest{Parameters: map[string]string{"a": "b"}, Tasks: []DelegateTask{entry}}, want: "either"},
+		"an empty batch":           {req: DelegateRequest{Tasks: []DelegateTask{}}, want: "empty"},
+		"a batch over the ceiling": {req: DelegateRequest{Tasks: many}, want: fmt.Sprintf("at most %d", DelegateBatchMax)},
+		"an entry over the cap": {req: DelegateRequest{Tasks: []DelegateTask{entry, {Addressee: "platform", Text: strings.Repeat("x", DelegateTextCap+1)}}},
+			want: "task 2"},
+		"an entry with blank text": {req: DelegateRequest{Tasks: []DelegateTask{entry, {Addressee: "platform", Text: " "}}}, want: "task 2"},
+		"single text over the cap": {req: DelegateRequest{Addressee: "platform", Text: strings.Repeat("x", DelegateTextCap+1)}, want: "too long"},
+		"single blank text":        {req: DelegateRequest{Addressee: "platform", Text: " "}, want: "text"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateDelegateRequest(tc.req)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one naming %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The width a turn may fan out to rides the delegateTargets part, absent
+// meaning one, and is held to the batch ceiling like everything else there.
+func TestDelegateTargetsCarryTheWidth(t *testing.T) {
+	want := DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}, WidthMax: 4}
+	part, err := DelegateTargetsPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := DelegateTargetsOf([]Part{part})
+	if err != nil || !ok || got.WidthMax != 4 || got.Width() != 4 {
+		t.Fatalf("got %+v ok=%v err=%v", got, ok, err)
+	}
+	if w := (DelegateTargets{}).Width(); w != 1 {
+		t.Fatalf("absent width = %d, want 1", w)
+	}
+	plain, _ := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}})
+	if strings.Contains(string(plain.Data), "widthMax") {
+		t.Fatalf("an unset width is on the wire: %s", plain.Data)
+	}
+	for _, w := range []int{-1, DelegateBatchMax + 1} {
+		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, WidthMax: w}); err == nil {
+			t.Errorf("width %d accepted", w)
+		}
 	}
 }

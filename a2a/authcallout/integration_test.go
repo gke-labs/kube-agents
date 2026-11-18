@@ -292,6 +292,8 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("the rendered nats.conf was refused by the server: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
+	// The rendered pid_file is the bus pod's path.
+	opts.PidFile = t.TempDir() + "/nats.pid"
 	serverConnectBudget(opts)
 	// Ports, paths and the connect budget are the only things a test may
 	// move: the render pins 4222, 8222 and 9222 and a JetStream store at

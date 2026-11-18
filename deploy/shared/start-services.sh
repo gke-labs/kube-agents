@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entrypoint for the credential-proxy container.
 #
-# Four peer services live here, not one service with helpers. They share a
+# Five peer services live here, not one service with helpers. They share a
 # container because they all need credentials, and credentials are deliberately
 # kept out of the agent sandbox — not because any of them belongs to another:
 #
@@ -10,6 +10,8 @@
 #   k8s-event-watcher     watches cluster API servers and reports events
 #   drift-detector        reads GKE admin-activity audit records from Pub/Sub
 #                         and reports the ones a person made outside git
+#   audit_report_store.py the broker-only audit-report store listener, in the
+#                         api-proxy role only (start_audit_report_store)
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
 # run in the same pod. It is the same variable and the same four values
@@ -89,6 +91,17 @@ DRIFT_HEALTHY_RUN_SECONDS="${DRIFT_HEALTHY_RUN_SECONDS:-120}"
 # consequence rather than logged as an exit. Three, as for the watcher: one is
 # ordinary during startup, and by the third the cause is not transient.
 DRIFT_SHORT_EXIT_ALERT_COUNT="${DRIFT_SHORT_EXIT_ALERT_COUNT:-3}"
+
+# The audit-report store listener's restart policy (start_audit_report_store),
+# retried in place like the watcher. Fixed, not read from the environment:
+# spec.deployment.env reaches this container unfiltered.
+readonly AUDIT_REPORT_STORE_RETRY_MIN_SECONDS=5
+readonly AUDIT_REPORT_STORE_RETRY_MAX_SECONDS=300
+readonly AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS=60
+# The listener itself. Run as a script, which binds port 8700
+# (audit_report_store.LISTEN_PORT, auditReportStorePort in the operator) so
+# that a port another process in the pod already holds is a loud ALERT naming it.
+readonly AUDIT_REPORT_STORE_SCRIPT=/opt/defaults/scripts/audit_report_store.py
 
 # Where the watcher and the detector post. Not overridable, unlike the values
 # above: it is the Session KV server on this pod's loopback, fixed by where those
@@ -317,7 +330,8 @@ duration_nanoseconds() {
 # into `--flag=${value}`, and one the watcher rejects is an exit on every start
 # -- the supervisor's backoff, `NO cluster events are being watched`, and a
 # container that stays Ready -- for a missing unit. $3, when set, also refuses
-# zero, for the flag whose validate() requires a value above it.
+# zero, for a flag whose validate() refuses zero or whose zero the watcher
+# replaces with its default without a log line.
 normalize_duration() {
   local name="$1"
   local fallback="$2"
@@ -343,21 +357,24 @@ normalize_duration() {
 # Rewrite the *named* variable, in place, to a decimal count the watcher's flag
 # parser accepts, or to $2 if it is not one. Leading zeros are dropped rather
 # than reported, as clamp_at_least drops them: `08` and `8` are the same
-# request, and only the binary would have read them differently.
+# request, and only the binary would have read them differently. $3, when set,
+# also refuses zero, for a count the watcher replaces with its default without
+# a log line.
 normalize_count() {
   local name="$1"
   local fallback="$2"
+  local positive="${3:-}"
   local value="${!name}"
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
 
-  if [[ "${value}" =~ ${WATCHER_COUNT_PATTERN} ]]; then
+  if [[ "${value}" =~ ${WATCHER_COUNT_PATTERN} ]] && { [[ -z "${positive}" ]] || ((10#${value} > 0)); }; then
     printf -v "${name}" '%s' "$((10#${value}))"
     return 0
   fi
 
   printf -v "${name}" '%s' "${fallback}"
-  echo "start-services: ${name}=${value} is not a usable count (decimal digits); using ${fallback}" >&2
+  echo "start-services: ${name}=${value} is not a usable count (decimal digits${positive:+, above zero}); using ${fallback}" >&2
 }
 
 clamp_at_least WATCHER_RETRY_MIN_SECONDS
@@ -419,9 +436,10 @@ readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # window plus margin, inside a 30s default grace with the Envoy kill after it.
 # In the api-proxy role the runtime installs no handler and exits on the
 # signal, so the wait there is one poll. The broker and exec roles drain longer
-# and wait BROKER_RUNTIME_DRAIN_SECONDS instead (below).
+# and wait BROKER_RUNTIME_DRAIN_SECONDS or EXEC_RUNTIME_DRAIN_SECONDS instead
+# (below).
 readonly RUNTIME_DRAIN_SECONDS=10
-# The standalone broker pod's runtime, and an exec pod's, drains longer: it
+# The standalone broker pod's runtime drains longer: it
 # refuses new requests and gives those in flight up to credential_proxy.py's own
 # SHUTDOWN_DRAIN_SECONDS (30s from the signal, the 3s settle inside it), then
 # ends the commands still running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for
@@ -431,6 +449,14 @@ readonly RUNTIME_DRAIN_SECONDS=10
 # inside the 45s terminationGracePeriodSeconds the operator gives the broker pod
 # (credentialProxyTerminationGraceSeconds), Envoy's kill after it.
 readonly BROKER_RUNTIME_DRAIN_SECONDS=40
+# An exec pod's runtime drains for as long as the longest command it admits:
+# credential_proxy.py's EXEC_SHUTDOWN_DRAIN_SECONDS (360s from the signal), then
+# its SHUTDOWN_END_WAIT_SECONDS (5s); the exec role starts no Chat relay, so
+# nothing is handed back. 370s holds those 365s and one poll
+# (tests/test_credential_proxy_drain_budget.py), inside the 380s
+# terminationGracePeriodSeconds the operator gives an exec pod
+# (credentialProxyExecTierTerminationGraceSeconds), Envoy's kill after it.
+readonly EXEC_RUNTIME_DRAIN_SECONDS=370
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -473,8 +499,9 @@ WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/
 # This and the seven tunables below reach the watcher as flags, so each is
 # normalised where it is declared (normalize_duration, normalize_count) against
 # a default named once, as WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD is: an unset
-# value and an unusable one resolve the same way. The window is the one that
-# also refuses zero, which the watcher's validate() rejects.
+# value and an unusable one resolve the same way. The window, the scale-up hold
+# and the three counts also refuse zero: validate() rejects a zero window, and
+# the watcher replaces the others with its own default without a log line.
 readonly WATCHER_DEDUP_WINDOW_DEFAULT=24h
 WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-${WATCHER_DEDUP_WINDOW_DEFAULT}}"
 normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positive
@@ -488,7 +515,7 @@ normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positi
 # rebuilding the image. Set to 1 to restore firing on the first event.
 readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
 WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
-normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}"
+normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}" positive
 
 # The same debounce for the half of the image-pull family that self-clears —
 # registry rate limits, 5xx, connection timeouts. Only failures the watcher
@@ -499,7 +526,7 @@ normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}"
 # mirror will rarely see it apply at all. Set to 1 to disable.
 readonly WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT=3
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}}"
-normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}"
+normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}" positive
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
 # verdict on the pod: five failed scheduling attempts, with
@@ -514,7 +541,7 @@ normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANS
 # no verdict is on record.
 readonly WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT=5
 WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}}"
-normalize_count WATCHER_FAILEDSCHEDULING_MIN_COUNT "${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}"
+normalize_count WATCHER_FAILEDSCHEDULING_MIN_COUNT "${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}" positive
 
 # How long such a FailedScheduling has to have lasted, by the event's own first
 # and last sighting, before the count backstop passes it. The count alone
@@ -536,7 +563,7 @@ normalize_duration WATCHER_FAILEDSCHEDULING_MIN_SPAN "${WATCHER_FAILEDSCHEDULING
 # last said. Raise it on a cluster whose node pools take longer to provision.
 readonly WATCHER_SCALEUP_HOLD_DEFAULT=15m
 WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
-normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
+normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}" positive
 
 # The Event.Reason values the watcher forwards, and the two cluster-autoscaler
 # verdicts it reads for the FailedScheduling gate and never forwards. The
@@ -550,10 +577,11 @@ readonly EVENT_WATCHER_REASONS=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff
 UpdateFailed,DeleteFailed,DependencyNotReady,DependencyNotFound,DependencyInvalid,ManagementConflict,Unmanaged,PreActuationTransformFailed,PostActuationTransformFailed
 
 # The settle period: how long a failure in the settle family (the crash-loop
-# family, FailedMount, Unhealthy, a Failed saying "host IP unknown"; the
-# reasons kubelet re-emits while they last; and Config Connector's
-# DependencyNotReady and Unmanaged) has to have lasted, by the
-# event's own first and last sighting, before the watcher forwards it. It
+# family, FailedMount, Unhealthy, a Failed saying "host IP unknown" or
+# that a deleted pod's etc-hosts is missing; the reasons kubelet re-emits
+# while they last; and Config Connector's DependencyNotReady and Unmanaged)
+# has to have lasted, by the event's own first and last sighting, before
+# the watcher forwards it. It
 # runs after the count debounces above: a failure has to have repeated AND
 # lasted. A BackOff that clears inside it, kubelet warming its object cache on
 # a fresh Autopilot node, is not forwarded; a real crash loop crosses it on
@@ -596,19 +624,27 @@ normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "${WATCHER_AUTOPILOT_SCAL
 # Not normalised here: the watcher parses the list, and a malformed one is
 # logged as an ALERT and ignored there, so it never stops the watcher.
 WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"
+# The file the operator mounts with the same list. The watcher reads it again
+# every minute, so a change to the rules applies without a restart. When it is
+# set, the list above is not passed: the watcher refuses both.
+WATCHER_ALERT_EXCLUDE_FILE="${WATCHER_ALERT_EXCLUDE_FILE:-}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
-# from; the two proxy scripts import nothing outside the standard library, so
-# what is in it does not matter, only that it exists. Named once because a wrong
+# from; the two proxy scripts (wif_credentials.py and credential_proxy.py)
+# import nothing outside the standard library, so what is in it does not
+# matter to them, only that it exists. The audit-report store listener, the
+# third caller, is the exception: it runs under uvicorn and verifies with
+# cryptography, both of which this venv carries. Named once because a wrong
 # path here is a container that exits 127 with one line of output and no
-# indication of which of the two callers below asked for it.
+# indication of which of the three callers below asked for it.
 PROXY_PYTHON="${PROXY_PYTHON:-/opt/hermes/.venv/bin/python3}"
 
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
 drift_pid=""
+store_pid=""
 
 # Shut down every supervised process and the subshell supervising it, given the
 # supervisors' pids. Three things here are load-bearing and none is obvious: what
@@ -633,7 +669,9 @@ drift_pid=""
 # The drift-detector's handler NACKs the records it has not finished with so that
 # they redeliver rather than each costing a duplicate inject, and the watcher's
 # writes its dedup snapshot so that a restart does not replay every event still
-# inside the API server's TTL. Both take seconds; this script exits milliseconds
+# inside the API server's TTL; the audit-report store's uvicorn finishes the
+# requests it is serving, so a write is not cut between its temp file and the
+# rename. Each can take seconds; this script exits milliseconds
 # after terminate() returns, and takes the PID namespace with it.
 #
 # **The wait watches the supervisors, not their children.** With the trap above, a
@@ -694,10 +732,11 @@ wait_for_exit() {
 # that sweeps the pid's children first, and the runtime's children are the
 # brokered commands in flight (kubectl, git, gh, gcloud, each in its own
 # session), which the runtime lets finish: in the broker and exec roles it
-# drains them for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an
-# answer; in the other roles its exec route stays open for the settle window,
-# and one still running when the runtime exits dies with the pod. A sweep would
-# end them at the first instant of the stop.
+# drains them for up to SHUTDOWN_DRAIN_SECONDS or EXEC_SHUTDOWN_DRAIN_SECONDS
+# and ends the rest itself, with an answer; in the other roles its exec route
+# stays open for the settle window, and one still running when the runtime
+# exits dies with the pod. A sweep would end them at the first instant of the
+# stop.
 drain_runtime() {
   local budget="$1"
   local pid="$2"
@@ -712,14 +751,16 @@ terminate() {
   local supervisors=()
   [[ -z "${watcher_pid}" ]] || supervisors+=("${watcher_pid}")
   [[ -z "${drift_pid}" ]] || supervisors+=("${drift_pid}")
-  # One shared drain budget, not one each: the two run concurrently and the pod's
+  [[ -z "${store_pid}" ]] || supervisors+=("${store_pid}")
+  # One shared drain budget, not one each: the three run concurrently and the pod's
   # grace period does not grow with the number of processes in the container.
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
   local runtime_budget="${RUNTIME_DRAIN_SECONDS}"
   case "${CREDENTIAL_PROXY_ROLE}" in
-    broker | exec) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+    broker) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+    exec) runtime_budget="${EXEC_RUNTIME_DRAIN_SECONDS}" ;;
   esac
   [[ -z "${runtime_pid}" ]] || drain_runtime "${runtime_budget}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
@@ -939,6 +980,11 @@ start_event_watcher() {
       ;;
   esac
 
+  alert_exclude_arg=(--alert-exclude="${WATCHER_ALERT_EXCLUDE}")
+  if [ -n "${WATCHER_ALERT_EXCLUDE_FILE}" ]; then
+    alert_exclude_arg=(--alert-exclude-file="${WATCHER_ALERT_EXCLUDE_FILE}")
+  fi
+
   (
     # Leave the loop on SIGTERM instead of going round it again. bash runs a trap
     # between commands, so this one is deferred until the foreground watcher below
@@ -972,7 +1018,7 @@ start_event_watcher() {
         --settle="${WATCHER_SETTLE}" \
         --quiet-after="${WATCHER_QUIET_AFTER}" \
         --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" \
-        --alert-exclude="${WATCHER_ALERT_EXCLUDE}" || true
+        "${alert_exclude_arg[@]}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
@@ -1220,6 +1266,49 @@ start_drift_detector() {
   drift_pid=$!
 }
 
+# The audit-report store's broker-only listener (#5619,
+# agents/platform/scripts/audit_report_store.py), in the api-proxy role only:
+# the gateway pod's half, where the agent PVC the store lives on is mounted and
+# where the pod's API-audience token (event-watcher-ksa-token) is, which the
+# listener reads the cluster JWKS with. Not the platform-agent container: that
+# one holds only audience-bound tokens (docs/security-requirements.md).
+#
+# On only where the operator says so, which it does on every install that
+# renders the store (with the A2A stack), and only with exactly `1`: off is the
+# state under an operator that predates the store, so it is silent. Supervised
+# and restarted in place like the watcher (AUDIT_REPORT_STORE_RETRY_* at the
+# top), and like it not on the credential path, so its exit never ends the
+# container. It logs to the container's stderr with the other supervised
+# processes.
+
+start_audit_report_store() {
+  [[ "${AUDIT_REPORT_STORE_ENABLED:-}" == "1" ]] || return 0
+
+  if [ -z "${AUDIT_REPORT_STORE_ALLOWED_SUBJECT:-}" ] || [ -z "${AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX:-}" ]; then
+    echo "start-services: ALERT AUDIT_REPORT_STORE_ALLOWED_SUBJECT or AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX is empty, so the audit-report store refuses every request with 403 — profile workers cannot read or write fleet-audit reports. The operator sets both with AUDIT_REPORT_STORE_ENABLED." >&2
+  fi
+
+  (
+    # The watcher supervisor's trap, for the same reason: see drain_supervised.
+    trap 'exit 0' TERM
+    delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
+    while true; do
+      started=$SECONDS
+      # See AUDIT_REPORT_STORE_SCRIPT for why it runs as a script.
+      "${PROXY_PYTHON}" "${AUDIT_REPORT_STORE_SCRIPT}" || true
+      ran=$((SECONDS - started))
+      if [[ "${ran}" -ge "${AUDIT_REPORT_STORE_HEALTHY_RUN_SECONDS}" ]]; then
+        delay="${AUDIT_REPORT_STORE_RETRY_MIN_SECONDS}"
+      fi
+      echo "start-services: audit-report store exited after ${ran}s; retrying in ${delay}s" >&2
+      sleep "${delay}"
+      delay=$((delay * 2))
+      [[ "${delay}" -le "${AUDIT_REPORT_STORE_RETRY_MAX_SECONDS}" ]] || delay="${AUDIT_REPORT_STORE_RETRY_MAX_SECONDS}"
+    done
+  ) &
+  store_pid=$!
+}
+
 write_wif_credentials
 start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
@@ -1231,6 +1320,9 @@ if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "e
   # not run.
   start_event_watcher
   start_drift_detector
+fi
+if [[ "${CREDENTIAL_PROXY_ROLE}" == "api-proxy" ]]; then
+  start_audit_report_store
 fi
 
 # Only the credential-path services are waited on. The watcher and the drift

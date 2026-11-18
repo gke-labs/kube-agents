@@ -46,6 +46,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 import audit_report  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import no_live_google_auth  # noqa: E402
+import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
 import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
@@ -55,6 +57,36 @@ import workspace_paths  # noqa: E402
 # need not each carry a manifest; the guard's own tests put this back.
 REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+    # Nor does one load google.auth. The collectors that this module starts as child processes
+    # open a Cloud Monitoring session with `google.auth.default()`. In a child that has the
+    # library, the guard's variable makes that fail at once; a child without it fails at the import.
+    global _NO_GOOGLE_AUTH
+    _NO_GOOGLE_AUTH = no_live_google_auth.install()
+
+
+def tearDownModule():
+    try:
+        _NO_GOOGLE_AUTH.uninstall()
+    finally:
+        _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
+
+
+class TestNoLiveGoogleAuth(unittest.TestCase):
+    def test_no_test_in_this_module_can_load_google_auth(self):
+        no_live_google_auth.assert_in_force(self, _NO_GOOGLE_AUTH)
 
 
 def skill_text() -> str:
@@ -82,6 +114,8 @@ DECLARING_AUDIT = "obtainability-audit"
 # is the patch stream.
 NON_DECLARING_AUDIT = "ai-security-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+# The stamp a later `start` leaves in the run record (`a_later_start_lands_after_the_staleness_check`).
+LATER_START = "2099-01-01T00:00:00Z"
 # How far the run-record stamp may sit from wall-clock and still be this run's.
 # Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
 STAMP_TOLERANCE_SECONDS = 300
@@ -229,6 +263,7 @@ NUMBER_WORDS = {
             "twenty-two",
             "twenty-three",
             "twenty-four",
+            "twenty-five",
         )
     )
 }
@@ -716,6 +751,8 @@ class Recorder:
         self.cwds: list[str | None] = []
         # The payload each forge call carried, None for a command.
         self.payloads: list[dict | None] = []
+        # The (verb, target) of each forge call: the finding it named for the post-merge check.
+        self.targets: list[tuple[str, dict | None]] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # What `identity` answers for each comment author, filled from the
@@ -757,8 +794,9 @@ class Recorder:
                 return CompletedProcess(cmd, 0, payload, "")
         return CompletedProcess(cmd, 0, "", "")
 
-    def forge(self, verb, payload, repository=None):
-        """`vcs_client.forge`, answered from `replies` and `failures`."""
+    def forge(self, verb, payload, repository=None, target=None):
+        """`vcs_client.forge`, answered from `replies` and `failures`; a `target` lands in `targets`."""
+        self.targets.append((verb, target))
         payload = {k: v for k, v in dict(payload).items() if v is not None}
         if repository is not None:
             payload["repository"] = repository
@@ -1099,10 +1137,12 @@ class BaseTestCase(unittest.TestCase):
         self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
 
     @staticmethod
-    def forge_through_recorder(verb, payload, repository=None):
+    def forge_through_recorder(verb, payload, repository=None, target=None):
         recorder = audit_report.run_cmd
         if not isinstance(recorder, Recorder):
             raise AssertionError(f"forge {verb} called with no Recorder installed")
+        if target:
+            return recorder.forge(verb, payload, repository=repository, target=target)
         return recorder.forge(verb, payload, repository=repository)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
@@ -1228,6 +1268,30 @@ class BaseTestCase(unittest.TestCase):
                 *argv_extra,
             ]
         )
+
+    def a_later_start_lands_after_the_staleness_check(self):
+        """Make a later `start` rewrite the run record as soon as `finish`'s
+        `findings_predate_run` has passed (#4268). Returns the start the
+        record holds now, as an envelope carries it."""
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        own = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
+        real = audit_report.findings_predate_run
+
+        def next_start_lands_after_the_check(*args, **kwargs):
+            stale_since = real(*args, **kwargs)
+            data = json.loads(record.read_text())
+            data[audit_report.RUN_RECORD_STARTED_KEY] = LATER_START
+            record.write_text(json.dumps(data))
+            return stale_since
+
+        self.patch_attr("findings_predate_run", next_start_lands_after_the_check)
+        return datetime.fromtimestamp(audit_report._utc_seconds(own), timezone.utc).isoformat()
+
+    def assert_the_envelope_keeps_its_runs_start(self, envelope, own):
+        """The later start landed in the run record, and `envelope` carries `own`."""
+        record = json.loads(Path(audit_report.run_record_path_for(AUDIT)).read_text())
+        self.assertEqual(record[audit_report.RUN_RECORD_STARTED_KEY], LATER_START, "the later start did not land")
+        self.assertEqual(envelope[audit_report.ENVELOPE_STARTED_KEY], own)
 
     def git_add_calls(self, recorder):
         # "add" is not at a fixed index: the harness passes git-level flags
@@ -1374,6 +1438,73 @@ class HarnessTestCase(BaseTestCase):
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
+
+
+class TestEnvelopeStartedAt(BaseTestCase):
+    """The report-store envelope names when its run opened (#4268), so a reader
+    can refuse a report from a run that started before its own window."""
+
+    NOW = datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)
+    RECORD_STAMP = "2026-11-10T10:00:00Z"
+    RECORD_ISO = "2026-11-10T10:00:00+00:00"
+    NOTE_EPOCH = datetime(2026, 11, 10, 11, 0, tzinfo=timezone.utc).timestamp()
+    NOTE_ISO = "2026-11-10T11:00:00+00:00"
+
+    def setUp(self):
+        super().setUp()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def write_record(self, audit=AUDIT):
+        Path(audit_report.run_record_path_for(AUDIT)).write_text(
+            json.dumps({"audit": audit, audit_report.RUN_RECORD_STARTED_KEY: self.RECORD_STAMP})
+        )
+
+    def write_note(self):
+        Path(audit_report.inflight_path_for(AUDIT)).write_text(
+            json.dumps({"audit": AUDIT, audit_report.INFLIGHT_STARTED_KEY: self.NOTE_EPOCH})
+        )
+
+    def test_the_run_record_names_the_start_over_the_note(self):
+        self.write_record()
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.RECORD_ISO)
+
+    def test_the_record_outlives_a_released_note(self):
+        self.write_record()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.RECORD_ISO)
+
+    def test_the_note_stands_in_when_there_is_no_record(self):
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.NOTE_ISO)
+
+    def test_another_streams_record_is_not_this_runs(self):
+        self.write_record(audit="obtainability-audit")
+        self.assertIsNone(audit_report.run_started_iso(AUDIT, self.NOW))
+
+    def test_a_record_that_does_not_parse_falls_back_to_the_note(self):
+        Path(audit_report.run_record_path_for(AUDIT)).write_text("{not json")
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.NOTE_ISO)
+
+    def test_nothing_to_read_is_none(self):
+        self.assertIsNone(audit_report.run_started_iso(AUDIT, self.NOW))
+
+    def test_the_envelope_carries_the_start(self):
+        self.write_record()
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {},
+            {},
+            self.NOW,
+            repo="acme/fleet",
+            issue_number=None,
+            ledger_body="",
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=[],
+        )
+        self.assertEqual(envelope[audit_report.ENVELOPE_STARTED_KEY], self.RECORD_ISO)
+        self.assertEqual(envelope["finished_at"], self.NOW.isoformat())
 
 
 class TestRenderBody(unittest.TestCase):
@@ -2786,6 +2917,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
+                "kanban-block-recheck",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
                 "feedback-prompt",
@@ -6673,7 +6805,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Five streams have no declared-intent step. A worker on one of them that writes a
+        # Four streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6685,7 +6817,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 4)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -7734,6 +7866,247 @@ class TestCostDeclaredShapes(HarnessTestCase):
                     audit_report.validate_findings(copy.deepcopy(written), self.COST)
                 self.assertIn("declared[0].object", str(caught.exception))
                 self.assertIn("never a roll-up", str(caught.exception))
+
+
+class TestStockoutDeclaredShapes(HarnessTestCase):
+    """The stockout stream's one posture: a zone-locked pool. The pool at its ceiling shares the slug and stays a finding."""
+
+    STOCKOUT = "stockout-prevention"
+    CLUSTER = "acme-prod/us-east1-b/prod-us-east"
+    PROJECT = "project/acme-prod"
+    # The two arms as fleet_stockout.py's check_single_zone_nodepool spells
+    # them; a pool matching both carries both clauses, joined.
+    ZONE_LOCKED = "single-zone (['us-east1-b']), autoscaling enabled, no NAP, tainted (seeded-role), so no other pool is counted as its fallback"
+    AT_CEILING = "at its autoscaling ceiling: 9/10 live nodes (90% of maxNodeCount 10 x 1 zone), zones ['us-east1-b']"
+
+    def _pool_finding(self, fid, obj, excerpt):
+        return make_finding(fid=fid, check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="", obj=obj, excerpt=excerpt, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _quota_finding(self):
+        return make_finding(fid="quota", check="quota-exhaustion-risk", severity="critical", cluster=self.PROJECT, namespace="", obj="Quota/us-east1:CPUS", excerpt="CPUS at 95% of its limit", command="gcloud compute regions describe us-east1 --project=acme-prod --format=json(quotas)", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [
+            {"name": self.CLUSTER, "location": "us-east1-b", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.CLUSTER))},
+            {"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.PROJECT))},
+        ]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.STOCKOUT, clusters=clusters), self.STOCKOUT)
+
+    def _declaration(self, obj, check="single-zone-nodepool", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/zonal-pools.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_zone_locked_pool(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.STOCKOUT), frozenset({"single-zone-nodepool"}))
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.STOCKOUT))
+
+    def test_a_declaration_moves_the_zone_locked_pool_and_not_one_at_its_ceiling(self):
+        # One note names three pools and a quota. The zone-locked pool moves;
+        # the pool at its ceiling and the pool matching both arms stay, each
+        # said on stderr; the quota is never looked up.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        both = self._pool_finding("both", "NodePool/zonal-full", f"{self.ZONE_LOCKED}; {self.AT_CEILING}")
+        doc = self._doc([locked, ceiling, both, self._quota_finding()])
+        declarations = [self._declaration(obj) for obj in ("NodePool/zonal-batch", "NodePool/regional-web", "NodePool/zonal-full")]
+        declarations.append(self._declaration("Quota/us-east1:CPUS", check="quota-exhaustion-risk"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/regional-web", "NodePool/zonal-full", "Quota/us-east1:CPUS"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 2)
+        self.assertIn("at its autoscaling ceiling", err.getvalue())
+        self.assertIn("SOP §3.9", err.getvalue())
+        self.assertIn("acme/fleet:knowledge/zonal-pools.md stands and the finding publishes", err.getvalue())
+
+    def test_the_manifest_route_declares_a_zone_locked_candidate_and_not_one_at_its_ceiling(self):
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [locked, full]}]}
+        doc = self._doc([])
+        declarations = [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")]
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, declarations, manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(locked))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+
+    def test_an_incomplete_search_withholds_both_arms_and_publishes_the_faults(self):
+        # The withhold cannot tell the arms apart without reading the excerpt
+        # and errs toward holding, as it does for `hpa-cannot-scale`.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling, self._quota_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["object"] for f in withheld), ["NodePool/regional-web", "NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Quota/us-east1:CPUS"])
+        # The coverage-gap sentence says why a fault sits among the withheld
+        # postures, as it does for the hpa dangling-target fault.
+        gap = audit_report._declared_intent_gap(doc)
+        self.assertIn("single-zone-nodepool at its autoscaling ceiling shares its slug", gap)
+        # And the ledger body's rendering of the same gap carries the footnote,
+        # so an operator is not told the held-back fault is a posture.
+        body = "\n".join(audit_report._render_declared_intent_search(doc))
+        self.assertIn("`single-zone-nodepool` at its autoscaling ceiling is a fault", body)
+        self.assertIn("NodePool/regional-web", body)
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_pool(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-batch", title="zonal-batch stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "spot-scarcity-risk", "ccc-missing-fallbacks"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "single-zone-nodepool"
+        for obj in ("Cluster/prod-us-east", "Deployment/web", "ComputeClass/zonal"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("nodepool", str(cm.exception))
+
+    def test_an_expired_declaration_leaves_the_pool_a_finding_and_a_standing_one_moves_it(self):
+        # Dates judged against the run's start day; pinned with the clock
+        # pinned beside it, so the test reads neither live.
+        run_day = date(2026, 11, 9)
+        self.patch_attr("run_start_day", lambda audit_id: run_day)
+        self.patch_attr("_today_utc", lambda: run_day)
+        yesterday = (run_day - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        next_year = (run_day + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=yesterday), self._declaration("NodePool/regional-web", expires=yesterday)])
+        self.assertEqual(moved, [])
+        lapsed, held = doc["findings"]
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["path"], "knowledge/zonal-pools.md")
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["expires"], yesterday)
+        # A lapsed note is reported only against a posture it did cover: the
+        # pool at its ceiling was never covered, so it carries no line.
+        self.assertNotIn(audit_report.EXPIRED_DECLARATION_FIELD, held)
+        self.assertEqual(err.getvalue().count("DECLARATION EXPIRED"), 1)
+        doc = self._doc([self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=next_year)])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual(doc["declared"][0]["declaration"]["expires"], next_year)
+
+    def test_the_arm_marks_are_the_collectors_prefixes(self):
+        # The join reads the arm off the excerpt the collector writes, so each
+        # prefix's two copies are pinned to each other and to what
+        # check_single_zone_nodepool produces for a zone-locked pool and for
+        # one at its ceiling; a rewording on one side alone fails here.
+        import fleet_stockout
+
+        self.assertEqual(audit_report.ZONE_LOCKED_ARM_MARK, fleet_stockout.ZONE_LOCKED_ARM_PREFIX)
+        self.assertEqual(audit_report.CEILING_ARM_MARK, fleet_stockout.CEILING_ARM_PREFIX)
+        pool = {"name": "zonal-batch", "locations": ["us-east1-b"], "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 2}, "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "zonal", "effect": "NO_SCHEDULE"}]}}
+        locked = fleet_stockout.check_single_zone_nodepool(pool, False, 0)
+        full = fleet_stockout.check_single_zone_nodepool(pool, False, 2)
+        self.assertTrue(audit_report._is_zone_locked_arm(locked), locked)
+        self.assertTrue(audit_report._is_ceiling_arm(full), full)
+        self.assertFalse(audit_report._is_zone_locked_arm(full), full)
+
+    def test_a_hand_written_excerpt_naming_no_arm_is_not_moved(self):
+        # A finding the worker wrote on a cluster the collector could not read
+        # carries the worker's wording; with neither prefix nothing says which
+        # arm it is, and the join errs toward not silencing.
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "2/2 live nodes, 100% of maxNodeCount 2, in us-east1-b")
+        # The zone-locked prefix counts only where the collector writes it, at
+        # the start: a full pool described in prose that mentions a single
+        # zone later on is still not the posture.
+        trailing = self._pool_finding("trailing", "NodePool/zonal-full", "2/2 live nodes, 100% of maxNodeCount 2, single-zone (us-east1-b) pool cannot grow")
+        doc = self._doc([prose, trailing])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/zonal-batch", "NodePool/zonal-full"])
+        self.assertEqual(err.getvalue().count("opens neither 3.9 arm"), 2)
+
+    def test_a_namespace_a_worker_wrote_onto_the_pool_is_folded_before_the_join(self):
+        # The collector files the pool with no namespace and the note writes
+        # `namespace: ""`; a worker's namespace would give the pool a third
+        # identity that neither matches, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        stray = make_finding(fid="stray", check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="kube-system", obj="NodePool/zonal-batch", excerpt=self.ZONE_LOCKED, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+        doc = self._doc([stray])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.nodepool-zonal-batch", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch")])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+
+    def test_a_hand_written_declared_entry_for_a_pool_at_its_ceiling_is_refused_against_the_manifest(self):
+        # A `declared[]` entry carries no excerpt, so the validator cannot tell
+        # the arms apart and lets the entry through; its identity would then
+        # enter `known` and keep the collector's at-ceiling candidate off the
+        # ledger. The manifest is where the entry meets the arm: exit 2.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [full, locked]}]}
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        doc = audit_report.validate_findings(doc, self.STOCKOUT)
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.reject_declared_ceiling_pools(doc, manifest)
+        self.assertIn("declared[]", str(cm.exception))
+        self.assertIn("NodePool/zonal-full", str(cm.exception))
+        self.assertIn(audit_report.CEILING_ARM_MARK, str(cm.exception))
+        # The same entry for the zone-locked pool stands, and a run without a
+        # manifest has nothing to hold the entry to.
+        doc["declared"][0]["object"] = "NodePool/zonal-batch"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, manifest))
+        doc["declared"][0]["object"] = "NodePool/zonal-full"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, None))
+
+    def test_remediate_reads_the_collectors_excerpt_before_judging_the_arm(self):
+        # The worker reworded the excerpt of a declared zone-locked pool.
+        # `finish` adopts the collector's wording before the join and lists the
+        # pool under Declared intent; `remediate` reads the same wording and
+        # refuses the id as declared, instead of opening a pull request for a
+        # posture the ledger calls declared.
+        workspace = self.gitops_root / self.STOCKOUT / "acme__fleet"
+        (workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(workspace)
+        self.patch_attr("repo_root", lambda: workspace)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.write_run_record(self.STOCKOUT, "acme/fleet", [], searched=[f"acme/fleet@{SEARCH_SHA}"], sources=[])
+        audit_report.write_declarations(self.STOCKOUT, "acme/fleet", [self._declaration("NodePool/zonal-batch")])
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "pool pinned to one zone, autoscaling on, nothing else to fall back to")
+        doc = self._doc([prose])
+        fid = doc["findings"][0]["id"]
+        candidate = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED, "command": "gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json"}
+        manifest_path = self.tmp_path / "manifest_stockout.json"
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate]}]}), encoding="utf-8")
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(doc), "--manifest-file", str(manifest_path), "--finding", fid, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("a repository declaration covers this posture", self.err)
+        self.assertNotIn("opens neither 3.9 arm", self.err)
+        # Through the same call site: a `declared[]` entry the worker wrote for
+        # a pool the manifest reports at its ceiling is refused before the join.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}", "command": candidate["command"]}
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate, full]}]}), encoding="utf-8")
+        written = self._doc([self._quota_finding()])
+        written["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        quota_id = written["findings"][0]["id"]
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(written), "--manifest-file", str(manifest_path), "--finding", quota_id, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("declared[]: NodePool/zonal-full", self.err)
+        self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):
@@ -12398,6 +12771,27 @@ class TestOpenRemediationPr(HarnessTestCase):
         # whatever survived the forced checkout.
         self.assertEqual((self.workspace / self.path).read_bytes(), b"# fix\n")
 
+    def test_create_names_the_finding_of_a_one_finding_no_pdb_group(self):
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
+        self.group = [dict(f, check=audit_report.GENERATED_FIX_CHECK, object="Deployment/web") for f in self.group]
+        self.open_it()
+        [target] = [t for verb, t in self.harness.targets if verb == "proposal-create"]
+        self.assertEqual(target, {"finding_id": self.group[0]["id"], "cluster": "prod-us-east",
+                                  "namespace": "payments", "object": "Deployment/web"})
+
+    def test_create_names_no_target_for_another_check(self):
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
+        self.group = [dict(f, check="no-hpa") for f in self.group]
+        self.open_it()
+        self.assertIn(("proposal-create", None), self.harness.targets)
+
+    def test_remediation_target_only_for_one_no_pdb_finding(self):
+        one = {"id": "no-pdb.c.ns.Deployment/x", "check": "no-pdb", "cluster": "c", "namespace": "ns", "object": "Deployment/x"}
+        self.assertEqual(audit_report.remediation_target([one])["finding_id"], "no-pdb.c.ns.Deployment/x")
+        self.assertIsNone(audit_report.remediation_target([one, dict(one, id="no-pdb.c.ns.Deployment/y")]))
+        self.assertIsNone(audit_report.remediation_target([dict(one, check="no-hpa")]))
+        self.assertIsNone(audit_report.remediation_target([]))
+
     def test_create_carries_all_four_labels(self):
         self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
         self.open_it()
@@ -13685,6 +14079,15 @@ class TestRemediateSubcommand(HarnessTestCase):
                 "refused": [],
             },
         )
+
+    def test_an_explain_only_install_is_refused_before_anything_is_cloned(self):
+        # Review: at writeMode none this cloned, was refused at the publish, and
+        # still printed REMEDIATED.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies = {"capabilities": {"forge": "github", "writeMode": "none"}}
+        self.assertEqual(self.run_remediate(make_doc(), [derived_id()]), 2)
+        self.assertIn("explain-only", self.err)
+        self.assertEqual(["capabilities"], [call[1] for call in self.harness.calls])
 
     def human_closed_pr_reply(self, doc):
         """A pull request on this finding's own branch, closed by a person."""
@@ -17231,6 +17634,85 @@ class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
         self.assertIn("a retry will not change this", refusal)
 
 
+class TestExplainOnlyInstallTakesNoRemediation(unittest.TestCase):
+    """Review: on an install at writeMode none, remediation cloned per group, and
+    /remediate was answered with a retry the broker would refuse every time."""
+
+    def setUp(self):
+        audit_report._CAPABILITIES.clear()
+        self.addCleanup(audit_report._CAPABILITIES.clear)
+
+    def _broker(self, write_mode):
+        asked = []
+
+        def forge(verb, repo, payload):
+            asked.append(verb)
+            if verb != "capabilities":
+                raise AssertionError(f"{verb} reached the broker on an explain-only install")
+            answer = {"forge": "github", "verbs": ["issue-list"]}
+            if write_mode is not None:
+                answer["writeMode"] = write_mode
+            return answer
+
+        return forge, asked
+
+    def test_none_is_a_refusal_with_no_retry(self):
+        forge, _ = self._broker("none")
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        self.assertIn("explain-only", refusal)
+        self.assertIn("a retry will not change this", refusal)
+
+    def test_a_misspelt_value_carries_the_brokers_reason(self):
+        def forge(verb, repo, payload):
+            return {"forge": "github", "writeMode": "none", "writeModeDetail": "KUBEAGENTS_WRITE_MODE is set to a value that is neither none nor propose"}
+
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        self.assertIn("explain-only", refusal)
+        self.assertIn("neither none nor propose", refusal)
+
+    def test_the_reply_to_remediate_names_the_write_mode_and_promises_no_retry(self):
+        forge, _ = self._broker("none")
+        requests = type("R", (), {"targets": ["f1"]})()
+        plan = type("P", (), {"already_open": set(), "superseded": set()})()
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        outcomes = audit_report._remediation_outcomes(requests, plan, {}, [], "pull request", refusal)
+        self.assertIn("explain-only", outcomes["f1"])
+        self.assertNotIn("will retry", outcomes["f1"])
+
+    def test_promoted_groups_are_not_cloned_at_none(self):
+        forge, asked = self._broker("none")
+        with patch.object(audit_report, "forge", forge):
+            opened = audit_report._open_promoted_prs(
+                "acme/fleet",
+                "compliance-audit",
+                [{"id": "f1"}],
+                ["f1"],
+                {},
+                root=Path("/nonexistent"),
+                issue_number=None,
+                generated_at=datetime(2026, 11, 11, tzinfo=timezone.utc),
+            )
+        self.assertEqual([], opened)
+        self.assertEqual(["capabilities"], asked)
+
+    def test_propose_or_an_older_broker_refuses_nothing(self):
+        for mode in ("propose", None):
+            audit_report._CAPABILITIES.clear()
+            forge, _ = self._broker(mode)
+            with self.subTest(mode=mode), patch.object(audit_report, "forge", forge):
+                self.assertEqual("", audit_report.write_mode_refusal("acme/fleet"))
+
+    def test_an_unreadable_answer_refuses_nothing(self):
+        def forge(verb, repo, payload):
+            raise audit_report.ForgeError("broker down")
+
+        with patch.object(audit_report, "forge", forge):
+            self.assertEqual("", audit_report.write_mode_refusal("acme/fleet"))
+
+
 class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):
     """Review: an install with a second forge spells GitHub's repositories
     `github.com/owner/name`, and the declared-intent clone refused that spelling."""
@@ -17732,6 +18214,160 @@ class TestCarryUnchangedFindings(unittest.TestCase):
         self.assertEqual(ids, [])
 
 
+class TestCarryRules(unittest.TestCase):
+    """A carried remediation that fails a `CARRY_RULES` rule gives way to this
+    run's, and one that no rule can judge stays."""
+
+    CLUSTER = "acme-prod/us-east4/seeded-c"
+    FLAGS = "--enable-master-authorized-networks --master-authorized-networks"
+    RIGHT = f"gcloud container clusters update seeded-c --location=us-east4 {FLAGS}=<ranges>"
+    REWORDED = f"gcloud container clusters update seeded-c --region us-east4 {FLAGS}=<owner-ranges>"
+
+    def finding(self, note, check="authorized-networks", cluster=CLUSTER, kind="gcloud", **overrides):
+        finding = {
+            "id": f"{check}.c._.cluster-seeded-c",
+            "check": check,
+            "cluster": cluster,
+            "title": "seeded-c has no authorized networks",
+            "impact": "The control plane answers every address.",
+            "recommendation": {"action": "Enable authorized networks.", "risk": "None."},
+            "remediation": {"kind": kind, "note": note},
+            "evidence": {"command": "gcloud container clusters list", "excerpt": "a"},
+            "severity": "critical",
+        }
+        finding.update(overrides)
+        return finding
+
+    def carry(self, before, now):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ids = audit_report.carry_unchanged_findings([now], {"findings": [before]})
+        return ids, now, err.getvalue()
+
+    def assert_kept(self, note, **kwargs):
+        """The previous note stays, and the run log does not name a rule."""
+        before = self.finding(note, title="previous title", **kwargs)
+        _, out, err = self.carry(before, self.finding(self.REWORDED, **kwargs))
+        self.assertEqual(out["remediation"]["note"], note)
+        self.assertEqual(out["title"], "previous title")
+        self.assertNotIn("not carried forward", err)
+
+    def assert_replaced(self, note, rule, **kwargs):
+        """This run's pair is published; title and impact still carry."""
+        before = self.finding(
+            note, title="previous title", recommendation={"action": "Previous action."}, **kwargs
+        )
+        now = self.finding(self.REWORDED, **kwargs)
+        ids, out, err = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], self.REWORDED)
+        self.assertEqual(out["recommendation"]["action"], "Enable authorized networks.")
+        self.assertEqual(out["title"], "previous title")
+        self.assertEqual(ids, [now["id"]])
+        self.assertIn(f"{now['id']}: the previous run's remediation is not carried forward ({rule}).", err)
+        self.assertNotIn("gcloud", err)
+
+    def test_a_right_command_for_the_same_cluster_is_kept(self):
+        self.assert_kept(self.RIGHT)
+        self.assert_kept(self.RIGHT.replace("--location=us-east4", "--location us-east4 --project=acme-prod"))
+
+    def test_a_command_for_another_cluster_is_replaced(self):
+        for wrong in (
+            self.RIGHT.replace("seeded-c", "seeded-a"),
+            self.RIGHT.replace("us-east4", "us-west1"),
+            self.RIGHT + " --project=acme-dev",
+            f"{self.RIGHT}\n{self.RIGHT.replace('seeded-c', 'seeded-a')}",
+            f"# Close the endpoint.\n$ {self.RIGHT.replace('seeded-c', 'seeded-a')}",
+        ):
+            with self.subTest(wrong=wrong):
+                self.assert_replaced(wrong, audit_report.CARRY_RULE_OTHER_CLUSTER, check="release-channel")
+
+    def test_a_wrong_command_in_a_manual_note_or_the_recommendation_is_replaced(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding(f"Run `{wrong}` in a change window.", kind="manual", check="release-channel")
+        now = self.finding("Ask the owner.", kind="manual", check="release-channel")
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], "Ask the owner.")
+        for field in audit_report.COMMAND_BEARING_RECOMMENDATION_FIELDS:
+            with self.subTest(field=field):
+                before = self.finding(self.RIGHT, recommendation={field: f"Run `{wrong}`."})
+                _, out, _ = self.carry(before, self.finding(self.REWORDED))
+                self.assertEqual(out["remediation"]["note"], self.REWORDED)
+
+    def test_the_note_before_the_route_cut_is_read(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding("See the route note.", check="release-channel")
+        before["remediation"][audit_report.ROUTE_UNCUT_NOTE_FIELD] = wrong
+        _, out, _ = self.carry(before, self.finding(self.REWORDED, check="release-channel"))
+        self.assertEqual(out["remediation"], {"kind": "gcloud", "note": self.REWORDED})
+
+    def test_a_command_the_rule_cannot_judge_is_kept(self):
+        update = "gcloud container clusters update"
+        for note in (
+            f"{update} <C> --location=<L> --project=<PROJECT> {self.FLAGS}=<CIDR>",
+            f"{update} $CLUSTER --location $LOCATION {self.FLAGS}=${{RANGES}}",
+            f"{update} seeded-c --location=us-east4 --project=123456789012 {self.FLAGS}=<ranges>",
+            f"{update} seeded-a {self.FLAGS}=<ranges>",
+            f"{update} projects/acme-prod/locations/us-east4/clusters/seeded-c --location=us-east4",
+            f"{update} SEEDED-C --location=US-EAST4 --project=Acme-Prod",
+            f"{update} seeded-a --location=us-west1 {self.FLAGS}=<ranges the cluster's own owner approves>",
+            "gcloud container node-pools update pool-1 --cluster=seeded-a --location=us-west1",
+            "Update seeded-a in us-west1 with gcloud container clusters update.",
+        ):
+            with self.subTest(note=note):
+                self.assert_kept(note)
+
+    def test_a_scope_that_is_not_one_cluster_is_kept(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        for cluster in ("project/acme-prod", "seeded-c", ""):
+            with self.subTest(cluster=cluster):
+                self.assert_kept(wrong, cluster=cluster, check="release-channel")
+
+    def test_a_literal_range_where_the_sop_leaves_it_to_the_owner_is_replaced(self):
+        for value in (
+            "=203.0.113.0/24",
+            " 203.0.113.0/24",
+            "=<ranges>,203.0.113.7",
+            '="198.51.100.0/24,203.0.113.0/24"',
+            "=2001:db8::/32",
+        ):
+            with self.subTest(value=value):
+                note = self.RIGHT.replace("=<ranges>", value)
+                self.assert_replaced(note, audit_report.CARRY_RULE_OWNER_VALUE)
+
+    def test_a_range_the_owner_rule_does_not_cover_is_kept(self):
+        literal = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        self.assert_kept(literal, check="release-channel")
+        # `public-control-plane` has no row; its carried command still gets its repair.
+        before = self.finding(literal, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        now = self.finding(self.REWORDED, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(
+            out["remediation"]["note"], f"{literal} {audit_report.GOOGLE_CLOUD_ACCESS_FLAG}"
+        )
+        self.assert_kept(self.RIGHT.replace("<ranges>", "<CIDR/len>,<X>/32"))
+        self.assert_kept(f"{self.RIGHT}  # not 203.0.113.0/24, which is a peer's")
+        self.assert_kept(f"{self.RIGHT} --cluster-ipv4-cidr=10.0.0.0/14")
+
+    def test_the_previous_pair_stays_when_this_runs_pair_fails_too(self):
+        previous = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        mine = self.RIGHT.replace("<ranges>", "198.51.100.0/24")
+        _, out, err = self.carry(self.finding(previous), self.finding(mine))
+        self.assertEqual(out["remediation"]["note"], previous)
+        self.assertNotIn("not carried forward", err)
+
+    def test_a_previous_remediation_validation_would_refuse_is_not_carried(self):
+        for remediation in ({"kind": "script", "note": "x"}, {"note": "x"}, {"kind": "manual", "note": 7}):
+            with self.subTest(remediation=remediation):
+                before = self.finding("x", title="previous title", remediation=remediation)
+                _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+                self.assertEqual(out["remediation"], {"kind": "manual", "note": "Ask the owner."})
+                self.assertEqual(out["title"], "previous title")
+
+    def test_a_previous_remediation_with_no_note_is_still_carried(self):
+        before = self.finding("x", remediation={"kind": "manual"})
+        _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+        self.assertEqual(out["remediation"], {"kind": "manual", "note": ""})
+
+
 class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
     """`finish` reads the previous run's document and keeps its wording, in a
     dry run and in the real run alike."""
@@ -17821,6 +18457,25 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
         body = self.harness.forge_calls("issue-create")[0]["body"]
         self.assertIn(self.OLD_TITLE, body)
         self.assertNotIn(self.NEW_TITLE, body)
+
+    def test_a_previous_command_for_another_cluster_is_not_published(self):
+        cluster = "acme-prod/us-east4/prod-us-east"
+        update = "gcloud container clusters update {} --location=us-east4 --enable-network-policy"
+
+        def finding(title, name):
+            return make_finding(
+                title=title, cluster=cluster, remediation={"kind": "gcloud", "note": update.format(name)}
+            )
+
+        before = finding(self.OLD_TITLE, "prod-us-west")
+        before["id"] = derived_id(cluster=cluster)
+        self.store({"findings": [before]})
+        rc = self.run_finish(make_doc(findings=[finding(self.NEW_TITLE, "prod-us-east")]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertIn(update.format("prod-us-east"), self.out)
+        self.assertNotIn("prod-us-west", self.out)
+        self.assertIn(f"not carried forward ({audit_report.CARRY_RULE_OTHER_CLUSTER})", self.err)
 
     def test_changed_evidence_publishes_the_new_wording(self):
         self.store(self.previous(excerpt="an older excerpt"))
@@ -22003,6 +22658,116 @@ class TestDraftFindings(BaseTestCase):
         )
         self.assertEqual(json.loads(out.read_text())["findings"][0]["check"], "netpol-missing")
 
+    def draft(self, *extra):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        self.out = self.err = ""
+        return self.run_main(["draft", "--audit", AUDIT, "--manifest-file", str(path), *extra])
+
+    def test_the_draft_goes_to_the_findings_path_and_not_through_the_worker(self):
+        """With no --out the document is on disk where `finish` reads it, and the
+        output is a status line: a document printed to stdout enters the worker's
+        context and has to be sent back through one tool call to become a file."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.draft(), 0, self.err)
+        written = json.loads(Path(audit_report.findings_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(written["findings"][0]["check"], "netpol-missing")
+        said = self.out + self.err
+        self.assertNotIn('"findings"', said)
+        self.assertIn(f"wrote {audit_report.findings_path_for(AUDIT)}", said)
+        self.assertIn("in place", said)
+        self.assertIn("Never send the document, or a block of its findings, through a tool call", said)
+        self.assertIn("one `patch` for one finding's fields", said)
+        # The card gate reads a JSON line with these key pairs as a `start` or a `finish`.
+        for line in said.splitlines():
+            self.assertFalse(line.lstrip().startswith("{"), line)
+
+    def test_a_dash_prints_the_draft_for_a_person(self):
+        self.assertEqual(self.draft("--out", audit_report.DRAFT_STDOUT), 0, self.err)
+        self.assertEqual(json.loads(self.out)["findings"][0]["check"], "netpol-missing")
+        self.assertFalse(Path(audit_report.findings_path_for(AUDIT)).exists())
+
+    def test_a_second_draft_does_not_erase_filled_findings(self):
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+        self.assertEqual(self.draft(), 0, self.err)
+        self.assertEqual(self.draft(), 0, "an unfilled draft is replaced: " + self.err)
+        document = json.loads(target.read_text(encoding="utf-8"))
+        document["findings"][0]["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        target.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SystemExit) as refused:
+            self.draft()
+        self.assertIn("a second draft would erase", str(refused.exception))
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "a")
+        self.assertEqual(self.draft("--overwrite"), 0, self.err)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "")
+
+    def test_a_second_draft_keeps_an_edit_to_any_field(self):
+        """The worker fills more than recommendations in place, and a run with no finding has no
+        recommendation at all, so the guard reads the whole document."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+
+        def remediation_only(document):
+            document["findings"][0]["remediation"] = {"kind": "manual", "note": "narrow the rule"}
+
+        def resolved_because(document):
+            document["resolved_because"] = {"some.finding.id": "the workload is gone"}
+
+        def declared(document):
+            document["declared"] = {"some.finding.id": "accepted by the owner"}
+
+        def scope_note(document):
+            document["scope"]["clusters"][0]["limitations"] = ["one read failed"]
+
+        for edit in (remediation_only, resolved_because, declared, scope_note):
+            with self.subTest(edit=edit.__name__):
+                self.assertEqual(self.draft("--overwrite"), 0, self.err)
+                document = json.loads(target.read_text(encoding="utf-8"))
+                edit(document)
+                kept = json.dumps(document)
+                target.write_text(kept, encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    self.draft()
+                self.assertEqual(target.read_text(encoding="utf-8"), kept)
+        with self.subTest(edit="a file that no longer parses"):
+            target.write_text('{"audit": "half an edit', encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                self.draft()
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"audit": "half an edit')
+        with self.subTest(edit="an empty file is not work"):
+            target.write_text("", encoding="utf-8")
+            self.assertEqual(self.draft(), 0, self.err)
+            self.assertIn("findings", json.loads(target.read_text(encoding="utf-8")))
+
+    def test_the_fill_step_bounds_a_tool_call_under_half_the_stale_bound(self):
+        """A tool call's arguments arrive only when complete, so the call must be written well
+        inside the runtime's stale bound: by the fill step an audit's prompt is large, which is the
+        300 s tier (the configured base when that is higher), and a slow writer produces 25 tokens a
+        second at about 3.5 characters each."""
+        large_prompt_stale_seconds = 300
+        slow_chars_per_second = 25 * 3.5
+        config = (Path(__file__).resolve().parents[3] / "config.yaml").read_text(encoding="utf-8")
+        base = int(re.search(r"^\s*stale_timeout_seconds:\s*(\d+)\s*$", config, re.M).group(1))
+        bound = max(base, large_prompt_stale_seconds)
+        self.assertLessEqual(audit_report.DRAFT_FILL_CALL_CHARS / slow_chars_per_second, bound / 2)
+        self.assertIn(str(audit_report.DRAFT_FILL_CALL_CHARS), audit_report.DRAFT_FILL_HINT)
+        skill = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(f"about {audit_report.DRAFT_FILL_CALL_CHARS:,} characters", skill)
+
+    def test_no_procedure_orders_the_document_through_one_call(self):
+        """Three procedures said "in one shot"; a worker that obeys writes the whole
+        document as one tool call, which is the call the runtime drops."""
+        governance = Path(__file__).resolve().parents[3] / "governance"
+        skill = Path(__file__).resolve().parents[1]
+        texts = list(governance.glob("*_sop.md")) + [skill / "SKILL.md"] + list((skill / "references").glob("*.md"))
+        self.assertTrue(texts)
+        for text in texts:
+            with self.subTest(file=text.name):
+                body = text.read_text(encoding="utf-8")
+                self.assertNotIn("in one shot", body)
+                self.assertNotIn("Write the whole document", body)
+
 
 class TestUnwrittenSweepFixes(HarnessTestCase):
     """`finish` refuses a fix the sweep would open and nobody wrote, until it is
@@ -22930,6 +23695,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             with self.subTest(attempt=attempt):
                 self.assertEqual(self.run_finish(make_doc()), 2)
                 self.assertIn("their fix is not written", self.err)
+                self.assertNotIn("Writing a fix opens nothing", self.err, "only the sweep-off refusal says it")
                 self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
                 self.assertFalse(self.harness.forge_calls("issue-create"))
         self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 0, self.err)
@@ -22951,12 +23717,27 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
                 self.assertEqual(self.run_finish(doc), 2)
                 self.assertIn("need their fix written before a `/remediate`", self.err)
+                # Writing the fix is not an ask to open it (#2953): a worker wrote three
+                # and then ran `remediate` on them.
+                self.assertIn("Writing a fix opens nothing unless a person's `/remediate` already asks for it", self.err)
                 self.assertNotIn("automatic pull request", self.err, "no sweep opens one on this install")
                 self.touch(doc["findings"][0]["remediation"]["path"])
                 self.assertEqual(self.run_finish(doc), 0, self.err)
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
+                # The worker is told a direct ask still opens these: a request that itself
+                # asks for the fixes, by id or as a set, runs `remediate`.
+                self.assertIn("only when the request itself asks for fixes to be opened", self.err)
+                self.assertIn("for each fix it asks for, by id or as a set", self.err)
+                self.assertIn("run `remediate --finding", self.err)
+                # ...and that an audit-only ask is not one. Worded loosely, a worker read
+                # its card's "remediation PRs required by the SOP" as the ask and opened an
+                # unrequested pull request (nightly 2026-11-11, obtainability-planted-pdb;
+                # #5093's smoke, compliance-rbac-overgrant).
+                self.assertIn("A request only to run an audit or follow its SOP is not that ask", self.err)
+                self.assertIn("a line that attributes remediation pull requests to the SOP", self.err)
+                self.assertIn("stop at the ledger and name the findings it lists as awaiting a fix", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 
@@ -24313,7 +25094,8 @@ metadata:
     def test_the_live_run_a_degraded_fix_names_the_planted_declaration(self):
         """The worker named a file it never wrote, so the fix degraded to
         `manual`; the planted declaration was in the repository. The paragraph
-        keeps the eval's first sentence and names the planted file."""
+        names the planted file in its first sentence, and does not say "this
+        file", because the fix's file is not the declaration."""
         self.write(self.PLANTED, self.PLANTED_DECLARATION)
         finding = self.pool_finding({"kind": "manifest", "path": "clusters/fa2-seeded-a/pinned-inference-pool.tf", "note": "Append zones."})
         audit_report.degrade_missing_remediations([finding], self.root)
@@ -24321,11 +25103,176 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), ["pool"])
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
-        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:120])
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertTrue(paragraph.startswith(f"**Config Connector is not applying `{self.PLANTED}`.**"), paragraph[:120])
+        self.assertNotIn("this file", paragraph)
         self.assertIn("`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`", paragraph)
         self.assertIn("DependencyNotFound", paragraph)
         self.assertIn("pinned-inference-pool", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_copied_paragraph_that_names_a_file_is_stripped_and_written_again(self):
+        """The strip-and-rewrite pattern covers the first sentence that names
+        a file, as it covers the two fixed forms."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+        once = finding["remediation"]["note"]
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(once.count(audit_report.KCC_STALLED_MARK_PREFIX), 1)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, declarations)
+        self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
+
+    def test_guard_the_workers_own_text_stays_before_the_paragraph(self):
+        """A guard, not a fix test: it passed before any change. Two live
+        ledger rows showed only the paragraph as the fix's text, because the
+        worker gave no note. The pass keeps the worker's own text, when there
+        is any, before the paragraph, for a manifest fix of the declaring
+        file, a fix of another file, a manual fix and a note long enough to
+        be cut; with no worker text, the paragraph is the whole note and
+        nothing is made up in its place."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        long_text = ("Append us-central1-b and us-central1-c to the pool's node locations. " * 40).strip()
+        for remediation, expected in (
+            ({"kind": "manifest", "path": self.PLANTED, "note": "Append zones."}, "Append zones."),
+            ({"kind": "manifest", "path": "clusters/fa2-seeded-a/other.yaml", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": long_text}, long_text[:200]),
+        ):
+            with self.subTest(kind=remediation["kind"], path=remediation.get("path")):
+                finding = self.pool_finding(dict(remediation))
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                note = finding["remediation"]["note"]
+                self.assertTrue(note.startswith(expected), note[:200])
+                self.assertLess(note.index(expected), note.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        for remediation in ({"kind": "manifest", "path": self.PLANTED, "note": ""}, {"kind": "manifest", "path": self.PLANTED}):
+            finding = self.pool_finding(dict(remediation))
+            audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+            self.assertTrue(finding["remediation"]["note"].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+
+    def test_a_worker_sentence_with_the_same_start_is_not_stripped(self):
+        """Review finding: the strip pattern took everything after the shared
+        start of the paragraph's first sentence, so a worker sentence that
+        starts the same way lost its end. Only an exact first sentence is a
+        copied paragraph."""
+        worker = ("Raise maxNodeCount to 6 in the pool file. **Config Connector is not applying the pool's last change**, "
+                  "so check its status first, then merge the pull request.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_exact_first_sentence_is_stripped(self):
+        tail = " When the audit ran, Config Connector reported `Ready=False` on `X a/b` (`UpdateFailed`)."
+        for mark in (
+            audit_report.KCC_STALLED_NOTE_MARK,
+            audit_report.KCC_STALLED_OBJECT_MARK,
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml`"),
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml` in the repository `acme/infra`"),
+        ):
+            with self.subTest(mark=mark):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + mark + tail}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    def test_a_worker_sentence_with_a_code_span_is_not_stripped(self):
+        """Review finding: the first-sentence pattern took any code span, so a
+        worker sentence that names an object in one lost the sentence and the
+        rest of its line, and the log called it a copied paragraph. A copied
+        paragraph is one that goes on as `finish` writes it."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying `pinned-inference-pool`.** "
+                  "Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+            audit_report.disclose_manual_routes_and_log([finding], kcc_manifest(), set())
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("copied", err.getvalue())
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_paragraph_finish_writes_is_stripped(self):
+        """Every step of each paragraph form, the context-repository form
+        included, is stripped and written again."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        texts = [audit_report.KCC_STALLED_NOTE.format(objects=objects), audit_report.KCC_STALLED_NOTE_CORE.format(objects=objects)]
+        for path in ("`a/b.yaml`", "`a/b.yaml` in the repository `acme/infra`"):
+            texts += [audit_report.KCC_STALLED_DECLARED_NOTE.format(path=path, objects=objects),
+                      audit_report.KCC_STALLED_DECLARED_CORE.format(path=path, objects=objects)]
+        for search in (audit_report.KCC_DECLARATION_NOT_NAMED, audit_report.KCC_DECLARATION_SEARCH_MANY.format(count=2)):
+            texts += [audit_report.KCC_STALLED_UNDECLARED_NOTE.format(search=search, objects=objects),
+                      audit_report.KCC_STALLED_UNDECLARED_CORE.format(search=search, objects=objects)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + text}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    # The paragraph that main wrote before the first sentence named the file:
+    # "this file" and then a second sentence that names it. A previous ledger
+    # can hold it, and the carry copies it.
+    MAIN_DECLARED_CORE = ("**Config Connector is not applying this file.** The declaration is {path}. "
+                          "When the audit ran, Config Connector reported {objects}.")
+    MAIN_DECLARED_TAIL = (" Config Connector does not apply the object until that reason is gone, so a change to the "
+                          "declaration does not take effect before then, and this finding comes back on each run until "
+                          "then. If the reason rejects the declaration, correct it there.")
+
+    def carried_main_paragraph(self, path, manifest, tail=True):
+        """Run the carry with a previous ledger whose manual fix has main's
+        paragraph, then the paragraph pass on this run's manifest."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        old = self.MAIN_DECLARED_CORE.format(path=path, objects=objects) + (self.MAIN_DECLARED_TAIL if tail else "")
+        before = self.pool_finding({"kind": "manual", "note": "Spread the pool by hand.\n\n" + old})
+        now = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        self.assertEqual(audit_report.carry_unchanged_findings([now], {"findings": [before]}), ["pool"])
+        audit_report.disclose_stalled_kcc_remediations([now], manifest, self.root, declarations)
+        return now["remediation"]["note"]
+
+    def main_paths(self):
+        return (f"`{self.PLANTED}`", f"`{self.PLANTED}` in the repository `acme/infra`")
+
+    def test_a_carried_paragraph_from_main_goes_when_the_stall_clears(self):
+        """Review finding: main's paragraph has a second sentence between
+        "this file.**" and the text that every paragraph goes on with, so the
+        strip pattern did not match it. The carry copied it, and the note
+        kept a stall that this run did not see."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, kcc_manifest(), tail)
+                    self.assertEqual(note, "Spread the pool by hand.")
+
+    def test_a_carried_paragraph_from_main_is_written_again_once_when_the_stall_continues(self):
+        """The same carry while the stall continues: the note holds one
+        paragraph, this run's, and not main's paragraph beside it."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, self.live_manifest(), tail)
+                    self.assertTrue(note.startswith("Spread the pool by hand.\n\n"), note[:120])
+                    self.assertEqual(note.count(audit_report.KCC_STALLED_MARK_PREFIX), 1, note)
+                    self.assertNotIn("The declaration is", note)
+                    self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, note)
+
+    def test_a_worker_sentence_like_mains_first_two_sentences_is_not_stripped(self):
+        """Main's two first sentences, without the text that every paragraph
+        goes on with, are a worker's sentences and stay."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying this file.** "
+                  "The declaration is `clusters/prod.yaml`. Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
 
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24357,10 +25304,10 @@ metadata:
         self.assertEqual(changed, ["pool"])
         self.assertEqual(finding["remediation"]["note"], command)
         paragraph = finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD]
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", paragraph)
         rendered = "\n".join(audit_report.render_finding(finding))
-        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_NOTE_MARK))
-        self.assertIn("```\n\n" + audit_report.KCC_STALLED_NOTE_MARK, rendered)
+        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        self.assertIn("```\n\n" + audit_report.KCC_STALLED_MARK_PREFIX, rendered)
         # A worker's copy of the field is dropped.
         finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD] = "made up"
         validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
@@ -24386,7 +25333,7 @@ metadata:
         scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan)
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", finding["remediation"]["note"])
 
     def test_content_mode_indexes_every_config_connector_kind(self):
         """A PubSubTopic, not only the container kinds, and a file whose only
@@ -24402,7 +25349,7 @@ metadata:
         finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan)
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
 
     def test_the_gcloud_check_reads_the_container_kinds_and_the_paragraph_every_kind(self):
         """The gcloud check reads only the files that name the container
@@ -24456,7 +25403,7 @@ metadata:
             with self.subTest(mode=label):
                 finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
                 audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     def test_the_absence_sentence_is_gone(self):
         """No text the audit writes says that no file declares an object."""
@@ -24508,7 +25455,7 @@ metadata:
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["b"]
         )
-        self.assertIn("The declaration is `projects/b/cluster.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `projects/b/cluster.yaml`.**", finding["remediation"]["note"])
         # The gcloud check still takes the first declaration of the name, as before.
         command = make_finding(fid="g", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
                                remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --release-channel regular"})
@@ -24535,7 +25482,7 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root))
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
         self.assertEqual(paragraph, audit_report.KCC_STALLED_NOTE.format(objects=finding[audit_report.KCC_STALLED_FINDING_FIELD]))
-        self.assertNotIn("The declaration is", paragraph)
+        self.assertNotIn("**Config Connector is not applying `", paragraph)
 
     def test_both_first_sentences_are_stripped_and_written_again(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24561,7 +25508,7 @@ metadata:
                 manifest = {"clusters": [{"name": "hubp/us-central1/hub", "outcome": "collected", "kcc_unready": [
                     {"kind": "PubSubTopic", "namespace": ns, "name": "events", "project": "p", "why": "UpdateFailed: 403"}]}]}
                 audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     POOL_STALL = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pinned-inference-pool", "cluster": "c1",
                   "project": "p", "why": "DependencyNotFound: reference ContainerCluster infra/c1 is not found"}
@@ -24597,6 +25544,36 @@ metadata:
         self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
         self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+        self.assertIn("the fix says so", err.getvalue())
+
+    def test_a_shortened_kustomize_block_keeps_the_location_note(self):
+        """The copied file fills the cap beside a declared-file note and the
+        reconciler note. The shorter block makes room for the paragraph's
+        core and for both route notes: the location note is not pushed out."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/a/provisioning/pool.yaml")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        routes = "\n\n" + declared + "\n\n" + reconciled
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b + routes)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap." + routes)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn(declared, note)
+        self.assertIn(reconciled, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertIn("the fix says so", err.getvalue())
 
     def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
@@ -24703,12 +25680,12 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
         # The fix of the declaring file gets the paragraph about that file.
         finding = self.wedged("p/us-central1/hub-a")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
-        self.assertNotIn("The declaration is", finding["remediation"]["note"])
+        self.assertNotIn("**Config Connector is not applying `", finding["remediation"]["note"])
         manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), [])
@@ -24770,6 +25747,26 @@ metadata:
                 self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
                 self.assertNotIn(path, note)
 
+    def test_the_paragraph_never_pushes_out_a_location_note(self):
+        """Review finding: a paragraph step was accepted as shorter although
+        it pushed out the location note (here the declared file), and only the
+        reconciler note was held. Every route note already on the note stays."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/c1/pool.yaml")
+        for repeats in range(20, 40):
+            command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * repeats
+            note = f"{prose}\n\n```bash\n{command.strip()}\n```" + "\n\n" + declared + "\n\n" + reconciled
+            finding = self.harness_finding(note)
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+            with self.subTest(repeats=repeats):
+                result = finding["remediation"]["note"]
+                self.assertIn(declared, result)
+                self.assertIn(reconciled, result)
+                self.assertIn(audit_report.KCC_STALLED_MARK_PREFIX, result)
+
     def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
         """A note of a reverted gcloud command (about 1,400 characters), which
         `finish` wrote and never cuts, leaves room for the reconciler note or
@@ -24807,7 +25804,7 @@ metadata:
         self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
         finding["remediation"]["note"] = "Set the channel."
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
-        self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `b/prod.yaml`.**", finding["remediation"]["note"])
 
     def test_a_kubernetes_kind_never_takes_a_config_connector_object_of_the_same_kind_name(self):
         """A compliance `lb-world-open` finding on the Kubernetes Service
@@ -28748,6 +29745,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("Read these before asking", body)
         self.assertIn(f"`{derived_id()}`", body)
         self.assertIn("the sweep will not open a pull request", self.err)
+        # Addressed to a person: the worker reads this line too (#2953).
+        self.assertIn("wants one comments `/remediate " + derived_id() + "`; never you.", self.err)
 
     def test_a_triage_marked_critical_is_published_but_not_auto_promoted(self):
         self.promotion_replies()
@@ -30402,6 +31401,29 @@ class TestReportStore(HarnessTestCase):
 
     def stored(self):
         return json.loads((self.store_dir() / "latest.json").read_text())
+
+    def test_a_later_start_during_finish_does_not_stamp_a_clean_runs_envelope(self):
+        """#4268: a `finish` with no findings passes on the start `finish`
+        read before its checks, as the no-forge one does."""
+        self.record_run(audit=AUDIT)
+        own = self.a_later_start_lands_after_the_staleness_check()
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assert_the_envelope_keeps_its_runs_start(self.stored(), own)
+
+    def test_a_later_start_during_finish_does_not_stamp_a_ledger_runs_envelope(self):
+        """#4268: a `finish` that writes the ledger issue passes on the start
+        `finish` read before its checks, as the no-forge one does."""
+        self.record_run(audit=AUDIT)
+        own = self.a_later_start_lands_after_the_staleness_check()
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "OPENED")
+        self.assert_the_envelope_keeps_its_runs_start(self.stored(), own)
 
     def test_a_written_report_is_read_back_for_the_same_ledger(self):
         audit_report.write_report(AUDIT, self.envelope(), NOW)
@@ -32326,6 +33348,20 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(len(latest["current_ids"]), 4)
         self.assertEqual(len(latest["document"]["findings"]), 4)
         self.assertEqual(self.recorder.calls, [])
+
+    def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
+        """#4268: `finish` reads its run's start before its checks. A later
+        `start` that rewrites the run record as soon as `findings_predate_run`
+        has passed leaves the envelope with this run's own start, so a read
+        placed anywhere after that check fails here."""
+        self.start()
+        own = self.a_later_start_lands_after_the_staleness_check()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--scheduled"]), 0, self.err)
+
+        latest = json.loads((self.store() / "latest.json").read_text())
+        self.assert_the_envelope_keeps_its_runs_start(latest, own)
 
     def test_the_delta_runs_against_the_previous_no_forge_report(self):
         doc = make_doc(findings=THREE_SEVERITIES)
@@ -34732,6 +35768,15 @@ class TestStoreLedger(HarnessTestCase):
             "body": audit_report.delta_block(ids) + "\n" + audit_report.remediation_stream_marker(AUDIT),
         }
 
+    def test_a_later_start_during_finish_does_not_stamp_the_store_ledger_envelope(self):
+        """#4268: the store-ledger `finish` passes on the start `finish` read
+        before its checks, as the no-forge one does."""
+        self.start()
+        self.touch(self.NETPOL)
+        own = self.a_later_start_lands_after_the_staleness_check()
+        self.assertEqual(self.finish(make_doc()), 0, self.err)
+        self.assert_the_envelope_keeps_its_runs_start(self.latest(), own)
+
     # -- the decision ----------------------------------------------------------
 
     def test_a_forge_without_issue_verbs_keeps_the_ledger_in_the_store_and_opens_fixes(self):
@@ -35091,6 +36136,31 @@ class TestStoreLedger(HarnessTestCase):
         self.assertNotIn("labelsAdd", update)
         self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
         self.assertIn(proposal["url"], out["summary"])
+
+    def test_a_scoped_install_leaves_another_installs_unlabelled_fix_on_the_store_path(self):
+        # The store ledger on a forge with proposals and labels but no issue
+        # tracker: the stale close is handed the stored ids, so #9, whose id
+        # this install never stored, stays open while this install's own #8
+        # closes.
+        self.forge_is({"forge": "stub", "verbs": PROPOSAL_VERBS, "labels": True})
+        with scoped({audit_report.LEDGER_SCOPE_ENV: "tenant-b"}):
+            self.claim()
+            self.touch(self.NETPOL)
+            doc = make_doc()
+            self.run_once(doc)
+            validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+            ours = self.open_proposal(8, validated)
+            theirs = {**self.open_proposal(9, validated, body_ids=["x"]), "source": "platform-agent/fix-theirs"}
+            self.harness.replies["proposal-list"] = {"proposals": [ours, theirs], "truncated": False}
+            clean = make_doc(findings=[])
+            clean["resolved_because"] = [
+                {**{k: validated["findings"][0][k] for k in ("check", "cluster", "namespace", "object")},
+                 "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+            ]
+            out = self.run_once(clean)
+        self.assertEqual(out["prs_closed"], [ours["url"]])
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
 
     def test_a_clean_run_over_an_unexplained_finding_closes_nothing(self):
         self.claim()
@@ -37301,6 +38371,195 @@ class TestScopedRemediationPrs(ScopedHarnessTestCase):
         self.assertEqual((found or {}).get("number"), 8)
 
 
+class TestUnlabelledPullRequestOfAnotherInstall(ScopedHarnessTestCase):
+    """A pre-upgrade remediation pull request carries no scope label (#5229).
+
+    During a mixed-version window every install that shares the repository
+    reads it as its own. A scoped install's stale close therefore leaves an
+    unlabelled open pull request alone when none of the ids it covers was
+    ever on this install's ledger: it is some other install's fix, and this
+    run never looked for its findings.
+    """
+
+    OURS = "platform-agent/fix-ours"
+    THEIRS = "platform-agent/fix-theirs"
+
+    def close(self, prs, current_ids=frozenset(), **kwargs):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            closed = audit_report.close_stale_remediation_prs(
+                "acme/fleet", AUDIT, prs, set(current_ids), {"a": "Old title"}, {}, NOW, **kwargs
+            )
+        self.err = err.getvalue()
+        return closed
+
+    def theirs(self):
+        return pr(9, self.THEIRS, body=audit_report.delta_block(["x"]))
+
+    def test_an_unlabelled_pull_request_this_install_never_listed_is_left_alone(self):
+        self.assertEqual(self.close([self.theirs()], previous_ids=["a"]), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+        self.assertIn("never listed", self.err)
+
+    def test_one_this_install_listed_is_still_closed(self):
+        ours = pr(8, self.OURS, body=audit_report.delta_block(["a"]))
+        self.assertEqual(self.close([ours], previous_ids=["a"]), [ours["url"]])
+        self.assertTrue(self.harness.forge_calls("proposal-close", number=8))
+
+    def test_one_covering_a_current_finding_is_this_installs(self):
+        # An id this run sees is this install's whatever the ledger listed
+        # before, so the pull request is judged as it always was: the finding
+        # persists, and it stays open for that reason, not for the skip.
+        self.assertEqual(self.close([self.theirs()], {"x"}, previous_ids=["a"]), [])
+        self.assertNotIn("never listed", self.err)
+
+    def test_the_orphan_rule_does_not_reach_it_either(self):
+        # On a findings run the branch rule closes a pull request on no
+        # group's branch, and another install's branch is never one of ours.
+        closed = self.close(
+            [self.theirs()], {"a"}, previous_ids=["a"], branch_by_finding={"a": self.OURS}
+        )
+        self.assertEqual(closed, [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertIn("never listed", self.err)
+
+    def test_a_forge_with_no_labels_skips_nothing(self):
+        # No pull request there carries a scope label, and the listing already
+        # proved each one this install's, so the question does not arise.
+        self.harness.replies["capabilities"] = NO_ISSUES_NO_LABELS
+        theirs = self.theirs()
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": theirs["body"]}}
+        self.assertEqual(self.close([theirs], previous_ids=["a"]), [theirs["url"]])
+        self.assertNotIn("never listed", self.err)
+
+    def test_the_shields_close_comes_before_the_skip(self):
+        # A finding in a namespace this install declared is this install's
+        # whatever the ledger listed: the shield closes it, on the
+        # declaration, as it did before (and over a lost memory, where
+        # `previous_ids` is empty).
+        theirs = self.theirs()
+        closed = self.close([theirs], previous_ids=[], shielded_ids={"x"})
+        self.assertEqual(closed, [theirs["url"]])
+        self.assertNotIn("never listed", self.err)
+        self.assertIn("declared", "".join(self.harness.bodies_for("proposal-comment")).lower())
+
+    def test_with_the_labelled_or_unscoped_cases_as_before(self):
+        # This install's own label: the skip is not for it. No scope at all:
+        # the install owns everything on the stream, as before scopes. No
+        # `previous_ids` handed in: the caller has no ledger to judge by.
+        labelled = {**self.theirs(), "labels": [{"name": self.scope.label}]}
+        self.assertEqual(self.close([labelled], previous_ids=["a"]), [labelled["url"]])
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        with scoped({audit_report.LEDGER_SCOPE_ENV: ""}):
+            self.assertEqual(self.close([self.theirs()], previous_ids=["a"]), [self.theirs()["url"]])
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        self.assertEqual(self.close([self.theirs()]), [self.theirs()["url"]])
+
+    def test_a_clean_run_leaves_another_installs_pre_upgrade_fix_open(self):
+        # End to end: the ledger carried `a`, whose fix is #8; #9 is a fix
+        # some other install opened before scopes for a finding this ledger
+        # never had. The clean run closes #8 and leaves #9 alone.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        a_id = derived_id(fid="a")
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+            "proposal-list": proposals_view(
+                [
+                    pr(8, self.OURS, body=audit_report.delta_block([a_id])),
+                    pr(9, self.THEIRS, body=audit_report.delta_block(["x"])),
+                ]
+            ),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8])
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
+    def test_an_id_the_body_cut_counts_as_listed_on_a_seeded_memory(self):
+        # The store was never written for this ledger, so the memory is
+        # seeded from the issue body and holds no document; the ids the body
+        # budget cut live only in its `audit-findings-all` block. A fix for
+        # one of them is this install's and closes as before.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        previous += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), "cut.id"])} -->\n'
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": previous}]
+            ),
+            "proposal-list": proposals_view([pr(8, self.OURS, body=audit_report.delta_block(["cut.id"]))]),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        # No store the harness wrote on the test's behalf: the body the
+        # listing serves is all the run has, as on the first run after an
+        # upgrade that brings in the store.
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        findings_file = self.write_findings(doc)
+        code = BaseTestCase.run_main(
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file, "--scheduled"]
+        )
+        self.assertEqual(code, 0, self.err)
+        self.assertIn("seeding this run's memory once", self.err)
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8], self.err)
+        self.assertNotIn("never listed", self.err)
+
+    def test_a_held_open_run_over_a_seeded_memory_keeps_the_cut_ids_listed(self):
+        # The run after a seeded, held-open clean run: the store now holds
+        # the seeded body beside that run's own empty document and
+        # `ledger_held_open`, so no stored document names the cut ids; the
+        # body's complete block still does, and the fix for one closes.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        previous += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), "cut.id"])} -->\n'
+        self.seed_report(previous, ledger_held_open=True)
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": previous}]
+            ),
+            "proposal-list": proposals_view([pr(8, self.OURS, body=audit_report.delta_block(["cut.id"]))]),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8], self.err)
+        self.assertNotIn("never listed", self.err)
+
+    NETPOL = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def test_a_findings_run_leaves_it_open_where_the_branch_rule_closed_it(self):
+        # The findings branch of `finish`: this install's fix goes to its
+        # group's branch, so #9's branch is no group's and the branch rule
+        # would have closed it as moved; the skip comes first.
+        self.touch(self.NETPOL)
+        self.harness.replies.update(
+            {
+                "identity": {"login": "kube-agents-bot"},
+                "issue-list": {"issues": []},
+                "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+                "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+                "rev-parse --abbrev-ref": "feature-branch\n",
+                "proposal-list": proposals_view([self.theirs()]),
+            }
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
+    def test_an_old_scheme_body_is_left_open_without_the_never_listed_claim(self):
+        old = pr(9, self.THEIRS, body='<!-- audit-findings: ["x"] -->\n<!-- audit-id-scheme: 0 -->')
+        self.assertEqual(self.close([old], {"a"}, previous_ids=["a"], branch_by_finding={"a": self.OURS}), [])
+        self.assertIn("another id scheme", self.err)
+        self.assertNotIn("never listed", self.err)
+
+
 # --------------------------------------------------------------------------- #
 # Relative ages in finding text are dated to the run (#4901)
 # --------------------------------------------------------------------------- #
@@ -37468,6 +38727,16 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         self.assertIn("closed as completed", comment)
         self.assertIn("Not confirmed fixed: 1 previously reported finding", comment)
         self.assertIn(f"- `{RETIRED_CLUSTER}`: `{self.gone_id()}`", comment)
+        # The lead above that note must not claim what the note takes back.
+        self.assertNotIn("Every finding previously reported here is gone", comment)
+        self.assertIn("1 finding on a cluster this run listed nowhere is not confirmed fixed", comment)
+        # Nor the banner `close_ledger_reads_clean` puts at the top of the
+        # closed ledger: it names the retired id instead of "all resolved".
+        banner = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn(audit_report.CLEAN_CLOSE_MARKER, banner)
+        self.assertNotIn("all of them are resolved", banner)
+        self.assertIn("not confirmed fixed", banner)
+        self.assertIn(f"`{self.gone_id()}`", banner)
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["resolved"], 1)
@@ -37494,7 +38763,60 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 2)
         self.assertNotIn(audit_report.RETIRED_UNLISTED_KEY, payload)
-        self.assertNotIn("Not confirmed fixed", self.harness.bodies_for("issue-comment")[0])
+        comment = self.harness.bodies_for("issue-comment")[0]
+        self.assertNotIn("Not confirmed fixed", comment)
+        self.assertIn("Every finding previously reported here is gone", comment)
+        banner = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn("all of them are resolved", banner)
+        self.assertNotIn("not confirmed fixed", banner)
+
+    def test_the_banner_names_the_retired_ids(self):
+        # The clean banner with nothing retired is the one it always was.
+        plain = audit_report.clean_close_banner(AUDIT, NOW)
+        self.assertIn("found none of the findings below, so all of them are resolved", plain)
+        self.assertEqual(audit_report.clean_close_banner(AUDIT, NOW, retired_ids=[]), plain)
+        banner = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=["z.id", "a.id"])
+        self.assertTrue(banner.startswith(audit_report.CLEAN_CLOSE_MARKER))
+        self.assertNotIn("all of them are resolved", banner)
+        self.assertIn("2 of them are not confirmed fixed", banner)
+        self.assertIn("`a.id`, `z.id`", banner)
+        self.assertIn("retired with the ledger", banner)
+        one = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=["a.id"])
+        self.assertIn("1 of them is not confirmed fixed", one)
+        # The lead of the all-clear comment is conditioned the same way.
+        gone = {"id": "a.id", "cluster": RETIRED_CLUSTER, "check": "c", "object": "o"}
+        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW, retired=[gone])
+        self.assertNotIn("Every finding previously reported here is gone", comment)
+        self.assertIn("closed as completed", comment)
+        self.assertIn("1 finding on a cluster this run listed nowhere is not confirmed fixed", comment)
+        two = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, retired=[gone, {**gone, "id": "b.id"}]
+        )
+        self.assertIn("2 findings on a cluster this run listed nowhere are not confirmed fixed", two)
+
+    def test_a_banner_whose_ids_do_not_fit_counts_them_instead(self):
+        # A body near the forge's limit: the named banner would push it over,
+        # so the count-only banner goes on rather than no banner at all.
+        ids = [f"check-{i}.cluster-{i}.ns-{i}.deployment-{i}" for i in range(40)]
+        named = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids)
+        counted = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids, named=False)
+        self.assertIn("40 of them are not confirmed fixed, and the closing comment names them.", counted)
+        self.assertNotIn(ids[0], counted)
+        # And the closing comment does name them, with a marker past its cap.
+        many = [{"id": f"c.k.n.d-{i:03d}", "cluster": RETIRED_CLUSTER} for i in range(audit_report.MAX_DELTA_ROWS + 1)]
+        note = "\n".join(audit_report._comment_retired(many))
+        self.assertIn("…and 1 more", note)
+        self.assertIn(f"`{RETIRED_CLUSTER}`: `c.k.n.d-000`", note)
+        room = audit_report.MAX_BODY_CHARS - len(counted) - 2 - 100
+        live = audit_report.delta_block(["a"]) + "\n" + "x" * (room - len(audit_report.delta_block(["a"])) - 1)
+        self.assertGreater(len(named) + 2 + len(live), audit_report.MAX_BODY_CHARS)
+        self.assertTrue(audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, live, NOW, retired_ids=ids))
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertTrue(body.startswith(counted))
+        # A body that fits with the named banner keeps it.
+        short = audit_report.delta_block(["a"])
+        self.assertTrue(audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, short, NOW, retired_ids=ids))
+        self.assertTrue(self.harness.bodies_for("issue-update")[-1].startswith(named))
 
     def test_a_cluster_in_scope_skipped_holds_the_close_instead(self):
         self.previous_ledger(self.gone())
@@ -37642,6 +38964,245 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         for answer in answers:
             self.assertNotIn("no longer reproduces", answer)
         self.assertTrue(any("not confirmed fixed" in a for a in answers))
+
+
+class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
+    """A direct ask for a declared `no-pdb` finding the worker left `manual`,
+    as the SOP tells it to: `remediate` writes the PodDisruptionBudget `finish`
+    would write and opens it, instead of refusing the finding as not a
+    `manifest`. This is the only way a chat ask reaches that budget on an
+    install whose automatic sweep is off (`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`),
+    which is every eval lane since #3439."""
+
+    SELECTOR = {"matchLabels": {"app": "checkout-gateway"}}
+    DECLARATION = "clusters/prod-us-east/payments/checkout-gateway.yaml"
+    GENERATED = "clusters/prod-us-east/payments/checkout-gateway-pdb.yaml"
+    STREAM = "obtainability-audit"
+
+    def finding(self):
+        return make_finding(
+            fid="checkout-gateway",
+            check="no-pdb",
+            severity="major",
+            obj="Deployment/checkout-gateway",
+            remediation={"kind": "manual", "note": "Let finish write the budget."},
+        )
+
+    def stream_tree(self):
+        """The obtainability stream's clone; `self.workspace` is the default stream's."""
+        return self.workspace.parent.parent / self.STREAM / self.workspace.name
+
+    def fid(self):
+        return derived_id(check="no-pdb", obj="Deployment/checkout-gateway")
+
+    def manifest_file(self, **fields):
+        candidate = {
+            "check": "no-pdb",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Deployment/checkout-gateway",
+            "severity": "major",
+            "excerpt": "replicas=2, no PodDisruptionBudget",
+            "impact": "x",
+            "needs_triage": None,
+            "declaration": {"path": self.DECLARATION, "directory": "clusters/prod-us-east/payments"},
+            "pod_selector": self.SELECTOR,
+            **fields,
+        }
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest(candidates=[candidate], audit=self.STREAM)), encoding="utf-8")
+        return str(path)
+
+    def run_remediate(self, extra=()):
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[self.finding()]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(), *extra]
+        )
+
+    def test_it_writes_the_budget_beside_the_declaration_and_opens_it(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        document = pytest_yaml().safe_load((self.stream_tree() / self.GENERATED).read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["metadata"], {"name": "checkout-gateway-pdb", "namespace": "payments"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_without_the_manifest_it_is_refused_and_says_to_pass_it(self):
+        self.assertEqual(self.run_remediate(), 2)
+        self.assertIn("pass the collector's --manifest-file", self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_budget_the_planner_will_not_write_is_refused_with_its_reason(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(namespace_pdbs=["checkout-gateway-pdb"])])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {self.fid()}: the namespace already has a PodDisruptionBudget", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_the_dry_run_says_it_would_write_the_budget_and_writes_nothing(self):
+        rc = self.run_remediate(["--dry-run", "--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("the real run writes its PodDisruptionBudget beside " + self.DECLARATION, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    WORKER_BUDGET = (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n"
+        "  name: checkout-gateway-pdb\n  namespace: payments\nspec:\n  maxUnavailable: 1\n"
+    )
+
+    def run_over_declaration(self, extra=()):
+        """The worker wrote its budget over the Deployment's own file, under the
+        conventional `<workload>-pdb` name, and named that file as the fix."""
+        # An existing clone (it has `.git`), so `ensure_workspace` reuses it and the
+        # worker's file is still there when the name search runs; a first clone would
+        # remove it, and the test could not tell `probe.ignored` from its absence.
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        declaration = self.stream_tree() / self.DECLARATION
+        declaration.parent.mkdir(parents=True, exist_ok=True)
+        declaration.write_text(self.WORKER_BUDGET, encoding="utf-8")
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": self.DECLARATION, "note": "x"}
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[finding]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
+             "--manifest-file", self.manifest_file(), *extra]
+        )
+
+    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
+        """A merge of the worker's file would replace the workload, so it is
+        demoted and the budget written beside, as `finish` does. The name search
+        reads past the worker's file, which names nothing the repository holds."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
+        }
+        rc = self.run_over_declaration()
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("already names an object", self.err)
+        self.assertIn("the budget is planned beside it instead", self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
+        # The worker's file was there for the name search, so `probe.ignored` was what let it pass.
+        self.assertEqual((self.stream_tree() / self.DECLARATION).read_text(), self.WORKER_BUDGET)
+
+    def test_the_dry_run_says_so_for_a_budget_over_the_declaration(self):
+        rc = self.run_over_declaration(["--dry-run"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DRY RUN: " + self.fid() + " names its PodDisruptionBudget", self.err)
+        self.assertNotIn("the budget is planned beside it instead", self.err)
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_withheld_selector_over_the_declaration_is_not_announced_as_written(self):
+        self.manifest_file = lambda real=self.manifest_file: real(pod_selector_withheld="other pods match")
+        self.assertEqual(self.run_over_declaration(), 2)
+        self.assertNotIn("beside it instead", self.err)
+
+    def human_closed_own_branch(self):
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        return proposals_view(
+            [
+                {
+                    **pr(8, branch, state="CLOSED", body=audit_report.delta_block([self.fid()])),
+                    "closedAt": "2026-07-15T00:00:00Z",
+                    "labels": [],
+                }
+            ]
+        )
+
+    def test_a_human_close_on_the_budgets_own_branch_is_superseded(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.human_closed_own_branch()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [self.fid()])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_override_flag_revives_a_human_closed_budget(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_own_branch(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/10"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(), "--override-human-close"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [])
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
+
+    def test_a_withheld_selector_is_not_planned(self):
+        manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
+
+    def test_a_refusal_names_what_the_collector_did_not_find(self):
+        """A direct ask refused as not a `manifest` says why the budget is not written."""
+        cases = {
+            "no declaration": ({"declaration": None}, "candidate for it carries no `declaration`"),
+            "withheld selector": ({"pod_selector_withheld": "other pods match"}, "withheld the workload's selector: other pods match"),
+            "no candidate": ({"object": "Deployment/other"}, "has no no-pdb candidate for"),
+        }
+        for name, (fields, phrase) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file(**fields)]), 2)
+                self.assertIn(phrase, self.err)
+                self.assertEqual(self.harness.calls, [])
+
+    def budget_pr(self, branch, state="OPEN"):
+        return proposals_view([{**pr(21, branch, state=state, body=audit_report.delta_block([self.fid()])), "labels": []}])
+
+    def own_branch(self):
+        return audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+
+    def test_a_rerun_meeting_its_own_open_pull_request_reports_it_already_open(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr(self.own_branch())}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 0, self.err)
+        self.assertEqual(self.stdout_json()["already_open"], [self.fid()])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_pull_request_on_another_branch_carrying_the_finding_answers_it(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr("someone/their-budget")}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn("already carries it", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_budget_already_in_the_repository_reads_as_already_fixed(self):
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        existing = self.stream_tree() / self.GENERATED
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn(f"REFUSED {self.fid()}: already fixed: {self.GENERATED} exists", self.err)
+
+    def test_only_named_findings_are_planned(self):
+        named, other = self.finding(), self.finding()
+        other["object"] = "Deployment/other"
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        fixes = audit_report.requested_generated_fixes([named, other], manifest, [str(named["id"])])
+        self.assertEqual(list(fixes), [str(named["id"])])
+
+    def test_a_manifest_finding_is_untouched_by_the_planner(self):
+        """Only a `manual` finding is planned; a worker-written file is opened as written."""
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
 
 
 if __name__ == "__main__":

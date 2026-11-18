@@ -1,11 +1,11 @@
-"""Route a proactive chat post through the A2A gateway when the next stack owns the chat backend.
+"""Route a proactive chat post through the A2A gateway when the gateway holds the chat backend.
 
-Under ``spec.mode: next`` the operator stops rendering the Hermes chat platform
-that ``hermes send`` posts through, because the A2A gateway consumes the chat
-backend instead. Every caller that posts unprompted (the alert path, the cron
+The operator does not render the Hermes chat platform that ``hermes send``
+posts through for a backend the A2A gateway consumes: Google Chat and Slack,
+each whenever it is enabled. Every caller that posts unprompted (the alert path, the cron
 relay, the Cluster Agent reconcile notice, ``send_notification``) would then post
-nowhere. The operator names the platform the gateway now holds in
-``A2A_NOTIFY_PLATFORM``, and for that platform these callers run
+nowhere. The operator names the platforms the gateway now holds, and for the
+ones :func:`routed_platforms` picks these callers run
 ``a2a notify`` instead, which asks the gateway to post to the home channel over
 its ``chat.notify`` route.
 
@@ -35,19 +35,26 @@ import os
 import sqlite3
 from contextlib import closing
 
-# The variable the operator renders into the agent container exactly when the
-# next stack holds the chat backend (platformagent_manifests.go,
-# a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
+# The variable the operator renders into the agent container when the A2A
+# gateway holds the chat backend (platformagent_manifests.go,
+# a2aNotifyPlatformEnvVar): every armed platform whose home channel the CR
+# sets, and absent when none is. Its value is a list of platform names as
+# Hermes spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list
+# of one. routed_platforms() adds the learned Slack channel and the fallback.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
-# a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
+# a2aNotifyConversationsEnvVar): the platforms whose backends the gateway holds,
+# in the same list form.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# What separates the platform names in either variable.
+PLATFORM_LIST_SEPARATOR = ","
 # The operator projects the home channel it admitted (the CR field, else the
 # channel the gateway learned) into a ConfigMap mounted as a directory in the
 # agent pod, so a learned channel reaches the pod without a restart. One file,
 # the Slack channel id or empty; the directory is absent on an operator older
-# than the projection and in today mode. No env override: the agent's own
+# than the projection and where the gateway does not hold Slack. No env
+# override: the agent's own
 # .env is loaded into its environment, so a seam there would let a line on
 # the writable volume point the readers at a file of its own.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
@@ -74,7 +81,7 @@ ROUTE_CONVERSATION = "conversation"
 ROUTE_CONTEXT = "context_id"
 # The bus CLI in the agent image (a2a/cmd/a2a), on PATH.
 A2A_CLI = "a2a"
-# The Hermes CLI the today path posts through.
+# The Hermes CLI a platform the gateway does not hold posts through.
 HERMES_CLI = "hermes"
 # The exit status `a2a notify` uses when the gateway did not answer in time: the
 # post may or may not have landed, so a caller must not post it again.
@@ -102,9 +109,10 @@ NOTIFY_MARGIN_SECONDS = 15
 NOTIFY_SUBPROCESS_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MARGIN_SECONDS
 # The `a2a notify --update` key an event alert is posted under, one per alert
 # (its event session's id): the gateway edits the message it posted with that
-# key, which is how the alert's triage replaces the alert in place under next
-# (slack_ux_incident's chat route, which finds the session by the alert's
-# thread). Hermes's send has no such key, so the today path posts as before.
+# key, which is how the alert's triage replaces the alert in place through
+# the gateway (slack_ux_incident's chat route, which finds the session by the
+# alert's thread). Hermes's send has no such key, so a platform the gateway
+# does not hold posts as before.
 ALERT_UPDATE_FORMAT = "alert-{session}"
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
@@ -126,7 +134,8 @@ def home_file() -> tuple[str, bool]:
     restarts for it. Mounted means the directory is there: the Optional
     volume gives an empty directory until the operator writes the ConfigMap,
     and in that gap the home is still the operator's to say. No directory at
-    all is today mode, or an operator older than the projection: ("", False).
+    all is an install where the gateway does not hold Slack, or an operator
+    older than the projection: ("", False).
     """
     try:
         with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
@@ -144,38 +153,55 @@ def home_file_value() -> str:
     return home_file()[0]
 
 
-def routed_platform() -> str:
-    """The platform whose posts go through the gateway, or "" when none does.
+def platform_list(raw: str) -> list[str]:
+    """The platform names in a comma-separated env value: stripped, empties dropped, first of a duplicate kept, in order."""
+    names: list[str] = []
+    for part in raw.split(PLATFORM_LIST_SEPARATOR):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
-    The rendered env names it when the CR sets the home channel, and when the
-    gateway's backend is the install's only chat platform with no home channel
-    set: the gateway then refuses each post and keeps it for the digest it
-    posts once one is. A learned channel is never rendered into the pod, so
-    with the env empty the answer is derived: the gateway holds Slack
-    (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
+
+def home_platforms() -> list[str]:
+    """The platforms with a home channel the agent can see, Chat first, or [] when none has one.
+
+    The operator lists every armed route whose home channel the CR sets
+    (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds it
+    and the projected file names a channel, the CR's or one it learned.
     """
-    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
-    if routed:
-        return routed
-    if gateway_platform() == SLACK_PLATFORM and home_file_value():
-        return SLACK_PLATFORM
-    return ""
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    slack_home = SLACK_PLATFORM in gateway_platforms() and bool(home_file_value())
+    if slack_home and SLACK_PLATFORM not in listed:
+        return [*listed, SLACK_PLATFORM]
+    return listed
 
 
-def gateway_platform() -> str:
-    """The platform whose backend the gateway holds, or "" when it holds none.
+def routed_platforms() -> list[str]:
+    """The platforms that get home posts through the gateway, or [] when none does.
 
-    Unlike :func:`routed_platform` this is set with no home channel, so it names
-    the platform an install has when nothing routes a proactive post there, and
-    whose conversations :func:`conversation_command` can post into.
+    Those are the platforms with a home channel (:func:`home_platforms`). With
+    none, home posts go to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
+    whose posts the gateway keeps for the digest it posts once a channel is set.
+    The rule reads only those two variables and the projected Slack file, so
+    every process computes the same list and a learned channel restarts no pod.
     """
-    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+    return home_platforms() or gateway_platforms()
+
+
+def gateway_platforms() -> list[str]:
+    """The platforms whose backends the gateway holds, or [] when it holds none.
+
+    It names every armed route, home channel or not: the platforms whose
+    conversations :func:`conversation_command` can post into, and the home-post
+    fallback of :func:`routed_platforms`.
+    """
+    return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 
 
 def routes(platform: str) -> bool:
     """Whether a post to ``platform`` goes through the gateway's chat.notify route."""
-    routed = routed_platform()
-    return bool(routed) and platform == routed
+    return platform in routed_platforms()
 
 
 def bus_unreachable_reason() -> str:
@@ -267,8 +293,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     if thread:
         # A Slack thread is a bare ts, which names no channel: it goes out
         # qualified by the target's own channel, and the gateway posts it only
-        # when that channel is home. A today-era DM or other channel's thread
-        # is then refused rather than followed up in home.
+        # when that channel is home. A DM or other channel's thread the Hermes
+        # Slack adapter opened is then refused rather than followed up in home.
         if platform == SLACK_PLATFORM and chat:
             thread = f"{chat}/{thread}"
         argv += ["--thread", thread]
@@ -283,9 +309,9 @@ def chat_command(platform: str, thread: str, text: str, chat_path: str, timeout_
 
     ``chat_path`` names a file holding the chat message's JSON object; ``text``
     is its fallback, which the gateway posts when it does not lay the message
-    out. Only for a platform :func:`routes` sends through the gateway; the
-    today path posts Block Kit through the broker's Slack relay
-    (slack_blocks_post.py).
+    out. Only for a platform :func:`routes` sends through the gateway; a
+    platform the gateway does not hold posts Block Kit through the broker's
+    Slack relay (slack_blocks_post.py).
     """
     argv = [A2A_CLI, "notify", "--platform", platform, "--chat-file", chat_path]
     if thread:

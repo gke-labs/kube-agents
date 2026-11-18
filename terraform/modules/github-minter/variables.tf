@@ -43,3 +43,15 @@ variable "kms_key_name" {
   type        = string
   default     = "github-token-minter-key"
 }
+
+variable "owner_labels" {
+  description = "Labels naming the install that owns the signing key, set on the crypto key (a KMS key ring carries no labels, so the ring is owned through its key). The installer's adoption step reads them to refuse another install's key. Empty sets none."
+  type        = map(string)
+  default     = {}
+}
+
+variable "owner_description" {
+  description = "Description of the minter's service account, naming the install that owns it, for the same check. Null leaves the description unset."
+  type        = string
+  default     = null
+}

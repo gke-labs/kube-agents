@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The ``oobe_audits_started`` check: did the first-run audits stage start every audit.
+"""The ``oobe_audits_started`` and ``oobe_audits_ended`` checks: did the first-run audits stage
+start every audit, and did any of those runs end in a state other than completed.
 
 ``agents/chat/scripts/oobe.py`` starts five Platform Agent audits once the onboarding
 scan settles -- the four fleet audits, then the upgrade retrospective -- by marking each
 due on that profile's roster. A started audit leaves a
-row in the profile's ``cron/executions.db``. The case's stack
-(``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
-state file, and the stage records when it marked each audit; this passes when every audit it
+row in the profile's ``cron/executions.db``. On a fresh install the case's stack
+(``bench/tf/prebuilt/oobe-first-run-audits``) arms nothing and records that it chose the
+install's own first run (OWN_STATE_FILE), and this grades that chain; on a long-lived install
+the stack records when it armed the stage in its state file. The stage records when it marked each audit; this passes when every audit it
 marked has a run of its own claimed at or after its mark that got going (running, completed, or
 ended after it started), and every other audit is one it adopted (a run completed since the
 sweep).
@@ -50,9 +52,17 @@ STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 AUDITS_MARKER = f"{DATA_ROOT}/.oobe_audits_fired"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
+# bench/tf/prebuilt/oobe-first-run-audits/own_stage.py: OWN_STATE, written when the stack found
+# the install's own first run recent and armed nothing.
+OWN_STATE_FILE = f"{DATA_ROOT}/.bench-oobe-own.json"
 # A run that got going by its status; a run that ended otherwise counts too when it has a
 # started_at (it began, then failed or was cut off). A row with no start time ran nothing.
 STARTED_STATUSES = ("running", "completed")
+# How a run that ended well is recorded. A run still claimed or running has not ended.
+COMPLETED_STATUS = "completed"
+IN_FLIGHT_STATUSES = ("claimed", "running")
+# How much of a run's recorded error a red quotes.
+ERROR_SHOWN_CHARS = 200
 # The gateway Deployment, as the stack names it (variables.tf: agent_deployment). Exec goes
 # there rather than through AGENT_SERVICE_NAME, which can name a tunnel in front of the
 # gateway that has none of its containers.
@@ -68,15 +78,17 @@ DEFAULT_AGENT_DEPLOYMENT = "platform-agent-gateway"
 _STARTS_SCRIPT = """
 import json, os, sqlite3, sys
 from datetime import datetime
-state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+state, own_state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 SQLITE_BUSY_TIMEOUT = 10
 SKIPPED = "skipped"
-out = {"applied_at": None, "marked": [], "adopted": [], "runs": {}, "error": None, "held": {}, "gave_up": [], "skipped": None}
+out = {"applied_at": None, "marked": [], "adopted": [], "runs": {}, "error": None, "held": {}, "gave_up": [], "skipped": None,
+       "own": False}
 marks = {}
 try:
     out["applied_at"] = json.load(open(state))["applied_at"]
 except FileNotFoundError:
-    pass
+    # Nothing armed: the install's own first run is graded if the stack chose it.
+    out["own"] = os.path.exists(own_state)
 except (OSError, ValueError, KeyError, TypeError) as exc:
     out["error"] = "%s: %s" % (state, exc)
 try:
@@ -89,6 +101,10 @@ try:
     marks = {a: t for a, t in (recorded.get("marks") or {}).items() if isinstance(t, (int, float))}
 except (OSError, ValueError, AttributeError, TypeError):
     pass
+# The install's own chain: its window opens at the stage's first mark (each audit's own
+# mark bounds it below), and a record with no mark has no window.
+if out["own"] and marks:
+    out["applied_at"] = datetime.fromtimestamp(min(marks.values())).astimezone().isoformat()
 # A store not yet created has no runs, as the stage and the runner read it.
 if out["applied_at"] and not out["error"] and os.path.exists(db):
     try:
@@ -96,11 +112,12 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
         con = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
         for audit in audits:
             since = max(armed, marks.get(audit, armed))
-            for status, claimed, finished, began in con.execute(
-                "SELECT status, claimed_at, finished_at, started_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
+            for status, claimed, finished, began, error in con.execute(
+                "SELECT status, claimed_at, finished_at, started_at, error FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
                 " ORDER BY claimed_at", (audit,)):
                 if status != SKIPPED and datetime.fromisoformat(claimed).timestamp() >= since:
-                    out["runs"][audit] = {"status": status, "claimed_at": claimed, "finished_at": finished, "started_at": began}
+                    out["runs"][audit] = {"status": status, "claimed_at": claimed, "finished_at": finished, "started_at": began,
+                                          "error": error}
                     break
     except (sqlite3.Error, ValueError, TypeError) as exc:
         out["error"] = "%s: %s" % (db, exc)
@@ -118,7 +135,7 @@ def agent_shell(script: str, timeout: float) -> str:
 def starts_command() -> str:
     """The ``sh -c`` line that runs the read in the agent container."""
     args = " ".join(
-        shlex.quote(a) for a in [STATE_FILE, AUDITS_MARKER, PLATFORM_EXECUTIONS_DB, STARTS_READ, *FIRST_RUN_AUDITS]
+        shlex.quote(a) for a in [STATE_FILE, OWN_STATE_FILE, AUDITS_MARKER, PLATFORM_EXECUTIONS_DB, STARTS_READ, *FIRST_RUN_AUDITS]
     )
     return (
         f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
@@ -160,8 +177,7 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
     marked) counts as had and is left out of that order; at least one must be the stage's own.
 
     A row with no start time does not count: a run cut off at its start leaves exactly that. Nor does a run the stage did not mark: a scheduled run that falls in the window is
-    not the stage's. Past running, the outcome is the audit's own, graded by the audit
-    cases.
+    not the stage's. Past running, the outcome is ``oobe_audits_ended``'s to grade.
     The agent pod unreadable, or a state file or cron store the read cannot use, is
     ``status="error"``.
     """
@@ -174,15 +190,19 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
             return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
         if read.get("error"):
             return "error", f"the stack's state file or the Platform Agent's cron store could not be read: {read['error']}", read
-        if not read.get("applied_at"):
-            return "error", f"there is no {STATE_FILE}: the stack did not arm the stage", read
-        armed = datetime.fromisoformat(read["applied_at"]).isoformat()
+        own = bool(read.get("own"))
+        if read.get("applied_at"):
+            armed = datetime.fromisoformat(read["applied_at"]).isoformat()
+        elif own:
+            armed = "the install's first run began"
+        else:
+            return "error", f"there is no {STATE_FILE} or {OWN_STATE_FILE}: the stack neither armed the stage nor chose the install's own first run", read
         runs, marked = read["runs"], set(read.get("marked") or [])
         # An audit the stage passed over because it had completed a run since the sweep (a
         # scheduled one): already had, so not required to be the stage's, and outside the chain.
         adopted = [a for a in FIRST_RUN_AUDITS if a in set(read.get("adopted") or [])]
         # A run that got going and then failed, or was cut off by a restart, still started: how it
-        # ended is the audit cases' to grade. A row with no start time ran nothing.
+        # ended is `oobe_audits_ended`'s to grade. A row with no start time ran nothing.
         running = [
             a for a in FIRST_RUN_AUDITS
             if runs.get(a, {}).get("status") in STARTED_STATUSES or runs.get(a, {}).get("started_at")
@@ -193,7 +213,8 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
             if overlaps:
                 return "fail", f"the first-run audits overlapped instead of running one after another: {'; '.join(overlaps)}", read
             also = f"; {', '.join(adopted)} had already completed a run since the sweep and was not run again" if adopted else ""
-            return "pass", f"{len(started)} first-run audits were marked due by the stage and ran one after another since {armed}{also}", read
+            which = "on the install's own first run, " if own else ""
+            return "pass", f"{which}{len(started)} first-run audits were marked due by the stage and ran one after another since {armed}{also}", read
         stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in running and a not in adopted]
         missing = [a for a in FIRST_RUN_AUDITS if a not in runs and a not in adopted]
         unmarked = [a for a in running if a not in marked and a not in adopted]
@@ -215,3 +236,43 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         if read.get("gave_up"):
             parts.append(f"the stage gave up on {', '.join(read['gave_up'])} after its marks were never claimed")
         return "fail", "; ".join(parts), read
+
+
+@VERIFIERS.register("oobe_audits_ended")
+class OobeAuditsEndedVerifier(_OnboardingPollVerifier):
+    """Fails when a first-run audit the stage marked due has a run that ended in a state other
+    than completed, and names the audit, the state and the error the run recorded. A run that
+    ends that way filed no report: a model call dropped until the runtime gave up leaves exactly
+    this.
+
+    A run still claimed or running has not ended and is not graded: the stage is done once its
+    last audit is running, so the first repetition can read that run before it ends. Whether
+    every audit started is ``oobe_audits_started``'s to grade; with no run of the stage's to
+    read, this fails, because it graded nothing. The reads and their errors are that check's.
+    """
+
+    type: Literal["oobe_audits_ended"]
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = read_starts(agent_shell, read_timeout)
+        if read is None:
+            return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"the stack's state file or the Platform Agent's cron store could not be read: {read['error']}", read
+        if not read.get("applied_at") and not read.get("own"):
+            return "error", f"there is no {STATE_FILE} or {OWN_STATE_FILE}: the stack neither armed the stage nor chose the install's own first run", read
+        marked = set(read.get("marked") or [])
+        runs = {a: read["runs"][a] for a in FIRST_RUN_AUDITS if a in marked and a in read["runs"]}
+        if not runs:
+            return "fail", "no first-run audit the stage marked due has a run, so no run's end was graded", read
+        ended_badly = [a for a, run in runs.items() if run.get("status") not in (COMPLETED_STATUS, *IN_FLIGHT_STATUSES)]
+        if ended_badly:
+            told = "; ".join(
+                f"{a} ended as {runs[a].get('status')}" + (f" ({str(runs[a]['error'])[:ERROR_SHOWN_CHARS]})" if runs[a].get("error") else "")
+                for a in ended_badly
+            )
+            return "fail", f"a first-run audit's run did not end as completed, so it filed no report: {told}", read
+        in_flight = [a for a, run in runs.items() if run.get("status") in IN_FLIGHT_STATUSES]
+        going = f"; {', '.join(in_flight)} had not ended and was not graded" if in_flight else ""
+        return "pass", f"{len(runs) - len(in_flight)} first-run audit run(s) ended as completed{going}", read
+

@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -2719,6 +2720,91 @@ class CollectClusterTest(unittest.TestCase):
                 self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
                 self.assertIn("not a JSON list of entries", entry["limitations"])
 
+    @staticmethod
+    def _without_durations(entry):
+        """The cluster entry less what two runs never share: each command's
+        duration, and the temporary directory each run keeps its kubeconfig in."""
+        clean = json.loads(re.sub(r'[^ "=]*/kubeconfig_', "KUBECONFIG_DIR/kubeconfig_", json.dumps(entry)))
+        for command in clean["commands"]:
+            command.pop("duration_s", None)
+        return clean
+
+    def test_the_relay_read_gives_the_same_entry_as_the_gcloud_read(self):
+        """The same entries through either door: the candidates, the recorded
+        command, the limitations and the outcome agree. (Both doors are handed one
+        text here, so the digests agree too; live, `gcloud` prints the list
+        indented and the relay's is compact, and nothing compares the digests.)"""
+        logged = [ERROR_MSG_ENTRY, {"jsonPayload": {}}]
+        by_gcloud = self.run_with(dump_items=[], log_entries=logged)
+        self.assertTrue([a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
+        with patch.object(fs.logging_reads, "read_json", return_value=json.dumps(logged)) as relay:
+            by_relay = self.run_with(dump_items=[], log_rc=1)
+        self.assertEqual([], [a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
+        self.assertEqual(self._without_durations(by_gcloud), self._without_durations(by_relay))
+        self.assertTrue([c for c in by_relay["candidates"] if c["check"] == "autoscaler-out-of-resources"])
+        (project, filter_text, limit), _ = relay.call_args
+        self.assertEqual((self.CLUSTER["project"], fs.AUTOSCALER_LOG_LIMIT), (project, limit))
+        # What gcloud sends for --freshness: the bound first, then the argv's filter.
+        gcloud_filter = by_gcloud["commands"][0]["command"]
+        bound, _, rest = filter_text.partition(" AND ")
+        self.assertRegex(bound, r'^timestamp>="\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z"$')
+        self.assertIn(f'resource.labels.cluster_name="{self.CLUSTER["name"]}"', rest)
+        self.assertTrue(any(shlex.quote(rest) in c["command"] for c in by_gcloud["commands"]), gcloud_filter)
+
+    def test_a_relay_that_does_not_answer_leaves_the_gcloud_read(self):
+        with patch.object(fs.logging_reads, "read_json", return_value=None):
+            entry = self.run_with(dump_items=[], log_entries=[ERROR_MSG_ENTRY])
+        self.assertEqual(1, len([a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]]))
+        self.assertTrue([c for c in entry["candidates"] if c["check"] == "autoscaler-out-of-resources"])
+
+    def test_a_relay_read_that_spends_the_cap_is_a_timed_out_read_and_gcloud_is_not_run(self):
+        timed_out = fs.logging_reads.ReadTimedOut("timed out after 60 seconds")
+        with patch.object(fs.logging_reads, "read_json", side_effect=timed_out) as relay:
+            entry = self.run_with(dump_items=[], log_entries=[ERROR_MSG_ENTRY])
+        self.assertEqual([], [a for a in self.issued if a[:3] == ["gcloud", "logging", "read"]])
+        self.assertEqual(fs.DEFAULT_TIMEOUT_S, relay.call_args.kwargs["timeout_s"])
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+        self.assertIn(f"`gcloud logging read` failed (rc={fs.TIMEOUT_RC})", entry["limitations"])
+        self.assertIn("timed out after 60 seconds", entry["limitations"])
+
+    def test_gcloud_gets_what_the_relay_left_of_the_cap(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(kwargs)
+            return run_of(0, "[]")
+
+        argv = ["gcloud", "logging", "read", "x"]
+        for spent, expected in ((0.4, {}), (25.0, {"timeout": fs.DEFAULT_TIMEOUT_S - 25})):
+            with self.subTest(spent=spent):
+                calls.clear()
+                ticks = iter([100.0, 100.0 + spent])
+                with patch.object(fs.logging_reads, "read_json", return_value=None), \
+                        patch.object(fs.time, "monotonic", lambda: next(ticks)):
+                    fs.run_logging_read(argv, run=run, project="p", filter_text="x", freshness=fs.timedelta(hours=1), limit=10)
+                self.assertEqual([expected], calls)
+
+    def test_an_empty_relay_read_is_a_clean_window(self):
+        with patch.object(fs.logging_reads, "read_json", return_value="[]"):
+            entry = self.run_with(dump_items=[], log_rc=1)
+        self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("autoscaler-out-of-resources", {e["check"] for e in entry.get("checks_unevaluated", [])})
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["candidates"]})
+
+    def test_a_full_relay_page_leaves_the_check_unevaluated_as_a_full_gcloud_page_does(self):
+        full = json.dumps([{"jsonPayload": {}}] * fs.AUTOSCALER_LOG_LIMIT)
+        with patch.object(fs.logging_reads, "read_json", return_value=full):
+            entry = self.run_with(dump_items=[], log_rc=1)
+        self.assertIn("older entries", entry["limitations"])
+        self.assertIn("autoscaler-out-of-resources", {e["check"] for e in entry["checks_unevaluated"]})
+
+    def test_the_freshness_the_relay_sends_is_the_one_the_argv_names(self):
+        self.assertEqual(f"{fs.AUTOSCALER_FRESHNESS_HOURS}h", fs.AUTOSCALER_FRESHNESS)
+        with patch.object(fs.logging_reads, "freshness_filter", wraps=fs.logging_reads.freshness_filter) as bound, \
+                patch.object(fs.logging_reads, "read_json", return_value="[]"):
+            self.run_with(dump_items=[])
+        self.assertEqual(fs.timedelta(hours=fs.AUTOSCALER_FRESHNESS_HOURS), bound.call_args.args[1])
+
     def test_an_empty_autoscaler_read_is_still_clean(self):
         entry = self.run_with(dump_items=[], log_stdout="\n")
         self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
@@ -2863,6 +2949,81 @@ class CollectClusterTest(unittest.TestCase):
         cc = compute_class("batch-staging", [{"machineFamily": "n2", "spot": True}])
         entry = self.run_with(dump_items=[cc])
         self.assertEqual([c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"], [])
+
+
+class NodePoolsFromTheDiscoveryListingTest(unittest.TestCase):
+    """single-zone-nodepool takes the pools from the `clusters list` item that
+    discovered the cluster, recorded against that listing's command, and runs
+    its own `node-pools list` only when the item carries none (#4081)."""
+
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    issued_node_pools_read = CollectClusterTest.issued_node_pools_read
+
+    POOL = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+    LIVE = [node(f"n{i}", "p1") for i in range(10)]
+
+    def listed(self, **extra):
+        """The running cluster `enumerate_clusters` builds from one item, and the listing argv."""
+        issued = []
+        item = {"name": "prod-usc1", "location": "us-central1", "status": "RUNNING", **extra}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return run_of(0, json.dumps([item]))
+
+        (cluster,), _ = fs.enumerate_clusters("acme", run=run)
+        (listing_argv,) = issued
+        return cluster, listing_argv
+
+    def test_the_listing_projects_node_pools_and_nothing_more(self):
+        _, argv = self.listed()
+        projection = argv[argv.index("--format") + 1]
+        self.assertEqual(
+            projection,
+            "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,"
+            "autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,"
+            "addonsConfig.configConnectorConfig.enabled,nodePools)",
+        )
+        self.assertNotIn("masterauth", " ".join(argv).lower())
+
+    def test_listed_pools_replace_the_node_pools_read(self):
+        cluster, listing_argv = self.listed(nodePools=[self.POOL])
+        # The fake's own `node-pools list` answers no pools, so a candidate
+        # can only come from the listing.
+        entry = self.run_with(dump_items=self.LIVE, pools=(), cluster=cluster)
+        self.assertEqual(self.issued_node_pools_read(), [])
+        self.assertIn("NodePool/p1", {c["object"] for c in entry["candidates"] if c["check"] == "single-zone-nodepool"})
+        record = next(c for c in entry["commands"] if c["check"] == "single-zone-nodepool")
+        self.assertEqual(record["command"], shlex.join(listing_argv))
+        self.assertEqual((record["rc"], record["duration_s"]), (0, 0))
+        self.assertEqual(record["output_sha256"], fs.output_digest(json.dumps([self.POOL], sort_keys=True)))
+        self.assertNotIn(fs.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(entry))
+
+    def test_an_empty_listed_list_is_a_cluster_with_no_pools(self):
+        cluster, _ = self.listed(nodePools=[])
+        entry = self.run_with(dump_items=self.LIVE, pools=[self.POOL], cluster=cluster)
+        self.assertEqual(self.issued_node_pools_read(), [])
+        self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
+
+    def test_a_listing_without_pools_falls_back_to_the_node_pools_read(self):
+        for extra in ({}, {"nodePools": {"not": "a list"}}):
+            with self.subTest(extra=extra):
+                cluster, _ = self.listed(**extra)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    entry = self.run_with(dump_items=self.LIVE, pools=[self.POOL], cluster=cluster)
+                expected = [
+                    "gcloud", "container", "node-pools", "list", "--cluster", "prod-usc1", "--location", "us-central1",
+                    "--project", "acme", "--format", "json",
+                ]
+                self.assertEqual(self.issued_node_pools_read(), [expected])
+                record = next(c for c in entry["commands"] if c["check"] == "single-zone-nodepool")
+                self.assertEqual(record["command"], shlex.join(expected))
+                self.assertIn("NodePool/p1", {c["object"] for c in entry["candidates"]})
+                self.assertIn("reading node-pools list", stderr.getvalue())
 
 
 class StockoutExclusionHelpersTest(unittest.TestCase):

@@ -108,9 +108,9 @@ func (b *Bridge) readBoard() ([]byte, error) {
 	return raw, nil
 }
 
-// answerBoardAction relays one Retry or Drop (lib.BoardAction) to session-kv
-// and answers with what it said, or a lib.BoardActionResult naming why it
-// could not.
+// answerBoardAction relays one board action (lib.BoardAction: a Retry or
+// Drop, or a dial tap) to session-kv and answers with what it said, or a
+// lib.BoardActionResult naming why it could not.
 func (b *Bridge) answerBoardAction(m *nats.Msg) {
 	data, err := b.postBoardAction(m.Data)
 	if err != nil {

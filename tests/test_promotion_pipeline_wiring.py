@@ -49,6 +49,8 @@ from tests.testing.release import parse_required_release_images
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
+# The relabel job's token step in release-publish.yml: the one release-bot mint that pushes no tag.
+RELABEL_TOKEN_STEP = "relabel-token"
 _PROMOTION = _WORKFLOWS / "staging-promotion-pipeline.yml"
 _COMMON_SH = _REPO_ROOT / "scripts" / "release" / "common.sh"
 _POLLER = _REPO_ROOT / "scripts" / "release" / "poll_rc_eval_verdict.py"
@@ -319,8 +321,8 @@ class PromotionPipelineWiringTest(unittest.TestCase):
     def test_the_eval_wait_makes_its_credential_the_active_account(self):
         """The poller's `gcloud storage` reads run as the active account, which
         the explicit `gcloud auth login --cred-file` makes the auth step's
-        credential. (The reads were gsutil's until 2026-10, and gsutil ignored
-        GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
+        credential. (Until 2026-10 the reads used the legacy storage client,
+        which ignored GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
         credentials, no build was ever found, and the job reported `never_ran`,
         which reads as a broken eval lane rather than a missing login.
         ci-health.yml paid forty failed ticks to learn this.)
@@ -800,87 +802,6 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
 
 
-_AUTOPUSH_NEXT_DEPLOY = "autopush-next-deploy.yml"
-
-
-class AutopushNextDeployWiringTest(unittest.TestCase):
-    """autopush-next deploys what autopush deploys, in a workflow of its own.
-
-    Its own file is what lets each lane hold a workflow-level group: a run holds
-    it from creation, so resolve and deploy are serialized as a unit and an
-    older publish can never land after a newer one. A job-level group would
-    be acquired in order of resolve completion instead.
-    """
-
-    def setUp(self):
-        self.doc = _doc(_WORKFLOWS / _AUTOPUSH_NEXT_DEPLOY)
-        self.jobs = self.doc["jobs"]
-        self.autopush = _doc(_WORKFLOWS / _AUTOPUSH_DEPLOY)
-
-    def test_it_has_its_own_workflow_level_lock(self):
-        """Shared only by runs that deploy.
-
-        A run created for a failed or cancelled publish deploys nothing, but in
-        the shared group it would still cancel a pending deploy of a good one.
-        """
-        concurrency = self.doc.get("concurrency", {})
-        self.assertEqual(
-            concurrency.get("group"),
-            "${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')"
-            " && 'autopush-next-deploy' || format('autopush-next-deploy-noop-{0}', github.run_id) }}",
-        )
-        self.assertNotIn(f"'{self.autopush['concurrency']['group']}'", concurrency["group"])
-        self.assertFalse(concurrency.get("cancel-in-progress"), "running deploys must not be cancelled mid-flight")
-        for name, job in self.jobs.items():
-            with self.subTest(job=name):
-                self.assertNotIn("concurrency", job)
-
-    def test_it_triggers_exactly_as_autopush_does(self):
-        on = self.doc[True]
-        autopush_on = self.autopush[True]
-        self.assertEqual(on["workflow_run"], autopush_on["workflow_run"])
-        self.assertNotIn("schedule", on)
-        self.assertEqual(on["workflow_dispatch"]["inputs"]["lease_policy"]["default"], "fail")
-
-    def test_it_resolves_the_candidate_exactly_as_autopush_does(self):
-        resolve = self.jobs["resolve-candidate"]
-        autopush_resolve = self.autopush["jobs"]["resolve-candidate"]
-        self.assertEqual(resolve["if"], autopush_resolve["if"])
-        self.assertEqual(resolve["steps"], autopush_resolve["steps"])
-
-    def test_the_resolve_job_never_binds_autopush_next(self):
-        """Binding a GitHub environment that does not exist creates it, empty."""
-        self.assertEqual(self.jobs["resolve-candidate"].get("environment"), "autopush")
-
-    def test_deploy_reconciles_autopush_next_at_the_resolved_candidate(self):
-        deploy = self.jobs["deploy"]
-        autopush_deploy = self.autopush["jobs"]["deploy"]
-        self.assertEqual(deploy["needs"], "resolve-candidate")
-        self.assertEqual(deploy["uses"], autopush_deploy["uses"])
-        self.assertEqual(deploy["permissions"], autopush_deploy["permissions"])
-        self.assertEqual(deploy["with"]["github_environment"], "autopush-next")
-        self.assertEqual(deploy["with"]["mode"], "apply")
-        self.assertEqual(deploy["with"]["image_tag"], autopush_deploy["with"]["image_tag"])
-        self.assertEqual(deploy["with"]["lease_policy"], autopush_deploy["with"]["lease_policy"])
-        self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
-
-    def test_only_autopush_next_may_skip_while_unprovisioned(self):
-        self.assertIs(self.jobs["deploy"]["with"]["skip_unconfigured"], True)
-        self.assertNotIn("skip_unconfigured", self.autopush["jobs"]["deploy"]["with"])
-
-    def test_verify_allows_skipped_for_autopush_next_only(self):
-        verify = self.jobs["verify-deploy"]
-        self.assertEqual(set(verify["needs"]), {"resolve-candidate", "deploy"})
-        step = next(s for s in verify["steps"] if "verify_deploy_result.sh" in s.get("run", ""))
-        self.assertEqual(step["env"]["TARGET_ENVIRONMENT"], "autopush-next")
-        self.assertEqual(step["env"]["DEPLOY_RESULT"], "${{ needs.deploy.outputs.result }}")
-        self.assertEqual(step["env"]["ALLOW_SKIPPED"], "true")
-        autopush = next(
-            s for s in self.autopush["jobs"]["verify-deploy"]["steps"] if "verify_deploy_result.sh" in s.get("run", "")
-        )
-        self.assertNotIn("ALLOW_SKIPPED", autopush["env"])
-
-
 class DockerPublishGhcrWiringTest(unittest.TestCase):
     def setUp(self):
         self.doc = _doc(_WORKFLOWS / "docker-publish-ghcr.yml")
@@ -999,7 +920,20 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                 self.assertTrue(token_steps, f"expected at least one release bot token step in {name}")
                 for step in token_steps:
                     self.assertEqual(step["with"].get("permission-contents"), "write")
+                    if step.get("id") == RELABEL_TOKEN_STEP:
+                        continue
                     self.assertEqual(step["with"].get("permission-workflows"), "write")
+
+    def test_the_relabel_token_pushes_no_tag_and_asks_for_no_workflows_scope(self):
+        """release-publish.yml's relabel job pushes a docs-only branch cut from main and opens a pull
+        request (#5673). Its branch holds no workflow change, so it needs no workflows scope, and
+        least privilege leaves it out; it does need pull-requests write to open the pull request."""
+        doc = _doc(_WORKFLOWS / "release-publish.yml")
+        steps = [step for step in doc["jobs"]["relabel-upgrade-table"]["steps"]
+                 if step.get("id") == RELABEL_TOKEN_STEP]
+        self.assertEqual(len(steps), 1)
+        scopes = {k: v for k, v in steps[0]["with"].items() if str(k).startswith("permission-")}
+        self.assertEqual(scopes, {"permission-contents": "write", "permission-pull-requests": "write"})
 
     def test_no_token_mint_uses_the_deprecated_app_id_input(self):
         """create-github-app-token v3.1.0 deprecated `app-id` for `client-id`, and the

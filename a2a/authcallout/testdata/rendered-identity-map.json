@@ -1,5 +1,5 @@
 {
-  "version": "f0e8d8237ce63a35",
+  "version": "615207778cc75fb8",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -40,6 +40,12 @@
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+          "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+          "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
           "_INBOX.provision.>"
         ],
         "subscribe": [
@@ -101,6 +107,107 @@
           "_INBOX.verifier.>"
         ]
       }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
+      "user": "gateway",
+      "account": "TRUSTED",
+      "grants": {
+        "publish": [
+          "a2a.tasks.*.*.in",
+          "a2a.tasks.*.*.supervisor",
+          "a2a.submit.*.*.*.*",
+          "a2a.stop.*.*",
+          "$KV.session-state.>",
+          "$KV.feedback.>",
+          "$KV.people.>",
+          "chat.console.*.out",
+          "chat.notify.reply.agent.>",
+          "$KV.cap.root.*",
+          "chat.board",
+          "$JS.API.STREAM.INFO.TASKS",
+          "$JS.API.CONSUMER.CREATE.TASKS.>",
+          "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+          "$JS.API.DIRECT.GET.TASKS.>",
+          "$JS.API.STREAM.INFO.KV_session-state",
+          "$JS.API.DIRECT.GET.KV_session-state.>",
+          "$JS.API.CONSUMER.CREATE.KV_session-state.>",
+          "$JS.API.CONSUMER.DELETE.KV_session-state.*",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.DIRECT.GET.KV_feedback.>",
+          "$JS.API.CONSUMER.CREATE.KV_feedback.>",
+          "$JS.API.CONSUMER.DELETE.KV_feedback.*",
+          "$JS.API.STREAM.INFO.KV_people",
+          "$JS.API.DIRECT.GET.KV_people.>",
+          "$JS.API.CONSUMER.CREATE.KV_people.>",
+          "$JS.API.CONSUMER.DELETE.KV_people.*",
+          "$JS.API.STREAM.INFO.DIRECTORY",
+          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+          "$JS.ACK.TASKS.>",
+          "$JS.FC.>",
+          "_INBOX.gateway.>"
+        ],
+        "subscribe": [
+          "a2a.tasks.*.*.events",
+          "a2a.tasks.*.*.supervisor",
+          "a2a.tasks.p.*.*.supervisor",
+          "a2a.agents.>",
+          "agents.hb.>",
+          "$KV.session-state.>",
+          "$KV.feedback.>",
+          "$KV.people.>",
+          "chat.console.*.in",
+          "chat.console.*.confirm",
+          "chat.notify.gchat",
+          "chat.notify.slack",
+          "chat.notify.console",
+          "chat.board.reply.gateway.>",
+          "_INBOX.gateway.>"
+        ],
+        "denyPublish": [
+          "$JS.API.*.*.KV_cap",
+          "$JS.API.*.*.KV_cap.>",
+          "$JS.API.*.*.*.KV_cap",
+          "$JS.API.*.*.*.KV_cap.>",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+          "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+          "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+          "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+        ],
+        "denySubscribe": [
+          "$KV.cap.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
+      "user": "dispatcher",
+      "account": "TRUSTED",
+      "grants": {
+        "publish": [
+          "$KV.PROFILE_LEASES.>",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.CREATE.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.DELETE.KV_PROFILE_LEASES.*",
+          "$JS.FC.KV_PROFILE_LEASES.>",
+          "a2a.dispatch.*.*.*",
+          "a2a.cap.verify.dispatcher",
+          "_INBOX.dispatcher.>"
+        ],
+        "subscribe": [
+          "a2a.dispatch.*.*.*.accept",
+          "a2a.dispatch.*.*.*.lease",
+          "a2a.cap.reply.dispatcher.>",
+          "_INBOX.dispatcher.>"
+        ]
+      },
+      "narrowing": "dispatcher"
     }
   ]
 }

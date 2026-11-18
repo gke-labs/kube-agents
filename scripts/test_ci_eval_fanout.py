@@ -179,6 +179,8 @@ class QueueOrderTest(unittest.TestCase):
                 # (the inject lane's second phase); with the list unset every
                 # task is in this queue, as on the api lane.
                 lifted("unit_phase"),
+                lifted("case_repetitions"),
+                lifted("first_queued_rep"),
                 f"EVAL_REPETITIONS={reps}",
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 # compliance carries a 1000 hint, the probe 200: order within a
@@ -241,6 +243,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "gce-startup-script-failure",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
+            "fleet-audit-manifest-fix-names-stalled-config-connector",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")
@@ -310,6 +313,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
+                "stream_note_count() { echo 1; }",
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=\n" + computed,
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=\n" + computed,
                 "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift streams=fleet-consistency-drift has_stack=\n" + computed,
@@ -317,7 +321,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["11100", "3600", "22200", "12000", "4500"])
+        self.assertEqual(run_bash(body).stdout.split(), ["12600", "5100", "25200", "13500", "6000"])
 
 
 class PerCaseGradingTest(unittest.TestCase):
@@ -375,6 +379,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The count of finished repetitions the unit reads under its
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
+            lifted("case_repetitions"),
             lifted("skip_unit"),
             # What the unit does when the install is gone (#3129): the code
             # wait_platform_runs returns for it and the marker that latches it.
@@ -835,6 +840,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -879,6 +885,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -922,6 +929,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -983,6 +991,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,

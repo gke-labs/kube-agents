@@ -90,17 +90,9 @@ func (r *PlatformAgentReconciler) replaceStuckA2ANATSPod(ctx context.Context, ag
 	if pod.DeletionTimestamp != nil || pod.Labels[appsv1.ControllerRevisionHashLabelKey] == updateRevision {
 		return 0, nil
 	}
-	since := pod.CreationTimestamp.Time
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type != corev1.PodReady {
-			continue
-		}
-		if cond.Status == corev1.ConditionTrue {
-			return 0, nil
-		}
-		if !cond.LastTransitionTime.IsZero() {
-			since = cond.LastTransitionTime.Time
-		}
+	since, ready := a2aNATSPodNotReadySince(pod)
+	if ready {
+		return 0, nil
 	}
 	if left := a2aNATSStuckPodGrace - now.Sub(since); left > 0 {
 		return left, nil
@@ -118,5 +110,44 @@ func (r *PlatformAgentReconciler) replaceStuckA2ANATSPod(ctx context.Context, ag
 	r.recordEvent(agent, corev1.EventTypeWarning, a2aNATSStuckPodReplacedReason,
 		fmt.Sprintf("Replaced A2A bus pod %s: not Ready for %s on revision %s, while the StatefulSet renders %s.",
 			pod.Name, now.Sub(since).Truncate(time.Second), revision, updateRevision))
+	return 0, nil
+}
+
+// a2aNATSPodNotReadySince reports when the bus pod last stopped being Ready:
+// its Ready condition's last transition, else its creation. ready is true
+// when the pod is Ready now, and then since means nothing.
+func a2aNATSPodNotReadySince(pod *corev1.Pod) (since time.Time, ready bool) {
+	since = pod.CreationTimestamp.Time
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type != corev1.PodReady {
+			continue
+		}
+		if cond.Status == corev1.ConditionTrue {
+			return since, true
+		}
+		if !cond.LastTransitionTime.IsZero() {
+			since = cond.LastTransitionTime.Time
+		}
+	}
+	return since, false
+}
+
+// a2aNATSPodDownFor returns how long the pod of live, the bus StatefulSet as
+// the server holds it, has not been Ready, when that is at least
+// a2aNATSStuckPodGrace; zero otherwise. A pod that is missing, Ready,
+// terminating, inside the grace, or not controlled by live counts as zero.
+// The pod is read live (podReader), as pods are outside the manager's cache.
+func (r *PlatformAgentReconciler) a2aNATSPodDownFor(ctx context.Context, live *appsv1.StatefulSet, now time.Time) (time.Duration, error) {
+	pod := &corev1.Pod{}
+	if err := r.podReader().Get(ctx, types.NamespacedName{Name: live.Name + a2aNATSPodOrdinalSuffix, Namespace: live.Namespace}, pod); err != nil {
+		return 0, client.IgnoreNotFound(err)
+	}
+	if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != live.UID || pod.DeletionTimestamp != nil {
+		return 0, nil
+	}
+	since, ready := a2aNATSPodNotReadySince(pod)
+	if down := now.Sub(since); !ready && down >= a2aNATSStuckPodGrace {
+		return down, nil
+	}
 	return 0, nil
 }

@@ -50,10 +50,11 @@ import (
 //     renders them separately, as A2A_RESERVED_ADDRESSEES; see addressees.go.
 //
 // A name in more than one is reported as a static principal first, then as an
-// addressee, then as a map user. Neither overlap happens in a rendered config
-// (the operator's contract test keeps the static residue out of the map, and
-// no static user is named after an addressee), and the static wording is the
-// one the refusal has always carried.
+// addressee, then as a map user. One overlap happens in a rendered config: the
+// gateway is a static user and a map user while its move to token auth is
+// pending (#5301). The operator's contract test keeps every other static
+// principal out of the map, no static user is named after an addressee, and
+// the static wording is the one the refusal has always carried.
 
 const (
 	// reservedPrincipalSeparator splits the operator-rendered list.

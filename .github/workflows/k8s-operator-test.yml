@@ -24,6 +24,15 @@ name: Operator Tests
 #
 # A merge-queue run takes the pull request's shape, not the push's: the check
 # is required there too, so it has to start every time and filter in the step.
+#
+# gosec runs here, inside the required check, rather than in security-scan.yml,
+# whose checks the `main-merge-queue` ruleset does not require. On 2026-11-10 a
+# change with a G304 finding merged with that check red, and every pull request
+# rebased onto main inherited the red for four and a half hours (#5228, fixed
+# by #5345). A
+# finding now fails `Run Controller Tests`, which no pull request can merge
+# around. tests/test_gosec_in_module_checks.py holds gosec to this workflow
+# and the other module checks.
 on:
   pull_request:
     branches: [main, "release/**"]
@@ -38,6 +47,16 @@ on:
       # tests), so a change to them must run this job too, or a stale fixture
       # reds main while every PR that touches only it skips the check.
       - "a2a/authcallout/testdata/**"
+      # Several operator tests read the chart through a relative path (the
+      # bus migration, flagged pods, minter size and scope publisher quota
+      # tests), so a chart-only change must run this job too, or it breaks
+      # those tests without running them and the next operator pull request
+      # goes red on a change it did not make (#6249).
+      # tests/test_operator_tests_cover_what_they_read.py holds this.
+      - "charts/kube-agents/**"
+      # The dispatch fixture tests read these rendered fixtures the same way.
+      - "a2a/lib/testdata/**"
+      - "a2a/dispatch/testdata/**"
       - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
 
@@ -87,6 +106,9 @@ jobs:
             operator:
               - "k8s-operator/**"
               - "a2a/authcallout/testdata/**"
+              - "charts/kube-agents/**"
+              - "a2a/lib/testdata/**"
+              - "a2a/dispatch/testdata/**"
               - ".github/workflows/k8s-operator-test.yml"
 
       - name: Set up Go
@@ -185,6 +207,20 @@ jobs:
             echo "::error::Generated deepcopy is out of date. Run 'make -C k8s-operator generate' and commit the result."
             exit 1
           fi
+
+      # G703 (path traversal) and G706 (log injection) arrived in gosec
+      # 2.28.0 and take os.Args and os.Getenv as taint sources. Every flag
+      # the operator and k8s-event-watcher read is rendered by the operator
+      # into their own Deployments, so argv is inside the trust boundary
+      # rather than attacker input, and all 12 findings the pair reports
+      # today trace back to it — one of them, a log.Printf whose only
+      # argument is an int, is the analyzer being imprecise. G304 stays
+      # enabled and still catches a file path that does come from outside.
+      # The pin is k8s-operator/go.mod's; the module's tools.go imports it.
+      - name: Run gosec
+        if: steps.filter.outputs.operator == 'true'
+        working-directory: k8s-operator
+        run: go run github.com/securego/gosec/v2/cmd/gosec -exclude=G703,G706 ./...
 
       - name: Run Tests
         if: steps.filter.outputs.operator == 'true'

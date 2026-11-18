@@ -112,6 +112,11 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
   all-clear names it under "Not confirmed fixed" by cluster and id, `resolved` leaves it out (on
   the JSON line, in the stored envelope, on the since-last-scheduled line and in the whole-run
   count), the JSON line lists it under `retired_unlisted`, and the run is never silent over one.
+  The lead of that all-clear and the banner `close_ledger_reads_clean` puts at the top of the
+  closed ledger say the same: with a retired finding, neither claims that every finding is gone
+  or that all of them are resolved; both count the retired ones as not confirmed fixed, and the
+  banner names their ids, or counts them alone when the names would push the body past the
+  forge's limit.
   The store ledger applies the same rule; the no-forge record keeps ids with no places, so a run
   with no repository cannot tell such a finding apart and counts it resolved as before. After the
   close, the run changes the title to `0 findings` and puts a
@@ -197,7 +202,19 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   name (`foreign_proposal_on`), a scoped install lands its fix on the primary name plus its scope
   digest (`scoped_group_branch_for`), and the mapping from a group to its pull request reads the
   primary name first and the scoped name second. The primary name stays for every install with no
-  such neighbour and for every pull request open today, so nothing is renamed on upgrade.
+  such neighbour and for every pull request open today, so nothing is renamed on upgrade. A pull
+  request with no scope label is from before scopes, and the listing keeps it, since the install
+  that opened it cannot be read off it. The stale close on a scoped install therefore leaves an
+  unlabelled open pull request alone when none of the ids it covers was on this install's ledger
+  (the last body's hidden block, the stored document behind it, and the complete block of a body
+  that cut findings for space, handed to the stale close as its `previous_ids`), is current, or
+  is shielded by a namespace this install declared: in the mixed-version window of an upgrade,
+  every install that shares the repository reads such a pull request as its own, and closing it as
+  stale or as "no longer reproduces" would retire another install's fix over a fleet this run never
+  read. The run logs the pull request it leaves. This install's own pre-scope fix whose ids the
+  shared ledger happened not to carry is left open the same way, for a person to close. A forge
+  with no labels skips nothing: no pull request there carries a scope label, and the listing already
+  proved each one this install's.
 
 ## 3. Decisions
 
@@ -453,7 +470,7 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
   works from. Labels only — no push, no rewritten body — so the promise above still holds.
 - **`refused` is a human decision, not a rejected command.** It is what a finding looks like when
   someone closed its fix without merging — a considered "no" the harness must not overrule by
-  re-proposing the same fix tomorrow. (A refused `/remediate` is a _reply_, not a finding state;
+  re-proposing the same fix tomorrow. In the proposed Decision Memory ingestion pipeline ([`memory.md`](memory.md)), only a collaborator close (`can_write`) carrying a non-situational technical reason records an advisory `status:rejected` lesson (superseded when a later PR merges on that path), whereas uncommented, situational, or non-writer closes retire the pending lesson candidate (`status:retired`). (A refused `/remediate` is a _reply_, not a finding state;
   there is no finding to put in a state, which is why the draft's condition for this row did not
   correspond to anything the renderer could compute.)
 - **`withdrawn` is the other half of that row**, and splitting the two is not cosmetic. A closed
@@ -531,8 +548,10 @@ writable entry by the shared parser; a key no write path reads is read-only by c
 minter policy does read it, for a `contents: read` grant the broker's own clone presents).
 The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
 the `repo`, `path` and `excerpt` of the declaration — validated for scope, a non-overlapping
-identity, and a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
-beside the roster; a fault check or a stream with no declared-intent step is rejected), and never
+identity, a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
+beside the roster; a fault check or a stream with no declared-intent step is rejected), and an
+`object` of a kind the check files where the check fixes one (`DECLARABLE_OBJECT_KINDS`: the cost
+checks' kinds and `NodePool/` for the stockout pool check), and never
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.
@@ -562,7 +581,11 @@ completely (every note under the searched paths arrived and was read) under `sea
 record, and `finish` unions that list into the document and moves each covered finding to
 `declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
 severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
-stays a finding. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
+stays a finding. It moves `netpol-missing` only on a `Namespace/` object, and `single-zone-nodepool`
+only when the collector's excerpt opens with `single-zone (` and carries no `at its autoscaling
+ceiling:` clause — the one rule read off the excerpt rather than the identity or the severity,
+because the two arms of that check share both; the prefixes are the collector's own constants,
+pinned by a test. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
 last day it stands: `start` files the date and `finish` holds it to the day the run started, from
 `start`'s record, whatever day the join or a later `remediate` happens to run on, so a lapsed item
 moves nothing, declares no collector candidate and shields no sibling, and the finding
@@ -705,7 +728,7 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
    An install turns the automatic half off with `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in
    `spec.deployment.env` (the operator forwards it to the shell sandbox, whose entrypoint writes
    it to a root-owned file the script reads first): the ledger then lists what the sweep would have
-   opened as awaiting `/remediate`, the only way a pull request opens there. The eval's inject lane runs that way.
+   opened as awaiting `/remediate`, and a pull request opens there only on a `/remediate` comment or a direct ask ([`remediation.md`](../../agents/platform/skills/fleet-audit/references/remediation.md)). The eval's inject lane runs that way.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
@@ -925,9 +948,11 @@ files that name any Config Connector group (`every_kind`), so every kind is inde
 (`kcc_paragraph_index`), and only when a finding needs it (`kcc_index_needed`): a
 `Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
 with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
-index, so the snapshot and each clone are read once. When exactly one file declares the object, the
-paragraph keeps the first sentence "**Config Connector is not applying this file.**" and names that
-file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
+index, so the snapshot and each clone are read once. The fix's file is not the declaration, so the
+paragraph does not say "this file": when exactly one file declares the object, its first sentence
+names that file ("**Config Connector is not applying `<path>`.**", `KCC_STALLED_DECLARED_MARK`, or
+"`<path>` in the repository `<repo>`" for a declaration in a context repository).
+Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
 says that more than one file declares the object, or only that the audit names no declaration file
 for it. It never says that no file declares the object: the index skips a file it cannot parse (a
 template, for example), so no search proves an absence. A snapshot that cannot be taken is a
@@ -937,7 +962,12 @@ two declarations. It keeps each other file that declares the same object, whole,
 `KccDeclaration.also`, and matches each file on its own fields, so two files of one object read as
 ambiguous. A `gcloud` fix's note is its command, so
 its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
-strip-and-rewrite pattern covers both first sentences.
+strip-and-rewrite pattern covers every form: an exact first sentence (`KCC_STALLED_NOTE_PATTERN`)
+followed by " When the audit ran, Config Connector reported " (`KCC_STALLED_CONTINUATION`), which
+every paragraph `finish` writes goes on with. A worker sentence that only starts the same way stays.
+An earlier release wrote "this file.**" and then "The declaration is `<path>`." for a fix of another
+file. A previous ledger can hold that form, and the carry copies it, so the pattern also accepts
+that sentence (`KCC_STALLED_OLD_DECLARATION_SENTENCE`) before the continuation.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
@@ -951,12 +981,13 @@ The note fits the note cap through `_fit_route_notes`, the route-note pass's fit
 own text is cut, never inside a code block, and the text `finish` wrote stays whole (the Kustomize
 note's own text, the closing text of `degrade_missing_remediations`, the note of
 `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`, and the route notes). The paragraph
-goes after the route notes, and one that would push out the reconciler note does not fit. The
+goes after the route notes, and a step that would push out any route note already on the note (a
+location note or the reconciler note) does not fit. The
 Kustomize note's copied file can only become shorter by whole lines, as below. When the
 whole paragraph does not fit, it names one object, then no object it waits on, then drops its tail;
 when even that core does not fit beside the text `finish` wrote and the note carries a Kustomize
-copied file, that block is made shorter by whole lines, with its fences closed, as
-`_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
+copied file, that block is made shorter by whole lines, with its fences closed, to make room for
+the core and every route note, as `_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
 past the cap, and the log warns that the renderer cuts its end. A cut keeps the whole worker note in
 `uncut_note`, as the route-note pass does, so the carry puts it back once the stall is gone. The
 route-note pass removes a copy of either paragraph from the worker's note before it keeps that note
@@ -987,6 +1018,14 @@ subcommand. Sharing one code path between the two is right; sharing the sweep is
 make `remediate --finding one-id` open up to six pull requests, five of them for findings the
 operator never mentioned and cannot tell apart from the one they did, on the command whose entire
 purpose is to act on a specific request.
+
+A named `no-pdb` finding the worker left `manual` because the collector found its declaration is
+the one non-`manifest` target `remediate` accepts. `finish` writes that PodDisruptionBudget itself,
+and given `--manifest-file`, `remediate` writes it the same way, with the same planner and the same
+refusals, and opens it. A pull request on the budget's own branch is left to the promotion gate, so
+a human close is reported as superseded and `--override-human-close` applies, as for any fix.
+Without this, a direct ask could not open the budget on an install whose automatic sweep is off, or
+past the sweep's cap.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
@@ -1048,7 +1087,7 @@ lose and anything present is debris from a run that did not finish.
 | Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Clean-close comment   | Date and the targets covered (counted by kind: clusters, subnets, projects), then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Remediation PR title  | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), the risk note, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus `<!-- audit-id-scheme -->` stamp. For a group, one section per member.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), the risk note, `## Files`, for a `no-pdb` fix a `## Safety checks` section while `KUBEAGENTS_AUTOMERGE` is not `off` (`pdb_safety.py`), and the trailing `<!-- audit-findings -->` delta block plus `<!-- audit-id-scheme -->` stamp. For a group, one section per member.                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Stale-close comment   | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ### 7.1 Size budget
@@ -1194,7 +1233,7 @@ against that cluster, as `{check, command}` — the backticked slug from the SOP
 the check, and the literal invocation that ran it. `AUDITS` carries the roster per stream as an
 `AuditSpec`, which makes four things enforceable that were not: an unknown or duplicated slug is
 rejected; an absent field is rejected outright; an entry whose `command` is missing, is a call back
-into this harness, or names none of `kubectl`/`gcloud`/`gsutil`/`bq`/`helm`/`curl` (or the upgrade audit's
+into this harness, or names none of `kubectl`/`gcloud`/`bq`/`helm`/`curl` (or the upgrade audit's
 readiness reporter, `fleet_upgrade_report.py`) is rejected; and
 an empty list is rejected unless that cluster's `limitations` says why nothing ran, or, on a stream
 in `COLLECTOR_AUDITS` whose manifest names the target as collected, every check the target answers
@@ -1818,7 +1857,8 @@ unchanged. As shipped it is **346**. New cases:
 - Idempotency markers: a merged PR already carrying `audit-persists` gets no second comment; a ledger
   already carrying `audit-refused` for a comment node id does not re-refuse it; a different node id
   for the same finding does.
-- Clean run closes the issue and every open remediation PR.
+- Clean run closes the issue and every open remediation PR of this install's; on a scoped install an
+  unlabelled one whose ids this ledger never carried stays open.
 - `--dry-run` issues no command through the harness runner at all (assert the recorder is empty),
   prints every pull request body it would open, separated from the ledger body by a machine-findable
   line so a size check can measure each one against the limit rather than the concatenation, and

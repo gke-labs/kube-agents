@@ -88,11 +88,20 @@ type Store struct {
 	// pending still holds, cannot clear what a broken shard left on record.
 	// mu covers pending, refused and setErr: it is taken on the informer's
 	// path, never on the authorization path, which reads current.
-	shards      int
-	mu          sync.Mutex
-	pending     []*IdentityMap
-	refused     map[int]string
-	setErr      string
+	shards  int
+	mu      sync.Mutex
+	pending []*IdentityMap
+	refused map[int]string
+	setErr  string
+	// raw is the latest document under each index, kept so Revalidate can
+	// parse it again when something it was judged against changes (the tier
+	// table, #3659). Covered by mu.
+	raw map[int][]byte
+	// serial runs one document at a time through parse and commit, so a
+	// Revalidate replaying a shard's document cannot land after a newer one
+	// for that index and put the older back. Taken before mu, on the
+	// informer's path only.
+	serial      sync.Mutex
 	pendingNote atomic.Pointer[string]
 
 	log *slog.Logger
@@ -202,6 +211,19 @@ func (s *Store) Update(raw []byte) error {
 // the set but does not clear the refusal of the shard whose live document is
 // still broken. A complete set, taken or refused, leaves nothing pending.
 func (s *Store) UpdateShard(index int, raw []byte) error {
+	s.serial.Lock()
+	defer s.serial.Unlock()
+	return s.updateShard(index, raw)
+}
+
+// updateShard is UpdateShard under serial.
+func (s *Store) updateShard(index int, raw []byte) error {
+	s.mu.Lock()
+	if s.raw == nil {
+		s.raw = map[int][]byte{}
+	}
+	s.raw[index] = append([]byte(nil), raw...)
+	s.mu.Unlock()
 	m, err := ParseIdentityMap(raw)
 	if err == nil {
 		err = s.checkStamps(index, m)
@@ -471,6 +493,31 @@ func (s *Store) WaitForMap(ctx context.Context, timeout time.Duration) error {
 			}
 			return fmt.Errorf("no identity map after %s", timeout)
 		case <-tick.C:
+		}
+	}
+}
+
+// Revalidate parses every shard's latest document again and re-assembles the
+// set, as if each had just arrived. The callout calls it when the tier table
+// changes (capability.OnTiersChanged): a map whose profile entry names a tier
+// the callout loaded after the map was refused, and nothing else would retry
+// it until an unrelated map change (#3659). A map now failing (its tier was
+// deleted) is refused and the previous one keeps serving, as on any refusal.
+//
+// It holds serial throughout, so each replayed document is the latest under
+// its index: an update arriving meanwhile waits and lands after the replay.
+func (s *Store) Revalidate() {
+	s.serial.Lock()
+	defer s.serial.Unlock()
+	s.mu.Lock()
+	docs := make(map[int][]byte, len(s.raw))
+	for i, raw := range s.raw {
+		docs[i] = raw
+	}
+	s.mu.Unlock()
+	for i := 0; i < s.shards; i++ {
+		if raw, ok := docs[i]; ok {
+			_ = s.updateShard(i, raw)
 		}
 	}
 }

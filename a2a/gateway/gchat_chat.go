@@ -27,7 +27,10 @@ import (
 // markers, the bullet on a row, the Stop button the gateway asks for under
 // a running task's line (gchat_stop.go), and, where a row carries Retry and
 // Drop, the row's number in the bullet's place and the "Retry n" and "Drop
-// n" labels on its buttons (gchat_board.go).
+// n" labels on its buttons (gchat_board.go). The one thing it leaves out is
+// a running or failed plan item's last step when the item's title already
+// holds that step whole, since Chat draws the steps in the open
+// (gchatChatPlan); a step the title clipped is kept.
 const (
 	// gchatChatTextMax bounds the laid-out text: the adapter's one bound on
 	// a posted text (gchatTextMax). A message past it posts as its
@@ -59,7 +62,8 @@ const (
 	gchatChatRowDetailSep = " · "
 	// gchatChatStepDone and gchatChatStepOpen mark a plan item's steps, as
 	// the Slack renderer does: the last step of a running item is the open
-	// one.
+	// one, unless the item's title already holds it and it is not drawn
+	// (gchatChatPlan).
 	gchatChatStepDone = "✓"
 	gchatChatStepOpen = "◌"
 	// gchatChatSectionGap separates the layout's sections.
@@ -88,16 +92,13 @@ var errGchatChatTooLarge = errors.New("the chat message is more than one Google 
 var errGchatChatEmpty = errors.New("the chat message lays nothing out")
 
 // gchatChatLayout is one rendered message: its text, and the accessory
-// widgets under it (empty when the message has no button).
+// widgets under it (empty when the message has no button). A row's place
+// in Text is not kept here: the row's buttons carry its line
+// (gchatBoardButtons), so a tap edits by it whether or not the layout was
+// remembered.
 type gchatChatLayout struct {
 	Text    string
 	Widgets []map[string]any
-	// RowsStart and RowsCount place the rows in Text, by line, when the
-	// message's rows carry Retry and Drop (gchat_board.go): a tap edits its
-	// row by them, so a numbered list in the detail or the fold is never
-	// taken for the rows. RowsCount is 0 when no row acts, or for a layout
-	// read back from a click's copy of the message.
-	RowsStart, RowsCount int
 }
 
 // renderGchatChat lays m out as a Chat text message with accessory buttons.
@@ -116,33 +117,28 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 	}
 	// The rows' buttons are drawn only where the rows are: a progress
 	// message's plan takes their place, and a button for a row not shown
-	// would name nothing.
+	// would name nothing. Each button carries its row's line in the text,
+	// so the rows' first line is settled before they are drawn: the rows
+	// begin after the sections so far (their last line is the count of
+	// breaks in them) and the gap's blank line.
 	var rowButtons []map[string]any
-	var rowsStart, rowsCount int
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(gchatChatPlan(m.Plan))
 	} else {
-		rows := strings.TrimRight(gchatChatRows(m.Rows), "\n")
-		rowButtons = gchatBoardButtons(m.Rows)
-		if len(rowButtons) > 0 && strings.TrimSpace(rows) != "" {
-			// The rows begin after the sections so far (their last line is
-			// the count of breaks in them) and the gap's blank line.
-			if before := strings.Join(sections, gchatChatSectionGap); before != "" {
-				rowsStart = strings.Count(before, "\n") + strings.Count(gchatChatSectionGap, "\n")
-			}
-			rowsCount = strings.Count(rows, "\n") + 1
+		rowsStart := 0
+		if before := strings.Join(sections, gchatChatSectionGap); before != "" {
+			rowsStart = strings.Count(before, "\n") + strings.Count(gchatChatSectionGap, "\n")
 		}
-		add(rows)
+		rowButtons = gchatBoardButtons(m.Rows, rowsStart)
+		add(strings.TrimRight(gchatChatRows(m.Rows), "\n"))
 	}
 	add(gchatChatAfter(m.After))
 	if m.Fold != nil {
 		add(gchatChatFold(m.Fold))
 	}
 	layout := gchatChatLayout{
-		Text:      strings.Join(sections, gchatChatSectionGap),
-		Widgets:   gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), rowButtons...)),
-		RowsStart: rowsStart,
-		RowsCount: rowsCount,
+		Text:    strings.Join(sections, gchatChatSectionGap),
+		Widgets: gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), rowButtons...)),
 	}
 	if layout.Text == "" && len(layout.Widgets) == 0 {
 		return gchatChatLayout{}, errGchatChatEmpty
@@ -276,8 +272,15 @@ func gchatChatTableCells(cells []string) []string {
 
 // gchatChatPlan is the plan, one line per item led by its status glyph, its
 // steps under it marked done but the last of a running item, which is the
-// open one. The plan's title is the fallback text's, and draws nothing, as
-// on Slack.
+// open one. A running or failed item's title already shows its latest note
+// (the emitter folds the item's note into its title), and that note is also
+// its last step. Slack keeps the steps behind the task card's arrow; Chat
+// draws them in the open, so a last step the title holds whole
+// (gchatStepIsTheNote) is left out and the title alone says where the card
+// is, with the steps before it as history; a step the title clipped stays,
+// so the note's tail is not lost. A complete item is drawn whole: its title
+// is its result, and its steps are history. The plan's title is the fallback
+// text's, and draws nothing, as on Slack.
 func gchatChatPlan(p *chatmsg.Plan) string {
 	var lines []string
 	for _, item := range p.Items {
@@ -287,15 +290,49 @@ func gchatChatPlan(p *chatmsg.Plan) string {
 			title = glyph + " " + title
 		}
 		lines = append(lines, strings.TrimSpace(title))
-		for i, step := range item.Steps {
+		steps := item.Steps
+		open := item.Status == chatmsg.StatusInProgress
+		if (open || item.Status == chatmsg.StatusError) && gchatStepIsTheNote(item) {
+			steps = steps[:len(steps)-1]
+			open = false
+		}
+		for i, step := range steps {
 			mark := gchatChatStepDone
-			if item.Status == chatmsg.StatusInProgress && i == len(item.Steps)-1 {
+			if open && i == len(steps)-1 {
 				mark = gchatChatStepOpen
 			}
 			lines = append(lines, gchatChatIndent+mark+" "+defangGchatControls(step))
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// gchatStepIsTheNote reports whether an item's last step is the note its
+// title shows whole: the step equals the item's note as the emitter sent it
+// beside the title (or the title itself, from an emitter that sent no note),
+// and the title contains the step. The emitter clips a title shorter than a
+// step (256, less the card's name in a plan of several), so a long note's
+// title is a prefix of it; the step is then the only whole copy and stays.
+// A note past the step's own clip (300) is cut by two different helpers for
+// the step and for the note, which can differ by a trailing comma or space;
+// the two then compare unequal and both lines draw, which the title check
+// would decide the same way, so the emitter is left alone. All compared as
+// sent, before the layout's defang.
+func gchatStepIsTheNote(item chatmsg.PlanItem) bool {
+	if len(item.Steps) == 0 {
+		return false
+	}
+	last := item.Steps[len(item.Steps)-1]
+	// The title as drawn: the emitter folds the note into the title with its
+	// raw whitespace (a newline, a run of spaces) while it collapses the step
+	// and the note to one line, so the comparison reads the one-line title the
+	// member sees, not the raw field.
+	title := gchatOneLine(item.Title)
+	shown := title
+	if item.Note != "" {
+		shown = item.Note
+	}
+	return last == shown && strings.Contains(title, last)
 }
 
 // gchatChatWidgets is the buttons as one accessory button list, choices

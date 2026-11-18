@@ -61,8 +61,14 @@ const (
 	// a line at a time: what answers on the port is input, and Go's default
 	// would hold ten mebibytes of headers from it.
 	usageScrapeMaxHeaderBytes = 16 * 1024
-	usageMetricsPath          = "/metrics"
-	usageScrapeScheme         = "http://"
+	// usageMetricsPath is the path every kube-agents listener serves its
+	// exposition at. usageLiteLLMMetricsPath is LiteLLM's: its router mounts
+	// the exposition under a trailing slash and answers the bare path with a
+	// 307 to it, which the client below does not follow, so the target names
+	// the slashed path and the scrape never depends on a redirect.
+	usageMetricsPath        = "/metrics"
+	usageLiteLLMMetricsPath = "/metrics/"
+	usageScrapeScheme       = "http://"
 
 	// The series the poller reads, and the gauge every listener exports so that
 	// a restart is seen whatever the sample did.
@@ -198,6 +204,13 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// The series' three labels, the cluster's triple as the watcher's profile
+	// names it, read into usageClusterGauges.Refs for the ScopeUndeclared
+	// condition (usage_scope.go). Label values are the peer's text and are
+	// validated where they are printed, not here.
+	clusterUpClusterLabel  = "cluster"
+	clusterUpProjectLabel  = "project"
+	clusterUpLocationLabel = "location"
 	// usageClusterGaugeCeiling bounds the series counted into the gauges in one
 	// body. The gauges are a reading, not an accumulation, so the per-poll delta
 	// ceiling does not reach them; this is what bounds what a body on the
@@ -214,6 +227,49 @@ const (
 	dataVolumeKindLabel = "kind"
 	dataVolumeKindTotal = "total"
 	dataVolumeKindFree  = "free"
+	// kanbanDispatcherFailedTicksSeries is the chat plugin's gauge of the
+	// kanban dispatcher's consecutive failed ticks, one series per failing
+	// board, with the class of the last failure; a good tick drops the board's
+	// series. Read from the body that serves kanbanGaveUpSeries, which only the
+	// chat_metrics listener does, and projected to the KanbanDispatcherFailing
+	// condition (usage_kanban_dispatcher.go).
+	kanbanDispatcherFailedTicksSeries = "kubeagents_kanban_dispatcher_failed_ticks"
+	// kanbanDispatcherFailingSecondsSeries is the plugin's age of each failing
+	// board's streak, in seconds, beside the ticks; matched to them by board.
+	// A plugin from before it serves only the ticks.
+	kanbanDispatcherFailingSecondsSeries = "kubeagents_kanban_dispatcher_failing_seconds"
+	// kanbanDispatcherStuckSecondsSeries is the plugin's gauge of a board whose
+	// tick ran past its limit or failed on a database lock after a busy timeout
+	// (a locked board), in seconds since that tick began; a board can be stuck
+	// before a streak rule holds. A plugin from before it serves none.
+	kanbanDispatcherStuckSecondsSeries = "kubeagents_kanban_dispatcher_stuck_seconds"
+	kanbanDispatcherBoardLabel         = "board"
+	kanbanDispatcherErrorLabel         = "error"
+	// usageDispatcherBoardCeiling bounds the failing boards one body may list,
+	// refused rather than clamped as usageClusterGaugeCeiling is. Hermes keeps
+	// a handful of boards; a body past this is a broken one.
+	usageDispatcherBoardCeiling = 1000
+	// The inference gateway's (LiteLLM's) token and spend families, summed
+	// over every label set (model, provider, key, team, user, requested
+	// model) into the three inference totals. LiteLLM has named each with and
+	// without the counter suffix across its releases, as the workstation
+	// summary's TOKEN_FAMILIES and SPEND_FAMILIES record, so the bare name is
+	// each counter's sibling (usageSiblingsFor); a body carries one or the
+	// other. tests/test_usage_counters_series_names.py pins these to the
+	// script's tuples. The token families' identifiers leave the word out:
+	// gosec's G101 reads a `token` in a name holding a string literal as a
+	// hardcoded credential, and the values are metric names.
+	litellmInputSeries      = "litellm_input_tokens_metric_total"
+	litellmInputBareSeries  = "litellm_input_tokens_metric"
+	litellmOutputSeries     = "litellm_output_tokens_metric_total"
+	litellmOutputBareSeries = "litellm_output_tokens_metric"
+	litellmSpendSeries      = "litellm_spend_metric_total"
+	litellmSpendBareSeries  = "litellm_spend_metric"
+	// usageSpendMicrosPerUSD scales LiteLLM's dollar figure to the integer
+	// micro-dollars status.usage.spendMicrosUSDTotal keeps: the sum over the
+	// body is scaled and rounded once, before the int64 conversion, so a
+	// fraction of a micro is never truncated per label set.
+	usageSpendMicrosPerUSD = 1_000_000
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -261,6 +317,15 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+
+	// usageClosedIdleErrorText is the text of net/http's unexported
+	// errServerClosedIdle: the transport's read loop starts as soon as the
+	// connection is dialled, and when the peer's close reaches it before the
+	// request is registered there, that plain sentinel -- neither a
+	// net.OpError nor io.EOF, and wrapping neither -- is what client.Do
+	// returns. usageConnectKind compares the innermost cause against it by
+	// equality, so no byte a peer sent can steer the match.
+	usageClosedIdleErrorText = "http: server closed idle connection"
 )
 
 var (
@@ -368,9 +433,26 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return chatFeedbackNegativeSeries, nil
 	case usageCounterPositiveFeedback:
 		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
+	case usageCounterInputTokens:
+		return litellmInputSeries, nil
+	case usageCounterOutputTokens:
+		return litellmOutputSeries, nil
+	case usageCounterSpendMicros:
+		return litellmSpendSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
+}
+
+// usageSampleScaleFor is the factor a counter's summed sample is multiplied
+// by, and rounded, before it becomes the integer the document keeps: the
+// spend counter's dollars to micro-dollars; every other counter is a count
+// already and is taken as it is.
+func usageSampleScaleFor(counter string) float64 {
+	if counter == usageCounterSpendMicros {
+		return usageSpendMicrosPerUSD
+	}
+	return 1
 }
 
 // usageSiblingsFor is the other families a counter is read from, on pods
@@ -380,7 +462,9 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 // pod, under the same label set; the errored counter comes from the plugin
 // whole and from the A2A gateway's task terminals under the errored states;
 // the thumbs-downs come from the plugin whole and from the A2A gateway's
-// answer ratings under the down rating.
+// answer ratings under the down rating; each inference total comes from
+// LiteLLM's suffixed family or, on a release that names it without the
+// suffix, the bare one, summed whole either way.
 func usageSiblingsFor(counter string) []usageSibling {
 	switch counter {
 	case usageCounterChatMessagesInbound:
@@ -391,6 +475,12 @@ func usageSiblingsFor(counter string) []usageSibling {
 		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
 	case usageCounterNegativeFeedback:
 		return []usageSibling{{family: a2aAnswerFeedbackSeries, filter: usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}}}
+	case usageCounterInputTokens:
+		return []usageSibling{{family: litellmInputBareSeries}}
+	case usageCounterOutputTokens:
+		return []usageSibling{{family: litellmOutputBareSeries}}
+	case usageCounterSpendMicros:
+		return []usageSibling{{family: litellmSpendBareSeries}}
 	}
 	return nil
 }
@@ -550,11 +640,41 @@ type usageReading struct {
 	// carried no complete one: not the watcher's, or a watcher whose statfs
 	// failed, or one built before it exported the series.
 	DataVolume *usageDataVolume
+	// Dispatcher is the chat plugin's kanban dispatcher reading, nil for any
+	// body but the chat_metrics listener's; an empty one when no board is
+	// failing or the plugin predates the series.
+	Dispatcher *usageDispatcherReading
 	// ToolPairs is the broker's tool counter by tool and subcommand, under
 	// the closed vocabularies, for a body asked for usageReadingTopTools;
 	// nil for any other. Not folded: the poll sums it across the broker pods
 	// read and projects the top rows as they stand (usageTopToolsForPoll).
 	ToolPairs map[usageToolPair]usageToolCounts
+}
+
+// usageDispatcherReading is the kanban dispatcher's failing boards in one
+// body: each board's consecutive failed ticks and the class of its last
+// failure.
+type usageDispatcherReading struct {
+	Failing []usageDispatcherFailure
+	// Stuck is the boards whose tick ran past the plugin's limit or failed on a
+	// lock after a busy timeout, with the seconds since that tick began.
+	Stuck []usageDispatcherStuck
+}
+
+// usageDispatcherStuck is one board the plugin reports stuck.
+type usageDispatcherStuck struct {
+	Board   string
+	Seconds int64
+}
+
+// usageDispatcherFailure is one board's failed-tick streak, and its age when
+// the body served one (HasAge).
+type usageDispatcherFailure struct {
+	Board   string
+	Error   string
+	Ticks   int64
+	Seconds int64
+	HasAge  bool
 }
 
 // usageDataVolume is one reading of the agent's data volume, in bytes.
@@ -570,6 +690,20 @@ type usageDataVolume struct {
 type usageClusterGauges struct {
 	Registered int64
 	Monitored  int64
+	// Refs is every series' triple as the watcher labelled it, in body order,
+	// one per Registered; read by the ScopeUndeclared condition (usage_scope.go).
+	// The values are the peer's text, unvalidated here.
+	Refs []usageClusterRef
+}
+
+// usageClusterRef is one cluster_up series' labels: the cluster's name, project
+// and location as its profile's identity names them. The watcher's directly
+// reached cluster carries an empty project and location until its profile is
+// absorbed.
+type usageClusterRef struct {
+	Name     string
+	Project  string
+	Location string
 }
 
 // usageScrapeError is a scrape that produced no body to count, with a kind the
@@ -590,10 +724,11 @@ func (e *usageScrapeError) Error() string {
 
 // usageConnectKind classifies a client.Do error by what happened rather than
 // where it surfaced: a timeout, a dial that was refused, unreachable, a
-// connection the peer accepted but never answered on, or -- only when the peer
-// did send a status line the client could not parse -- a malformed response, so
-// the event points the reader at the layer that failed rather than at a policy.
-// Never the text net/http builds from the bytes it read.
+// connection the peer accepted but never answered on (however the transport
+// reports the close), or -- only when the peer did send a status line the
+// client could not parse -- a malformed response, so the event points the
+// reader at the layer that failed rather than at a policy. Never the text
+// net/http builds from the bytes it read.
 func usageConnectKind(err error) string {
 	if usageTimedOut(err) {
 		return usageScrapeKindTimeout
@@ -617,7 +752,26 @@ func usageConnectKind(err error) string {
 		errors.Is(err, io.EOF) {
 		return usageScrapeKindConnect
 	}
+	// The same close, seen by the transport's read loop before the request
+	// was registered with it, surfaces as the closed-idle sentinel instead of
+	// the EOF underneath: still nothing answered, still connect.
+	if usageRootCause(err).Error() == usageClosedIdleErrorText {
+		return usageScrapeKindConnect
+	}
 	return usageScrapeKindMalformed
+}
+
+// usageRootCause is the innermost error of err's Unwrap chain, the one whose
+// text is its own rather than a wrapper's, so a wrapper that quotes the peer's
+// bytes around a cause is never what a sentinel is compared against.
+func usageRootCause(err error) error {
+	for {
+		inner := errors.Unwrap(err)
+		if inner == nil {
+			return err
+		}
+		err = inner
+	}
 }
 
 // usageTimedOut reports whether err is a deadline or a network timeout, which
@@ -628,14 +782,18 @@ func usageTimedOut(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
 
-// usageSource reads a listener. The pod scraper is its one implementation; a
-// test supplies a stub, and a deployment that cannot admit operator-to-pod
-// traffic could gain another without changing the accumulation or the writer.
+// usageSource reads a listener at a pod address and the path its exposition
+// is served at (usageMetricsPath for every kube-agents listener,
+// usageLiteLLMMetricsPath for LiteLLM). The pod scraper is its one
+// implementation; a test supplies a stub, and a deployment that cannot admit
+// operator-to-pod traffic could gain another without changing the
+// accumulation or the writer.
 type usageSource interface {
-	Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error)
+	Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error)
 }
 
-// podUsageSource reads /metrics at a pod IP and port over the pod network.
+// podUsageSource reads the exposition at a pod IP and port over the pod
+// network.
 type podUsageSource struct {
 	client *http.Client
 }
@@ -660,11 +818,12 @@ func newPodUsageSource() *podUsageSource {
 	}}
 }
 
-// Scrape GETs the listener at addr and folds the body for each of counters,
-// one sample per counter from the one body, and for each of kinds. Any status
-// other than 200 is a failed scrape.
-func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
+// Scrape GETs path on the listener at addr and folds the body for each of
+// counters, one sample per counter from the one body, and for each of kinds.
+// Any status other than 200 is a failed scrape, a redirect included: the
+// target names the path the listener serves, and the client follows nothing.
+func (s *podUsageSource) Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+path, nil)
 	if err != nil {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
@@ -707,6 +866,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	var clusters *usageClusterGauges
 	// volume collects the data volume series; a reading needs both kinds.
 	var volume map[string]float64
+	// dispatcher collects the kanban dispatcher's failing boards, for the
+	// chat_metrics listener's body alone.
+	var dispatcher *usageDispatcherReading
+	// dispatcherAges is each board's streak age, joined to its ticks after the body.
+	var dispatcherAges map[string]int64
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -728,6 +892,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			clusters = &usageClusterGauges{}
 			volume = map[string]float64{}
 			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
+		}
+		if family == kanbanGaveUpSeries {
+			dispatcher = &usageDispatcherReading{}
+			dispatcherAges = map[string]int64{}
+			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries, kanbanDispatcherStuckSecondsSeries)
 		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
@@ -814,6 +983,37 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						}
 						continue
 					}
+					if name == kanbanDispatcherFailedTicksSeries {
+						if len(dispatcher.Failing) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcher.Failing = append(dispatcher.Failing, usageDispatcherFailure{
+							Board: usageLabelValue(metric, kanbanDispatcherBoardLabel),
+							Error: usageLabelValue(metric, kanbanDispatcherErrorLabel),
+							Ticks: int64(value),
+						})
+						continue
+					}
+					if name == kanbanDispatcherFailingSecondsSeries {
+						// Bounded to what a time.Duration holds, for the condition's message.
+						if len(dispatcherAges) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcherAges[usageLabelValue(metric, kanbanDispatcherBoardLabel)] = int64(value)
+						continue
+					}
+					if name == kanbanDispatcherStuckSecondsSeries {
+						// Bounded as the age is. The condition uses the value only to
+						// pick the board that it names.
+						if len(dispatcher.Stuck) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcher.Stuck = append(dispatcher.Stuck, usageDispatcherStuck{
+							Board:   usageLabelValue(metric, kanbanDispatcherBoardLabel),
+							Seconds: int64(value),
+						})
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -822,6 +1022,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						if value == clusterUpMonitored {
 							clusters.Monitored++
 						}
+						clusters.Refs = append(clusters.Refs, usageClusterRef{
+							Name:     usageLabelValue(metric, clusterUpClusterLabel),
+							Project:  usageLabelValue(metric, clusterUpProjectLabel),
+							Location: usageLabelValue(metric, clusterUpLocationLabel),
+						})
 						continue
 					}
 					if pairs != nil && name == toolInvocationsSeries {
@@ -846,12 +1051,24 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	}
 	samples := make(map[string]int64, len(sums))
 	for counter, sum := range sums {
+		// The spend counter's dollars become micro-dollars here, rounded once
+		// over the whole body; a count's scale is one and leaves it exact.
+		if scale := usageSampleScaleFor(counter); scale != 1 {
+			sum = math.Round(sum * scale)
+		}
 		if sum >= float64(math.MaxInt64) {
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 		}
 		samples[counter] = int64(sum)
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume)}
+	if dispatcher != nil {
+		for i := range dispatcher.Failing {
+			if age, ok := dispatcherAges[dispatcher.Failing[i].Board]; ok {
+				dispatcher.Failing[i].Seconds, dispatcher.Failing[i].HasAge = age, true
+			}
+		}
+	}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
 	if readings != nil {
 		var ok bool
 		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {

@@ -5,8 +5,12 @@ read them; all use the names here, so a renamed field breaks the tests instead
 of the analysis.
 """
 
-# 2: litellm_config_checksum became model_behaviour_checksum.
-LOG_SCHEMA_VERSION = 2
+# 2: litellm_config_checksum became model_behaviour_checksum, a checksum that
+#    treated the Gemini Developer API and Vertex AI routes as one.
+# 3: back to litellm_config_checksum, the LiteLLM pods' checksum/config. Not 1
+#    again, since the bucket holds schema-2 lines. The readers group lines by
+#    fingerprint and read neither name, so schema-2 lines still read.
+LOG_SCHEMA_VERSION = 3
 
 REQUEST_EVENT = "replay_shadow_request"
 START_EVENT = "replay_shadow_start"
@@ -20,7 +24,7 @@ JOB = "job"
 MODEL = "model"
 STREAM = "stream"
 NORMALIZER_VERSION = "normalizer_version"
-MODEL_BEHAVIOUR_CHECKSUM = "model_behaviour_checksum"
+LITELLM_CONFIG_CHECKSUM = "litellm_config_checksum"
 LITELLM_IMAGE = "litellm_image"
 STATUS = "status"
 LATENCY_MS = "latency_ms"
@@ -104,6 +108,15 @@ UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
 # Normalized, the answer still holds an identifier shape (a card, a pod, a
 # session) the request never bound, so it would be served as recorded.
 UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
+# The answer names a file the request's read_file `similar_files` listed, which
+# the key drops: served to a run whose list lacked it, it would act on a file
+# that run was never shown.
+UNSTORABLE_NAMES_DROPPED_FILE = "names_dropped_similar_file"
+# The answer talks about a queue or a slot (`queued`, `frees up`, `slot`, `in
+# use`) after a kanban_create result whose `queued` the key drops: served to a
+# run whose card had a free slot, it would tell the user of a wait that run
+# does not have.
+UNSTORABLE_TALKS_ABOUT_DROPPED_QUEUE = "talks_about_dropped_queue"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
@@ -139,6 +152,13 @@ RECORDED = "recorded"
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
 RECORD_ERROR = "record_error"
 RECORD_ERROR_BUDGET = "budget_spent"
+# In record mode: [context, answer] identifying this request's answer as a
+# later request's history holds it (normalizer.answer_variant), and the same
+# pair for the last assistant message this request holds. A later request's
+# PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
+# went on from that very answer (hack/replay-proxy/run_attribution.py).
+ANSWER_VARIANT = "answer_variant"
+PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.
 MISS = "miss"
 MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"
@@ -164,6 +184,10 @@ GUARD_VALUE_ONLY_IN_ANSWERS = "value_only_in_answers"
 GUARD_UNBOUND_PLACEHOLDER = "unbound_placeholder"
 # The saved answer is missing or not an answer.
 GUARD_UNREADABLE_ENTRY = "unreadable_entry"
+# The saved answer names a file this request's read_file `similar_files`
+# listed, which the key drops: the recording may have acted on that file not
+# being there (written it, reported it missing).
+GUARD_NAMES_DROPPED_FILE = "names_dropped_similar_file"
 # Where the first difference is when it is not a message.
 MISS_ROLE_SETTINGS = "settings"
 MISS_ROLE_NONE = "none"

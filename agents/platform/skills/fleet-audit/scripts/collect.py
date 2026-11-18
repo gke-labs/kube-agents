@@ -7,8 +7,8 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s seventeen-check roster (§2.1–§2.17 of
+twenty-five-check roster (§3.1–§3.25 of `governance/obtainability_audit_sop.md`),
+`compliance-audit`'s eighteen-check roster (§2.1–§2.18 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -21,8 +21,9 @@ opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
-several distinct `kubectl` and `gcloud` reads per cluster, four of them
-best-effort because their CRDs are not installed everywhere; ai-security reads
+several distinct `kubectl` and `gcloud` reads per cluster, six of them
+best-effort (four because their CRDs are not installed everywhere, two because
+an identity may not list webhook configurations or EndpointSlices); ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
 `collect_cluster` is a thin dispatcher over a per-stream *context builder* for
@@ -70,6 +71,7 @@ import datetime
 import errno
 import functools
 import hashlib
+import importlib
 import ipaddress
 import json
 import math
@@ -220,6 +222,35 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # the broker path.
 PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 PLATFORM_SCRIPT_DIR_DEPTH = 3
+
+# §3.25 `hpa-aggressive-scaledown`: autoscaling/v2 `behavior.scaleDown`
+# defaults and thresholds. Kubernetes defaults `stabilizationWindowSeconds` to
+# 300, `selectPolicy` to `Max`, and `policies` to 100% per 15 seconds; only an
+# explicit stabilization window below 60 seconds exposes the workload to immediate
+# post-burst contraction. A `Percent` policy at or above 50 removes at least
+# half the running replicas in one period.
+HPA_AGGRESSIVE_SCALEDOWN_SLUG = "hpa-aggressive-scaledown"
+CHECK_KIND_CLUSTER = "cluster"
+SEVERITY_MAJOR = "major"
+# S2, the label GKE stamps on the add-ons it manages; shared by HPA, Service
+# and compliance checks whose objects do not pass through `normalize_workloads`.
+_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
+DEFAULT_HPA_SCALEDOWN_STABILIZATION_SECONDS = 300
+HPA_AGGRESSIVE_SCALEDOWN_MAX_STABILIZATION_SECONDS = 60
+DEFAULT_HPA_SCALEDOWN_SELECT_POLICY = "Max"
+HPA_SELECT_POLICY_DISABLED = "Disabled"
+HPA_SELECT_POLICY_MIN = "Min"
+HPA_POLICY_TYPE_PERCENT = "Percent"
+DEFAULT_HPA_SCALEDOWN_PERCENT_VALUE = 100
+DEFAULT_HPA_SCALEDOWN_PERIOD_SECONDS = 15
+HPA_AGGRESSIVE_SCALEDOWN_PERCENT_FLOOR = 50
+HPA_HIT_COMMA_JOIN = ", "
+IMPACT_HPA_AGGRESSIVE_SCALEDOWN = (
+    "When traffic subsides after a burst, the autoscaler removes a large share "
+    "of running pods in a single period with little or no stabilization window "
+    "while the containers receive SIGTERM immediately with no preStop wait, "
+    "dropping connections in flight and flapping capacity on brief load dips."
+)
 
 
 def _platform_script_dirs() -> tuple[str, ...]:
@@ -540,6 +571,8 @@ Discovery = collector_run.Discovery
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
+listing_fields = collector_run.listing_fields
+listed_node_pools = collector_run.listed_node_pools
 
 
 RunFn = Callable[..., Run]
@@ -725,7 +758,8 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
     did not answer returns the clusters it has *and* an error, so the ones in
     the silent zones do not read as clusters that do not exist.
     """
-    result = run(["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"])
+    listing_argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
+    result = run(listing_argv)
     if result.rc != 0:
         if any(marker in result.stderr for marker in API_DISABLED_MARKERS):
             log(f"{project}: Kubernetes Engine API is not enabled; no cluster can exist here")
@@ -750,6 +784,9 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
                 "location": location,
                 "project": project,
                 "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
+                # The node pools this listing already returned, for the two
+                # streams that read them (`collector_run.listed_node_pools`).
+                **listing_fields(c, listing_argv),
             }
         )
     not_running = [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
@@ -1321,9 +1358,10 @@ def hpas_by_namespace(dump: dict) -> dict[str, list[dict]]:
 def _hpa_is_owned(hpa: dict) -> bool:
     """An HPA carrying `ownerReferences`, KEDA's `ScaledObject` included.
 
-    Skipped only by the checks that grade the HPA's own `min`/`max` (3.6,
-    3.22): on an owned HPA those are a copy the operator writes from a CRD
-    this audit cannot read, so grading them grades a projection. The checks
+    Skipped only by the checks that grade the HPA's own `min`/`max` or
+    `behavior` (3.6, 3.22, 3.25): on an owned HPA those are a copy the operator
+    writes from a CRD this audit cannot read, so grading them grades a
+    projection. The checks
     that ask whether a workload is autoscaled at all (3.4, 3.5, 3.11) keep
     it -- a KEDA-scaled Deployment is autoscaled, and its floor is the one
     KEDA wrote. This is not `_defers_to_owner`: a workload owned by a CRD
@@ -2509,6 +2547,139 @@ def check_hpa_floors_at_one(context: dict) -> list[dict]:
                 }
             )
     return hits
+
+
+def _scaledown_policy_is_aggressive(policy: object) -> bool:
+    """Whether one `HPAScalingPolicy` removes at least half the replicas in a period."""
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("type") != HPA_POLICY_TYPE_PERCENT:
+        return False
+    value = policy.get("value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return value >= HPA_AGGRESSIVE_SCALEDOWN_PERCENT_FLOOR
+
+
+def check_hpa_aggressive_scaledown(context: dict) -> list[dict]:
+    """§3.25 -- an HPA whose `behavior.scaleDown` sets `stabilizationWindowSeconds`
+    below 60 with an aggressive `Percent` scale-down policy on a workload whose
+    containers declare no `lifecycle.preStop` hook.
+
+    Kubernetes defaults `behavior.scaleDown.stabilizationWindowSeconds` to 300
+    seconds and `policies` to 100% per 15 seconds under `selectPolicy: Max`.
+    With the 300-second window intact, that default policy waits out post-burst
+    dips; overriding `stabilizationWindowSeconds` below 60 exposes the 100%
+    step immediately when metrics fall, and a target container with no
+    `preStop` hook receives `SIGTERM` before callers stop sending work to it.
+    """
+    workloads = {(w["ns"], w["kind"], w["name"]): w for w in context["workloads"]}
+    hits = []
+    for ns, hpas in context["hpas"].items():
+        if _is_system_namespace(ns):  # S1
+            continue
+        for hpa in hpas:
+            meta = hpa.get("metadata") or {}
+            if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):  # S2
+                continue
+            if _hpa_is_owned(hpa):
+                continue
+            spec = hpa.get("spec") or {}
+            floor = spec.get("minReplicas")
+            if not isinstance(floor, int) or isinstance(floor, bool):
+                floor = DEFAULT_HPA_MIN_REPLICAS
+            max_replicas = spec.get("maxReplicas")
+            if not isinstance(max_replicas, int) or isinstance(max_replicas, bool) or max_replicas <= floor:
+                continue
+            behavior = spec.get("behavior")
+            if not isinstance(behavior, dict):
+                continue
+            scale_down = behavior.get("scaleDown")
+            if not isinstance(scale_down, dict):
+                continue
+            select_policy = scale_down.get("selectPolicy") or DEFAULT_HPA_SCALEDOWN_SELECT_POLICY
+            if select_policy == HPA_SELECT_POLICY_DISABLED:
+                continue
+            stabilization = scale_down.get("stabilizationWindowSeconds")
+            if stabilization is None:
+                stabilization = DEFAULT_HPA_SCALEDOWN_STABILIZATION_SECONDS
+            if (
+                not isinstance(stabilization, int)
+                or isinstance(stabilization, bool)
+                or stabilization >= HPA_AGGRESSIVE_SCALEDOWN_MAX_STABILIZATION_SECONDS
+            ):
+                continue
+            raw_policies = scale_down.get("policies")
+            if raw_policies is None or raw_policies == []:
+                policies = [
+                    {
+                        "type": HPA_POLICY_TYPE_PERCENT,
+                        "value": DEFAULT_HPA_SCALEDOWN_PERCENT_VALUE,
+                        "periodSeconds": DEFAULT_HPA_SCALEDOWN_PERIOD_SECONDS,
+                    }
+                ]
+                policies_defaulted = True
+            elif isinstance(raw_policies, list):
+                policies = [p for p in raw_policies if isinstance(p, dict)]
+                if not policies:
+                    continue
+                policies_defaulted = False
+            else:
+                continue
+            aggressive = [p for p in policies if _scaledown_policy_is_aggressive(p)]
+            if select_policy == HPA_SELECT_POLICY_MIN:
+                if len(aggressive) != len(policies):
+                    continue
+            elif not aggressive:
+                continue
+            target = spec.get("scaleTargetRef") or {}
+            if (
+                target.get("apiVersion") != _WORKLOAD_API_VERSION
+                or target.get("kind") not in SCALABLE_WORKLOAD_KINDS
+            ):
+                continue
+            workload = workloads.get((ns, target.get("kind"), target.get("name")))
+            if workload is None:
+                continue
+            services = _selecting_services(workload, context)
+            candidate_containers = (
+                _containers_behind_a_service(workload, _routing_services(services))
+                if services and _exposure_scope(services) == _SCOPE_SERVING
+                else _effective_containers(workload)
+            )
+            missing = [
+                c.get("name", "")
+                for c in candidate_containers
+                if c.get("name") not in _SELF_HEALTH_SIDECARS
+                and not (c.get("lifecycle") or {}).get("preStop")
+            ]
+            if not missing:
+                continue
+            grace = workload["template"].get("terminationGracePeriodSeconds")
+            if grace is None:
+                grace = DEFAULT_GRACE_PERIOD_S
+            policy_summary = HPA_HIT_COMMA_JOIN.join(
+                f"{p.get('value')}% per {p.get('periodSeconds')}s" for p in aggressive
+            )
+            if policies_defaulted:
+                policy_summary += " (API default)"
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"HorizontalPodAutoscaler/{meta.get('name', '')}",
+                    "excerpt": (
+                        f"behavior.scaleDown: stabilizationWindowSeconds={stabilization}, "
+                        f"selectPolicy={select_policy}, policies={policy_summary}; "
+                        f"scaling {workload['kind']}/{workload['name']} "
+                        f"(minReplicas={floor}, maxReplicas={max_replicas})\n"
+                        f"target containers with no preStop hook: "
+                        f"{HPA_HIT_COMMA_JOIN.join(missing)} (terminationGracePeriodSeconds={grace})"
+                    ),
+                    "reconciler": reconciler_of(meta),
+                    "release": release_of(meta),
+                }
+            )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
 
 
 _HOSTNAME_KEY = "kubernetes.io/hostname"
@@ -4323,7 +4494,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all seventeen checks of §2.
+# compliance-audit: all eighteen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -6798,11 +6969,6 @@ _INTERNAL_LB_ANNOTATION_VALUE = "Internal"
 # `spec.ports[].protocol` when the field is omitted.
 _DEFAULT_SERVICE_PROTOCOL = "TCP"
 
-# S2, the label GKE stamps on the add-ons it manages. Named here rather than
-# repeated as a literal because this is the first Service-scoped check to apply
-# the suppression; the workload-scoped ones inherit it from `normalize_workloads`.
-_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
-
 _IMPACT_LB_WORLD_OPEN = (
     "This Service holds a public load-balancer address that forwards a "
     "management or datastore port straight to its pods, with no source-range "
@@ -7583,6 +7749,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_UNTARGETED_COMPUTE_CLASS,
     ),
+    CheckSpec(
+        HPA_AGGRESSIVE_SCALEDOWN_SLUG,
+        CHECK_KIND_CLUSTER,
+        check_hpa_aggressive_scaledown,
+        SEVERITY_MAJOR,
+        None,
+        IMPACT_HPA_AGGRESSIVE_SCALEDOWN,
+    ),
 )
 
 def _condition(item: dict, condition_type: str) -> dict | None:
@@ -7667,6 +7841,149 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
             }
         )
     return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
+
+
+# §2.18 `webhook-backend-unreachable`: a fail-closed admission webhook whose
+# backend the API server cannot reach. The predicate is the upgrade readiness
+# report's (`backend_problem` in the fleet-upgrade-verification skill: the
+# Service is missing, has no port equal to the webhook's, or has no ready
+# endpoint behind that port), imported from that skill's `scripts/`, which the
+# image and the repository lay out beside this one (`patch_readiness.py` reaches
+# the same directory for 3.11's reporter). The readiness report grades such a
+# webhook only when its rules reach the upgrade's path; this check names every
+# one, because a fail-closed webhook with a dead backend refuses every request
+# its rules match today, and a config-management system is the first caller to
+# find out. Both reads are best-effort, like `ccnp` above: a cluster whose
+# identity cannot list webhook configurations or EndpointSlices keeps its
+# other seventeen checks, and this one reads `Undetermined` there.
+WEBHOOK_DUMP_KINDS = "validatingwebhookconfigurations,mutatingwebhookconfigurations"
+ENDPOINTSLICE_DUMP_KINDS = "endpointslices"
+UPGRADE_READINESS_SCRIPTS = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts"
+UPGRADE_READINESS_MODULE = "upgrade_readiness"
+# admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail: an absent
+# field reads as Fail, as the API server reads it.
+WEBHOOK_FAILURE_POLICY_FAIL = "Fail"
+# The namespaces whose writes a dead fail-closed webhook hurts most, judged for
+# severity: the platform's own controllers (`kube-system`) and the
+# config-management system (Config Sync's `config-management-system`). A webhook
+# whose `namespaceSelector` is absent, empty, or admits either is `critical`;
+# one that reaches neither is `major`, a real outage for whatever it does gate.
+# Each is judged on the Namespace object the read returned, or on the name label
+# every namespace carries when the read returned none (`config-management-system`
+# is absent on a cluster without Config Sync, and a selector on its name must
+# still read the way it would once it exists).
+WEBHOOK_SEVERITY_NAMESPACES = ("kube-system", "config-management-system")
+WEBHOOK_SEVERITY_REACHES = "critical"
+WEBHOOK_SEVERITY_OFF_PATH = "major"
+NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
+_GKE_COMPONENT_ANNOTATION = "components.gke.io/component-name"
+_WEBHOOK_RULE_CORE_GROUP = "core"
+_WEBHOOK_HIT_JOIN = " | "
+_IMPACT_WEBHOOK_BACKEND_UNREACHABLE = (
+    "This admission webhook fails closed and the API server cannot reach its backend, so "
+    "every request its rules match is refused until the backend answers again. A "
+    "config-management system or a controller that writes a matching object cannot apply, "
+    "and the cluster drifts from its repository while every object reads healthy."
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _upgrade_readiness():
+    """The fleet-upgrade-verification skill's readiness module, imported once from the
+    `scripts/` directory beside this skill's. Imported on first use so this module's own
+    import stays as it was; a missing sibling raises ImportError to the caller, which
+    records the check as unevaluated rather than failing the cluster closed."""
+    scripts_dir = str(UPGRADE_READINESS_SCRIPTS)
+    if scripts_dir not in sys.path:
+        sys.path.append(scripts_dir)
+    return importlib.import_module(UPGRADE_READINESS_MODULE)
+
+
+def _webhook_rules_text(rules: list[dict]) -> str:
+    parts = []
+    for rule in rules:
+        groups = ",".join(g or _WEBHOOK_RULE_CORE_GROUP for g in rule.get("apiGroups") or ["*"])
+        resources = ",".join(rule.get("resources") or ["*"])
+        operations = "/".join(rule.get("operations") or ["*"])
+        parts.append(f"{operations} {resources} in {groups}")
+    return "; ".join(parts)
+
+
+def _webhook_severity_namespaces(context: dict) -> dict[str, dict]:
+    by_name: dict[str, dict] = {}
+    for item in context.get("namespaces") or []:
+        meta = item.get("metadata") or {}
+        name = meta.get("name", "")
+        by_name[name] = {**(meta.get("labels") or {}), NAMESPACE_NAME_LABEL: name}
+    return {name: by_name.get(name, {NAMESPACE_NAME_LABEL: name}) for name in WEBHOOK_SEVERITY_NAMESPACES}
+
+
+def check_webhook_backend_unreachable(context: dict) -> list[dict]:
+    """Cluster-scoped: a fail-closed admission webhook whose backend the API server cannot reach.
+
+    One hit per configuration, since the finding id is (check, cluster, namespace,
+    object): the excerpt names each failing webhook of it, its backend problem, its
+    rules, and whether its selector admits the severity namespaces. Skipped: a webhook
+    with `failurePolicy: Ignore` (admission skips it in silence; #4960 is that shape), one
+    whose backend is a URL (its reachability is not readable from the cluster), one with
+    no rules (the server never calls it), and a configuration carrying GKE's add-on
+    label or component annotation (the universal suppressions, which the webhook
+    configurations of GKE's own operators carry).
+    """
+    configurations = context.get("webhook_configurations") or []
+    if not configurations:
+        # Nothing to judge, and the one state the collector leaves when a read
+        # or the import failed (the check is then unevaluated): import nothing.
+        return []
+    readiness = _upgrade_readiness()
+    services = context.get("services") or []
+    slices = context.get("endpointslices") or []
+    severity_labels = _webhook_severity_namespaces(context)
+    hits = []
+    for config in configurations:
+        meta = config.get("metadata") or {}
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        lines, reaches = [], False
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", WEBHOOK_FAILURE_POLICY_FAIL) != WEBHOOK_FAILURE_POLICY_FAIL:
+                continue
+            rules = [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+            if not rules:
+                continue
+            service_ref = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service_ref, dict):
+                continue
+            problem = readiness.backend_problem(service_ref, services, slices)
+            if problem is None:
+                continue
+            admitted = [ns for ns, labels in severity_labels.items() if readiness.namespace_selector_reaches(hook, labels)]
+            reaches = reaches or bool(admitted)
+            reach = (
+                f"its namespaceSelector admits {', '.join(admitted)}"
+                if admitted
+                else f"its namespaceSelector admits neither {' nor '.join(WEBHOOK_SEVERITY_NAMESPACES)}"
+            )
+            lines.append(
+                f"{hook.get('name', '')}: failurePolicy Fail and {problem}; rules: {_webhook_rules_text(rules)}; {reach}"
+            )
+        if not lines:
+            continue
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"{config.get('kind', '')}/{meta.get('name', '')}",
+                "excerpt": _WEBHOOK_HIT_JOIN.join(lines),
+                "severity": WEBHOOK_SEVERITY_REACHES if reaches else WEBHOOK_SEVERITY_OFF_PATH,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
 
 
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
@@ -7844,6 +8161,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "including a remediation this audit proposes -- changes nothing on it "
         "until the reconciler is unblocked.",
     ),
+    CheckSpec(
+        "webhook-backend-unreachable",
+        "cluster",
+        check_webhook_backend_unreachable,
+        "critical",  # overridden per hit: major when the selector reaches no severity namespace
+        None,
+        _IMPACT_WEBHOOK_BACKEND_UNREACHABLE,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -7970,14 +8295,22 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
             f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
         )
         if cc_items:
-            np_argv = [
-                "gcloud", "container", "node-pools", "list",
-                "--cluster", cluster["name"],
-                "--location", cluster["location"],
-                "--project", cluster["project"],
-                "--format", "json",
-            ]
-            np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
+            # This read records no command of its own (the check's record is
+            # the ComputeClass read above), so a listing-sourced answer adds
+            # none either.
+            np_result, unlisted = listed_node_pools(cluster)
+            if np_result is not None:
+                np_parsed = json.loads(np_result.stdout)
+            else:
+                log(f"{cluster.get('target', cluster['name'])}: {unlisted}; reading node-pools list")
+                np_argv = [
+                    "gcloud", "container", "node-pools", "list",
+                    "--cluster", cluster["name"],
+                    "--location", cluster["location"],
+                    "--project", cluster["project"],
+                    "--format", "json",
+                ]
+                np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
             pools_listed = isinstance(np_parsed, list) and all(isinstance(p, dict) for p in np_parsed)
             if not pools_listed:
                 commands.pop("untargeted-compute-class-workload", None)
@@ -8064,6 +8397,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "kcc-object-wedged": ("kcc",),
     "configsync-reconciler-stalled": ("configsync",),
     "lb-world-open": ("services",),
+    "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -8302,6 +8636,52 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     context["services"] = parsed.get("items", []) or []
     commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
 
+    # §2.18's two reads, best-effort like `ccnp` below: both APIs exist on
+    # every cluster, but an identity that cannot list them must not cost the
+    # cluster its other seventeen checks. A failed read leaves the check
+    # `Undetermined` on this cluster; the same disposition when the sibling
+    # skill's predicate cannot be imported, which is a packaging fault, not a
+    # clean cluster. The Services the check joins against are the read above.
+    context["webhook_configurations"], context["endpointslices"] = [], []
+    webhook_reads: list[tuple[str, dict | None, Run]] = []
+    for kinds in (WEBHOOK_DUMP_KINDS, ENDPOINTSLICE_DUMP_KINDS):
+        parsed, result = paged(kinds)
+        webhook_reads.append((kinds, parsed, result))
+    webhook_reason = ""
+    for kinds, parsed, result in webhook_reads:
+        if parsed is None:
+            stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+            webhook_reason = (
+                f"{UNDETERMINED_PREFIX} `kubectl get {kinds}` exited {result.rc} ({stderr}), so "
+                "whether a fail-closed webhook has a reachable backend was not established. "
+                "This check cleared nothing on this cluster."
+            )
+            break
+    if not webhook_reason:
+        try:
+            _upgrade_readiness()
+        except ImportError as exc:
+            webhook_reason = (
+                f"{UNDETERMINED_PREFIX} the readiness module this check reads its predicate from "
+                f"could not be imported ({exc}), so no webhook was judged. This check cleared "
+                "nothing on this cluster."
+            )
+    if webhook_reason:
+        context.setdefault("unevaluated", {})["webhook-backend-unreachable"] = webhook_reason
+    else:
+        context["webhook_configurations"] = webhook_reads[0][1].get("items", []) or []
+        context["endpointslices"] = webhook_reads[1][1].get("items", []) or []
+        commands["webhook-backend-unreachable"] = _record(
+            "; ".join(paged_text(kinds) for kinds, _, _ in webhook_reads),
+            Run(
+                [],
+                0,
+                "".join(result.stdout for _, _, result in webhook_reads),
+                "",
+                sum(result.duration_s for _, _, result in webhook_reads),
+            ),
+        )
+
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
     # -o name`) is not installed on every cluster, so a failure here almost
@@ -8487,12 +8867,21 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         context["node_pools"] = context["cluster_describe"].get("nodePools") or []
         commands["legacy-metadata"] = describe_record
     else:
-        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-        parsed, result = gated(node_pools_argv)
+        # The listing's pools when it carried them, recorded against the
+        # discovery command that returned them; else the cluster's own read.
+        result, unlisted = listed_node_pools(cluster)
+        if result is not None:
+            parsed = json.loads(result.stdout)
+            node_pools_command = shlex.join(result.argv)
+        else:
+            log(f"{cluster.get('target', name)}: {unlisted}; reading node-pools list")
+            node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+            parsed, result = gated(node_pools_argv)
+            node_pools_command = shlex.join(node_pools_argv)
         if parsed is None:
             raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
         context["node_pools"] = parsed if isinstance(parsed, list) else []
-        commands["legacy-metadata"] = _record(shlex.join(node_pools_argv), result)
+        commands["legacy-metadata"] = _record(node_pools_command, result)
 
     # Whether the three admission premises `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE`
     # rests on are still intact on this cluster. They hold only while nothing
@@ -8569,12 +8958,12 @@ _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
 # Cluster-kind checks that match against `collected.workloads`, so an empty
 # workload set leaves them nothing to examine exactly as it does a workload
 # check: a PDB is only graded against the workload it covers, and an HPA's
-# floor only against the Service-backed workload it scales. Compliance's two
+# floor or scale-down behavior only against the workload it scales. Compliance's two
 # automount checks iterate the workload set too. `netpol-missing` does not: it
 # reads `pod_namespaces`, every namespace holding a live Pod, so it still has
 # something to examine on a cluster whose workloads are all out of scope.
 _WORKLOAD_ANCHORED_CLUSTER_CHECKS = frozenset({
-    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one",
+    "blocking-pdb", "pdb-overlapping", "hpa-floors-at-one", HPA_AGGRESSIVE_SCALEDOWN_SLUG,
     "default-sa-automount", "unbound-sa-automount",
 })
 

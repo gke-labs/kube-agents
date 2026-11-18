@@ -70,8 +70,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # chart ships selects agent bindings by that suffix, so a name outside it goes
 # unselected; the plan is refused instead (variables.tf has the detail).
 # The installer front doors regenerate this file on every run, so through
-# install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME and
-# LITELLM_GSA_NAME in install.env instead of editing here. The KSA name has no
+# install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME,
+# GITHUB_MINTER_KSA_NAME and LITELLM_GSA_NAME in install.env instead of editing
+# here (install.sh names and records a new install's minter KSA itself). The KSA name has no
 # install.env key of its own yet, so it goes in the same file as
 # TF_VAR_agent_ksa_name=... — the generator never writes agent_ksa_name, so
 # nothing in this file overrides it.
@@ -79,6 +80,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # github_minter_service_account_id = "kubeagents-github-minter-gsa-2"
 # litellm_service_account_id       = "kubeagents-litellm-gsa-2"
 # agent_ksa_name                   = "kubeagents-platform-2-agent"
+# github_minter_ksa_name           = "<cluster>-github-minter"
 
 # Cluster tuning
 # deletion_protection = true
@@ -98,12 +100,6 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # over a release another state or a manual `helm install` owns in the
 # namespace. Only for a long-lived install whose own state owns the release.
 # helm_upgrade_install = true
-
-# The PlatformAgent's spec.mode: "today" (the default, which renders no mode
-# field) or "next", which puts the NATS bus and the A2A gateway in front of
-# the agent, and is what install.sh records on a first install. Changing it
-# later is a mode switch; see variables.tf.
-# platform_agent_mode = "today"
 
 # The PlatformAgent's spec.storage.size: the agent's data volume and the shell
 # sandbox's, which the operator gives the same size. The default passes
@@ -141,13 +137,20 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #   rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]
 # }
 
+# The gateway's spend ceiling, in US dollars per period (a LiteLLM duration);
+# usd 0 is no ceiling, on it is at least 0.01. See variables.tf.
+# litellm_budget = {
+#   usd    = 0
+#   period = "1d"
+# }
+
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults
 # to "global" rather than the cluster location, because a model is only callable
 # from a location that serves it. Set a region for a data-residency requirement,
 # or for a Model Garden partner model served only from specific regions.
 # model_provider     = "vertex_ai"
-# model_default_name = "gemini-3.5-flash"
+# model_default_name = "gemini-3.8-flash"
 # vertex_project_id  = ""
 # vertex_location    = ""
 # false when vertex_project_id is a project you cannot administer: you enable the
@@ -196,6 +199,18 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # A self-managed instance behind a private CA: the Secret holding that CA
 # under the key `ca.crt` (install.sh writes it from --gitops-ca-file).
 # gitlab_ca_secret_name     = "gitlab-forge-ca"
+# Or Bitbucket Cloud (gitops_forge = "bitbucket", no host) or Bitbucket Data
+# Center (gitops_forge = "bitbucket-datacenter", with gitops_host, served at the
+# root path on port 443). gitops_repo_path is workspace/repo-slug on Cloud and
+# PROJECTKEY/repo-slug on Data Center. The token is never a variable: create
+# Secret gitops_token_secret_name (default bitbucket-forge-token), key `token`,
+# in the agent's namespace. gitops_identity is the account UUID a Cloud
+# workspace, project or repository access token acts as.
+# gitops_forge             = "bitbucket"
+# gitops_repo_path         = "acme/gitops"
+# gitops_token_secret_name = "bitbucket-forge-token"
+# gitops_identity          = "{0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e}"
+# gitops_ca_secret_name    = "bitbucket-forge-ca" # Data Center behind a private CA
 
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack
@@ -310,7 +325,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # shared cluster, install cert-manager separately and set this to false.
 # enable_cert_manager  = true
 # enable_webhooks      = true
-# cert_manager_version = "v1.21.2"
+# cert_manager_version = "v1.21.3"
 
 # Anything the variables above do not reach. Deep-merged over the values this
 # composition computes, so one leaf can be set without restating its block.

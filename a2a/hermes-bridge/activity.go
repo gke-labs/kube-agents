@@ -81,7 +81,7 @@ const (
 	// (the `secret_env` of the hooks.outbound entry); the bridge sets it per
 	// child. In a single-profile CLI process hermes's secret scope falls
 	// through to the process environment, which is what makes this work.
-	ActivitySecretEnv = "A2A_ACTIVITY_SECRET"
+	ActivitySecretEnv = "A2A_ACTIVITY_SECRET" // #nosec G101 -- an env var name, not a credential
 	// ActivityURLEnv tells the child where its deliveries go. hermes reads
 	// the URL from the managed config the bridge writes; the variable is for
 	// the record and for test stubs standing in for hermes.
@@ -544,6 +544,11 @@ type activityState struct {
 	// stepRefused says a step record was refused at encoding and the log
 	// has said so; one line per task (publishSteps).
 	stepRefused atomic.Bool
+
+	// secrets is the secret values this task's tool results carried
+	// (answer_scrub.go), redacted out of its answer and cleared when it
+	// finalizes.
+	secrets seenSecrets
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -1125,7 +1130,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	var env []byte
 	src := b.cfg.ManagedScopeDir
 	if src != "" {
-		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile))
+		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile)) // #nosec G304 -- the operator-set managed scope directory, not task data
 		switch {
 		case rerr == nil:
 			// UseNumber: the copy has to carry the operator's pins as written,
@@ -1140,7 +1145,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		case !errors.Is(rerr, os.ErrNotExist):
 			return "", fmt.Errorf("managed config %s: %w", src, rerr)
 		}
-		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile))
+		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile)) // #nosec G304 -- same directory as above
 		switch {
 		case rerr == nil:
 			env = raw
@@ -1359,13 +1364,19 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	run := b.runForSignature(r.Header.Get(hookSignatureHeader), body)
+	sig := r.Header.Get(hookSignatureHeader)
+	run, decoded, runs := b.routeDelivery(sig, body)
 	if run == nil {
+		if decoded != nil {
+			b.collectCardWorkerSecrets(runs, decoded)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil {
+	if decoded != nil {
+		d = *decoded
+	} else if err := json.Unmarshal(body, &d); err != nil {
 		// Signed for this task and unreadable, and which event it was
 		// cannot be known: an unreadable pre costs the trace nothing (the
 		// post carries the record whole), an unreadable post leaves its
@@ -1381,6 +1392,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// and the entry would then be dropped as post-terminal - present in the
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
+	// The result's secret values, for the answer's scrub, read before
+	// run.mu: the read is CPU only and bounded, and holding run.mu over it
+	// would hold the heartbeat and a finalize behind it. A value that lands
+	// after the answer was published scrubs nothing; the answer is out.
+	if d.Event == hookPostToolCall {
+		act.secrets.collectToolResult(d.Extra.Result)
+	}
 	run.mu.Lock()
 	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
@@ -1405,8 +1423,17 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 // session id is read only after the signature verifies, so an unsigned body
 // cannot pick a task.
 func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
+	run, _, _ := b.routeDelivery(sig, body)
+	return run
+}
+
+// routeDelivery is runForSignature, also handing back what it read on the
+// way, so the door neither verifies nor decodes a body twice: the delivery,
+// when the pod's shared secret signed it and it decoded (nil otherwise),
+// and the snapshot of tasks it matched against.
+func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
-		return nil
+		return nil, nil, nil
 	}
 	b.mu.Lock()
 	runs := make([]*taskRun, 0, len(b.tasks))
@@ -1416,22 +1443,42 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	b.mu.Unlock()
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
-			return r
+			return r, nil, runs
 		}
 	}
 	if !hookSigned(b.cfg.ActivitySecret, sig, body) {
-		return nil
+		return nil, nil, runs
 	}
-	var d hookDelivery
-	if err := json.Unmarshal(body, &d); err != nil || d.SessionID == "" {
-		return nil
+	d := new(hookDelivery)
+	if err := json.Unmarshal(body, d); err != nil {
+		return nil, nil, runs
+	}
+	if d.SessionID == "" {
+		return nil, d, runs
 	}
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
-			return r
+			return r, d, runs
 		}
 	}
-	return matchWorkerDeliveryRun(runs, d)
+	return matchWorkerDeliveryRun(runs, *d), d, runs
+}
+
+// collectCardWorkerSecrets reads the Secret values of a post_tool_call
+// that matched no task's trace because its card's worker ran before the
+// task started waiting on its cards (a card runs as soon as it is filed,
+// while the coordinator's turn goes on), into the set of the task that
+// filed or tracks the card (cardWorkerRun), whose answer folds the card's
+// report in. Nothing else of the delivery is used: it stays out of the
+// trace, as before. d is the delivery routeDelivery verified and decoded,
+// and runs the tasks it matched against.
+func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
+	if d.Event != hookPostToolCall || d.SessionID == "" {
+		return
+	}
+	if run := cardWorkerRun(runs, *d); run != nil {
+		run.act.Load().secrets.collectToolResult(d.Extra.Result)
+	}
 }
 
 // --- the heartbeat ---

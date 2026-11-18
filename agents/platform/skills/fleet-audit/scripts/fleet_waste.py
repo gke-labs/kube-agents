@@ -9,7 +9,8 @@ governance/fleet_wide_cost_analysis_sop.md.
 
 This stream's own collector: its targets are both GKE clusters (the fifteen
 `kubectl` object kinds in `CLUSTER_DUMP_KINDS`, a Cloud
-Monitoring usage read, `gcloud container node-pools list`, and §3.7's
+Monitoring usage read, the node pools (the discovery `clusters list` item's
+`nodePools`, else `gcloud container node-pools list`), and §3.7's
 `gcloud container operations list` for `CREATE_NODE_POOL`, which dates each
 pool; a pool with no such operation is dated from the cluster's `createTime`,
 and only a failed operations read falls back to node age, with a limitation)
@@ -875,6 +876,8 @@ def log(msg: str) -> None:
 
 
 Run = collector_run.Run
+listing_fields = collector_run.listing_fields
+listed_node_pools = collector_run.listed_node_pools
 run_and_gate = collector_run.run_and_gate
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
@@ -1113,9 +1116,14 @@ def _describing_once(run: RunFn) -> RunFn:
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
-    result = run(
-        ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled,createTime)"]
-    )
+    # `nodePools` so the Standard clusters' idle-nodepool read can take them
+    # from here (`collector_run.listed_node_pools`); the projection gains that
+    # sub-object and nothing else.
+    listing_argv = [
+        "gcloud", "container", "clusters", "list", "--project", project,
+        "--format", "json(name,location,status,autopilot.enabled,createTime,nodePools)",
+    ]
+    result = run(listing_argv)
     if result.rc != 0:
         # Discovery lists no project, so this is where a project whose
         # Kubernetes Engine API is off first answers: with no cluster.
@@ -1145,6 +1153,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             "project": project,
             "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
             "create_time": c.get("createTime") or "",
+            **listing_fields(c, listing_argv),
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -4685,10 +4694,20 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # were checked and were fine. An answer that parses to anything but a
         # list of objects (an error object, a stray string) is as unread: one
         # key read as a sole pool, and more crashed the cluster on a string.
-        parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        #
+        # Taken from the discovery listing when it carried the pools, and
+        # recorded against that listing's command, the read that returned them.
+        pools_result, unlisted = listed_node_pools(cluster)
+        if pools_result is not None:
+            parsed_pools = json.loads(pools_result.stdout)
+            pools_command = shlex.join(pools_result.argv)
+        else:
+            log(f"{project}/{location}/{name}: {unlisted}; reading node-pools list")
+            parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+            pools_command = shlex.join(node_pools_argv)
         pools_readable = isinstance(parsed_pools, list) and all(isinstance(p, dict) for p in parsed_pools)
         node_pools = parsed_pools if pools_readable else []
-        pools_record = _record(shlex.join(node_pools_argv), pools_result)
+        pools_record = _record(pools_command, pools_result)
         if not pools_readable:
             pools_failure = (
                 "returned output that is not a JSON list of node pools (rc=0)"

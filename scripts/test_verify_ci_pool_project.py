@@ -24,6 +24,29 @@ from unittest import mock
 
 import verify_ci_pool_project as checker
 
+# The repository root, for `tests.testing`: a direct run has only this directory on the path.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tests.testing import no_live_gcloud  # noqa: E402
+
+
+def setUpModule():
+    # No test here runs the real gcloud: a gcloud call that a test leaves
+    # unstubbed goes to a stand-in, and the stand-in fails the module.
+    global _NO_GCLOUD
+    _NO_GCLOUD = no_live_gcloud.install()
+
+
+def tearDownModule():
+    _NO_GCLOUD.uninstall()
+
+
+class TestNoLiveGcloud(unittest.TestCase):
+    def test_no_test_in_this_module_can_run_the_real_gcloud(self):
+        no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
+
 
 def _ok(stdout: str):
     return (0, stdout, "")
@@ -665,12 +688,12 @@ class SeededFleetFixturesTest(unittest.TestCase):
     def _roles(self) -> int:
         return len(json.loads(checker._FLEET_CATALOG.read_text(encoding="utf-8"))["roles"])
 
-    def _state(self, converged: int, drifted: int = 0, unchecked: int = 0) -> str:
+    def _state(self, converged: int, drifted: int = 0, unchecked: int = 0, not_ready: int = 0) -> str:
         """The line hack/fleet-fixture-state.py prints; the third call when the
         presence pass published at least one role (#1544)."""
         return (
             f"Seeded-fleet fixture state: {converged} role(s) in their designed state, "
-            f"{drifted} drifted, {unchecked} not checked (project kube-agents-evals-5)"
+            f"{drifted} drifted, {unchecked} not checked, {not_ready} not yet ready (project kube-agents-evals-5)"
         )
 
     def test_every_role_written_passes(self):
@@ -684,6 +707,26 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertEqual([], result.warnings)
         self.assertIn("in their designed state", result.message)
+
+    def test_an_assertion_the_script_had_no_credential_for_is_advice_not_an_unread(self):
+        # The declared-intent note with no `gh` login: the roles were read and
+        # are in shape, the note was not asserted. The script's own line is
+        # carried as advice, so the pass does not say more than the script did.
+        warning = (
+            "WARNING: repository/knowledge/notification-relay-no-pdb.md was not asserted in kube-agents-evals-5 "
+            "(no credential to read it with: gh auth login); roles declared-no-pdb-workload are judged on their other assertions"
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", warning + "\n" + self._state(self._roles())),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("in their designed state", result.message)
+        self.assertEqual([warning], result.warnings)
+        self.assertFalse(any(isinstance(w, checker.Unread) for w in result.warnings))
 
     def test_project_is_passed_to_the_script(self):
         # FLEET_PROJECT_ID is the only thing pointing the script at the project
@@ -928,10 +971,32 @@ class SeededFleetFixturesTest(unittest.TestCase):
         start = text.index("SUMMARY_FORMAT = (")
         end = text.index("\n)", start)
         literal = ast.literal_eval("(" + text[start + len("SUMMARY_FORMAT = ("):end] + ")")
-        rendered = literal.format(converged=7, drifted=0, unchecked=0, project="p")
+        rendered = literal.format(converged=7, drifted=0, unchecked=0, not_ready=2, project="p")
         match = checker._FLEET_STATE_SUMMARY.search(rendered)
         self.assertIsNotNone(match, rendered)
+        # And the warning the pass branch carries as advice, read the same way.
+        start = text.index("UNASSERTED_WARNING = (")
+        end = text.index("\n)", start)
+        warning = ast.literal_eval("(" + text[start + len("UNASSERTED_WARNING = ("):end] + ")")
+        self.assertIn(checker.FLEET_STATE_UNASSERTED_MARK, warning.format(subject="s", project="p", reason="r", roles="a, b"))
         self.assertEqual("7", match.group("converged"))
+        self.assertEqual("2", match.group("not_ready"))
+
+    def test_a_role_that_is_not_yet_ready_passes_and_is_named(self):
+        # The orphaned-snapshot roles report not ready, not drifted, for the 91
+        # days the compute audit ignores a snapshot: a project whose only
+        # shortfall is that clock is registrable, and the message says so.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", self._state(self._roles() - 2, not_ready=2)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([], result.warnings)
+        self.assertIn("2 planted and not yet ready", result.message)
+        self.assertIn(f"{self._roles() - 2} in their designed state", result.message)
 
     def test_unplanted_fixture_fails_and_names_the_role(self):
         # The clusters are up and labelled; the objects were never created.
@@ -2169,6 +2234,187 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIn(f"readonly GITOPS_INTENT_NOTE_CONTENT='{checker.GITOPS_INTENT_NOTE_CONTENT}'", script)
         # The content the verifier expects is one the audit's parser joins.
         self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", "gke-agentic/x-infra"))
+
+
+class GitopsSeededFileStateTest(unittest.TestCase):
+    """What hack/fleet-fixture-state.py reads the declared-intent note through (#5827).
+
+    The seeded-fleet scan's `repository/<path>` subject asks this module two
+    things: the git blob sha of the file provisioning seeds at a path, and the
+    blob sha the pool repository carries there now. One contents read; a 404
+    is absence only once the repository itself answered, since gh and the API
+    answer 404 alike for a private repository the credential cannot see.
+    `gh` reads it where `gh` is on PATH (a laptop, the GitHub Actions runner);
+    the presubmit's image has none, so a token in GH_TOKEN is used directly.
+    """
+
+    _PROJECT = "kube-agents-evals-29"
+    _REPO = "gke-agentic/kube-agents-evals-29-infra"
+    _PATH = checker.GITOPS_INTENT_NOTE_PATH
+
+    def test_the_seeded_blob_is_what_git_would_store_for_the_seed_commands_file(self):
+        # The seed command writes the content through `printf '%s\n'`; the
+        # blob the repository then carries is git's hash of that file.
+        for path in (checker.GITOPS_INTENT_NOTE_PATH, checker.GITOPS_WORKLOAD_MANIFEST_PATH):
+            with self.subTest(path=path):
+                data = checker.gitops_seeded_bytes(path)
+                self.assertTrue(data.endswith(b"\n"))
+                self.assertEqual(data.decode(), checker.GITOPS_SEEDED_FILES[path] + "\n")
+                hashed = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True)
+                self.assertEqual(hashed.stdout.decode().strip(), checker.gitops_seeded_blob_sha(path))
+        # The six-item note, as the forty repositories carry it since the
+        # 2026-11-13 repair (blob cd9d2500 in the issue's record).
+        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("cd9d2500"))
+        with self.assertRaises(KeyError):
+            checker.gitops_seeded_bytes("knowledge/other.md")
+
+    def test_the_repair_line_prints_the_replace_command_for_the_live_sha(self):
+        # The line is meant to be pasted: run it, and what it prints is the
+        # seed command for this repository with the live sha (a PUT without
+        # the sha conflicts on an existing file). Not the declaration check:
+        # that check passes a note that differs from the seed by bytes alone.
+        hint = checker.gitops_seeded_file_repair(self._PROJECT, self._PATH, "3c5790d5")
+        command = hint[hint.index("python3 -c"):hint.rindex("' prints the command") + 1]
+        printed = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=True, cwd=str(Path(__file__).resolve().parents[1]))
+        self.assertEqual(printed.stdout, checker.gitops_note_seed_command(self._REPO, "3c5790d5") + "\n")
+        self.assertIn("-f sha=3c5790d5", printed.stdout)
+        manifest = checker.gitops_seeded_file_repair(self._PROJECT, checker.GITOPS_WORKLOAD_MANIFEST_PATH)
+        self.assertIn(f'gitops_manifest_seed_command("{self._REPO}", "")', manifest)
+
+    @staticmethod
+    def _contents(sha: str) -> str:
+        return json.dumps({"sha": sha, "path": "knowledge/notification-relay-no-pdb.md", "type": "file", "encoding": "none", "content": ""})
+
+    def _with_gh(self, *answers):
+        return mock.patch.object(checker.shutil, "which", return_value="/usr/bin/gh"), mock.patch.object(checker, "run_cmd", side_effect=list(answers))
+
+    def test_through_gh_a_present_file_is_its_blob_sha(self):
+        which, run = self._with_gh(_ok(self._contents("abc123")))
+        with which, run as calls:
+            self.assertEqual((checker.GITHUB_PATH_PRESENT, "abc123"), checker.gitops_seeded_file_state(self._PROJECT, self._PATH))
+        self.assertEqual(1, calls.call_count)
+        self.assertIn(f"repos/{self._REPO}/contents/{self._PATH}", " ".join(calls.call_args.args[0]))
+
+    def test_through_gh_a_404_is_absence_only_when_the_repository_answers(self):
+        which, run = self._with_gh(_fail("gh: Not Found (HTTP 404)"), _ok('{"full_name": "x", "default_branch": "main"}'))
+        with which, run as calls:
+            self.assertEqual((checker.GITHUB_PATH_ABSENT, ""), checker.gitops_seeded_file_state(self._PROJECT, self._PATH))
+        self.assertEqual(f"repos/{self._REPO}", calls.call_args_list[1].args[0][-1])
+        which, run = self._with_gh(_fail("gh: Not Found (HTTP 404)"), _fail("gh: Not Found (HTTP 404)"))
+        with which, run:
+            state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_UNREAD, state)
+        self.assertIn("not visible to this credential", reason)
+
+    def test_through_gh_a_refusal_and_a_transient_are_unread(self):
+        for err in ("gh: HTTP 502", "gh: Must have admin rights to Repository. (HTTP 403)"):
+            with self.subTest(err=err):
+                which, run = self._with_gh(_fail(err))
+                with which, run:
+                    state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+                self.assertEqual(checker.GITHUB_PATH_UNREAD, state, reason)
+                self.assertTrue(reason)
+
+    def test_a_gh_with_no_login_is_an_unread_for_every_gh_read(self):
+        # Before, a GitHub check on a machine with no `gh` login failed the
+        # project; the read never left the machine, so it is unverified.
+        self.assertIsNotNone(checker._unread_reason("To get started with GitHub CLI, please run:  gh auth login\n"))
+
+    def test_through_gh_no_credential_is_its_own_answer(self):
+        # The hourly scan's case: gh with nothing to authenticate as. Not a
+        # failed read but a read never attempted, which the scan leaves out
+        # of a role's verdict rather than counting it as unread.
+        which, run = self._with_gh((4, "", "To get started with GitHub CLI, please run:  gh auth login"))
+        with which, run:
+            state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_NO_CREDENTIAL, state)
+        self.assertIn("gh auth login", reason)
+
+    def test_through_gh_a_directory_at_the_path_is_a_failure_not_a_blob(self):
+        which, run = self._with_gh(_ok('[{"name": "a.md", "type": "file"}]'))
+        with which, run:
+            state, _ = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_FAILED, state)
+
+    def _without_gh(self, token="ghs_narrowed"):
+        # An empty value is no token, whatever the developer's shell exports.
+        return mock.patch.object(checker.shutil, "which", return_value=None), mock.patch.dict(os.environ, {checker.GITOPS_READ_TOKEN_ENV: token})
+
+    @staticmethod
+    def _http_error(code):
+        return urllib.error.HTTPError("https://api.github.com/x", code, "err", {}, io.BytesIO(b""))
+
+    def test_without_gh_the_token_reads_the_contents_api_directly(self):
+        which, env = self._without_gh()
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen", return_value=_Response({"sha": "abc123", "type": "file"})) as opened:
+            self.assertEqual((checker.GITHUB_PATH_PRESENT, "abc123"), checker.gitops_seeded_file_state(self._PROJECT, self._PATH))
+        request = opened.call_args.args[0]
+        self.assertEqual(f"https://api.github.com/repos/{self._REPO}/contents/{self._PATH}", request.full_url)
+        self.assertEqual("Bearer ghs_narrowed", request.get_header("Authorization"))
+
+    def test_without_gh_a_404_is_absence_only_when_the_repository_answers(self):
+        which, env = self._without_gh()
+        answers = [self._http_error(404), _Response({"full_name": self._REPO})]
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=answers) as opened:
+            self.assertEqual((checker.GITHUB_PATH_ABSENT, ""), checker.gitops_seeded_file_state(self._PROJECT, self._PATH))
+        self.assertEqual(f"https://api.github.com/repos/{self._REPO}", opened.call_args_list[1].args[0].full_url)
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=[self._http_error(404), self._http_error(404)]):
+            state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_UNREAD, state)
+        self.assertIn("not visible to this credential", reason)
+
+    def test_without_gh_refusals_transients_and_no_answer_are_unread(self):
+        which, env = self._without_gh()
+        for exc in (self._http_error(401), self._http_error(403), self._http_error(429), self._http_error(503), urllib.error.URLError("dial tcp: i/o timeout"), TimeoutError("timed out")):
+            with self.subTest(exc=exc), which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=exc):
+                state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+                self.assertEqual(checker.GITHUB_PATH_UNREAD, state, reason)
+                self.assertTrue(reason)
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=self._http_error(422)):
+            self.assertEqual(checker.GITHUB_PATH_FAILED, checker.gitops_seeded_file_state(self._PROJECT, self._PATH)[0])
+
+    def test_a_credential_with_a_line_break_is_refused_before_any_request_and_never_echoed(self):
+        # http.client refuses a header value with a line break by quoting the
+        # whole value; a credential file with a second line would otherwise
+        # put the credential in the scan's report. Refused up front, and the
+        # refusal names nothing of it.
+        first, second = "ghs_firstline0123", "ghs_secondline4567"
+        for shape in (f"{first}\n{second}", f"{first}\r{second}", f"{first} {second}", f"{first}\t{second}"):
+            with self.subTest(shape=shape):
+                which, env = self._without_gh(token=shape)
+                with which, env, mock.patch.object(checker.urllib.request, "urlopen") as opened:
+                    state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+                self.assertEqual(checker.GITHUB_PATH_UNREAD, state)
+                self.assertNotIn(first, reason)
+                self.assertNotIn(second, reason)
+                self.assertIn(checker.GITOPS_READ_TOKEN_ENV, reason)
+                opened.assert_not_called()
+        # And should http.client ever refuse a header anyway, its message is
+        # not repeated.
+        which, env = self._without_gh()
+        refusal = ValueError(f"Invalid header value b'Bearer {first}\\n{second}'")
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen", side_effect=refusal):
+            state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_UNREAD, state)
+        self.assertNotIn(second, reason)
+        self.assertIn("malformed", reason)
+
+    def test_without_gh_and_without_a_token_nothing_is_read(self):
+        which, env = self._without_gh(token="")
+        with which, env, mock.patch.object(checker.urllib.request, "urlopen") as opened:
+            state, reason = checker.gitops_seeded_file_state(self._PROJECT, self._PATH)
+        self.assertEqual(checker.GITHUB_PATH_NO_CREDENTIAL, state)
+        self.assertIn(checker.GITOPS_READ_TOKEN_ENV, reason)
+        opened.assert_not_called()
+
+    def test_the_seeded_content_lives_in_its_own_module(self):
+        # bench/kube_agents_bench/fixture_drift.py lists that module, not this
+        # script, as what decides note drift; the names here are re-exports.
+        import gitops_seed_files
+
+        self.assertIs(checker.GITOPS_SEEDED_FILES, gitops_seed_files.GITOPS_SEEDED_FILES)
+        self.assertIs(checker.gitops_seeded_blob_sha, gitops_seed_files.gitops_seeded_blob_sha)
+        self.assertEqual(set(gitops_seed_files.GITOPS_SEEDED_FILES), {checker.GITOPS_INTENT_NOTE_PATH, checker.GITOPS_WORKLOAD_MANIFEST_PATH})
 
 
 class GitlabWorkloadManifestTest(unittest.TestCase):
@@ -3436,7 +3682,7 @@ class LedgerTokenMintTest(unittest.TestCase):
 
     def test_a_refused_permission_fails_because_the_eval_preflight_would(self):
         # The pinned body makes 422 possible: the installation no longer holds
-        # one of the three reads. hack/ci-eval-pr.sh sends the same body at
+        # one of the four reads. hack/ci-eval-pr.sh sends the same body at
         # preflight and exits on this answer, so it is a pool-wide failure,
         # not an "unknown" to re-run later.
         token, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
@@ -4477,6 +4723,11 @@ FLEET_RESOURCE_ROLES = {
     "google_compute_disk": {"roles/compute.storageAdmin"},
     "google_compute_firewall": {"roles/compute.securityAdmin", "roles/compute.viewer"},
     "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
+    # The declared-mtu-peering fixture: a VPC network and its two one-way peerings
+    # with `default` (compute.networks.create/.delete/.addPeering/.removePeering/
+    # .updatePeering are networkAdmin's; no other role in the set holds them).
+    "google_compute_network": {"roles/compute.networkAdmin", "roles/compute.viewer"},
+    "google_compute_network_peering": {"roles/compute.networkAdmin", "roles/compute.viewer"},
     # The lb-drain fixture: a health check and a backend service on the default pool's instance
     # group (compute.instanceGroups.use is in loadBalancerAdmin; the GKE provider's refresh of the
     # pool's group is compute.viewer's, above).
@@ -4490,18 +4741,64 @@ FLEET_RESOURCE_ROLES = {
     # status subresources on seeded-a as the reconciler, and
     # terraform_data.config_connector's runs config_connector.py, which applies
     # seeded-a's ConfigConnector object the same way.
-    "terraform_data": {"roles/container.admin"},
+    # terraform_data.orphan_snapshots's runs orphan_snapshot.py, whose calls are
+    # `gcloud compute disks create|snapshot|delete` and `snapshots describe`:
+    # compute.storageAdmin's, the role the orphan-pd disks already need.
+    "terraform_data": {"roles/container.admin", "roles/compute.storageAdmin"},
     # Data sources: reads the plan makes before anything is created. external
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
-    # get-server-config` and `clusters describe` as the reconciler.
-    "external": {"roles/container.admin"},
-    "google_client_config": set(),
+    # get-server-config` and `clusters describe` as the reconciler, and
+    # orphan_snapshot.py's probe, whose reads are `gcloud compute snapshots
+    # describe` and `disks list`: compute.storageAdmin's, held already.
+    "external": {"roles/container.admin", "roles/compute.storageAdmin"},
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
 FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
 # Needed by every google_* call regardless of type.
 FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetKubernetesProvidersUseExecAuthTest(unittest.TestCase):
+    """Every `provider "kubernetes"` block in the fleet stack authenticates
+    through gke-gcloud-auth-plugin on each call and carries no `token`.
+
+    hack/fleet_reconcile.py saves the plan and applies it, so a token read at
+    plan time travels inside the plan and is dead an hour later; a project
+    whose node pools roll before its in-cluster fixtures then fails every
+    Kubernetes write with Unauthorized. Read through the HCL tokenizer the
+    next class loads, so a commented-out `exec` or a brace inside a comment
+    is read as HCL reads it.
+    """
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    _PLUGIN = "gke-gcloud-auth-plugin"
+    _PROVIDER_BLOCK, _PROVIDER_LABELS, _KUBERNETES = "provider", 1, "kubernetes"
+    _TOKEN_ATTRIBUTE, _EXEC_BLOCK = "token", "exec"
+    _API_VERSION_ATTRIBUTE, _COMMAND_ATTRIBUTE = "api_version", "command"
+
+    @classmethod
+    def _kubernetes_providers(cls, fleet):
+        """(file name, attributes, [exec block attributes]) per kubernetes provider."""
+        hcl, providers = FleetResourceTypesAreCoveredByReconcilerRolesTest._tokenizer(), []
+        for path in sorted(fleet.glob("*.tf")):
+            for labels, body in hcl._blocks(hcl._tokens(path.read_text()), cls._PROVIDER_BLOCK, cls._PROVIDER_LABELS):
+                if labels[0] == cls._KUBERNETES:
+                    execs = [hcl._attributes(block) for block in hcl._nested_blocks(body, cls._EXEC_BLOCK)]
+                    providers.append((path.name, hcl._attributes(body), execs))
+        return providers
+
+    def test_every_kubernetes_provider_runs_the_plugin_and_bakes_no_token(self):
+        providers = self._kubernetes_providers(self._FLEET)
+        self.assertTrue(providers, 'no provider "kubernetes" block under %s' % self._FLEET)
+        for name, attributes, execs in providers:
+            with self.subTest(file=name):
+                self.assertNotIn(self._TOKEN_ATTRIBUTE, attributes, "%s: a kubernetes provider reads a token at plan time" % name)
+                self.assertEqual(len(execs), 1, "%s: a kubernetes provider without one exec block" % name)
+                self.assertIn(self._API_VERSION_ATTRIBUTE, execs[0], "%s: the exec block sets no api_version" % name)
+                command = execs[0].get(self._COMMAND_ATTRIBUTE)
+                self.assertIsNotNone(command, "%s: the exec block sets no command" % name)
+                self.assertEqual(command[1].strip('"'), self._PLUGIN, "%s: the exec command is not the plugin" % name)
 
 
 class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
@@ -4517,11 +4814,11 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # to load no provider, and a read block whose header the scan cannot read.
     # The names tofu's loader skips are skipped here too, so a parked file
     # neither demands a role nor keeps one accounted for.
-    # seeded_b_pin.py is the program data.external runs, and gateway_status.py
-    # and config_connector.py the ones the terraform_data local-execs run, not
-    # something tofu loads; their calls are accounted for on the external and
-    # terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py"}
+    # seeded_b_pin.py is the program data.external runs, and gateway_status.py,
+    # config_connector.py and orphan_snapshot.py the ones the terraform_data
+    # local-execs run, not something tofu loads; their calls are accounted for
+    # on the external and terraform_data types above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.
@@ -5065,6 +5362,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
+             mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
         # IAM, Artifact Registry and the warm-cache readers all need the
@@ -5266,6 +5564,7 @@ class ReportDocumentTest(unittest.TestCase):
              mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)), \
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("d", True)), \
              mock.patch.object(checker, "check_gemini_api_key", return_value=checker.CheckResult("gk", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
@@ -5450,8 +5749,8 @@ class ReportDocumentTest(unittest.TestCase):
         finally:
             checker._RUN_DEADLINE = None
         source = inspect.getsource(checker)
-        self.assertEqual(source.count("urlopen("), 3, "the three probes, and no other urlopen")
-        self.assertEqual(source.count("urlopen(request, timeout=_net_timeout(timeout))"), 3, "every urlopen goes through the deadline")
+        self.assertEqual(source.count("urlopen("), 4, "the three probes and the seeded-file read, and no other urlopen")
+        self.assertEqual(source.count("urlopen(request, timeout=_net_timeout("), 4, "every urlopen goes through the deadline")
 
     def test_a_subset_runs_banner_says_it_is_not_the_registration_verdict(self):
         passing = [checker.CheckResult("IAM", True)]

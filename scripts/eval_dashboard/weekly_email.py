@@ -15,8 +15,8 @@ default the Sunday before today, UTC), and **last week** the seven before
 it. A night is dated as ``nightly.night_date`` dates it.
 
 **A counted night** ran to its verdict: none of its parts was cut off at
-the job deadline (``nightly.run_truncated``), it has both halves of the
-main matrix it owed (main, and main-b once that job runs: the night's
+the job deadline (``nightly.run_truncated``), it has every shard of the
+main matrix it owed (main, and main-b to main-e once those jobs run: the night's
 ``verdict_withheld_by``, as the digest reads it), and it is not a
 run-level event (``classify.is_run_event``: nearly every graded
 case failed). Two counted nights on one date are one night: per case the
@@ -232,13 +232,16 @@ TILE_TIME_VALUE = "{minutes} min"
 TILE_TIME_SUB = "middle of {count} timed runs; " + SLOWEST_SHARE + " over {p90} min"
 TILE_TIME_NONE = "n/a"
 TILE_TIME_NONE_SUB = "no timing on record"
-TILE_TOKENS_LABEL = "typical tokens per run"
-TILE_TOKENS_SUB = "middle of {count} counted runs"
+TILE_TOKENS_LABEL = "typical tokens per scenario run"
+TILE_TOKENS_SUB = "one repetition of one scenario, all agents; middle of {count} counted runs"
 TILE_TOKENS_UP = "; &#9650; {pct}% vs last week on the same scenarios"
 TILE_TOKENS_DOWN = "; &#9660; {pct}% vs last week on the same scenarios"
 TILE_TOKENS_SAME = "; flat vs last week on the same scenarios"
 TILE_TOKENS_PARTIAL = "; {count} partial left out"
 TILE_TOKENS_CACHE = "; {pct}% of prompt tokens read from cache ({count} runs)"
+# Fewer runs than this with a prompt split say little about caching, so the
+# cache share is left off the tile and the Chat line below it.
+TOKENS_CACHE_MIN_RUNS = 30
 TILE_TOKENS_NONE = "n/a"
 TILE_TOKENS_NONE_SUB = "no full count; {count} partial left out"
 # Three tiles share the row, or four with the tokens tile.
@@ -312,8 +315,12 @@ ROWS_JOIN = "\n"
 WHY_CUT = "cut off"
 WHY_NO_MAIN = "no main part"
 WHY_NO_MAIN_B = "no main-b part"
-# The half of the main matrix a night lacks (``verdict_withheld_by``) -> why.
-WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B}
+WHY_NO_MAIN_C = "no main-c part"
+WHY_NO_MAIN_D = "no main-d part"
+WHY_NO_MAIN_E = "no main-e part"
+# The shard of the main matrix a night lacks (``verdict_withheld_by``) -> why.
+WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B, nightly.PART_MAIN_C: WHY_NO_MAIN_C,
+               nightly.PART_MAIN_D: WHY_NO_MAIN_D, nightly.PART_MAIN_E: WHY_NO_MAIN_E}
 WHY_RUN_EVENT = "nearly every scenario failed"
 WHY_NO_RUN = "no run on record"
 
@@ -333,7 +340,7 @@ CHAT_NO_TREND = "No week-over-week trend: only {counted} of {dates} nights count
 CHAT_NO_TREND_PREV = "No week-over-week trend: only {counted} of last week's {dates} nights counted ({why})."
 CHAT_LEFT_OUT = "{count} {why}"
 # Why a night is not counted, as the post words it.
-CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part",
+CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part", WHY_NO_MAIN_C: "missing the main-c part", WHY_NO_MAIN_D: "missing the main-d part", WHY_NO_MAIN_E: "missing the main-e part",
             WHY_RUN_EVENT: "failed run-wide", WHY_NO_RUN: "not run"}
 CHAT_ATTENTION_TITLE = "*Needs attention*"
 CHAT_ATTENTION_ITEM = "• {name}: {state}, <{url}|{bugs}>"
@@ -352,7 +359,7 @@ CHAT_TIME_SLOWEST = " · slowest area: {name} ({minutes} min)"
 CHAT_TIME_NONE = "⏱ Task time: no timing on record"
 # The tokens line, the same on the card and in its text fallback; left out
 # of both when no repetition the week compared carries a count.
-CHAT_TOKENS = "🔢 Tokens: typical {typical} per run{change}{partial}"
+CHAT_TOKENS = "🔢 Tokens: typical {typical} per scenario run{change}{partial}"
 CHAT_TOKENS_NONE = "🔢 Tokens: no full count{partial}"
 CHAT_TOKENS_UP = " (▲ {pct}% vs last week on the same scenarios)"
 CHAT_TOKENS_DOWN = " (▼ {pct}% vs last week on the same scenarios)"
@@ -702,9 +709,9 @@ def bugs_url(repo: str, slug: str) -> str:
 
 def night_status(night: dict[str, dict], data: dict) -> str | None:
     """None for a counted night, else why it is left out. A night without a
-    half of the main matrix it owed is the night ``nightly`` withholds a
-    verdict for (``verdict_withheld_by``): no main part, or main-b missing
-    while main-b runs."""
+    shard of the main matrix it owed is the night ``nightly`` withholds a
+    verdict for (``verdict_withheld_by``): no main part, or another main
+    shard missing while its job runs."""
     parts = nightly.night_parts(night)
     if any(nightly.run_truncated(run) for run in parts):
         return WHY_CUT
@@ -1283,7 +1290,7 @@ def tokens_tile_text(figures: dict | None) -> tuple[str, str] | None:
     if figures["typical"] is None:
         return TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)
     change = "" if pct is None else TILE_TOKENS_UP.format(pct=pct) if pct > 0 else TILE_TOKENS_DOWN.format(pct=-pct) if pct < 0 else TILE_TOKENS_SAME
-    cache = "" if figures["cache_pct"] is None else TILE_TOKENS_CACHE.format(pct=figures["cache_pct"], count=figures["cache_runs"])
+    cache = "" if figures["cache_pct"] is None or figures["cache_runs"] < TOKENS_CACHE_MIN_RUNS else TILE_TOKENS_CACHE.format(pct=figures["cache_pct"], count=figures["cache_runs"])
     sub = TILE_TOKENS_SUB.format(count=figures["counted"]) + change + cache + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
     return figures["typical"], sub
 
@@ -1342,7 +1349,7 @@ def chat_tokens(week: dict) -> str | None:
     if figures["typical"] is None:
         return CHAT_TOKENS_NONE.format(partial=partial_text)
     change = "" if pct is None else CHAT_TOKENS_UP.format(pct=pct) if pct > 0 else CHAT_TOKENS_DOWN.format(pct=-pct) if pct < 0 else CHAT_TOKENS_SAME
-    cache = "" if figures["cache_pct"] is None else CHAT_TOKENS_CACHE.format(pct=figures["cache_pct"])
+    cache = "" if figures["cache_pct"] is None or figures["cache_runs"] < TOKENS_CACHE_MIN_RUNS else CHAT_TOKENS_CACHE.format(pct=figures["cache_pct"])
     return CHAT_TOKENS.format(typical=figures["typical"], change=change + cache, partial=partial_text)
 
 

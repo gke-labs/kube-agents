@@ -138,6 +138,11 @@ breaking change (`type!:` or a `BREAKING CHANGE:` footer), as a rollback to an o
 usually does, and names each one; `--plan` only warns. Show the user the named commits and get
 their consent before re-running with `--allow-breaking-downgrade`.
 
+A full upgrade also stops before the apply when it would destroy the gVisor node pool
+(`ENABLE_GVISOR` resolving to `false` on a Standard install that runs one). Never add
+`--allow-node-pool-destroy` on your own: it is for a user who has said they want the sandbox off.
+Otherwise set `ENABLE_GVISOR="true"` in `install.env`.
+
 A GitLab install needs nothing extra. The upgrade reads the forge, host, project and Secret names
 from `install.env`, needs no token and no CA file, and keeps both Secrets.
 
@@ -206,11 +211,8 @@ When `--keep-image-tag` (or a tagless `--plan` whose state records no tag) reads
 agent Deployment, it validates it exactly as a passed one, so an install serving a mutable ref stops the
 run rather than writing that ref into the composition.
 
-## After the Upgrade, and Switching `spec.mode`
+## After the Upgrade
 
 - On an install with Slack, check that Slack answers before reporting success: the log line and
   the DM test (ask a person to send it) in the Upgrade page's
   [Checking the result → Slack](../../../docs/site/src/content/docs/install/upgrade.md#slack).
-- To switch `spec.mode` (`PLATFORM_AGENT_MODE`), follow the Upgrade page's
-  [Switching `spec.mode`](../../../docs/site/src/content/docs/install/upgrade.md#switching-specmode)
-  step by step. Of `upgrade.sh`'s modes only `--upgrade-mode=full` applies the key.

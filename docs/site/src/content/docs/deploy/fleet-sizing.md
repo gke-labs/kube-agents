@@ -39,8 +39,8 @@ agent reads.
 
 ## What each pod needs
 
-The table is the `today` component stack with the GitHub minter on, the web console off and
-Hindsight off. The default column is declared. The fleet column is what
+The table is the component stack without the A2A stack, with the GitHub minter on, the web
+console off and Hindsight off. The default column is declared. The fleet column is what
 [`values-fleet.yaml`](#the-fleet-values-file) sets, plus the one field it cannot, and is modeled.
 CPU is in vCPU, memory in GiB, and each cell reads requests then limits. A test derives the
 declared column from the two files and fails when the page falls behind them.
@@ -48,13 +48,13 @@ declared column from the two files and fails when the page falls behind them.
 | Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                                | Ephemeral (declared)     | Persistent                                               |
 | ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------- | ------------------------ | -------------------------------------------------------- |
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
-| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 4 GiB metadata |
+| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 4 GiB for `sshd`       |
 | Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.5 then 1 / 1, each          | unchanged                                      | none declared            | none                                                     |
 | Operator                                                     | 1    | standard                                                               | 0.1 / 0.25 then 0.5 / 0.5           | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 10   |                                                                        | **2.806 / 9.875 then 14 / 25.25**   | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.806 / 11.875 then 14 / 25.25**  | **6.8 / 23.25 then 20 / 37.75**                | **13.5 GiB**             | **228 GiB default, 328 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -65,10 +65,14 @@ The gateway pod's fleet row raises two containers. `agent-api-auth` is the examp
 `agentAPIAuth.resources`, 0.5 vCPU and 2 GiB requests with a 4 GiB memory limit. The agent
 container is the CR's `spec.deployment.resources`, which the chart has no value for; the row
 models it at 1 vCPU and 6 GiB requests and 3 vCPU and 12 GiB limits. That field replaces the
-operator's defaults (1 vCPU and 2 GiB requests, 3 vCPU and 8 GiB limits) as a whole block, so
+operator's defaults (1 vCPU and 4 GiB requests, 3 vCPU and 8 GiB limits) as a whole block, so
 set every key you want to keep. Set it on the CR with `kubectl edit`; a later `helm upgrade`
 leaves it alone, because Helm patches only the fields its render changes. The
 [CRD page](/kube-agents/operator/platformagent-crd/#specdeployment) describes the field.
+
+The memory request is also the dispatcher's admission budget, so the row's 6 GiB admits workers
+up to about 6 GiB of container memory
+([`tuning.admission`](/kube-agents/operator/platformagent-crd/#specharnesstuning)).
 
 The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
 [`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
@@ -79,15 +83,21 @@ runtime unless
 names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
 the installer sets.
 
-Two optional stacks add to the total:
+Two more stacks add to the total:
 
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
   at 0.5 vCPU and 2 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
   requests, 1 vCPU and 1 GiB limits, 1.1 GiB ephemeral and an 8 GiB claim. Declared.
-- **`spec.mode: next`**: about 0.9 vCPU and 1.4 GiB of standing requests across seven pods, and
-  a 40 GiB NATS claim. Each delegation adds a session pod at 0.25 vCPU and 512 MiB requests with
-  2 vCPU and 2 GiB limits, up to `maxSessions` (default 10) at once. The
-  [prerequisites page](/kube-agents/install/prerequisites/#cluster-requirements) itemises them.
+- **The A2A stack**, on every install: its standing pods, a container in the agent pod and a
+  JetStream claim per NATS server. Each delegation adds a session pod, up to `maxSessions` at
+  once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
+  gives the totals and each pod's requests and limits, generated from the chart.
+
+  Each NATS server's metrics exporter is sized for up to about 2,000 JetStream consumers, which
+  is about 1,000 clusters at two consumers per AgentProfile. Its memory and CPU grow with the
+  consumer count, and past that it nears its 192 MiB limit. The same ceiling holds on an
+  Autopilot cluster without Pod bursting, where the limits become the 50m and 96 MiB requests:
+  there, CPU runs out first, and past about 2,500 consumers a scrape outlasts the interval.
 
 ## The host cluster
 
@@ -109,7 +119,7 @@ table above means there:
   proxy's 8 GiB is the largest declared; raising `limits.ephemeral-storage` past 10 GiB leaves
   the pod unschedulable.
 
-Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 202 GiB of `pd-balanced`
+Billed capacity for the fleet column is about 7 vCPU and 23 GiB, plus 328 GiB of `pd-balanced`
 (modeled, without bursting). At `us-central1` list prices that is about $400 to $500 a month
 including the cluster fee; modeled, so check the pricing calculator against your region.
 
@@ -145,16 +155,54 @@ request (`e2-standard-8` or larger) before the count reaches 25. The `medium` ro
 fits an `e2-standard-4`. A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
 the tier at the row it admits, and the CR's `SizingCappedByQuota` condition names it.
 
-| Pool             | Shape (modeled)                                                                            | Carries                                                               |
-| ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
-| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the `next` stack                    |
-| gVisor (sandbox) | 1 × `n2-standard-4`, 150 GB boot disk, autoscale 1 to 2; `n2-standard-8` for `mode: next`  | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
+| Pool             | Shape (modeled)                                                                                                                                         | Carries                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4                                                              | proxy, operator, LiteLLM, minter, the A2A stack                       |
+| gVisor (sandbox) | 1 × `n2-standard-4` from the profile, 150 GB boot disk, autoscale 1 to 2; the A2A gateway pod needs `n2-standard-8`, so set `gvisor_machine_type` to it | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
 
 Create the gVisor pool with `--sandbox type=gvisor`, so it carries the taint only the sandboxed
 pods tolerate. The boot disk sizes are modeled: the measured fleet's evictions were disk
 pressure, and the pod table's ephemeral figures plus the node's images have to fit under the
 eviction threshold with room left. About $900 to $1,100 a month on demand at `us-central1` list
 prices, modeled.
+
+## The data volume
+
+The agent's `<name>-data` claim holds every profile's session store, and each Cluster Agent
+profile is one cluster in scope. Under the default 90-day session retention a store keeps
+growing well past the period: SQLite reuses the pages a prune frees only partly, so the file
+settles at a multiple of its live data. These settled sizes are **modeled**. They come from a
+simulation against the session store (`hack/session_retention_sim.py`), with inputs measured
+on a dev fleet:
+
+| Profile                                                        | 90-day retention | 7-day retention        |
+| -------------------------------------------------------------- | ---------------- | ---------------------- |
+| A Cluster Agent profile (10 cards a day, about 25 KB each)     | 291 MiB          | 18.6 MiB               |
+| The Platform Agent's own profile (18 cards a day, 220 KB each) | 3.47 GiB         | not settled by day 300 |
+
+**At the 50Gi default the claim fills at about 163 Cluster Agent profiles**, beside the
+Platform Agent's own store. Set
+`platformAgent.storage.expectedClusterProfiles` (CR: `spec.storage.expectedClusterProfiles`)
+to the number of clusters you expect in scope, and the operator sizes the agent's claim to at
+least:
+
+```text
+8Gi + expectedClusterProfiles x 400Mi, rounded up to whole GiB
+```
+
+That is the Platform Agent's stores plus 25% for the base, and each Cluster Agent profile's
+ceiling (its live sessions at four times their size) plus Hermes' log cap per profile. The
+claim takes the larger of the formula and `platformAgent.storage.size`, or the 50Gi default,
+so the count only raises it. **The formula passes 50Gi above 107 profiles**, so an install
+of more than about 100 clusters on the default should set it. For example, 200 profiles is
+87Gi and 2,500 is 985Gi.
+
+Raising the count later expands the existing claim online where its StorageClass allows
+expansion. `standard-rwo` and `standard` do on GKE. Where a class doesn't, the
+`DataVolumeNotExpanded` condition says so, and the claim keeps its size. The shell sandbox's
+claim holds no session stores and stays at `size` or the default. A namespace
+`requests.storage` quota counts the raised agent claim, and the chart's quota preflight
+counts it the same way.
 
 ## The fleet values file
 
@@ -165,7 +213,9 @@ caveat beside it:
 - `operator.resources`: 1 GiB memory, request and limit alike, for a host cluster at or past
   50,000 objects. The chart's floor on the limit is 512 MiB.
 - `platformAgent.storage.size: 100Gi`: both data claims. A claim cannot shrink, and each GiB
-  counts twice against a namespace `requests.storage` quota.
+  counts twice against a namespace `requests.storage` quota. For a fleet of more than about 230
+  clusters, also set `platformAgent.storage.expectedClusterProfiles`
+  ([The data volume](#the-data-volume)), which raises the agent's claim alone.
 - `platformAgent.harness.tuning.maxInProgress: 3`: kanban workers at once, board-wide.
 - `platformAgent.deployment.credentialProxy.resources`: 4 vCPU and 8 GiB requests, 8 vCPU and
   8 GiB limits. The broker admits at most eight commands at once, a cap the operator fixes, and
@@ -183,10 +233,15 @@ caveat beside it:
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
 run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. The name in the example reaches the container that reads it. Process tunables such
-as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
-allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
-`kubectl` run, and an agent container that does not. The example leaves them out. The
+containers. The name in the example reaches the container that reads it.
+
+A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values
+file that sets it renders credential proxy and `agent-api-auth` containers that carry it, and an
+agent container that does not. In those two containers it reaches the container's own process,
+and not the `gcloud` and `kubectl` commands. The credential proxy passes a fixed list of names
+from its environment to the commands it runs, and this name is not on the list.
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is not on it either, so setting it has no effect on
+`gcloud`. The example leaves both out. The
 [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#sizing-for-a-fleet-examplesvalues-fleetyaml)
 has the chart-side detail.
 

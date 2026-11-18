@@ -62,18 +62,22 @@ interpreter is worth it, never whether a job runs, and it errs towards
 spawning: a spurious tick is a no-op, a missed one is the bug this exists to
 fix.
 
-The one thing this script changes in a store before Hermes reads it is the
-idle policy in ``cron_idle_policy.py``: on an install nobody has messaged for
-a week or more it moves due model-run jobs' ``next_run_at`` out of reach,
-under Hermes' own store lock, before the filter above looks. Skipping an id
-here would hold nothing, because the ``no_agent`` entries keep every tick
-spawning and Hermes fires whatever is due; the timestamp is the lever Hermes
-itself reads. A fault in the policy is one line in the output and the tick
-goes on as before.
+Two policies change a store before Hermes reads it, both under Hermes' own
+store lock and before the filter above looks, and both by moving a model-run
+job's ``next_run_at``, the one lever Hermes itself reads (skipping an id here
+would hold nothing, because the ``no_agent`` entries keep every tick spawning
+and Hermes fires whatever is due). The idle policy in ``cron_idle_policy.py``
+runs first: on an install nobody has messaged for a week or more it moves
+due model-run jobs out of reach. The catch-up policy in
+``cron_catch_up_policy.py`` runs over what is still due: after a pause it
+skips a catch-up that is a whole period late and spaces the rest out, so an
+install back from two days at ``scaleToZero`` does not start every
+whole-estate audit in its first tick. A fault in either is one line in the
+output and the tick goes on as before.
 
 Output is empty on a quiet minute (``deliver: local`` plus empty stdout is a
-silent run). It speaks only when a tick was dispatched or the idle policy held
-or released a job, and exits non-zero if
+silent run). It speaks only when a tick was dispatched or a policy held,
+skipped, deferred or released a job, and exits non-zero if
 one failed to start or came back non-zero within
 :data:`DEFAULT_BUDGET_SECONDS` — so a broken ticker shows up as a failed cron
 run instead of reproducing the silence it was written to end. A tick still
@@ -473,21 +477,36 @@ def idle_policy_lines(home: Path, now: datetime) -> list[str]:
         return [f"cron idle policy skipped: {type(exc).__name__}: {exc}"]
 
 
+def catch_up_policy_lines(home: Path, now: datetime) -> list[str]:
+    """Run the catch-up policy over every named profile; its report, never a raise.
+
+    After the idle policy on purpose: a job the idle policy has held is no
+    longer due, so this policy neither skips nor defers it.
+    """
+    try:
+        import cron_catch_up_policy
+
+        return cron_catch_up_policy.apply(home, now)
+    except Exception as exc:
+        return [f"cron catch-up policy skipped: {type(exc).__name__}: {exc}"]
+
+
 def main() -> int:
     now = datetime.now(timezone.utc)
     lines = idle_policy_lines(hermes_home(), now)
+    lines.extend(catch_up_policy_lines(hermes_home(), now))
     work = profiles_with_due_jobs(hermes_home(), now)
     if not work:
         if lines:
             print("\n".join(lines))
-        return 0  # quiet minute: silent unless the policy held or released something
+        return 0  # quiet minute: silent unless a policy moved something
 
     try:
         binary = hermes_bin()
     except FileNotFoundError as exc:
         names = ", ".join(profile.name for profile, _ in work)
-        # The policy has already written its holds; this run's output is
-        # the only place they are reported.
+        # The policies have already written their holds and skips; this
+        # run's output is the only place they are reported.
         print("\n".join([*lines, f"cannot tick {names}: {exc}"]))
         return 1
 

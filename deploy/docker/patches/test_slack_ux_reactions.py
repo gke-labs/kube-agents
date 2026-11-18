@@ -1082,6 +1082,8 @@ class OpenCardsQueryTest(unittest.TestCase):
         import kanban_progress_lines
 
         self.assertEqual(runtime.HARD_WALL_BLOCK_KIND, kanban_progress_lines.HARD_WALL_BLOCK_KIND)
+        self.assertEqual(runtime.HARD_WALL_BLOCK_KINDS, kanban_progress_lines.HARD_WALL_BLOCK_KINDS)
+        self.assertIn("'capacity'", runtime.OPEN_CARDS_SQL)
         self.assertEqual(runtime.GAVE_UP_KIND, kanban_progress_lines.GAVE_UP_KIND)
 
     def _fake_hermes(self, paths, rows, reads, broken=()):

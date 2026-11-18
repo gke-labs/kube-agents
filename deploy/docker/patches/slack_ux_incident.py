@@ -45,9 +45,11 @@ on, also records the thread's session title on its routing row, read back by
 drift in seeded-b") and marks the row as drift (:func:`is_drift_alert`), and its
 triage is laid out by :func:`drift_triage`: the rest of the "What's wrong"
 paragraph, which says what changed, who changed it and when, goes on a line
-under the headline, and no button carries the `` (recommended)`` suffix, the
-primary style alone marking the recommended one. Any other alert records
-neither.
+under the headline, no button carries the `` (recommended)`` suffix, the
+primary style alone marking the recommended one, and the fold, which still
+holds the report, is titled "diff", since the drift report's "Why" opens on a
+diff of the changed field.
+Any other alert records neither.
 
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would
@@ -66,7 +68,7 @@ Lists are not modelled: under a list item ``block_kit`` reads an indented
 fence or divider as list content, so such a report can fall back to the
 threaded reply or fold where Slack draws no divider.
 
-Under ``spec.mode: next`` the report reaches the alert's thread through the
+Where the gateway holds the platform, the report reaches the alert's thread through the
 kanban notifier's chat.notify stand-in (``kanban_chat_notify``), and the edit
 is a ``kube-agents.chat/v1`` message (:func:`chat_triage`) sent with the
 ``update`` key the event watcher's alert post carries, one per alert
@@ -127,6 +129,8 @@ ALERT_SESSION_LIKE = "k8s-evt-%"
 ACTION_PREFIX = "kage_incident"
 FOLD_TITLE_OPTIONS = "why · what each option does"
 FOLD_TITLE_SINGLE = "why · what the fix does"
+#: A drift triage's fold: the report, whose "Why" opens on a diff of the changed field.
+FOLD_TITLE_DRIFT = "diff"
 OPTION_LABEL = "{title}"
 SINGLE_LABEL = "{title}"
 RECOMMENDED_SUFFIX = " (recommended)"
@@ -210,7 +214,7 @@ _edited: OrderedDict[tuple[str, str], None] = OrderedDict()
 
 def _chat_ux_platforms() -> tuple:
     """The platforms whose alerts the triage edits (kanban_notifier.CHAT_UX_PLATFORMS): Slack,
-    and Google Chat under ``spec.mode: next``, where the edit is a chat message the gateway
+    and Google Chat where the gateway serves it, where the edit is a chat message the gateway
     lays out. Slack alone on an image without the notifier module."""
     try:
         try:
@@ -411,7 +415,9 @@ def drift_triage(triage: dict, report: str) -> dict:
 
     The detail is the rest of the report's "What's wrong" paragraph, as plain
     text. The recommended choice keeps its primary style and loses its
-    `` (recommended)`` suffix, so each button reads as the choice it is.
+    `` (recommended)`` suffix, so each button reads as the choice it is. The
+    fold is titled :data:`FOLD_TITLE_DRIFT`; it still holds the report, whose
+    "Why" opens on a diff of the field that changed.
     """
     _headline, body = _presenter.split_answer(_section(_sections(report), WHATS_WRONG))
     prose = []
@@ -423,6 +429,7 @@ def drift_triage(triage: dict, report: str) -> dict:
     detail = _presenter._plain(" ".join(" ".join(prose).split())).strip()
     return {
         **triage,
+        "fold_title": FOLD_TITLE_DRIFT,
         "detail": _presenter._clip(detail, _presenter.ROW_TEXT_MAX) if detail else "",
         # Rebuilt from the reply's title: the recommended label was clipped short to fit the suffix.
         "choices": [(_presenter._clip(reply.split(": ", 1)[-1], _presenter.BUTTON_TEXT_MAX), reply, recommended)
@@ -481,7 +488,7 @@ def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list
 
 
 def _alert_rows(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[tuple[str, dict]]:
-    """``(event session id, routing metadata)`` of every event alert posted as ``thread_id`` in ``chat_id`` on a platform the triage edits (Slack, or Google Chat under ``spec.mode: next``)."""
+    """``(event session id, routing metadata)`` of every event alert posted as ``thread_id`` in ``chat_id`` on a platform the triage edits (Slack, or Google Chat where the gateway serves it)."""
     # The LIKE on metadata narrows the scan; the JSON check below decides.
     rows = conn.execute(
         "SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
@@ -653,7 +660,7 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
     """``adapter``, or one whose ``send`` edits the alert this report answers.
 
     The editor is returned only with the flag on, on Slack or on Google Chat through
-    the chat.notify stand-in (``spec.mode: next``), for a ``completed``
+    the chat.notify stand-in, for a ``completed``
     event whose result is an actionable report with at least one option,
     bound for the thread of an event alert that has no stored report yet.
     Everything else, including any error deciding, gets ``adapter`` itself.
@@ -664,8 +671,8 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
             return adapter
         if name != SLACK and not callable(getattr(adapter, "send_chat", None)):
             # Google Chat edits the alert only through the chat.notify stand-in
-            # (spec.mode: next), where the gateway lays the triage out; under
-            # today Hermes's own adapter takes text and has no Slack client.
+            # where the gateway lays the triage out; Hermes's own adapter takes
+            # text and has no Slack client.
             return adapter
         if getattr(event, "kind", None) != COMPLETED or not isinstance(sub, dict):
             return adapter

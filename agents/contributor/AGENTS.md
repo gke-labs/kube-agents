@@ -48,9 +48,10 @@ cycle.
    the fix is one mechanical edit per site that adds no file, helper, branch,
    flag, dependency or regex alternative; otherwise reply
    `declined: <reason about this change>` or `deferred to #N`, record it in
-   **Self-Review**, and resolve the thread: an open thread hides the PR from
-   its reviewer. A reviewer who disagrees replies in it; on a reply that
-   asks for the fix, unresolve the thread and owe the fix. A correct 🔴 High is a fix on any round, unless its fix would add a
+   **Self-Review**, and resolve the thread: an open thread counts as the
+   author's unfinished work and blocks the merge. A reviewer who disagrees
+   replies in it; on a reply that asks for the fix, unresolve the thread and
+   owe the fix. A correct 🔴 High is a fix on any round, unless its fix would add a
    mechanism - then it is a design question for the human reviewer, deferred
    to an issue, not built on a review round. Resolve only a thread a commit
    fixed, you showed factually wrong, or a bot finding you declined or
@@ -114,7 +115,7 @@ other agent's assignment may have landed after your re-read.
 ## Before you claim or file
 
 - **Reproduce first.** File or claim an issue only for a defect you executed in
-  the current session and whose actual output you can paste. A claim
+  the current session and whose actual output you have seen. A claim
   transcribed from a document is not evidence - the document may be wrong. A
   number you can reproduce is not a number you have understood: read the
   field's definition before building an argument on it.
@@ -143,6 +144,9 @@ label, not a comment, is the signal to resume.
 
 ## Hard rules
 
+- **Every post follows [`public_surfaces.md`](../../.agents/rules/public_surfaces.md)**: a
+  pull request body, a comment, a review reply, an issue. It names a run's outcome and where its
+  record is, nothing from inside the record.
 - **Never merge**, not even a PR you authored that is approved. Merging is
   external automation: once `lgtm` and `approved` are both present and the
   required checks pass, the system merges. Your account holds `triage` on

@@ -794,8 +794,11 @@ def sweep_gitlab_project(project, path, token, dry_run=False):
         exc.closed = len(record["closed"])
         raise
     except gitlab.RateLimited as exc:
-        # The GitHub pass's rule: a limit ends the run, and the projects
-        # Boskos still hands out are held and released untouched.
+        # Raised only once a request stayed refused through the module's
+        # Retry-After waits (a single 429 is waited out there and the project
+        # carries on, kube-agents#5215). Then the GitHub pass's rule: the run
+        # ends, and the projects Boskos still hands out are held and released
+        # untouched.
         raise RateLimited(str(exc), closed=len(record["closed"]))
     except gitlab.ResetError as exc:
         # The module's refusals (a path outside the pool, a lookup without a

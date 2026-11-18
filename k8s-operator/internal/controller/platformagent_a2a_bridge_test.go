@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -36,8 +37,9 @@ func bridgeTestPod(agent *agentv1alpha1.PlatformAgent) corev1.PodTemplateSpec {
 	return buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{})
 }
 
-// provisionedAgent is a next agent whose bus has been provisioned once, which
-// is when the rendered bridge enters the pod.
+// provisionedAgent is a next agent whose bus has been provisioned once. The
+// rendered bridge is in the pod before that too (#5962); tests use this for
+// the settled state.
 func provisionedAgent() *agentv1alpha1.PlatformAgent {
 	agent := a2aTestAgent()
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
@@ -161,33 +163,6 @@ func TestARenderedBridgeWithNoExecutorSettingRunsTheAPIExecutor(t *testing.T) {
 	}
 }
 
-// Under today nothing is rendered, which is also what ends the rollback
-// crash-loop: there is no bridge left behind to dial a torn-down bus.
-func TestATodayInstallGetsNoBridge(t *testing.T) {
-	// Provisioned first: on the pass that flips to today the CR still carries
-	// BusProvisioned (the end-of-pass status write removes it), so the mode
-	// check is the only thing keeping the bridge out.
-	agent := provisionedAgent()
-	agent.Spec.Mode = ptr.To("today")
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
-		t.Errorf("a today install renders %d bridge containers", len(got))
-	}
-	agent.Spec.Mode = nil
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
-		t.Errorf("an install with no mode renders %d bridge containers", len(got))
-	}
-}
-
-// Version skew freezes a running bus rather than tearing it down, so its
-// executor stays, like the agent container's own bus wiring.
-func TestVersionSkewKeepsTheRenderedBridge(t *testing.T) {
-	agent := provisionedAgent()
-	agent.Spec.Mode = ptr.To("later")
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 1 {
-		t.Errorf("version skew renders %d bridge containers, want 1", len(got))
-	}
-}
-
 // A CR that declares its own bridge keeps it, and the operator renders none,
 // so the pod never carries two containers of one name.
 func TestADeclaredBridgeWins(t *testing.T) {
@@ -236,15 +211,16 @@ func TestARenderedBridgeAtItsDefaultIsBudgetedAtTheRenderedDefault(t *testing.T)
 	}
 }
 
-// Before the bus is provisioned the bridge has nothing to connect to and would
-// crash-loop the agent pod through bring-up, so it is withheld from the pod.
-// The TASKS budget counts it anyway, so the first provisioning Job is sized for
-// the bridge that will arrive and does not re-render when it does.
-func TestTheRenderedBridgeWaitsForTheBusButIsBudgetedFromTheStart(t *testing.T) {
+// The bridge is in the pod from the first render, before the bus is
+// provisioned: it waits for the bus instead of exiting, so the pod template
+// does not change when provisioning completes and a fresh install rolls the
+// agent once (#5962). The TASKS budget counts it from the start too, so the
+// first provisioning Job is sized for it and nothing re-renders.
+func TestTheRenderedBridgeIsInThePodAndBudgetedFromTheStart(t *testing.T) {
 	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "6")
 	agent := a2aTestAgent()
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
-		t.Errorf("the bridge is in the pod before the bus is provisioned (%d containers)", len(got))
+	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 1 {
+		t.Errorf("before provisioning the pod has %d bridge containers, want 1", len(got))
 	}
 	if n := a2aBridgeConcurrency(agent); n != 6 {
 		t.Errorf("before provisioning the budget reads %d workers, want the 6 the bridge will run", n)
@@ -255,7 +231,37 @@ func TestTheRenderedBridgeWaitsForTheBusButIsBudgetedFromTheStart(t *testing.T) 
 		t.Errorf("after provisioning the pod has %d bridge containers, want 1", len(got))
 	}
 	if a2aProvisionScript(agent) != before {
-		t.Error("the provision script changed when the bridge arrived; the Job would re-render")
+		t.Error("the provision script changed when the bus was provisioned; the Job would re-render")
+	}
+}
+
+// A migration that changes the server count drops BusProvisioned so Ready
+// waits for the provision Job after it. The bridge stays in the pod through
+// the run, both legs and after Done until that Job completes: dropping it
+// rolled the agent pod out and back in on ka-next-4 (#4488 live run).
+func TestTheBridgeStaysInThePodThroughABusMigration(t *testing.T) {
+	for _, phase := range []busMigrationPhase{busMigrationShrinking, busMigrationConverting, busMigrationRestoring, busMigrationDone} {
+		agent := provisionedAgent()
+		want := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName)
+		if len(want) != 1 {
+			t.Fatalf("a provisioned agent has %d bridge containers, want 1", len(want))
+		}
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(phase)}
+		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
+		pod := bridgeTestPod(agent)
+		if got := containersNamed(pod, a2aBridgeContainerName); len(got) != 1 {
+			t.Errorf("%s: the pod has %d bridge containers with BusProvisioned dropped by the run, want 1", phase, len(got))
+		}
+		if _, ok := envIndex(containersNamed(pod, a2aAgentContainerName)[0])[a2aActivitySecretEnvVar]; !ok {
+			t.Errorf("%s: the agent container lost %s with the bridge kept", phase, a2aActivitySecretEnvVar)
+		}
+	}
+	// A run given up waits, like a first bring-up, for the provision Job
+	// that recreates what it did not put back.
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationFailed), GivenUp: true}
+	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
+		t.Errorf("a given-up run on an unprovisioned bus has %d bridge containers, want 0", len(got))
 	}
 }
 
@@ -720,5 +726,31 @@ func TestAnAgentsGoMemLimitDoesNotReachTheBridge(t *testing.T) {
 		return e.Name == a2aBridgeMemoryLimitEnvVar && e.ValueFrom != nil && e.ValueFrom.ResourceFieldRef != nil
 	}) {
 		t.Errorf("the bridge's %s resourceFieldRef is missing; the derived limit has nothing to read", a2aBridgeMemoryLimitEnvVar)
+	}
+}
+
+// A bridge declared on the CR binds its pre-created intake durable as the
+// rendered one does (#4173): the bridge principal is refused creating it, so
+// without the flag it would wait out its bind window and exit. Another
+// sidecar gets nothing.
+func TestADeclaredBridgeBindsThePreCreatedIntake(t *testing.T) {
+	got := a2aExecutorSidecarEnv([]corev1.Container{
+		{Name: a2aBridgeContainerName, Image: "example.com/hermes-bridge:v1",
+			Env: []corev1.EnvVar{{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "false"}}},
+		{Name: "log-shipper", Image: "example.com/fluent-bit:v1"},
+	})
+	value := func(c corev1.Container) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == a2aBridgeDurablePrecreatedEnvVar {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	if v, ok := value(got[0]); !ok || v != "true" {
+		t.Errorf("the declared bridge's %s = %q (set %v), want \"true\"", a2aBridgeDurablePrecreatedEnvVar, v, ok)
+	}
+	if v, ok := value(got[1]); ok {
+		t.Errorf("a sidecar that isn't the bridge got %s=%q", a2aBridgeDurablePrecreatedEnvVar, v)
 	}
 }

@@ -1,0 +1,2075 @@
+package controller
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+const (
+	// a2aClusterFormDeadline bounds how long the three embedded servers may
+	// take to peer and elect a JetStream meta leader. A fresh meta group
+	// campaigns within about a second, often before the TLS routes are up,
+	// and nats-server retries a failed election on a randomized four-to-nine
+	// second timer, so a loaded CI runner can legitimately need several
+	// rounds. A healthy run leaves the loop in three to ten seconds; the
+	// deadline only bounds the slow path.
+	a2aClusterFormDeadline = 90 * time.Second
+	// a2aClusterFormPoll is how often the formation loop re-reads the servers.
+	a2aClusterFormPoll = 100 * time.Millisecond
+	// a2aClusterRouteSettle is how long, once the cluster has formed, each
+	// server gets to settle on exactly one route connection per peer. A pair
+	// that dialled each other at once drops the duplicate within a round
+	// trip; a count still wrong after this is a pooling regression.
+	a2aClusterRouteSettle = 5 * time.Second
+	// a2aClusterDeliveryDeadline is how long one publisher gets to reach one
+	// subscriber across the routes; each publisher-to-subscriber pair gets
+	// its own.
+	a2aClusterDeliveryDeadline = 10 * time.Second
+	// a2aClusterDeliveryPoll is how long one publish waits before the next.
+	a2aClusterDeliveryPoll = 200 * time.Millisecond
+	// a2aClusterIntruderWait is how long a server with a foreign certificate
+	// is given to try the routes before the test reads who it peers with.
+	a2aClusterIntruderWait = 3 * time.Second
+	// a2aTestServerReadyWait bounds how long an embedded server may take to
+	// open its client and route listeners in a2aStartRenderedClusterOn.
+	a2aTestServerReadyWait = 10 * time.Second
+	// a2aClusterSeedPortRetries is how many times server 0 retries with a
+	// fresh loopback port if another process claims its reserved seed port
+	// before StartRouting binds it.
+	a2aClusterSeedPortRetries = 5
+	// a2aLoopbackNetwork, a2aLoopbackHost and a2aLoopbackAnyPort are the
+	// loopback network and addresses the embedded cluster tests bind.
+	a2aLoopbackNetwork       = "tcp"
+	a2aLoopbackHost          = "127.0.0.1"
+	a2aLoopbackAnyPort       = "127.0.0.1:0"
+	a2aPodServerNameLine     = "server_name: $POD_NAME"
+	a2aTestServerNamePrefix  = "server_name: a2a-test-nats-"
+	a2aTestPIDFileName       = "pid"
+	a2aTestConfFileName      = "nats.conf"
+	a2aTestConfFileMode      = 0o600
+	a2aLocalhostRoutePrefix  = "localhost:"
+	a2aClusterPortLinePrefix = "port: "
+)
+
+// a2aTestAgentWithBusReplicas is a2aTestAgent with spec.harness.tuning.busReplicas set.
+func a2aTestAgentWithBusReplicas(n int) *agentv1alpha1.PlatformAgent {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(n)}}
+	return agent
+}
+
+// The bus is a three-server cluster by default and one server on request, and
+// every piece of the cluster shape (the route listener, the spread, the
+// readiness path that lets OrderedReady form a new cluster, the rollout pause,
+// the lame-duck hook, the routes Service, the budget) comes and goes with it.
+func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		agent         *agentv1alpha1.PlatformAgent
+		wantReplicas  int
+		wantStreams   int
+		wantCluster   bool
+		wantReadiness string
+	}{
+		{"default", a2aTestAgent(), 3, 3, true, "/healthz?js-enabled-only=true"},
+		{"busReplicas 3", a2aTestAgentWithBusReplicas(3), 3, 3, true, "/healthz?js-enabled-only=true"},
+		{"busReplicas 1", a2aTestAgentWithBusReplicas(1), 1, 1, false, "/healthz"},
+		// Past the CRD's enum: the default, never a two-server cluster.
+		{"busReplicas 2 past the schema", a2aTestAgentWithBusReplicas(2), 3, 3, true, "/healthz?js-enabled-only=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := tc.agent
+			if got := a2aNATSReplicas(agent); got != tc.wantReplicas {
+				t.Fatalf("a2aNATSReplicas = %d, want %d", got, tc.wantReplicas)
+			}
+			if got := a2aStreamReplicas(agent); got != tc.wantStreams {
+				t.Errorf("a2aStreamReplicas = %d, want %d", got, tc.wantStreams)
+			}
+
+			sts := buildA2ANATSStatefulSet(agent, "h")
+			if got := int(*sts.Spec.Replicas); got != tc.wantReplicas {
+				t.Errorf("StatefulSet replicas = %d, want %d", got, tc.wantReplicas)
+			}
+			// Immutable on a StatefulSet; changing either would mean
+			// recreating every existing install's bus.
+			if sts.Spec.ServiceName != a2aNATSName(agent) {
+				t.Errorf("serviceName = %q, want the client Service %q", sts.Spec.ServiceName, a2aNATSName(agent))
+			}
+			if sts.Spec.PodManagementPolicy != "" {
+				t.Errorf("podManagementPolicy = %q, want unset (OrderedReady)", sts.Spec.PodManagementPolicy)
+			}
+			pod := sts.Spec.Template.Spec
+			c := pod.Containers[0]
+			if got := c.ReadinessProbe.HTTPGet.Path; got != tc.wantReadiness {
+				t.Errorf("readiness path = %q, want %q", got, tc.wantReadiness)
+			}
+			hasRoutePort := slices.ContainsFunc(c.Ports, func(p corev1.ContainerPort) bool { return p.ContainerPort == a2aNATSRoutePort })
+			if hasRoutePort != tc.wantCluster {
+				t.Errorf("route port declared = %v, want %v", hasRoutePort, tc.wantCluster)
+			}
+			if got := len(pod.TopologySpreadConstraints) > 0; got != tc.wantCluster {
+				t.Errorf("topology spread present = %v, want %v", got, tc.wantCluster)
+			}
+			if tc.wantCluster {
+				// The hostname spread is the HA: DoNotSchedule with a
+				// minimum of three domains, so a third server waits for a
+				// third node rather than doubling up on one.
+				if !slices.ContainsFunc(pod.TopologySpreadConstraints, func(c corev1.TopologySpreadConstraint) bool {
+					return c.TopologyKey == corev1.LabelHostname && c.WhenUnsatisfiable == corev1.DoNotSchedule &&
+						c.MinDomains != nil && *c.MinDomains == 3 && c.MaxSkew == 1
+				}) {
+					t.Errorf("no hostname spread with DoNotSchedule and minDomains 3: %+v", pod.TopologySpreadConstraints)
+				}
+			}
+			if p := sts.Spec.PersistentVolumeClaimRetentionPolicy; p == nil ||
+				p.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType || p.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+				t.Errorf("claim retention = %+v, want retain on scale-down and on StatefulSet deletion (a scale to 0 keeps the store)", p)
+			}
+			if got := sts.Spec.MinReadySeconds > 0; got != tc.wantCluster {
+				t.Errorf("minReadySeconds > 0 = %v, want %v", got, tc.wantCluster)
+			}
+			if !slices.ContainsFunc(c.Env, func(e corev1.EnvVar) bool {
+				return e.Name == "POD_NAME" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == "metadata.name"
+			}) {
+				t.Error("POD_NAME is not the pod's name; server_name reads it")
+			}
+			// Lame duck only on a cluster: a single server has nowhere to move
+			// its clients, and lame duck there only delays its exit.
+			if tc.wantCluster {
+				if c.Lifecycle == nil || c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil ||
+					!slices.Equal(c.Lifecycle.PreStop.Exec.Command, []string{"nats-server", "--signal", "ldm=" + a2aNATSPIDFile}) {
+					t.Errorf("preStop is not the lame-duck signal: %+v", c.Lifecycle)
+				}
+				if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds <= a2aNATSLameDuckSeconds {
+					t.Errorf("termination grace %v does not leave room for a %ds lame duck", pod.TerminationGracePeriodSeconds, a2aNATSLameDuckSeconds)
+				}
+			} else {
+				if c.Lifecycle != nil {
+					t.Errorf("a single server has a lifecycle hook: %+v", c.Lifecycle)
+				}
+				if pod.TerminationGracePeriodSeconds != nil {
+					t.Errorf("a single server sets a grace period (%d); the default is enough without lame duck", *pod.TerminationGracePeriodSeconds)
+				}
+			}
+
+			conf := renderA2ANATSConf(agent, func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+			if got := a2aClusterBlockRe.MatchString(conf); got != tc.wantCluster {
+				t.Errorf("cluster block present = %v, want %v", got, tc.wantCluster)
+			}
+			if !strings.Contains(conf, "server_name: $POD_NAME") {
+				t.Error("nats.conf lacks server_name: $POD_NAME")
+			}
+			// The pid file is every bus's: the config reloader reads it, and
+			// on a cluster the preStop lame-duck signal does too.
+			if pid := `pid_file: "` + a2aNATSPIDFile + `"`; !strings.Contains(conf, pid) {
+				t.Errorf("nats.conf lacks %q", pid)
+			}
+			if got := strings.Contains(conf, `lame_duck_duration: "30s"`); got != tc.wantCluster {
+				t.Errorf("nats.conf has lame_duck_duration = %v, want %v", got, tc.wantCluster)
+			}
+
+			job := buildA2AProvisionJob(agent)
+			if !slices.ContainsFunc(job.Spec.Template.Spec.Containers[0].Env, func(e corev1.EnvVar) bool {
+				return e.Name == a2aStreamReplicasEnv && e.Value == strconv.Itoa(tc.wantStreams)
+			}) {
+				t.Errorf("provision Job does not set %s=%d", a2aStreamReplicasEnv, tc.wantStreams)
+			}
+		})
+	}
+}
+
+// The routes Service is headless and publishes not-ready addresses: a server
+// of a new cluster reports ready only after it has met a peer, so a Service
+// of ready addresses alone would keep the first two servers from finding each
+// other. The budget allows one eviction, never zero.
+func TestTheRoutesServiceAndBudgetFitAClusterThatIsStillForming(t *testing.T) {
+	agent := a2aTestAgent()
+	svc := buildA2ANATSRoutesService(agent)
+	if svc.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Errorf("routes Service ClusterIP = %q, want None", svc.Spec.ClusterIP)
+	}
+	if !svc.Spec.PublishNotReadyAddresses {
+		t.Error("routes Service does not publish not-ready addresses")
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != a2aNATSRoutePort {
+		t.Errorf("routes Service ports = %+v, want 6222 only", svc.Spec.Ports)
+	}
+	if svc.Spec.Selector["app"] != a2aNATSName(agent) {
+		t.Errorf("routes Service selects %v, want the bus's pods", svc.Spec.Selector)
+	}
+
+	pdb := buildA2ANATSPDB(agent)
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("bus budget maxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
+	}
+	if pdb.Spec.MinAvailable != nil {
+		t.Errorf("bus budget sets minAvailable %v as well", pdb.Spec.MinAvailable)
+	}
+	if pdb.Spec.Selector.MatchLabels["app"] != a2aNATSName(agent) {
+		t.Errorf("bus budget selects %v, want the bus's pods", pdb.Spec.Selector.MatchLabels)
+	}
+}
+
+// 6222 is admitted from the bus's own servers and from nothing else, whatever
+// the server count: the rule does not follow the count, so no pass that reads
+// a count other than the one running (a refused spec edit that sets
+// busReplicas renders the fence without converting the bus) can cut a running
+// cluster's routes. Its scope is exactly one port, TCP 6222, and exactly one
+// peer, the bus's own pods in the agent's namespace.
+func TestTheBusFenceAdmitsRoutesFromItsOwnServersOnly(t *testing.T) {
+	desiredOne := a2aTestAgentWithBusReplicas(1)
+	desiredOne.Status.BusReplicas = 3 // a running cluster the spec would convert
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"default":                       a2aTestAgent(),
+		"busReplicas 1":                 a2aTestAgentWithBusReplicas(1),
+		"busReplicas 3":                 a2aTestAgentWithBusReplicas(3),
+		"spec 1 over a running cluster": desiredOne,
+	} {
+		t.Run(name, func(t *testing.T) {
+			np := buildA2ANATSNetworkPolicy(agent)
+			var rules []networkingv1.NetworkPolicyIngressRule
+			for _, rule := range np.Spec.Ingress {
+				for _, p := range rule.Ports {
+					if p.Port != nil && p.Port.IntValue() == a2aNATSRoutePort {
+						rules = append(rules, rule)
+					}
+				}
+			}
+			if len(rules) != 1 {
+				t.Fatalf("the fence has %d rules naming 6222, want exactly one", len(rules))
+			}
+			rule := rules[0]
+			if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP || rule.Ports[0].EndPort != nil {
+				t.Errorf("the route rule admits more than TCP 6222: %+v", rule.Ports)
+			}
+			if len(rule.From) != 1 || rule.From[0].PodSelector == nil || rule.From[0].NamespaceSelector != nil || rule.From[0].IPBlock != nil ||
+				len(rule.From[0].PodSelector.MatchLabels) != 1 || rule.From[0].PodSelector.MatchLabels["app"] != a2aNATSName(agent) ||
+				len(rule.From[0].PodSelector.MatchExpressions) != 0 {
+				t.Errorf("the route rule's peers are not exactly the bus's own pods: %+v", rule.From)
+			}
+		})
+	}
+}
+
+// Routes authenticate by certificate alone: the cluster block has a tls block
+// naming the bus CA (nats-server requires and verifies a client certificate on
+// every route once there is one), and renders no route user or password, in
+// the block or in the route URL.
+func TestTheRoutesAuthenticateByCertificateOnly(t *testing.T) {
+	conf := renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+	block := a2aClusterBlockRe.FindString(conf)
+	for _, want := range []string{"tls {", "verify: true", `ca_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCAKey + `"`, `cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`} {
+		if !strings.Contains(block, want) {
+			t.Errorf("the cluster block lacks %q:\n%s", want, block)
+		}
+	}
+	for _, unwanted := range []string{"authorization", "user:", "password", "pw-"} {
+		if strings.Contains(block, unwanted) {
+			t.Errorf("the cluster block carries %q; routes authenticate by certificate:\n%s", unwanted, block)
+		}
+	}
+	if regexp.MustCompile(`nats-route://[^"]*@`).MatchString(block) {
+		t.Errorf("the route URL carries credentials:\n%s", block)
+	}
+}
+
+// The serving certificate names the routes Service and allows client auth, and
+// one issued before either is reissued rather than kept: a server presenting
+// it on a route would be refused by its peer.
+func TestTheServingCertificateCoversTheRoutesAndClientAuth(t *testing.T) {
+	agent := a2aTestAgent()
+	names := a2aNATSDNSNames(agent)
+	for _, want := range []string{
+		a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain,
+		a2aNATSName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain,
+	} {
+		if !slices.Contains(names, want) {
+			t.Errorf("serving SANs lack %q: %v", want, names)
+		}
+	}
+	// The same SANs for one server or three, so changing busReplicas does
+	// not reissue the certificate and roll the bus a second time.
+	if !slices.Equal(a2aNATSDNSNames(a2aTestAgentWithBusReplicas(1)), names) {
+		t.Error("the serving SANs depend on busReplicas")
+	}
+
+	now := time.Now()
+	caCert, caKey, caPEM, _, err := generateA2ANATSCA(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, names, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := parseA2ACert(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cert.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}) {
+		t.Errorf("serving certificate EKU = %v, want ServerAuth and ClientAuth", cert.ExtKeyUsage)
+	}
+	secret := &corev1.Secret{Data: map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: caPEM}}
+	if _, ok := readA2ANATSServing(secret, caCert, caPEM, names, now); !ok {
+		t.Fatal("a freshly issued certificate is not reused")
+	}
+
+	// The same certificate with ServerAuth alone, as every bus before
+	// cluster routes was issued: reissued.
+	old := a2aServerAuthOnlyCert(t, caCert, caKey, names, now)
+	secret.Data[a2aNATSTLSCertKey] = old.certPEM
+	secret.Data[a2aNATSTLSKeyKey] = old.keyPEM
+	if _, ok := readA2ANATSServing(secret, caCert, caPEM, names, now); ok {
+		t.Error("a ServerAuth-only certificate is reused; its server would be refused on every route")
+	}
+}
+
+// Every server's data claim is reaped on deletion, not only ordinal 0's, and
+// the instance-label guard still holds for each.
+func TestHandleDeletionReapsEveryServersJetStreamPVC(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Finalizers = []string{platformAgentFinalizer}
+	now := metav1.Now()
+	agent.DeletionTimestamp = &now
+	labels := buildA2ANATSStatefulSet(a2aTestAgent(), "h").Spec.VolumeClaimTemplates[0].Labels
+	objs := []*corev1.PersistentVolumeClaim{}
+	for ordinal := range a2aNATSMaxReplicas {
+		objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace, Labels: labels,
+		}})
+	}
+	squatter := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: objs[1].Name, Namespace: agent.Namespace}}
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, objs[0], squatter, objs[2])
+	cl := builder.Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if _, err := r.handleDeletion(context.Background(), agent); err != nil {
+		t.Fatalf("handleDeletion failed: %v", err)
+	}
+	for _, i := range []int{0, 2} {
+		err := cl.Get(context.Background(), types.NamespacedName{Name: objs[i].Name, Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{})
+		if !errors.IsNotFound(err) {
+			t.Errorf("server %d's labelled claim survived deletion (err=%v)", i, err)
+		}
+	}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: squatter.Name, Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Errorf("an unlabelled squatter on ordinal 1's name was deleted (err=%v)", err)
+	}
+}
+
+// The claims wait for the bus StatefulSet's deletion mark: a claim reaped
+// while it still creates pods is recreated with one and outlives it, pinned
+// to a zone (handleDeletion). The first pass marks the StatefulSet and
+// leaves every claim; a pass that finds it marked (still terminating, its
+// pods going) or gone reaps them, so a stuck pod holds nothing. A
+// StatefulSet of that name the agent doesn't control holds nothing back.
+func TestHandleDeletionReapsTheBusClaimsOnlyOnceItsStatefulSetIsMarked(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	agent.Finalizers = []string{platformAgentFinalizer}
+	now := metav1.Now()
+	agent.DeletionTimestamp = &now
+	sts := buildA2ANATSStatefulSet(a2aTestAgent(), "h")
+	sts.OwnerReferences = []metav1.OwnerReference{{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+		Name: agent.Name, UID: agent.UID, Controller: ptr.To(true)}}
+	labels := sts.Spec.VolumeClaimTemplates[0].Labels
+	objs := []client.Object{agent, sts}
+	for ordinal := range a2aNATSMaxReplicas {
+		objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace, Labels: labels,
+		}})
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	claimsLeft := func() int {
+		n := 0
+		for ordinal := range a2aNATSMaxReplicas {
+			if cl.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}) == nil {
+				n++
+			}
+		}
+		return n
+	}
+
+	res, err := r.handleDeletion(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter != a2aNATSDeletionRecheck {
+		t.Errorf("RequeueAfter = %v with the StatefulSet just deleted, want %v", res.RequeueAfter, a2aNATSDeletionRecheck)
+	}
+	if n := claimsLeft(); n != a2aNATSMaxReplicas {
+		t.Fatalf("%d of %d claims left after the first pass, want all: they wait for the StatefulSet", n, a2aNATSMaxReplicas)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(sts), &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
+		t.Fatalf("the bus StatefulSet survived the first pass (err=%v)", err)
+	}
+	if _, err := r.handleDeletion(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if n := claimsLeft(); n != 0 {
+		t.Errorf("%d claims left once the StatefulSet was gone, want none", n)
+	}
+
+	// Already marked and still terminating (its pods held by a lost node,
+	// say): the claims go on the first pass, and nothing is deleted again.
+	agent3 := a2aTestAgent()
+	agent3.UID = "agent-uid"
+	agent3.Finalizers = []string{platformAgentFinalizer}
+	agent3.DeletionTimestamp = &now
+	terminating := sts.DeepCopy()
+	terminating.ResourceVersion = ""
+	terminating.Finalizers = []string{metav1.FinalizerDeleteDependents}
+	terminating.DeletionTimestamp = &now
+	cl3 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent3, terminating}, objs[2:]...)...).Build()
+	r3 := &PlatformAgentReconciler{Client: cl3, Scheme: scheme}
+	res3, err := r3.handleDeletion(ctx, agent3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res3.RequeueAfter == a2aNATSDeletionRecheck {
+		t.Error("a pass held the reap for a StatefulSet already marked for deletion")
+	}
+	if err := cl3.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("a StatefulSet already marked held back the claim reap (err=%v)", err)
+	}
+
+	// A StatefulSet of that name the agent doesn't control: the claims go
+	// on the first pass, and the StatefulSet stays.
+	agent2 := a2aTestAgent()
+	agent2.UID = "agent-uid"
+	agent2.Finalizers = []string{platformAgentFinalizer}
+	agent2.DeletionTimestamp = &now
+	foreign := buildA2ANATSStatefulSet(a2aTestAgent(), "h")
+	cl2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent2, foreign}, objs[2:]...)...).Build()
+	r2 := &PlatformAgentReconciler{Client: cl2, Scheme: scheme}
+	if _, err := r2.handleDeletion(ctx, agent2); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl2.Get(ctx, client.ObjectKeyFromObject(foreign), &appsv1.StatefulSet{}); err != nil {
+		t.Errorf("a StatefulSet the agent doesn't control was deleted (err=%v)", err)
+	}
+	if err := cl2.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("a foreign StatefulSet held back the claim reap (err=%v)", err)
+	}
+}
+
+// Every stream and bucket the provision script creates takes the configured
+// replica count, never a literal. A stream added with --replicas=1 (or any
+// number) fails here, so a new stream cannot quietly ship R1 on a cluster.
+func TestEveryProvisionedStreamTakesTheConfiguredReplicaCount(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	if m := regexp.MustCompile(`--replicas[= ]+[0-9]`).FindAllString(script, -1); len(m) != 0 {
+		t.Errorf("the provision script writes a literal replica count: %v", m)
+	}
+	adds := regexp.MustCompile(`\$NATS (stream|kv) add `).FindAllStringIndex(script, -1)
+	if len(adds) == 0 {
+		t.Fatal("the provision script adds no stream or bucket; the check below would be vacuous")
+	}
+	for _, loc := range adds {
+		// A stream add continues over backslashed lines; read to the end
+		// of the command.
+		cmd := script[loc[0]:]
+		for i := 0; i < len(cmd); i++ {
+			if cmd[i] == '\n' && (i == 0 || cmd[i-1] != '\\') {
+				cmd = cmd[:i]
+				break
+			}
+		}
+		if !strings.Contains(cmd, `--replicas="${`+a2aStreamReplicasEnv+`}"`) {
+			t.Errorf("this add does not take --replicas=\"${%s}\":\n%s", a2aStreamReplicasEnv, cmd)
+		}
+	}
+	// And every provisioned stream is one the script adds.
+	for _, s := range a2aProvisionedStreams {
+		name := strings.TrimPrefix(s, "KV_")
+		if !regexp.MustCompile(`\$NATS (stream|kv) add ` + regexp.QuoteMeta(name) + `\b`).MatchString(script) {
+			t.Errorf("a2aProvisionedStreams names %q, which the provision script does not add", s)
+		}
+	}
+}
+
+// The rendered cluster block forms a cluster: three embedded servers, started
+// from the operator's own nats.conf with only what a test process cannot
+// honour changed (server names, ports, the store, the pid file, and the route
+// host, which is the routes Service in a pod and localhost here), meet over
+// routes whose TLS is verified both ways, and elect a JetStream meta leader.
+//
+// The peers each server learns by gossip arrive as IPs, which the test
+// certificate does not name. That they connect at all is nats-server dialling
+// them with the TLS name saved from the explicit route (saveRouteTLSName), the
+// behaviour the render's SANs rely on. A fourth server whose certificate comes
+// from another CA does not join: routes authenticate by certificate.
+//
+// Formation is polled under a wide deadline (a2aClusterFormDeadline): the
+// first meta election often runs before the routes are up, and each retry
+// waits a randomized election timeout, so wall time varies by the round the
+// cluster lands on.
+func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
+	agent := a2aTestAgent()
+	creds := a2aFullCreds("c", "1")
+	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	if !a2aClusterBlockRe.MatchString(conf) {
+		t.Fatal("the default render has no cluster block")
+	}
+	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc:" + strconv.Itoa(a2aNATSRoutePort)
+	if !strings.Contains(conf, routeHost) {
+		t.Fatalf("the cluster block does not route to %s", routeHost)
+	}
+
+	start := a2aStartRenderedClusterOn(t, conf, routeHost, a2aFreePort)
+
+	servers := []*natsserver.Server{start(0, ""), start(1, ""), start(2, "")}
+	// Formed means every server holds a route to each of its two peers and
+	// runs clustered JetStream, and one of them is meta leader. All of it is
+	// polled under one deadline: a server reporting clustered a tick after
+	// its peers is a moment in formation, not a verdict.
+	deadline := time.Now().Add(a2aClusterFormDeadline)
+	for {
+		formed := true
+		for _, s := range servers {
+			if len(a2aRoutePeers(t, s)) != 2 || !s.JetStreamIsClustered() {
+				formed = false
+			}
+		}
+		leader := slices.ContainsFunc(servers, func(s *natsserver.Server) bool { return s.JetStreamIsLeader() })
+		if formed && leader {
+			break
+		}
+		if time.Now().After(deadline) {
+			for i, s := range servers {
+				t.Logf("server %d: peers %v, routes=%d, clustered=%v, leader=%v", i, a2aRoutePeers(t, s), s.NumRoutes(), s.JetStreamIsClustered(), s.JetStreamIsLeader())
+			}
+			t.Fatalf("the rendered cluster did not form with a JetStream meta leader within %s", a2aClusterFormDeadline)
+		}
+		time.Sleep(a2aClusterFormPoll)
+	}
+	// One route per peer (pool_size -1): two, not a pool of four. A pair
+	// that dialled each other at once holds a duplicate for a moment while
+	// it settles on one, so the count gets a short window of its own rather
+	// than a place in the formation deadline: a count that never reaches two
+	// is a pooling regression and is named as one, not as a slow election.
+	settled := time.Now().Add(a2aClusterRouteSettle)
+	for slices.ContainsFunc(servers, func(s *natsserver.Server) bool { return s.NumRoutes() != 2 }) {
+		if time.Now().After(settled) {
+			for i, s := range servers {
+				if n := s.NumRoutes(); n != 2 {
+					t.Errorf("server %d holds %d route connections after %s, want exactly one per peer (2)", i, n, a2aClusterRouteSettle)
+				}
+			}
+			break
+		}
+		time.Sleep(a2aClusterFormPoll)
+	}
+
+	// Interest crosses every route in the APP account: a subscriber on each
+	// server receives what the other two publish. A client on a server
+	// missing a peer's interest would see "no responders" for every stream
+	// that peer leads, which is the failure pool_size -1 exists for.
+	seedPassword := string(creds.Data[a2aSeedPasswordKey])
+	connect := func(s *natsserver.Server) *nats.Conn {
+		t.Helper()
+		nc, err := nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo("seed", seedPassword))
+		if err != nil {
+			t.Fatalf("connect as seed to %s: %v", s.Name(), err)
+		}
+		t.Cleanup(nc.Close)
+		return nc
+	}
+	const subject = "a2a.topics.shared.blueprint"
+	for i, sub := range servers {
+		nc := connect(sub)
+		ch := make(chan *nats.Msg, 4)
+		subscription, err := nc.ChanSubscribe(subject, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		for j, pub := range servers {
+			if j == i {
+				continue
+			}
+			pc := connect(pub)
+			got := false
+			// Only this pair's payload counts: a retry from the previous
+			// publisher that arrived after its wait is still on the
+			// channel, and reading it as this publisher's would pass a
+			// route that carried nothing.
+			want := fmt.Sprintf("%d->%d", j, i)
+			deadline := time.Now().Add(a2aClusterDeliveryDeadline)
+			for !got && time.Now().Before(deadline) {
+				if err := pc.Publish(subject, []byte(want)); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case m := <-ch:
+					got = string(m.Data) == want
+				case <-time.After(a2aClusterDeliveryPoll):
+				}
+			}
+			if !got {
+				t.Errorf("a publish on server %d never reached a subscriber on server %d", j, i)
+			}
+		}
+		// Drop the subscription before the next server's round, or the
+		// retries published later land on this small channel too and the
+		// client reports a slow consumer.
+		if err := subscription.Unsubscribe(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A serving pair from a CA of its own, as anything that is not one of the
+	// bus's servers would have: it names the right host and is not signed by
+	// the bus CA. It trusts the bus CA, though, so its own handshake with a
+	// bus server succeeds and the refusal, if any, is the bus server's check
+	// of its certificate (verify: true), which is what this exercises.
+	foreignCA := t.TempDir()
+	busTLSDir, _ := a2aTestTLSMaterial(t)
+	busCAPEM, err := os.ReadFile(filepath.Join(busTLSDir, a2aNATSTLSCAKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, caKey, _, _, err := generateA2ANATSCA(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, []string{a2aTestServerName}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: busCAPEM} {
+		if err := os.WriteFile(filepath.Join(foreignCA, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	intruder := start(3, foreignCA)
+	time.Sleep(a2aClusterIntruderWait)
+	if peers := a2aRoutePeers(t, intruder); len(peers) != 0 {
+		t.Errorf("a server with a certificate from another CA joined, peering with %v", peers)
+	}
+	for i, s := range servers {
+		if peers := a2aRoutePeers(t, s); len(peers) != 2 || slices.Contains(peers, "a2a-test-nats-3") {
+			t.Errorf("server %d peers with %v after the intruder tried, want its two members only", i, peers)
+		}
+	}
+}
+
+// a2aStartRenderedClusterOn returns a starter for the embedded servers in
+// TestTheRenderedClusterFormsOverVerifiedRoutes, taking server 0's seed route
+// port from pick and binding peers 1..3 on ephemeral route ports (-1). When
+// another socket claims server 0's seed port before StartRouting binds it, the
+// server listens for clients (Addr() != nil) but not for routes
+// (ClusterAddr() == nil); only that case is retried with a fresh seed port.
+func a2aStartRenderedClusterOn(t *testing.T, conf, routeHost string, pick func(*testing.T) int) func(i int, tlsDir string) *natsserver.Server {
+	t.Helper()
+	ports := []int{pick(t), -1, -1, -1}
+	startOnce := func(i int, tlsDir string) (*natsserver.Server, net.Addr, *net.TCPAddr, []string) {
+		t.Helper()
+		c := strings.Replace(conf, a2aPodServerNameLine, a2aTestServerNamePrefix+strconv.Itoa(i), 1)
+		c = strings.Replace(c, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), a2aTestPIDFileName)+`"`, 1)
+		c = strings.Replace(c, routeHost, a2aLocalhostRoutePrefix+strconv.Itoa(ports[0]), 1)
+		c = strings.Replace(c, a2aClusterPortLinePrefix+strconv.Itoa(a2aNATSRoutePort), a2aClusterPortLinePrefix+strconv.Itoa(ports[i]), 1)
+		if tlsDir != "" {
+			c = strings.ReplaceAll(c, a2aNATSTLSMountDir+"/", tlsDir+"/")
+		} else {
+			c = a2aWithTestTLS(t, c)
+		}
+		path := filepath.Join(t.TempDir(), a2aTestConfFileName)
+		if err := os.WriteFile(path, []byte(c), a2aTestConfFileMode); err != nil {
+			t.Fatal(err)
+		}
+		opts, err := natsserver.ProcessConfigFile(path)
+		if err != nil {
+			t.Fatalf("server %d: the rendered nats.conf does not parse: %v", i, err)
+		}
+		opts.Port, opts.HTTPPort, opts.Websocket.Port = -1, 0, 0
+		opts.Host, opts.Cluster.Host = a2aLoopbackHost, a2aLoopbackHost
+		opts.StoreDir = t.TempDir()
+		opts.NoSigs = true
+		s, err := natsserver.NewServer(opts)
+		if err != nil {
+			t.Fatalf("server %d: %v", i, err)
+		}
+		log := &a2aServerLog{}
+		s.SetLoggerV2(log, false, false, false)
+		go s.Start()
+		if s.ReadyForConnections(a2aTestServerReadyWait) && s.ClusterAddr() != nil {
+			t.Cleanup(func() { s.Shutdown(); s.WaitForShutdown() })
+			return s, s.Addr(), s.ClusterAddr(), nil
+		}
+		clientAddr, routeAddr := s.Addr(), s.ClusterAddr()
+		s.Shutdown()
+		s.WaitForShutdown()
+		log.mu.Lock()
+		lines := slices.Clone(log.lines)
+		log.mu.Unlock()
+		return nil, clientAddr, routeAddr, lines
+	}
+	return func(i int, tlsDir string) *natsserver.Server {
+		t.Helper()
+		attempts := 1
+		if i == 0 {
+			attempts = a2aClusterSeedPortRetries
+		}
+		for attempt := range attempts {
+			s, clientAddr, routeAddr, lines := startOnce(i, tlsDir)
+			if s != nil {
+				return s
+			}
+			if i == 0 && clientAddr != nil && routeAddr == nil && attempt+1 < attempts {
+				ports[0] = pick(t)
+				continue
+			}
+			t.Fatalf("server %d did not become ready on attempt %d/%d (client=%v, route=%v): %v", i, attempt+1, attempts, clientAddr, routeAddr, lines)
+		}
+		return nil
+	}
+}
+
+// a2aFreePort reserves a loopback port and releases it for the seed server's
+// route listener to bind.
+func a2aFreePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen(a2aLoopbackNetwork, a2aLoopbackAnyPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
+}
+
+// When another socket holds server 0's reserved seed port before StartRouting
+// binds it, server 0 still opens its client listener (Addr() != nil) while its
+// route listener stays nil (ClusterAddr() == nil), and a2aStartRenderedClusterOn
+// retries server 0 on a fresh port from pick.
+func TestRenderedClusterStartRetriesWhenTheSeedRoutePortIsTaken(t *testing.T) {
+	agent := a2aTestAgent()
+	creds := a2aFullCreds("c", "1")
+	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t), nil).Data[a2aTestConfFileName])
+	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc:" + strconv.Itoa(a2aNATSRoutePort)
+
+	held, err := net.Listen(a2aLoopbackNetwork, a2aLoopbackAnyPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	heldPort := held.Addr().(*net.TCPAddr).Port
+
+	picks := 0
+	pick := func(t *testing.T) int {
+		t.Helper()
+		picks++
+		if picks == 1 {
+			return heldPort
+		}
+		return a2aFreePort(t)
+	}
+	start := a2aStartRenderedClusterOn(t, conf, routeHost, pick)
+	s := start(0, "")
+	if picks < 2 {
+		t.Fatalf("picked %d seed ports, want at least 2 after the held port was refused", picks)
+	}
+	if got := s.ClusterAddr(); got == nil || got.Port == heldPort {
+		t.Fatalf("server 0 route listener = %v, want bound on a port other than held port %d", got, heldPort)
+	}
+}
+
+// a2aServerAuthOnlyCert issues the serving certificate as the bus issued it
+// before cluster routes: the same names, ServerAuth alone.
+func a2aServerAuthOnlyCert(t *testing.T, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, names []string, now time.Time) struct{ certPEM, keyPEM []byte } {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := a2aSerial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: names[0]},
+		DNSNames:     names,
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(a2aNATSTLSLifetime),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := a2aKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return struct{ certPEM, keyPEM []byte }{a2aCertPEM(der), keyPEM}
+}
+
+// a2aRoutePeers is the distinct servers s holds routes to, by server name.
+// NumRoutes counts connections, and nats-server pools several per peer.
+func a2aRoutePeers(t *testing.T, s *natsserver.Server) []string {
+	t.Helper()
+	rz, err := s.Routez(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var peers []string
+	for _, r := range rz.Routes {
+		if r.RemoteName != "" && !slices.Contains(peers, r.RemoteName) {
+			peers = append(peers, r.RemoteName)
+		}
+	}
+	slices.Sort(peers)
+	return peers
+}
+
+// The server count is sticky: an existing bus keeps what it runs (from its
+// StatefulSet, or from the claims a deleted StatefulSet left), a set field
+// decides only for a bus that does not exist yet, and three when it is
+// unset. A field asking a running bus for the other count starts a
+// migration, once, in the direction it asks, and the bus keeps its count
+// until the migration's phases convert it.
+func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int, labelled bool) *corev1.PersistentVolumeClaim {
+		c := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}}
+		if labelled {
+			c.Labels = buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+		}
+		return c
+	}
+	// sts is a StatefulSet rendered for rendered servers and scaled to
+	// replicas: the two differ only after a hand scale.
+	sts := func(agent *agentv1alpha1.PlatformAgent, rendered, replicas int32) *appsv1.StatefulSet {
+		shaped := agent.DeepCopy()
+		shaped.Status.BusReplicas = rendered
+		s := buildA2ANATSStatefulSet(shaped, "h")
+		s.Spec.Replicas = ptr.To(replicas)
+		return s
+	}
+	for _, tc := range []struct {
+		name     string
+		spec     *int
+		recorded int32
+		objects  func(*agentv1alpha1.PlatformAgent) []client.Object
+		want     int32
+		wantLeg  busMigrationLeg // "" for no migration
+	}{
+		{"a new bus", nil, 0, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 3, ""},
+		{"an existing single-server bus", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, ""},
+		{"an existing cluster", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 3, ""},
+		{"a deleted single-server bus's claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, true)} }, 1, ""},
+		{"a deleted cluster's claims, one missing", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
+		}, 3, ""},
+		{"an unlabelled squatter claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, false)} }, 3, ""},
+		{"set to 3 on a single-server bus migrates it", ptr.To(3), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, busMigrationGrow},
+		{"set to 1 on a cluster migrates it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 3, busMigrationShrink},
+		{"set to what runs is no migration", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, ""},
+		// Claims 0 and 1 without 2 read as a cluster, so setting 1 over
+		// them migrates three servers to one.
+		{"set to 1 over a deleted cluster's two claims migrates it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
+		}, 3, busMigrationShrink},
+		// A hand scale between 1 and 3 is not the bus's shape: the record
+		// holds, with or without the field, and nothing migrates.
+		{"a single-server bus scaled by hand to 3", nil, 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, ""},
+		{"a cluster scaled by hand to 1", nil, 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 1)} }, 3, ""},
+		{"a hand scale to 3 with the field at the old count", ptr.To(1), 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, ""},
+		// With no record (an operator from before the field), the template
+		// decides, not the live count.
+		{"an unrecorded single-server bus scaled by hand to 3", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			objs := append([]client.Object{agent}, tc.objects(agent)...)
+			agent.Status.BusReplicas = tc.recorded
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
+				busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.want {
+				t.Errorf("status.busReplicas = %d, want %d", agent.Status.BusReplicas, tc.want)
+			}
+			if got := a2aNATSReplicas(agent); got != int(tc.want) {
+				t.Errorf("a2aNATSReplicas = %d, want %d", got, tc.want)
+			}
+			run := agent.Status.BusMigration
+			switch {
+			case tc.wantLeg == "" && run != nil:
+				t.Errorf("a migration started: %+v", run)
+			case tc.wantLeg != "" && (run == nil || busMigrationLeg(run.Leg) != tc.wantLeg):
+				t.Errorf("migration %+v, want leg %s", run, tc.wantLeg)
+			}
+			if run == nil {
+				return
+			}
+			// Once: a second pass carries the same run on.
+			id := run.RunID
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusMigration.RunID != id {
+				t.Errorf("the next pass started run %s over %s", agent.Status.BusMigration.RunID, id)
+			}
+		})
+	}
+}
+
+// The provision Job is not created until the bus has rolled out: every replica
+// updated and Ready, on a status that has seen the applied generation. A Job
+// that ran mid-conversion would find the old streams, create nothing, and
+// leave the bus empty once the last server restarted into the new shape.
+func TestTheProvisionJobWaitsForTheBusToRollOut(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	reportCalloutStatus(t, ctx, cl, agent, 2, 2, 2)
+	jobKey := client.ObjectKey{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}
+
+	// Two of three servers Ready: held.
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 3, ReadyReplicas: 2, UpdatedReplicas: 3, CurrentRevision: "r", UpdateRevision: "r"}
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.jobHeld {
+		t.Error("the provision Job was not held with a server not Ready")
+	}
+	if err := cl.Get(ctx, jobKey, &batchv1.Job{}); !errors.IsNotFound(err) {
+		t.Errorf("the provision Job exists mid-rollout (err=%v)", err)
+	}
+
+	// Every server Ready but one still on the old revision: held.
+	if err := cl.Get(ctx, client.ObjectKey{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 3, ReadyReplicas: 3, UpdatedReplicas: 3, CurrentRevision: "old", UpdateRevision: "r"}
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	if state, err = r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if !state.jobHeld {
+		t.Error("the provision Job was not held with a server still on the old revision")
+	}
+
+	// Rolled out: created.
+	reportBusRolledOut(t, ctx, cl, agent)
+	if state, err = r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if state.jobHeld {
+		t.Error("the provision Job is held on a bus that has rolled out")
+	}
+	if err := cl.Get(ctx, jobKey, &batchv1.Job{}); err != nil {
+		t.Errorf("the provision Job was not created once the bus rolled out: %v", err)
+	}
+}
+
+// A StatefulSet read that fails for any reason but NotFound fails the pass: it
+// is not read as "no bus", which would give a running single-server bus three
+// servers and empty it.
+func TestABusReadErrorIsNotReadAsNoBus(t *testing.T) {
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.StatefulSet); ok {
+				return apierrors.NewServiceUnavailable("informer not ready")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		}}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(4)}
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err == nil {
+		t.Fatalf("a failed StatefulSet read resolved to %d servers instead of failing the pass", agent.Status.BusReplicas)
+	}
+}
+
+// Lowering a cluster to one server (the three to one migration's Shrinking
+// phase) takes the routes Service and the budget away rather than leaving
+// them: a budget over one server would block its drains.
+func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	routes := client.ObjectKey{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace}
+	pdb := client.ObjectKey{Name: a2aNATSName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, routes, &corev1.Service{}); err != nil {
+		t.Fatalf("a new bus rendered no routes Service: %v", err)
+	}
+	if err := cl.Get(ctx, pdb, &policyv1.PodDisruptionBudget{}); err != nil {
+		t.Fatalf("a new bus rendered no budget: %v", err)
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationShrinking),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if a2aNATSReplicas(agent) != 1 {
+		t.Fatalf("Shrinking rendered %d servers", a2aNATSReplicas(agent))
+	}
+	if err := cl.Get(ctx, routes, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the routes Service survived lowering the bus to one server (err=%v)", err)
+	}
+	if err := cl.Get(ctx, pdb, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the budget survived lowering the bus to one server (err=%v)", err)
+	}
+}
+
+// The resolved count reaches the stored status even on a pass where nothing
+// else changed: the writer is told the persisted value differs.
+func TestTheResolvedBusCountIsWrittenToStatus(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	// One pass to bring the conditions current, so the next is a no-op but
+	// for the count.
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	persisted := agent.Status.BusReplicas
+	agent.Status.BusReplicas = 1
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{busReplicasPersisted: persisted}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.BusReplicas != 1 {
+		t.Errorf("stored status.busReplicas = %d, want the resolved 1", stored.Status.BusReplicas)
+	}
+}
+
+// A migration provisions the bus again once it ends, in both directions and
+// back: the new count changes STREAM_REPLICAS and so the Job's digested name,
+// the migration holds the Job while it runs, and the superseded-Job sweep
+// removes the old shape's Job. A migration back to an earlier shape gets a
+// fresh Job, not that shape's old completed one.
+func TestAMigrationProvisionsTheBusAgain(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	// The callout's current ReplicaSet, which the fake's absent Deployment
+	// controller would have made: without one the bus holds each config
+	// change of the migration until it can tell the callout has rolled
+	// (a2aBusWaitsForCallout).
+	callout := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aCalloutName(agent)}, callout); err != nil {
+		t.Fatal(err)
+	}
+	calloutReplicaSet(t, ctx, cl, callout, "current", "1")
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	threeServerJob := buildA2AProvisionJob(agent).Name
+	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
+		t.Fatalf("no provision Job before the migration: %v", err)
+	}
+	// migrate puts the run in phase, as its passes would, then ends it once
+	// the bus has rolled out at the phase's count.
+	migrate := func(leg busMigrationLeg, phase busMigrationPhase, servers int) {
+		t.Helper()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(servers)}}
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "1-1", Phase: string(phase),
+			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.jobHeld {
+			t.Errorf("the provision Job was not held during the %s phase", phase)
+		}
+		reportBusRolledOut(t, ctx, cl, agent)
+		agent.Status.BusMigration.Phase = string(busMigrationDone)
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// To one server: the three-server Job is swept as superseded, and the
+	// one-server Job runs once the run is done.
+	migrate(busMigrationShrink, busMigrationShrinking, 1)
+	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the completed three-server provision Job survived the migration (err=%v)", err)
+	}
+	oneServerJob := buildA2AProvisionJob(agent).Name
+	if oneServerJob == threeServerJob {
+		t.Fatal("the one-server Job has the three-server Job's name")
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: oneServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
+		t.Fatalf("no one-server provision Job after the migration: %v", err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+
+	// And back to three: the three-server Job's name again, created fresh
+	// rather than found complete.
+	migrate(busMigrationGrow, busMigrationConverting, 3)
+	job := &batchv1.Job{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, job); err != nil {
+		t.Fatalf("no provision Job after migrating back to three: %v", err)
+	}
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete {
+			t.Error("the provision Job after migrating back is the old completed one, not a fresh run")
+		}
+	}
+}
+
+// A single-server bus leaves a routes Service or budget it does not own alone:
+// skipped and logged, not deleted, and the pass goes on (#3871).
+func TestASingleServerBusSkipsAForeignBudgetUnderItsName(t *testing.T) {
+	agent := a2aTestAgentWithBusReplicas(1)
+	foreign := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, foreign).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("a foreign budget under the bus's name failed the pass: %v", err)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(foreign), &policyv1.PodDisruptionBudget{}); err != nil {
+		t.Errorf("a budget this PlatformAgent does not own was deleted: %v", err)
+	}
+}
+
+// The status writer counts the NATS StatefulSet ready once a quorum of its
+// servers is: one of three is a bus that cannot elect a leader.
+func TestTheBusCountsTowardReadyOnlyWithAQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		replicas, ready, want int32
+	}{
+		{3, 0, 0}, {3, 1, 0}, {3, 2, 2}, {3, 3, 3}, {1, 0, 0}, {1, 1, 1},
+	} {
+		sts := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{Replicas: ptr.To(tc.replicas)}, Status: appsv1.StatefulSetStatus{ReadyReplicas: tc.ready}}
+		if got := a2aNATSServingReplicas(sts); got != tc.want {
+			t.Errorf("%d of %d servers Ready counts as %d, want %d", tc.ready, tc.replicas, got, tc.want)
+		}
+	}
+}
+
+// A write whose echo comes back without status.busReplicas (the served CRD
+// prunes it) stops the writers keying on the field, so the pruned write does
+// not repeat on every pass; an echo that carries it clears the record.
+func TestAPrunedBusReplicasStatusDoesNotLoopTheWriters(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := a2aTestAgent()
+	agent.Status.BusReplicas = 1
+	if r.busReplicasStatusCurrent(agent, 0) {
+		t.Fatal("a resolved count the CR does not carry reads as current before any write")
+	}
+	agent.Status.BusReplicas = 0 // the echo of a write of 1, pruned
+	r.noteBusReplicasEcho(agent, 1)
+	agent.Status.BusReplicas = 1 // the next pass resolves 1 again
+	if !r.busReplicasStatusCurrent(agent, 0) {
+		t.Error("after a pruned echo the writers still key on status.busReplicas and would write every pass")
+	}
+	r.noteBusReplicasEcho(agent, 1) // an echo that carries the field
+	if r.busReplicasStatusCurrent(agent, 0) {
+		t.Error("an echo that carried the field did not clear the pruned record")
+	}
+}
+
+// A migration's count change drops the provisioned-once record, so the CR
+// reads Provisioning until the new shape's provision Job completes, not
+// Ready over a bus whose streams are not all back. A phase that keeps the
+// count (the pin) keeps the record.
+func TestAMigrationsCountChangeDropsBusProvisioned(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if !busProvisioned(agent) {
+		t.Fatal("precondition: BusProvisioned not set")
+	}
+	// The same shape: the record stands.
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(agent) {
+		t.Fatal("BusProvisioned dropped on a pass with no conversion")
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationPinning),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(agent) {
+		t.Fatal("BusProvisioned dropped while the pin ran at three servers")
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationShrinking)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if busProvisioned(agent) {
+		t.Error("BusProvisioned survived the bus going to one server")
+	}
+}
+
+// A NATS pod the hostname spread holds Pending is named with the scheduler's
+// reason by the status pod scan, not blamed on the CR's RuntimeClass, which
+// the pod does not ask for: the remedy that message gives (a gVisor node pool)
+// does not add the node the spread waits for.
+func TestAnUnschedulableBusServerIsNotBlamedOnTheRuntimeClass(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")}}
+	if len(requestedRuntimeClasses(agent)) == 0 {
+		t.Fatal("precondition: the CR requests a RuntimeClass")
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-2", Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)}},
+		Status: corev1.PodStatus{Phase: corev1.PodPending, Conditions: []corev1.PodCondition{{
+			Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: "Unschedulable",
+			Message: "0/2 nodes are available: 2 node(s) didn't match pod topology spread constraints.",
+		}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	_, _, msg := r.getDeploymentStatusDetails(context.Background(), agent, true)
+	if strings.Contains(msg, "RuntimeClass") || strings.Contains(msg, "gVisor") {
+		t.Errorf("a bus server Pending under the spread is blamed on the RuntimeClass: %q", msg)
+	}
+	if !strings.Contains(msg, "topology spread") {
+		t.Errorf("the scheduler's reason is not in the message: %q", msg)
+	}
+}
+
+// The Ready message names a server short of the configured count, and says
+// nothing when every server is Ready.
+func TestTheReadyMessageNamesAMissingBusServer(t *testing.T) {
+	agent := a2aTestAgent()
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Status = appsv1.StatefulSetStatus{Replicas: 3, ReadyReplicas: 2}
+	ready := func(name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)}},
+			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	}
+	pending := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-2", Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Message: "0/2 nodes are available: 2 node(s) didn't match pod topology spread constraints."}}}}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(sts, ready(a2aNATSName(agent)+"-0"), ready(a2aNATSName(agent)+"-1"), pending).
+		WithStatusSubresource(&appsv1.StatefulSet{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	note := r.a2aNATSShortNote(context.Background(), agent)
+	if !strings.Contains(note, "2 of 3 NATS servers") || !strings.Contains(note, a2aNATSName(agent)+"-2: 0/2 nodes are available") {
+		t.Errorf("note = %q, want the count and the Pending server with the scheduler's reason", note)
+	}
+	if strings.Contains(note, "-0:") || strings.Contains(note, "-1:") {
+		t.Errorf("note names a Ready server: %q", note)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(sts), sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status.ReadyReplicas = 3
+	if err := cl.Status().Update(context.Background(), sts); err != nil {
+		t.Fatal(err)
+	}
+	if note := r.a2aNATSShortNote(context.Background(), agent); note != "" {
+		t.Errorf("note on a fully Ready bus = %q, want none", note)
+	}
+}
+
+// The pruned status.busReplicas record schedules its own reprobe and is
+// forgotten with the CR.
+func TestThePrunedBusReplicasRecordIsReprobedAndForgotten(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := a2aTestAgent()
+	r.prunedBusReplicasStatus.Store(client.ObjectKeyFromObject(agent), time.Now())
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Errorf("requeue with a pruned busReplicas record = %s, want the reprobe interval %s", got, usageStatusReprobeInterval)
+	}
+	r.forgetUsageStatus(agent)
+	if r.busReplicasStatusPruned(agent) {
+		t.Error("the pruned busReplicas record outlived forgetUsageStatus")
+	}
+}
+
+// A minAvailable another manager set on the live bus budget. A forced apply
+// cannot remove a field it never owned, so without clearForeignPDBBudgetField
+// the apply merges to both fields and is refused, and the bus step sits ahead
+// of the callout, the fences and the provision Job in reconcileA2A.
+func TestTheBusBudgetRecoversFromAForeignBudgetField(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	want := buildA2ANATSPDB(agent)
+	live := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: want.Name, Namespace: agent.Namespace},
+		Spec:       policyv1.PodDisruptionBudgetSpec{MinAvailable: ptr.To(intstr.FromInt32(2)), Selector: want.Spec.Selector},
+	}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, live).WithInterceptorFuncs(pdbSSAInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	if err := r.reconcileA2ANATSClusterObjects(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2ANATSClusterObjects: %v", err)
+	}
+	got := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(want), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.MinAvailable != nil || got.Spec.MaxUnavailable == nil || got.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("bus budget = maxUnavailable %v / minAvailable %v, want 1 / unset", got.Spec.MaxUnavailable, got.Spec.MinAvailable)
+	}
+}
+
+// OrderedReady creates server 1 and its claim only once server 0 is Ready, so
+// a new cluster's StatefulSet deleted before then leaves only claim 0, as a
+// single server does. The recorded count tells them apart; with nothing
+// recorded (a record lost to a served CRD that prunes it) the lone claim
+// reads as one server.
+func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
+	for _, tc := range []struct {
+		recorded, want int32
+	}{{3, 3}, {1, 1}, {0, 1}} {
+		agent := a2aTestAgent()
+		agent.Status.BusReplicas = tc.recorded
+		claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace,
+			Labels: buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels,
+		}}
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, claim).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		if agent.Status.BusReplicas != tc.want || agent.Status.BusMigration != nil {
+			t.Errorf("recorded %d, lone claim 0: status.busReplicas = %d migration %+v, want %d and no migration", tc.recorded, agent.Status.BusReplicas, agent.Status.BusMigration, tc.want)
+		}
+	}
+}
+
+// With WhenScaled Retain, a single server scaled by hand to 3 keeps claims 1
+// and 2 after the scale is reverted. If the StatefulSet then goes, the record
+// still holds the bus at one server: read from the claims alone it would come
+// back as a cluster on server 0's standalone store, past the conversion gate.
+// With no claims left there is no bus, and the field (or the default) decides.
+func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	for _, tc := range []struct {
+		name     string
+		recorded int32
+		claims   []int
+		spec     *int
+		want     int32
+	}{
+		{"one server, claims 0-2 from a hand scale", 1, []int{0, 1, 2}, nil, 1},
+		{"one server, claims 0-1 from a hand scale", 1, []int{0, 1}, nil, 1},
+		{"one server, claims 0-2, field asks 3", 1, []int{0, 1, 2}, ptr.To(3), 1},
+		{"three servers, claims 0-2", 3, []int{0, 1, 2}, nil, 3},
+		{"no record, claims 0-2", 0, []int{0, 1, 2}, nil, 3},
+		{"no record, claims 0-1", 0, []int{0, 1}, nil, 3},
+		{"one server recorded, no claims: a new bus", 1, nil, nil, 3},
+		{"one server recorded, no claims, field asks 1", 1, nil, ptr.To(1), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Status.BusReplicas = tc.recorded
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			objs := []client.Object{agent}
+			labels := buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+			for _, o := range tc.claims {
+				objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace, Labels: labels,
+				}})
+			}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
+				busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.want {
+				t.Errorf("status.busReplicas = %d, want %d", agent.Status.BusReplicas, tc.want)
+			}
+			// The recorded count is what a field asking another count
+			// migrates from; the stray claims never decide it.
+			run := agent.Status.BusMigration
+			switch {
+			case tc.spec != nil && *tc.spec != int(tc.want):
+				wantLeg := busMigrationGrow
+				if *tc.spec < int(tc.want) {
+					wantLeg = busMigrationShrink
+				}
+				if run == nil || busMigrationLeg(run.Leg) != wantLeg {
+					t.Errorf("a field asking %d of a %d-server bus: migration %+v, want leg %s", *tc.spec, tc.want, run, wantLeg)
+				}
+			case run != nil:
+				t.Errorf("a migration started: %+v", run)
+			}
+			_ = rec
+		})
+	}
+}
+
+// Pods are not watched, so the short server's note follows its pod only if a
+// short bus requeues on a provisioned, Ready pass; and the note skips a pod
+// on its way out, which its successor replaces.
+func TestAShortBusRequeuesAndItsNoteSkipsATerminatingPod(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Status = appsv1.StatefulSetStatus{Replicas: 3, ReadyReplicas: 2}
+	leaving := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: a2aNATSName(agent) + "-2", Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)},
+		DeletionTimestamp: ptr.To(metav1.Now()), Finalizers: []string{"test/hold"},
+	}}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(sts, leaving).WithStatusSubresource(&appsv1.StatefulSet{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	settled := a2aProvisionState{done: true}
+	if !r.a2aBusNeedsRecheck(ctx, agent, settled) {
+		t.Error("a provisioned bus one server short does not requeue; its Ready note would stand stale until the 15-minute re-probe")
+	}
+	if note := r.a2aNATSShortNote(ctx, agent); strings.Contains(note, "-2:") {
+		t.Errorf("note names a terminating pod: %q", note)
+	}
+	sts.Status.ReadyReplicas = 3
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	if r.a2aBusNeedsRecheck(ctx, agent, settled) {
+		t.Error("a provisioned, fully Ready bus requeues at 30s")
+	}
+}
+
+// A pass that moves the count (the migration's Shrinking phase) and fails
+// after the StatefulSet apply writes no status, so the CR keeps
+// BusProvisioned and the old count. The retry finds the StatefulSet already
+// at the new count; the persisted count still differs, and the record is
+// dropped.
+func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	failCallout := false
+	base := fakeServerSideApplyInterceptors()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				// The bus's client Service, applied right after the
+				// StatefulSet (the callout reconciles before it).
+				if _, isSvc := obj.(*corev1.Service); failCallout && isSvc && obj.GetName() == a2aNATSName(agent) {
+					return fmt.Errorf("injected: the apply after the bus StatefulSet fails")
+				}
+				return base.Patch(ctx, c, obj, patch, opts...)
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	// The callout's current ReplicaSet, which the fake's absent Deployment
+	// controller would have made: without one the bus holds a config change
+	// until it can tell the callout has rolled (a2aBusWaitsForCallout).
+	callout := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aCalloutName(agent)}, callout); err != nil {
+		t.Fatal(err)
+	}
+	calloutReplicaSet(t, ctx, cl, callout, "current", "1")
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusReplicas != 3 || !busProvisioned(agent) {
+		t.Fatalf("precondition: status.busReplicas = %d, BusProvisioned = %v; want 3 and set", agent.Status.BusReplicas, busProvisioned(agent))
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationShrinking),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+
+	// The count-changing pass, on a copy: it fails, so none of its
+	// in-memory status reaches the CR the retry reads.
+	failCallout = true
+	if _, err := r.reconcileA2A(ctx, agent.DeepCopy(), homeChannelRecord{}); err == nil {
+		t.Fatal("precondition: the injected failure did not fail the count-changing pass")
+	}
+	failCallout = false
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil || ptr.Deref(sts.Spec.Replicas, 0) != 1 {
+		t.Fatalf("precondition: the failed pass did not land the StatefulSet at 1 (err=%v replicas=%v)", err, sts.Spec.Replicas)
+	}
+
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if busProvisioned(agent) {
+		t.Error("BusProvisioned survived the retry of a count-changing pass that failed after the StatefulSet apply")
+	}
+}
+
+// Setting busReplicas to the other count on an existing bus starts a
+// migration in that direction, read from the StatefulSet or from the claims
+// a deleted one left; the bus keeps the count it runs until the migration's
+// phases convert it, and the field still decides for a bus that does not
+// exist yet.
+func TestAFieldChangeStartsAMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace,
+			Labels: buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels,
+		}}
+	}
+	// sts is a StatefulSet rendered for, and running, replicas servers: the
+	// count resolveA2ABusReplicas reads from its template.
+	sts := func(agent *agentv1alpha1.PlatformAgent, replicas int32) *appsv1.StatefulSet {
+		shaped := agent.DeepCopy()
+		shaped.Status.BusReplicas = replicas
+		s := buildA2ANATSStatefulSet(shaped, "h")
+		s.Spec.Replicas = ptr.To(replicas)
+		return s
+	}
+	for _, tc := range []struct {
+		name    string
+		spec    int
+		objects func(*agentv1alpha1.PlatformAgent) []client.Object
+		want    int32
+		leg     busMigrationLeg
+	}{
+		{"one to three", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, busMigrationGrow},
+		{"three to one", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, busMigrationShrink},
+		{"three to one over a deleted cluster's claims", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+			return []client.Object{claim(a, 0), claim(a, 1)}
+		}, 3, busMigrationShrink},
+		{"one to three over a deleted single server's claim", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0)} }, 1, busMigrationGrow},
+		{"the count it runs", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, ""},
+		{"a new bus takes the field", 1, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Generation = 4
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.want || int(*buildA2ANATSStatefulSet(agent, "h").Spec.Replicas) != int(tc.want) {
+				t.Errorf("status %d, rendered %d; want %d until the migration converts it", agent.Status.BusReplicas, *buildA2ANATSStatefulSet(agent, "h").Spec.Replicas, tc.want)
+			}
+			run := agent.Status.BusMigration
+			switch {
+			case tc.leg == "" && run != nil:
+				t.Errorf("no migration wanted, started %+v", run)
+			case tc.leg != "" && (run == nil || run.Leg != string(tc.leg) || run.ObservedGeneration != 4 || run.Deadline.Sub(run.StartedAt.Time) != busMigrationRunDeadline):
+				t.Errorf("migration %+v, want leg %s at generation 4 with the run deadline", run, tc.leg)
+			}
+		})
+	}
+}
+
+// A migration under way is not restarted. One that ended without converting
+// is not started again by an unrelated spec change or a GitOps sync (a new
+// generation asking the same count): only by a different count, or a
+// person naming the last run in the start annotation.
+func TestAMigrationStartsOnlyOnANewTargetOrWhenAsked(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	agent := a2aTestAgent()
+	agent.Generation = 7
+	now := metav1.Now()
+	startBusMigration(agent, 1, 3, now)
+	first := agent.Status.BusMigration.RunID
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(time.Minute)))
+	if agent.Status.BusMigration.RunID != first {
+		t.Error("a migration under way was restarted")
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationAbandoned)
+	for gen := int64(7); gen <= 9; gen++ { // the same generation, then unrelated edits
+		agent.Generation = gen
+		startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(time.Duration(gen)*time.Minute)))
+		if agent.Status.BusMigration.RunID != first {
+			t.Fatalf("generation %d asking the same count started run %s", gen, agent.Status.BusMigration.RunID)
+		}
+	}
+	agent.Annotations = map[string]string{a2aBusMigrationStartAnnotation: "9-999"}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(10*time.Minute)))
+	if agent.Status.BusMigration.RunID != first {
+		t.Fatal("a start annotation naming another run started one")
+	}
+	agent.Annotations = map[string]string{a2aBusMigrationStartAnnotation: first}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(11*time.Minute)))
+	second := agent.Status.BusMigration
+	if second.RunID == first || busMigrationPhase(second.Phase) != busMigrationFreezing {
+		t.Fatalf("the start annotation naming the last run: %+v, want a new run from Freezing", second)
+	}
+	// The annotation, left in place, names the old run now: once only.
+	second.Phase = string(busMigrationAbandoned)
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(12*time.Minute)))
+	if agent.Status.BusMigration.RunID != second.RunID {
+		t.Error("a start annotation left in place started a third run")
+	}
+	// A different count starts one with no annotation.
+	agent.Annotations = nil
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "x", Phase: string(busMigrationAbandoned)}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(13*time.Minute)))
+	if agent.Status.BusMigration.RunID == "x" {
+		t.Error("a new count after a three to one run did not start a migration")
+	}
+}
+
+// The whole pass, both directions: a field change starts a migration whose
+// first phase (the pin, or the freeze) keeps the bus at the count it runs,
+// so the StatefulSet stays there, including on the retry of a pass that
+// failed after its StatefulSet apply, and BusProvisioned stands.
+func TestAFieldChangeRendersNothingTowardTheNewCountBeforeTheMigrationDoes(t *testing.T) {
+	for _, from := range []int32{1, 3} {
+		to := 4 - int(from)
+		agent := a2aTestAgent()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(int(from))}}
+		scheme := setupScheme()
+		failCallout := false
+		base := fakeServerSideApplyInterceptors()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+			WithInterceptorFuncs(interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				// The bus's client Service, applied right after the
+				// StatefulSet (the callout reconciles before it).
+				if _, isSvc := obj.(*corev1.Service); failCallout && isSvc && obj.GetName() == a2aNATSName(agent) {
+					return fmt.Errorf("injected: the apply after the bus StatefulSet fails")
+				}
+				return base.Patch(ctx, c, obj, patch, opts...)
+			}}).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+		ctx := context.Background()
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+			t.Fatal(err)
+		}
+		replicas := func() int32 {
+			t.Helper()
+			sts := &appsv1.StatefulSet{}
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+				t.Fatal(err)
+			}
+			return ptr.Deref(sts.Spec.Replicas, 0)
+		}
+		if got := replicas(); got != from {
+			t.Fatalf("precondition: the bus runs %d, want %d", got, from)
+		}
+		agent.Spec.Harness.Tuning.BusReplicas = ptr.To(to)
+		failCallout = true
+		if _, err := r.reconcileA2A(ctx, agent.DeepCopy(), homeChannelRecord{}); err == nil {
+			t.Fatal("precondition: the injected failure did not fail the pass")
+		}
+		if got := replicas(); got != from {
+			t.Errorf("%d to %d, failed pass: the StatefulSet went to %d", from, to, got)
+		}
+		failCallout = false
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := replicas(); got != from || agent.Status.BusReplicas != from {
+			t.Errorf("%d to %d, retry: StatefulSet %d, status.busReplicas %d; want %d", from, to, got, agent.Status.BusReplicas, from)
+		}
+		if !busProvisioned(agent) {
+			t.Errorf("%d to %d: BusProvisioned dropped although the count did not change", from, to)
+		}
+	}
+}
+
+// A StatefulSet scaled by hand outside 1 and 3 is still the bus last
+// resolved: a single server scaled to 2 (claims -0 and -1, which read like a
+// cluster short one) or to 0 (claims gone) stays one server, and a cluster
+// stays three, so neither the default nor a set field converts it.
+func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		recorded int32
+		scaled   int32
+		claims   []int
+		spec     *int
+	}{
+		{"one server scaled to 2", 1, 2, []int{0, 1}, nil},
+		{"one server scaled to 0", 1, 0, nil, nil},
+		{"one server scaled to 2, field asks 3", 1, 2, []int{0, 1}, ptr.To(3)},
+		{"three servers scaled to 0", 3, 0, nil, nil},
+		{"three servers scaled to 2, field asks 1", 3, 2, []int{0, 1}, ptr.To(1)},
+		// No record (pruned, or a failed first write): the rendered shape,
+		// not the claims a scale to 2 adds.
+		{"one server scaled to 2, no record", 0, 2, []int{0, 1}, nil},
+		{"three servers scaled to 2, no record", 0, 2, []int{0, 1}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Status.BusReplicas = tc.recorded
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			want := tc.recorded
+			if want == 0 {
+				want = 1
+				if strings.HasPrefix(tc.name, "three") {
+					want = 3
+				}
+			}
+			shaped := agent.DeepCopy()
+			shaped.Status.BusReplicas = want
+			sts := buildA2ANATSStatefulSet(shaped, "h")
+			sts.Spec.Replicas = ptr.To(tc.scaled)
+			objs := []client.Object{agent, sts}
+			for _, o := range tc.claims {
+				objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace,
+					Labels: sts.Spec.VolumeClaimTemplates[0].Labels,
+				}})
+			}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != want || a2aNATSReplicas(agent) != int(want) {
+				t.Errorf("status.busReplicas %d, rendered %d; want %d", agent.Status.BusReplicas, a2aNATSReplicas(agent), want)
+			}
+		})
+	}
+}
+
+// An install upgraded from the operator that refused bus conversions may
+// carry its A2ABusConversionRefused condition; this operator, which
+// migrates instead, removes it on its first status write and never writes
+// it.
+func TestTheRetiredConversionRefusalIsCleared(t *testing.T) {
+	agent := a2aTestAgent()
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{Type: a2aBusConversionRefusedConditionType, Status: metav1.ConditionTrue,
+		Reason: "ConversionNotSupported", Message: "left by an earlier operator", LastTransitionTime: metav1.Now()})
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(stored.Status.Conditions, a2aBusConversionRefusedConditionType); c != nil {
+		t.Errorf("the retired condition is still on the CR: %+v", c)
+	}
+}
+
+// Without the operator's own image nothing could run the migration's work,
+// so a busReplicas change starts none: the bus keeps its count and a
+// Warning says why, rather than a run that freezes writes until its
+// deadline.
+func TestNoOperatorImageStartsNoMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "")
+	agent := a2aTestAgent()
+	// A bus rendered for one server, so the field below asks it to grow.
+	sts := buildA2ANATSStatefulSet(a2aSingleServerTestAgent(), "h")
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(3)}}
+	rec := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || agent.Status.BusReplicas != 1 {
+		t.Errorf("migration %+v, busReplicas %d; want none and 1", agent.Status.BusMigration, agent.Status.BusReplicas)
+	}
+	select {
+	case e := <-rec.Events:
+		if !strings.Contains(e, reasonA2ABusMigrationUnavailable) || !strings.Contains(e, "OPERATOR_IMAGE") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning saying why the migration did not start")
+	}
+}
+
+// a2aSingleServerTestAgent is a2aTestAgent with a one-server bus: the in-place
+// reload is a single server's, and a cluster rolls instead.
+func a2aSingleServerTestAgent() *agentv1alpha1.PlatformAgent {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	return agent
+}
+
+// emptyBusStreams is a bus whose provisioned streams hold nothing: none is
+// over a limit, so a one to three migration may start.
+func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+	streams := map[string]a2aBusStream{}
+	for _, p := range a2aStreamPolicies(1) {
+		streams[p.Name] = a2aBusStream{}
+	}
+	return streams, nil
+}
+
+// One server to three restores every stream under the cap this operator
+// renders, behind a write freeze. A stream already over its cap, or a bus
+// whose stream sizes can't be read, refuses the run before anything freezes:
+// no migration starts, the bus keeps its one server, and a Warning says why.
+// A stream at its cap exactly, and a shrink, start as before.
+func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	var tasks busmigratePolicy
+	for _, p := range a2aStreamPolicies(1) {
+		if p.Name == "TASKS" {
+			tasks = busmigratePolicy{p.MaxBytes, p.MaxAge}
+		}
+	}
+	with := func(name string, st a2aBusStream) map[string]a2aBusStream {
+		m, _ := emptyBusStreams(context.Background(), nil)
+		m[name] = st
+		return m
+	}
+	now := time.Now()
+	for _, tc := range []struct {
+		name      string
+		single    bool
+		ask       int
+		streams   map[string]a2aBusStream
+		readErr   error
+		wantStart bool
+		wantWarn  string
+	}{
+		{"TASKS over its cap", true, 3, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes + 1}), nil, false, "TASKS holds"},
+		{"TASKS keeps a message past its max age", true, 3, with("TASKS", a2aBusStream{Bytes: 1, Msgs: 1, FirstTime: now.Add(-tasks.maxAge - time.Hour)}), nil, false, "older than its"},
+		{"the sizes can't be read", true, 3, nil, errors.NewServiceUnavailable("no monitor"), false, "could not be read"},
+		{"a report listing none of the streams", true, 3, map[string]a2aBusStream{}, nil, false, "lists none"},
+		{"TASKS at its cap, inside its age", true, 3, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes, Msgs: 1, FirstTime: now.Add(-time.Hour)}), nil, true, ""},
+		{"a stream the policies don't name", true, 3, with("SOMETHING_ELSE", a2aBusStream{Bytes: 1 << 40}), nil, true, ""},
+		{"a shrink isn't checked", false, 1, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes + 1}), nil, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			render := agent
+			if tc.single {
+				render = a2aSingleServerTestAgent()
+			}
+			sts := buildA2ANATSStatefulSet(render, "h")
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.ask)}}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec,
+				busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+					return tc.streams, tc.readErr
+				}}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+				t.Fatal(err)
+			}
+			if started := agent.Status.BusMigration != nil; started != tc.wantStart {
+				t.Fatalf("migration %+v, want started=%v", agent.Status.BusMigration, tc.wantStart)
+			}
+			if tc.wantWarn == "" {
+				return
+			}
+			select {
+			case ev := <-rec.Events:
+				if !strings.Contains(ev, reasonA2ABusMigrationStreamsOverCap) || !strings.Contains(ev, tc.wantWarn) {
+					t.Errorf("event %q, want %s naming %q", ev, reasonA2ABusMigrationStreamsOverCap, tc.wantWarn)
+				}
+			default:
+				t.Error("no Warning saying why the migration did not start")
+			}
+		})
+	}
+}
+
+// busmigratePolicy is the two limits the pre-check reads off a policy.
+type busmigratePolicy struct {
+	maxBytes int64
+	maxAge   time.Duration
+}
+
+// The decoder reads the fields nats-server's /jsz?streams=true reports, in
+// a body captured from nats-server v2.14.5 (account and stream trimmed to
+// one each): bytes, messages and the oldest message's time per stream.
+func TestTheJszReportDecodesEachStreamsState(t *testing.T) {
+	body := `{"server_id":"x","now":"2026-11-12T00:20:12Z","config":{},"memory":0,"storage":55,"streams":1,
+		"account_details":[{"name":"TRUSTED","id":"TRUSTED","stream_detail":[{"name":"TASKS","created":"2026-11-12T00:20:12Z",
+		"state":{"messages":1,"bytes":55,"first_seq":1,"first_ts":"2026-11-12T00:20:12.227001Z","last_seq":1,
+		"last_ts":"2026-11-12T00:20:12.227001Z","num_subjects":1,"consumer_count":0}}]}]}`
+	got, err := decodeA2AJsz("jsz", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := a2aBusStream{Bytes: 55, Msgs: 1, FirstTime: time.Date(2026, 11, 12, 0, 20, 12, 227001000, time.UTC)}
+	if got["TASKS"] != want {
+		t.Errorf("TASKS = %+v, want %+v", got["TASKS"], want)
+	}
+}
+
+// A bus never provisioned, with no migration behind it, takes a changed
+// count as asked: no run starts against a bus with no streams, and on a
+// cluster that can't schedule three servers this is how the count comes
+// down. A bus whose last migration changed the count waits for the
+// provisioning after it before the next run starts.
+func TestNoMigrationStartsBeforeTheBusIsProvisioned(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	threeServers := func() (*agentv1alpha1.PlatformAgent, *PlatformAgentReconciler) {
+		agent := a2aTestAgent()
+		agent.Status.BusReplicas = 3
+		sts := buildA2ANATSStatefulSet(agent, "h")
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(),
+			Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+		return agent, r
+	}
+
+	agent, r := threeServers()
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || agent.Status.BusReplicas != 1 {
+		t.Errorf("never provisioned: migration %+v, busReplicas %d; want none and the asked 1", agent.Status.BusMigration, agent.Status.BusReplicas)
+	}
+
+	agent, r = threeServers()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationDone)}
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration.RunID != "2-1" || agent.Status.BusReplicas != 3 {
+		t.Errorf("not yet provisioned after a run: run %s, busReplicas %d; want the old run and 3", agent.Status.BusMigration.RunID, agent.Status.BusReplicas)
+	}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration.RunID == "2-1" || busMigrationLeg(agent.Status.BusMigration.Leg) != busMigrationShrink {
+		t.Errorf("once provisioned: run %+v, want a new three-to-one run", agent.Status.BusMigration)
+	}
+}
+
+// The bus logs at debug only while the operator's environment carries
+// A2A_NATS_DEBUG=true, as CI's does; never trace, which logs payloads. The
+// default render, and any other value, has neither.
+func TestTheBusLogsAtDebugOnlyWhenTheOperatorAsks(t *testing.T) {
+	render := func() string {
+		return renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "") // a developer shell may carry it
+	debugLine := regexp.MustCompile(`(?m)^\s*debug:`)
+	traceLine := regexp.MustCompile(`(?m)^\s*(trace|trace_verbose):`)
+	if conf := render(); debugLine.MatchString(conf) || traceLine.MatchString(conf) {
+		t.Errorf("the default render logs at debug or trace:\n%s", conf)
+	}
+	for _, v := range []string{"1", "yes", "TRUE", ""} {
+		t.Setenv(a2aNATSDebugEnvVar, v)
+		if debugLine.MatchString(render()) {
+			t.Errorf("%s=%q turned debug on; only \"true\" does", a2aNATSDebugEnvVar, v)
+		}
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "true")
+	conf := render()
+	if !regexp.MustCompile(`(?m)^debug: true$`).MatchString(conf) {
+		t.Errorf("%s=true left debug off:\n%s", a2aNATSDebugEnvVar, conf)
+	}
+	if traceLine.MatchString(conf) {
+		t.Error("debug brought trace with it")
+	}
+	// The rendered config still parses with the line in it.
+	full := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aFullCreds("c", "1"), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	path := filepath.Join(t.TempDir(), "nats.conf")
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, strings.NewReplacer(`pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, "server_name: $POD_NAME", "server_name: n0").Replace(full))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := natsserver.ProcessConfigFile(path)
+	if err != nil {
+		t.Fatalf("the debug render does not parse: %v", err)
+	}
+	if !opts.Debug || opts.Trace {
+		t.Errorf("parsed debug=%v trace=%v, want debug only", opts.Debug, opts.Trace)
+	}
+}

@@ -48,7 +48,7 @@
 # archives every `bootstrap-inventory-*` card and removes the cap file. The
 # onboarding state lock (hack/ci-eval-pr.sh, unit_state_lock) keeps it apart
 # from the other cases whose stacks rewrite the onboarding markers, which puts
-# it in the nightly's main-a whatever hack/eval/nightly-main-b.txt says.
+# it in the nightly's main-a whatever the hack/eval/nightly-main-*.txt lists say.
 # Eligible tier: nightly -- the sweep's cards take dispatcher slots that other
 # cases' cards running at the same time would use.
 ---

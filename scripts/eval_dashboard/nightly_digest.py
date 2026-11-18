@@ -388,7 +388,7 @@ class Builder:
         if ungraded:
             notes.append(NOT_GRADED_NOTE.format(count=ungraded))
         cut = [PART_CUT_NOTE.format(part=nightly.PART_WORDS.get(p.get("part"), p.get("part"))) for p in night.get("parts") or [] if p.get("truncated")]
-        # A writers part missing or still running is named too (main halves
+        # A writers part missing or still running is named too (main shards
         # held the section back above), and keeps the night from being quiet.
         cut += nightly.part_notes(night, cut=False)
         notes += cut
