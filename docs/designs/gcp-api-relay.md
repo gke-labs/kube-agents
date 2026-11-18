@@ -391,13 +391,19 @@ class ApiSession:
 `relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
 where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set and well-formed, else
 `CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
-has the routing and the fallback). `requests` is imported inside the
+has the routing and the fallback). When the caller's environment names a custom universe domain
+(`GOOGLE_CLOUD_UNIVERSE_DOMAIN`, which the sandbox entrypoint forwards to each sandbox SSH
+session, then `CLOUDSDK_CORE_UNIVERSE_DOMAIN`), `relay_url` also rewrites a
+`<service>.googleapis.com` host to `<service>.<universe domain>`, the form in which
+[the policy module](#the-policy-module) reads the table's hosts there.
+`requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module
 stay free of it; `http` is injectable for tests and for a caller that already holds a session.
 
 Two properties of that shape are the point. A collector's URL literal,
 `https://monitoring.googleapis.com/v3/projects/{project}/timeSeries`, stays as written, so a
-manifest's evidence label still names the real endpoint. And the object satisfies a
+manifest's evidence label still names the Google endpoint the collector reads, in its commercial
+form on a custom universe domain. And the object satisfies a
 `SessionFn`-style contract — "anything with a `requests`-shaped `.get(url, params=,
 timeout=)`" — so code written against `google.auth.transport.requests.AuthorizedSession`
 runs against it unchanged.
@@ -602,7 +608,7 @@ The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py
 and `gke_cluster_reads.py` makes the Cluster Agent reconcile's GKE list and get reads;
 `logging_reads.py` makes the stockout collector's and the readiness report's log reads, and falls back to `gcloud logging read`),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
-`ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
+`ApiSession()` instead of from `google.auth`, keeps its URL literals as the commercial endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's
 `limitations` note rather than as zero usage, which is the reading the cost SOP already
 prescribes for a usage check that did not run. Nothing in the sandbox can use `google.auth`,

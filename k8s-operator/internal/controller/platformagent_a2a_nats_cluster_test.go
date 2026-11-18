@@ -929,7 +929,7 @@ func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
 			}
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			agent.Status.BusReplicas = tc.recorded
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
 				busStreamState: emptyBusStreams}
 			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
@@ -1467,7 +1467,7 @@ func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
 				}})
 			}
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: rec,
 				busStreamState: emptyBusStreams}
 			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
@@ -1633,7 +1633,7 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 			agent := a2aTestAgent()
 			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
 			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
@@ -1940,7 +1940,7 @@ func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 			sts := buildA2ANATSStatefulSet(render, "h")
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.ask)}}
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec,
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(), Scheme: setupScheme(), Recorder: rec,
 				busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 					return tc.streams, tc.readErr
 				}}
@@ -2002,7 +2002,7 @@ func TestNoMigrationStartsBeforeTheBusIsProvisioned(t *testing.T) {
 		agent.Status.BusReplicas = 3
 		sts := buildA2ANATSStatefulSet(agent, "h")
 		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
-		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(),
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build(),
 			Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
 		return agent, r
 	}

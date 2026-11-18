@@ -264,5 +264,18 @@ class TestAllowWriter(unittest.TestCase):
                 self.assertIsNone(self.vcs.committed)
 
 
+
+class TestCli(unittest.TestCase):
+    def test_an_unexpected_forge_error_prints_retry_with_its_reason(self):
+        import json
+
+        out = io.StringIO()
+        with mock.patch.object(pmo, "offer", side_effect=RuntimeError("identity: 502")), \
+                contextlib.redirect_stdout(out):
+            code = pmo.main(["--repo", "https://github.com/acme/gitops", "--number", "7", "--kind", "no-pdb",
+                             "--environment", "dev"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue()), {"action": "retry", "reason": "RuntimeError: identity: 502"})
+
 if __name__ == "__main__":
     unittest.main()

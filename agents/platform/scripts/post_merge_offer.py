@@ -218,7 +218,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kind", required=True)
     parser.add_argument("--environment", required=True)
     args = parser.parse_args(argv)
-    result = offer(args.repo, args.number, args.kind, args.environment)
+    try:
+        result = offer(args.repo, args.number, args.kind, args.environment)
+    except Exception as exc:  # noqa: BLE001 -- a forge error outside offer()'s own handling: the driver retries
+        result = {"action": "retry", "reason": f"{type(exc).__name__}: {exc}"}
     print(json.dumps(result, indent=2))
     # As the step-down's CLI does: a retry is a run that did not finish.
     return 1 if result["action"] == "retry" else 0
