@@ -165,7 +165,9 @@ item with its cost.
   one scenario. The sizing is per scenario, and a slice runs every scenario of its roster part
   serially, so a part's size is bounded by the timeout; the rule that bounds it is an open
   item. A Rerun on the same release pools into its window.
-- **Artifacts.** The lane's logs bucket, one path a job, `logs/ci-kube-agents-validated-capabilities-<N>/<build>/`:
+- **Artifacts.** The lane's logs bucket, one path a job, `logs/ci-kube-agents-validated-capabilities-<N>/<build>/`
+  (the first slice's builds under its job's earlier name are in `logs/ci-kube-agents-certification-1/`, and
+  the page's reader lists that folder too):
   `case-<id>.json` per scenario per build, written by `hack/ci-eval-pr.sh` when the scenario's
   last repetition has finished (one result per repetition inside it; a cut build has none for
   the scenario it was inside), and `artifacts/release-under-test.json`

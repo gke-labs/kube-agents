@@ -13,6 +13,7 @@ finished builds, read from the bucket they log to, and the notes health.py carri
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import pathlib
@@ -109,6 +110,7 @@ def archive(job, builds, podinfo=None, log=None):
 
 CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-validated-capabilities-1"]
 CERT_2 = periodics.WATCHED_BY_JOB["ci-kube-agents-validated-capabilities-2"]
+CERT_OLD = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-1"]
 REPLAY_LANE = periodics.WATCHED_BY_JOB["ci-kube-agents-eval-replay-lane"]
 
 
@@ -135,7 +137,7 @@ class FetchTest(unittest.TestCase):
         # nightlies, so their builds live under EVAL_NIGHTLY_LOGS_ROOT; a read
         # under the periodic-logs root would find nothing and the lane would be
         # unwatched without anyone knowing.
-        for job in (CERT, CERT_2, REPLAY_LANE):
+        for job in (CERT, CERT_2, CERT_OLD, REPLAY_LANE):
             with self.subTest(job=job.job):
                 root = f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{job.job}"
                 # The newest build is still running (no finished.json), so the read
@@ -152,7 +154,7 @@ class FetchTest(unittest.TestCase):
         self.assertNotIn(periodics.LOGS_ROOT, "".join(call[-1] for call in gcloud.calls))
         self.assertEqual(periodics.history_url(CERT.job, CERT.logs_root), f"https://oss.gprow.dev/job-history/gs/kube-agents-evals-nightly-logs/logs/{CERT.job}")
         self.assertEqual(periodics.history_url(DAILY.job), f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{DAILY.job}")
-        for slice_ in (CERT, CERT_2):
+        for slice_ in (CERT, CERT_2, CERT_OLD):
             self.assertEqual(slice_.stale_after, timedelta(days=8), "a week between runs plus a day: a missed Saturday reads STALE on the Sunday")
 
     def test_each_lane_slice_is_watched_under_its_own_part(self):
@@ -164,6 +166,20 @@ class FetchTest(unittest.TestCase):
             for words in (slice_.absence, slice_.presence, slice_.does, slice_.effect):
                 self.assertIn(f"part {part}", words)
         self.assertEqual((CERT.logs_root, CERT.artifact, CERT.runbook), (CERT_2.logs_root, CERT_2.artifact, CERT_2.runbook))
+
+    def test_the_first_slice_stays_watched_under_the_name_its_job_still_has(self):
+        # oss-test-infra renames the job only once a release admits the new
+        # name; until then the old name is the job that runs, and a failed
+        # build of it must still write a note.
+        self.assertEqual(CERT_OLD.job, periodics.VALIDATED_CAPABILITIES_SLICE_1_OLD_JOB)
+        self.assertEqual(dataclasses.replace(CERT_OLD, job=CERT.job), CERT)
+        objects = archive_at(f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT_OLD.job}", {"300": finished(NOW - timedelta(days=1), passed=False)})
+        watched = (CERT, CERT_2, CERT_OLD)
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=watched, runner=FakeGcloud(objects))
+        notes = periodics.assess(readings, NOW, {}, watched=watched)
+        self.assertEqual(sorted(notes), [CERT_OLD.job], "the new names have no build yet and write nothing")
+        self.assertEqual(notes[CERT_OLD.job][periodics.KEY_VERDICT], periodics.VERDICT_FAILED)
 
     def test_a_lane_slice_with_no_build_yet_writes_no_note(self):
         # A slice is admitted here before its job has run once (its first
@@ -1168,7 +1184,7 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
             ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-validated-capabilities-1",
-             "ci-kube-agents-validated-capabilities-2", "ci-kube-agents-eval-replay-lane"],
+             "ci-kube-agents-validated-capabilities-2", "ci-kube-agents-certification-1", "ci-kube-agents-eval-replay-lane"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))
