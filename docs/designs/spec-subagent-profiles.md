@@ -364,8 +364,10 @@ What the operator renders per profile, as built (amended 10/6):
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
   route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist; with a
   task credential, the MCP relay for Developer Knowledge's two document reads alone
-  (`mcp_policy.PROFILE_SERVER_TOOLS`); and the version-control routes under the permit rule
-  below.
+  (`mcp_policy.PROFILE_SERVER_TOOLS`); the version-control routes under the permit rule
+  below; and the audit-report store's `/v1/audit-reports` routes under the reports allowlist
+  and the builtin-schedule write rule (#5619,
+  [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key

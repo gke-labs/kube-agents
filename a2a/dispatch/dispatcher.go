@@ -109,6 +109,11 @@ type holding struct {
 	// onJob is a task run on a Job of its own (job.go), whose Job endJob
 	// deletes; a pool task has none.
 	onJob bool
+	// permitJob is a permit-carrying task's own Job at a tier whose runner
+	// is its warm pool (#5646). That tier's breaker guards the pool, so this
+	// task never waits on it, is never its probe, and its end or lost worker
+	// never opens or closes it.
+	permitJob bool
 	// lease and renew are what the task was offered (or, re-adopted, what
 	// its record shows): a config change never moves them.
 	lease, renew time.Duration
@@ -837,7 +842,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// as a probe: it is never stamped as one, so its end can't close the
 	// breaker while the probe runs.
 	family := d.probesChild(prof.Name, tier, kind, del.Envelope().CorrelationID)
-	h, why := d.reserve(snap, prof, tier, kind, taskID)
+	h, why := d.reserve(snap, prof, tier, kind, taskID, d.permitJobOffPool(prof, tier, adm.changeRequested, adm.cluster))
 	if h != nil {
 		// A stop heard since admission read the stream (onStop marks only
 		// the holdings it finds, and this one is new): mark it, so the
@@ -873,7 +878,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobRunner(prof, h.tier) {
+	// A permit-carrying task runs only in its own one-pod Job, at any tier
+	// and of any kind (#5646): admission refused one with no Job runner for
+	// its tier (change-needs-job), and the mint gives a pool pod no permit.
+	if (h.unattended || carriesPermit(h.changeRequested, h.cluster)) && d.jobRunner(prof, h.tier) {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
@@ -885,6 +893,16 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 			return
 		}
 	} else {
+		// A submission is replaced under the same subject (admission reads
+		// changeRequested from each delivery), so an earlier pass may have
+		// launched a Job for this task while it carried a permit. That Job
+		// goes before the task is offered to a pool pod, or its pod would wait
+		// for an offer until its deadline, outside every cap. Attempted under
+		// Job mode (the config carries jobLabels) whatever the profile's
+		// template says now; without it the dispatcher has no Jobs Role.
+		if len(snap.JobLabels) > 0 {
+			d.dropUnstartedJob(ctx, log, hk)
+		}
 		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
 	}
 	if errors.Is(err, errStopped) {
@@ -1019,7 +1037,7 @@ const capHeld = "already held here"
 // failed for it: it stays queued. A submission already held here (a second
 // delivery that raced the first past handle's check) is refused as capHeld,
 // never given a second holding.
-func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string) (*holding, string) {
+func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string, permitJob bool) (*holding, string) {
 	unattended := d.cfg.unattendedFor(prof, tier)
 	shared := snap.Ceiling - snap.ChildReserve - snap.InteractiveReserve
 
@@ -1063,8 +1081,10 @@ func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, 
 		return nil, "the free slots are reserved for other kinds"
 	}
 	h := &holding{profile: prof.Name, tier: tier, kind: kind, taskID: taskID, unattended: unattended,
-		probe:    d.breakers.probeEpoch(prof.Name, tier, d.now()),
-		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
+		permitJob: permitJob, renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
+	if !permitJob {
+		h.probe = d.breakers.probeEpoch(prof.Name, tier, d.now())
+	}
 	d.active[hk] = h
 	return h, ""
 }
@@ -1266,7 +1286,8 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
 		rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
 			ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease),
-			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
+			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
+			OnJob: h.onJob}
 		if err := d.putLease(ctx, key, rec); err != nil {
 			// Unrecorded, the task can't be confirmed: a restart
 			// would not know it had started.
@@ -1407,8 +1428,16 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier), onJob: d.cfg.jobPossible(prof, hk.tier) && d.jobs != nil,
-		lease: lease, renew: renew, pod: pod, confirmed: true,
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier),
+		// The record says (#5646); one from an older dispatcher doesn't, and
+		// its task ran on a Job only at an unattended tier. A delete of a Job
+		// never made is no error.
+		onJob: d.jobs != nil && (rec.OnJob || d.cfg.jobPossible(prof, hk.tier)),
+		// A Job at a tier that isn't unattended is a permit-carrying task's
+		// alone, which stays clear of the pool's breaker as it did before
+		// the restart.
+		permitJob: rec.OnJob && !d.cfg.unattendedFor(prof, hk.tier),
+		lease:     lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()
 	if first := d.active[hk]; first != nil {
@@ -1493,7 +1522,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			}
 			if r.final {
 				log.Info("task finished", "pod", rec.Pod)
-				if !d.stopRequestedOn(h) {
+				if !d.stopRequestedOn(h) && !h.permitJob {
 					d.breakers.finished(h.profile, h.tier, h.probe)
 				}
 				d.settle(ctx, log, del, h, key, rec)
@@ -1513,7 +1542,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// against 90s), so a worker that went silent on the stop is
 				// counted here: silent for a renewal and a tick is a worker
 				// lost, and a stop must not hide one.
-				if !now.Before(graceUntil) && now.Sub(rec.RenewedAt) > h.renew+max(h.renew/ticksPerRenewal, minTick) {
+				if !h.permitJob && !now.Before(graceUntil) && now.Sub(rec.RenewedAt) > h.renew+max(h.renew/ticksPerRenewal, minTick) {
 					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
 				}
 				d.stopHeld(ctx, log, del, h, key, rec)
@@ -1524,7 +1553,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// Its worker renewed to the end, so it was no worker loss: the
 				// probe of this opening closes the breaker as on a finish. A
 				// stopped task never closes it.
-				if !d.stopRequestedOn(h) {
+				if !d.stopRequestedOn(h) && !h.permitJob {
 					d.breakers.finished(h.profile, h.tier, h.probe)
 				}
 				d.fail(ctx, log, del, h, key, rec, ReasonDeadlineExceeded,
@@ -1539,8 +1568,11 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// Counted even for a stopped task: a worker lost is a worker
 				// lost, and a stop must not hide one (stopping each poisoned
 				// task would keep the breaker shut). Only closing is denied
-				// a stopped task.
-				d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				// a stopped task. A permit Job at a pool's tier is not the
+				// pool's worker, so it isn't counted on the pool's breaker.
+				if !h.permitJob {
+					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				}
 				d.fail(ctx, log, del, h, key, rec, ReasonLeaseExpired,
 					fmt.Sprintf("worker %s stopped renewing at %s", rec.Pod, rec.RenewedAt.UTC().Format(time.RFC3339)))
 				return

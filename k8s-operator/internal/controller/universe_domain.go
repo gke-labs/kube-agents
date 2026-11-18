@@ -46,9 +46,15 @@ const (
 	universeDomainSourceDiscovered = "Discovered"
 
 	// reasonUniverseDomainMismatch parks Ready False / Phase Degraded before
-	// rendering workloads when spec.harness.universeDomain disagrees with the
-	// host cluster's metadata server.
+	// rendering workloads when spec.harness.universeDomain is malformed, is
+	// under googleapis.com, or disagrees with the host cluster's metadata
+	// server.
 	reasonUniverseDomainMismatch = "UniverseDomainMismatch"
+	// universeDomainUnderCommercialMsgFmt answers a spec.harness.universeDomain
+	// under the commercial domain: the value, the commercial domain, and the
+	// commercial domain again as what to set.
+	universeDomainUnderCommercialMsgFmt = "spec.harness.universeDomain %q is under %q, which is the commercial Google Cloud universe and not another one. " +
+		"Set spec.harness.universeDomain to %q (or omit it to auto-detect from the host cluster)."
 	universeDomainMismatchMsgFmt = "spec.harness.universeDomain is %q, while the host cluster's GKE metadata server reports %q. " +
 		"One PlatformAgent spans a single Google Cloud universe domain and will not send tokens across universe boundaries. " +
 		"Set spec.harness.universeDomain to %q (or omit it to auto-detect from the host cluster)."
@@ -172,7 +178,8 @@ func (r *PlatformAgentReconciler) hostUniverseDomain(ctx context.Context) (strin
 
 // validateUniverseDomain checks that spec.harness.universeDomain, when
 // explicitly set, does not contradict the host cluster's GKE metadata server,
-// and is a well-formed DNS domain even when admission webhooks are off.
+// and is a well-formed DNS domain that is not under googleapis.com, even when
+// admission webhooks are off.
 // When the metadata probe fails transiently on GKE, transient=true asks the
 // caller to requeue rather than rendering cross-universe workloads unverified.
 func (r *PlatformAgentReconciler) validateUniverseDomain(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (reason, message string, transient bool) {
@@ -188,6 +195,10 @@ func (r *PlatformAgentReconciler) validateUniverseDomain(ctx context.Context, ag
 			return "", "", true
 		}
 		return "", "", false
+	}
+	if agentv1alpha1.IsUnderCommercialUniverseDomain(specDomain) {
+		return reasonUniverseDomainMismatch, fmt.Sprintf(universeDomainUnderCommercialMsgFmt,
+			specDomain, agentv1alpha1.DefaultUniverseDomain, agentv1alpha1.DefaultUniverseDomain), false
 	}
 	if !agentv1alpha1.IsValidUniverseDomain(specDomain) {
 		return reasonUniverseDomainMismatch, fmt.Sprintf(
@@ -243,7 +254,8 @@ func (r *PlatformAgentReconciler) resolvedUniverseDomainPair(ctx context.Context
 // reconcileAgentNetworkGuardrails on refusal and requeue branches before step
 // 10a, plus skipFQDN=true when no authoritative universe is known yet (a
 // cold-start metadata timeout with empty status.resolvedUniverseDomain).
-// When spec.harness.universeDomain was refused (mismatch or malformed syntax),
+// When spec.harness.universeDomain was refused (mismatch, malformed syntax, or
+// a name under googleapis.com),
 // the rejected spec value is cleared so FQDNNetworkPolicy never renders rules
 // for a rejected or unparseable universe domain.
 func (r *PlatformAgentReconciler) guardrailAgentForUniverse(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, bool) {

@@ -36,7 +36,7 @@ func newFakeJobs(readyAfter time.Duration) *fakeJobs {
 	return &fakeJobs{readyAfter: readyAfter, failed: map[string]bool{}, launchedAt: map[string]time.Time{}}
 }
 
-func (f *fakeJobs) Launch(_ context.Context, _, _, taskID string) (time.Time, error) {
+func (f *fakeJobs) Launch(_ context.Context, _, _, _, taskID string) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.launches = append(f.launches, taskID)
@@ -49,7 +49,7 @@ func (f *fakeJobs) Launch(_ context.Context, _, _, taskID string) (time.Time, er
 	return f.launchedAt[taskID], nil
 }
 
-func (f *fakeJobs) Pod(_ context.Context, _, _, taskID string) (string, bool, error) {
+func (f *fakeJobs) Pod(_ context.Context, _, _, _, taskID string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.podErr != nil {
@@ -68,7 +68,7 @@ func (f *fakeJobs) Pod(_ context.Context, _, _, taskID string) (string, bool, er
 	return "job-" + taskID, false, nil
 }
 
-func (f *fakeJobs) Delete(_ context.Context, _, _, taskID string) error {
+func (f *fakeJobs) Delete(_ context.Context, _, _, _, taskID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, taskID)
@@ -402,7 +402,7 @@ func TestAnUnstartedTasksJobIsDeletedWhenItEndsAtAdmission(t *testing.T) {
 			b := newBus(t, "job-task-1")
 			b.ensure("inv", 1, 0, "unattended")
 			jobs := newFakeJobs(0)
-			if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // before the restart
+			if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // before the restart
 				t.Fatal(err)
 			}
 			v := setup(b)
@@ -422,7 +422,7 @@ func TestAnUnstartedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
 	b := newBus(t, "job-task-1")
 	b.ensure("inv", 1, 0, "unattended")
 	jobs := newFakeJobs(0)
-	if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // an earlier pass, in Job mode
+	if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // an earlier pass, in Job mode
 		t.Fatal(err)
 	}
 	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
@@ -468,7 +468,7 @@ func TestAnUnstartedTasksJobIsDeletedWhenItsProfileLeaves(t *testing.T) {
 			b := newBus(t, "job-task-1")
 			b.ensure("inv", 1, 0, "unattended")
 			jobs := newFakeJobs(0)
-			if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // an earlier pass
+			if _, err := jobs.Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil { // an earlier pass
 				t.Fatal(err)
 			}
 			ti := unattendedInstall(1, nil)

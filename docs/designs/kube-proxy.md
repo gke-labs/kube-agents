@@ -19,6 +19,7 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Go module                                | [`k8s-api-proxy/go.mod`](../../k8s-api-proxy/go.mod) (`github.com/gke-labs/kube-agents/k8s-api-proxy`)                               |
 | Core HTTP handler and L7 policy          | [`k8s-api-proxy/pkg/k8sapiproxy/`](../../k8s-api-proxy/pkg/k8sapiproxy/)                                                             |
 | Pluggable upstream transport interface   | [`k8s-api-proxy/pkg/k8sapiproxy/transport.go`](../../k8s-api-proxy/pkg/k8sapiproxy/transport.go)                                     |
+| Caller authentication (TokenReview)      | [`k8s-api-proxy/pkg/tokenreview/`](../../k8s-api-proxy/pkg/tokenreview/)                                                             |
 | GKE HTTPS upstream transport             | [`k8s-api-proxy/pkg/upstream/`](../../k8s-api-proxy/pkg/upstream/)                                                                   |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
@@ -134,11 +135,12 @@ k8s-api-proxy/
     │   ├── secrets.go            # PartialObjectMetadata rewrite + Secret response redaction
     │   ├── cache.go              # Pluggable CacheStore, MemoryCacheStore, in-flight request coalescing, and RFC 9111/9211 cache
     │   ├── headers.go            # Strip Authorization, Impersonate-*, X-Remote-*, unsafe Upgrade headers
-    │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
     │   ├── audit.go              # AuditSink interface, AuditEvent struct, and slog audit sink
     │   ├── metrics.go            # Closed-vocabulary Prometheus metrics collector
     │   ├── telemetry.go          # OpenTelemetry OTLP HTTP tracer setup
-    │   └── transport.go          # UpstreamTransport interface
+    │   └── transport.go          # CallerAuthenticator and UpstreamTransport interfaces, ErrAuthenticationUnavailable
+    ├── tokenreview/
+    │   └── tokenreview.go        # TokenReview CallerAuthenticator with TTL cache (the binary's)
     └── upstream/
         ├── upstream.go           # GKE HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
         └── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
@@ -160,6 +162,10 @@ type CallerIdentity struct {
 	UID      string
 	Groups   []string
 }
+
+// ErrAuthenticationUnavailable is wrapped by an authenticator that could not decide, so the
+// handler answers 503 rather than 401.
+var ErrAuthenticationUnavailable = errors.New("caller authentication is unavailable")
 
 // CallerAuthenticator verifies that an incoming request comes from an authorized sandbox.
 type CallerAuthenticator interface {
@@ -245,7 +251,7 @@ Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path co
 
 In [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile):
 
-- The stock `kubectl` binary is installed at `/usr/local/libexec/kubectl`, with a thin `/usr/local/bin/kubectl` wrapper that, when `KUBE_PROXY_URL` is set and `--context` is passed, invokes `credential_proxy_client.py --ensure-kubectl-context` unless `/usr/local/libexec/kubectl-context-registered` finds that step's own record (written beside the kubeconfig under its lock) that it found the context current in these exact file bytes for this proxy URL, CA file and token file, at the helper's own record version, before `exec`ing `/usr/local/libexec/kubectl`. The pinned version is 1.34 or later: before 1.34, `kubectl get --raw` replaced the server URL's path with the raw path, so a paged collection read through a `/clusters/<ctx>` kubeconfig reached the proxy with no cluster in it, which the proxy now refuses (section 3). The pin is 1.35, inside kubectl's one-minor skew for the GKE 1.35 and 1.36 clusters the fleet runs. The image build (`check_kubectl_base_path.py`) and the image's smoke test both prove the installed binary keeps the path.
+- The stock `kubectl` binary is installed at `/usr/local/libexec/kubectl`, with a thin `/usr/local/bin/kubectl` wrapper that, when `KUBE_PROXY_URL` is set and `--context` is passed, invokes `credential_proxy_client.py --ensure-kubectl-context` unless `/usr/local/libexec/kubectl-context-registered` finds that step's own record (written beside the kubeconfig under its lock) that it found the context current in these exact file bytes for this proxy URL, CA file and token file, at the helper's own record version, before `exec`ing the kubectl admission (`/usr/local/libexec/kubectl-admit`, [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md#a-cost-check-in-front-of-kubectl)), which runs `/usr/local/libexec/kubectl`. The pinned version is 1.34 or later: before 1.34, `kubectl get --raw` replaced the server URL's path with the raw path, so a paged collection read through a `/clusters/<ctx>` kubeconfig reached the proxy with no cluster in it, which the proxy now refuses (section 3). The pin is 1.35, inside kubectl's one-minor skew for the GKE 1.35 and 1.36 clusters the fleet runs. The image build (`check_kubectl_base_path.py`) and the image's smoke test both prove the installed binary keeps the path.
 - Only the kubeconfig's owner registers a context in it. `--ensure-kubectl-context` run by another user (root through `kubectl exec` into the shell pod, for example) changes nothing and makes no lock beside the file: a lock that root made is one the `agent` user cannot open. Where the file is missing, that user creates none. The client creates a default kubeconfig only in a folder that its caller owns. A kubeconfig that root made in the agent's folder is one the agent cannot add a cluster to. If the owner cannot open the lock, the step says so on stderr; the wrapper discards that step's stderr, so the line shows on `gcloud container clusters get-credentials`, which does the same merge, and on a direct run. `sandbox-entrypoint` removes a lock left on the volume at pod start, before any session can hold it.
 - `/opt/credential-proxy/bin/kubectl` is removed; `/opt/credential-proxy/bin/gcloud` remains a symlink to `/usr/local/bin/credential-proxy-exec`.
 - No client-side `kubectl` `exec` auth plugin (such as `gke-gcloud-auth-plugin`) is installed in the sandbox. Running `gke-gcloud-auth-plugin` inside the sandbox would place the upstream Google Cloud access token (**Asset A1**) inside the untrusted environment. Instead, `kube-proxy` attaches the upstream token outside the sandbox.
@@ -280,7 +286,7 @@ How multi-cluster context switching works:
 2. **`gcloud container clusters get-credentials`**: When the agent runs `gcloud container clusters get-credentials <cluster> --location=<loc> --project=<proj>`, `credential_proxy_client.py` checks that the cluster exists and is running with one `/v1/gcp/` relay read (a call that does not name the cluster, location and project in full, or any other answer, goes to the broker's `gcloud` as before) and writes a `kubeconfig` entry whose `server:` points to `${KUBE_PROXY_URL}/clusters/gke_<project>_<location>_<cluster>`, whose `certificate-authority:` points to `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and whose `user:` (`kube-proxy-caller`) references `tokenFile` from `CREDENTIAL_PROXY_TOKEN_FILE`. No cluster credentials or GCP tokens ever enter the sandbox.
 3. **Stock `kubectl config` commands**: An agent or script can also register any fleet cluster directly inside the sandbox with `kubectl config set-cluster gke_<project>_<location>_<cluster> --server="${KUBE_PROXY_URL}/clusters/gke_<project>_<location>_<cluster>" --certificate-authority=/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`.
 
-### 5. Caller authentication (`pkg/k8sapiproxy/auth.go`)
+### 5. Caller authentication (`pkg/tokenreview/tokenreview.go`)
 
 `kube-proxy` authenticates every request from the sandbox or session pod before inspecting the Kubernetes API path:
 

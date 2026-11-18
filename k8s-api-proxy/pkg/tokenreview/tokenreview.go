@@ -1,4 +1,8 @@
-package k8sapiproxy
+// Package tokenreview is a k8sapiproxy.CallerAuthenticator that admits a caller whose bearer
+// token a Kubernetes TokenReview accepts for a configured audience. It lives outside the core
+// package so an embedder that authenticates callers another way does not import client-go or
+// the API server's authenticator and token-cache packages.
+package tokenreview
 
 import (
 	"context"
@@ -17,6 +21,8 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
 	"k8s.io/client-go/rest"
+
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
 )
 
 const (
@@ -30,14 +36,10 @@ const (
 	tokenReviewBurst = 400
 )
 
-// errAuthenticationUnavailable is returned when the TokenReview itself fails, so the
-// handler answers 503 rather than telling the caller its token is wrong.
-var errAuthenticationUnavailable = errors.New("caller authentication is unavailable")
-
 var errNotAuthenticated = errors.New("the caller's token was not accepted")
 
-// TokenReviewConfig configures NewTokenReviewAuthenticator.
-type TokenReviewConfig struct {
+// Config configures NewAuthenticator.
+type Config struct {
 	// Kubernetes reaches the API server that reviews caller tokens, as the proxy's own
 	// identity, which needs create on tokenreviews. Required; rest.InClusterConfig in a pod.
 	Kubernetes *rest.Config
@@ -64,13 +66,13 @@ type tokenReviewAuthenticator struct {
 	bearer            authenticator.Request
 }
 
-// NewTokenReviewAuthenticator returns a CallerAuthenticator that accepts a bearer token in
+// NewAuthenticator returns a k8sapiproxy.CallerAuthenticator that accepts a bearer token in
 // the Authorization header when a TokenReview finds it valid for a configured audience and
 // its user is in that audience's allowed caller set. Reviews that accept or refuse the
 // token are cached for cfg.CacheTTL; a review that fails is not.
-func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, error) {
+func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 	if cfg.Kubernetes == nil {
-		return nil, errors.New("k8sapiproxy: TokenReviewConfig.Kubernetes is required")
+		return nil, errors.New("tokenreview: Config.Kubernetes is required")
 	}
 	var audiences authenticator.Audiences
 	seenAudiences := sets.New[string]()
@@ -132,7 +134,7 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 				continue
 			}
 			if seenAudiences.Has(aud) {
-				return nil, fmt.Errorf("k8sapiproxy: AudienceCallers audience %q duplicates an already configured audience", aud)
+				return nil, fmt.Errorf("tokenreview: AudienceCallers audience %q duplicates an already configured audience", aud)
 			}
 			seenAudiences.Insert(aud)
 			audiences = append(audiences, aud)
@@ -144,7 +146,7 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 		}
 		for _, c := range sets.List(callerSet) {
 			if prevAud, exists := callerPrimaryAudience[c]; exists {
-				return nil, fmt.Errorf("k8sapiproxy: caller %q cannot be bound to both %q and %q", c, prevAud, groupAudiences[0])
+				return nil, fmt.Errorf("tokenreview: caller %q cannot be bound to both %q and %q", c, prevAud, groupAudiences[0])
 			}
 			callerPrimaryAudience[c] = groupAudiences[0]
 		}
@@ -162,9 +164,9 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 			}
 		}
 		if !hasAudience {
-			return nil, errors.New("k8sapiproxy: TokenReviewConfig.Audience is required")
+			return nil, errors.New("tokenreview: Config.Audience is required")
 		}
-		return nil, errors.New("k8sapiproxy: TokenReviewConfig.AllowedCallers is required")
+		return nil, errors.New("tokenreview: Config.AllowedCallers is required")
 	}
 	ttl := cfg.CacheTTL
 	if ttl <= 0 {
@@ -175,7 +177,7 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 	kc.QPS, kc.Burst = tokenReviewQPS, tokenReviewBurst
 	client, err := authenticationv1client.NewForConfig(kc)
 	if err != nil {
-		return nil, fmt.Errorf("k8sapiproxy: TokenReview client: %w", err)
+		return nil, fmt.Errorf("tokenreview: TokenReview client: %w", err)
 	}
 	review := &tokenReviewer{reviews: client.TokenReviews()}
 	return &tokenReviewAuthenticator{
@@ -185,10 +187,10 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 	}, nil
 }
 
-func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdentity, error) {
+func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapiproxy.CallerIdentity, error) {
 	r = r.WithContext(authenticator.WithAudiences(r.Context(), a.audiences))
 	resp, ok, err := a.bearer.AuthenticateRequest(r)
-	if errors.Is(err, errAuthenticationUnavailable) {
+	if errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
 		return nil, err
 	}
 	if !ok {
@@ -205,11 +207,11 @@ func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 	if !allowed {
 		return nil, fmt.Errorf("caller %q is not allowed", name)
 	}
-	return &CallerIdentity{Username: name, UID: resp.User.GetUID(), Groups: resp.User.GetGroups()}, nil
+	return &k8sapiproxy.CallerIdentity{Username: name, UID: resp.User.GetUID(), Groups: resp.User.GetGroups()}, nil
 }
 
 // tokenReviewer is an authenticator.Token backed by the TokenReview API. A refused token is
-// (nil, false, nil), which the cache keeps; a failed review is errAuthenticationUnavailable
+// (nil, false, nil), which the cache keeps; a failed review is k8sapiproxy.ErrAuthenticationUnavailable
 // wrapping the cause, which it does not.
 type tokenReviewer struct {
 	reviews authenticationv1client.TokenReviewInterface
@@ -226,7 +228,7 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 		Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: want},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: %w", errAuthenticationUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %w", k8sapiproxy.ErrAuthenticationUnavailable, err)
 	}
 	got := want.Intersect(result.Status.Audiences)
 	if !result.Status.Authenticated || len(got) == 0 {

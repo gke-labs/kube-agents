@@ -50,7 +50,7 @@ const MaxTurnWait = submissionWait + noticeGrace + maxWaitSeconds*time.Second
 
 // TurnBus is what the turn tools need from the bus.
 type TurnBus interface {
-	SendTurn(ctx context.Context, convs *Conversations, token, text string, wait time.Duration) (TurnResult, *turnWatch, error)
+	SendTurn(ctx context.Context, convs *Conversations, token, text string, to TurnAddress, wait time.Duration) (TurnResult, *turnWatch, error)
 	WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, wait time.Duration) (TurnOutcome, error)
 	WaitForTurnStep(ctx context.Context, convs *Conversations, w *turnWatch, root TaskRef, wait time.Duration) (TurnStepOutcome, error)
 	SendStop(ctx context.Context, convs *Conversations, token string) (TurnResult, error)
@@ -65,6 +65,30 @@ type sendMessageArgs struct {
 	ConversationToken string `json:"conversation_token"`
 	WaitSeconds       int    `json:"wait_seconds"`
 	StreamSteps       *bool  `json:"stream_steps,omitempty"`
+	TurnAddress
+}
+
+// TurnAddress names the AgentProfile a turn is for and its task parameters
+// (gateway.ConsoleInFrame's addressee and parameters). The zero value is a
+// turn for the conversation's route, as every turn was before.
+type TurnAddress struct {
+	Addressee  string            `json:"addressee,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+}
+
+// check refuses what the gateway would drop without a word or could never
+// take: an addressee that is not one subject token (the console door drops
+// that frame and answers nothing), and parameters with no profile to take
+// them. Whether the profile exists, runs at the console's tier and may reach
+// the target is the gateway's to say, and its refusal is the turn's answer.
+func (a TurnAddress) check() error {
+	if a.Addressee != "" && !lib.ValidSubjectToken(a.Addressee) {
+		return fmt.Errorf("addressee %q is not an AgentProfile name: one token, no spaces, dots or wildcards", a.Addressee)
+	}
+	if a.Addressee == "" && len(a.Parameters) > 0 {
+		return errors.New("parameters are an AgentProfile's task parameters; name the profile in addressee")
+	}
+	return nil
 }
 
 func shouldStreamSteps(ctx context.Context, explicit *bool) bool {
@@ -93,7 +117,13 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 				"Once the turn's tasks end, the reports of any card it filed are gathered too, until the wait ends or " +
 				"no new report has come for a while; a card's report can take minutes, so for card work pass a longer " +
 				"wait_seconds, or read later reports with poll_events. " +
-				"A message on a conversation whose turn is still running waits for that turn to end first, within the same wait.",
+				"A message on a conversation whose turn is still running waits for that turn to end first, within the same wait. " +
+				"To send the turn straight to an AgentProfile rather than the conversation's agent, name it in addressee " +
+				"(for example cluster) and pass its task parameters in parameters (for cluster: project, location and cluster); " +
+				"read_topics with action cards lists the agent cards on DIRECTORY, by profile. " +
+				"The gateway refuses an unknown profile, a tier the profile doesn't run at, or a target outside the install's scope, " +
+				"and its notice is the answer. An addressed turn still running when the wait ends returns its task as <profile>/<task-id>; " +
+				"read it with task_control under that reference, which always resolves; a bare id resolves only while this server still holds the task.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"text"},
@@ -103,6 +133,14 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 					"conversation_token": map[string]any{"type": "string", "description": "Continue a conversation by the token a previous answer reported, instead of by name."},
 					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("How long to wait for the answer, %d at most. Default %d.", maxWaitSeconds, defaultWaitSeconds)},
 					"stream_steps":       map[string]any{"type": "boolean", "description": "When true, return a custom step envelope after the next step so the caller can stream progress step-by-step with task_control get."},
+					"addressee": map[string]any{"type": "string", "description": "The AgentProfile to send the turn to, by name (for example cluster), as a new task for it. " +
+						"Default: the conversation's agent. " +
+						"Refused on a stop word, a bare /feedback or /feedback summary, and on any /session text, a message after it included: an addressed turn is a new task for the profile, not a session."},
+					"parameters": map[string]any{
+						"type":                 "object",
+						"additionalProperties": map[string]any{"type": "string"},
+						"description":          "The addressed profile's task parameters, as string values (for cluster: project, location and cluster). Only with addressee.",
+					},
 				},
 			},
 		},
@@ -113,21 +151,24 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
-			if shouldStreamSteps(ctx, a.StreamSteps) {
-				return sendAndStreamStep(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, waitFor(a.WaitSeconds))
+			if err := a.TurnAddress.check(); err != nil {
+				return "", err
 			}
-			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, waitFor(a.WaitSeconds))
+			if shouldStreamSteps(ctx, a.StreamSteps) {
+				return sendAndStreamStep(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, a.TurnAddress, waitFor(a.WaitSeconds))
+			}
+			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, a.TurnAddress, waitFor(a.WaitSeconds))
 		},
 	}
 }
 
-func sendAndStreamStep(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
+func sendAndStreamStep(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, to TurnAddress, wait time.Duration) (string, error) {
 	token, byToken, err := convs.ResolveCall(alias, token)
 	if err != nil {
 		return "", err
 	}
 	start := time.Now()
-	res, w, err := bus.SendTurn(ctx, convs, token, text, wait)
+	res, w, err := bus.SendTurn(ctx, convs, token, text, to, wait)
 	if err != nil {
 		return "", err
 	}
@@ -157,9 +198,9 @@ func sendAndStreamStep(ctx context.Context, bus TurnBus, convs *Conversations, a
 }
 
 // sendAndWait sends text as one turn of the conversation named by alias or
-// token and renders what came of it: the gateway's notices, and the turn's
-// task as it stands after wait.
-func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
+// token, addressed as to says, and renders what came of it: the gateway's
+// notices, and the turn's task as it stands after wait.
+func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, to TurnAddress, wait time.Duration) (string, error) {
 	token, byToken, err := convs.ResolveCall(alias, token)
 	if err != nil {
 		return "", err
@@ -167,7 +208,7 @@ func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, 
 	// The wait covers any wait for the conversation's running turn too, so
 	// a second message waits rather than being steered into it.
 	start := time.Now()
-	res, w, err := bus.SendTurn(ctx, convs, token, text, wait)
+	res, w, err := bus.SendTurn(ctx, convs, token, text, to, wait)
 	if err != nil {
 		return "", err
 	}

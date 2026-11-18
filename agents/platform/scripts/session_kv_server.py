@@ -8560,7 +8560,9 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
         cluster,
         _bounded_text(request_data, "namespace"),
         workload,
-        _bounded_text(request_data, "environment"),
+        # NULL when not sent, so post_merge_environment.py can tell "not read
+        # yet" from a cluster read and found unlabelled, which it stores as "".
+        _bounded_text(request_data, "environment") or None,
         origin,
         platform,
         opened_at,

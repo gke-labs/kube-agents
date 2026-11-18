@@ -171,11 +171,18 @@ pool) on a pool that carries the compute-class label: see Symptom 13.
     behaviour for a version that is not one of these two.
 -   **Confirm all four** before naming this cause: (1) the Pod spec has no
     `nodeSelector` and no required `nodeAffinity` on
-    `cloud.google.com/compute-class`, and no namespace or cluster default
-    class applies; (2) every pool that could grow carries the compute-class
-    label; (3) the `NotTriggerScaleUp` message stays empty and the visibility
-    log names no rejected or skipped pool, while the pool is below its maximum;
-    (4) the cluster's version is one where the behaviour was seen.
+    `cloud.google.com/compute-class`, and no cluster default class is on (a
+    namespace default class that reached the Pod shows in its spec as a
+    `nodeSelector` that GKE added; a namespace label set after the Pod was
+    created does not count); (2) every pool that could grow carries the
+    compute-class label with no taint; (3) the
+    `NotTriggerScaleUp` message stays empty and the visibility log names no
+    rejected or skipped pool, while the pool is below its maximum
+    (`autoscaling.maxNodeCount` is for each zone: compare the pool's node
+    count with `autoscaling.totalMaxNodeCount` when it is set, else with
+    `autoscaling.maxNodeCount` times the number of zones in the pool's
+    `locations`); (4) the cluster's version is one where the behaviour was
+    seen.
 -   **Not this cause:** an empty `unhandledPodGroups` record **alone**. The
     autoscaler can write one for a new group of waiting Pods before it gives a
     reason (for a pool at its maximum, `no.scale.up.mig.skipped` with `max node
@@ -186,10 +193,12 @@ pool) on a pool that carries the compute-class label: see Symptom 13.
     cloud.google.com/compute-class: <NAME>`, or a required `nodeAffinity` on
     that key (with either form the pool grew on both versions). For workloads
     that no manifest in Git describes, the namespace default
-    (`cloud.google.com/default-compute-class=<NAME>`) is the route; it was not
-    part of the test, and it applies only to Pods created after the label is
-    set, so recreate the Pods. Adding the missing taint does not start these
-    Pods: a tainted pool takes only Pods that name the class.
+    (`cloud.google.com/default-compute-class=<NAME>`) is the route: GKE then
+    adds the class `nodeSelector` and toleration to new Pods and the pool
+    grows for them (seen on `1.35.8-gke.1796000` for Deployment Pods, one
+    try). Pods that already wait get neither, so recreate them after the
+    label is set. Adding the missing taint does not
+    start these Pods: a tainted pool takes only Pods that name the class.
 
 ## Useful Commands
 

@@ -164,7 +164,10 @@ func TestReconcileReportsAMissingRoleBindingInTheProfileNamespace(t *testing.T) 
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reasonRBACIncomplete {
 		t.Fatalf("expected Degraded=True/%s naming the profile namespace, got %+v", reasonRBACIncomplete, degraded)
 	}
-	for _, want := range []string{"create deployments.apps (in namespace " + profileNamespaceName(agent) + ")", "RoleBinding"} {
+	// The profile namespace is one the chart and make deploy render into, so the
+	// message sends the reader to the upgrade, after removing a hand-made copy,
+	// not to writing the Role by hand.
+	for _, want := range []string{"create deployments.apps (in namespace " + profileNamespaceName(agent) + ")", "RoleBinding", "run helm upgrade or make deploy", "delete any hand-made copy"} {
 		if !strings.Contains(degraded.Message, want) {
 			t.Errorf("condition message %q does not name %q", degraded.Message, want)
 		}
@@ -336,7 +339,9 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reasonRBACIncomplete {
 		t.Fatalf("expected Degraded=True/%s on the CR, got %+v", reasonRBACIncomplete, degraded)
 	}
-	for _, want := range []string{"create secrets (in namespace team-a)", "RoleBinding"} {
+	// team-a is a namespace neither install path renders into, so the message
+	// keeps the hand-made Role and RoleBinding as that namespace's remedy.
+	for _, want := range []string{"create secrets (in namespace team-a)", "RoleBinding", "gets both by hand"} {
 		if !strings.Contains(degraded.Message, want) {
 			t.Errorf("condition message %q does not name %q", degraded.Message, want)
 		}

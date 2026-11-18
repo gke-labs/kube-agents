@@ -4,7 +4,7 @@
 The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket it logs to, gs://kube-agents-periodic-logs for the pool jobs and
-the nightlies' bucket for the certification slice and the replay lane, each entry's `logs_root`
+the nightlies' bucket for the validated-capabilities slice and the replay lane, each entry's `logs_root`
 (`latest-build.txt`, then `finished.json`, then the report the job wrote and any
 extra report the entry names, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
@@ -43,7 +43,7 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/periodics
 # own identities, which cannot write gs://kube-agents-prow.
 LOGS_ROOT = "gs://kube-agents-periodic-logs/logs"
 # Where the eval lanes that share the nightlies' decoration log: the
-# certification slice and the replay lane write there, beside the nightlies,
+# validated-capabilities slice and the replay lane write there, beside the nightlies,
 # not to the periodic-logs bucket the other watched jobs use.
 EVAL_NIGHTLY_LOGS_ROOT = collect.NIGHTLY_LOGS_ROOT
 # Deck's job-history page for a logs root: the gs:// prefix becomes a path
@@ -231,11 +231,11 @@ REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
 # kube-agents-postsubmits.yaml); a rename there is a rename here.
 RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
-# The certification lane's first slice (oss-test-infra: kube-agents-periodics.yaml).
-CERTIFICATION_SLICE_JOB = "ci-kube-agents-certification-1"
+# The validated-capabilities lane's first slice (oss-test-infra: kube-agents-periodics.yaml).
+VALIDATED_CAPABILITIES_SLICE_JOB = "ci-kube-agents-certification-1"
 # A week between runs, plus a day: a Saturday run that never started (no
 # cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
-CERTIFICATION_STALE_AFTER = timedelta(days=8)
+VALIDATED_CAPABILITIES_STALE_AFTER = timedelta(days=8)
 # The inference-replay lane (oss-test-infra: kube-agents-periodics.yaml),
 # daily at 06:00 UTC; a day and a half, as for the daily reconcile.
 REPLAY_LANE_JOB = "ci-kube-agents-eval-replay-lane"
@@ -384,16 +384,16 @@ WATCHED = (
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
         actionable_or_persistent=True,
     ),
-    # The certification lane's first slice: weekly and on Rerun, graded on
-    # the newest GA release, recorded for the certified-capabilities page from its logs
+    # The validated-capabilities lane's first slice: weekly and on Rerun, graded on
+    # the newest GA release, recorded for the validated-capabilities page from its logs
     # bucket and nowhere else, so a failed build (a forbidden write, an
     # unrun check, a deploy refusal) reaches a person only through this note.
     Periodic(
-        CERTIFICATION_SLICE_JOB, "certification lane (slice 1)", CERTIFICATION_STALE_AFTER, None,
-        "Certification lane", "the certification suite's weekly run is not recording", "the certification suite's weekly run is recording again",
-        "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of the certification suite (the task files carrying suite: certification) at 60 repetitions against the newest GA release on a leased pool project",
-        "the certified-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
-        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-certification-lane",
+        VALIDATED_CAPABILITIES_SLICE_JOB, "validated-capabilities lane (slice 1)", VALIDATED_CAPABILITIES_STALE_AFTER, None,
+        "Validated Capabilities lane", "the validated-capabilities suite's weekly run is not recording", "the validated-capabilities suite's weekly run is recording again",
+        "runs on Saturday and Sunday at 14:00 UTC and on Rerun, grading part 1 of the validated-capabilities suite (the task files carrying suite: validated-capabilities) at 3 repetitions against the newest GA release on a leased pool project",
+        "the validated-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-validated-capabilities-lane",
         logs_root=EVAL_NIGHTLY_LOGS_ROOT,
     ),
     # The inference-replay lane: it gates nothing and publishes no dashboard
