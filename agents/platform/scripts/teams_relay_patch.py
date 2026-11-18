@@ -64,9 +64,12 @@ TEAMS_DEFAULT_CHAT_TYPE = "channel"
 _TABLE_PIPE = "|"
 _TABLE_ESCAPED_PIPE = "\\|"
 _TABLE_PIPE_PLACEHOLDER = "\x00"
-# A line opening one of these ends a running table even when it carries a
-# pipe: a list item, a heading or a fence is a block of its own, not a row.
-_TABLE_BLOCK_STARTS = ("- ", "* ", "#", "```")
+# A line opening one of these is a block of its own, not a table row, even
+# when it carries a pipe: a list item or a fence; a heading is one too
+# (_TABLE_HEADING_RE, the renderer's own rule: a run of # then a space, so
+# "#1040 | open" stays a row).
+_TABLE_BLOCK_STARTS = ("- ", "* ", "```")
+_TABLE_HEADING_RE = re.compile(r"^#{1,6} ")
 
 
 def default_service_url() -> str:
@@ -205,14 +208,22 @@ def _table_starts(header: str, next_line: str) -> bool:
     return len(_split_table_row(next_line)) == len(_split_table_row(header))
 
 
+def _starts_block(stripped: str) -> bool:
+    """A list item, a fence or a heading: never a table row, whatever pipes it has."""
+    return stripped.startswith(_TABLE_BLOCK_STARTS) or bool(_TABLE_HEADING_RE.match(stripped))
+
+
 def _opens_table(stripped: str, next_line: str) -> bool:
     """Whether ``stripped`` is the first row of a table.
 
     GitHub's rule first (a delimiter row follows). A bordered row followed by
     another bordered row opens one too: a continuation piece of a reply split
     mid-table carries body rows and no header, and two bordered rows in a row
-    are not prose, where a lone ``|x| + |y| = 1`` line is.
+    are not prose, where a lone ``|x| + |y| = 1`` line is. A block start
+    (heading, list item, fence) opens nothing.
     """
+    if _starts_block(stripped):
+        return False
     next_line = next_line.strip()
     if _TABLE_PIPE in next_line and _is_table_separator(next_line):
         # A delimiter row follows: GitHub's rule decides, so a header whose
@@ -223,6 +234,42 @@ def _opens_table(stripped: str, next_line: str) -> bool:
         and not _is_table_separator(stripped)
         and _is_table_row(next_line)
     )
+
+
+def _table_line_kinds(lines: list[str]) -> list[str]:
+    """Classify each line as the renderer's table scan will: ``"row"`` (a
+    table row, the header included), ``"delimiter"`` (the row under a header,
+    dropped), or ``""`` (anything else, fenced code included). The one scan
+    both ``markdown_to_adaptive_card`` and ``_detach_part_marker`` read, so
+    the two cannot disagree about which line is in a table."""
+    kinds = [""] * len(lines)
+    in_table = False
+    in_code = False
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            in_table = False
+            index += 1
+            continue
+        if in_code or _TABLE_PIPE not in stripped:
+            in_table = False
+            index += 1
+            continue
+        if in_table and not _starts_block(stripped):
+            kinds[index] = "row"
+            index += 1
+            continue
+        in_table = False
+        if index + 1 < len(lines) and _opens_table(stripped, lines[index + 1]):
+            kinds[index] = "row"
+            in_table = True
+            if _table_starts(stripped, lines[index + 1]):
+                kinds[index + 1] = "delimiter"
+                index += 1
+        index += 1
+    return kinds
 
 
 def _split_table_row(stripped: str) -> list[str]:
@@ -279,10 +326,10 @@ def _detach_part_marker(text: str) -> str:
         return text
     body = text[: match.start()]
     body_lines = body.rstrip("\n").split("\n")
-    last_line = body_lines[-1].strip()
-    line_before = body_lines[-2].strip() if len(body_lines) > 1 else ""
-    # A bordered row, or a borderless one under another pipe line.
-    if not (_is_table_row(last_line) or (_TABLE_PIPE in last_line and _TABLE_PIPE in line_before)):
+    # The last line is a table row by the renderer's own scan, not by a
+    # pipe heuristic: a lone pipe line, a shell pipeline or a bullet under
+    # a table render as prose and keep their marker where Hermes put it.
+    if _table_line_kinds(body_lines)[-1] != "row":
         return text
     return f"{body.rstrip()}\n\n({match.group(1)}/{match.group(2)})"
 
@@ -344,22 +391,18 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
         )
         table_rows.clear()
 
-    skip_delimiter_row = False
+    # Which lines are table rows and which is a header's delimiter row, by
+    # the one scan _detach_part_marker also reads. Every row after the
+    # delimiter is data, GitHub's rule, so a body row of dashes ("| - | - |",
+    # an empty entry) is kept.
+    kinds = _table_line_kinds(lines)
     for index, line in enumerate(lines):
-        if skip_delimiter_row:
-            skip_delimiter_row = False
-            continue
         stripped = line.strip()
-        if not in_code_block and _TABLE_PIPE in stripped:
-            if table_rows and not stripped.startswith(_TABLE_BLOCK_STARTS):
-                # A row of the running table; a stray delimiter row is skipped.
-                if not _is_table_separator(stripped):
-                    table_rows.append(_split_table_row(stripped))
-                continue
-            if not table_rows and index + 1 < len(lines) and _opens_table(stripped, lines[index + 1]):
-                table_rows.append(_split_table_row(stripped))
-                skip_delimiter_row = _table_starts(stripped, lines[index + 1])
-                continue
+        if kinds[index] == "delimiter":
+            continue
+        if kinds[index] == "row":
+            table_rows.append(_split_table_row(stripped))
+            continue
         flush_table()
         if stripped.startswith("```"):
             if in_code_block:

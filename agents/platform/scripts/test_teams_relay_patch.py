@@ -493,6 +493,41 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body[0]["rows"][1]["cells"][1]["items"][0]["text"], "2")
         self.assertEqual(body[1]["text"], "(2/3)")
 
+    def test_a_body_row_of_dashes_is_data(self):
+        # GitHub's rule: only the line under the header is the delimiter; a
+        # later all-dash row is an empty entry and stays.
+        body = markdown_to_adaptive_card("| pod | restarts |\n|---|---|\n| a | 3 |\n| - | - |\n| --- | --- |")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table"])
+        rows = body[0]["rows"]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[2]["cells"][0]["items"][0]["text"], "-")
+        self.assertEqual(rows[3]["cells"][1]["items"][0]["text"], "---")
+
+    def test_an_issue_number_row_and_a_heading_are_told_apart(self):
+        # "#1040 | open" is a row (no space after the #); "# Section | x" is a
+        # heading and neither continues nor opens a table.
+        body = markdown_to_adaptive_card("Issue | Status\n---|---\n#1040 | open\n#3055 | closed")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table"])
+        self.assertEqual(len(body[0]["rows"]), 3)
+        self.assertEqual(body[0]["rows"][1]["cells"][0]["items"][0]["text"], "#1040")
+        body = markdown_to_adaptive_card("# Section | Overview\n---|---\n- item | a\n---|---\n| 1 | 2 |")["body"]
+        self.assertEqual(body[0]["type"], "TextBlock")
+        self.assertEqual(body[0]["size"], "Large")
+        self.assertEqual([b["type"] for b in body].count("Table"), 0)
+        self.assertEqual(body[2]["text"], "• item | a")
+
+    def test_split_marker_stays_on_a_prose_line_with_pipes(self):
+        for text in (
+            "|x| + |y| = 1 (1/2)",
+            "| Pod | Status | (1/2)",
+            "Run: kubectl get pods | grep api\nOr: kubectl get pods | grep web (1/2)",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n- see `x | y` (1/2)",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(teams_relay_patch._detach_part_marker(text), text)
+                body = markdown_to_adaptive_card(text)["body"]
+                self.assertTrue(body[-1]["text"].endswith("(1/2)"), body)
+
     def test_an_escaped_pipe_stays_in_its_cell(self):
         split = teams_relay_patch._split_table_row
         self.assertEqual(split("| a \\| b | c |"), ["a | b", "c"])
