@@ -200,12 +200,11 @@ SCENARIO_BATCH_WAIT = (
 
 KNOWN_UNREGISTERED = {
     # The cluster agent as a dispatched profile diagnosing a fleet fixture
-    # (#3658). Its child runs only where the dispatcher does, which the CI
-    # next lane has since #5394; #5500's follow-up registers it in
-    # hack/eval/nightly-cases.txt and on hack/eval/api-lane-exclusions.txt,
-    # and this entry goes then.
+    # (#3658). Its child runs only where the dispatcher does, which the CI eval
+    # install has since #5394; #5500's follow-up registers it in
+    # hack/eval/nightly-cases.txt, and this entry goes then.
     "cluster-profile-names-the-oom-kill": (
-        "#5394: needs the AgentProfile dispatcher and profiles.cluster, which the CI next lane gets from #5394"
+        "#5394: needs the AgentProfile dispatcher and profiles.cluster, which the CI eval install gets from #5394"
     ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
@@ -339,6 +338,13 @@ FIXTURE_NOT_READY = {
         "#2567 item 2: needs a pool with a live node whose surge node or green pool exceeds a "
         "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
         "$9 an hour standing or about $7 a run on a per-run cluster"
+    ),
+    # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
+    # cluster, as the OOM reproduction harness builds them) and an install on the
+    # kubectl cost table's fleet tier. No pool project carries one.
+    "harness-oversized-list-narrows": (
+        "#4896: needs two clusters of more than 100,000 Pods (KWOK) on the pool; "
+        "no pool project carries one"
     ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub

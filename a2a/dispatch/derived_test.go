@@ -17,7 +17,7 @@ func TestAHashOnlyJobTemplateRefReadsTheProfilesOwnParam(t *testing.T) {
 		return []byte(`{"metadata":{"annotations":{"` + lib.DispatchJobTemplateHashAnnotation + `":"aaaa"}},"spec":{"template":{"spec":{"containers":[{"name":"w"}]}}}}`), nil
 	}}
 	prof := &lib.DispatchProfile{Name: "tse", JobTemplateRef: &lib.DispatchJobTemplateRef{Hash: "aaaa"}}
-	if tmpl, err := k.jobTemplate(context.Background(), "ns", prof); err != nil || len(tmpl) == 0 {
+	if tmpl, err := k.jobTemplate(context.Background(), "ns", prof, "unattended"); err != nil || len(tmpl) == 0 {
 		t.Fatalf("template %s, err %v: want the param's", tmpl, err)
 	}
 	if asked != lib.DispatchJobTemplateName("tse") {

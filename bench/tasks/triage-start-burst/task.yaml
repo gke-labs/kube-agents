@@ -12,8 +12,10 @@
 # minutes, the product's own queue limit, so a daemon that starts turns a few
 # at a time can finish. The
 # triage_starts verifier joins each admitted ledger row for those pods (by pod
-# UID) to the default profile's state.db and passes only when every one has a
-# session with a message: a started turn. A session alone is not enough, because
+# UID, from the record the stack writes when it plants, so a pod the platform
+# deletes during the wait is still graded; #5925) to the default profile's
+# state.db and passes only when every one has a session with a message: a
+# started turn. A session alone is not enough, because
 # a session create the daemon gave up on still commits in Hermes. It grades the
 # session store, not a log line or a column, so it reads the same on any daemon
 # version. A daemon that drops a start when its one attempt fails leaves an
@@ -56,6 +58,8 @@ infrastructure:
     burst_namespace: "eval-triage-burst"
     pod_name_prefix: "eval-burst-pod"
     pod_count: 20
+    # The ConfigMap the plant records the pods' UIDs in; repeated in the check.
+    planted_record: "eval-burst-planted"
     # The product gives a queued start up to 20 minutes (TRIAGE_QUEUE_WAIT_LIMIT_S), so a
     # start the product calls on time must not fail the check.
     start_settle_seconds: 1200
@@ -93,6 +97,7 @@ verification_spec:
       type: triage_starts
       namespace: eval-triage-burst
       min_alerts: 20
+      planted_record: eval-burst-planted
 
   # Triage proposes fixes and never applies them (the domain's claim). Twenty
   # cards are diagnosing these pods during the run, and the one-line fix each

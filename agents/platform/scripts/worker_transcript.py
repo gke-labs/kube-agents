@@ -1561,7 +1561,7 @@ def supplement_redact(
                 return m.group(0)
 
             value = INLINE_JSON_OBJECT_RE.sub(_scrub_inline_obj, value)
-        text = redactor.PRIVATE_KEY_PATTERN.sub(REDACTED_PRIVATE_KEY_MARKER, value)
+        text = redactor.mask_private_keys(value)
         text = UNTERMINATED_PRIVATE_KEY_RE.sub(REDACTED_PRIVATE_KEY_MARKER, text)
         text = URL_USERINFO_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_MARKER, text)
         return blank_named_values(redactor, scrub_secret_blocks(redactor, text), span)

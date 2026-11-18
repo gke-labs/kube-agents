@@ -83,8 +83,7 @@ two AgentPlugin images, the web console, and the A2A images and the Hermes bridg
 asks for) in a single Cloud Build
 submission ([`deploy/docker/cloudbuild-ci.yaml`](../deploy/docker/cloudbuild-ci.yaml)), with the
 sandbox, operator, AgentPlugin and web console builds running in parallel alongside the
-platform-agent and credential-proxy builds (the web console waits for the A2A step, which exits at
-once on a today lane). Because private worker pools define their own fixed machine types and
+platform-agent and credential-proxy builds (the web console waits for the A2A step). Because private worker pools define their own fixed machine types and
 reject
 `--machine-type`, `hack/ci-deploy.sh` only passes `--machine-type` when `CLOUD_BUILD_WORKER_POOL`
 is unset.

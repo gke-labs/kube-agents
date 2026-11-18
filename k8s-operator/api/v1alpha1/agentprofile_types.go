@@ -354,11 +354,11 @@ const (
 	// AgentProfileConditionCardPublished is True when the profile's agent card
 	// is on the directory.
 	AgentProfileConditionCardPublished = "CardPublished"
-	// AgentProfileConditionJobResourcesFit is False when the profile allows
-	// the unattended tier and its resource requests break GKE Autopilot's
-	// cpu-to-memory ratio: Autopilot raises them on the profile's Jobs, which
-	// then no longer equal their template, so the Job admission policy refuses
-	// them there.
+	// AgentProfileConditionJobResourcesFit is False when the profile's
+	// resource requests break GKE Autopilot's cpu-to-memory ratio: Autopilot
+	// raises them on the profile's Jobs (its unattended tasks', and at any tier
+	// its permit-carrying ones'), which then no longer equal their template,
+	// so the Job admission policy refuses them there.
 	AgentProfileConditionJobResourcesFit = "JobResourcesFit"
 	// AgentProfileConditionTiersRendered is False when allowedTiers lists a
 	// name with no tier (reason TierUnknown) or a second unattended-mode tier

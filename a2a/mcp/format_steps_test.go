@@ -157,7 +157,7 @@ type fakeStepTurnBus struct {
 	stepCall int
 }
 
-func (f *fakeStepTurnBus) SendTurn(_ context.Context, _ *Conversations, token, _ string, _ time.Duration) (TurnResult, *turnWatch, error) {
+func (f *fakeStepTurnBus) SendTurn(_ context.Context, _ *Conversations, token, _ string, _ TurnAddress, _ time.Duration) (TurnResult, *turnWatch, error) {
 	r := f.ref
 	return TurnResult{Token: token, Task: &r, Notices: []string{"Routing to @platform"}}, nil, nil
 }

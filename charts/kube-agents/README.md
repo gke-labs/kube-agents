@@ -172,10 +172,15 @@ and `AGENT_SANDBOX_IMAGE` follow `global.imageRegistry`, while `FLUENT_BIT_IMAGE
 and the four bus images follow `global.thirdPartyImageRegistry` (the bus images
 from `a2aBus.images`, below). Without passing both, a mirrored install reaches
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
-`CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
-broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image is not derived from the agent image, so
-the chart names it.
+`CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` are passed only when
+`credentialProxy.image` or `hermesBridge.image` names a `repository` or a `tag`;
+empty, the default, leaves the operator deriving the broker from each agent's
+image, and the bridge from the agent image when that is the release
+`platform-agent` image by tag, else from the operator's release set. A pin
+renders under `global.imageRegistry` like the other first-party images and
+applies to every `PlatformAgent` the operator manages; `values.yaml` has the
+contract. The sandbox image is not derived from the agent image, so the chart
+always names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -186,7 +191,8 @@ most on the mirror, one somewhere else — leave `global.imageRegistry` and
 `global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
 mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
 `FLUENT_BIT_IMAGE` and the four `A2A_NATS_*`/`A2A_PROVISION_IMAGE` variables are
-rendered from those values either way.
+rendered from those values either way, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE`
+from `credentialProxy.image` and `hermesBridge.image` when those are set.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.

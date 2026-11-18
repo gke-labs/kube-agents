@@ -691,6 +691,35 @@ class TestScrubStepText(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
                 self.assertNotIn("S3cretValue9", out)
 
+    def test_key_headers_with_no_end_line_scrub_in_linear_time(self):
+        # 170 KB of private key headers with no END line. The redactor's
+        # pattern read to the end of the text from each header, in the
+        # redactor and again here, so the scrub took 6 s of CPU time
+        # (#6072); with the redactor's one-pass mask it takes 0.04 s. The
+        # coverage job in CI runs about 5 times slower than a developer's
+        # machine, which leaves the 1 s bound a margin of about 5.
+        import time
+
+        header = "-----BEGIN PRIVATE KEY-----\n"
+        start = time.process_time()
+        out = _scrub("tool_result", header * 6000)
+        self.assertLess(time.process_time() - start, 1.0)
+        # Only the last header is masked: it is a key that the text cuts short.
+        self.assertEqual(out, header * 5999 + worker_transcript.REDACTED_PRIVATE_KEY_MARKER)
+
+    def test_a_key_block_that_only_the_transcript_rules_decode_is_masked(self):
+        # A JSON string inside a JSON string, with each dash and line end of
+        # the key block written as a `\\u` escape: the redactor's own pass
+        # does not decode it, so the mask in `supplement_redact` is the one
+        # that masks the block.
+        dashes, line_end = "\\u002d" * 5, "\\u000a"
+        inner = '{"pem": "' + dashes + "BEGIN PRIVATE KEY" + dashes + line_end + "MIIE" + line_end + dashes + "END PRIVATE KEY" + dashes + '"}'
+        self.assertEqual(json.loads(inner), {"pem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"})
+        want = json.dumps({"output": json.dumps({"pem": worker_transcript.REDACTED_PRIVATE_KEY_MARKER})})
+        for kind in ("tool_call", "tool_result", "reply", "thinking"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, json.dumps({"output": inner})), want)
+
     def test_a_value_that_holds_the_next_flag_word_does_not_hide_the_next_value(self):
         # The first value is `abc\ -p` (or `abc\ -u`): its place overlaps
         # the place of the second value, and one marker stands for both. The
@@ -986,6 +1015,42 @@ class TestScrubStepText(unittest.TestCase):
         self.assertTrue(worker_transcript.named_value_is_sensitive(REDACTOR, "client-key-data"))
 
 
+def _deepest_python_call(function, *args):
+    """How many Python frames `function` runs at its deepest, itself counted
+    as 1. `sys.setprofile` sees each call and each return of a Python
+    function, also one that a pattern's `sub` calls back; a C function
+    counts for nothing. The number does not depend on the recursion limit
+    of the run, while the function stays below that limit. The garbage
+    collector is off for the call: a finalizer that it ran in the middle
+    would count as a call of the function's. So would a Python signal
+    handler; no test in this file sets one."""
+    import gc
+
+    depth = deepest = 0
+
+    def note(frame, event, arg):
+        nonlocal depth, deepest
+        if event == "call":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif event == "return":
+            depth -= 1
+
+    collects = gc.isenabled()
+    gc.disable()
+    try:
+        before = sys.getprofile()
+        sys.setprofile(note)
+        try:
+            function(*args)
+        finally:
+            sys.setprofile(before)
+    finally:
+        if collects:
+            gc.enable()
+    return deepest
+
+
 class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
     """Three patterns were quadratic on a long run (#5901). Their linear forms
     must give the same output as the old forms: the same key, scheme and
@@ -1123,6 +1188,21 @@ class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
         ):
             with self.subTest(cmd=cmd):
                 self.assertEqual(_scrub("tool_call", cmd), want)
+
+    def test_blank_quoted_spans_keeps_its_depth_in_python_frames(self):
+        # The callback runs one Python frame below the rule and calls no
+        # Python function, also for the single quotes inside an open double
+        # quote. A callback of its own for those (a second `re.sub`) gives
+        # the same output one frame deeper, so the rule reaches the
+        # recursion limit one frame sooner in a deeply nested step. No other
+        # test in this file sees that.
+        #
+        # First, the count does see a function that a pattern's `sub` calls
+        # back: the second lambda runs one frame below the first.
+        self.assertEqual(_deepest_python_call(lambda: worker_transcript.SHELL_QUOTED_SPAN_RE.sub(lambda match: "", "'a'")), 2)
+        for text in ("echo plain", "echo 'a b'", 'echo "c d"', 'echo "c d', "x 'a' 'b' \"c 'd' 'e' f"):
+            with self.subTest(text=text):
+                self.assertEqual(_deepest_python_call(worker_transcript.blank_quoted_spans, text), 2)
 
     def test_a_long_run_scrubs_in_linear_time(self):
         # The whole scrub. Each command took seconds on the old forms (1.6 s
@@ -1315,6 +1395,26 @@ class TestJsonBlockRuleKeepsItsOutput(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), want)
+
+    def test_the_block_rule_keeps_its_depth_in_python_frames(self):
+        # The block callback runs one Python frame below
+        # `scrub_secret_blocks`, and the pair function one frame below the
+        # callback, for a pair only. A call of the pair function for a
+        # string that opens no pair gives the same output one frame deeper
+        # on such a block, so the rule reaches the recursion limit one frame
+        # sooner. No other test in this file sees that. The callback's other
+        # paths have a text each: a block that is not masked, and a marker
+        # of an earlier document that the callback steps over.
+        for text, deepest in (
+            ('"stringData":{"a","b"}', 2),
+            ('{"kind":"Secret",\n"data":{"a","b"}}', 2),
+            ('{"level":"info","data":{"a","b"}}', 2),
+            ('x "kind": 1\n{"apiVersion":"v1","data":{"a","b"}}', 2),
+            ('"stringData":{"a":"b"}', 3),
+            ('{"kind":"Secret",\n"data":{"a":"b","c":"d"}}', 3),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_deepest_python_call(worker_transcript.scrub_secret_blocks, REDACTOR, text), deepest)
 
     def test_many_blocks_scrub_in_linear_time(self):
         # The whole scrub. Each text took seconds on the old forms (1.3 s to

@@ -983,6 +983,42 @@
         }
       }
     },
+    "credentialProxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
+    "hermesBridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
     "platformAgent": {
       "type": "object",
       "additionalProperties": false,

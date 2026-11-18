@@ -174,8 +174,18 @@ def scope_clusters(profiles_dir: Path | None = None) -> fleet_scope_targets.Scop
     """
     if fleet_scope_targets.resolved_scope_file() is None:
         return None
+    home = (profiles_dir or PROFILES_DIR).parent
+    # spec.harness.projectId may be a project number, which no Cluster Agent
+    # profile names. Then, as agent_roster does, take the project's ID from
+    # the reconcile snapshot's management row; an ID is used as it is, and
+    # with no snapshot row list_scope_clusters falls back to the same variable
+    # this reads (fleet_scope_targets.MANAGEMENT_PROJECT_ENVS).
+    fallback = next(
+        (os.environ[name] for name in fleet_scope_targets.MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), ""
+    )
+    management = fleet_scope_targets.management_project_id(home) if fallback.strip().isdigit() else None
     try:
-        return fleet_scope_targets.list_scope_clusters((profiles_dir or PROFILES_DIR).parent)
+        return fleet_scope_targets.list_scope_clusters(home, management_project=management)
     except fleet_scope_targets.ScopeRenderUnreadable as exc:
         raise BoardError(f"the scope render could not be read: {exc}") from None
 

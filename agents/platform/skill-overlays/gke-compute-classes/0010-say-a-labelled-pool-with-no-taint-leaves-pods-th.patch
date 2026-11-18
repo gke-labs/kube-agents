@@ -2,6 +2,7 @@ Subject: Say a labelled pool with no taint leaves Pods that name no class `Pendi
 
 Why: The skill said only that a manual pool needs the compute-class label and taint. It did not say what happens with the label and no taint: Pods that name no class run on the pool until its nodes fill, then stay Pending while the autoscaler does not grow the pool, with an empty `NotTriggerScaleUp` message that reads like a capacity problem. The agent needs the sign (four conditions together), the version scope as observed (seen on 1.35.8-gke.1796000, not on 1.36.4-gke.2377000, other versions not tested), and the repair (name the class by `nodeSelector` or required `nodeAffinity`, or set a default class), so that it does not report a stockout.
 Local-Issue: #2528
+Eval-Case: compute-class-untargeted-pending-probe, autoscaler-pending-generated-workloads-probe
 Upstream-Issue: none filed yet
 Retire-When: when upstream's debug reference describes this case with its version scope
 
@@ -46,7 +47,7 @@ diff --git a/references/compute-class-debug.md b/references/compute-class-debug.
  ## Symptom 3: Trapped in Pending (GPU Tolerations Missing)
  
  -   **Symptom:** Pod requesting a GPU ComputeClass is stuck in `Pending` with
-@@ -147,6 +150,47 @@ Check **Autoscaler Visibility logs**
+@@ -147,6 +150,56 @@ Check **Autoscaler Visibility logs**
          preemption.
      3.  **Kueue:** Use Kueue for complex batch/AI/ML fair-sharing and queueing.
  
@@ -71,11 +72,18 @@ diff --git a/references/compute-class-debug.md b/references/compute-class-debug.
 +    behaviour for a version that is not one of these two.
 +-   **Confirm all four** before naming this cause: (1) the Pod spec has no
 +    `nodeSelector` and no required `nodeAffinity` on
-+    `cloud.google.com/compute-class`, and no namespace or cluster default
-+    class applies; (2) every pool that could grow carries the compute-class
-+    label; (3) the `NotTriggerScaleUp` message stays empty and the visibility
-+    log names no rejected or skipped pool, while the pool is below its maximum;
-+    (4) the cluster's version is one where the behaviour was seen.
++    `cloud.google.com/compute-class`, and no cluster default class is on (a
++    namespace default class that reached the Pod shows in its spec as a
++    `nodeSelector` that GKE added; a namespace label set after the Pod was
++    created does not count); (2) every pool that could grow carries the
++    compute-class label with no taint; (3) the
++    `NotTriggerScaleUp` message stays empty and the visibility log names no
++    rejected or skipped pool, while the pool is below its maximum
++    (`autoscaling.maxNodeCount` is for each zone: compare the pool's node
++    count with `autoscaling.totalMaxNodeCount` when it is set, else with
++    `autoscaling.maxNodeCount` times the number of zones in the pool's
++    `locations`); (4) the cluster's version is one where the behaviour was
++    seen.
 +-   **Not this cause:** an empty `unhandledPodGroups` record **alone**. The
 +    autoscaler can write one for a new group of waiting Pods before it gives a
 +    reason (for a pool at its maximum, `no.scale.up.mig.skipped` with `max node
@@ -86,10 +94,12 @@ diff --git a/references/compute-class-debug.md b/references/compute-class-debug.
 +    cloud.google.com/compute-class: <NAME>`, or a required `nodeAffinity` on
 +    that key (with either form the pool grew on both versions). For workloads
 +    that no manifest in Git describes, the namespace default
-+    (`cloud.google.com/default-compute-class=<NAME>`) is the route; it was not
-+    part of the test, and it applies only to Pods created after the label is
-+    set, so recreate the Pods. Adding the missing taint does not start these
-+    Pods: a tainted pool takes only Pods that name the class.
++    (`cloud.google.com/default-compute-class=<NAME>`) is the route: GKE then
++    adds the class `nodeSelector` and toleration to new Pods and the pool
++    grows for them (seen on `1.35.8-gke.1796000` for Deployment Pods, one
++    try). Pods that already wait get neither, so recreate them after the
++    label is set. Adding the missing taint does not
++    start these Pods: a tainted pool takes only Pods that name the class.
 +
  ## Useful Commands
  
