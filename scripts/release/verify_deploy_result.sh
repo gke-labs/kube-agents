@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Verifies that an automated deployment to a long-lived environment (autopush,
-# autopush-next, staging) applied successfully and was not deferred or dropped
+# staging) applied successfully and was not deferred or dropped
 # due to lease contention.
-# Used by .github/workflows/autopush-deploy.yml, autopush-next-deploy.yml and staging-deploy.yml.
+# Used by .github/workflows/autopush-deploy.yml and staging-deploy.yml.
 #
 # ALLOW_SKIPPED=true also accepts `skipped`, which reconcile-environment.yml
 # reports only for a caller that passed skip_unconfigured: the environment is
@@ -15,14 +15,14 @@ source "${SCRIPT_DIR}/common.sh"
 
 env_target="${TARGET_ENVIRONMENT:-${1:-}}"
 if [ -z "${env_target}" ]; then
-  echo "❌ ERROR: Target environment (autopush, autopush-next or staging) must be specified via TARGET_ENVIRONMENT or as first argument." >&2
+  echo "❌ ERROR: Target environment (autopush or staging) must be specified via TARGET_ENVIRONMENT or as first argument." >&2
   exit 1
 fi
 
 case "${env_target}" in
-  autopush|autopush-next|staging) ;;
+  autopush|staging) ;;
   *)
-    echo "❌ ERROR: Invalid target environment: '${env_target}'. Must be 'autopush', 'autopush-next' or 'staging'." >&2
+    echo "❌ ERROR: Invalid target environment: '${env_target}'. Must be 'autopush' or 'staging'." >&2
     exit 1
     ;;
 esac

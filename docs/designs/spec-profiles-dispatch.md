@@ -337,7 +337,8 @@ leave open:
 - **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
   `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
   dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
-  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  concurrency, queue timeout and deadline (the dispatcher derives each profile's durables from
+  its tiers and draining tiers, and the config is written compact; #5479), and four intervals: `leaseSeconds`
   (default 90), `renewSeconds` (20; a lease is at least three renewals),
   `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
   offers. A task already handed out keeps the intervals its offer carried.
@@ -500,7 +501,8 @@ leave open:
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`
-  and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
+  and `deadline-exceeded` while it holds, and on a `canceled` terminal `stopped` (the
+  conversation's stop) and `tier-ended` (an administrator ended its tier's drain, #5850). A terminal is retried until it lands, except for a
   profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
   task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
@@ -530,9 +532,10 @@ leave open:
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
-  The dispatch config doesn't carry the Job's pod template. It names the profile's own
-  `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
-  Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
+  The dispatch config doesn't carry the Job's pod template. It carries the hash of the rendering
+  of the profile's own `DispatchJobTemplate` in the profile namespace, the param the Job
+  admission policy holds each Job to (`jobTemplateRef`). The param's name is derived from the
+  profile's (#5479). The dispatcher reads that
   object when it launches the Job, with `get` alone on those objects, and uses it only while
   the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
   missing param, or one with no containers keeps that profile's task queued, shows on the

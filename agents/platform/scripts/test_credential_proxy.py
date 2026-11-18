@@ -37,6 +37,7 @@ import credential_proxy
 import credential_proxy_client
 import feedback_broker
 import gke_endpoint
+import logging_reads
 import no_live_kubectl
 import providers
 import scope_exclude
@@ -11151,6 +11152,101 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
                     "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
                 )
 
+    def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
+        # The proxy gives the commands it runs a fixed list of names from its
+        # own environment. These two, which an operator can set on the pod
+        # (`platformAgent.deployment.env`), are not on it, and the exec role
+        # sets the gcloud name itself, to its own value. This keeps both in the
+        # proxy's environment from the start of `serve` to the end of each
+        # command, and reads what a gcloud and a kubectl command were given.
+        pod_environment = {
+            "MALLOC_ARENA_MAX": "2",
+            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: "0",
+        }
+        unset = "<unset>"
+        # A stand-in prints these two names and nothing else, so a failure
+        # cannot put the rest of an environment in a log. Each has the tool's
+        # file name, in a directory of its own: the proxy reads that name.
+        script = "#!/bin/bash\n" + "".join(
+            f"printf '{name}=%s\\n' \"${{{name}-{unset}}}\"\n" for name in pod_environment
+        )
+        commands = (["gcloud", "config", "list"], ["kubectl", "get", "pods"])
+        stand_ins = {}
+        for argv in commands:
+            stand_in = Path(self.tmp.name) / f"fake-{argv[0]}-bin" / argv[0]
+            stand_in.parent.mkdir()
+            stand_in.write_text(script, encoding="utf-8")
+            stand_in.chmod(0o755)
+            stand_ins[argv[0]] = str(stand_in)
+        for role, gcloud_logging_off in (
+            (credential_proxy_client.EXEC_ROLE, "1"),
+            ("broker", unset),
+            ("combined", unset),
+        ):
+            self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
+            executor = CredentialProxyHandler.executor
+            executor.executables.update(stand_ins)
+            for argv in commands:
+                with self.subTest(role=role, command=argv[0]):
+                    with mock.patch.dict(os.environ, pod_environment):
+                        result = executor.execute(argv)
+                    self.assertEqual(0, result.exit_code, result.stderr)
+                    self.assertEqual(
+                        {
+                            "MALLOC_ARENA_MAX": unset,
+                            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: gcloud_logging_off,
+                        },
+                        dict(line.split("=", 1) for line in result.stdout.splitlines()),
+                    )
+
+    def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_the_bootstrap_command(self):
+        # `bootstrap` gives its command the command environment plus a second
+        # list of names from the proxy's own environment. A `serve` with no
+        # bootstrap command does not reach that list. This starts `serve` with
+        # one, for each role, with both names in the proxy's environment, and
+        # reads what the command was given. On GKE the operator's bootstrap
+        # command runs gcloud. The exec role sets the gcloud name itself, to
+        # its own value; the pod's value must not replace it.
+        pod_environment = {
+            "MALLOC_ARENA_MAX": "2",
+            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: "0",
+        }
+        unset = "<unset>"
+        # The command writes these two names and nothing else, so a failure
+        # cannot put the rest of an environment in a log.
+        command = (
+            "{ "
+            + " ".join(f"printf '{name}=%s\\n' \"${{{name}-{unset}}}\";" for name in pod_environment)
+            + ' } > "$HOME/bootstrap-names"'
+        )
+        for role, gcloud_logging_off in (
+            (credential_proxy_client.EXEC_ROLE, "1"),
+            ("broker", unset),
+            ("combined", unset),
+        ):
+            with self.subTest(role=role):
+                self._serve_with(
+                    None,
+                    extra_env={
+                        "CREDENTIAL_PROXY_ROLE": role,
+                        "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": command,
+                        **pod_environment,
+                    },
+                )
+                written = CredentialProxyHandler.executor.home_dir / "bootstrap-names"
+                given = written.read_text(encoding="utf-8")
+                # Removed before the assertion, so the next role starts with no
+                # file also when this role fails: a bootstrap that did not run
+                # cannot pass, or fail, on the file of the role before it.
+                written.unlink()
+                self.assertEqual(
+                    {
+                        "MALLOC_ARENA_MAX": unset,
+                        credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: gcloud_logging_off,
+                    },
+                    dict(line.split("=", 1) for line in given.splitlines()),
+                )
+
     def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
         for role, wired in ((credential_proxy_client.EXEC_ROLE, True), ("broker", False)):
             with self.subTest(role=role):
@@ -13934,6 +14030,65 @@ class RouteRolesTableTest(unittest.TestCase):
                     ("/v1/chat/", (credential_proxy.CALLER_ROLE_A2A_CHAT,)),
                 )
             )
+
+
+class DialRouteTest(unittest.TestCase):
+    """`POST /v1/dial`: the agent pod's chat role reports the dial's level; nobody else may."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(setattr, vcs_broker, "_dial_level", None)
+        self.addCleanup(setattr, vcs_broker, "_dial_reported", False)
+        vcs_broker._dial_level = None
+        for patcher in (
+            mock.patch.dict(os.environ, {vcs_broker.DIAL_ENV: "on", vcs_broker.WRITE_MODE_ENV: ""}),
+            mock.patch.object(vcs_broker, "DIAL_STATE_FILE", os.path.join(scratch.name, "dial")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _post(self, body, role=credential_proxy.CALLER_ROLE_CHAT):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        encoded = body if isinstance(body, bytes) else json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.path = credential_proxy.DIAL_PATH
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        principal = credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role)
+        handler._handle_dial_post(principal)
+        return replies[0]
+
+    def test_the_route_is_the_chat_roles_alone(self):
+        self.assertIn((credential_proxy.DIAL_PATH, (credential_proxy.CALLER_ROLE_CHAT,)), credential_proxy.ROUTE_ROLES)
+
+    def test_a_report_applies_to_the_next_write_at_once(self):
+        status, payload = self._post({"level": "explain"})
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual({"level": "explain", "writeMode": "none", "automerge": False}, payload)
+        self.assertEqual("none", vcs_broker.write_mode()[0])
+        status, payload = self._post({"level": "automerge"})
+        self.assertEqual((HTTPStatus.OK, "propose", True), (status, payload["writeMode"], payload["automerge"]))
+
+    def test_any_role_but_chat_is_refused_even_with_no_role(self):
+        for role in ("", credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP):
+            with self.subTest(role=role), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, payload = self._post({"level": "propose"}, role=role)
+                self.assertEqual((HTTPStatus.FORBIDDEN, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        self.assertEqual("explain", vcs_broker.dial_level())
+
+    def test_a_bad_body_is_refused_and_stores_nothing(self):
+        for body in ({"level": "none"}, {"level": 1}, ["explain"], b"{", b"x" * 2048):
+            with self.subTest(body=body):
+                self.assertEqual(HTTPStatus.BAD_REQUEST, self._post(body)[0])
+        self.assertIsNone(vcs_broker._dial_level)
+
+    def test_with_the_switch_off_nothing_is_stored(self):
+        with mock.patch.dict(os.environ, {vcs_broker.DIAL_ENV: "off"}):
+            status, payload = self._post({"level": "explain"})
+        self.assertEqual((HTTPStatus.CONFLICT, "DIAL_OFF"), (status, payload["code"]))
+        self.assertIsNone(vcs_broker._dial_level)
 
 
 class RolePermitsTest(unittest.TestCase):
@@ -18663,6 +18818,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
     def setUp(self):
         owner = self
         self.upstream_requests = []
+        self.upstream_bodies = []
         self.reply = {"status": 200, "content_type": "application/json; charset=UTF-8",
                       "body": b'{"timeSeries":[]}', "headers": {}, "delay": 0.0,
                       # (pieces, seconds between them): send the body a piece at
@@ -18710,6 +18866,10 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
                 except OSError:
                     # The broker gave up on us (the deadline test); nothing to report.
                     pass
+
+            def do_POST(self):  # noqa: N802
+                owner.upstream_bodies.append(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                self.do_GET()
 
             def log_message(self, _message, *_args):
                 return
@@ -19244,7 +19404,10 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
              "gcp.api.host-refused"),
             ("GET", "/v1/gcp/metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
              "gcp.api.host-refused"),
-            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.host"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.path"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries:list", "gcp.api.path"),
+            ("POST", "/v1/gcp/logging.googleapis.com/v2/entries:write", "gcp.api.method"),
+            ("POST", "/v1/gcp/logging.googleapis.com/v2/projects/kagents-dev/sinks", "gcp.api.method"),
             ("GET", "/v1/gcp/evil.example.com/anything", "gcp.api.host"),
             ("POST", self.ALLOWED, "gcp.api.method"),
             ("POST", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries:query", "gcp.api.method"),
@@ -19437,7 +19600,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertTrue(lines[1].endswith(" rule=gcp.api.monitoring.timeseries-list"))
         # The policy still answers first: a refusal reads as a refusal, not an outage.
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-            status, _, payload = self._json_request("/v1/gcp/logging.googleapis.com/v2/entries")
+            status, _, payload = self._json_request("/v1/gcp/compute.googleapis.com/compute/v1/projects/p/regions")
         self.assertEqual(403, status)
         self.assertEqual("gcp.api.host", payload["rule"])
 
@@ -19639,9 +19802,287 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         # The design doc and the site's observability page list these words: a
         # new routed host adds one, and both pages then need it.
         self.assertEqual(
-            {"monitoring", "cloudtrace", "container"}, set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values())
+            {"monitoring", "cloudtrace", "container", "logging"},
+            set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values()),
         )
         self.assertNotIn(credential_proxy.API_RELAY_AUDIT_TOOL, CommandExecutor.ALLOWED_EXECUTABLES)
+
+    # -- the one read with a body: Logging entries:list --------------------
+
+    ENTRIES_LIST = "/v1/gcp/logging.googleapis.com/v2/entries:list"
+    ENTRIES_BODY = {
+        "resourceNames": ["projects/kagents-dev"],
+        "filter": 'resource.type="k8s_cluster" AND timestamp>="2026-11-06T00:00:00Z"',
+        "orderBy": "timestamp desc",
+        "pageSize": 1000,
+    }
+
+    def _entries_list(self, body, token="shell-token", path=None, headers=None):
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        return self._json_request(
+            path or self.ENTRIES_LIST, token=token, method="POST", body=raw,
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+
+    def test_an_entries_list_reaches_the_upstream_as_the_brokers_own_post(self):
+        self.reply.update(body=b'{"entries":[{"insertId":"a"}],"nextPageToken":"t"}')
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._entries_list(
+                self.ENTRIES_BODY, headers={"X-Goog-User-Project": "other-project", "X-HTTP-Method-Override": "DELETE"}
+            )
+        self.assertEqual(200, status)
+        self.assertEqual({"entries": [{"insertId": "a"}], "nextPageToken": "t"}, payload)
+        self.assertEqual(["logging.googleapis.com"], self.relay.hosts)
+        [(path, upstream_headers)] = self.upstream_requests
+        self.assertEqual("/v2/entries:list", path)
+        self.assertEqual(
+            {"Host", "Authorization", "Accept", "Content-Type", "Content-Length"},
+            set(upstream_headers),
+            "the broker's headers and Host, and none of the caller's",
+        )
+        self.assertEqual("Bearer broker-token", upstream_headers["Authorization"])
+        self.assertEqual("application/json", upstream_headers["Content-Type"])
+        [sent] = self.upstream_bodies
+        self.assertEqual(self.ENTRIES_BODY, json.loads(sent))
+        started, completed = self._audits(logs)
+        self.assertEqual(("gcp-api", "logging", "started"), (started["tool"], started["subcommand"], started["status"]))
+        self.assertEqual(("completed", 200), (completed["status"], completed["upstream_status"]))
+        # The filter is in no log line and in no audit field.
+        self.assertNotIn("k8s_cluster", "\n".join(r.getMessage() for r in logs.records))
+        self.assertNotIn("k8s_cluster", json.dumps(self._audits(logs)))
+
+    def test_the_upstream_gets_the_brokers_serialisation_not_the_callers_bytes(self):
+        # A duplicate key: the parser keeps the last, the check reads the last,
+        # and the upstream is sent one key with that value. Nothing of the
+        # caller's spelling (the first value, the spacing) leaves the broker.
+        raw = (
+            b'{ "resourceNames": ["projects/first-project"],\n'
+            b'  "resourceNames" : ["projects/kagents-dev"], "pageSize": 5 }'
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._entries_list(raw)
+        self.assertEqual(200, status)
+        [sent] = self.upstream_bodies
+        self.assertEqual(b'{"resourceNames":["projects/kagents-dev"],"pageSize":5}', sent)
+
+    def test_the_collectors_helper_reads_through_the_client_and_this_handler(self):
+        """`logging_reads.read_json` over `ApiSession.post`, this handler and the
+        fake upstream: the whole chain, with no seam stood in for."""
+        try:
+            import requests  # noqa: F401, PLC0415 -- ApiSession's transport, absent from a bare checkout
+        except ImportError:
+            self.skipTest("requests is not installed")
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "token").write_text("shell-token\n", encoding="utf-8")
+        logged = [{"insertId": "a", "timestamp": "2026-11-13T00:00:02Z"}, {"insertId": "b", "timestamp": "2026-11-13T00:00:01Z"}]
+        self.reply.update(body=json.dumps({"entries": logged}).encode())
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_TOKEN_FILE": str(directory / "token")}):
+            session = credential_proxy_client.ApiSession(f"http://127.0.0.1:{self.server.server_address[1]}")
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+                text = logging_reads.read_json(
+                    "kagents-dev", 'resource.type="k8s_cluster"', 1000, timeout_s=10, session=session
+                )
+        self.assertEqual(logged, json.loads(text))
+        [sent] = self.upstream_bodies
+        self.assertEqual(
+            {
+                "resourceNames": ["projects/kagents-dev"],
+                "filter": 'resource.type="k8s_cluster"',
+                "orderBy": "timestamp desc",
+                "pageSize": 1000,
+            },
+            json.loads(sent),
+        )
+
+    def test_in_a_custom_universe_the_entries_list_goes_to_that_universes_host(self):
+        universe = "apis-tpczero.example"
+        self.addCleanup(
+            self._restore, "universe_domain", "universe_domain" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("universe_domain"),
+        )
+        CredentialProxyHandler.universe_domain = universe
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._entries_list(
+                self.ENTRIES_BODY, path=f"/v1/gcp/logging.{universe}/v2/entries:list"
+            )
+        self.assertEqual(200, status)
+        self.assertEqual([f"logging.{universe}"], self.relay.hosts)
+        self.assertEqual(self.ENTRIES_BODY, json.loads(self.upstream_bodies[0]))
+        # The commercial host is another universe's: refused, and nothing is sent.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.method", payload["rule"])
+        self.assertEqual(1, len(self.upstream_requests))
+
+    def test_a_body_the_policy_refuses_never_reaches_the_upstream(self):
+        cases = (
+            {**self.ENTRIES_BODY, "resourceNames": ["projects/kagents-dev", "projects/other-project"]},
+            {**self.ENTRIES_BODY, "resourceNames": ["folders/123456789012"]},
+            {**self.ENTRIES_BODY, "resourceNames": ["billingAccounts/0X0X0X-0X0X0X-0X0X0X"]},
+            {**self.ENTRIES_BODY, "projectIds": ["other-project"]},
+            {**self.ENTRIES_BODY, "pageSize": 100000},
+            {"filter": "x"},
+            [self.ENTRIES_BODY],
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._entries_list(body)
+                self.assertEqual(403, status)
+                self.assertEqual(
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.body"},
+                    {key: payload[key] for key in ("status", "code", "rule")},
+                )
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts, "a refused body never opens a connection")
+                started, blocked = self._audits(logs)
+                self.assertEqual(("blocked", "gcp.api.body", "logging"),
+                                 (blocked["status"], blocked["rule"], blocked["subcommand"]))
+
+    def test_a_query_on_the_entries_list_route_is_refused(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(self.ENTRIES_BODY, path=self.ENTRIES_LIST + "?fields=entries")
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.body", payload["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_a_body_that_is_not_json_is_400(self):
+        for raw in (b"not json", b'{"resourceNames": ', b"\xff\xfe", b"[" * 5000):
+            with self.subTest(raw=raw[:12]):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._entries_list(raw)
+                self.assertEqual(400, status)
+                self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_a_body_over_the_cap_is_413_and_is_not_read_into_the_policy(self):
+        filler = "x" * credential_proxy.API_RELAY_MAX_BODY_BYTES
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": filler})
+        self.assertEqual(413, status)
+        self.assertEqual("API_RELAY_BODY_TOO_LARGE", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+        # One larger than the socket buffers still receives its answer.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(b"x" * _BODY_LARGER_THAN_SOCKET_BUFFERS)
+        self.assertEqual(413, status)
+
+    def test_a_body_exactly_at_the_cap_is_read(self):
+        room = credential_proxy.API_RELAY_MAX_BODY_BYTES - len(json.dumps({**self.ENTRIES_BODY, "pageToken": ""}))
+        body = json.dumps({**self.ENTRIES_BODY, "pageToken": "t" * room}).encode()
+        self.assertEqual(credential_proxy.API_RELAY_MAX_BODY_BYTES, len(body))
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._entries_list(body)
+        self.assertEqual(200, status)
+
+    def test_a_post_without_a_content_length_is_400(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer shell-token\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            payload = json.loads(response.read())
+        self.assertEqual(400, response.status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+
+    def _raw_entries_list(self, head: bytes, body: bytes = b"", read_timeout=10):
+        """An entries:list POST with the framing headers as written; (status, payload) or None on a close."""
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=read_timeout) as sock:
+            sock.sendall(
+                b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer shell-token\r\n" + head + b"\r\n" + body
+            )
+            response = http.client.HTTPResponse(sock)
+            try:
+                response.begin()
+            except (http.client.HTTPException, OSError):
+                return None
+            return response.status, json.loads(response.read())
+
+    def test_a_request_that_cannot_be_framed_is_400_and_is_not_forwarded(self):
+        body = json.dumps(self.ENTRIES_BODY).encode()
+        length = str(len(body)).encode()
+        for head in (
+            b"Transfer-Encoding: chunked\r\nContent-Length: " + length + b"\r\n",
+            b"Content-Length: " + length + b"\r\nContent-Length: 0\r\n",
+            b"Content-Length: -1\r\n",
+            b"Content-Length: many\r\n",
+        ):
+            with self.subTest(head=head):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, payload = self._raw_entries_list(head, body)
+                self.assertEqual(400, status)
+                self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_a_body_shorter_than_its_content_length_did_not_arrive(self):
+        # The part that arrived is a whole JSON object the policy would allow:
+        # it is still not the request the caller announced.
+        sent = json.dumps({"resourceNames": ["projects/kagents-dev"]}).encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                sock.sendall(
+                    b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                    b"Authorization: Bearer shell-token\r\nContent-Length: "
+                    + str(len(sent) + 40).encode() + b"\r\n\r\n" + sent
+                )
+                sock.shutdown(socket.SHUT_WR)
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                payload = json.loads(response.read())
+        self.assertEqual(400, response.status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual("the request body did not arrive", payload["error"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_a_post_with_no_body_at_all_is_400(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, payload = self._raw_entries_list(b"")
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_a_body_that_stalls_still_leaves_a_verdict_in_the_audit_trail(self):
+        # The window a request has to arrive in full, shortened for the test.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                answer = self._raw_entries_list(b"Content-Length: 100\r\n", b'{"resourceNames":')
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        self.assertIsNone(answer, "a request whose body never arrived gets no relayed answer")
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+        self.assertTrue(any("the request body did not arrive" in r.getMessage() for r in logs.records))
+
+    def test_the_entries_list_route_refuses_the_chat_and_session_roles(self):
+        for token in ("chat-token", "session-token"):
+            with self.subTest(token=token):
+                status, _, _ = self._entries_list(self.ENTRIES_BODY, token=token)
+                self.assertEqual(403, status)
+                self.assertEqual([], self.upstream_requests)
+
+    def test_an_upstream_refusal_of_an_entries_list_passes_through(self):
+        self.reply.update(status=403, body=b'{"error":{"code":403,"status":"PERMISSION_DENIED"}}')
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(403, status)
+        self.assertEqual({"error": {"code": 403, "status": "PERMISSION_DENIED"}}, payload)
+        self.assertEqual(("completed", 403), (self._audits(logs)[-1]["status"], self._audits(logs)[-1]["upstream_status"]))
+
+    def test_no_relay_armed_answers_an_entries_list_503_after_the_body_is_read(self):
+        CredentialProxyHandler.api_relay = None
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(503, status)
+        self.assertEqual("API_RELAY_DISABLED", payload["code"])
 
 
 class ApiRelayAuditLineCannotBeForgedTest(unittest.TestCase):

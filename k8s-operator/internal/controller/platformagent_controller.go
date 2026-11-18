@@ -22,6 +22,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"net"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -258,11 +259,11 @@ const (
 	// install without one looks healthy while every unprompted post is
 	// dropped (#3320). Written only in that state, like EventWatcher, and it
 	// leaves Ready alone: chat works, and some installs want no posts.
-	// a2aBusConversionRefusedConditionType stands while
-	// spec.harness.tuning.busReplicas asks for a server count other than the
-	// one the existing bus runs (BusConversionRefusedMessage).
+	// a2aBusConversionRefusedConditionType is retired: the operator that
+	// refused a bus conversion wrote it, and this one migrates instead
+	// (A2ABusMigrating). It is only ever removed, from a CR an earlier
+	// operator wrote it to.
 	a2aBusConversionRefusedConditionType = "A2ABusConversionRefused"
-	a2aBusConversionRefusedReason        = "ConversionNotSupported"
 
 	homeChannelUnsetConditionType = "HomeChannelUnset"
 	homeChannelUnsetReason        = "NoHomeChannel"
@@ -536,6 +537,21 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// prunedBusMigrationStatus records, per CR, that a status write carrying
+	// status.busMigration came back without it: the served CRD predates the
+	// field. A run the API server drops is gone by the next pass, which would
+	// start another, so while a record is held no run starts
+	// (resolveA2ABusReplicas). Unlike prunedBusReplicasStatus it is not
+	// reprobed on a timer: the only probe is starting a run, whose first
+	// pass already rolls the callout into the freeze or runs the pin Job.
+	// Cleared by an echo that carries the field, and when the CR is deleted;
+	// a restart of the operator after the CRD is applied clears it too.
+	prunedBusMigrationStatus sync.Map
+	// singleServerBusWarned holds, per CR, the UID of the one-server bus pod
+	// the A2ABusSingleServer Event last named (noteA2ABusSingleServer), so
+	// the Event is written once per pod, not on every pass. Cleared when the
+	// bus is not one server, and when the CR is deleted.
+	singleServerBusWarned sync.Map
 	// prunedObservedVersion records, per CR, when a status write was last
 	// seen to come back without status.observedVersion: an operator rolled
 	// ahead of the CRD that adds the field. While fresh, updateStatusReady
@@ -543,14 +559,6 @@ type PlatformAgentReconciler struct {
 	// server prunes does not repeat on every pass.
 	prunedObservedVersion sync.Map
 
-	// busConversionAllowed lets resolveA2ABusReplicas convert an existing bus
-	// between one server and three. Off in every operator: a conversion
-	// empties the bus (a cluster deletes a standalone server's streams as
-	// orphans, a standalone server refuses a cluster's R3 streams), and the
-	// migration that keeps the data, #4225, lifts this in the same change. No
-	// flag, env var or constructor sets it; only tests do
-	// (TestNothingButTestsAllowsABusConversion).
-	busConversionAllowed bool
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings), the two people
@@ -688,9 +696,23 @@ type PlatformAgentReconciler struct {
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
-	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
-	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
-	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+	// busConfigLoadTime stands in for reading a bus server's config_load_time
+	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
+	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
+	// tests; it wins over busConfigLoadTime, which answers a fixed start.
+	busVarz func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error)
+	// busConfigWrittenAt stands in for reading when the live bus config
+	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
+	// keeps no managedFields.
+	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
+	// busTLSWrittenAt stands in for reading when the bus's TLS Secret was
+	// last written (a2aBusWatched), in tests: the fake client keeps no
+	// managedFields.
+	busTLSWrittenAt func(tls *corev1.Secret) (time.Time, bool)
+	// busStreamState stands in for reading each bus stream's state from the
+	// monitoring endpoint (a2aBusStreamState), in tests.
+	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
 	// busServerViews stands in for reading each bus server's /jsz
 	// (readA2ABusServerViews) in tests.
 	busServerViews func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) ([]a2aBusServerView, error)
@@ -767,8 +789,8 @@ type PlatformAgentReconciler struct {
 // The markers below are the operator's whole Kubernetes authority: controller-gen renders them
 // into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. A
 // marker without `namespace=` lands in the ClusterRole; one with it lands in the Role document
-// beside it, which both install paths bind in the install namespace and, under mode next, in the
-// profile namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
+// beside it, which both install paths bind in the install namespace and in the profile
+// namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
 // or the group it sits in:
 //
 //   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
@@ -839,8 +861,8 @@ type PlatformAgentReconciler struct {
 // exists, so a namespaced read would be a 403 wherever that RoleBinding is
 // absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
-// namespaced Role there in the same apply (the chart under mode next,
-// config/profiles under make deploy), which is what lets the namespaced
+// namespaced Role there in the same apply (the chart, or config/profiles
+// under make deploy), which is what lets the namespaced
 // writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
 // and 2026-10-31, #3655 PR 6, predates that binding).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list
@@ -1014,6 +1036,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// A bus migration's Jobs and pods are not watched, so while one runs
+	// every return polls it (busMigrationRequeue), whichever branch it takes;
+	// a clean requeue and an error keep their own retry.
+	defer func() {
+		if retErr != nil || result.Requeue {
+			return
+		}
+		if d := busMigrationRequeue(instance); d > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > d) {
+			result.RequeueAfter = d
+		}
+	}()
 	// The gauges carry the CR as read, on every reconcile: an operator restart
 	// serves the fleet on its first pass, and a status write by any writer is
 	// published on the reconcile it re-enqueues, so no writer publishes itself.
@@ -1402,6 +1435,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The bus creds Secret before the agent Deployment, which can read keys of
+	// it from the first render: the rendered bridge's password, and the
+	// activity-hook key the agent holds beside any bridge, rendered or declared
+	// (a2aActivityHookWanted). The A2A stack below ensures it as well, but runs
+	// after the workload, so on a fresh install the first render would digest
+	// the Secret as absent (secretEnvHash) and the next pass, finding it, would
+	// change the pod template and roll the agent a second time (#5962). The
+	// stack ensures it on every pass, so ensuring it here first changes when,
+	// not whether; the ensure is idempotent and returns the Secret when it is
+	// there.
+	if _, err := r.ensureA2ACredsSecret(ctx, renderAgent); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
+	}
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1424,6 +1470,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, renderAgent, netpolProf); err != nil {
+		return ctrl.Result{}, err
+	}
+	// The audit-report store's Service (audit_report_store.go); its ingress
+	// rule is in the gateway policy above.
+	if err := r.reconcileAuditReportStore(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, renderAgent); err != nil {
@@ -1571,6 +1622,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
+		// And a tier drain's end (#5850), which nothing watched marks.
+		if a2aState.drainEndRequeue > 0 {
+			requeue = min(requeue, a2aState.drainEndRequeue)
+		}
 		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
@@ -1638,6 +1693,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// config: a single server's reload landing moves nothing watched.
 	if a2aState.profileHoldRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.profileHoldRequeue)
+	}
+	// A tier drain ending: its teardown is the pass after its end.
+	if a2aState.drainEndRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.drainEndRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
@@ -4772,7 +4831,6 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
 	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
-	conversionMsg := a2aBusConversionRefusedMessage(agent)
 	noChatMsg := noChatPlatformMsg(agent)
 	// So does the sandbox pin: an old sandbox is a likely cause of the park.
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
@@ -4782,11 +4840,12 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
 		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
+		retiredConversionRefusedAbsent(agent) &&
+		busMigratingConditionCurrent(agent) && busMigrationStatusCurrent(agent, a2a) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		a2aBusMetaConditionCurrent(agent, a2a.busMeta) &&
 		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
-		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
@@ -4798,11 +4857,12 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
+			retiredConversionRefusedAbsent(live) &&
+			reflect.DeepEqual(live.Status.BusMigration, agent.Status.BusMigration) && busMigratingConditionCurrent(live) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			a2aBusMetaConditionCurrent(live, a2a.busMeta) &&
 			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
-			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
 			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas) &&
 			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
@@ -4816,17 +4876,19 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setNoChatPlatformCondition(agent, noChatMsg, now)
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+	setBusMigratingCondition(agent, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
-	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
 	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
-	writtenBusReplicas := agent.Status.BusReplicas
+	writtenBusReplicas, wroteBusMigration := agent.Status.BusReplicas, agent.Status.BusMigration != nil
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
+	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
 }
 
@@ -4861,6 +4923,28 @@ func (r *PlatformAgentReconciler) noteBusReplicasEcho(agent *agentv1alpha1.Platf
 		return
 	}
 	r.prunedBusReplicasStatus.Store(key, time.Now())
+}
+
+// noteBusMigrationEcho reads status.busMigration back after a status write,
+// as noteBusReplicasEcho does status.busReplicas: written says the write
+// carried a run, and an echo without one is the served CRD pruning it.
+func (r *PlatformAgentReconciler) noteBusMigrationEcho(agent *agentv1alpha1.PlatformAgent, written bool) {
+	if !written {
+		return
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.BusMigration != nil {
+		r.prunedBusMigrationStatus.Delete(key)
+		return
+	}
+	r.prunedBusMigrationStatus.Store(key, time.Now())
+}
+
+// busMigrationStatusPruned reports a record that the served CRD drops
+// status.busMigration (noteBusMigrationEcho).
+func (r *PlatformAgentReconciler) busMigrationStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	_, pruned := r.prunedBusMigrationStatus.Load(client.ObjectKeyFromObject(agent))
+	return pruned
 }
 
 // liveAgentSatisfies checks whether the uncached live object already satisfies pred.
@@ -5220,10 +5304,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	sandboxPinnedUnchanged := shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg)
 
-	// The refused conversion, from the spec and the count this pass resolved:
-	// advisory, so Ready stands on the bus that runs.
-	conversionRefusedMsg := a2aBusConversionRefusedMessage(agent)
-	conversionRefusedUnchanged := a2aBusConversionRefusedConditionCurrent(agent, conversionRefusedMsg)
+	// The retired conversion refusal an earlier operator may have left.
+	conversionRefusedUnchanged := retiredConversionRefusedAbsent(agent)
+	busMigratingUnchanged := busMigratingConditionCurrent(agent)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
@@ -5327,6 +5410,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
 		conversionRefusedUnchanged &&
+		busMigratingUnchanged && busMigrationStatusCurrent(agent, a2a) &&
 		noChatPlatformUnchanged &&
 		sandboxPinnedUnchanged &&
 		hostPathDroppedUnchanged &&
@@ -5412,7 +5496,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
-	setA2ABusConversionRefusedCondition(agent, conversionRefusedMsg, now)
+	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+	setBusMigratingCondition(agent, now)
 	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
@@ -5431,7 +5516,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	setExternalModelEgressCondition(agent, externalEgressMsg, now)
 
-	writtenBusReplicas := agent.Status.BusReplicas
+	writtenBusReplicas, wroteBusMigration := agent.Status.BusReplicas, agent.Status.BusMigration != nil
 	// Copied before the write: decoding the response may reuse the pointer's target.
 	var wroteInference *inferenceModel
 	if newInference != nil {
@@ -5442,6 +5527,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
+	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
 	r.noteUniverseDomainEcho(ctx, agent, resolvedUniverseDomain, universeDomainSource)
 	r.noteObservedVersionEcho(ctx, agent, newObservedVersion)
@@ -5572,6 +5658,8 @@ func (r *PlatformAgentReconciler) noteObservedVersionEcho(ctx context.Context, a
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedBusMigrationStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.singleServerBusWarned.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
@@ -6054,7 +6142,8 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the A2A stack renders — one per reconcile while the exec tier is short
 // of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
 // pod per reconcile while a bus replica is not on the StatefulSet's update
-// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
+// revision (replaceStuckA2ANATSPod), and one Get of the bus pod per reconcile
+// on a one-server bus with no migration in flight (noteA2ABusSingleServer). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
@@ -6743,7 +6832,10 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				// also picks the incumbent unattended tier, but it changes
 				// only on a pass that a spec or Tier change started, which
 				// enqueues this controller too.
-				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+				// The end-tier-drain annotation too (#5850): it changes no
+				// generation, and the dispatch config this pass writes is
+				// where the end takes effect.
+				builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, endTierDrainChanged())),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its
 				// operator-created ServiceAccounts (a foreign one under

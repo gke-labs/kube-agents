@@ -409,7 +409,9 @@ func (s *Service) decide(ctx context.Context, m *nats.Msg) {
 		// "Authorization Violation" whether its token was bad, the callout
 		// was down, or the response was malformed — so this log line and
 		// the $SYS disconnect advisory are the only places the reason
-		// exists. Log the identity, never the token.
+		// exists. Log the identity, never the token nor the password: the
+		// reason is built from what the client sent, so no step below may
+		// format either into it (ParseDispatcherBucketCredential once did).
 		s.log.Warn("refusing a connection",
 			"reason", err,
 			"host", req.ClientInformation.Host,
@@ -490,9 +492,9 @@ type decision struct {
 	perms   *jwt.Permissions
 	user    string
 
-	// task and notAfter are set on a profile worker's task connection
-	// alone: the task its grants are scoped to, and its credential's
-	// expiry, which caps the minted JWT's (see mint).
+	// task is set on a profile worker's task connection alone: the task
+	// its grants are scoped to. notAfter caps the minted JWT's expiry (see
+	// mint): the task credential's expiry there, or the entry's NotAfter.
 	task     string
 	notAfter time.Time
 
@@ -573,6 +575,14 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	grants, user := id.Grants, id.User
 	var task string
 	var notAfter time.Time
+	// An entry past its NotAfter authenticates nothing, whatever the map
+	// still says; one before it mints no JWT that outlives it.
+	if id.NotAfter != nil {
+		if !s.now().Before(*id.NotAfter) {
+			return decision{}, fmt.Errorf("%s's entry expired at %s", att.ServiceAccount, id.NotAfter.UTC().Format(time.RFC3339))
+		}
+		notAfter = *id.NotAfter
+	}
 	if id.Narrowing == NarrowingDispatcher {
 		// The dispatcher's users are the map's own (its entry's user, or
 		// that user's bucket users, which the map reserves), not a pod
@@ -786,6 +796,9 @@ func permissionsFor(grants Grants) *jwt.Permissions {
 	p := &jwt.Permissions{}
 	p.Pub.Allow.Add(grants.Publish...)
 	p.Sub.Allow.Add(grants.Subscribe...)
+	// The entry's own denies, on top of its allows (Grants.DenyPublish).
+	p.Pub.Deny.Add(grants.DenyPublish...)
+	p.Sub.Deny.Add(grants.DenySubscribe...)
 	if len(p.Pub.Allow) == 0 {
 		p.Pub.Deny.Add(">")
 	}

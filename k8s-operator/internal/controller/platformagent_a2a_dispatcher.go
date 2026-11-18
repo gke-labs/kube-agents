@@ -180,7 +180,7 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //     $JS.ACK on them to ack, nak and send the in-progress heartbeats a held
 //     message lives on. No CONSUMER.CREATE: the durables are the operator's.
 //     Each durable is named rather than PROFILE_SUBMITS.*, so a dispatcher
-//     reads only the durables its config lists. The grants are fixed for a
+//     reads only the durables its config derives. The grants are fixed for a
 //     connection, so the dispatcher reconnects when its config adds a
 //     durable (contract on #3655).
 //   - PROFILE_LEASES, which it alone writes: put and delete on $KV, INFO and
@@ -330,6 +330,10 @@ func a2aDispatcherResources() corev1.ResourceRequirements {
 }
 
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+	// The install's tier table (#6091), for the report-credential mint to key
+	// on a tier's mode rather than its name. Nothing reads it yet: the mount
+	// is inert until the dispatcher's mint reads A2A_TIERS_FILE.
+	tiersVolume, tiersMount, tiersEnv := a2aTiersVolumeAndMount(agent)
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)
 	podLabels := a2aLabels(agent, "dispatcher")
@@ -382,9 +386,10 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							// so the process opens its bucket connections
 							// exactly when the callout splits its grants.
 							{Name: a2aDispatcherBucketedGrantsEnvVar, Value: strconv.FormatBool(a2aDispatcherBucketedGrants())},
+							tiersEnv,
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
-							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},
+							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}, tiersMount},
 						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -403,7 +408,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 						Resources:       a2aDispatcherResources(),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent), tiersVolume},
 				},
 			},
 		},
@@ -601,7 +606,10 @@ type a2aDispatchConfig struct {
 
 // a2aDispatchJobTemplateRef is lib.DispatchJobTemplateRef.
 type a2aDispatchJobTemplateRef struct {
-	Name string `json:"name"`
+	// Name is the param's name, kept here for the operator's own use and not
+	// written (#5479): it is always the profile's own param, which the
+	// dispatcher derives (lib.DispatchJobTemplateName).
+	Name string `json:"-"`
 	Hash string `json:"hash"`
 }
 
@@ -616,8 +624,13 @@ type a2aDispatchProfile struct {
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter `json:"parameters,omitempty"`
 	// Scripts is lib.DispatchProfile's: the profile's spec.scripts (#5622).
-	Scripts  []a2aDispatchScript  `json:"scripts,omitempty"`
-	Durables []a2aDispatchDurable `json:"durables"`
+	Scripts []a2aDispatchScript `json:"scripts,omitempty"`
+	// Durables are the shared durables the operator creates for the profile,
+	// one per (tier, kind), which its grant names list
+	// (dispatcherGrantNames). They aren't written (#5479): the dispatcher
+	// derives the same set from tiers and drainingTiers, pinned by the
+	// shared fixture a2a/lib/testdata/rendered-dispatch-durables.json.
+	Durables []a2aDispatchDurable `json:"-"`
 	// JobTemplateRef names the DispatchJobTemplate the dispatcher stamps the
 	// profile's unattended Jobs from, and the rendering it holds
 	// (lib.DispatchProfile.JobTemplateRef), set only for a profile allowing
@@ -645,6 +658,9 @@ type a2aDrainingTier struct {
 	Tier  string    `json:"tier"`
 	Mode  string    `json:"mode"`
 	Until time.Time `json:"until"`
+	// Ending is lib.DrainingTier's (#5850): an administrator ending this
+	// drain now (endTierDrainAnnotation).
+	Ending bool `json:"ending,omitempty"`
 }
 
 type a2aDispatchDurable struct {
@@ -786,10 +802,10 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 		dp.Scripts = append(dp.Scripts, a2aDispatchScript{Name: sc.Name, Path: sc.Path,
 			TimeoutSeconds: min(int(sc.TimeoutSeconds), dp.ActiveDeadlineSeconds)})
 	}
-	drains := drainingTiersOf(p)
+	drains, ending := drainingTiersOf(p), endingTiersOf(p)
 	for _, tier := range p.AllowedTierList() {
 		if until, ok := drains[tier]; ok {
-			dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until})
+			dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until, Ending: ending[tier]})
 		}
 	}
 	// The draining tiers' durables too, so what is queued at them is read

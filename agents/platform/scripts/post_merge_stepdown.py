@@ -76,14 +76,14 @@ def _login(login: object) -> str:
     return str(login or "").strip().removesuffix("[bot]").casefold()
 
 
-def _marker_comment(forge: Forge, number: int, viewer: str) -> str | None:
+def _marker_comment(forge: Forge, number: int, viewer: str, marker: str = MARKER) -> str | None:
     answer = forge("proposal-view", {"number": number, "comments": True, "limit": COMMENTS_LIMIT})
     if answer.get("commentsTruncated"):
         return _TRUNCATED
     for comment in answer.get("comments") or []:
         author = comment.get("author")
         login = author.get("login") if isinstance(author, dict) else author
-        if MARKER in str(comment.get("body") or "") and _login(login) == _login(viewer):
+        if marker in str(comment.get("body") or "") and _login(login) == _login(viewer):
             return str(comment.get("url") or "")
     return None
 

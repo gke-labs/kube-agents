@@ -268,7 +268,7 @@ func TestAdmissionRefusesAScriptOutsideJobMode(t *testing.T) {
 			prof.Tiers = []string{"read", "unattended"}
 			hk.tier = "read"
 		},
-		"no Job runner":   func(d *Dispatcher, _ *lib.DispatchProfile, _ *holdKey) { d.jobs = nil },
+		"no Job runner": func(d *Dispatcher, _ *lib.DispatchProfile, _ *holdKey) { d.jobs = nil },
 		"no Job template": func(_ *Dispatcher, prof *lib.DispatchProfile, _ *holdKey) {
 			prof.JobTemplate, prof.JobTemplateRef = nil, nil
 		},

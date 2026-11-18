@@ -514,3 +514,20 @@ func TestAScriptGetsNoInheritedEnvironmentAndLeavesNoChild(t *testing.T) {
 		t.Error("the script's child outlived a successful exit")
 	}
 }
+
+// A failed script's stderr is logged with credentials masked: a bearer header, and a value given to a
+// token-, secret- or password-named key, whether written key=value, key: value or as JSON. The rest
+// of the line, and the key names, stay, so the log still says what failed.
+func TestAFailedScriptsStderrIsLoggedWithSecretsMasked(t *testing.T) {
+	for in, want := range map[string]string{
+		"Authorization: Bearer abcdefghijkl0123":          "Authorization: Bearer [redacted]",
+		"GITHUB_TOKEN=ghp_abcdef123456 not set right":     "GITHUB_TOKEN=[redacted] not set right",
+		`{"api_key": "sk-123456789"}`:                     `{"api_key": "[redacted]"}`,
+		"password: hunter22, retrying":                    "password: [redacted], retrying",
+		"error: namespace kube-system not found (exit 2)": "error: namespace kube-system not found (exit 2)",
+	} {
+		if got := redactScriptOutput(in); got != want {
+			t.Errorf("redactScriptOutput(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
