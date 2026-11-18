@@ -79,6 +79,40 @@ func tseItems(section string, numbered bool) []string {
 	return items
 }
 
+// tseBlock is the first line in text matching start, with the lines after it
+// that are indented more deeply (its continuation and any nested items),
+// stopping at a blank line or a line indented no deeper; "" when none matches.
+func tseBlock(text string, start *regexp.Regexp) string {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if !start.MatchString(l) {
+			continue
+		}
+		indent := len(l) - len(strings.TrimLeft(l, " "))
+		block := []string{l}
+		for _, next := range lines[i+1:] {
+			if strings.TrimSpace(next) == "" || len(next)-len(strings.TrimLeft(next, " ")) <= indent {
+				break
+			}
+			block = append(block, next)
+		}
+		return strings.Join(block, "\n")
+	}
+	return ""
+}
+
+// tseUntil is text up to the first line matching stop, exclusive.
+func tseUntil(text string, stop *regexp.Regexp) string {
+	var out []string
+	for _, l := range strings.Split(text, "\n") {
+		if stop.MatchString(l) {
+			break
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
+}
+
 // tseLead is an item's bold lead without its trailing punctuation, or its
 // whole first line when it has none.
 func tseLead(item string) string {
@@ -131,31 +165,33 @@ func TestTheTsePersonaKeepsTheHermesProfilesSharedText(t *testing.T) {
 		same("self-audit question "+string(rune('1'+i)), hermesGate[i], personaGate[i])
 	}
 
+	// Each passage is taken whole, with its continuation lines, so a wrapped
+	// line compares the same as an unwrapped one and wording after a wrap is
+	// still compared.
 	loop := tseItems(tseSection(t, soul, "## 1. Core Truths", "SOUL.md"), false)[0]
-	var hermesStages []string
-	for _, l := range strings.Split(loop, "\n") {
-		if m := regexp.MustCompile(`^\s+\d+\. (.*)`).FindStringSubmatch(l); m != nil {
-			hermesStages = append(hermesStages, m[1])
+	personaLoop := tseSection(t, instructions, "## 3. The 4-stage diagnostic loop", "instructions.md")
+	stage := func(n int) *regexp.Regexp { return regexp.MustCompile(`^\s*` + string(rune('0'+n)) + `\. `) }
+	strip := func(b string) string { return regexp.MustCompile(`^\s*\d+\. `).ReplaceAllString(b, "") }
+	for _, n := range []int{1, 2, 3, 4} {
+		if tseBlock(loop, stage(n)) == "" || tseBlock(personaLoop, stage(n)) == "" {
+			t.Fatalf("diagnostic loop: stage %d is missing from SOUL.md or instructions.md; this test compares stages 1 and 3 and the fourth's escalation case", n)
 		}
 	}
-	personaStages := tseItems(tseSection(t, instructions, "## 3. The 4-stage diagnostic loop", "instructions.md"), true)
-	if len(hermesStages) != 4 || len(personaStages) != 4 {
-		t.Fatalf("diagnostic loop: SOUL.md has %d stages and instructions.md %d, want 4 each", len(hermesStages), len(personaStages))
-	}
-	for _, i := range []int{0, 2} {
-		same("diagnostic stage "+string(rune('1'+i)), hermesStages[i], strings.SplitN(personaStages[i], "\n", 2)[0])
+	for _, n := range []int{1, 3} {
+		same("diagnostic stage "+string(rune('0'+n)), strip(tseBlock(loop, stage(n))), strip(tseBlock(personaLoop, stage(n))))
 	}
 	same("the diagnostic loop's opening line",
-		strings.SplitN(strings.TrimSpace(regexp.MustCompile(`^\*\*[^*]+\*\*\s*`).ReplaceAllString(loop, "")), "\n", 2)[0],
-		strings.TrimSpace(strings.SplitN(strings.TrimSpace(tseSection(t, instructions, "## 3. The 4-stage diagnostic loop", "instructions.md")), "\n", 2)[0]))
+		tseUntil(regexp.MustCompile(`^\*\*[^*]+\*\*\s*`).ReplaceAllString(loop, ""), stage(1)),
+		tseUntil(strings.TrimSpace(personaLoop), stage(1)))
+	escalationStart := regexp.MustCompile(`^\s*[-*+] \*\*Google-Side Escalations`)
 	escalation := func(text, file string) string {
-		m := regexp.MustCompile(`(?m)^\s*- (\*\*Google-Side Escalations.*)$`).FindStringSubmatch(text)
-		if m == nil {
+		b := tseBlock(text, escalationStart)
+		if b == "" {
 			t.Fatalf("%s's fourth stage has no Google-Side Escalations case", file)
 		}
-		return m[1]
+		return regexp.MustCompile(`^\s*[-*+] `).ReplaceAllString(b, "")
 	}
-	same("the Google-side escalation criteria", escalation(loop, "SOUL.md"), escalation(personaStages[3], "instructions.md"))
+	same("the Google-side escalation criteria", escalation(tseBlock(loop, stage(4)), "SOUL.md"), escalation(tseBlock(personaLoop, stage(4)), "instructions.md"))
 }
 
 // tseRedLineMap places each red line the Hermes profile states. A value
