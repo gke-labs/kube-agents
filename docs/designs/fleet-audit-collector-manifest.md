@@ -350,7 +350,7 @@ helper a finding's heading is — and its id is appended to the hidden marker af
 ones. The marker is what the next run keys on, under every tier; the heading is what gives it a
 title. Only the detail lines (the check and the collector's command) are capped, at
 `MAX_HELD_DETAIL_ROWS`. The section is measured _after_ the document's findings and before the
-evidence appendix, so it can never displace a finding: full rows if they fit, identity lines alone
+evidence appendix, so it can never displace a finding or the dropped check-evidence notice: full rows if they fit, identity lines alone
 if not, and failing that a one-line note — never an oversized body. A held entry is not `new` (its
 id was already in `previous_ids`), the sweep never sees it (it is not in the document), and it stays
 until the collector stops emitting it or a `declared` entry releases it.

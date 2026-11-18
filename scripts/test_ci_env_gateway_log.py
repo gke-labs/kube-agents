@@ -161,10 +161,9 @@ class GatewayLogCollectionTest(unittest.TestCase):
         self.assertNotIn("--context", first, "no pin, no flag: the deploy script's failure path has only the ambient context")
 
     def test_a_second_call_in_the_same_process_keeps_the_first_capture(self):
-        """ci-eval-pr.sh takes the log before the rollback round trip replaces
-        the agent pod; a later call in the same process (the EXIT trap's, or
-        the failure dumper's through it) must not overwrite the eval's log
-        with the replacement pod's."""
+        """ci-eval-pr.sh takes the log once; a later call in the same process
+        (the EXIT trap's, or the failure dumper's through it) must not
+        overwrite the eval's log with a replacement pod's."""
         proc, log = run_collect(f"STUB_LINES=7 {FUNCTION}", 'echo "SECOND STATUS: $?"', STUB_LINES="3")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SECOND STATUS: 0", proc.stdout)
