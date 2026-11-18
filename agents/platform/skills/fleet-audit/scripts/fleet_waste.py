@@ -303,6 +303,36 @@ REPLACED_POD_PATTERNS = {
     "StatefulSet": r"^{name}-[0-9]+$",
     "ReplicaSet": rf"^{{name}}-{K8S_GENERATED_CHARS}{{{{5}}}}$",
 }
+# The patterns above are the names of a controller with a short name. Kubernetes
+# cuts a generated name at 63 characters: the generator keeps at most 58 of the
+# base it is given -- `<replicaset>-`, which for a Deployment's pod is
+# `<deployment>-<hash>-` -- and appends its five with no separator. With a
+# ten-character hash, a Deployment named in 47 characters loses the hyphen
+# before the suffix, one of 48 ends `-55c6d97c65q5rw`, and from 57 no character
+# of the hash is left. No pattern above matches such a name, so the controller
+# was sized on its live pods alone, which is the defect the patterns exist to
+# prevent. `_cut_pod_pattern` builds the cut form.
+K8S_GENERATED_NAME_MAX = 63
+K8S_GENERATED_SUFFIX_CHARS = 5
+K8S_GENERATED_BASE_MAX = K8S_GENERATED_NAME_MAX - K8S_GENERATED_SUFFIX_CHARS
+# A pod-template-hash is the decimal form of a 32-bit number, re-encoded one
+# character for one from the alphabet above: ten characters at most, and only
+# the ten the digits map to. A name with room for more than a whole hash before
+# the cut has no cut form, which is what keeps `web` from claiming every
+# 63-character name that starts `web-`.
+POD_TEMPLATE_HASH_CHARS = "[4-9bcdf]"
+POD_TEMPLATE_HASH_MAX_CHARS = 10
+# How much of the hash a cut name must keep to tell this controller's pods from
+# a sibling's. `<name>-worker`, named in 58 characters or more, leaves pods that
+# start `<name>-w`. With one or two characters of hash to match, the start of a
+# tail such as `db` or `cache` passes for them; four characters of a ten-letter
+# alphabet with no vowel in it are no word. A tail that does start with four of
+# them (`c5d9`) still passes: nothing in a name tells it from a hash.
+CUT_NAME_HASH_MIN_CHARS = 4
+# The kinds in `REPLACED_POD_PATTERNS` whose pods the generator names, and
+# whether a pod-template-hash sits between the controller's name and the pod's
+# suffix.
+CUT_NAME_KINDS = {"Deployment": True, "ReplicaSet": False}
 # Alignment happens twice. The primary period buckets each container's raw
 # points before they are summed across the containers of a pod -- it has to
 # be short enough that a spike stays a spike, since a wide bucket averages
@@ -3067,8 +3097,46 @@ def _live_pod_owners(context: dict) -> dict[tuple[str, str], tuple[str, str]]:
     return owners
 
 
+def _cut_pod_pattern(kind: str, name: str) -> tuple[re.Pattern, bool] | None:
+    """This controller's pod names that Kubernetes cut at 63 characters, and whether they are its own alone.
+
+    None for a kind the generator does not name and for a name too short to be
+    cut. Otherwise the pattern, by how much of the base `<name>-<hash>-`
+    (`<name>-` for a bare ReplicaSet) fits in its 58 characters:
+
+    - `<name>-` fits: the name, its hyphen, as much of the hash as fits (none
+      of it, where `<name>-` fills the 58), then the five. Deployment only, and
+      only when the room is no more than a hash can fill.
+    - `<name>-` runs past the 58: the first 58 characters of it, then the five.
+
+    The flag is whether `CUT_NAME_HASH_MIN_CHARS` of the hash are left. Short of
+    that, another controller whose name starts the same way leaves pods of the
+    same shape -- every `<name>-<tail>` Deployment, Job or DaemonSet once no
+    hash is left -- and nothing in a gone pod's name says whose it was.
+    `_observed_pod_keys` decides what a name like that may count for.
+    """
+    hashed = CUT_NAME_KINDS.get(kind)
+    if hashed is None:
+        return None
+    head = f"{name}-"
+    hash_room = K8S_GENERATED_BASE_MAX - len(head)
+    suffix = f"{K8S_GENERATED_CHARS}{{{K8S_GENERATED_SUFFIX_CHARS}}}"
+    if hash_room < 0:
+        return re.compile(rf"^{re.escape(head[:K8S_GENERATED_BASE_MAX])}{suffix}$"), False
+    if not hashed or hash_room > POD_TEMPLATE_HASH_MAX_CHARS:
+        return None
+    pattern = re.compile(rf"^{re.escape(head)}{POD_TEMPLATE_HASH_CHARS}{{{hash_room}}}{suffix}$")
+    return pattern, hash_room >= CUT_NAME_HASH_MIN_CHARS
+
+
+def _measured_on_every_dimension(series: Any, keys: list[tuple[str, str]]) -> bool:
+    """Whether these pods, between them, have a figure on every dimension the read reports."""
+    values = [value if isinstance(value, tuple) else (value,) for value in map(series.get, keys) if value is not None]
+    return bool(values) and all(any(value[index] is not None for value in values) for index in range(len(values[0])))
+
+
 def _observed_pod_keys(
-    entry: dict, kind: str, name: str, metric_keys: Any, live_owners: dict
+    entry: dict, kind: str, name: str, metric_keys: Any, live_owners: dict, *, shared_names: bool = False
 ) -> tuple[list[tuple[str, str]], int]:
     """Every pod of this controller the metric read saw, live or since replaced.
 
@@ -3090,6 +3158,16 @@ def _observed_pod_keys(
     that the sizing checks skipped is live, not replaced. And a controller kind absent
     from `REPLACED_POD_PATTERNS` is not widened at all, because a bare `Pod` and
     the kinds this does not model name their pods by rules this does not know.
+
+    A cut name that another controller's pod can also carry is read for each
+    controller it fits, on two conditions. The caller asks for it
+    (`shared_names`), which is for a check where a higher figure withholds a
+    proposal or makes it smaller, never one where it makes the finding or
+    enlarges a number the finding writes. And this controller's live pods are
+    measured on every dimension, so the borrowed figure can raise what the
+    controller measured and never stand in for it. Such a pod sits in `keys`
+    and not in `replaced_count`: whose it was is not known, so it may not
+    widen the window the excerpt claims.
     """
     live = [(pod["ns"], pod["name"]) for pod in entry["pods"]]
     template = REPLACED_POD_PATTERNS.get(kind)
@@ -3098,18 +3176,20 @@ def _observed_pod_keys(
     ns = entry["ns"]
     seen = set(live)
     pattern = re.compile(template.format(name=re.escape(name)))
-    extra = [
-        key
-        for key in metric_keys
-        if key not in seen
-        and key[0] == ns
-        and pattern.match(key[1])
+    cut_pattern, own_alone = _cut_pod_pattern(kind, name) or (None, False)
+    borrow = cut_pattern is not None and not own_alone and shared_names and _measured_on_every_dimension(metric_keys, live)
+    own, shared = [], []
+    for key in metric_keys:
         # A pod still in the dump is not replaced, whoever owns it: another
         # controller's, or this one's that the sizing checks skipped (under an
         # hour old, terminating, Pending).
-        and key not in live_owners
-    ]
-    return live + sorted(extra), len(extra)
+        if key in seen or key[0] != ns or key in live_owners:
+            continue
+        if pattern.match(key[1]) or (own_alone and cut_pattern.match(key[1])):
+            own.append(key)
+        elif borrow and cut_pattern.match(key[1]):
+            shared.append(key)
+    return live + sorted(own) + sorted(shared), len(own)
 
 
 def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = None) -> float | None:
@@ -3384,7 +3464,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         replicas = len(entry["pods"])
         guaranteed = _is_guaranteed(entry)
 
-        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners, shared_names=True)
         # Same guard `check_underrequest` carries, and this is the direction in
         # which getting it wrong is worse. A controller none of whose pods
         # reported would read as zero on both dimensions, which is not "idle"
@@ -3891,7 +3971,7 @@ def check_idle_workload(
             continue
         replicas = len(entry["pods"])
 
-        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners, shared_names=True)
         # Same guard as §3.1, and it matters more here. Zero is the most idle a
         # workload can read, and an unmeasured controller would read as zero on
         # both dimensions -- so without this, a metrics agent down on one node
