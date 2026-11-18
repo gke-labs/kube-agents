@@ -3,6 +3,8 @@
 // picks the target cluster from the path (SplitClusterPath), decides from the API server's
 // own classification of the request (NewRequestInfoFactory, Policy.Evaluate) whether it may
 // be forwarded, strips the caller's credentials and identity headers, and forwards it through
-// an UpstreamTransport, recording an AuditEvent for each request. NewTokenReviewAuthenticator
-// is the CallerAuthenticator. See the module README.
+// an UpstreamTransport, recording an AuditEvent for each request. The kube-agents binary's
+// CallerAuthenticator is tokenreview.NewAuthenticator, in its own package so an embedder that
+// authenticates callers another way does not import client-go or the API server's
+// authenticator and token-cache packages. See the module README.
 package k8sapiproxy

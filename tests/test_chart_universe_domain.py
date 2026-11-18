@@ -134,6 +134,25 @@ class ChartUniverseDomainRenderTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("universeDomain", res.stderr)
 
+    def test_schema_rejects_a_universe_domain_under_googleapis_com(self) -> None:
+        # `<service>.mtls.googleapis.com` is a host of the commercial universe.
+        for under in ("mtls.googleapis.com", "a.b.googleapis.com"):
+            with self.subTest(under=under):
+                cmd = [
+                    "helm", "template", "ka", str(_CHART), *_REQUIRED,
+                    "--set", f"platformAgent.harness.universeDomain={under}",
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("universeDomain", res.stderr)
+        # The commercial domain itself is still accepted.
+        cmd = [
+            "helm", "template", "ka", str(_CHART), *_REQUIRED,
+            "--set", "platformAgent.harness.universeDomain=googleapis.com",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
 
 class ChartUniverseDomainStaticGuardTest(unittest.TestCase):
     def test_crd_field_guard_and_schema_entry_exist(self) -> None:

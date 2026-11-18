@@ -98,6 +98,20 @@ func TestConsoleFrameBecomesAnInboundMessage(t *testing.T) {
 	}
 }
 
+// A frame's replyTo rides the inbound message as typed; the gateway checks
+// its shape where it writes the part (startTaskWith).
+func TestConsoleFrameReplyToReachesTheInboundMessage(t *testing.T) {
+	r := startConsoleRig(t)
+	r.send(t, "tab-2", ConsoleInFrame{MessageID: "m1", Text: "and the other pool?", ReplyTo: "task-7"})
+	waitFor(t, "inbound", func() bool { return len(r.inbound()) == 1 })
+	got := r.inbound()[0]
+	want := InboundMessage{Conversation: "console:tab-2", Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor,
+		MessageID: "m1", Text: "and the other pool?", ReplyTo: "task-7"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("inbound = %+v, want %+v", got, want)
+	}
+}
+
 func TestConsoleDropsEmptyMalformedAndOversizeFrames(t *testing.T) {
 	r := startConsoleRig(t)
 	// Not JSON.

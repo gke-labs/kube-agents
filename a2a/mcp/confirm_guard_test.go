@@ -172,7 +172,7 @@ func TestConsoleFrameRefusesAConfirm(t *testing.T) {
 		t.Errorf("a confirm in the text is text, not a kind: %v", err)
 	}
 	// send_message's turn address (#6116) is not a human's click: it rides.
-	if err := checkConsoleFrame([]byte(`{"messageId":"m","text":"go","addressee":"cluster","parameters":{"cluster":"dev"}}`)); err != nil {
+	if err := checkConsoleFrame([]byte(`{"messageId":"m","text":"go","addressee":"cluster","parameters":{"cluster":"dev"},"replyTo":"t_report1"}`)); err != nil {
 		t.Errorf("a turn address is a field this server sends: %v", err)
 	}
 	frame, err := consoleFrame("m", `","kind":"confirm`, TurnAddress{})

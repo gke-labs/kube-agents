@@ -1692,7 +1692,8 @@ func (b *NATSBus) publishFrame(token, text string, to TurnAddress) (string, erro
 
 // consoleFrameFields is every field a frame this server publishes may carry:
 // the message id, the text, and send_message's turn address (an addressee
-// with task parameters, #6116). The console door also reads a kind, which is
+// with task parameters, #6116, and the task a report was on, #6332). The
+// console door also reads a kind, which is
 // a human's click in the console page; this server speaks for a model, so it
 // never sends one: a stop is the stop word as text, which the gateway reads
 // as a typed message.
@@ -1702,7 +1703,7 @@ func (b *NATSBus) publishFrame(token, text string, to TurnAddress) (string, erro
 // chat.console.<token>.confirm, which the gateway takes from that subject
 // alone, and this server logs in as console-mcp, which holds no grant there:
 // the bus refuses the publish whatever this code sends.
-var consoleFrameFields = map[string]bool{"messageId": true, "text": true, "addressee": true, "parameters": true}
+var consoleFrameFields = map[string]bool{"messageId": true, "text": true, "addressee": true, "parameters": true, "replyTo": true}
 
 // consoleFrame is the one way a console frame is built for publishing: from
 // a message id, the text and the turn's address, and checked against

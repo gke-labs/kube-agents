@@ -157,13 +157,14 @@ const (
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
 )
 
-// ConsoleInFrame is what the browser publishes, on chat.console.<token>.in
-// for a typed message or chat.console.<token>.confirm for a click on a
-// confirm button: the same ask, sent with IntentConfirm, so its task may
-// make the change it confirms. The subject, never the frame, carries the
-// confirm. Kind is empty or "text" on either; a frame of any other kind
-// (including "confirm") is dropped (logged, no notice) rather than
-// forwarded as an ask.
+// ConsoleInFrame is what a console client (the browser, the MCP server)
+// publishes, on chat.console.<token>.in for a typed message, or (the
+// browser only) on chat.console.<token>.confirm for a click on a confirm
+// button: the same ask, sent with IntentConfirm, so its task may make the
+// change it confirms. The subject, never the frame, carries the confirm.
+// Kind is empty or "text" on either; it is the seam for gateway-side
+// commands later, and a frame of any other kind (including "confirm") is
+// dropped (logged, no notice) rather than forwarded as an ask.
 type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
@@ -173,6 +174,13 @@ type ConsoleInFrame struct {
 	// the turn goes to the conversation's route, as every page turn does.
 	Addressee  string            `json:"addressee,omitempty"`
 	Parameters map[string]string `json:"parameters,omitempty"`
+	// ReplyTo, when set, names the task a notify frame reported on
+	// (ConsoleOutFrame.ReplyTo): this turn answers that report, and the
+	// gateway puts the task on the submission so the agent's turn starts
+	// with the report in front of it. A reply while the turn is still
+	// running is steered into it and carries no replyTo; the report is
+	// attached on an opening turn only.
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
 // ConsoleOutFrame is what the gateway publishes back. Edit true means
@@ -559,7 +567,7 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	msg := InboundMessage{
 		Conversation: conversation, Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: f.MessageID,
-		Profile: f.Addressee, Parameters: f.Parameters,
+		Profile: f.Addressee, Parameters: f.Parameters, ReplyTo: f.ReplyTo,
 	}
 	if parts[3] == consoleConfirmSuffix {
 		msg.Intent = IntentConfirm

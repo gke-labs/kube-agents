@@ -647,6 +647,29 @@ class SendTest(unittest.TestCase):
         self.assertEqual(argv[-2:], ["--", "3 nodes"])
         self.assertFalse(Path(seen["path"]).exists(), "the chat file outlived the send")
 
+    def test_the_report_post_carries_the_report_flag_and_a_note_does_not(self):
+        # kanban_progress_lines marks the settled card's report post; a rolling
+        # note on a console card shares the thread and the --reply-to task but
+        # not the mark, so the gateway can tell them apart.
+        adapter = kanban_chat_notify.ConversationNotifyAdapter(types.SimpleNamespace(value="console"), _Runner())
+        calls = []
+
+        async def fake_exec(*argv, **kwargs):
+            calls.append(list(argv))
+            return _Proc(0, b'{"message_id":"n-1"}')
+
+        thread = {"thread_id": "console:tab-1#task-7"}
+        with mock.patch.object(kanban_chat_notify, "conversation_context", return_value="ctx-1"), \
+                mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            asyncio.run(adapter.send("a2a-ctx-1", "np-quartz-7 is at 92%",
+                                     metadata={**thread, kanban_chat_notify.REPORT_METADATA_KEY: True}))
+            asyncio.run(adapter.send("a2a-ctx-1", "⏳ reading pod state", metadata=thread))
+        report, note = calls
+        self.assertIn("--report", report)
+        self.assertEqual(report[report.index("--reply-to") + 1], "task-7")
+        self.assertNotIn("--report", note)
+        self.assertEqual(note[note.index("--reply-to") + 1], "task-7")
+
     def test_a_chat_message_never_rides_without_its_text(self):
         adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.SLACK, _Runner())
         calls = []

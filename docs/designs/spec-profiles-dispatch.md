@@ -283,6 +283,16 @@ publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so
 a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
 is #4173.
 
+**Re-creating a durable.** The operator re-creates a profile durable only when it is really
+gone. A re-created durable starts from the stream's first message with a fresh ack floor, and a
+new stream leader can answer "not found" before a durable's assignment reaches it, as after a
+replica change. So a durable whose tier is in the profile's `status.durableTiers` (written only
+by a pass whose durable sync succeeded, and kept through passes the bus refuses) is re-created
+only if it is still missing a pass later (`durableRecreateDelay`, 30s), with the card reading
+`DurableRecheck` meanwhile. A new profile, or a tier new to it, gets its durables at once.
+`lib.EnsureHeldConsumer` offers the refusal as a primitive (`HeldConsumerConfig.Existed`) and
+leaves the timing to its caller (#6283).
+
 ### Admission and holding
 
 **The dispatcher is the only fetcher and holder** (decided 2026-10-22), on both execution
