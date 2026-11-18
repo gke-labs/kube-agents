@@ -186,16 +186,20 @@ class FollowupsTest(unittest.TestCase):
 
 class ForgeHelpersTest(unittest.TestCase):
     def test_marker_comment_and_branch_calls(self):
+        import forge as real
+
         sent = []
-        answers = {"proposal-view": {"comments": [{"body": "x"}], "commentsTruncated": False},
+        answers = {"identity": {"identity": {"login": "kube-agents[bot]"}},
+                   "proposal-view": {"comments": [{"author": "mallory", "body": "M"}], "commentsTruncated": False},
                    "proposal-list": {"proposals": [{"number": 4}, {"number": 9, "state": "merged"}]}}
         fake = types.ModuleType("forge")
+        fake.normalise_login = real.normalise_login
         fake.call = lambda verb, payload, repo, **kw: sent.append((verb, payload)) or answers.get(verb, {})
         with mock.patch.dict(sys.modules, {"forge": fake}):
-            self.assertFalse(pmf.forge_has_marker(REPO, 3, "M"))
+            self.assertFalse(pmf.forge_has_marker(REPO, 3, "M"), "someone else's marker does not count")
             answers["proposal-view"]["commentsTruncated"] = True
             self.assertIsNone(pmf.forge_has_marker(REPO, 3, "M"))
-            answers["proposal-view"]["comments"].append({"body": "a M"})
+            answers["proposal-view"]["comments"].append({"author": "kube-agents", "body": "a M"})
             self.assertTrue(pmf.forge_has_marker(REPO, 3, "M"))
             pmf.forge_comment(REPO, 3, "b")
             self.assertEqual(pmf.forge_branch_proposal(REPO, "platform-agent/revert-3")["number"], 9)

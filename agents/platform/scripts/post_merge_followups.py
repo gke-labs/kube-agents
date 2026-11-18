@@ -42,6 +42,7 @@ from post_merge_check import (
     _now_text,
     _parse_time,
 )
+import post_merge_report
 from post_merge_report import STILL_BROKEN, VERIFIED_FIXED
 
 logger = logging.getLogger("post_merge_check")
@@ -61,7 +62,6 @@ REVERT_WATCH = timedelta(days=8)
 #: ``post_merge_stepdown.REVERT_BRANCH`` and ``MARKER``; equal, as a test pins.
 REVERT_BRANCH = "platform-agent/revert-{number}"
 STEPDOWN_MARKER = "<!-- kube-agents:post-merge-step-down -->"
-COMMENTS_LIMIT = 100
 #: How much of the last failure the give-up comment quotes.
 REASON_CHARS = 300
 RETRY = "retry"
@@ -124,13 +124,8 @@ def forge_comment(repo: str, number: int, body: str) -> None:
 
 
 def forge_has_marker(repo: str, number: int, marker: str) -> bool | None:
-    import forge
-
-    answer = forge.call("proposal-view", {"number": number, "comments": True, "limit": COMMENTS_LIMIT}, repo,
-                        retry_transient=True, timeout_s=VIEW_TIMEOUT_SECONDS * 3)
-    if any(marker in str(c.get("body") or "") for c in (answer.get("comments") or [])):
-        return True
-    return None if answer.get("commentsTruncated") else False
+    """``post_merge_report.forge_has_marker``: only this install's own comments count."""
+    return post_merge_report.forge_has_marker(repo, number, marker)
 
 
 def _since(stamp: object, now: datetime) -> timedelta | None:

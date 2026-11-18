@@ -210,20 +210,41 @@ class CommentTextTest(unittest.TestCase):
 
 
 class ForgeCallsTest(unittest.TestCase):
+    def fake_forge(self, answer, sent, viewer="kube-agents-app[bot]"):
+        import forge as real
+
+        fake = types.ModuleType("forge")
+        fake.normalise_login = real.normalise_login
+
+        def call(verb, payload, repo, **kw):
+            sent.append((verb, payload, repo))
+            return {"identity": {"login": viewer}} if verb == "identity" else answer
+
+        fake.call = call
+        return fake
+
     def test_forge_marker_and_comment_calls(self):
         sent = []
-        answer = {"comments": [{"body": "hello"}], "commentsTruncated": False}
-        fake = types.ModuleType("forge")
-        fake.call = lambda verb, payload, repo, **kw: sent.append((verb, payload, repo)) or answer
-        with mock.patch.dict(sys.modules, {"forge": fake}):
+        answer = {"comments": [{"author": "kube-agents-app", "body": "hello"}], "commentsTruncated": False}
+        with mock.patch.dict(sys.modules, {"forge": self.fake_forge(answer, sent)}):
             self.assertFalse(post_merge_report.forge_has_marker(REPO, 3))
             self.assertEqual(sent[-1], ("proposal-view", {"number": 3, "comments": True, "limit": 100}, REPO))
             answer["commentsTruncated"] = True
             self.assertIsNone(post_merge_report.forge_has_marker(REPO, 3))
-            answer["comments"].append({"body": "x " + MARKER})
+            answer["comments"].append({"author": {"login": "kube-agents-app"}, "body": "x " + MARKER})
             self.assertTrue(post_merge_report.forge_has_marker(REPO, 3), "a marker found ends the question")
             post_merge_report.forge_comment(REPO, 3, "body")
         self.assertEqual(sent[-1], ("proposal-comment", {"number": 3, "body": "body"}, REPO))
+
+    def test_a_marker_someone_else_wrote_does_not_count(self):
+        answer = {"comments": [{"author": "mallory", "body": MARKER}], "commentsTruncated": False}
+        with mock.patch.dict(sys.modules, {"forge": self.fake_forge(answer, [])}):
+            self.assertFalse(post_merge_report.forge_has_marker(REPO, 3))
+
+    def test_no_viewer_raises_so_the_report_is_retried(self):
+        with mock.patch.dict(sys.modules, {"forge": self.fake_forge({}, [], viewer="")}):
+            with self.assertRaises(RuntimeError):
+                post_merge_report.forge_has_marker(REPO, 3)
 
 
 class MainTest(unittest.TestCase):
@@ -242,17 +263,21 @@ class MainTest(unittest.TestCase):
             with sqlite3.connect(str(Path(tmp) / "kv.db")) as conn:
                 conn.execute(schema())
                 add_record(conn, 1)
+            import forge as real
+
             fake = types.ModuleType("forge")
+            fake.normalise_login = real.normalise_login
             fake.call = mock.Mock(side_effect=AssertionError("off and silent post nothing"))
             with mock.patch.dict(sys.modules, {"forge": fake}):
                 self.assertEqual(self.run_main(tmp, "off"), {"switch": "off"})
                 self.assertEqual(self.run_main(tmp, "silent")["silent"], [f"{REPO}/pull/1"])
             with sqlite3.connect(str(Path(tmp) / "kv.db")) as conn:
                 add_record(conn, 2)
-            fake.call = mock.Mock(return_value={"comments": [], "commentsTruncated": False})
+            fake.call = mock.Mock(return_value={"identity": {"login": "kube-agents"}, "comments": [],
+                                                "commentsTruncated": False})
             with mock.patch.dict(sys.modules, {"forge": fake}):
                 self.assertEqual(self.run_main(tmp, "report")["commented"], [f"{REPO}/pull/2"])
-            self.assertEqual([c.args[0] for c in fake.call.call_args_list], ["proposal-view", "proposal-comment"])
+            self.assertEqual([c.args[0] for c in fake.call.call_args_list], ["identity", "proposal-view", "proposal-comment"])
 
 
 if __name__ == "__main__":

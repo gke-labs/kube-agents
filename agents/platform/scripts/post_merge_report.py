@@ -133,15 +133,29 @@ def forge_comment(repo: str, number: int, body: str) -> None:
     forge.call("proposal-comment", {"number": number, "body": body}, repo, timeout_s=VIEW_TIMEOUT_SECONDS * 3)
 
 
-def forge_has_marker(repo: str, number: int) -> bool | None:
-    """Whether a comment on ``repo`` ``number`` carries :data:`COMMENT_MARKER`; None when the read
-    returned only some of the comments and none of those does."""
+def forge_has_marker(repo: str, number: int, marker: str = COMMENT_MARKER) -> bool | None:
+    """Whether a comment this install wrote on ``repo`` ``number`` carries ``marker``; None when the read
+    returned only some of the comments and none of those does.
+
+    Only the install's own comments count (the ``identity`` login, as
+    ``post_merge_stepdown`` checks), so someone else pasting the marker cannot
+    silence the report. Raises when the forge does not say who the install is.
+    """
     import forge
 
+    viewer = forge.normalise_login(
+        str((forge.call("identity", {}, repo, retry_transient=True, timeout_s=VIEW_TIMEOUT_SECONDS) or {})
+            .get("identity", {}).get("login") or "")
+    )
+    if not viewer:
+        raise RuntimeError("the forge did not say who this install is")
     answer = forge.call("proposal-view", {"number": number, "comments": True, "limit": COMMENTS_LIMIT}, repo,
                         retry_transient=True, timeout_s=VIEW_TIMEOUT_SECONDS * 3)
-    if any(COMMENT_MARKER in str(c.get("body") or "") for c in (answer.get("comments") or [])):
-        return True
+    for comment in answer.get("comments") or []:
+        author = comment.get("author")
+        login = author.get("login") if isinstance(author, dict) else author
+        if marker in str(comment.get("body") or "") and forge.normalise_login(str(login or "")) == viewer:
+            return True
     return None if answer.get("commentsTruncated") else False
 
 
