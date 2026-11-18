@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -704,30 +705,113 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
     def test_symlinks_inside_knowledge_root_are_rejected(self) -> None:
         outside = self.root / "outside.md"
         outside.write_text("# Outside\n", encoding="utf-8")
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "note.md").write_text(
+            "---\ntype: runbook\n---\n\n# Note\n",
+            encoding="utf-8",
+        )
+        empty_elsewhere = self.root / "empty-elsewhere"
+        empty_elsewhere.mkdir()
+
         index_file = self.write("index.md", "# Index\n")
         runbook_dir = self.knowledge / "runbook"
         runbook_dir.mkdir(parents=True, exist_ok=True)
         (runbook_dir / "linked.md").symlink_to(outside)
         (runbook_dir / "index.md").symlink_to(index_file)
+        (runbook_dir / "broken.md").symlink_to(self.root / "does-not-exist.md")
+        (self.knowledge / "symlinked-dir").symlink_to(elsewhere)
+        (self.knowledge / "empty-dir-link").symlink_to(empty_elsewhere)
+        (self.knowledge / "cycle-link").symlink_to(self.root)
 
         _, errors = self.validate()
-        self.assertEqual(len(errors), 2, errors)
-        self.assertTrue(
-            any(
-                "knowledge/runbook/linked.md" in err
-                and check_okf_knowledge.MSG_SYMLINK_NOT_ALLOWED in err
-                for err in errors
-            ),
-            errors,
+        self.assertEqual(len(errors), 6, errors)
+        for expected_path in (
+            "knowledge/runbook/linked.md",
+            "knowledge/runbook/index.md",
+            "knowledge/runbook/broken.md",
+            "knowledge/symlinked-dir/note.md",
+            "knowledge/empty-dir-link",
+            "knowledge/cycle-link",
+        ):
+            self.assertTrue(
+                any(
+                    expected_path in err
+                    and check_okf_knowledge.MSG_SYMLINK_NOT_ALLOWED in err
+                    for err in errors
+                ),
+                f"missing symlink error for {expected_path}: {errors}",
+            )
+
+    def test_git_tracked_broken_symlinks_symlinked_dirs_and_symlinked_roots_are_rejected(
+        self,
+    ) -> None:
+        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
+
+        # 1. Tracked broken .md symlink and tracked symlinked subdirectory inside knowledge/.
+        elsewhere = self.root / "elsewhere-target"
+        elsewhere.mkdir()
+        (elsewhere / "note.md").write_text(
+            "---\ntype: runbook\n---\n\n# External note\n",
+            encoding="utf-8",
         )
-        self.assertTrue(
-            any(
-                "knowledge/runbook/index.md" in err
-                and check_okf_knowledge.MSG_SYMLINK_NOT_ALLOWED in err
-                for err in errors
-            ),
-            errors,
+        self.write("index.md", "# Index\n")
+        runbook_dir = self.knowledge / "runbook"
+        runbook_dir.mkdir(parents=True, exist_ok=True)
+        (runbook_dir / "broken.md").symlink_to(self.root / "missing-target.md")
+        (self.knowledge / "linked-subdir").symlink_to(elsewhere)
+
+        # 2. Tracked symlinked knowledge/ root pointing to a directory without "knowledge" in its path.
+        pkg_dir = self.root / "examples" / "pkg"
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        symlink_root = pkg_dir / "knowledge"
+        symlink_root.symlink_to(elsewhere)
+
+        subprocess.run(
+            [
+                "git",
+                "add",
+                "knowledge/index.md",
+                "knowledge/runbook/broken.md",
+                "knowledge/linked-subdir",
+                "examples/pkg/knowledge",
+                "elsewhere-target/note.md",
+            ],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
         )
+
+        tracked = check_okf_knowledge.git_tracked_paths(self.root)
+        roots = check_okf_knowledge.discover_knowledge_roots(self.root, tracked=tracked)
+        self.assertEqual(
+            roots,
+            sorted([self.knowledge, symlink_root]),
+            roots,
+        )
+
+        all_errors: list[str] = []
+        for root in roots:
+            _, root_errors = check_okf_knowledge.validate_knowledge_root(
+                root,
+                display_root=self.root,
+                tracked=tracked,
+            )
+            all_errors.extend(root_errors)
+
+        for expected_path in (
+            "knowledge/runbook/broken.md",
+            "knowledge/linked-subdir/note.md",
+            "examples/pkg/knowledge",
+        ):
+            self.assertTrue(
+                any(
+                    expected_path in err
+                    and check_okf_knowledge.MSG_SYMLINK_NOT_ALLOWED in err
+                    for err in all_errors
+                ),
+                f"missing git-tracked symlink error for {expected_path}: {all_errors}",
+            )
 
     def test_empty_knowledge_root_fails_loudly(self) -> None:
         buf = io.StringIO()
