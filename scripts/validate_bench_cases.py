@@ -90,17 +90,17 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
 ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
-# The certification suite has no roster file: the bare line
-# `suite: certification` in a task file registers the case on that lane, and
-# `certification_part: N` puts it in section N. hack/ci-eval-pr.sh reads the
+# The validated-capabilities suite has no roster file: the bare line
+# `suite: validated-capabilities` in a task file registers the case on that lane, and
+# `suite_part: N` puts it in section N. hack/ci-eval-pr.sh reads the
 # two lines with grep, so the lines must be those exact spellings; the YAML
 # read below catches any other, since a case the YAML parse registers and the
 # grep cannot see would be a case the lane never runs.
 SUITE_KEY = "suite"
-CERTIFICATION_SUITE = eval_rosters.CERTIFICATION_SUITE
-CERTIFICATION_SUITE_LINE_RE = eval_rosters.CERTIFICATION_SUITE_LINE_RE
-CERTIFICATION_PART_KEY = eval_rosters.CERTIFICATION_PART_KEY
-CERTIFICATION_PART_LINE_RE = eval_rosters.CERTIFICATION_PART_LINE_RE
+VALIDATED_CAPABILITIES_SUITE = eval_rosters.VALIDATED_CAPABILITIES_SUITE
+VALIDATED_CAPABILITIES_SUITE_LINE_RE = eval_rosters.VALIDATED_CAPABILITIES_SUITE_LINE_RE
+VALIDATED_CAPABILITIES_PART_KEY = eval_rosters.VALIDATED_CAPABILITIES_PART_KEY
+VALIDATED_CAPABILITIES_PART_LINE_RE = eval_rosters.VALIDATED_CAPABILITIES_PART_LINE_RE
 # The synthetic result key validate_all() reports a broken roster parse under,
 # so a tree whose roster files cannot be read fails loudly instead of calling
 # every case an orphan.
@@ -1107,13 +1107,13 @@ def fixture_catalog_disagreements() -> list[str]:
 
 def registered_cases() -> set[str] | None:
     """Case names the eval runs: the presubmit and nightly files, and the
-    certification suite's task files.
+    validated-capabilities suite's task files.
 
     An entry in either file is registered; the presubmit one runs on every
     pull request, the nightly one every night (EVAL_TIER=nightly in
     hack/ci-eval-pr.sh). A case whose task file carries the bare line
-    `suite: certification` is registered on the certification lane
-    (EVAL_TIER=certification) and sits in no file. A commented-out path counts
+    `suite: validated-capabilities` is registered on the validated-capabilities lane
+    (EVAL_TIER=validated-capabilities) and sits in no file. A commented-out path counts
     for nothing -- that parking state is retired; a case whose fixture does
     not exist waits in FIXTURE_NOT_READY instead, and
     commented_out_registrations() reports the comment as a finding.
@@ -1130,17 +1130,17 @@ def registered_cases() -> set[str] | None:
             names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             return None
-    return names | certification_cases()
+    return names | validated_capabilities_cases()
 
 
-def certification_cases() -> set[str]:
-    """Case names whose task file carries the bare `suite: certification` line,
+def validated_capabilities_cases() -> set[str]:
+    """Case names whose task file carries the bare `suite: validated-capabilities` line,
     as the lane reads them."""
-    return set(eval_rosters.certification_cases())
+    return set(eval_rosters.validated_capabilities_cases())
 
 
 def roster_file_cases() -> set[str]:
-    """Case names in the presubmit and nightly files, the lanes a certification
+    """Case names in the presubmit and nightly files, the lanes a validated-capabilities
     case must stay off; empty when a file cannot be read (registered_cases()
     reports that)."""
     names: set[str] = set()
@@ -1419,11 +1419,11 @@ def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) ->
 
 
 def validate_case(
-    name: str, path: pathlib.Path, *, registered: set[str] | None, certification: set[str] | None = None
+    name: str, path: pathlib.Path, *, registered: set[str] | None, validated_capabilities: set[str] | None = None
 ) -> list[str]:
     """Every problem with one case file, as reader-facing sentences.
 
-    ``certification`` is the set of case names the presubmit and nightly files
+    ``validated_capabilities`` is the set of case names the presubmit and nightly files
     hold, which a suite case must stay off; None skips that rule."""
     problems: list[str] = []
     spec = _load_yaml(path)
@@ -1432,8 +1432,8 @@ def validate_case(
     _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
     _profile_directive(spec, problems)
 
-    # The suite. The bare line `suite: certification` is the registration on
-    # the certification lane: hack/ci-eval-pr.sh greps for that exact line,
+    # The suite. The bare line `suite: validated-capabilities` is the registration on
+    # the validated-capabilities lane: hack/ci-eval-pr.sh greps for that exact line,
     # so the YAML key and the text must agree, or the validator would register
     # a case the lane never runs. The part line is held the same way.
     suite = spec.get(SUITE_KEY)
@@ -1441,25 +1441,25 @@ def validate_case(
     # the way the lane's grep does and the spelling rule below reports it.
     with path.open(encoding="utf-8", newline="") as handle:
         text = handle.read()
-    suite_line = CERTIFICATION_SUITE_LINE_RE.search(text) is not None
-    if suite is not None and suite != CERTIFICATION_SUITE:
-        problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{CERTIFICATION_SUITE}'")
-    if suite == CERTIFICATION_SUITE and not suite_line:
+    suite_line = VALIDATED_CAPABILITIES_SUITE_LINE_RE.search(text) is not None
+    if suite is not None and suite != VALIDATED_CAPABILITIES_SUITE:
+        problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{VALIDATED_CAPABILITIES_SUITE}'")
+    if suite == VALIDATED_CAPABILITIES_SUITE and not suite_line:
         problems.append(
-            f"declares the certification suite in a spelling the lane does not read; write the bare "
-            f"line '{SUITE_KEY}: {CERTIFICATION_SUITE}' (no quotes, no trailing comment), which is what "
+            f"declares the validated-capabilities suite in a spelling the lane does not read; write the bare "
+            f"line '{SUITE_KEY}: {VALIDATED_CAPABILITIES_SUITE}' (no quotes, no trailing comment), which is what "
             f"hack/ci-eval-pr.sh greps for"
         )
-    part = spec.get(CERTIFICATION_PART_KEY)
+    part = spec.get(VALIDATED_CAPABILITIES_PART_KEY)
     if part is not None:
-        if suite != CERTIFICATION_SUITE:
-            problems.append(f"sets '{CERTIFICATION_PART_KEY}:' without '{SUITE_KEY}: {CERTIFICATION_SUITE}'; the part is a section of that lane")
+        if suite != VALIDATED_CAPABILITIES_SUITE:
+            problems.append(f"sets '{VALIDATED_CAPABILITIES_PART_KEY}:' without '{SUITE_KEY}: {VALIDATED_CAPABILITIES_SUITE}'; the part is a section of that lane")
         if not isinstance(part, int) or isinstance(part, bool) or part < 1:
-            problems.append(f"'{CERTIFICATION_PART_KEY}:' {part!r} is not a whole number from 1; write the bare integer")
-        elif not CERTIFICATION_PART_LINE_RE.search(text):
+            problems.append(f"'{VALIDATED_CAPABILITIES_PART_KEY}:' {part!r} is not a whole number from 1; write the bare integer")
+        elif not VALIDATED_CAPABILITIES_PART_LINE_RE.search(text):
             problems.append(
-                f"sets '{CERTIFICATION_PART_KEY}:' in a spelling the lane does not read; write the bare line "
-                f"'{CERTIFICATION_PART_KEY}: {part}', which is what hack/ci-eval-pr.sh greps for"
+                f"sets '{VALIDATED_CAPABILITIES_PART_KEY}:' in a spelling the lane does not read; write the bare line "
+                f"'{VALIDATED_CAPABILITIES_PART_KEY}: {part}', which is what hack/ci-eval-pr.sh greps for"
             )
     if suite_line:
         # One lane: a case the lane runs sits in no roster file and in no
@@ -1467,13 +1467,13 @@ def validate_case(
         # fixture.
         if name in KNOWN_UNREGISTERED or name in FIXTURE_NOT_READY:
             problems.append(
-                f"carries '{SUITE_KEY}: {CERTIFICATION_SUITE}' and is parked in KNOWN_UNREGISTERED or "
+                f"carries '{SUITE_KEY}: {VALIDATED_CAPABILITIES_SUITE}' and is parked in KNOWN_UNREGISTERED or "
                 f"FIXTURE_NOT_READY; the lane would run it, so drop the line until the case can run"
             )
-        if certification is not None and name in certification:
+        if validated_capabilities is not None and name in validated_capabilities:
             problems.append(
-                f"carries '{SUITE_KEY}: {CERTIFICATION_SUITE}' and is also in "
-                f"{_display(PRESUBMIT_CASES_FILE)} or {_display(NIGHTLY_CASES_FILE)}; a certification case "
+                f"carries '{SUITE_KEY}: {VALIDATED_CAPABILITIES_SUITE}' and is also in "
+                f"{_display(PRESUBMIT_CASES_FILE)} or {_display(NIGHTLY_CASES_FILE)}; a validated-capabilities case "
                 f"runs on that lane only, or it holds two records under one name"
             )
 
@@ -1825,22 +1825,22 @@ def validate_case(
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
-    # hack/eval/nightly-cases.txt, and on the certification tier every task
+    # hack/eval/nightly-cases.txt, and on the validated-capabilities tier every task
     # file with the bare suite line -- and only those. A `suite:
-    # certification` case is registered by its line; the suite checks above
+    # validated-capabilities` case is registered by its line; the suite checks above
     # hold the line's spelling.
     if (
         registered is not None
         and name not in registered
         and name not in KNOWN_UNREGISTERED
         and name not in FIXTURE_NOT_READY
-        and suite != CERTIFICATION_SUITE
+        and suite != VALIDATED_CAPABILITIES_SUITE
     ):
         problems.append(
             "is registered nowhere and never runs. Add it to "
             "hack/eval/nightly-cases.txt (where a new case lands; a presubmit "
-            "seat is earned on its record), or, for a certification case, give "
-            "its task file the bare line 'suite: certification', or, if its "
+            "seat is earned on its record), or, for a validated-capabilities case, give "
+            "its task file the bare line 'suite: validated-capabilities', or, if its "
             "fixture does not exist yet, add a FIXTURE_NOT_READY entry in "
             "scripts/validate_bench_cases.py naming the issue that plants it, or "
             "a reviewed KNOWN_UNREGISTERED entry with the reason it must not run"
@@ -1901,7 +1901,7 @@ def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
         in_tree = resolved.parent.parent == TASKS_DIR
         name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
         out[name] = validate_case(
-            name, resolved, registered=registered if in_tree else None, certification=other_lanes if in_tree else None
+            name, resolved, registered=registered if in_tree else None, validated_capabilities=other_lanes if in_tree else None
         )
     return out
 
@@ -1921,7 +1921,7 @@ def validate_all() -> dict[str, list[str]]:
         return {
             ROSTER_PARSE_KEY: [
                 "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt parsed "
-                "to no cases and no task file carries 'suite: certification' -- either "
+                "to no cases and no task file carries 'suite: validated-capabilities' -- either "
                 "everything is empty or this parse has drifted"
             ]
         }
@@ -1932,7 +1932,7 @@ def validate_all() -> dict[str, list[str]]:
     for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
-            results[name] = validate_case(name, path, registered=registered, certification=other_lanes)
+            results[name] = validate_case(name, path, registered=registered, validated_capabilities=other_lanes)
         except CaseError as exc:
             results[name] = [str(exc)]
     for name, problems in greet_phrase_collisions(cases).items():
