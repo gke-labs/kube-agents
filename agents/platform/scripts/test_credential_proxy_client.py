@@ -2770,7 +2770,7 @@ class ScriptedBroker:
     """A local HTTP server that answers `/v1/exec` from a script, in order.
 
     Each entry is `(status, headers, body)`; a body that is a dict is sent as
-    JSON. The last entry repeats once the script runs out, so a test that
+    JSON, and a bytes body as it is. The last entry repeats once the script runs out, so a test that
     expects five refusals scripts one. Every request's body is kept, so a test
     can check the retried request is the same one. Real sockets rather than a
     patched opener: the retry has to work through `open_broker_request`'s own
@@ -2800,7 +2800,10 @@ class ScriptedBroker:
                     return
                 index = min(len(server.requests) - 1, len(server.script) - 1)
                 status, headers, body = server.script[index]
-                data = json.dumps(body).encode("utf-8") if isinstance(body, dict) else body.encode("utf-8")
+                if isinstance(body, dict):
+                    data = json.dumps(body).encode("utf-8")
+                else:
+                    data = body if isinstance(body, bytes) else body.encode("utf-8")
                 self.send_response(status)
                 for name, value in headers.items():
                     self.send_header(name, value)
@@ -3123,6 +3126,111 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertEqual([], self.sleeps)
         self.assertIn("the connection dropped after the request was sent", err.getvalue())
         self.assertNotIn("HTTP 200", err.getvalue())
+
+    def test_a_2xx_object_with_a_field_of_a_wrong_type_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
+        """The fields are checked before anything is written. The line names the field and the type, never a value."""
+        whole = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": 0}
+        cases = (
+            ({**whole, "stdout": 5}, "the response's stdout is of type int, not a string"),
+            ({**whole, "stdout": None}, "the response's stdout is of type NoneType, not a string"),
+            ({**whole, "stderr": ["a warning"]}, "the response's stderr is of type list, not a string"),
+            ({**whole, "exitCode": "x"}, "the response's exitCode is of type str, not an integer"),
+            ({**whole, "exitCode": "0"}, "the response's exitCode is of type str, not an integer"),
+            ({**whole, "exitCode": None}, "the response's exitCode is of type NoneType, not an integer"),
+            ({**whole, "exitCode": True}, "the response's exitCode is of type bool, not an integer"),
+            ({**whole, "exitCode": 1.5}, "the response's exitCode is of type float, not an integer"),
+            ({**whole, "kubeconfig": 5}, "the response's kubeconfig is of type int, not a string"),
+            ({"stdout": "NAME STATUS\n", "stderr": ""}, "the response has no exitCode"),
+            ({}, "the response has no exitCode"),
+        )
+        for answer, shape in cases:
+            with self.subTest(answer=answer):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, answer), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+
+    def test_an_object_with_a_field_of_a_wrong_type_is_not_sent_to_the_fallback(self):
+        exec_tier = self.broker([(200, {}, {"stdout": 5, "exitCode": 0})])
+        stateful = self.broker([(200, {}, OK)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                sleep_fn=self.sleeps.append, rng=self.rng,
+            )
+        self.assertEqual(1, code)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual(1, len(exec_tier.requests))
+        self.assertEqual([], stateful.requests)
+        self.assertIn("the command may have run", err.getvalue())
+
+    def test_an_object_that_holds_only_its_exit_code_still_runs_as_before(self):
+        """An absent `stdout` or `stderr` is empty, as it was. An integer exit code is the shim's
+        as it stands, also one that no process can exit with: its value is not checked."""
+        answers = (
+            ({"exitCode": 3}, 3),
+            ({"exitCode": 0, "stdout": "ok\n"}, 0),
+            ({"exitCode": 0, "kubeconfig": None}, 0),
+            ({"exitCode": 300}, 300),
+            ({"exitCode": -1}, -1),
+        )
+        for answer, expected in answers:
+            with self.subTest(answer=answer):
+                code, out, err = self.run_shim(self.broker([(200, {}, answer)]))
+                self.assertEqual(expected, code)
+                self.assertEqual(answer.get("stdout", ""), out)
+                self.assertEqual("", err)
+
+    def test_a_2xx_body_that_is_not_utf_8_is_the_line_of_a_body_that_is_not_json(self):
+        for body in (b"\xff", b'{"stdout": "\xff", "exitCode": 0}'):
+            with self.subTest(body=body):
+                broker = self.broker([(200, {}, body), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual(
+                    "credential proxy error (HTTP 200): non-JSON response; the command may have run\n", err
+                )
+
+    # The depth at which `json.loads` gives up depends on the Python version and on the
+    # stack, so the tests find a document that the parser of this run refuses.
+    DEEP_DOCUMENT_FIRST_DEPTH = 1000
+    DEEP_DOCUMENT_LAST_DEPTH = 4_000_000
+
+    def a_document_that_the_parser_refuses(self):
+        depth = self.DEEP_DOCUMENT_FIRST_DEPTH
+        while depth <= self.DEEP_DOCUMENT_LAST_DEPTH:
+            document = "[" * depth + "]" * depth
+            try:
+                json.loads(document)
+            except RecursionError:
+                return document
+            depth *= 2
+        self.skipTest(f"json.loads parses {depth // 2} nested lists; no document is too deep here")
+
+    def test_a_2xx_body_nested_too_deep_for_the_parser_is_the_line_of_a_body_that_is_not_json(self):
+        broker = self.broker([(200, {}, self.a_document_that_the_parser_refuses()), (200, {}, OK)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertEqual("credential proxy error (HTTP 200): non-JSON response; the command may have run\n", err)
+
+    def test_a_refusal_nested_too_deep_for_the_parser_is_a_refusal_with_no_json_body(self):
+        broker = self.broker([(502, {}, self.a_document_that_the_parser_refuses()), (200, {}, OK)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertEqual("credential proxy error (HTTP 502): non-JSON response\n", err)
 
     def test_a_policy_block_still_exits_77_at_once(self):
         blocked = {"code": "SECURITY_POLICY_BLOCKED", "message": "Command blocked.", "rule": "no-delete"}
