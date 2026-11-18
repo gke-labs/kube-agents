@@ -251,6 +251,20 @@ def test_setup_failures_are_errors_not_fails(world, monkeypatch, setup, why):
     assert result.status == "error" and why in result.reason
 
 
+def test_an_unresolvable_role_errors_before_any_merge(world, monkeypatch):
+    def unresolved(role, directory=None):
+        raise fleet.FleetRoleUnresolved("no kubeconfig for no-pdb-workload")
+
+    monkeypatch.setattr(fleet, "kubeconfig_for_role", unresolved)
+    result = _verifier().verify(0)
+    assert result.status == "error" and world.forge.writes == []
+
+
+def test_a_bad_role_name_fails_at_load():
+    with pytest.raises(ValueError):
+        _verifier(apply_fixture_role="No_Such Role")
+
+
 def test_an_unreadable_jobs_file_is_an_error(world):
     world.pod.jobs.write_text("not json")
     assert _verifier().verify(0).status == "error"

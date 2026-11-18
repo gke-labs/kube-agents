@@ -58,7 +58,7 @@ import urllib.request
 from typing import Any, Literal
 
 from devops_bench.verification.base import VERIFIERS, VerificationStatus
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from kube_agents_bench import fleet, forges, onboarding, transcript
 from kube_agents_bench.verifiers import (
@@ -257,6 +257,15 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     # The fixture role whose cluster plays the reconciler's target.
     apply_fixture_role: str = Field(min_length=1)
 
+    @field_validator("apply_fixture_role")
+    @classmethod
+    def _role_shape(cls, value: str) -> str:
+        # At spec load, as fleet_resource_property's fixture_role is: a bad
+        # name must fail before the run, not after the merge.
+        if not fleet.ROLE_PATTERN.fullmatch(value):
+            raise ValueError(f"apply_fixture_role {value!r} must be a lowercase-hyphen name from bench/tf/fleet/fixtures.json")
+        return value
+
     @model_validator(mode="after")
     def _phrase_for_report(self):
         if self.report == "report" and not self.comment_phrase:
@@ -433,6 +442,11 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         if len(refs) != 1:
             return "error", f"the reply names {len(refs)} pull requests under {self.owner or 'any owner'}; one fix is needed to merge"
         owner, repo, number = refs[0]
+        # Before the merge: a role the runner cannot resolve must not cost a merge and its undo.
+        try:
+            kubeconfig = fleet.kubeconfig_for_role(self.apply_fixture_role)
+        except fleet.FleetRoleUnresolved as exc:
+            return "error", str(exc)
         api = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}"
         status, payload = _github_write("PUT", f"{api}/merge", write_token, {"merge_method": "squash"})
         if status not in (200, 405):
@@ -442,6 +456,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             if status != 200 or not (isinstance(pull, dict) and pull.get("merged")):
                 return "error", f"{owner}/{repo}#{number} is not mergeable: {(payload or {}).get('message')}"
         self._repo = (owner, repo)
+        self._kubeconfig = kubeconfig
         status, pull = _forge_get_json(api, read_token, timeout)
         self._base = str(((pull or {}).get("base") or {}).get("sha") or "") if status == 200 and isinstance(pull, dict) else ""
         for page in range(1, MAX_FILES_PAGES + 1):
@@ -462,10 +477,6 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                 break
         if not self._added:
             return "error", f"{owner}/{repo}#{number} adds no manifest to apply"
-        try:
-            self._kubeconfig = fleet.kubeconfig_for_role(self.apply_fixture_role)
-        except fleet.FleetRoleUnresolved as exc:
-            return "error", str(exc)
         for _, manifest in self._added:
             ok, why = _apply(manifest, self._kubeconfig)
             if not ok:
