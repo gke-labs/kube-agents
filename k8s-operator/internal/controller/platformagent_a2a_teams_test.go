@@ -169,12 +169,20 @@ func TestATeamsOnlyGatewayIsABrokerCaller(t *testing.T) {
 	if broker[credentialProxyA2AChatAudienceEnvVar].Value != credentialProxyA2AChatAudience {
 		t.Errorf("the broker is not told the a2a-chat audience: %+v", broker[credentialProxyA2AChatAudienceEnvVar])
 	}
-	// Switch off: none of the three widens.
+	if got := broker[credentialProxyA2AChatCallersEnvVar].Value; got != a2aGatewayBrokerCaller(agent) {
+		t.Errorf("the broker is not told the a2a-chat binding: %s = %q, want the gateway's ServiceAccount", credentialProxyA2AChatCallersEnvVar, got)
+	}
+	// Switch off: the gateway stays a broker caller on every install (its
+	// report reader calls the store routes), but neither a2a-chat value
+	// renders, so the role it is admitted to does not widen.
 	t.Setenv(a2aTeamsBackendEnvVar, "")
-	if callers := allowedBrokerCallers(agent, brokerCallerOwnership{}); strings.Contains(callers, gatewaySA) {
-		t.Errorf("broker callers %q admit the gateway while Teams is on Hermes", callers)
+	if callers := allowedBrokerCallers(agent, brokerCallerOwnership{}); !strings.Contains(callers, gatewaySA) {
+		t.Errorf("broker callers %q dropped the A2A gateway when Teams moved to Hermes; the report reader still calls the broker", callers)
 	}
 	broker = brokerEnvOf(agent)
+	if _, ok := broker[credentialProxyA2AChatCallersEnvVar]; ok {
+		t.Errorf("the a2a-chat binding rendered with no relay armed: %+v", broker[credentialProxyA2AChatCallersEnvVar])
+	}
 	if _, ok := broker[credentialProxyA2AChatAudienceEnvVar]; ok {
 		t.Error("the a2a-chat audience is rendered while Teams is on Hermes")
 	}

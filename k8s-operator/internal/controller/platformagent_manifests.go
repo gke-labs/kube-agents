@@ -5085,11 +5085,19 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		// across every connection it has open, so the broker's own relay
 		// (credential_proxy.py, serve: SlackRelay) is never armed; see
 		// a2aSlackArmed.
-		// The a2a-chat audience when the Teams backend is the gateway's only
-		// relay caller: the Chat block above renders it beside the
-		// subscription, and a Teams-only install has no such block.
+		// The a2a-chat audience and its binding when the Teams backend is the
+		// gateway's only relay caller: the Chat block above renders both
+		// beside the subscription, and a Teams-only install has no such
+		// block. The callers go with the audience here as there: with the
+		// binding the broker confers the a2a-chat role on the gateway's
+		// ServiceAccount alone (#6276); without it any allowed caller that
+		// presents the audience would get the role, which is the reach the
+		// binding exists to close, and the exec tier reads the same value.
 		if a2aTeamsArmed(agent) && !a2aChatArmed(agent) {
-			envVars = append(envVars, corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience})
+			envVars = append(envVars,
+				corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+				corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},
+			)
 		}
 		// The broker opens its Teams routes to the a2a-chat role only on this
 		// word, so a Chat-armed gateway on an install whose Teams stays on
