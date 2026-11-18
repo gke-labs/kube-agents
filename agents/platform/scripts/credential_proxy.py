@@ -14480,15 +14480,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return False
 
     def _answer_managed_repositories(self) -> str:
-        """Answer the managed repositories' `host/path` keys, sorted, and return the outcome label.
+        """Answer the managed repositories as `host/path` names, sorted, and return the outcome label.
 
-        The same list `repository_is_managed` compares against
-        (`managed_repositories`). An unreadable list is the 503 the managed
-        check answers, a fault rather than an empty answer; an install with
-        nothing registered answers an empty list.
+        The same entries `repository_is_managed` compares against
+        (`managed_repositories`), each written as the name a verb accepts: the
+        gate's keys lead with the entry's provider type (`github:github.com/
+        acme/infra`), which no verb reads as a repository, so the type is
+        dropped. An unreadable list is the 503 the managed check answers, a
+        fault rather than an empty answer; an install with nothing registered
+        answers an empty list.
         """
         try:
-            names = sorted(managed_repositories())
+            names = sorted({key.partition(":")[2] or key for key in managed_repositories()})
         except Exception as exc:
             LOGGER.warning(
                 "profile identity: the managed-repository list could not be read type=%s",

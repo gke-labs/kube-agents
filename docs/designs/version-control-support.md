@@ -682,8 +682,9 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
 repository, and no label edit. Its `identity` with no repository answers the managed list's
-names (`managedRepositories`), so a task that names no repository can find the one it may
-use. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
+names (`{managedRepositories: [host/path, …]}`, the same entries the managed check compares
+against, without their provider prefix), so a task that names no repository can find the one
+it may use; the verb table's `identity` row is every other caller's. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
 owns that caller.
 
 ### No shallow clones

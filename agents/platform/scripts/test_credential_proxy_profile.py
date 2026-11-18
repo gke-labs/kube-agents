@@ -1644,18 +1644,29 @@ class ProfileVcsRouteTest(unittest.TestCase):
     # -- identity with no repository: the managed list (#6389) ------------------
 
     def test_a_profile_identity_with_no_repository_answers_the_managed_list(self):
-        managed = frozenset({"github.com/acme/infra", "gitlab.example.com/ops/fleet"})
+        # The gate's own keys, provider type first, as managed_repositories() reads them.
+        managed = frozenset({"github:github.com/acme/infra", "gitlab:gitlab.example.com/ops/fleet"})
+        names = ["github.com/acme/infra", "gitlab.example.com/ops/fleet"]
         for payload in ({}, {"repository": ""}, {"repository": None}, {"login": "someone"}):
             with self.subTest(payload=payload):
                 self.reset()
                 with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed):
                     status, body = self.post(payload, token=VALID["token"], path="/v1/vcs/identity")
                 self.assertEqual(200, status, body)
-                self.assertEqual({credential_proxy.PROFILE_IDENTITY_MANAGED_KEY: sorted(managed)}, body)
+                # Names a verb accepts as a repository: no provider prefix.
+                self.assertEqual({credential_proxy.PROFILE_IDENTITY_MANAGED_KEY: names}, body)
                 # Names only: no repository resolved, no forge called, no credential spent.
                 self.routes["identity"].assert_not_called()
                 self.vcs.registry.resolve.assert_not_called()
                 self.managed.assert_not_called()
+
+    def test_only_identity_answers_the_list(self):
+        # Another profile verb with no repository takes its normal path (here
+        # the stand-in resolver accepts anything); it never answers the list.
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/a/b"})) as listed:
+            status, body = self.post({}, token=VALID["token"], path="/v1/vcs/proposal-list")
+        self.assertNotIn(credential_proxy.PROFILE_IDENTITY_MANAGED_KEY, body)
+        listed.assert_not_called()
 
     def test_a_profile_identity_with_no_repository_needs_a_task_credential(self):
         with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset({"github.com/a/b"})):
