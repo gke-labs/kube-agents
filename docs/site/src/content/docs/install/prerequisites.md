@@ -116,7 +116,7 @@ On a three-server bus, and only while the other two servers are Ready, delete th
 
 An install that ran without the A2A stack has no bus, so the upgrade that adds the stack creates one with three servers, like a new install. The chart's quota check cannot see the bus that runs, so it counts three servers unless `platformAgent.harness.tuning.busReplicas` is `1`. An install that keeps one server under a namespace quota should set that value before it upgrades. Otherwise the check asks for room for two more pods and two more claims.
 
-A Standard cluster that cannot grow to three nodes should run one server, set before the first install: the chart value `platformAgent.harness.tuning.busReplicas: 1`, which `install.sh` and the Terraform full install take through `extra_helm_values` (see [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings)). One server is down for as long as its pod restarts. Once the bus exists, changing the field migrates it.
+A Standard cluster that cannot grow to three nodes should run one server, set before the first install: the chart value `platformAgent.harness.tuning.busReplicas: 1`, which `install.sh` and the Terraform full install take through `extra_helm_values` (see [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings)). One server is down for as long as its pod restarts. Once the bus exists, changing the field migrates it; one server to three is temporarily refused.
 
 The Terraform full install sets it to 1 on a zonal Standard cluster it creates, so that bus runs one server from the start.
 
