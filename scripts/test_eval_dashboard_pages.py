@@ -1909,11 +1909,11 @@ class BrowserTest(unittest.TestCase):
 
 
 RC_RELEASE = {
-    "build_id": "2097891568546484224", "rc_tag": "staging_2609092307_5b5ad10", "commit": "5b5ad10", "tier": "nightly",
-    "verdict": "GREEN", "result": "SUCCESS", "started": "2026-09-10T03:35:01+00:00", "finished": "2026-09-10T07:51:10+00:00",
-    "duration_s": 15006, "project": "kube-agents-evals-10",
-    "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224",
-    "pass_rate": 0.9, "baseline_rate": None, "margin": None,
+    "build_id": "2090000000000000070", "rc_tag": "staging_2609092307_0707070", "commit": "0707070", "tier": "nightly",
+    "verdict": "GREEN", "result": "SUCCESS", "started": "2025-09-11T03:35:01+00:00", "finished": "2025-09-11T07:51:10+00:00",
+    "duration_s": 10554, "project": "kube-agents-evals-10",
+    "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2090000000000000070",
+    "pass_rate": 0.88, "baseline_rate": None, "margin": None,
     "tasks": [{"name": f"case-{n}", "result": "pass" if n < 15 else "fail"} for n in range(25)] + [{"name": "case-infra", "result": "infra"}],
 }
 MERGES = [
@@ -1947,12 +1947,12 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
         data["releases"] = [
             RC_RELEASE,
-            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2025-09-10T03:35:01+00:00"),
             # A release read from the lane's private bucket (SCHEMA.md,
             # releases[].gcs_base): its row links the Console, not Spyglass.
-            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
-                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
-                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+            dict(RC_RELEASE, build_id="2090000000000000071", rc_tag="evalcand_2611100000_0707070", started="2025-09-10T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000071/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000071"),
         ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
@@ -2137,16 +2137,16 @@ class CasesAndGridPagesTest(unittest.TestCase):
     def test_the_brief_lists_the_release_candidates(self):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
-        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
-        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2090000000000000070"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000071"', app)
         self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
-        self.assertIn("90.0%", app)
+        self.assertIn("88.0%", app)
         self.assertIn("baselines maturing", app)
         self.assertIn("15/25", app)
         self.assertIn("1 infra excluded", app)
-        self.assertIn("Wed 11:35 PM ET", app)
-        self.assertIn("4h 10m", app)
+        self.assertIn("Sep 10, 11:35 PM ET", app)
+        self.assertIn("2h 56m", app)
         self.assertIn('<span class="pill p-infra">NO VERDICT</span>', app)
         self.assertIn("no eval banner · job SUCCESS", app)
         self.assertNotIn("javascript:", app)

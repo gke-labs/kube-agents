@@ -47,24 +47,25 @@ LONG_REASON = (
     "that does not exist"
 )
 
-# The real post-kube-agents-eval-rc build the collector fixture is built from
-# (scripts/eval_dashboard/testdata_rc/), reduced to the releases[] record.
+# A releases[] record in the shape the collector derives from a
+# post-kube-agents-eval-rc build (scripts/eval_dashboard/testdata_rc/ is one);
+# the values here are this test's own.
 RC_TASKS = [{"name": f"case-{n}", "result": "pass" if n < 15 else "fail"} for n in range(25)]
 RC_TASKS.append({"name": "case-infra", "result": "infra"})
 RC_RELEASE = {
-    "build_id": "2097891568546484224",
-    "rc_tag": "staging_2609092307_5b5ad10",
-    "commit": "5b5ad10",
+    "build_id": "2090000000000000070",
+    "rc_tag": "staging_2609092307_0707070",
+    "commit": "0707070",
     "tier": "nightly",
     "verdict": "GREEN",
     "result": "SUCCESS",
-    "started": "2026-09-10T03:35:01+00:00",
-    "finished": "2026-09-10T07:51:10+00:00",
-    "duration_s": 15006,
+    "started": "2025-09-11T03:35:01+00:00",
+    "finished": "2025-09-11T07:51:10+00:00",
+    "duration_s": 10554,
     "project": "kube-agents-evals-10",
     "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/"
-                     "post-kube-agents-eval-rc/2097891568546484224",
-    "pass_rate": 0.9,
+                     "post-kube-agents-eval-rc/2090000000000000070",
+    "pass_rate": 0.88,
     "baseline_rate": None,
     "margin": None,
     "tasks": RC_TASKS,
@@ -467,14 +468,14 @@ class ReleasesAndPendingTest(unittest.TestCase):
 
     def test_a_real_release_is_compacted_and_its_cases_counted(self):
         release = self.brief_with(releases=[RC_RELEASE])["releases"][0]
-        self.assertEqual(release["build"], "2097891568546484224")
-        self.assertEqual(release["rc_tag"], "staging_2609092307_5b5ad10")
+        self.assertEqual(release["build"], "2090000000000000070")
+        self.assertEqual(release["rc_tag"], "staging_2609092307_0707070")
         self.assertEqual(release["artifacts_url"], RC_RELEASE["artifacts_url"])
         self.assertEqual((release["tier"], release["verdict"], release["result"]), ("nightly", "GREEN", "SUCCESS"))
-        self.assertEqual(release["pass_rate"], 0.9)
+        self.assertEqual(release["pass_rate"], 0.88)
         self.assertIsNone(release["baseline_rate"])
         self.assertEqual(release["cases"], {"passed": 15, "graded": 25, "infra": 1})
-        self.assertEqual(release["duration_s"], 15006)
+        self.assertEqual(release["duration_s"], 10554)
         self.assertNotIn("tasks", release)
 
     def test_a_release_in_a_private_bucket_links_the_console(self):
@@ -482,11 +483,11 @@ class ReleasesAndPendingTest(unittest.TestCase):
         Console's bucket browser: from `gcs_base` when the collector recorded
         it, and from a Spyglass `artifacts_url` into that bucket for a record
         written before the field. A release in the old bucket keeps its link."""
-        base = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484224/"
-        console = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484224"
+        base = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000070/"
+        console = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000070"
         recorded = self.brief_with(releases=[dict(RC_RELEASE, gcs_base=base, artifacts_url=console)])["releases"][0]
         self.assertEqual(recorded["artifacts_url"], console)
-        stale = self.brief_with(releases=[dict(RC_RELEASE, artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484224")])["releases"][0]
+        stale = self.brief_with(releases=[dict(RC_RELEASE, artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000070")])["releases"][0]
         self.assertEqual(stale["artifacts_url"], console)
         self.assertNotIn("gcs_base", recorded)
 
@@ -496,7 +497,7 @@ class ReleasesAndPendingTest(unittest.TestCase):
 
     def test_a_run_with_no_banner_keeps_its_nulls(self):
         blank = {"build_id": "42", "rc_tag": None, "commit": None, "tier": None, "verdict": None, "result": "FAILURE",
-                 "started": "2026-09-10T03:35:01+00:00", "finished": None, "duration_s": None, "project": None,
+                 "started": "2025-09-11T03:35:01+00:00", "finished": None, "duration_s": None, "project": None,
                  "artifacts_url": None, "pass_rate": None, "baseline_rate": None, "margin": None, "tasks": []}
         release = self.brief_with(releases=[blank])["releases"][0]
         self.assertEqual((release["build"], release["verdict"], release["result"], release["cases"]), ("42", None, "FAILURE", None))

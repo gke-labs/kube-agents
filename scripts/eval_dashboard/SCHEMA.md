@@ -12,11 +12,11 @@ only — anything that renames, removes or re-types a field bumps
   "source": "logs",
   "runs": [
     {
-      "build_id": "2093054394793725952",
+      "build_id": "2090000000000000030",
       "tier": "presubmit",
       "job": "pull-kube-agents-smoke-test",
-      "pr": 998,
-      "head_sha": "a28f0b3",
+      "pr": 102,
+      "head_sha": "0303030",
       "project": "kube-agents-evals-2",
       "started": "<iso8601>",
       "finished": "<iso8601>",
@@ -135,7 +135,7 @@ layout and are collected from the moment they start running.
   verdict's own `outcome` travels as `eval_outcome` below, so a reader of
   this field alone keeps working. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
-  `ABORTED`; build 2092688354838581248 below is one), a death before the
+  `ABORTED`; build 2090000000000000010 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
   the field existed has no key: unknown, which is not `null` — `health.py`
   never counts it as a deadline kill.
@@ -519,9 +519,9 @@ Additive, optional, and safe to omit — consumers must default them.
 
 ```json
 {
-  "build_id": "2097891568546484224",
-  "rc_tag": "staging_2609092307_5b5ad10",
-  "commit": "5b5ad10",
+  "build_id": "2090000000000000070",
+  "rc_tag": "staging_2609092307_0707070",
+  "commit": "0707070",
   "tier": "nightly",
   "verdict": "GREEN|RED|NOT RUN|null",
   "result": "SUCCESS|FAILURE|ABORTED",
@@ -1578,27 +1578,49 @@ file is copied into the out-dir: the adjudicator owns both.
 
 ## Fixtures
 
-`testdata/` holds three **real** `pull-kube-agents-smoke-test` builds
-(PRs 956 and 998), logs trimmed to the eval section, `started.json` /
-`finished.json` verbatim:
+Every file under `testdata/`, `testdata_reps/`, `testdata_rc/`,
+`testdata_nightly/`, `testdata_notevaluated/` and `testdata_store/` is
+synthetic (`.agents/rules/public_surfaces.md`). Kept, because the parsers and
+the tests read them: the line shapes the drivers print, the result and verdict
+words (`PASSED`, `UNSTABLE`, `pass`/`fail`/`infra`/`blocked`, `GREEN`,
+`NOT EVALUATED`), the harness's own fixed sentences, the pool project and
+GitOps repository names, and the ordering of lines and repetitions. Synthetic:
+every score (`OutcomeValidity`, `OutcomeScore`, `VerificationCorrectness`,
+`ChecklistScore`, the store's judged means), every duration and agent latency,
+every wall clock (ISO stamps and Prow epochs sit one fixed offset from any
+real build), the build ids (`20900000000000000N0`), PR numbers (`101`, `102`,
+…), commit shas (`0101010…`-patterned), the case ids (`case-NN`, drawn by a
+seeded permutation, not in the order of `bench/tasks/`), the setup and judge
+(`setup-x` / `model-x`), the ledger App and installation (`1` / `2`), and the
+grader reasons and report excerpts (`check-1: the required phrase is absent`).
+The directories after them (`testdata_lostpod/`, `testdata_health/`,
+`testdata_classify/`) are described as they are.
+
+`testdata/` holds three **synthetic** `pull-kube-agents-smoke-test` builds in
+the single-repetition era's trimmed shape: the lease line, every
+`Task ... Result:` line, and the final verdict where the build reached one,
+with `started.json` / `finished.json` as Prow writes them:
 
 | build               | why it is here                                       |
 | ------------------- | ---------------------------------------------------- |
-| 2092688354838581248 | PR 956 — deadline truncated the log, no verdict line |
-| 2093030474753511424 | PR 998 — `RESOURCE_PREPARATION_FAILED` (infra) task  |
-| 2093054394793725952 | PR 998 — full run, pass/fail mix, verdict line       |
+| 2090000000000000010 | PR 101 — deadline truncated the log, no verdict line |
+| 2090000000000000020 | PR 102 — `RESOURCE_PREPARATION_FAILED` (infra) task  |
+| 2090000000000000030 | PR 102 — full run, pass/fail mix, verdict line       |
 
-These three predate the multi-repetition eval, which is exactly why they
+These three are in the single-repetition shape, which is exactly why they
 stay: they pin the omission semantics of `reps` (no grading lines, no key).
-`testdata_reps/` holds three more **real** builds from the repetition era,
-same trimming, covering both launch-marker formats and every rep verdict
-token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
+`testdata_reps/` holds three more **synthetic** builds in the repetition-era
+shapes, covering both launch-marker formats and every rep verdict token the
+parser knows (`pass`, `fail`, `infra`, `blocked`). The harness's own fixed
+sentences (the `KUBE_AGENTS_INFRA_FAILURE` reason, the empty-trajectory
+reason) are kept because the parser matches them; one grader reason is
+padded past `REP_REASON_MAX_CHARS` to pin the cap:
 
-| build               | why it is here                                   |
-| ------------------- | ------------------------------------------------ |
-| 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
-| 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
-| 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+| build               | why it is here                                  |
+| ------------------- | ----------------------------------------------- |
+| 2090000000000000040 | PR 103 — parallel fan-out, green, one infra rep |
+| 2090000000000000050 | PR 104 — serial markers, aborted mid-task       |
+| 2090000000000000060 | PR 105 — blocked/infra-heavy, >300-char reasons |
 
 `testdata_lostpod/` holds two **real** builds of 2026-09-11 (#1478), the two
 zero-task shapes the health adjudicator has to tell apart. `started.json` /
@@ -1613,31 +1635,26 @@ PR 1446's build log keeps the clone header and the failing tail, and its
 | 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                                            |
 | 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log and `clone-records.json` present, last event `Started`, phase `Failed` |
 
-`testdata_notevaluated/` holds one **derived** build: no
-`pull-kube-agents-smoke-test` run had ended with the not-evaluated verdict
-when the fixture was written (the verdict itself landed on 2026-09-21), so
-this one is shaped from the repetition-era builds above and labelled here
-rather than passed off as real. Its build id, PR number, commit shas and
-project are stand-ins; the `Task ... Result:` lines, the `rep N:` grading
-lines, the final line and `artifacts/eval-verdict.json` are in the shapes
-`bench-gate` and `hack/ci-eval-pr.sh` print for the state. Replace it with a
-real build when one is on record.
+`testdata_notevaluated/` holds one **synthetic** build for the not-evaluated
+verdict (which landed on 2026-09-21): the `Task ... Result:` lines, the
+`rep N:` grading lines, the final line and `artifacts/eval-verdict.json` are
+in the shapes `bench-gate` and `hack/ci-eval-pr.sh` print for the state.
 
 | build               | why it is here                                                                                                                   |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| 2101862036789329920 | one admitted case lost every repetition to infrastructure; final line says `NOT EVALUATED`; `artifacts/eval-verdict.json` agrees |
+| 2090000000000000090 | one admitted case lost every repetition to infrastructure; final line says `NOT EVALUATED`; `artifacts/eval-verdict.json` agrees |
 
-`testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
+`testdata_rc/` holds one **synthetic** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no
 `pull` key and its log carries no PR number:
 
 | build               | why it is here                                        |
 | ------------------- | ----------------------------------------------------- |
-| 2097891568546484224 | `staging_2609092307_5b5ad10` — GREEN, no baseline yet |
+| 2090000000000000070 | `staging_2609092307_0707070` — GREEN, no baseline yet |
 
-Captured from
-`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`,
-the archive the lane logs to before it moves to
+Its log is in the shape the lane archives under
+`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/`,
+the prefix it logged to before it moved to
 `gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/` — either
 prefix is where the job name the collector globs for is verifiable, since
 nothing in this repository declares it (the job lives in
@@ -1649,24 +1666,19 @@ prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
 and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
 opens the parse on the first one, so the decoy stays in the fixture.
 
-`testdata_nightly/` holds the nightly of 2026-09-21 (`ci-kube-agents-eval-nightly`,
-the periodic, so no `pull` key and `revision: main`), the second night the
-480m deadline ended with every unit finished and nothing graded (#1491).
-`started.json` / `finished.json` are verbatim and every driver line is real —
-the lease, the fan-out start, the launch and `finished` markers, the
-entrypoint's timeout and grace-period lines, the profile table. The four
-grading blocks are **spliced in**: the real night printed none, because the
-grading ran after the fan-out's `wait` and the deadline arrived first. They
-are real `bench-gate case` output from the night before
-(build 2101461441721667584) for four cases that also ran this night, placed at
-each case's repetition-3 `finished` line the way `hack/ci-eval-pr.sh` prints them
-since it grades per case, three of them after the SIGTERM, inside the grace
-period; the `recorded` lines are restamped to this build. The
+`testdata_nightly/` holds one **synthetic** nightly (`ci-kube-agents-eval-nightly`,
+the periodic, so no `pull` key and `revision: main`) in the shape of a night
+the 480m deadline ended: the lease, the fan-out start, the launch and
+`finished` markers, the entrypoint's timeout and grace-period lines, the
+profile table, and four grading blocks placed at each case's repetition-3
+`finished` line the way `hack/ci-eval-pr.sh` prints them since it grades per
+case, three of them after the SIGTERM, inside the grace period. The
+`recorded` lines name the `setup-x`/`model-x` key, and the
 `Eval ended before its verdict` line is the EXIT trap's cut-off report:
 
 | build               | why it is here                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------- |
-| 2102186223282950144 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
+| 2090000000000000100 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
 
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by
@@ -1707,18 +1719,18 @@ the timeline of [2026-09-17 04:00Z, 2026-09-17 16:30Z) — four runs concluding 
 a 356-minute run finished with the gate staying GREEN (#2873); the test
 asserts the `near_deadline` note from 16:00Z that day and none at 04:00Z.
 
-`testdata_store/` holds four **real** objects from the evidence store's
-first recording night (2026-09-17, build 2100374258805903360, commit
-`b458323d`), in the store's own layout under an `evidence/` root — the case,
-the setup, the judge, the `<scoring>-f<fleet>-v<verifiers>` directory and the
-`<stamp>-<build>.jsonl` name — one record per object, verbatim:
+`testdata_store/` holds four **synthetic** objects in the evidence store's
+own layout under an `evidence/` root — the case, the setup (`setup-x`), the
+judge (`model-x`), the `<scoring>-f<fleet>-v<verifiers>` directory and the
+`<stamp>-<build>.jsonl` name — one record per object, all from one night
+(build 2090000000000000080, commit `08080808`):
 
-| case                            | why it is here                                         |
-| ------------------------------- | ------------------------------------------------------ |
-| `agent-kanban-smoke`            | 3/3, `ToolInvocation` 0.67: a clean night              |
-| `rca-remediation-pr`            | 2/3: a partial night with judged means below 1         |
-| `cluster-agent-crashloop-debug` | 3/3 with `OutcomeValidity` 0.9: a pass that is not 1.0 |
-| `upgrades-fleet-version-table`  | 3/3, `OutcomeValidity` 0.8                             |
+| case      | why it is here                                          |
+| --------- | ------------------------------------------------------- |
+| `case-24` | 3/3, `ToolInvocation` 0.53: a clean night               |
+| `case-23` | 2/3: a partial night with judged means below 1          |
+| `case-19` | 3/3 with `OutcomeValidity` 0.87: a pass that is not 1.0 |
+| `case-31` | 3/3, `OutcomeValidity` 0.73                             |
 
 `scripts/test_eval_dashboard_store.py` serves them through a fake `gcloud`
 (`ls` of the tree, `cat` of the files) and pins the parse, the window, the
@@ -1729,7 +1741,8 @@ derives the trend from them and renders the page.
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
 the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
 trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
-and the page tests — plus one **derived** run, build 2097362141184626688,
-the `testdata_notevaluated/` build re-dated into the outage window so the
-not-evaluated verdict is classified and rendered beside the real week; its
-`trimmed.derived` note says so.
+and the page tests — plus one **derived** run, build 2097362141184626688:
+the not-evaluated fixture as it was first written (stand-in build id, PR and
+shas, but real case names and grading lines) re-dated into the outage window
+so the not-evaluated verdict is classified and rendered beside the real week;
+its `trimmed.derived` note says so.
