@@ -78,13 +78,14 @@ A one-server bus starts its server with a `stale-cluster-meta` init step. A serv
 3. **The clear.** With the snapshot pinned, the operator's pod deletes the streams from the single server, so it joins the cluster with nothing on disk; the conversion would have dropped them anyway.
 4. **The conversion.** The bus renders three servers. On a cluster that provisions nodes on demand, such as Autopilot, that includes the nodes for servers 1 and 2. The conversion has 15 minutes of its own (`status.busMigration.phaseDeadline`) to get all three Ready, so a cluster that cannot schedule servers 1 and 2 turns the run back then, not at the run's two-hour deadline.
 5. **The restore.** The operator's restore pod restores each stream, with its consumers, and raises it to three replicas. Before it restores a stream, it checks the snapshot against the operator's digests and against the operator's policy for that stream: its subjects, limits and retention. The stream comes back with the limits the install renders now. A snapshot that does not fit them is refused, which turns the run back: more bytes than the rendered `max_bytes`, or an oldest message older than the rendered `max_age`. After, it checks the restored stream against the same policy and deletes one that fails.
-6. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
+6. **The settle.** Once every stream is raised, the restore pod waits, up to 5 minutes for all of them together, until each stream's replicas are current and each restored durable consumer answers from its leader. A stream that doesn't settle in that time turns the run back, like any failed restore.
+7. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
 
-The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (15Gi today), so the default StorageClass must support that access mode.
+The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes; the restore's settle wait adds up to 5 of them. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (15Gi today), so the default StorageClass must support that access mode.
 
 Before a one to three run starts, the operator reads each stream's size from the bus's monitoring endpoint. If a stream holds more than the cap the restore puts on it, keeps a message older than its max age (a stream an earlier install kept longer), or the sizes can't be read, no run starts and nothing freezes. The bus keeps its one server, and an `A2ABusMigrationStreamsOverCap` Warning Event names each stream and the limit it is over. The operator checks again on later passes and starts the run once every stream is under its cap.
 
-A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event.
+A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event. How long the streams took to settle is in `status.busMigration.settleTime`, and in a `BusMigrationSettled` Normal Event.
 
 #### When a migration fails
 

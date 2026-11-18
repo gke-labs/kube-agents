@@ -75,7 +75,7 @@ const (
 	busMigrationHashing           busMigrationPhase = "Hashing"           // grow: the operator's hashing pod digests the stage
 	busMigrationClearing          busMigrationPhase = "Clearing"          // grow: the streams deleted ahead of the conversion, or of the rollback after a failed restore
 	busMigrationConverting        busMigrationPhase = "Converting"        // grow: three servers rendered, waiting for them
-	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores and raises to R3
+	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores, raises to R3 and waits for it to settle
 	busMigrationRollingBack       busMigrationPhase = "RollingBack"       // grow failed in or after the conversion: one server rendered again
 	busMigrationRollbackRestoring busMigrationPhase = "RollbackRestoring" // grow: the same snapshot restored into one server
 	busMigrationReleasing         busMigrationPhase = "Releasing"         // grow: the freeze lifted
@@ -728,9 +728,15 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "DELETE"}
 	case busMigrationRestoring, busMigrationRollbackRestoring:
 		// The restores create each stream, send its chunks, raise its
-		// replicas, and delete a stream whose restore went wrong.
+		// replicas, and delete a stream whose restore went wrong. The
+		// forward restore then reads each stream's consumers by name, and
+		// changes none, until every durable is up on its leader (#6174):
+		// the stream's own consumer count is the cluster's assignments, not
+		// consumers that answer.
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}
-		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>"} }
+		extra = func(stream string) []string {
+			return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>", "$JS.API.CONSUMER.NAMES." + stream, "$JS.API.CONSUMER.INFO." + stream + ".*"}
+		}
 	default:
 		return nil
 	}
@@ -1224,6 +1230,15 @@ func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent
 	var report busmigrate.Report
 	if err := json.Unmarshal([]byte(msg), &report); err != nil {
 		return "its report could not be read", nil
+	}
+	// Only a restore that finished settled: a failed one is turning back.
+	if report.SettleSeconds > 0 && report.Error == "" && run.SettleTime == "" {
+		settled := time.Duration(report.SettleSeconds * float64(time.Second)).Round(time.Millisecond)
+		run.SettleTime = settled.String()
+		if r.Recorder != nil {
+			r.Recorder.Event(agent, corev1.EventTypeNormal, "BusMigrationSettled",
+				fmt.Sprintf("the A2A bus migration's restored streams reached three replicas, every replica current and every restored durable consumer answering from its leader, %s after the last raise", settled))
+		}
 	}
 	if len(report.Warnings) > 0 && run.Warnings == nil {
 		run.Warnings = report.Warnings
