@@ -284,7 +284,9 @@ def diff_paths(diff: str) -> list[str]:
         if path and path not in found:
             found.append(path)
 
-    for line in diff.splitlines():
+    # Split on "\n" alone, as git does: splitlines() also breaks on a bare "\r" or U+2028
+    # inside a changed line, which could start a header that is not one.
+    for line in (raw.removesuffix("\r") for raw in diff.split("\n")):
         if line.startswith("diff --git "):
             in_header = True
             simple = DIFF_GIT_RE.match(line)
@@ -325,7 +327,11 @@ def forge_paths(repo: str, number: int) -> list[str] | None:
         # A cut diff lists only some of the files, and kept as the whole list it would
         # narrow the match to the reconcilers of those files for good.
         return None
-    return diff_paths(diff) or None
+    try:
+        return diff_paths(diff) or None
+    except ValueError as exc:  # an escape no path decodes (\\400): unknown, never a crash
+        logger.warning("post-merge check: could not read the files of %s#%s: %r", repo, number, exc)
+        return None
 
 
 def _dir_key(value: object) -> str:

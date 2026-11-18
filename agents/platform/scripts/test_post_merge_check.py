@@ -625,6 +625,19 @@ class ReconcilersForTest(unittest.TestCase):
         diff = 'diff --git "a/caf\u00e9/\\"q\\".yaml" "b/caf\u00e9/\\"q\\".yaml"\n--- "a/caf\u00e9/\\"q\\".yaml"\n'
         self.assertEqual(post_merge_check.diff_paths(diff), ['caf\u00e9/"q".yaml'])
 
+    def test_diff_paths_ends_lines_only_where_git_does(self):
+        diff = ("diff --git a/a.yaml b/a.yaml\r\n--- a/a.yaml\r\n+++ b/a.yaml\r\n@@ -1 +1 @@\r\n"
+                "+x\rdiff --git a/clusters/prod/p.yaml b/clusters/prod/p.yaml\n+y\u2028diff --git a/c/q b/c/q\n")
+        self.assertEqual(post_merge_check.diff_paths(diff), ["a.yaml"])
+
+    def test_forge_paths_reads_an_undecodable_escape_as_unknown(self):
+        from unittest import mock
+
+        diff = 'diff --git "a/\\400/p.yaml" "b/\\400/p.yaml"\n--- "a/\\400/p.yaml"\n'
+        forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
+        with mock.patch.dict(sys.modules, {"forge": forge}), self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+
     def test_diff_paths_reads_renames_and_binary_files(self):
         diff = ("diff --git a/old/pdb.yaml b/clusters/dev/pdb.yaml\nsimilarity index 100%\n"
                 "rename from old/pdb.yaml\nrename to clusters/dev/pdb.yaml\n"
