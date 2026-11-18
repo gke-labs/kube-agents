@@ -131,30 +131,48 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 	defer rc.Close()
 	js, _ := rc.JetStream()
 	// RaiseReplicas only updates the stream's config: the new replicas catch
-	// up, and the restored consumer reappears on the stream leader, some time
+	// up, and the restored consumer reappears on its new leader, some time
 	// after. On a CI runner a fixed 2s read found the consumer missing (#6174),
-	// so wait for both. How long it took is logged as a diagnostic: it prints
-	// with -v, and on a failing run; CI's go test runs without -v, so a
-	// passing run there doesn't keep it.
+	// and then, with only the stream and the consumer's presence waited for,
+	// present but answering from a group not yet settled (0 pending). So wait
+	// for the stream at three replicas with its followers current, and for the
+	// consumer's own group: a leader, both replicas current, and the restored
+	// state.
+	// How long it took is logged as a diagnostic: it prints with -v, and on a
+	// failing run; CI's go test runs without -v, so a passing run there
+	// doesn't keep it.
+	allCurrent := func(peers []*nats.PeerInfo) bool {
+		for _, p := range peers {
+			if p == nil || !p.Current {
+				return false
+			}
+		}
+		return true
+	}
 	waitStart := time.Now()
 	deadline := waitStart.Add(30 * time.Second)
 	for {
+		short := ""
 		si, serr := js.StreamInfo("TASKS")
-		current := serr == nil && si.Config.Replicas == 3 && si.Cluster != nil && len(si.Cluster.Replicas) == 2
-		if current {
-			for _, r := range si.Cluster.Replicas {
-				if !r.Current {
-					current = false
-				}
-			}
+		ci, cerr := js.ConsumerInfo("TASKS", "worker")
+		switch {
+		case serr != nil:
+			short = "stream: " + serr.Error()
+		case si.Config.Replicas != 3 || si.Cluster == nil || len(si.Cluster.Replicas) != 2 || !allCurrent(si.Cluster.Replicas):
+			short = "stream not at three replicas with its followers current"
+		case cerr != nil:
+			short = "consumer: " + cerr.Error()
+		case ci.Cluster == nil || ci.Cluster.Leader == "" || len(ci.Cluster.Replicas) != 2 || !allCurrent(ci.Cluster.Replicas):
+			short = "consumer's group not settled (leader, two replicas current)"
+		case ci.AckFloor.Stream != 2 || ci.NumPending != 3:
+			short = fmt.Sprintf("consumer's state not restored yet (ack floor %d, %d pending)", ci.AckFloor.Stream, ci.NumPending)
 		}
-		_, cerr := js.ConsumerInfo("TASKS", "worker")
-		if current && cerr == nil {
-			t.Logf("restore-window: consumer present after %s (stream R3, replicas current)", time.Since(waitStart).Round(time.Millisecond))
+		if short == "" {
+			t.Logf("restore-window: consumer settled after %s (stream R3, consumer group current, state restored)", time.Since(waitStart).Round(time.Millisecond))
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Logf("restore-window: not settled after %s: stream %v, consumer %v", time.Since(waitStart).Round(time.Millisecond), serr, cerr)
+			t.Logf("restore-window: not settled after %s: %s", time.Since(waitStart).Round(time.Millisecond), short)
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
