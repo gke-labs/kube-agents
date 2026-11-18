@@ -22,7 +22,7 @@
 id: obtainability-untargeted-compute-class-manifest
 name: Reliability audit flags workload missing compute-class selector on ComputeClass cluster
 domain: reliability
-suite: certification
+suite: validated-capabilities
 audit_streams:
   - obtainability-audit
 fixtures:

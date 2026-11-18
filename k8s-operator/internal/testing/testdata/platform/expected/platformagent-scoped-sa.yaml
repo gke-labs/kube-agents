@@ -1131,6 +1131,12 @@ spec:
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
               value: . profiles/platform
+            - name: SANDBOX_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: shell
+                  divisor: "1"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -3438,7 +3444,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "8"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "9"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent

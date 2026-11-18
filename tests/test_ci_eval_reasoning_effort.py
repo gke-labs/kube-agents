@@ -25,7 +25,7 @@ _STORE_RULE = (
     "fi\n"
 )
 _STORE_ECHO = 'elif [ -n "${EVAL_REASONING_EFFORT:-}" ] && [ -z "${PULL_NUMBER:-}" ]; then'
-_CERTIFICATION_RULE = 'if [ "${EVAL_TIER}" = "certification" ]; then\n  EVAL_IS_MAIN_RUN="false"\nfi\n'
+_VALIDATED_CAPABILITIES_RULE = 'if [ "${EVAL_TIER}" = "validated-capabilities" ]; then\n  EVAL_IS_MAIN_RUN="false"\nfi\n'
 _DEFAULT_MODEL = "gemini-3.1-pro-preview"
 
 _HARNESS = """set -euo pipefail
@@ -103,7 +103,7 @@ class ReasoningEffortStoreRuleTest(unittest.TestCase):
     def test_a_named_effort_never_appends_to_the_store(self) -> None:
         text = _text()
         self.assertEqual(text.count(_STORE_RULE), 1, "the effort rule must sit once beside the other recorder rules")
-        self.assertLess(text.index(_CERTIFICATION_RULE), text.index(_STORE_RULE))
+        self.assertLess(text.index(_VALIDATED_CAPABILITIES_RULE), text.index(_STORE_RULE))
         self.assertLess(text.index(_STORE_RULE), text.index("Recording baseline evidence from main"))
 
     def test_the_record_step_names_the_effort_as_the_reason(self) -> None:

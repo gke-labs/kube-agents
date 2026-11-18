@@ -19807,6 +19807,44 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         )
         self.assertNotIn(credential_proxy.API_RELAY_AUDIT_TOOL, CommandExecutor.ALLOWED_EXECUTABLES)
 
+    def test_in_a_custom_universe_the_audit_subcommand_is_still_the_service_word(self):
+        universe = "apis-tpczero.example"
+        self.addCleanup(
+            self._restore, "universe_domain", "universe_domain" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("universe_domain"),
+        )
+        CredentialProxyHandler.universe_domain = universe
+        in_universe = self.ALLOWED.replace("monitoring.googleapis.com", f"monitoring.{universe}")
+        cases = (
+            (in_universe, 200, "monitoring"),
+            # Not in normal form, on a host a route names: still that host's word.
+            (in_universe.replace("kagents-dev", ".."), 400, "monitoring"),
+            # No route names these hosts in this universe: the commercial host
+            # is another universe's, and the third is in no table at all.
+            (self.ALLOWED, 403, "other"),
+            (f"/v1/gcp/evil.{universe}/anything", 403, "other"),
+        )
+        for path, expected, subcommand in cases:
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path)
+                self.assertEqual(expected, status)
+                self.assertEqual(
+                    [("gcp-api", subcommand)] * 2,
+                    [(a["tool"], a["subcommand"]) for a in self._audits(logs)],
+                )
+
+    def test_a_malformed_universe_domain_gives_every_host_the_other_word(self):
+        self.addCleanup(
+            self._restore, "universe_domain", "universe_domain" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("universe_domain"),
+        )
+        CredentialProxyHandler.universe_domain = "not a domain"
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(403, status)
+        self.assertEqual(["other", "other"], [a["subcommand"] for a in self._audits(logs)])
+
     # -- the one read with a body: Logging entries:list --------------------
 
     ENTRIES_LIST = "/v1/gcp/logging.googleapis.com/v2/entries:list"
@@ -20206,6 +20244,24 @@ class GoogleApiRelayCredentialTest(unittest.TestCase):
         self.assertEqual("monitoring.googleapis.com", connection.host)
         self.assertEqual(credential_proxy.API_RELAY_UPSTREAM_PORT, connection.port)
         self.assertEqual(credential_proxy.API_RELAY_CONNECT_TIMEOUT_S, connection.timeout)
+
+
+class ApiRelayAuditSubcommandTest(unittest.TestCase):
+    """The audit word reads a host the way the policy does, in every universe."""
+
+    def test_a_host_has_its_service_word_exactly_when_the_policy_routes_it(self):
+        services = set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values())
+        for universe in ("googleapis.com", "apis-tpczero.example", "not a domain"):
+            domains = {"googleapis.com", "apis-tpczero.example", "example.com"}
+            hosts = {f"{service}.{domain}" for service in services | {"evil"} for domain in domains}
+            for host in sorted(hosts):
+                with self.subTest(universe=universe, host=host):
+                    # A path no route has: the policy answers gcp.api.path for
+                    # a host it routes, and a host rule for every other host.
+                    decision = api_policy.evaluate("GET", host, "no/such/path", "", universe_domain=universe)
+                    routed = decision.rule_id == api_policy.RULE_PATH
+                    word = credential_proxy.api_relay_audit_subcommand(host, universe)
+                    self.assertEqual(host.partition(".")[0] if routed else "other", word)
 
 
 class ApiRelayQueryStrippingTest(unittest.TestCase):

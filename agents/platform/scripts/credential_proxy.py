@@ -1452,6 +1452,8 @@ FEEDBACK_REASON_LOG_LENGTH = 200
 # `gcloud`, so a record whose tool is `gcloud` still means a gcloud process ran.
 # The subcommand is the service word of a host the route table names (the host's
 # first label), and LABEL_OTHER for every other host, so no caller text is a label.
+# The table holds the commercial hosts; `api_relay_audit_subcommand` reads it for
+# the configured universe domain.
 API_RELAY_AUDIT_TOOL = "gcp-api"
 API_RELAY_AUDIT_SUBCOMMANDS = {
     route.host: route.host.partition(".")[0] for route in api_policy.API_READ_ROUTES
@@ -13431,6 +13433,23 @@ def api_relay_target_problem(host: str, path: str, query: str) -> tuple[str, str
     return None
 
 
+def api_relay_audit_subcommand(host: str, universe_domain: str) -> str:
+    """The audit subcommand of a relay request for `host`.
+
+    The service word when a route names `host` in `universe_domain`, which is
+    how `api_policy.evaluate` reads the route table, and LABEL_OTHER for every
+    other host. A malformed universe domain has no routed host, so every host
+    there is LABEL_OTHER.
+    """
+    try:
+        for route_host, service in API_RELAY_AUDIT_SUBCOMMANDS.items():
+            if credential_proxy_client.rewrite_google_api_host(route_host, universe_domain) == host:
+                return service
+    except ValueError:
+        pass
+    return LABEL_OTHER
+
+
 def strip_credential_query_keys(query: str) -> str:
     """The query with API_RELAY_STRIPPED_QUERY_KEYS removed and nothing else touched.
 
@@ -15816,12 +15835,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
         problem = api_relay_target_problem(host, path, parts.query)
+        universe_domain = self._active_universe_domain()
         decision = (
             None
             if problem is not None
-            else api_policy.evaluate(
-                self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
-            )
+            else api_policy.evaluate(self.command, host, path, parts.query, universe_domain=universe_domain)
         )
         has_body = decision is not None and decision.allowed and api_policy.carries_body(decision.rule_id)
         if self.command != api_policy.API_READ_METHOD and not has_body:
@@ -15834,7 +15852,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(
             principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
         )
-        subcommand_label = API_RELAY_AUDIT_SUBCOMMANDS.get(host, LABEL_OTHER)
+        subcommand_label = api_relay_audit_subcommand(host, universe_domain)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
             return {
