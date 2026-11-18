@@ -2806,7 +2806,10 @@ had and nothing checked. The same table carries a third role, `a2a-chat`, for th
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
 role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
-apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+apart from the legacy chat one. It is bound to its caller as the session role is, below:
+`CREDENTIAL_PROXY_A2A_CHAT_CALLERS` names the A2A gateway's own ServiceAccount, which may present
+only the a2a-chat audience, and no other caller may present that audience; with the list empty,
+as from an operator that doesn't render it, the audience alone decides. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and

@@ -691,6 +691,35 @@ class TestScrubStepText(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
                 self.assertNotIn("S3cretValue9", out)
 
+    def test_key_headers_with_no_end_line_scrub_in_linear_time(self):
+        # 170 KB of private key headers with no END line. The redactor's
+        # pattern read to the end of the text from each header, in the
+        # redactor and again here, so the scrub took 6 s of CPU time
+        # (#6072); with the redactor's one-pass mask it takes 0.04 s. The
+        # coverage job in CI runs about 5 times slower than a developer's
+        # machine, which leaves the 1 s bound a margin of about 5.
+        import time
+
+        header = "-----BEGIN PRIVATE KEY-----\n"
+        start = time.process_time()
+        out = _scrub("tool_result", header * 6000)
+        self.assertLess(time.process_time() - start, 1.0)
+        # Only the last header is masked: it is a key that the text cuts short.
+        self.assertEqual(out, header * 5999 + worker_transcript.REDACTED_PRIVATE_KEY_MARKER)
+
+    def test_a_key_block_that_only_the_transcript_rules_decode_is_masked(self):
+        # A JSON string inside a JSON string, with each dash and line end of
+        # the key block written as a `\\u` escape: the redactor's own pass
+        # does not decode it, so the mask in `supplement_redact` is the one
+        # that masks the block.
+        dashes, line_end = "\\u002d" * 5, "\\u000a"
+        inner = '{"pem": "' + dashes + "BEGIN PRIVATE KEY" + dashes + line_end + "MIIE" + line_end + dashes + "END PRIVATE KEY" + dashes + '"}'
+        self.assertEqual(json.loads(inner), {"pem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"})
+        want = json.dumps({"output": json.dumps({"pem": worker_transcript.REDACTED_PRIVATE_KEY_MARKER})})
+        for kind in ("tool_call", "tool_result", "reply", "thinking"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, json.dumps({"output": inner})), want)
+
     def test_a_value_that_holds_the_next_flag_word_does_not_hide_the_next_value(self):
         # The first value is `abc\ -p` (or `abc\ -u`): its place overlaps
         # the place of the second value, and one marker stands for both. The

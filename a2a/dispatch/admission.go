@@ -78,13 +78,28 @@ func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
 	return len(d.pool.Pods(prof.Name, tier)) == 0
 }
 
-// jobRunner reports whether a task of prof's at tier runs in a Job of its
-// own: Job mode (a JobRunner and the profile's Job template, which the
-// operator renders only where the chart installed the Job admission policy)
-// at an unattended tier. Placement and the permit refusal both read it, so
-// a task admitted for a permit is one placement puts on a Job.
+// jobRunner reports whether a task of prof's at tier can run in a Job of its
+// own: Job mode (a JobRunner, and a Job template for the tier, which the
+// operator renders only where the chart installed the Job admission policy).
+// An unattended tier's template is the profile's own; any other tier has one
+// only when the profile's templates are per tier (#5646), for the tasks that
+// carry a permit. Placement and the permit refusal both read it, so a task
+// admitted for a permit is one placement puts on a Job.
 func (d *Dispatcher) jobRunner(prof lib.DispatchProfile, tier string) bool {
-	return d.cfg.unattendedFor(prof, tier) && d.jobs != nil && prof.HasJobTemplate()
+	if d.jobs == nil || !prof.HasJobTemplate(tier) {
+		return false
+	}
+	return d.cfg.unattendedFor(prof, tier) || prof.JobTemplatesPerTier()
+}
+
+// permitJobOffPool reports whether a task of prof's at tier runs in its own
+// Job for its permit (#5646) at a tier whose runner is otherwise a warm pool.
+// Such a task stays clear of that tier's breaker: it guards the pool, which
+// the task doesn't use, so the task neither waits on it nor counts toward it.
+// At an unattended tier the Job is the tier's runner, and the breaker
+// guards it as before.
+func (d *Dispatcher) permitJobOffPool(prof lib.DispatchProfile, tier string, changeRequested bool, cluster *taskcred.Target) bool {
+	return carriesPermit(changeRequested, cluster) && !d.cfg.unattendedFor(prof, tier) && d.jobRunner(prof, tier)
 }
 
 // carriesPermit reports whether a task's credential-proxy credential would
@@ -130,19 +145,10 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		return admitted{}, nil, errStopped
 	}
 	// After the age check: a submission a breaker holds still ends at its
-	// queue timeout.
+	// queue timeout. The breaker wait itself comes after the target, below.
 	queued := del.Received()
 	if queued.IsZero() {
 		queued = now
-	}
-	// A child of the current half-open probe is part of the probe's own
-	// attempt, not a fresh one: holding it would hold the probe until its
-	// deadline. Every other child waits as a top task does.
-	if !d.probesChild(prof.Name, tier, hk.kind, env.CorrelationID) {
-		if wait, _ := d.breakers.wait(prof.Name, tier, now, func() bool { return d.probing(prof.Name, tier) },
-			func() bool { return d.olderWaiting(hk, queued) }); wait {
-			return admitted{}, nil, errHeldBack
-		}
 	}
 	target, cluster, changeRequested, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
@@ -153,6 +159,17 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	// is refused, not run without one.
 	if carriesPermit(changeRequested, cluster) && !d.jobRunner(prof, tier) {
 		return admitted{}, &refusal{ReasonChangeNeedsJob, fmt.Sprintf("this change runs in its own Job, and profile %s has no Job runner at tier %s", prof.Name, tier)}, nil
+	}
+	// A child of the current half-open probe is part of the probe's own
+	// attempt, not a fresh one: holding it would hold the probe until its
+	// deadline. Every other child waits as a top task does. A permit-carrying
+	// task that runs in its own Job at a pool's tier doesn't wait on the
+	// breaker at all: the breaker guards the pool, which it doesn't use.
+	if !d.permitJobOffPool(prof, tier, changeRequested, cluster) && !d.probesChild(prof.Name, tier, hk.kind, env.CorrelationID) {
+		if wait, _ := d.breakers.wait(prof.Name, tier, now, func() bool { return d.probing(prof.Name, tier) },
+			func() bool { return d.olderWaiting(hk, queued) }); wait {
+			return admitted{}, nil, errHeldBack
+		}
 	}
 	if ref := profileParentRefusal(env, snap, prof, hk.kind, target); ref != nil {
 		return admitted{}, ref, nil

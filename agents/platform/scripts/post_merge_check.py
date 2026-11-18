@@ -518,24 +518,31 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     prints what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
+
+    ``report`` is one tick of the report step (``post_merge_report``), in the switch's mode.
     """
     import os
     import sys
     from contextlib import closing
 
     argv = sys.argv[1:] if argv is None else argv
-    if argv not in (["notice"], ["health"]):
-        print("usage: post_merge_check.py notice|health", file=sys.stderr)
+    if argv not in (["notice"], ["health"], ["report"]):
+        print("usage: post_merge_check.py notice|health|report", file=sys.stderr)
         return 2
     import kubeagents_switches
 
-    if kubeagents_switches.switch(SWITCH) == kubeagents_switches.OFF:
+    mode = kubeagents_switches.switch(SWITCH)
+    if mode == kubeagents_switches.OFF:
         print(json.dumps({"switch": kubeagents_switches.OFF}))
         return 0
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
         if argv == ["notice"]:
             print(json.dumps(notice_merges(conn, view)))
+        elif argv == ["report"]:
+            import post_merge_report
+
+            print(json.dumps(post_merge_report.report_outcomes(conn, mode)))
         else:
             print(json.dumps(watch_health(conn, kubectl_json)))
     return 0

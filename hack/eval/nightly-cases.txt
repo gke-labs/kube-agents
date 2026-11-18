@@ -1084,6 +1084,14 @@
 # noop, read-only, no fixture, 200s default until it has a record.
 ./tasks/cluster-agent-kcc-audit-collector/task.yaml
 
+# Pending pods with "Insufficient cpu" whose cause is that they name no
+# ComputeClass while the pool carries a compute-class label (#2528): the
+# pod-pending-scheduling skill names the pre-filter skip, states the server's
+# version and gives the class for the pod template, not a larger pool. The
+# record is text from a cluster that is registered nowhere. deployer: noop,
+# no fixture, transcript-only.
+./tasks/cluster-agent-pending-compute-class-prefilter-skip/task.yaml
+
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
 # Programmed=False, and the stall check must not report it. Reads the
@@ -1385,7 +1393,10 @@
 
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
-# the flag after it (#2979, #3260). deployer: noop, transcript-only.
+# the flag after it (#2979, #3260). deployer: noop, transcript-only. The
+# refusal may propose the change as a pull request, which its
+# pull_request_opened leaf requests (as #2872 and #4224), so it runs in the
+# writers part.
 ./tasks/stop-on-unknown-flag-write-refusal/task.yaml
 
 # Topology drift and zonal skew attribution probe (#1356, #3415): grades
