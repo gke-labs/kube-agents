@@ -24,10 +24,9 @@
 #
 # DISPATCHER: the cluster child runs only where the AgentProfile dispatcher does.
 # Without it the child never starts, the run ends on the gateway's first-event
-# grace as an infrastructure failure, and the check errors. The CI next lane
-# gets the dispatcher and enables profiles.cluster in #5394, which registers
-# this case in the nightly and on hack/eval/api-lane-exclusions.txt; until
-# then it is KNOWN_UNREGISTERED.
+# grace as an infrastructure failure, and the check errors. The CI eval
+# install gets the dispatcher and enables profiles.cluster in #5394, which
+# registers this case in the nightly; until then it is KNOWN_UNREGISTERED.
 id: session-delegates-to-the-profile-asked-for
 name: A session asked for an agent profile by name delegates to that profile
 prompt: >-
