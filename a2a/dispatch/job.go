@@ -53,8 +53,9 @@ func jobStart(cfg lib.DispatchConfig) time.Duration {
 // to jobStartSeconds for its pod to be Ready, and offers the task to that pod
 // once. It returns what handOff does, the lease record and key of a task
 // confirmed to the pod, or an error for a submission that stays queued. ended
-// is a task this call has already finished: a Job that never came up, or
-// whose pod didn't take the task, fails no-worker (admitted, so failed, not
+// is a task this call has already finished: one whose tier an administrator
+// ended before it was confirmed ends canceled tier-ended (tierEndedJob), and
+// otherwise a Job that never came up, or whose pod didn't take the task, fails no-worker (admitted, so failed, not
 // rejected), its Job deleted, the submission tombstoned before the terminal
 // (as a refusal is: no worker ever held it, so there is no lease record a
 // redelivery would adopt), then terminated and its slot released, so a
@@ -64,7 +65,28 @@ func jobStart(cfg lib.DispatchConfig) time.Duration {
 // cut short.
 func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig,
 	prof lib.DispatchProfile, h *holding) (rec lib.LeaseRecord, key string, ended bool, err error) {
+	// A tier an administrator ended (#5850) while the task's Job was still
+	// coming up: the task ends canceled tier-ended, as a held one does
+	// (endTierHeld), not failed no-worker when the Job never gets a worker
+	// (the tier's ServiceAccount goes at the shortened end). Its Job is
+	// deleted and its submission tombstoned before the terminal, as for any
+	// task no worker held; the breaker doesn't count it (#6134).
+	tierEndedJob := func() (lib.LeaseRecord, string, bool, error) {
+		log.Info("an administrator ended this tier's drain while its Job was starting; ending the task", "tier", h.tier)
+		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
+			log.Warn("delete the task's Job", "err", err)
+		}
+		d.endUnstarted(ctx, log, del, h.key(), lib.StateCanceled,
+			&refusal{ReasonTierEnded, fmt.Sprintf("an administrator ended tier %s's drain on profile %s", h.tier, h.profile)})
+		d.release(h, ctx.Err() == nil)
+		return lib.LeaseRecord{}, "", true, nil
+	}
 	noWorker := func(detail string) (lib.LeaseRecord, string, bool, error) {
+		// A Job that failed, or a pod that didn't take the task, after
+		// its tier was ended is the end's, not a worker's loss.
+		if d.tierEndedOn(h) {
+			return tierEndedJob()
+		}
 		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
 			log.Warn("delete the task's Job", "err", err)
 		}
@@ -91,6 +113,9 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	if stopped {
 		return stoppedJob()
 	}
+	if d.tierEndedOn(h) {
+		return tierEndedJob()
+	}
 	created, err := d.jobs.Launch(ctx, h.profile, h.tier, h.taskID)
 	if err != nil {
 		if errors.Is(err, ErrJobRefusedByPolicy) || errors.Is(err, ErrJobTemplateNotCurrent) {
@@ -112,6 +137,9 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		d.mu.Unlock()
 		if stopped {
 			return stoppedJob()
+		}
+		if d.tierEndedOn(h) {
+			return tierEndedJob()
 		}
 		p, failed, err := d.jobs.Pod(ctx, h.profile, h.tier, h.taskID)
 		pollErr = err

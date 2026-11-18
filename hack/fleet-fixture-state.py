@@ -57,13 +57,22 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-world-open firewall rule and its VM, the peered jumbo-frame network) is
-published as `<role>.confirmed` alone, and its subjects are read with
-`gcloud compute instances list`, `gcloud compute firewall-rules list` or
-`gcloud compute networks list` in the project. `serial_contains` reads
-an instance subject's serial port 1 output as well, with `gcloud compute
-instances get-serial-port-output`: the startup-fail VM's failure line is
-printed at boot only, and the buffer that holds it rotates within weeks.
+world-open firewall rule and its VM, the peered jumbo-frame network, the two
+orphaned snapshots) is published as `<role>.confirmed` alone, and its subjects
+are read with `gcloud compute instances list`, `gcloud compute firewall-rules
+list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
+project. `serial_contains` reads an instance subject's serial port 1 output as
+well, with `gcloud compute instances get-serial-port-output`: the startup-fail
+VM's failure line is printed at boot only, and the buffer that holds it rotates
+within weeks. `source_disk_gone` reads the project's disks for the name a
+snapshot's `sourceDisk` ends in.
+
+One kind of assertion is a clock rather than a shape: `ready_after_hours`,
+on the orphaned-snapshot roles, whose snapshots the GCE compute audit ignores
+until they are more than 90 full days old, and `creationTimestamp` cannot be
+backdated. A role failing that and nothing else is NOT READY, reported with
+the time its clock passes, never drifted: a project applied today is
+registrable, the hourly scan shows the date, and no re-apply is asked for.
 
 A `repository/<path>` subject is a file in the pool project's GitOps
 repository (`gke-agentic/<project>-infra`), the one place a fixture lives
@@ -110,14 +119,15 @@ Inputs (flags win over the environment):
 Output: everything goes to stderr, ending in one summary line:
 
     Seeded-fleet fixture state: N role(s) in their designed state, D drifted,
-    U not checked (project P)
+    U not checked, R not yet ready (project P)
 
 With `--report PATH` the same verdicts are written as JSON, one entry per
-catalog role: `converged`, `drifted` or `unchecked` with the lines above as
-`detail`, `unpublished` for a role the runner did not publish (no kubeconfig,
-or for a project-scoped role no `.confirmed` list), and `no_state` for one
-that declares no assertions; beside them, `unasserted` lists the subjects the
-pass had no credential to read, with their roles and the reason.
+catalog role: `converged`, `drifted`, `unchecked` or `not_ready` with the
+lines above as `detail`, `unpublished` for a role the runner did not publish
+(no kubeconfig, or for a project-scoped role no `.confirmed` list), and
+`no_state` for one that declares no assertions; beside them, `unasserted`
+lists the subjects the pass had no credential to read, with their roles and
+the reason.
 
 Exit 0 whenever the fleet was looked at, whatever it found; 1 on a repository
 bug (unreadable catalog, malformed `state` entry, missing directory).
@@ -134,7 +144,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # The pool verifier, which owns what provisioning seeds into a pool
@@ -179,11 +189,13 @@ BLOB_SHA_SHORT = 8
 # cluster carries. Its subjects are `<kind>/<name-prefix>*`, read with
 # `gcloud compute <collection> list` in the project, and this is the kind to
 # collection map. The runner's probe grammar (hack/fleet-kubeconfigs.sh,
-# PROJECT_PROBE) accepts the same three kinds. A network's listing carries
+# PROJECT_PROBE) accepts the same four kinds. A network's listing carries
 # its `peerings`, which is how the declared-mtu-peering role reads both
 # halves of its peering, one list per network.
-PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks"}
-PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
+PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots"}
+PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network|snapshot)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
+# The collection `source_disk_gone` reads beside a snapshot subject.
+DISKS_COLLECTION = "disks"
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
@@ -261,25 +273,55 @@ OP_SERIAL_CONTAINS = "serial_contains"
 # answers) fails it: a missing note files the posture as a finding as a stale
 # one does.
 OP_AS_SEEDED = "as_seeded"
+# `ready_after_hours` is `age_hours_ge` for a fixture whose audit has an age
+# gate the stack cannot shortcut: the orphaned-snapshot roles' snapshots are
+# invisible to the GCE compute audit's orphaned-snapshots check until they are
+# more than 90 full days old (`(now - creationTimestamp).days > 90`, its
+# collector's ORPHAN_AGE_DAYS), and creationTimestamp is server-set. Failing
+# it is not drift: the role is NOT READY, reported with the time the clock
+# passes, so a project applied today is registrable and the hourly scan shows
+# a date rather than a fixture out of shape. An unparseable timestamp is a
+# broken object, which is drift.
+OP_READY_AFTER_HOURS = "ready_after_hours"
+# `source_disk_gone` reads the project's disks for the name each matched
+# snapshot's `sourceDisk` ends in and wants none: the orphaned-snapshots check
+# files a snapshot only when its source names no live disk, by name or by
+# selfLink, so a disk re-created under that name un-orphans it. No snapshot
+# matched fails it, and so does a snapshot with no `sourceDisk` at all, which
+# the check never flags; a failed disk list, with no live disk found, leaves
+# the role not checked for the pass rather than drifted.
+OP_SOURCE_DISK_GONE = "source_disk_gone"
+# The words a not-ready line carries before the time its gate passes, which
+# the hourly scan's document shows as the role's detail.
+READY_AT = "ready at"
 # Ops a `--wait` cannot see converge, so their drift does not hold the pass:
-# the clock clears an age, in hours, only a reboot of the VM (the next
-# reconcile's reset) puts a rotated line back on a serial console, and only
-# an operator's replace puts the seeded file back.
-OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS, OP_AS_SEEDED})
-OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS})
+# the clock clears an age, in hours (and the one drift `ready_after_hours`
+# writes, a timestamp that is not one, is a second snapshot under the prefix
+# or a broken one, which a hand deletion clears), only a reboot of the VM
+# (the next reconcile's reset) puts a rotated line back on a serial console,
+# only the next reconcile's re-run of the planter deletes a re-created source
+# disk, and only an operator's replace puts the seeded file back.
+OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_READY_AFTER_HOURS, OP_SERIAL_CONTAINS, OP_SOURCE_DISK_GONE, OP_AS_SEEDED})
+OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS, OP_READY_AFTER_HOURS})
 # Ops whose `value` must be a number; anything else is a catalog bug.
-OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
+OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE, OP_READY_AFTER_HOURS})
 # Ops whose `value` must be a non-empty string.
 OPS_WITH_STRING_VALUE = frozenset({OP_SERIAL_CONTAINS})
-OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD, OP_AS_SEEDED})
+OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD, OP_AS_SEEDED, OP_SOURCE_DISK_GONE})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
 # Ops that read the subject's objects whole and therefore take no path.
-OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE, OP_SERIAL_CONTAINS, OP_AS_SEEDED})
+OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE, OP_SERIAL_CONTAINS, OP_AS_SEEDED, OP_SOURCE_DISK_GONE})
 # The repository subject's only op, and that op's only subject.
 REPOSITORY_ONLY_OPS = frozenset({OP_AS_SEEDED})
 # Ops whose subject must be a project-scoped `instance/<prefix>*`.
 INSTANCE_SUBJECT_ONLY_OPS = frozenset({OP_SERIAL_CONTAINS})
 INSTANCE_KIND = "instance"
+# Ops whose subject must be a project-scoped `snapshot/<prefix>*`.
+SNAPSHOT_SUBJECT_ONLY_OPS = frozenset({OP_SOURCE_DISK_GONE})
+SNAPSHOT_KIND = "snapshot"
+# The `sourceDisk` field of a `compute snapshots list` item: a URL ending in
+# the disk's name (or, in some payloads, the bare name).
+SNAPSHOT_SOURCE_FIELD = "sourceDisk"
 # The serial port the guest agent and systemd write to; gcloud's own default,
 # named so the command line says which console was read.
 SERIAL_PORT = 1
@@ -288,6 +330,8 @@ ZONE_RE = re.compile(r"[a-z]+-[a-z]+[0-9]+-[a-z]")
 # A Compute Engine instance name, as GCE defines it: a letter first, and
 # hyphens anywhere inside, `--` included. No flag or shell metacharacter fits.
 INSTANCE_NAME_RE = re.compile(r"[a-z]([-a-z0-9]*[a-z0-9])?")
+# A disk name has the same shape; `source_disk_gone` puts one on a command line.
+DISK_NAME_RE = INSTANCE_NAME_RE
 # Ops whose subject must be a `node?<selector>`.
 NODE_SELECTOR_ONLY_OPS = frozenset({OP_NODE_CPU_SPARE})
 NODE_KIND = "node"
@@ -342,11 +386,11 @@ DEFAULT_INTERVAL_SECONDS = 15.0
 NOT_FOUND_RE = re.compile(r"\bNotFound\b|\bnot found\b", re.IGNORECASE)
 
 # The one line other programs parse. scripts/verify_ci_pool_project.py reads
-# the three counts off it and test_verify_ci_pool_project.py renders this
+# the four counts off it and test_verify_ci_pool_project.py renders this
 # format string to prove its regex still matches.
 SUMMARY_FORMAT = (
     "Seeded-fleet fixture state: {converged} role(s) in their designed state, "
-    "{drifted} drifted, {unchecked} not checked (project {project})"
+    "{drifted} drifted, {unchecked} not checked, {not_ready} not yet ready (project {project})"
 )
 
 # The warning for a subject the pass had no credential to read, one per
@@ -357,12 +401,13 @@ UNASSERTED_WARNING = (
     "roles {roles} are judged on their other assertions"
 )
 
-# `--report` verdicts, one per catalog role. The first three are the summary
-# line's three counts; the last two are roles the summary does not count.
+# `--report` verdicts, one per catalog role. The first four are the summary
+# line's four counts; the last two are roles the summary does not count.
 REPORT_SCHEMA_VERSION = 1
 VERDICT_CONVERGED = "converged"
 VERDICT_DRIFTED = "drifted"
 VERDICT_UNCHECKED = "unchecked"
+VERDICT_NOT_READY = "not_ready"
 VERDICT_UNPUBLISHED = "unpublished"
 VERDICT_NO_STATE = "no_state"
 
@@ -385,6 +430,12 @@ class Unasserted(Exception):
     report names what it left out -- because the hourly scan holds no such
     credential by design, and a role it could never read as healthy would
     hold every incident on it open and the digest's clean line out of reach."""
+
+
+class NotReady(Exception):
+    """A `ready_after_hours` assertion that fails only because the fixture's
+    clock has not run: the line says when it passes. check_role files it apart
+    from drift, and a role failing nothing else is NOT READY."""
 
 
 def _warn(message: str) -> None:
@@ -414,6 +465,10 @@ def repository_path(subject: str) -> str | None:
     """The path a `repository/<path>` subject names; None for any other subject."""
     match = REPOSITORY_SUBJECT_RE.fullmatch(str(subject))
     return match.group("path") if match else None
+
+
+def _note(message: str) -> None:
+    print(f"NOTE: {message}", file=sys.stderr)
 
 
 # --- Catalog ------------------------------------------------------------------
@@ -524,6 +579,10 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 project_scoped and str(subject).startswith(f"{INSTANCE_KIND}/")
             ):
                 raise CatalogError(f"{where}: op {op!r} applies to a project-scoped `{INSTANCE_KIND}/<prefix>*` subject only")
+            if op in SNAPSHOT_SUBJECT_ONLY_OPS and not (
+                project_scoped and str(subject).startswith(f"{SNAPSHOT_KIND}/")
+            ):
+                raise CatalogError(f"{where}: op {op!r} applies to a project-scoped `{SNAPSHOT_KIND}/<prefix>*` subject only")
             if op in OPS_WITH_STRING_VALUE and not (isinstance(entry.get("value"), str) and entry["value"]):
                 raise CatalogError(f"{where}: op {op!r} takes a non-empty string")
             if (op in OPS_WITH_VALUE) != ("value" in entry):
@@ -538,7 +597,7 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 if op not in OPS_WITHOUT_PATH:
                     raise CatalogError(f"{where}: op {op!r} needs a path")
                 steps = None
-            elif op in NODE_SELECTOR_ONLY_OPS or op in INSTANCE_SUBJECT_ONLY_OPS or op in REPOSITORY_ONLY_OPS:
+            elif op in NODE_SELECTOR_ONLY_OPS or op in INSTANCE_SUBJECT_ONLY_OPS or op in REPOSITORY_ONLY_OPS or op in SNAPSHOT_SUBJECT_ONLY_OPS:
                 raise CatalogError(f"{where}: op {op!r} reads the objects whole and takes no path")
             elif isinstance(path, str):
                 steps = parse_path(path)
@@ -641,18 +700,14 @@ def _objects(kind: str, out: str) -> list[dict]:
     raise Unreadable(f"kubectl get {kind} printed an unexpected document")
 
 
-def read_compute(project: str, subject: str) -> list[dict]:
-    """The Compute Engine objects a project-scoped `<kind>/<name-prefix>*`
-    subject names: every object of the kind in `project` whose name starts
-    with the prefix. None there is an observation (an empty list), which an
-    assertion may fail on; a failed list is Unreadable."""
-    match = PROJECT_SUBJECT_RE.fullmatch(subject)
-    if not match:
-        raise Unreadable(f"{subject!r} is not a project subject")
-    collection = PROJECT_COLLECTIONS[subject.split("/", 1)[0]]
+def _compute_list(project: str, collection: str, name_filter: str) -> list[dict]:
+    """`gcloud compute <collection> list` in `project`, filtered on the name.
+    None there is an observation (an empty list), which an assertion may fail
+    on; a failed list is Unreadable. The filter's name part comes from the
+    catalog's grammar or from a validated object name, never raw."""
     cmd = [
         "gcloud", "compute", collection, "list", "--project", project,
-        f"--filter=name ~ ^{match.group('prefix')}", "--format", "json",
+        f"--filter=name ~ {name_filter}", "--format", "json",
     ]
     rc, out, err = _run(cmd, GCLOUD_TIMEOUT_SECONDS)
     if rc != 0:
@@ -664,6 +719,27 @@ def read_compute(project: str, subject: str) -> list[dict]:
     if not isinstance(doc, list):
         raise Unreadable(f"compute {collection} list printed an unexpected document")
     return [item for item in doc if isinstance(item, dict)]
+
+
+def read_compute(project: str, subject: str) -> list[dict]:
+    """The Compute Engine objects a project-scoped `<kind>/<name-prefix>*`
+    subject names: every object of the kind in `project` whose name starts
+    with the prefix."""
+    match = PROJECT_SUBJECT_RE.fullmatch(subject)
+    if not match:
+        raise Unreadable(f"{subject!r} is not a project subject")
+    collection = PROJECT_COLLECTIONS[subject.split("/", 1)[0]]
+    return _compute_list(project, collection, f"^{match.group('prefix')}")
+
+
+def read_disks_named(project: str, name: str) -> list[dict]:
+    """The project's disks named exactly `name`, in any zone, as the
+    orphaned-snapshots check indexes live disks by name. The name comes from a
+    snapshot's `sourceDisk`; one outside the GCE shape is refused rather than
+    put on a command line."""
+    if not DISK_NAME_RE.fullmatch(name):
+        raise Unreadable(f"source disk {name!r} is not a name this script reads")
+    return _compute_list(project, DISKS_COLLECTION, f"^{name}$")
 
 
 def read_serial(project: str, name: str, zone: str) -> str:
@@ -875,8 +951,10 @@ def _describe(values: list) -> str:
     return f"observed {shown}"
 
 
-def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None, serial_for=None, seeded_for=None) -> str | None:
+def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None, serial_for=None, seeded_for=None, disks_named=None) -> str | None:
     """None when the assertion holds; otherwise one line saying what was seen.
+    A `ready_after_hours` assertion that fails on its clock alone raises
+    NotReady with that line instead.
 
     `channel_default` is a callable returning the channel default version for
     the cluster document, used by the minor-behind operator only, and
@@ -890,6 +968,8 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
     callable returning (the blob sha provisioning seeds at a repository path,
     a callable from the live file's sha to the repair to name), used by
     `as_seeded` only.
+    `disks_named` is a callable returning the project's disks of one name,
+    used by `source_disk_gone` only.
     """
     op, expected = entry["op"], entry["value"]
     label = " ".join(part for part in (entry["subject"], entry["path"], op) if part)
@@ -929,6 +1009,36 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
         if hours < float(expected):
             return f"{label}: {_describe(values)}, {hours:.1f} hours old"
         ok = True
+    elif op == OP_READY_AFTER_HOURS:
+        when = _timestamp(values[0]) if len(values) == 1 else None
+        if when is None:
+            return f"{label}: {_describe(values)}, not one RFC 3339 timestamp"
+        hours = (datetime.now(timezone.utc) - when).total_seconds() / SECONDS_PER_HOUR
+        if hours < float(expected):
+            ready = (when + timedelta(hours=float(expected))).astimezone(timezone.utc)
+            raise NotReady(f"{label}: {_describe(values)}, {hours:.1f} hours old; {READY_AT} {ready.isoformat()}")
+        ok = True
+    elif op == OP_SOURCE_DISK_GONE:
+        if disks_named is None:  # pragma: no cover - check_role always supplies it
+            raise CatalogError(f"op {op!r} needs the disk reader")
+        if not objects:
+            return f"{label}: no snapshot matched"
+        live, failed = [], []
+        for obj in objects:
+            source = str(obj.get(SNAPSHOT_SOURCE_FIELD) or "").rstrip("/").rsplit("/", 1)[-1]
+            if not source:
+                return f"{label}: {obj.get('name') or 'a snapshot'} carries no {SNAPSHOT_SOURCE_FIELD}"
+            try:
+                if disks_named(source):
+                    live.append(source)
+            except Unreadable as exc:
+                failed.append(str(exc))
+        if live:
+            # Positive evidence wins over a read that failed elsewhere.
+            return f"{label}: {SNAPSHOT_SOURCE_FIELD} {', '.join(live)} is a live disk"
+        if failed:
+            raise Unreadable("; ".join(failed))
+        return None
     elif op == OP_MINOR_BEHIND:
         ok = False
         if len(values) == 1:
@@ -1041,6 +1151,7 @@ class Reader:
         # One contents read per seeded path per pass, whichever way it went:
         # the declared-* roles share the note.
         self._repository: dict[str, list | Unreadable | Unasserted] = {}
+        self._disks: dict[str, list | Unreadable] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -1129,6 +1240,18 @@ class Reader:
 
         return verifier.gitops_seeded_blob_sha(path), repair
 
+    def disks_named(self, name: str) -> list:
+        """The project's disks of one name, read once per pass."""
+        if name not in self._disks:
+            try:
+                self._disks[name] = read_disks_named(self.project, name)
+            except Unreadable as exc:
+                self._disks[name] = exc
+        cached = self._disks[name]
+        if isinstance(cached, Unreadable):
+            raise cached
+        return cached
+
     def pods_by_node_for(self, role: str):
         """The cluster's bound pods grouped by node, read once per role per pass."""
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -1146,9 +1269,9 @@ class Reader:
         return lookup
 
 
-def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str], list[tuple[str, str]], bool]:
+def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str], list[tuple[str, str]], bool, list[str]]:
     """(drift lines, unreadable lines, unasserted (subject, reason) pairs,
-    worth waiting for) for one role in one pass.
+    worth waiting for, not-ready lines) for one role in one pass.
 
     Objects are read once per distinct subject, so two assertions on the same
     pod list cost one kubectl. An assertion whose subject could not be read
@@ -1157,11 +1280,14 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
     the pass had nothing to read with (Unasserted) lands in the third, and
     says nothing about the role's verdict. The flag is true when some failed
     assertion could converge within a wait, which an age gate, a rotated
-    serial console and a seeded file cannot (`OPS_A_WAIT_CANNOT_CLEAR`).
+    serial console and a seeded file cannot (`OPS_A_WAIT_CANNOT_CLEAR`). A
+    `ready_after_hours` assertion that failed on its clock lands in the last
+    list, apart from drift.
     """
     drift: list[str] = []
     unreadable: list[str] = []
     unasserted: list[tuple[str, str]] = []
+    not_ready: list[str] = []
     settling = False
     cache: dict[str, list] = {}
     for entry in spec["state"]:
@@ -1187,14 +1313,18 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
                 pods_by_node=reader.pods_by_node_for(role),
                 serial_for=reader.serial_for,
                 seeded_for=reader.seeded_for,
+                disks_named=reader.disks_named,
             )
         except Unreadable as exc:
             unreadable.append(f"{subject}: {exc}")
             continue
+        except NotReady as exc:
+            not_ready.append(str(exc) + (f" (why: {entry['why']})" if entry["why"] else ""))
+            continue
         if problem:
             drift.append(problem + (f" (why: {entry['why']})" if entry["why"] else ""))
             settling = settling or entry["op"] not in OPS_A_WAIT_CANNOT_CLEAR
-    return drift, unreadable, unasserted, settling
+    return drift, unreadable, unasserted, settling, not_ready
 
 
 def published(directory: Path, role: str, spec: dict) -> bool:
@@ -1231,7 +1361,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         if spec["state"] and published(directory, role, spec)
     }
     converged: list[str] = []
-    last: dict[str, tuple[list[str], list[str]]] = {}
+    last: dict[str, tuple[list[str], list[str], list[str]]] = {}
     settling: dict[str, bool] = {}
     # {subject: (reason, roles)} for the assertions this pass had nothing to
     # read with, kept out of every verdict and named once in the report.
@@ -1240,11 +1370,11 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
     while True:
         reader = Reader(directory, project, context)
         for role in sorted(pending):
-            drift, unreadable, left_out, settling[role] = check_role(reader, role, pending[role])
-            last[role] = (drift, unreadable)
+            drift, unreadable, left_out, settling[role], not_ready = check_role(reader, role, pending[role])
+            last[role] = (drift, unreadable, not_ready)
             for subject, reason in left_out:
                 unasserted.setdefault(subject, (reason, set()))[1].add(role)
-            if not drift and not unreadable:
+            if not drift and not unreadable and not not_ready:
                 converged.append(role)
                 # Idempotent across re-runs: a role that has converged since a
                 # previous pass must not keep an old verdict on disk.
@@ -1263,7 +1393,8 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         # role keeps the loop going, so a transient failure gets its retries.
         # An age gate is the same exception: a cluster under a day old is still
         # under it when the wait runs out. So is a rotated serial console: only
-        # a reboot puts the line back.
+        # a reboot puts the line back. A role that is not ready is never
+        # settling: its clock is not drift, and no wait this short moves it.
         waiting = [role for role in pending if settling[role]]
         if not waiting or remaining <= 0:
             break
@@ -1271,16 +1402,20 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
 
     drifted = 0
     unchecked = 0
+    not_yet_ready = 0
     verdicts: dict[str, tuple[str, list[str]]] = {role: (VERDICT_CONVERGED, []) for role in converged}
     for role in sorted(pending):
-        drift, unreadable = last[role]
+        drift, unreadable, not_ready = last[role]
         # Positive evidence wins: an assertion that was READ and failed is drift
-        # whatever else in the role went unread. Only a role whose every failure
-        # was a failed read is "not checked", and it gets no drift file -- a
-        # fixture nobody saw must not be reported as out of shape.
+        # whatever else in the role went unread or unaged. Only a role whose
+        # every failure was a failed read is "not checked", and it gets no
+        # drift file -- a fixture nobody saw must not be reported as out of
+        # shape. A role whose only failure is its clock is "not ready": no
+        # drift file either, and a NOTE rather than a WARNING, because nothing
+        # is wrong with it and no re-apply is owed.
         if drift:
             drifted += 1
-            lines = drift + [f"unread: {u}" for u in unreadable]
+            lines = drift + [f"not ready: {n}" for n in not_ready] + [f"unread: {u}" for u in unreadable]
             path = directory / f"{role}{DRIFT_SUFFIX}"
             path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
             os.chmod(path, 0o600)
@@ -1290,7 +1425,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
                 f"{project}; the cases that depend on it cannot be graded against it: "
                 + "; ".join(lines)
             )
-        else:
+        elif unreadable:
             unchecked += 1
             verdicts[role] = (VERDICT_UNCHECKED, list(unreadable))
             try:
@@ -1301,6 +1436,17 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
                 f"fixture role '{role}' could not be checked in {project}; nothing is "
                 f"known about its state: " + "; ".join(unreadable)
             )
+        else:
+            not_yet_ready += 1
+            verdicts[role] = (VERDICT_NOT_READY, list(not_ready))
+            try:
+                (directory / f"{role}{DRIFT_SUFFIX}").unlink()
+            except FileNotFoundError:
+                pass
+            _note(
+                f"fixture role '{role}' is planted in {project} but not yet ready; the cases "
+                f"that depend on it wait for its clock: " + "; ".join(not_ready)
+            )
     left_out = [
         {"subject": subject, "roles": sorted(role_set), "reason": reason}
         for subject, (reason, role_set) in sorted(unasserted.items())
@@ -1309,12 +1455,12 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         _warn(UNASSERTED_WARNING.format(subject=entry["subject"], project=project, reason=entry["reason"], roles=", ".join(entry["roles"])))
     print(
         SUMMARY_FORMAT.format(
-            converged=len(converged), drifted=drifted, unchecked=unchecked, project=project
+            converged=len(converged), drifted=drifted, unchecked=unchecked, not_ready=not_yet_ready, project=project
         ),
         file=sys.stderr,
     )
     if report is not None:
-        write_report(report, project, roles, verdicts, left_out, converged=len(converged), drifted=drifted, unchecked=unchecked)
+        write_report(report, project, roles, verdicts, left_out, converged=len(converged), drifted=drifted, unchecked=unchecked, not_ready=not_yet_ready)
     return EXIT_OK
 
 

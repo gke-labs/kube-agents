@@ -100,6 +100,9 @@ var reasonSentences = map[string]string{
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
 	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	// A confirmed change runs only in a one-pod Job of its own (#4458); the
+	// detail names the profile and tier, which are for an operator.
+	"change-needs-job": "this change has to run in a job of its own, which this agent can't start for this kind of request, so nothing was changed",
 	// The dispatcher's re-check of a profile task's child (#5686). The
 	// gateway refuses the same at mint, so these reach the room only from a
 	// child an older gateway sent, or one that broke a rule anyway.
@@ -107,6 +110,8 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A script-run task naming a script its profile doesn't list (#5622).
+	"script-not-allowed": "this agent isn't set up to run the script this schedule asked for, so it didn't run; whoever manages this agent can allow the script, or change the schedule",
 	// The agent ran and produced no answer.
 	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",
 	"stream-ended-without-result":   "the agent stopped before it produced an answer",

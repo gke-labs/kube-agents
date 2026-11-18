@@ -55,13 +55,13 @@ run "sap_with_the_secret_renders_env_from_secret" {
     litellm_env_secret_name = "sap-aicore"
   }
   assert {
-    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm) == jsonencode({
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm) == jsonencode({
       envFromSecret    = "sap-aicore"
       maxTokens        = 0
       modelDefaultName = ""
       modelProvider    = "sap"
     })
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -73,8 +73,8 @@ run "another_slug_with_a_model_renders" {
     litellm_env_secret_name = "azure-openai"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm.modelProvider == "azure"
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm.modelProvider == "azure"
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -87,8 +87,8 @@ run "openai_compatible_carries_the_secret_beside_its_own_values" {
     litellm_env_secret_name    = "ai-gateway-oauth"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm.envFromSecret == "ai-gateway-oauth"
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm.envFromSecret == "ai-gateway-oauth"
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -98,8 +98,8 @@ run "openai_compatible_carries_the_secret_beside_its_own_values" {
 run "unset_renders_no_env_from_secret_key" {
   command = apply
   assert {
-    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm), "envFromSecret")
-    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).litellm)}"
+    condition     = !contains(keys(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm), "envFromSecret")
+    error_message = "litellm: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).litellm)}"
   }
 }
 
@@ -109,7 +109,7 @@ run "a_slug_without_a_model_fails_the_plan" {
     model_provider          = "azure"
     litellm_env_secret_name = "azure-openai"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "a_provider_that_is_not_a_slug_fails_the_plan" {

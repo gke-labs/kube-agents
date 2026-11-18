@@ -2901,21 +2901,14 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // served until the pod restarts. A renewal rolls the bus once a year; the
 // bus pod's reloader would also apply it in place, but the hash still rolls.
 //
-// On a single server the gateway's per-profile deny is left out
-// (renderA2ANATSConf with no profiles): the config Secret carries it, the
-// reloader applies it, and planA2ABusReload confirms it, so a profile change
-// doesn't restart the bus. A cluster digests it too, so a profile change rolls
-// the servers one at a time onto it, each in lame duck while the others serve:
-// the reload's confirmation reads one config_load_time through the Service,
-// which can't tell whether every server reloaded, and its fallback restarts
-// one pod.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
-	if a2aNATSReplicas(agent) <= 1 {
-		profiles = nil
-	}
+// The gateway's per-profile deny is left out (renderA2ANATSConf with no
+// profiles) on every server count: the config Secret carries it, each
+// server's reloader applies it, and planA2ABusReload confirms it server by
+// server, so a profile change restarts no server and rolls no cluster.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys, profiles)
+	}, keys, nil)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -7555,13 +7548,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
 	// ones and the ones still draining, the same names as the dispatcher's
 	// grant. A profile the controller refuses gets neither. The list is in
-	// the config, and on a single server not the pod template's hash, so a
-	// profile admitted, removed or done draining reaches a single-server bus
-	// by a reload (planA2ABusReload) rather than a restart. A cluster rolls
-	// onto it (a2aConfigRolloutHash).
+	// the config and not the pod template's hash, so a profile admitted,
+	// removed or done draining reaches every bus server by a reload
+	// (planA2ABusReload) rather than a restart or a roll.
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
-	annotateA2ABusProfiles(agent, sts, profileNames)
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -7576,7 +7567,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+		if err := r.actOnA2ABusReload(ctx, agent, reload); err != nil {
 			return state, err
 		}
 		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {

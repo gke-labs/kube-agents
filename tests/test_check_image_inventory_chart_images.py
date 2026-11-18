@@ -47,7 +47,7 @@ _CHECK_THREE_FUNCTIONS = (
     "check_mirror_names",
     "check_toggle",
 )
-_CHECK_THREE_CONSTANTS = (*_LIFTED_CONSTANTS, "LABEL_DEFAULT", "LABEL_MIRRORED")
+_CHECK_THREE_CONSTANTS = (*_LIFTED_CONSTANTS, "LABEL_DEFAULT", "LABEL_MIRRORED", "MIRRORED_VALUES")
 
 # The env vars the chart renders an image into. The pattern has to match every
 # one of them: a name it misses is an image the operator stamps onto agent pods
@@ -78,6 +78,16 @@ _CALL_SITES = (
     "\ncheck_toggle hindsight --set hindsight.enabled=true\n",
     "--set githubMinter.enabled=true",
     'check_chart_image_env_rendered "$LABEL_DEFAULT" "$default_render"',
+    # The reused-values render (no a2aBus key) goes through the same four
+    # checks, over the bus's four env vars alone: the template's own copy of
+    # the bus pins is read by nothing else, and the rest of that render is the
+    # default render's.
+    "readonly REUSED_VALUES=(--set a2aBus=null)",
+    'check_chart_image_env_rendered "$LABEL_REUSED" "$reused_render"',
+    'reused_bus_images="$(bus_image_env_refs <<<"$reused_render")"',
+    'check_inventory_pins "$LABEL_REUSED" "$reused_bus_images"',
+    'check_mirror_prefix "$LABEL_REUSED_MIRRORED" "$(bus_image_env_refs <<<"$mirrored_reused_render")"',
+    'check_mirror_names "$LABEL_REUSED_MIRRORED" "$(bus_image_env_refs <<<"$mirrored_reused_render")"',
 )
 _GUARDS = (
     '[ -n "$(image_field_refs <<<"$default_render")" ] || {',

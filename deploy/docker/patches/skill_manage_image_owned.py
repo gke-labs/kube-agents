@@ -52,8 +52,8 @@ way the entrypoint and the kanban dispatcher already agree on it: the default
 profile is homed at ``$HERMES_HOME`` itself and a specialist at
 ``$HERMES_HOME/profiles/<name>``. ``platform`` is fed by
 ``/opt/platform-template/skills`` (plus the one-skill ``/opt/a2a-template``
-overlay, which exists in the image whether or not the install's mode applies
-it), every ``cluster-*`` profile by ``/opt/cluster-template/skills``, and the
+overlay, which the entrypoint lays into the platform profile on every boot),
+every ``cluster-*`` profile by ``/opt/cluster-template/skills``, and the
 default profile by nothing this image ships (its config disables the toolset
 anyway). The answer is a ``stat`` on the read-only image tree, never on the
 profile's own copy: the copy is what is being protected.

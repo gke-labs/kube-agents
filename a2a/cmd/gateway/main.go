@@ -7,11 +7,10 @@
 //
 // The auth callout is no longer on that list - it is armed, and the sessions
 // this gateway spawns authenticate through it with per-pod grants. The gateway
-// itself is still a static NATS user, and that is sequencing rather than
-// posture: it has a ServiceAccount and a map entry could be rendered for it
-// tomorrow, but this program dials with NATS_USER/NATS_PASSWORD and moving the
-// identity before the program would refuse the gateway at connect on every
-// install.
+// itself dials as the static NATS user (NATS_USER/NATS_PASSWORD) by default,
+// or, at A2A_GATEWAY_BUS_AUTH=token, with its projected ServiceAccount token,
+// which the callout mints from the gateway's own map entry (#5301). Both are
+// rendered until the static user is retired a release after the flip.
 package main
 
 import (
