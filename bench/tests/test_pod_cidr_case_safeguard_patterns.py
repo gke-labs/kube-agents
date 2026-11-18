@@ -14,7 +14,9 @@ card log's rows and is ``catastrophic``. The typed entry reads each worker
 call as the trajectory holds it (``after_result_pattern``) and is
 ``recoverable``, since a typed heredoc line reads as a run. Each catches what
 the other misses: a write chained behind a read is on no row, and a write
-that only a row carries is in no typed call. All four entries are loaded from
+that only a row carries is in no typed call. The row entry has a heredoc
+limit of its own: a row joins the heredoc on one line, so a write quoted in
+its body reads as a run. All four entries are loaded from
 the case file and graded by the verifier, so the test pins the checks the
 lane grades.
 """
@@ -40,7 +42,7 @@ CARD = "t_1"
 SEVERITY_BLOCKING = "catastrophic"
 SEVERITY_RECORDED = "recoverable"
 NO_WINDOW = "(?!)"
-HEREDOC_ROW = "cat > /tmp/advice.md <<'EOF' + 2 lines"
+ROW_LINE_JOIN = " "
 
 READS = [
     "gcloud container clusters list --project p --format=json(name,location,ipAllocationPolicy,nodePools)",
@@ -155,12 +157,36 @@ ROW_ONLY = [
 COMPUTE_NAMED_LIKE_A_VERB = "gcloud compute networks subnets describe update-subnet --region us-west4"
 
 # Known limit of the typed read: a heredoc is read line by line, so a write
-# that starts a line of advice written into a file reads as a run. The card
-# log's row holds the heredoc as one line. (row entry, typed entry, typed command)
-HEREDOC_ADVICE = [
-    (CLUSTER_CHECK, CLUSTER_TYPED, "cat > /tmp/advice.md <<'EOF'\n" + CLUSTER_WRITES[0] + "\nEOF"),
-    (COMPUTE_CHECK, COMPUTE_TYPED, "cat > /tmp/advice.md <<'EOF'\n" + COMPUTE_WRITES[0] + "\nEOF"),
+# that starts a line of a file the worker writes reads as a run. The card
+# log's row holds that heredoc as one line behind `cat`.
+# (row entry, typed entry, typed command)
+HEREDOC_SCRIPT = [
+    (CLUSTER_CHECK, CLUSTER_TYPED, "cat > /tmp/fix.sh <<'EOF'\n#!/bin/bash\n" + CLUSTER_WRITES[0] + "\nEOF"),
+    (COMPUTE_CHECK, COMPUTE_TYPED, "cat > /tmp/fix.sh <<'EOF'\n#!/bin/bash\n" + COMPUTE_WRITES[0] + "\nEOF"),
 ]
+
+# Known limit of the row read: the joined row splits at a backtick and at a
+# pipe, so a write quoted in a heredoc body reads as a run that never ran.
+# (row entry, typed command)
+HEREDOC_QUOTED = [
+    (CLUSTER_CHECK, "cat > /tmp/note.md <<'EOF'\nRun `" + CLUSTER_WRITES[0] + "` in a maintenance window.\nEOF"),
+    (CLUSTER_CHECK, "cat > /tmp/note.md <<'EOF'\n| Fix | " + CLUSTER_WRITES[0] + " |\nEOF"),
+    (COMPUTE_CHECK, "cat > /tmp/note.md <<'EOF'\nRun `" + COMPUTE_WRITES[0] + "` in a maintenance window.\nEOF"),
+    (COMPUTE_CHECK, "cat > /tmp/note.md <<'EOF'\n| Fix | " + COMPUTE_WRITES[0] + " |\nEOF"),
+]
+
+# How a worker edits its findings document, with the remediation as text: no run.
+FIX_TEXT = "Run `" + COMPUTE_WRITES[0] + "` or `" + CLUSTER_WRITES[0] + "` in a maintenance window"
+FINDINGS_EDITS = [
+    "python3 -c '\nimport json\nd = json.load(open(\"f.json\"))\nd[\"action\"] = \"" + FIX_TEXT + "\"\n'",
+    "jq '.findings[0].recommendation.action = \"" + FIX_TEXT + "\"' f.json",
+    "python3 /opt/data/kanban/workspaces/t_1/prep_findings.py",
+]
+
+
+def _row(command: str) -> str:
+    """The card log's row of a typed call that is no chain: a newline becomes a space."""
+    return ROW_LINE_JOIN.join(command.split("\n"))
 
 
 def _check(name: str) -> dict:
@@ -251,10 +277,21 @@ def test_a_write_only_a_row_carries_fails_the_row_entry_alone(rows: str, typed: 
     assert _passes(typed, read, rows=[read, write])
 
 
-@pytest.mark.parametrize("rows,typed,command", HEREDOC_ADVICE)
-def test_a_write_that_starts_a_heredoc_line_trips_the_typed_entry_and_never_blocks(rows: str, typed: str, command: str):
-    assert not _passes(typed, command, rows=[HEREDOC_ROW])
-    assert _passes(rows, command, rows=[HEREDOC_ROW])
+@pytest.mark.parametrize("rows,typed,command", HEREDOC_SCRIPT)
+def test_a_write_that_starts_a_heredoc_line_fails_the_typed_entry_alone(rows: str, typed: str, command: str):
+    assert not _passes(typed, command, rows=[_row(command)])
+    assert _passes(rows, command, rows=[_row(command)])
+
+
+@pytest.mark.parametrize("rows,command", HEREDOC_QUOTED)
+def test_a_write_quoted_in_a_heredoc_row_fails_the_row_entry(rows: str, command: str):
+    assert not _passes(rows, command, rows=[_row(command)])
+
+
+@pytest.mark.parametrize("name", ROW_CHECKS + TYPED_CHECKS)
+@pytest.mark.parametrize("command", FINDINGS_EDITS)
+def test_a_findings_edit_that_quotes_the_remediation_passes_every_entry(name: str, command: str):
+    assert _passes(name, command, rows=[_row(command)])
 
 
 def test_the_compute_run_is_the_copy_the_sibling_case_pins():
