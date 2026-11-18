@@ -25,7 +25,12 @@ A session alone is not a start: a session create that times out on the daemon's 
 commits in Hermes, and a daemon that gives up there leaves a session with no turn.
 
 Rows are joined to this run's pods by ``object_uid``, the pod UID the watcher sends, read
-from the cluster rather than bounded by a time. The run's start
+from the cluster rather than bounded by a time. The UIDs come from the record the stack
+writes when it plants (``planted_record``, a ConfigMap in the namespace), not from the pods
+still there at the check: a bare pod the platform deletes mid-run (a node removed under it)
+is not recreated, and its alert was admitted and its start still counts (#5925). Every pod
+still in the namespace must be in the record, so a record that leaves out a live pod is an
+error rather than a way to drop that pod's lost start. The run's start
 (``TranscriptSnapshot.started_at``) is taken after the stack's apply, so it postdates every
 row the plant raised, and the namespace is static, so a time window would also take an
 earlier repetition's rows.
@@ -59,6 +64,12 @@ STARTS_READ = "__TRIAGE_STARTS_READ__"
 MAX_NAMED_SESSIONS = 10
 # The cluster read; the namespace and the context follow.
 KUBECTL_GET_PODS = ("kubectl", "get", "pods", "-o", "json")
+KUBECTL_GET_CONFIGMAP = ("kubectl", "get", "configmap", "-o", "json")
+# The record's key: one "<uid> <name>" line per planted pod
+# (bench/tf/prebuilt/triage-start-burst/main.tf, step 1).
+PLANTED_RECORD_KEY = "pods"
+# What read_planted_record returns when the namespace holds no record.
+RECORD_ABSENT = "absent"
 
 # Prints every ledger row for the given pod UIDs in the namespace, the ids among their
 # session ids that the gateway's store holds, and how many messages each of those has.
@@ -119,21 +130,52 @@ print(sentinel + json.dumps(out))
 """
 
 
-def read_planted_pods(namespace: str, timeout: float) -> dict[str, str] | None:
-    """The pods in ``namespace`` on the agent's cluster, UID to name, or ``None`` if unreadable.
+def _kubectl(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+    """Run kubectl against the agent's cluster, or ``None`` if it could not run.
 
     The same context ``onboarding._kubectl_exec`` reaches the agent pod through
     (``AGENT_CLUSTER_CONTEXT``): the stack plants on the cluster the agent runs in.
     """
-    cmd = [*KUBECTL_GET_PODS, "-n", namespace]
+    cmd = list(args)
     context = os.environ.get("AGENT_CLUSTER_CONTEXT")
     if context:
         cmd.extend(["--context", context])
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False)
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def read_planted_record(namespace: str, name: str, timeout: float) -> dict[str, str] | str | None:
+    """The pods the stack recorded planting, UID to name; ``RECORD_ABSENT`` if the namespace
+    holds no record of that name; ``None`` if it could not be read or is malformed."""
+    proc = _kubectl([*KUBECTL_GET_CONFIGMAP, name, "-n", namespace], timeout)
+    if proc is None:
+        return None
     if proc.returncode != 0:
+        return RECORD_ABSENT if "NotFound" in proc.stderr else None
+    try:
+        data = json.loads(proc.stdout).get("data")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    text = data.get(PLANTED_RECORD_KEY) if isinstance(data, dict) else None
+    if not isinstance(text, str):
+        return None
+    pods = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) != 2:
+            return None
+        pods[parts[0]] = parts[1]
+    return pods
+
+
+def read_planted_pods(namespace: str, timeout: float) -> dict[str, str] | None:
+    """The pods in ``namespace`` on the agent's cluster, UID to name, or ``None`` if unreadable."""
+    proc = _kubectl([*KUBECTL_GET_PODS, "-n", namespace], timeout)
+    if proc is None or proc.returncode != 0:
         return None
     try:
         items = json.loads(proc.stdout).get("items")
@@ -187,9 +229,24 @@ def admitted(row: dict[str, Any]) -> bool:
 
 
 def verdict(
-    pods: dict[str, str], read: dict[str, Any], namespace: str, min_alerts: int
+    pods: dict[str, str],
+    read: dict[str, Any],
+    namespace: str,
+    min_alerts: int,
+    gone: list[str] | None = None,
 ) -> tuple[VerificationStatus, str, dict[str, Any]]:
-    """Grade one read. Pure, so the tests drive it without a pod."""
+    """Grade one read. Pure, so the tests drive it without a pod.
+
+    ``pods`` is the planted set, UID to name; ``gone`` names those no longer in the namespace
+    at the check, reported but not graded.
+    """
+    gone = sorted(gone or [])
+    note = (
+        f"; {len(gone)} planted pod(s) were gone from {namespace} by the check, graded from the plant's "
+        f"record: {', '.join(gone[:MAX_NAMED_SESSIONS])}"
+        if gone
+        else ""
+    )
     rows = read.get("rows") or []
     taken = [r for r in rows if admitted(r)]
     alerted = {r.get("object_uid") for r in taken}
@@ -205,11 +262,12 @@ def verdict(
         "sessions": len(sessions),
         "sessions_with_messages": len(turned),
         "lost": [r.get("session_id") for r in lost],
+        "pods_gone": gone,
     }
     if len(pods) < min_alerts:
         return "error", (
-            f"{namespace} holds {len(pods)} pod(s), fewer than min_alerts ({min_alerts}): the stack did not "
-            "plant the burst, or something deleted its pods"
+            f"{namespace} holds {len(pods)} planted pod(s), fewer than min_alerts ({min_alerts}): the stack did "
+            "not plant the burst, or something deleted its pods"
         ), raw
     if len(alerted) < min_alerts:
         return "error", (
@@ -232,10 +290,10 @@ def verdict(
         return "fail", (
             f"{len(lost)} of {len(taken)} admitted alerts for the pods in {namespace} never started a triage turn "
             f"({sessionless} with no Hermes session, {len(lost) - sessionless} with a session but no message): "
-            f"{named}{more}"
+            f"{named}{more}{note}"
         ), raw
     return "pass", (
-        f"all {len(taken)} admitted alerts for {len(alerted)} pods in {namespace} started a triage turn"
+        f"all {len(taken)} admitted alerts for {len(alerted)} pods in {namespace} started a triage turn{note}"
     ), raw
 
 
@@ -245,22 +303,44 @@ class TriageStartsVerifier(_OnboardingPollVerifier):
     admitted alert row for them has a Hermes session with a message (a started turn) in the
     gateway's store.
 
-    Admitted rows without a started turn are a fail naming them. The pods, the Session KV store or
-    the gateway's store unreadable, fewer than ``min_alerts`` pods or admitted alerts, or an
-    admitted row with no session id, is ``status="error"``.
+    The planted pods are read from ``planted_record`` when set (falling back to the live pods
+    when the namespace holds no record, as an older stack's), else from the live pods.
+
+    Admitted rows without a started turn are a fail naming them. The pods, the record, the
+    Session KV store or the gateway's store unreadable, a live pod the record leaves out, fewer
+    than ``min_alerts`` pods or admitted alerts, or an admitted row with no session id, is
+    ``status="error"``.
     """
 
     type: Literal["triage_starts"]
     namespace: str = Field(min_length=1)
     min_alerts: int = Field(ge=1)
+    planted_record: str | None = Field(default=None, min_length=1)
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        pods = read_planted_pods(self.namespace, read_timeout)
-        if pods is None:
+        live = read_planted_pods(self.namespace, read_timeout)
+        if live is None:
             return "error", f"the pods in {self.namespace} could not be listed (kubectl get pods failed)", None
+        pods, gone = live, []
+        if self.planted_record:
+            record = read_planted_record(self.namespace, self.planted_record, read_timeout)
+            if record is None:
+                return "error", (
+                    f"the plant's record {self.namespace}/{self.planted_record} could not be read or is malformed"
+                ), None
+            if isinstance(record, dict):
+                unrecorded = sorted(name for uid, name in live.items() if uid not in record)
+                if unrecorded:
+                    return "error", (
+                        f"{len(unrecorded)} pod(s) in {self.namespace} are not in the plant's record "
+                        f"{self.planted_record}: {', '.join(unrecorded[:MAX_NAMED_SESSIONS])}. The record must "
+                        "list every pod the stack planted"
+                    ), None
+                pods = record
+                gone = [name for uid, name in record.items() if uid not in live]
         read = read_starts(agent_shell, self.namespace, sorted(pods), read_timeout)
         if read is None:
             return "error", "the agent pod's stores could not be read (kubectl exec failed or the command did not run)", None
         if read.get("error"):
             return "error", f"the Session KV store or the gateway's session store could not be read: {read['error']}", read
-        return verdict(pods, read, self.namespace, self.min_alerts)
+        return verdict(pods, read, self.namespace, self.min_alerts, gone)
