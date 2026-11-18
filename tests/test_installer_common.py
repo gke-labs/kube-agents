@@ -3443,12 +3443,13 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn(f"card_stop_enabled = {want}\n", dest.read_text())
 
     def test_card_stop_enabled_reaches_the_chart_value(self):
-        """The tfvars key is inert unless main.tf hands it to operator.cardStop.enabled."""
+        """main.tf hands the tfvars key to operator.cardStop.enabled, and only while it is on."""
         composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
         main_tf = (composition / "main.tf").read_text()
         self.assertIsNotNone(
-            re.search(r"(?m)^      cardStop = \{\n        enabled = var\.card_stop_enabled\n      \}$", main_tf),
-            "kube_agents_helm_values does not set operator.cardStop.enabled = var.card_stop_enabled",
+            re.search(r"(?m)^      var\.card_stop_enabled \? \{\n        cardStop = \{\n          enabled = true\n"
+                      r"        \}\n      \} : \{\},$", main_tf),
+            "kube_agents_helm_values does not set operator.cardStop.enabled only when card_stop_enabled is on",
         )
         variables_tf = (composition / "variables.tf").read_text()
         block = variables_tf.split('variable "card_stop_enabled" {', 1)[1].split("\n}\n", 1)[0]
