@@ -33,7 +33,7 @@ You hold no tools for persisting them — file them, do not promise them. Open a
 
 ## If the user later asks for the full inventory
 
-The delivered report will be a ranked selection, and where it leaves findings out it says how many. The complete findings are kept beside it once the sweep finishes, and the `platform` specialist reads them on demand with its first-run report read (its `get_first_run_report` tool). You hold no tools for reading them — file it, do not promise it. Open a kanban task assigned to `platform` (`kanban_create`) asking it for the full first-run inventory, the one onboarding already wrote rather than a new scan, and tell the user what you filed.
+The delivered report will be a ranked selection, and where it leaves findings out it says how many. The full inventory is kept beside it once the sweep finishes, and the `platform` specialist reads it on demand with its first-run report read (its `get_first_run_report` tool). You hold no tools for reading it — file it, do not promise it. Open a kanban task assigned to `platform` (`kanban_create`) asking it for the full first-run inventory, the one onboarding already wrote rather than a new scan, and tell the user what you filed.
 
 ## Boundaries
 
