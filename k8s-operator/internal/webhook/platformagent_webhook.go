@@ -457,6 +457,10 @@ func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) fie
 // bus to three is switched off (#6298).
 const busConversionDisabledMessage = "converting a one-server bus is temporarily disabled; see https://github.com/gke-labs/kube-agents/issues/6298"
 
+// busReplicasRemovalDisabledMessage refuses removing busReplicas: 1 from a bus
+// with no recorded count while the conversion is switched off (#6298).
+const busReplicasRemovalDisabledMessage = "removing busReplicas: 1 from a bus with no recorded server count is temporarily disabled, since it marks the bus as one server; see https://github.com/gke-labs/kube-agents/issues/6298"
+
 // validateBusConversion refuses an update that sets busReplicas to 3 on an
 // existing one-server bus (status.busReplicas recorded as 1), while the
 // one-to-three migration can loop and leave the bus's credentials down
@@ -478,10 +482,15 @@ func validateBusConversion(oldObj, platformAgent *agentv1alpha1.PlatformAgent) f
 		return nil
 	}
 	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
+	recorded := oldObj.Status.BusReplicas
+	// With no count recorded, a spec of 1 is the only sign the bus runs one
+	// server, so removing it would let a later 3 through as a new bus.
+	if recorded == 0 && previous != nil && *previous == 1 && asked == nil {
+		return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"), busReplicasRemovalDisabledMessage)}
+	}
 	if asked == nil || *asked != 3 {
 		return nil
 	}
-	recorded := oldObj.Status.BusReplicas
 	oneServer := recorded == 1 || (recorded == 0 && previous != nil && *previous == 1)
 	if !oneServer {
 		return nil
