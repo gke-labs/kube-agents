@@ -255,11 +255,15 @@ resource "null_resource" "burst" {
       # node's state and events say why it went (a repair, an upgrade, a
       # scale-down) while the API still holds them. Best effort throughout.
       set +e
-      present="$(${local.kubectl} get pods -l app=${local.prefix} \
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
-      while read -r name node; do
+      if ! present="$(${local.kubectl} get pods -l app=${local.prefix} \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"; then
+        echo "Could not list the pods in ${local.ns} after the wait; no gone-pod report."
+        present="$(printf '%s\n' "$planted" | awk '{print $2}')"
+      fi
+      while read -r _ name; do
         [ -n "$name" ] || continue
         grep -qx "$name" <<<"$present" && continue
+        node="$(awk -v n="$name" '$1 == n {print $2}' <<<"$placed")"
         echo "NOTE: planted pod $name is gone from ${local.ns}; it ran on node '$node'. The check grades it from the record ${var.planted_record}."
         ${local.kubectl} get events --field-selector "involvedObject.name=$name" --sort-by=.lastTimestamp | tail -10
         [ -n "$node" ] || continue
@@ -272,7 +276,7 @@ resource "null_resource" "burst" {
         echo "Events for node $node:"
         kubectl get events -A --field-selector "involvedObject.kind=Node,involvedObject.name=$node" \
           --sort-by=.lastTimestamp | tail -20
-      done <<<"$placed"
+      done <<<"$planted"
       set -e
     EOT
   }

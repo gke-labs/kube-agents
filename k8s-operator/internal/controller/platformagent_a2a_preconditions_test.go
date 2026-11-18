@@ -158,14 +158,14 @@ func TestPodsCreateIsTheGatewayAndTheOperatorOnly(t *testing.T) {
 	}
 }
 
-// The agent's cluster-wide ClusterRole only reads. Its write grants are
-// namespaced Roles in the install's own namespace, so in any other namespace
-// the agent can look and change nothing.
+// The agent's cluster-wide audit ClusterRole only reads. Its write grants are
+// namespaced Roles in the install's own namespace. This checks the role, not
+// every binding the agent's ServiceAccount holds, nor GKE IAM.
 //
 // Evals lean on this: bench/tf/prebuilt/triage-start-burst records the pods it
 // plants in a ConfigMap beside them, and the triage_starts check grades from
 // that record, so an agent able to write there could rewrite what it is graded
-// against.
+// against; this role is the grant that reaches that namespace.
 func TestTheAgentsClusterRoleOnlyReads(t *testing.T) {
 	read := []string{"get", "list", "watch"}
 	agent := a2aTestAgent()
