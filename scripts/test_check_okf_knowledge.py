@@ -250,14 +250,14 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
         _, errors = self.validate()
         self.assertTrue(
             any(
-                "runbook/index.md" in err and check_okf_knowledge.MSG_RESERVED_ENTRY_FILENAME in err
+                "runbook/index.md" in err and check_okf_knowledge.MSG_ROOT_HAS_TYPE in err
                 for err in errors
             ),
             errors,
         )
         self.assertTrue(
             any(
-                "runbook/Log.md" in err and check_okf_knowledge.MSG_RESERVED_ENTRY_FILENAME in err
+                "runbook/Log.md" in err and check_okf_knowledge.MSG_ROOT_HAS_TYPE in err
                 for err in errors
             ),
             errors,
@@ -275,6 +275,40 @@ class CheckOkfKnowledgeTest(KnowledgeFixture):
                 for err in errors
             ),
             errors,
+        )
+
+        # Untyped index.md and log.md are allowed at any directory level, whereas
+        # STATE_OF_BEING.md and README.md remain root-only.
+        self.write(
+            "runbook/index.md",
+            """
+            # Runbooks
+            """,
+        )
+        self.write(
+            "runbook/Log.md",
+            """
+            # Runbook history
+            """,
+        )
+        self.write(
+            "runbook/STATE_OF_BEING.md",
+            """
+            # Subdirectory state of being without frontmatter
+            """,
+        )
+        _, subdir_errors = self.validate()
+        self.assertFalse(
+            any("runbook/index.md" in err or "runbook/Log.md" in err for err in subdir_errors),
+            subdir_errors,
+        )
+        self.assertTrue(
+            any(
+                "runbook/STATE_OF_BEING.md" in err
+                and check_okf_knowledge.MSG_MISSING_FRONTMATTER in err
+                for err in subdir_errors
+            ),
+            subdir_errors,
         )
 
     def test_missing_malformed_or_typeless_frontmatter_is_rejected(self) -> None:

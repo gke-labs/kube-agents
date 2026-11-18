@@ -7,8 +7,8 @@ YAML frontmatter under `knowledge/`, lives **outside** the paths the pipeline de
 **never applied to a cluster**. Agents **read** OKF for context and **propose** updates via PR;
 humans approve (curate-as-code). OKF holds durable knowledge only — **not** session state.
 
-Every entry (other than reserved root `index.md` navigation and `log.md` history files) must declare
-a `type` in frontmatter. The canonical starting set (open convention, not a hard enum — add new
+Every entry (other than `index.md` navigation and `log.md` history files, which are reserved at every
+level) must declare a `type` in frontmatter. The canonical starting set (open convention, not a hard enum — add new
 types by PR):
 
 | `type`              | Purpose                                                                                          |
