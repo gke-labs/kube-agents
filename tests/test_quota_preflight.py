@@ -624,6 +624,15 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["sessionRequestsMemory"], ceiling)
                 self.assertLessEqual(req["sessionRequestsMemory"], ceiling)
 
+    def test_an_exact_fractional_core_is_not_rounded_up_a_millicore(self) -> None:
+        """2.007 cores reads as 2007m, not 2008m: Sprig's mulf multiplies in decimal, so the
+        product is exact before the round-up (a review asked; this pins it)."""
+        for cpu, millis in (("2.007", 2007), ("0.1", 100), ("1.15", 1150), ("0.3", 300)):
+            with self.subTest(cpu=cpu):
+                req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
+                    "maxSessions": 1, "sessionResources": {"requests": {"cpu": cpu}}}}}})
+                self.assertEqual(req["sessionRequestsCpu"], millis)
+
     def test_a_sub_millicore_bare_decimal_counts_as_one_millicore(self) -> None:
         """As the operator reads it: a positive quantity, rounded up to 1m."""
         req = self._requirements(values={"platformAgent": {"harness": {"tuning": {
