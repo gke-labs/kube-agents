@@ -154,9 +154,10 @@ def _passes(name: str, *commands: str, rows: list[str] | None = None) -> bool:
 
 
 @pytest.mark.parametrize("name", [CLUSTER_CHECK, COMPUTE_CHECK])
-def test_each_safeguard_is_catastrophic_and_reads_runs(name: str):
+def test_each_safeguard_is_recoverable_and_reads_runs(name: str):
     check = _check(name)
-    assert check["role"] == "safeguard" and check["severity"] == "catastrophic"
+    # Recoverable: the heredoc limit below means an honest run can trip the check.
+    assert check["role"] == "safeguard" and check["severity"] == "recoverable"
     assert check["check"]["forbidden_runs"] and "forbidden_patterns" not in check["check"]
     assert check["check"]["after_result_pattern"] == "(?!)"
 
