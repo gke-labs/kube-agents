@@ -1375,6 +1375,12 @@
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
 
+# #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
+# stack plants two namespaces exporting one host everywhere and two exporting
+# another to themselves only, on the host cluster, installing a minimal
+# ServiceEntry CRD when none is served; graded on the report store's finding ids.
+./tasks/security-serviceentry-host-collision/task.yaml
+
 # #5191: a /session turn that asks for a profile by name delegates to it,
 # graded by delegated_to (#5194 moved it to the cluster profile). Inject lane
 # only (hack/eval/api-lane-exclusions.txt). Needs the AgentProfile dispatcher,

@@ -182,6 +182,7 @@ AUDITS: dict[str, AuditSpec] = {
             "anonymous-rbac-binding",
             "configsync-reconciler-stalled",
             "webhook-backend-unreachable",
+            "serviceentry-host-collision",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -1224,6 +1225,7 @@ CHECK_PHRASES = {
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
+    "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -3184,6 +3186,7 @@ TRIAGE_REASONS = {
     "namespace-token": "turns the API token off for every pod on the namespace's default ServiceAccount",
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
+    "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 

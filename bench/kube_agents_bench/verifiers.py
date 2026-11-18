@@ -8587,7 +8587,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
-        "webhook-backend-unreachable",
+        "webhook-backend-unreachable", "serviceentry-host-collision",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -9354,8 +9354,10 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
     the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), and has, for each ``required_finding_phrases`` entry, a finding
-    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it, and has no finding whose id
+    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
+    that plants a look-alike the check must leave alone). ``current_ids`` is not read: it
     also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
@@ -9367,6 +9369,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
@@ -9451,6 +9454,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
             wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
@@ -9461,6 +9465,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw
