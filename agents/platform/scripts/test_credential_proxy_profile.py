@@ -1564,13 +1564,25 @@ class ProfileTaskWritesTest(unittest.TestCase):
         self.assertFalse(record.owns_branch("t", "r", "b"))
         self.assertFalse(record.owns_proposal("t", "r", 1))
 
-    def test_past_the_cap_the_soonest_expiring_go_first(self):
+    def test_past_the_cap_a_newcomer_is_refused_and_no_live_entry_is_dropped(self):
         record = credential_proxy.ProfileTaskWrites(max_entries=2)
-        record.record_proposal("t", FAR + 1, "r", 1)
-        record.record_proposal("t", FAR + 3, "r", 3)
-        record.record_proposal("t", FAR + 2, "r", 2)
-        self.assertFalse(record.owns_proposal("t", "r", 1))
-        self.assertTrue(record.owns_proposal("t", "r", 2) and record.owns_proposal("t", "r", 3))
+        record.record_proposal("t1", FAR, "r", 1)
+        record.claim_branch("t1", FAR, "r", "b1", lambda: False)
+        # Full: another task's new proposal goes unrecorded, its new claim is refused.
+        record.record_proposal("t2", FAR, "r", 2)
+        self.assertEqual((False, False), record.claim_branch("t2", FAR, "r", "b2", lambda: False))
+        self.assertFalse(record.owns_proposal("t2", "r", 2))
+        self.assertFalse(record.owns_branch("t2", "r", "b2"))
+        # The first task's live entries are all still there.
+        self.assertTrue(record.owns_proposal("t1", "r", 1) and record.owns_branch("t1", "r", "b1"))
+
+    def test_an_expired_entry_makes_room(self):
+        now = [1000.0]
+        record = credential_proxy.ProfileTaskWrites(clock=lambda: now[0], max_entries=1)
+        record.record_proposal("t1", 1100.0, "r", 1)
+        now[0] = 1200.0
+        record.record_proposal("t2", 2000.0, "r", 2)
+        self.assertTrue(record.owns_proposal("t2", "r", 2))
 
     def test_ownership_is_per_repository(self):
         # The same number or branch name in another repository is another task's question.
@@ -1580,6 +1592,22 @@ class ProfileTaskWritesTest(unittest.TestCase):
         self.assertTrue(record.owns_proposal("t", "acme/infra", 5))
         self.assertFalse(record.owns_proposal("t", "acme/other", 5))
         self.assertFalse(record.owns_branch("t", "acme/other", "platform-agent/x"))
+
+    def test_a_pending_claim_admits_nobody_until_the_remote_says_free(self):
+        # Two publishes of one new name from the same task: while the first's
+        # lookup is in flight, the second is refused, so it can't ride a claim
+        # the lookup is about to drop (the branch turned out to be on the remote).
+        record = credential_proxy.ProfileTaskWrites()
+        seen = []
+
+        def present_and_raced():
+            seen.append(record.claim_branch("t1", FAR, "r", "platform-agent/x", lambda: False))
+            seen.append(record.owns_branch("t1", "r", "platform-agent/x"))
+            return True
+
+        self.assertEqual((False, False), record.claim_branch("t1", FAR, "r", "platform-agent/x", present_and_raced))
+        self.assertEqual([(False, False), False], seen)
+        self.assertFalse(record.owns_branch("t1", "r", "platform-agent/x"))
 
     def test_a_release_drops_only_the_holders_claim(self):
         record = credential_proxy.ProfileTaskWrites()

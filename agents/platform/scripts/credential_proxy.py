@@ -1496,8 +1496,9 @@ PROPOSAL_NOT_THIS_TASKS_CODE = "PROPOSAL_NOT_THIS_TASKS"
 # How long after its task credential expires a task's record is kept, so a write
 # racing the expiry is judged by the record rather than by its absence.
 PROFILE_TASK_RECORD_MARGIN_SECONDS = 300
-# The most branches and proposals the record holds at once; past it the entries
-# whose tasks expire first are dropped, which refuses their later writes.
+# The most branches and proposals the record holds at once. At the cap a new
+# claim or proposal is refused rather than any live entry dropped, so one task's
+# writes can never push out another's.
 PROFILE_TASK_RECORD_MAX_ENTRIES = 4096
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
@@ -5272,6 +5273,9 @@ class ClaimTokens:
 class _TaskOwned:
     task: str
     expires_at: float
+    # A branch claim is pending until its remote lookup says the name is free;
+    # nothing, the claiming task included, may rely on it before then.
+    confirmed: bool = True
 
 
 class ProfileTaskWrites:
@@ -5310,33 +5314,40 @@ class ProfileTaskWrites:
         self._lock = threading.Lock()
 
     def _prune_locked(self) -> None:
+        """Drop expired entries, and only those: a live one is never evicted."""
         now = self._clock()
         for table in (self._branches, self._proposals):
             for key in [key for key, owned in table.items() if owned.expires_at <= now]:
                 del table[key]
-            while len(self._branches) + len(self._proposals) > self._max_entries and table:
-                del table[min(table, key=lambda key: table[key].expires_at)]
+
+    def _full_locked(self) -> bool:
+        return len(self._branches) + len(self._proposals) >= self._max_entries
 
     def claim_branch(
         self, task: str, expires_at: float, repository: str, branch: str, on_remote: Callable[[], bool]
     ) -> tuple[bool, bool]:
         """(allowed, fresh): may ``task`` publish ``branch``, and is the claim new to this call.
 
-        Allowed when the task already holds the branch, or when nobody holds it
-        and it is absent from the remote (``on_remote``, asked outside the lock;
-        an error there counts as present). A fresh claim is taken before the
-        remote is asked, so a second task racing the same new name finds it held.
+        Allowed when the task already holds a confirmed claim on the branch, or
+        when nobody holds it and it is absent from the remote (``on_remote``,
+        asked outside the lock; an error there counts as present). A fresh claim
+        is taken, pending, before the remote is asked, so a second request racing
+        the same new name finds it held -- refused whoever sent it, the claiming
+        task included, until the lookup confirms the name is free. At the cap a
+        new claim is refused.
         """
         key = (repository, branch)
         with self._lock:
             self._prune_locked()
             owned = self._branches.get(key)
             if owned is not None:
-                if owned.task != task:
+                if owned.task != task or not owned.confirmed:
                     return False, False
                 owned.expires_at = max(owned.expires_at, expires_at)
                 return True, False
-            self._branches[key] = _TaskOwned(task, expires_at)
+            if self._full_locked():
+                return False, False
+            self._branches[key] = _TaskOwned(task, expires_at, confirmed=False)
         try:
             present = on_remote()
         except Exception:
@@ -5344,6 +5355,11 @@ class ProfileTaskWrites:
         if present:
             self.release_branch(task, repository, branch)
             return False, False
+        with self._lock:
+            owned = self._branches.get(key)
+            if owned is None or owned.task != task:
+                return False, False
+            owned.confirmed = True
         return True, True
 
     def release_branch(self, task: str, repository: str, branch: str) -> None:
@@ -5357,12 +5373,15 @@ class ProfileTaskWrites:
         with self._lock:
             self._prune_locked()
             owned = self._branches.get((repository, branch))
-            return owned is not None and owned.task == task
+            return owned is not None and owned.task == task and owned.confirmed
 
     def record_proposal(self, task: str, expires_at: float, repository: str, number: int) -> None:
+        """Record ``task``'s proposal; at the cap it goes unrecorded, so its later updates are refused."""
         with self._lock:
-            self._proposals[(repository, number)] = _TaskOwned(task, expires_at)
             self._prune_locked()
+            if (repository, number) not in self._proposals and self._full_locked():
+                return
+            self._proposals[(repository, number)] = _TaskOwned(task, expires_at)
 
     def owns_proposal(self, task: str, repository: str, number: int) -> bool:
         with self._lock:
