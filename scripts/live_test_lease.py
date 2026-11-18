@@ -795,6 +795,26 @@ def _release_once(install):
 GHA_SESSION_RE = re.compile(r"^gha-[0-9]+$")
 
 
+# How many takeovers a lease remembers (takeoverHistory, newest last).
+TAKEOVER_HISTORY_KEEP = 5
+
+
+def _takeover_history(data):
+    """The takeovers recorded on a lease, oldest first: its takeoverHistory, or,
+    for a lease that has only the single fields, those. Unreadable history is
+    dropped rather than failing the takeover."""
+    try:
+        history = json.loads(data.get("takeoverHistory") or "[]")
+    except ValueError:
+        history = []
+    if not isinstance(history, list):
+        history = []
+    history = [h for h in history if isinstance(h, dict)]
+    if not history and data.get("takenOverFrom"):
+        history = [{"from": data["takenOverFrom"], "at": data.get("takenOverAt", "")}]
+    return history
+
+
 def do_takeover(install, if_session, if_note, ttl=DEFAULT_TTL_MIN, note=None):
     """Replaces a lease still held by one named workflow run's session -- a
     compare-and-swap, not a steal (#6381). The caller has already established that
@@ -815,6 +835,11 @@ def do_takeover(install, if_session, if_note, ttl=DEFAULT_TTL_MIN, note=None):
     fresh = context_fields(note=note if note is not None else if_note, ttl=ttl)
     fresh["takenOverFrom"] = if_session
     fresh["takenOverAt"] = fresh["acquiredAt"]
+    # Earlier takeovers stay visible: two in a row (a deploy that leaked behind a
+    # deploy that leaked) would otherwise show only the last.
+    fresh["takeoverHistory"] = json.dumps(
+        (_takeover_history(data) + [{"from": if_session, "at": fresh["takenOverAt"]}])
+        [-TAKEOVER_HISTORY_KEEP:])
     rc, _, err = kubectl(install, ["replace", "-f", "-"],
                          stdin=build_manifest(install, fresh, rv))
     if rc != 0:

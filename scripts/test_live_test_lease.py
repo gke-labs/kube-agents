@@ -1434,6 +1434,38 @@ class Takeover(unittest.TestCase):
         self.assertIn("takenOverAt", sent["data"])
         self.assertTrue(os.path.exists(self.install.token_file()))
 
+    def test_earlier_takeovers_stay_visible(self):
+        held = self._held()
+        held["takenOverFrom"] = "gha-100"
+        held["takenOverAt"] = "2026-11-18T18:00:00Z"
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(held)) as fake:
+            ok, _ = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertTrue(ok)
+        sent = json.loads(fake.call_args_list[-1][1]["stdin"])["data"]
+        history = json.loads(sent["takeoverHistory"])
+        self.assertEqual([h["from"] for h in history], ["gha-100", "gha-111"])
+        self.assertEqual(sent["takenOverFrom"], "gha-111")
+
+    def test_the_history_keeps_the_last_few(self):
+        held = self._held()
+        held["takeoverHistory"] = json.dumps(
+            [{"from": "gha-%d" % i, "at": "t%d" % i} for i in range(1, 9)])
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(held)) as fake:
+            lease.do_takeover(self.install, "gha-111", self.NOTE)
+        history = json.loads(json.loads(fake.call_args_list[-1][1]["stdin"])["data"]["takeoverHistory"])
+        self.assertEqual(len(history), lease.TAKEOVER_HISTORY_KEEP)
+        self.assertEqual(history[-1]["from"], "gha-111")
+        self.assertEqual(history[0]["from"], "gha-5")
+
+    def test_unreadable_history_does_not_block_a_takeover(self):
+        held = self._held()
+        held["takeoverHistory"] = "not json"
+        with mock.patch.object(lease, "kubectl", _fake_kubectl(held)) as fake:
+            ok, _ = lease.do_takeover(self.install, "gha-111", self.NOTE)
+        self.assertTrue(ok)
+        history = json.loads(json.loads(fake.call_args_list[-1][1]["stdin"])["data"]["takeoverHistory"])
+        self.assertEqual([h["from"] for h in history], ["gha-111"])
+
     def test_a_claim_between_the_read_and_the_replace_refuses(self):
         def call(install, args, stdin=None):
             if args[0] == "get":
