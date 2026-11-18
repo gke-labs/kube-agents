@@ -85,6 +85,41 @@ func TestSendMessageReturnsTheCardsReport(t *testing.T) {
 	}
 }
 
+// A send_message that names the task a report was on puts it on the turn's
+// frame as replyTo, for the gateway to carry to the agent; one that names
+// none sends a frame without it, and one that is not a task id is refused
+// before anything is sent.
+func TestSendMessageReplyToRidesTheFrame(t *testing.T) {
+	s, _, _, b := turnServer(t, gatewayScenario{finish: true})
+	var mu sync.Mutex
+	var frames []ConsoleInFrame
+	nc := adminConn(t, b.client.Conn().ConnectedUrl())
+	if _, err := nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) == nil {
+			mu.Lock()
+			frames = append(frames, f)
+			mu.Unlock()
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	send(t, s, map[string]any{"text": "and the other pool?", "reply_to": "task-7", "wait_seconds": turnWaitSecs})
+	send(t, s, map[string]any{"text": "how is the fleet", "wait_seconds": turnWaitSecs})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "same again", "reply_to": "not a task"})
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "reply_to") {
+		t.Fatalf("a malformed reply_to was not refused: %+v", res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(frames) != 2 || frames[0].ReplyTo != "task-7" || frames[1].ReplyTo != "" {
+		t.Fatalf("frames = %+v, want the first carrying task-7, the second none, and no third", frames)
+	}
+}
+
 // Reports on any task of the turn's chain are gathered: a delegated child's
 // card included. A report on another turn's task, or on another
 // conversation, is not.

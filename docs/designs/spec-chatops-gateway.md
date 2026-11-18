@@ -1733,7 +1733,7 @@ as the primitive, unused, like the other backends.
 (an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
 the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
-core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?, "reply_to"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?, "reply_to"?, "report"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
@@ -1953,7 +1953,8 @@ the whole `text`, not chunked; a `chat` message's text is its fallback, and the 
 text. An `update` key edits the frame it posted, as it edits a chat message elsewhere. A
 request may carry `reply_to`, the gateway task whose turn filed the card (`a2a notify
 --reply-to`), which the frame passes on as `replyTo` so a console client can join the report to
-its turn. A `reply_to` that is not a task id's shape is dropped and the report still posted.
+its turn, and echo it as the `replyTo` of a reply under the report ("Transport" below). A
+`reply_to` that is not a task id's shape is dropped and the report still posted.
 The task reaches the card this way. The hermes-bridge records it on a console conversation's
 route (`task_id`). `kanban_event_routing` snapshots it into the card's subscription when the
 card is filed, as `console:<token>#<taskId>` (`#` cannot occur in a console token, which is one
@@ -1961,6 +1962,29 @@ DNS-1123 label). The kanban notifier splits it back off as `--reply-to`. Hermes 
 platform, and its notifier reads a subscription's platform through its own `Platform` enum, so
 the notify patch registers one in Hermes's platform registry. That registration is kanban-era
 and goes when kanban does.
+
+The gateway keeps each report the route posts into a conversation for the reply under it: a post
+the kanban notifier marks as a card's report (`report`, `a2a notify --report`, set by
+`kanban_progress_lines._with_answer` on the settled card's report post alone, never on a progress
+note, heartbeat, queued or plan line) that names the task it reports on (`reply_to`). The notifier
+puts `reply_to` on every post into a console thread, and a console card's rolling lines are
+unkeyed posts of their own (the stand-in cannot edit), so `reply_to` and `update` alone cannot tell
+a report from a note; the mark can. Only the console route names the task today, so the cache
+holds console reports. Per conversation key its last eight
+reports in order (`pushedReportsPerConversation`), each with the text (cut to 64 KiB,
+`lib.PushedReportTextCap`, with a note) and the root of the task it reported on, over at most 1024
+conversations (`pushedReportsConversationsMax`) and 32 MiB of text in all
+(`pushedReportsBytesMax`); past either bound the conversation least recently posted a report to is
+forgotten whole, so the cache holds at most 32 MiB or one conversation (the per-conversation bounds
+alone would allow 1024 × 8 × 64 KiB). A human turn, on any route, that names a task (the console
+frame's `replyTo`, read as its chain's root) carries the newest report kept on that root; a turn
+naming none carries nothing, so a Slack or Google Chat thread reply keeps the executor's own
+lookup (the thread relay is a follow-up: the notifier naming the task and marking the report on
+thread posts, and `postConversation` recording the root). The turn's submission gets it as a
+`pushedReport` part (`spec-a2a-payloads.md`), which the hermes-bridge frames ahead of the words on
+the platform route, the install's default; the a2a-worker, which runs session pods and profile
+tasks, reads text parts only and does not frame it yet. Process memory: a restart forgets every report, and a reply then falls back to the
+executor's own lookup (`a2a/docs/hermes-bridge.md`).
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
@@ -2856,7 +2880,10 @@ the one every other writer here has.
 
 **Transport.** Core NATS, no stream. The browser publishes a frame -
 `{"messageId","text","kind"}`, `kind` defaulting to `text`, with an optional `addressee` and
-`parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles") - to
+`parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles"), and an optional
+`replyTo`, the task a notify frame reported on, when the turn answers that report (sent by a
+console client such as the MCP server; the page sends none; the gateway puts it on the submission
+as a `replyTo` part, `spec-a2a-payloads.md`) - to
 `chat.console.<token>.in`;
 the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus

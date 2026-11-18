@@ -77,7 +77,11 @@ gateway and runs through the hermes-bridge's `api` executor, never through the H
 gateway's `incident_context` hook. The bridge makes the hook's by-thread read instead
 (`a2a/hermes-bridge/incident.go`; the hook's other two steps, the recent-reports index for a
 message with no row and the Google Chat first-reply recovery, do not run on the `api`
-executor): before the task's first turn it looks the
+executor): when the submission carries no `pushedReport` part (the A2A gateway relays a report
+it posted into a conversation; `a2a/docs/hermes-bridge.md`; a relayed scheduled report is a
+home-channel thread post the gateway does not keep, so the by-thread read still serves it),
+before the task's first turn it tries the row a console reply names with its
+`replyTo` part (`<key>#<task>`, `a2a/docs/hermes-bridge.md`), then looks the
 conversation's thread up in the same table, and the row the kanban notifier stores for
 a card's report inviting a reply, posted into a Slack or Google Chat gateway conversation (keyed by the Hermes
 session and the conversation key; a key naming a whole DM or space rather than a thread is not looked
