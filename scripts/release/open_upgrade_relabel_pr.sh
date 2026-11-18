@@ -94,7 +94,7 @@ Until the rows are relabelled, \`make docs-check-upgrade-releases\` (Documentati
 
 ## What Changed
 
-\`${UPGRADE_PAGE}\`: the Release cells of these rows change, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and the table's rows go back in newest-first order, which the check also holds it to. The change stays inside the breaking-changes table; The table is out of \`prettier\` (\`prettier-ignore\`), so no other row of it changes.
+\`${UPGRADE_PAGE}\`: the Release cells of these rows change, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`), and the table's rows go back in newest-first order, which the check also holds it to. The change stays inside the breaking-changes table, which is out of \`prettier\` (\`prettier-ignore\`), so no other row of it changes.
 
 ${rows}
 
