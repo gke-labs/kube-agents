@@ -449,10 +449,11 @@ AUDITS: dict[str, AuditSpec] = {
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
             "firewall-world-open-ingress",
+            "missing-nodelocal-dnscache",
         ),
         # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
         # subnet for the IPAM check, one `project/<id>` entry for the other
-        # five. This stream enumerates no clusters.
+        # six. This stream enumerates no clusters.
         scopes=(
             ("subnet", ("subnet-ip-exhaustion",)),
             (
@@ -463,6 +464,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "mtu-packet-fragmentation",
                     "cloud-armor-false-positive",
                     "firewall-world-open-ingress",
+                    "missing-nodelocal-dnscache",
                 ),
             ),
         ),
@@ -1326,6 +1328,7 @@ CHECK_PHRASES = {
     "mtu-packet-fragmentation": "MTU settings fragment packets",
     "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
     "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
+    "missing-nodelocal-dnscache": "{object} cluster runs without NodeLocal DNSCache",
     # GCE Compute Engine and MIG Fleet Audit
     "gce-startup-script-status": "{object} startup script failed",
     "mig-convergence-stalled": "{object} instance group isn't converging",
