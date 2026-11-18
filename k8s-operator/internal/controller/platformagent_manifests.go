@@ -52,9 +52,9 @@ var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
 	// kindLocation is the spec.harness.location a kind install sets (with
-	// "kind" for projectId and clusterName as well). No GKE location looks like
-	// this. It means: there is no GKE cluster to fetch credentials for, use the
-	// cluster the pod runs in.
+	// "kind" for projectId as well). No GKE location looks like this. It means:
+	// there is no GKE cluster to fetch credentials for, use the cluster the pod
+	// runs in.
 	kindLocation = "kind"
 	// inClusterContextName is the kubectl context the credential proxy and the
 	// agent use on kind.
