@@ -182,10 +182,14 @@ class TickTest(unittest.TestCase):
         self.cluster = FakeCluster()
         self.cluster.apps = [argo_app()]
 
+    def fakes(self, ran):
+        return {name: (lambda c, name=name: ran.append(name) or {})
+                for name in ("fill_edited", "fill_environments", "report", "followups", "reverts")}
+
     def tick(self, minutes, **overrides):
         args = {"view": self.forge, "kubectl_json": self.cluster, "recheck": clean, "scope_refusal": lambda r: None,
-                "now": NOW + timedelta(minutes=minutes), **overrides}
-        return post_merge_outcome.tick(self.conn, **args)
+                "now": NOW + timedelta(minutes=minutes), **self.fakes([]), **overrides}
+        return post_merge_outcome.tick(self.conn, "silent", **args)
 
     def outcome(self):
         return self.conn.execute("SELECT outcome FROM post_merge_records").fetchone()[0]
@@ -202,11 +206,33 @@ class TickTest(unittest.TestCase):
     def test_an_unreadable_scope_reads_no_cluster_and_still_notices_merges(self):
         with mock.patch.object(post_merge_scope, "install_scope", side_effect=RuntimeError("render unreadable")), \
                 self.assertLogs("post_merge_check", level="WARNING"):
-            seen = post_merge_outcome.tick(self.conn, view=self.forge, kubectl_json=self.cluster, now=NOW)
+            ran = []
+            seen = post_merge_outcome.tick(self.conn, "report", view=self.forge, kubectl_json=self.cluster, now=NOW,
+                                           **self.fakes(ran))
         self.assertEqual(seen["notice"]["merged"], [URL])
         self.assertEqual(self.cluster.calls, [])
         self.assertNotIn("outcomes", seen)
+        self.assertEqual(ran, ["fill_edited", "report"], "outcomes already reached are still reported")
         self.assertTrue(post_merge_outcome.errored(seen))
+
+    def test_every_step_runs_in_order_with_the_environment_before_the_follow_ups(self):
+        ran = []
+        seen = self.tick(0, **self.fakes(ran))
+        self.assertEqual(ran, ["fill_edited", "fill_environments", "report", "followups", "reverts"])
+        self.assertEqual(list(seen), ["notice", "edited", "health", "outcomes", "environments", "reports", "followups",
+                                      "reverts"])
+
+    def test_the_report_step_gets_the_switch_s_mode(self):
+        import post_merge_report
+
+        modes = []
+        fakes = self.fakes([])
+        del fakes["report"]
+        with mock.patch.object(post_merge_report, "report_outcomes",
+                               lambda conn, mode, **kw: modes.append(mode) or {}):
+            post_merge_outcome.tick(self.conn, "report", view=self.forge, kubectl_json=self.cluster, recheck=clean,
+                                    scope_refusal=lambda r: None, now=NOW, **fakes)
+        self.assertEqual(modes, ["report"])
 
     def test_a_step_that_raises_is_kept_and_the_rest_run(self):
         def broken(conn, view, now, limit):

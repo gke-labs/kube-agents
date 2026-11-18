@@ -7,12 +7,11 @@ failed, or the check still fires), ``applied_not_rechecked`` (applied, but the
 workload or the re-check could not be read, or the install's scope leaves the
 cluster out) and ``not_applied`` (not live by the kind's apply deadline).
 :func:`decide_outcomes` stores each in ``outcome``, ``outcome_at`` and
-``outcome_detail``, once; nothing here comments on the pull request.
+``outcome_detail``, once; ``post_merge_report`` comments on it.
 
-:func:`tick` is one run of the ``post-merge-check`` cron job: notice merges,
-wait for the apply and hold the health window
-(``post_merge_check.watch_health``), then decide. When the install's declared
-scope cannot be read, no cluster is read that run.
+:func:`tick` is one run of the ``post-merge-check`` cron job: every step of
+the check, in order. When the install's declared scope cannot be read, no
+cluster is read that run.
 """
 
 from __future__ import annotations
@@ -31,13 +30,21 @@ from post_merge_check import (
     _now_text,
     _parse_time,
 )
+from post_merge_report import (
+    APPLIED_NOT_RECHECKED,
+    APPLY,
+    HEALTH,
+    NOT_APPLIED,
+    RECHECK,
+    SCOPE,
+    SCOPE_UNKNOWN,
+    STILL_BROKEN,
+    UNREADABLE,
+    VERIFIED_FIXED,
+)
 
 logger = logging.getLogger("post_merge_check")
 
-VERIFIED_FIXED = "verified_fixed"
-STILL_BROKEN = "still_broken"
-APPLIED_NOT_RECHECKED = "applied_not_rechecked"
-NOT_APPLIED = "not_applied"
 OUTCOMES = (VERIFIED_FIXED, STILL_BROKEN, APPLIED_NOT_RECHECKED, NOT_APPLIED)
 #: How long after the merge the GitOps tool has to apply it, per kind of fix
 #: (design gke-labs/kube-agents#5054, "Settings per fix").
@@ -45,15 +52,6 @@ APPLY_DEADLINE = {"no-pdb": timedelta(minutes=60)}
 #: How long after the apply the health window and the re-check may keep
 #: failing to read the cluster before the record ends as not checked.
 CHECK_DEADLINE = timedelta(minutes=60)
-#: The fixed reason categories ``outcome_detail`` starts with, so a reader
-#: (the report comment, the clean-merge counter) chooses by category and never
-#: parses the detail text.
-SCOPE = "out of scope"
-SCOPE_UNKNOWN = "scope unknown"
-UNREADABLE = "unreadable"
-HEALTH = "health"
-RECHECK = "re-check"
-APPLY = "apply"
 
 OPEN_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster", "namespace", "object",
                 "merged_at", "merge_checked_at", "merge_commit", "applied_at", "sync_state", "health_result",
@@ -211,20 +209,47 @@ def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck,
     return seen
 
 
-def tick(conn: sqlite3.Connection, *, view: post_merge_check.View = post_merge_check.forge_view,
-         kubectl_json: post_merge_check.KubectlJson | None = None, recheck: post_merge_scope.Recheck | None = None,
-         scope_refusal: post_merge_scope.ScopeRefusal | None = None, now: datetime | None = None,
-         limit: int | None = None) -> dict[str, dict]:
-    """One run of the ``post-merge-check`` cron job: notice merges, wait for the apply, hold the window, decide.
+#: A step run on the connection alone, so a caller can replace one.
+Step = Callable[[sqlite3.Connection], dict]
 
-    When the install's declared scope cannot be read, nothing is read from a
-    cluster this run and nothing is decided; merges are still noticed. A step
-    that raises is kept under its name as ``{"errors": [...]}`` and the steps
-    after it still run. Each step reads at most ``limit`` records,
+
+def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = post_merge_check.forge_view,
+         kubectl_json: post_merge_check.KubectlJson | None = None, recheck: post_merge_scope.Recheck | None = None,
+         scope_refusal: post_merge_scope.ScopeRefusal | None = None, fill_edited: Step | None = None,
+         fill_environments: Step | None = None, report: Step | None = None, followups: Step | None = None,
+         reverts: Step | None = None, now: datetime | None = None, limit: int | None = None) -> dict[str, dict]:
+    """One run of the ``post-merge-check`` cron job, every step in order.
+
+    Notice merges (``post_merge_check.notice_merges``) and who edited them
+    (``post_merge_edited``); wait for the apply and hold the health window
+    (``post_merge_check.watch_health``); decide (:func:`decide_outcomes`); fill
+    the environment of each outcome the clean-merge counter reads
+    (``post_merge_environment``), before the follow-ups need it; report each
+    outcome once in ``mode`` (``post_merge_report``); then step a still-broken
+    fix down or offer auto-merge, and notice the reverts
+    (``post_merge_followups``). The follow-ups run whatever
+    ``KUBEAGENTS_AUTOMERGE`` says: the step-down reverts a labelled fix with
+    the switch off, and the offer does nothing while it is off.
+
+    When the install's declared scope cannot be read, no step that reads a
+    cluster runs, and nothing is decided or followed up; merges are still
+    noticed and outcomes already reached are still reported. A step that
+    raises is kept under its name as ``{"errors": [...]}`` and the steps after
+    it still run. Each step reads at most ``limit`` records,
     ``post_merge_check.reads_per_tick()`` when not given.
     """
+    import post_merge_edited
+    import post_merge_environment
+    import post_merge_followups
+    import post_merge_report
+
     seen: dict[str, dict] = {}
     limit = post_merge_check.reads_per_tick() if limit is None else limit
+    fill_edited = fill_edited or (lambda c: post_merge_edited.fill_human_edited(c, now=now, limit=limit))
+    fill_environments = fill_environments or (lambda c: post_merge_environment.fill_environments(c, now=now, limit=limit))
+    report = report or (lambda c: post_merge_report.report_outcomes(c, mode, now=now, limit=limit))
+    followups = followups or (lambda c: post_merge_followups.run_followups(c, now=now, limit=limit))
+    reverts = reverts or (lambda c: post_merge_followups.notice_reverts(c, now=now, limit=limit))
 
     def step(name: str, run: Callable[[], dict]) -> None:
         try:
@@ -234,8 +259,10 @@ def tick(conn: sqlite3.Connection, *, view: post_merge_check.View = post_merge_c
             seen[name] = {"errors": [f"{type(exc).__name__}: {exc}"[:300]]}
 
     step("notice", lambda: post_merge_check.notice_merges(conn, view, now, limit))
+    step("edited", lambda: fill_edited(conn))
     kubeconfigs: dict[tuple[str, str, str], str] = {}
     kubectl_json = kubectl_json or post_merge_check.SandboxKubectl(kubeconfigs)
+    scope_read = True
     if recheck is None or scope_refusal is None:
         try:
             scope = post_merge_scope.install_scope()
@@ -244,10 +271,16 @@ def tick(conn: sqlite3.Connection, *, view: post_merge_check.View = post_merge_c
         except Exception as exc:  # noqa: BLE001 — an unknown scope reads no cluster
             logger.warning("post-merge check: the install's scope could not be read; no cluster is read: %r", exc)
             seen["scope"] = {"errors": [f"the install's scope could not be read: {exc}"[:300]]}
-            return seen
-    refusal, rechecker = scope_refusal, recheck
-    step("health", lambda: post_merge_check.watch_health(conn, kubectl_json, now, limit, scope_refusal=refusal))
-    step("outcomes", lambda: decide_outcomes(conn, rechecker, now, refusal, limit))
+            scope_read = False
+    if scope_read:
+        refusal, rechecker = scope_refusal, recheck
+        step("health", lambda: post_merge_check.watch_health(conn, kubectl_json, now, limit, scope_refusal=refusal))
+        step("outcomes", lambda: decide_outcomes(conn, rechecker, now, refusal, limit))
+        step("environments", lambda: fill_environments(conn))
+    step("reports", lambda: report(conn))
+    if scope_read:
+        step("followups", lambda: followups(conn))
+        step("reverts", lambda: reverts(conn))
     return seen
 
 

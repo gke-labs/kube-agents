@@ -919,8 +919,9 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     """With no arguments, the ``post-merge-check`` cron job: one ``post_merge_outcome.tick``, printing
     nothing to stdout. The summary goes to ``logs/post_merge_check.log``. A run in which any record or
     step errored exits 1 with one line naming them on stderr, so chat gets the scheduler's failure
-    line; a clean run exits 0 and the scheduler relays nothing. ``notice`` and ``health`` run one step
-    by hand and print what it saw as JSON.
+    line; a clean run exits 0 and the scheduler relays nothing. ``notice``, ``health`` and ``report``
+    run one step by hand (``report`` in the switch's mode, through ``post_merge_report``) and print
+    what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
     """
@@ -929,8 +930,8 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     from contextlib import closing
 
     argv = sys.argv[1:] if argv is None else argv
-    if argv not in ([], ["notice"], ["health"]):
-        print("usage: post_merge_check.py [notice|health]", file=sys.stderr)
+    if argv not in ([], ["notice"], ["health"], ["report"]):
+        print("usage: post_merge_check.py [notice|health|report]", file=sys.stderr)
         return 2
     import kubeagents_switches
 
@@ -952,10 +953,14 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
                 print(json.dumps({"scope": "unreadable", "error": str(exc)[:300]}))
                 return 1
             print(json.dumps(watch_health(conn, kubectl_json, limit=reads_per_tick(), scope_refusal=refusal)))
+        elif argv == ["report"]:
+            import post_merge_report
+
+            print(json.dumps(post_merge_report.report_outcomes(conn, mode)))
         else:
             import post_merge_outcome
 
-            seen = post_merge_outcome.tick(conn, view=view, kubectl_json=kubectl_json, **tick_overrides)
+            seen = post_merge_outcome.tick(conn, mode, view=view, kubectl_json=kubectl_json, **tick_overrides)
             summary = f"post-merge check ({mode}): {json.dumps(seen)}"
             try:
                 import script_log
