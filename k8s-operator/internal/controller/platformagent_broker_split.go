@@ -210,8 +210,8 @@ var allBrokerCallersOwned = brokerCallerOwnership{mcp: true, scope: true}
 // allowedBrokerCallers is the value of CREDENTIAL_PROXY_ALLOWED_CALLERS: the
 // TokenReview usernames the broker will serve.
 //
-// Two of them on every install; a third when the next stack takes Chat, and a
-// fourth under the cluster-view flag. The sandbox's is the caller that matters —
+// Three of them on every install (the gateway's, the sandbox's and the A2A
+// gateway's), and more under their flags. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
 // only the gateway's identity would answer 401 to all of them. The gateway's
 // is there because its chat relays, its Pub/Sub platform adapter and its
@@ -238,7 +238,7 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	// audiences, and with Chat armed by CREDENTIAL_PROXY_A2A_CHAT_CALLERS
 	// as well, so it reaches no other role.
 	callers = append(callers, a2aGatewayBrokerCaller(agent))
-	// The third caller exists only under the cluster-view flag. It is
+	// The session pods' caller exists only under the cluster-view flag. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
 	// buildCredentialProxyEnv renders beside it: the broker refuses this
 	// ServiceAccount every audience but the session one, and the session
@@ -269,8 +269,9 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 }
 
 // a2aGatewayBrokerCaller is the TokenReview username of the A2A gateway's
-// ServiceAccount, as the broker sees it: an allowed caller while Chat is
-// armed, and the one CREDENTIAL_PROXY_A2A_CHAT_CALLERS names.
+// ServiceAccount, as the broker sees it: an allowed caller on every install,
+// the one CREDENTIAL_PROXY_A2A_REPORTS_CALLERS names, and with Chat armed the
+// one CREDENTIAL_PROXY_A2A_CHAT_CALLERS names too.
 func a2aGatewayBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent))
 }

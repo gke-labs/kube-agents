@@ -175,7 +175,7 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
-	// allowed callers, the A2A gateway among them while Chat is armed, and
+	// allowed callers, the A2A gateway among them on every install, and
 	// the binding is what holds that account to the a2a-chat audience. The
 	// exec tier confers no a2a-chat role, so there it is refused every
 	// audience. The value changes only when the allowed callers do (#6090).
