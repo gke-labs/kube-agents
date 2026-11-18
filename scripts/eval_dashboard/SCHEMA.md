@@ -1579,22 +1579,24 @@ file is copied into the out-dir: the adjudicator owns both.
 ## Fixtures
 
 Every file under `testdata/`, `testdata_reps/`, `testdata_rc/`,
-`testdata_nightly/`, `testdata_notevaluated/` and `testdata_store/` is
-synthetic (`.agents/rules/public_surfaces.md`). Kept, because the parsers and
+`testdata_nightly/`, `testdata_notevaluated/`, `testdata_store/`,
+`testdata_health/` and `testdata_classify/` is synthetic
+(`.agents/rules/public_surfaces.md`). Kept, because the parsers and
 the tests read them: the line shapes the drivers print, the result and verdict
 words (`PASSED`, `UNSTABLE`, `pass`/`fail`/`infra`/`blocked`, `GREEN`,
 `NOT EVALUATED`), the harness's own fixed sentences, the pool project and
 GitOps repository names, and the ordering of lines and repetitions. Synthetic:
 every score (`OutcomeValidity`, `OutcomeScore`, `VerificationCorrectness`,
 `ChecklistScore`, the store's judged means), every duration and agent latency,
-every wall clock (ISO stamps and Prow epochs sit one fixed offset from any
-real build), the build ids (`20900000000000000N0`), PR numbers (`101`, `102`,
-…), commit shas (`0101010…`-patterned), the case ids (`case-NN`, drawn by a
+every wall clock in the six log directories (ISO stamps and Prow epochs sit
+one fixed offset from any real build; the two snapshot directories keep
+their timeline, as their paragraphs say), the build ids (`20900000000000000N0`
+in the log directories; the snapshots' own numbering is in their
+paragraphs), PR numbers (`101`, `102`, …), commit shas (`0101010…`-patterned), the case ids (`case-NN`, drawn by a
 seeded permutation, not in the order of `bench/tasks/`), the setup and judge
 (`setup-x` / `model-x`), the ledger App and installation (`1` / `2`), and the
 grader reasons and report excerpts (`check-1: the required phrase is absent`).
-The directories after them (`testdata_lostpod/`, `testdata_health/`,
-`testdata_classify/`) are described as they are.
+`testdata_lostpod/` is described as it is.
 
 `testdata/` holds three **synthetic** `pull-kube-agents-smoke-test` builds in
 the single-repetition era's trimmed shape: the lease line, every
@@ -1680,44 +1682,58 @@ case, three of them after the SIGTERM, inside the grace period. The
 | ------------------- | --------------------------------------------------------------------------------------------------------------- |
 | 2090000000000000100 | nightly, deadline at 8h — four graded cases (one with an infra rep, one UNSTABLE), no verdict line, `truncated` |
 
-`testdata_health/data.json.gz` is a **real** published `data.json` reduced by
-`health.py --trim` (and gzip-compressed, which `health.py --data` reads by
-suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
-them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
-`pr`, `started`, `finished`, `result`, `duration_s`, `tier` when the run
-carries one, the how-it-ended fields — `has_build_log`, the `pod_*` trio,
-`merge_conflict`, `eval_verdict` — when the source has them, and per task
-`name`, `result`, `reps[].result` and the first
-128 characters of `reps[].reason`);
-its `trimmed` key records the source and the cut. Six of its zero-task runs
-carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
-the one departure from the `result` vocabulary above seen in the wild, so
-consumers compare it case-insensitively. `testdata_health/roster-history.json` is the
-blocking roster per era over the same week, taken from the commits that
-changed it (the `BOOTSTRAP_ADMITTED` line of `hack/ci-eval-pr.sh` then;
-`hack/eval/blocking-roster.txt` since 2026-09-15 — `health.Roster.from_file`
-reads the file and `health.Roster.from_script_text` the old line, so an era
-from before the move is taken from the script at that commit). Together they are the replay fixture
-`scripts/test_eval_dashboard_health.py` asserts the week's incident
-timeline against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same
-cut of the published `data.json` for 2026-09-11 (#1478) — the day five build
-nodes went NotReady — with its twenty zero-task reds re-read by
-`collect.build_run` so they carry `has_build_log` and the `pod_*` trio
-(`trim` keeps those fields when the source has them); the same test file
-asserts it reads as `lost_pods` and not as setup deaths.
-`testdata_health/slow-gate-2026-09-14.json.gz` is the same cut for
-[2026-09-07 18:00Z, 2026-09-14 18:20Z) — the seven days the slow-gate rule's
-baseline needs, ending on the afternoon every run was green and three hours
-long (#1586); the test asserts the `slow` note from 18:00Z that day and none
-over the 09-12/13 weekend. `testdata_health/deadline-kills-2026-09-22.json.gz`
-is the same cut for [2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of
-them killed at the deadline with `eval_verdict: null` (#1880, #1894); the
-test asserts the `deadline_kill` OUTAGE from the third kill and a lull
-reading as recovering.
-`testdata_health/near-deadline-2026-09-17.json.gz` is a synthetic scenario modeling
-the timeline of [2026-09-17 04:00Z, 2026-09-17 16:30Z) — four runs concluding on the afternoon
-a 356-minute run finished with the gate staying GREEN (#2873); the test
-asserts the `near_deadline` note from 16:00Z that day and none at 04:00Z.
+`testdata_health/data.json.gz` is a **synthetic** `data.json` in the shape
+`health.py --trim` produces (gzip-compressed, which `health.py --data` reads
+by suffix): the runs that finished in [2026-09-01, 2026-09-09) in the
+published copy of 2026-09-08, with their timestamps, durations, `result`
+words, task order and `reps[].result` kept exactly — so the week's incident
+timeline replays as it did — and everything that came out of a run's record
+replaced: case ids are `case-NN` (the map the directories above use;
+`case-36` to `case-38` are cases only these snapshots name), PR numbers
+`201`, `202`, … (a pull request the log directories above already number
+keeps that number, `105` to `108`), build ids `2091000000000000001`, … (the
+one build shared with `testdata_reps/` keeps its `2090…` id;
+`near-deadline` keeps its own `2100…` stand-ins), and each grader reason an
+invented one-liner that keeps the phrase the adjudicator keys on (one of
+three `check-NN: …` sentences behind the `VerificationCorrectness=` head; the
+harness's and scorer's own fixed sentences — never ran, infra failure,
+provisioning, ceiling, no scores map, no `results.json` — with no command
+text; `checks errored rather than ran: […]` for a rung-2 block), cut at the
+`trimmed.reason_chars` each file records. The fields are the ones the health adjudicator reads
+(`build_id`, `pr`, `started`, `finished`, `result`, `duration_s`, `tier`
+when the run carries one, the how-it-ended fields — `has_build_log`, the
+`pod_*` trio, `merge_conflict`, `eval_verdict` — when the source had them,
+and per task `name`, `result`, `reps[].result` and `reps[].reason`); its
+`trimmed.source` says the file is synthetic. Six of its zero-task runs carry
+`result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 — the one
+departure from the `result` vocabulary above seen in the wild, so consumers
+compare it case-insensitively. `testdata_health/roster-history.json` is the
+blocking roster per era over the same week in the same case ids, under
+invented commit subjects (the real eras were the `BOOTSTRAP_ADMITTED` line of
+`hack/ci-eval-pr.sh` then; `hack/eval/blocking-roster.txt` since 2026-09-15 —
+`health.Roster.from_file` reads the file and `health.Roster.from_script_text`
+the old line). Together they are the replay fixture
+`scripts/test_eval_dashboard_health.py` asserts the week's incident timeline
+against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same treatment
+of the published `data.json` for 2026-09-11 (#1478) — the day five build
+nodes went NotReady — its twenty zero-task reds carrying `has_build_log` and
+the `pod_*` trio as `collect.build_run` re-read them (`trim` keeps those
+fields when the source has them; the node names are the build cluster's, as
+in `testdata_lostpod/`); the same test file asserts it reads as `lost_pods`
+and not as setup deaths. `testdata_health/slow-gate-2026-09-14.json.gz` is
+the same for [2026-09-07 18:00Z, 2026-09-14 18:20Z) — the seven days the
+slow-gate rule's baseline needs, ending on the afternoon every run was green
+and three hours long (#1586); the test asserts the `slow` note from 18:00Z
+that day and none over the 09-12/13 weekend.
+`testdata_health/deadline-kills-2026-09-22.json.gz` is the same for
+[2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of them killed at the
+deadline with `eval_verdict: null` (#1880, #1894); the test asserts the
+`deadline_kill` OUTAGE from the third kill and a lull reading as recovering.
+`testdata_health/near-deadline-2026-09-17.json.gz` is a synthetic scenario
+modeling the timeline of [2026-09-17 04:00Z, 2026-09-17 16:30Z), with one
+run after it — four runs concluding on the afternoon a 356-minute run finished with the gate staying
+GREEN (#2873), in the same case ids and PR numbering; the test asserts the
+`near_deadline` note from 16:00Z that day and none at 04:00Z.
 
 `testdata_store/` holds four **synthetic** objects in the evidence store's
 own layout under an `evidence/` root — the case, the setup (`setup-x`), the
@@ -1737,12 +1753,11 @@ judge (`model-x`), the `<scoring>-f<fleet>-v<verifiers>` directory and the
 per-key cap and the incremental read; `scripts/test_eval_dashboard_trend.py`
 derives the trend from them and renders the page.
 
-`testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
-for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
-the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
-trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
-and the page tests — plus one **derived** run, build 2097362141184626688:
-the not-evaluated fixture as it was first written (stand-in build id, PR and
-shas, but real case names and grading lines) re-dated into the outage window
-so the not-evaluated verdict is classified and rendered beside the real week;
-its `trimmed.derived` note says so.
+`testdata_classify/incidents.json.gz` is the same **synthetic** treatment of
+a published `data.json`'s runs for two windows of the week of 2026-09-01 (PR
+#218's last runs on 09-04/05; the crashloop outage of 09-07/08 with PR #206's
+15-case red inside it), trimmed to the fields `classify.py` reads, for
+`test_eval_dashboard_classify.py` and the page tests — plus one **derived**
+run, build 2091000000000000609, the `testdata_notevaluated/` build's shape
+re-dated into the outage window so the not-evaluated verdict is classified
+and rendered beside the week; its `trimmed.derived` note says so.
