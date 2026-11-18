@@ -138,12 +138,12 @@ def _green_case_file(tmp_path: Path, name: str) -> Path:
 
 
 class TestRecordRefusal:
-    """A run at a named effort never appends: the fourth refusal inside
-    `bench-gate record`, beside PULL_NUMBER, RC_COMMIT_SHA and the rollback lane."""
+    """A run at a named effort never appends: the third refusal inside
+    `bench-gate record`, beside PULL_NUMBER and RC_COMMIT_SHA."""
 
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):
-        for name in ("PULL_NUMBER", "RC_COMMIT_SHA", "EVAL_ROLLBACK_LANE", "EVAL_BASELINE_STORE", REASONING_EFFORT_ENV):
+        for name in ("PULL_NUMBER", "RC_COMMIT_SHA", "EVAL_BASELINE_STORE", REASONING_EFFORT_ENV):
             monkeypatch.delenv(name, raising=False)
 
     def test_a_named_effort_is_refused_and_writes_nothing(self, tmp_path, monkeypatch, capsys) -> None:

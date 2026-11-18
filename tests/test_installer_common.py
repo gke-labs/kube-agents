@@ -2401,6 +2401,88 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("Could not probe cluster", proc.stderr)
 
+    _API_DISABLED_IN = (
+        'echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, '
+        "message=Kubernetes Engine API has not been used in project {project} before or it is disabled. "
+        'Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project={project} then retry." >&2; exit 1'
+    )
+
+    def test_tfvars_reads_a_disabled_gke_api_in_the_target_project_as_absence(self):
+        # A fresh project's first install: the Kubernetes Engine API is off, so
+        # no cluster can exist there, and the apply enables the API before it
+        # creates one. The generator must not refuse this as an unreadable
+        # cluster (the pool's new projects and a fresh standalone project both
+        # stopped here on 2026-11-13 and 2026-11-16).
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="test-project"),
+        )
+        # The harness stubs print_info, so the absence line is not readable
+        # here; the exit code and the missing refusal are the assertion.
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_project_number_as_absence(self):
+        # gcloud names the project by number in the ErrorInfo consumer line.
+        stub = (
+            'echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; '
+            'echo "  consumer: projects/123456789" >&2; exit 1'
+        )
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_a_disabled_gke_api_that_names_no_project(self):
+        # A bare SERVICE_DISABLED with no project named (a quota-project
+        # refusal without its consumer line) says nothing about the target.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub='echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; exit 1',
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_number_in_the_message_as_absence(self):
+        # The message line itself can carry the number rather than the id.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=self._API_DISABLED_IN.format(project="123456789"),
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_resolves_the_project_number_when_the_front_door_did_not_export_it(self):
+        # upgrade.sh, uninstall.sh and the menu reach the generator before
+        # PROJECT_NUMBER is exported; a refusal by number is then resolved
+        # with one `projects describe`, and only for a refusal of that shape.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="123456789"),
+            gcloud_extra_cases='  *"projects describe test-project"*) printf "123456789\\n"; exit 0 ;;\n',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_when_the_disabled_gke_api_is_another_projects(self):
+        # The refusal names the caller's quota project, not the target: it says
+        # nothing about whether the target holds a cluster, so the generator
+        # keeps refusing to guess.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="someone-elses-quota-project"),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
     def test_tfvars_generation_recovers_credentials_from_live_secret(self):
         # PERSIST_SECRETS_ON_DISK=false leaves install.env without the keys; the
         # live Secret is their home, so the generator reads them back from it.
@@ -6673,7 +6755,7 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_real_render_prints_the_notes_block_for_the_tfvars(self):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn("      Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
         # which `make docs-generate` renders from the same chart template with these
@@ -6698,9 +6780,11 @@ class FootprintSummaryTest(unittest.TestCase):
                 self.assertIn("rc=0", output.stdout, output.stderr)
             r = profile["requirements"]
             gib = 1024**3
-            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
-            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
-            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            # The summary prints the standing release; the session pods' share, which the
+            # totals carry, is on its own line.
+            self.assertIn(f"CPU requests:        {(r['requestsCpu'] - r['sessionRequestsCpu']) / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {(r['requestsMemory'] - r['sessionRequestsMemory']) / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods'] - r['sessionPods']}\n", output.stdout, key)
             self.assertIn(
                 f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
                 output.stdout, key,
@@ -6711,7 +6795,7 @@ class FootprintSummaryTest(unittest.TestCase):
             profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the session pods", proc.stdout)
+        self.assertIn("Not in these figures or the cost: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

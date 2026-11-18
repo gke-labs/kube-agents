@@ -235,8 +235,7 @@ that from being a trap:
 - **Every caller is updated in the same change as the standby's 503:** the bench harness's
   inject transport (`bench/kube_agents_bench/harness.py` and `inject_transport.py`), which
   drives the required smoke gate, resolves the holder and re-resolves on a 503 or a dropped
-  tunnel; `hack/rollback-roundtrip.sh`, the one script that port-forwards a door; and
-  `bench/README.md` and the docs that show a door port-forward. That change lands before the
+  tunnel; and `bench/README.md` and the docs that show a door port-forward. That change lands before the
   operator renders a second replica, so the gate never sees a standby it can't route around.
 
 Two surfaces aren't affected. The console page's port-forward goes to the console server, its own

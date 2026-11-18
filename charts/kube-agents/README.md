@@ -172,10 +172,15 @@ and `AGENT_SANDBOX_IMAGE` follow `global.imageRegistry`, while `FLUENT_BIT_IMAGE
 and the four bus images follow `global.thirdPartyImageRegistry` (the bus images
 from `a2aBus.images`, below). Without passing both, a mirrored install reaches
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
-`CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
-broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image is not derived from the agent image, so
-the chart names it.
+`CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE` are passed only when
+`credentialProxy.image` or `hermesBridge.image` names a `repository` or a `tag`;
+empty, the default, leaves the operator deriving the broker from each agent's
+image, and the bridge from the agent image when that is the release
+`platform-agent` image by tag, else from the operator's release set. A pin
+renders under `global.imageRegistry` like the other first-party images and
+applies to every `PlatformAgent` the operator manages; `values.yaml` has the
+contract. The sandbox image is not derived from the agent image, so the chart
+always names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -186,7 +191,8 @@ most on the mirror, one somewhere else — leave `global.imageRegistry` and
 `global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
 mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
 `FLUENT_BIT_IMAGE` and the four `A2A_NATS_*`/`A2A_PROVISION_IMAGE` variables are
-rendered from those values either way.
+rendered from those values either way, and `CREDENTIAL_PROXY_IMAGE` and `A2A_BRIDGE_IMAGE`
+from `credentialProxy.image` and `hermesBridge.image` when those are set.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -1437,7 +1443,12 @@ or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.
 folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
 hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
 provisioning Job, so it overstates both.
-The session pods the install spawns on demand are not counted; the operator caps those with
+It counts the session pods the gateway spawns on demand at their cap:
+`platformAgent.harness.tuning.maxSessions` (10 by default) times one session pod, from
+`files/footprint.yaml`'s `operatorRenderedPerReplica.sessionPod` with each key
+`platformAgent.harness.tuning.sessionResources` sets laid over it, as the operator resolves
+them, and on GKE Autopilot at Autopilot's per-Pod minimums. The refusal says how much of
+what it requires is that share. The operator also caps the session pods with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
@@ -1556,9 +1567,10 @@ apply. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them, but not the preflight's quota gate: it sums
 on every render, a namespace with no ResourceQuota and `helm template` included, so the
-refusals the preflight section lists apply wherever the summary prints. It says what it
-leaves out: the session pods, which the
-[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+refusals the preflight section lists apply wherever the summary prints. Its figures
+and cost are the standing release; it prints the session pods' share at the cap on a line
+of its own, as the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) do.
 
 #### Upgrade notes: operator memory floor
 

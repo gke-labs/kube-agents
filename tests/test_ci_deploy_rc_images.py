@@ -140,6 +140,10 @@ def run_build_section(rc_commit_sha: str) -> subprocess.CompletedProcess:
             'export PROJECT_ID="kube-agents-evals"',
             'export HERMES_AGENT_TAG="v0"',
             "BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)",
+            # Section 2b-ii admits the bridge concurrency and section 2a names the
+            # candidate's registry; section 4 reads both.
+            'MODE_NEXT_BRIDGE_CONCURRENCY="4"',
+            'RC_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"',
             'gcloud() { case "$1 $2" in "builds submit") echo "BUILD SUBMITTED" >&2; printf "b-1\\tu\\n" ;; "builds describe") echo SUCCESS ;; esac; }',
             'timeout() { shift 2; "$@"; }',
             head_constants(),
