@@ -368,15 +368,15 @@ func alreadyRestored(ctx context.Context, nc *nats.Conn, policy StreamPolicy, st
 // already gone counts as cleared, so a retry continues where a failed clear
 // stopped. The staged snapshot is what these streams are restored from.
 //
-// The streams come in provision order, where a stream can depend on one
-// before it: PROFILE_SUBMITS on KV_PROFILE_LEASES, whose entries mark the
-// submits already claimed. So they are deleted last to first. A clear that
-// stops partway, a failed delete, then leaves an index without its
-// dependent, never a dependent without its index. That matters if the run is
-// then given up: the streams it did not put back are recreated empty, and an
-// empty KV_PROFILE_LEASES next to a full PROFILE_SUBMITS would offer
-// claimed submits again. The restore walks the same order forward, so a
-// restore that stops partway leaves the same safe shape.
+// The streams come in the operator's migration order, where a stream that
+// indexes another comes before it: KV_PROFILE_LEASES (the claimed submits)
+// and DISPATCH_STOPS (the stopped ones) before PROFILE_SUBMITS. So they are
+// deleted last to first. A clear that stops partway, a failed delete, then
+// leaves an index without the submits, never the submits without an index.
+// That matters if the run is then given up: the streams it did not put back
+// are recreated empty, and an empty index next to full submits would admit
+// claimed or stopped submits again (#6287). The restore walks the same
+// order forward, so a restore that stops partway leaves the same safe shape.
 func ClearStreams(ctx context.Context, nc *nats.Conn, streams []string) ([]string, error) {
 	var cleared []string
 	for i := len(streams) - 1; i >= 0; i-- {
