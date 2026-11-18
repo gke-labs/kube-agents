@@ -339,3 +339,4 @@
 #   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.
+./tasks/post-merge-verified-fixed/task.yaml

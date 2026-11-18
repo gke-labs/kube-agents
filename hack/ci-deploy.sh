@@ -961,12 +961,21 @@ A2A_OPERATOR_ENV_ARGS=()
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
 # budget is sized for one install per GitHub App installation, and every eval
 # project shares one, so concurrent lanes drained its quota and the cases' own
-# forge calls failed with FORGE_RATE_LIMITED (#4611). Hence env[4] here.
+# forge calls failed with FORGE_RATE_LIMITED (#4611). env[4], also on every
+# lane, turns the post-merge check on in silent mode: the pr_opened plugin
+# records each fix and the check stores outcomes for the case that grades it
+# (bench/tasks/post-merge-verified-fixed), and nothing is posted, so no case
+# meets a GitHub write it did not ask for. env[5] caps each post-merge step at
+# five records a run: the cron ticks every five minutes on every install and
+# reads the forge for each waiting record (none when there are none) on the
+# GitHub App installation every eval project shares (#4611, #6105), so at most
+# 60 reads an hour an install. An operator older than the cap drops the name.
+# Hence env[6] here.
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
-    --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
-    --set-string "platformAgent.deployment.env[4].value=false"
+    --set-string "platformAgent.deployment.env[6].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[6].value=false"
     --set "profiles.cluster.enabled=true"
     --set "profiles.tse.enabled=true"
   )
@@ -2445,6 +2454,10 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
     --set-string "platformAgent.deployment.env[3].value=off" \
+    --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_POST_MERGE_CHECK" \
+    --set-string "platformAgent.deployment.env[4].value=silent" \
+    --set-string "platformAgent.deployment.env[5].name=POST_MERGE_READS_PER_TICK" \
+    --set-string "platformAgent.deployment.env[5].value=5" \
     --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
