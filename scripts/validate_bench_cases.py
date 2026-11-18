@@ -655,7 +655,6 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # session daemon folded into its newest incident. The count is the
     # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
     "workload_incident_folded": ("min_folded",),
-    "post_merge_outcome": ("outcome",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
