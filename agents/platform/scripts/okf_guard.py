@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Operational Knowledge Framework (OKF) guard evaluator for VCS publish."""
+"""Deterministic Open Knowledge Format (OKF) guard evaluator for VCS publish."""
 
 from __future__ import annotations
 
