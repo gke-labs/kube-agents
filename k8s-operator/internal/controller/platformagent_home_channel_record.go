@@ -97,7 +97,7 @@ const (
 	gchatHomeChannelRecordIDMax = 64
 
 	// The refusal vocabulary the gateway writes into slack.refused, its
-	// homeRefused* constants in a2a/gateway/slack_home_channel.go;
+	// homeRefused* constants in a2a/gateway/home_channel.go;
 	// TestHomeChannelRefusedReasonsMatchTheGatewaysVocabulary fails when this
 	// map and those words differ.
 	homeChannelRefusedShared        = "shared"

@@ -3657,11 +3657,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// card's report back to the conversation it was filed in, and
 	// onboarding's first report, need no home. A2A_NOTIFY_PLATFORM names the
 	// armed routes whose home channel the CR sets, and is absent when none
-	// is. The agent adds Slack when the projected file below names a channel
-	// the gateway learned, and sends home posts to every armed route when no
+	// is. The agent adds Slack or Chat when its projected file below names a
+	// channel the gateway learned, and sends home posts to every armed route when no
 	// platform has a home; the gateway keeps a home-less platform's posts for
 	// the digest it posts once a channel is set (a2a/gateway/notify_refused.go).
-	// The alert picks one of those on its own, Chat first. Both lists read CR
+	// The alert picks the first of those: a configured home before a learned
+	// one, Chat before Slack within each. Both lists read CR
 	// fields only, so a learn rolls no pod.
 	notify := strings.Join(a2aNotifyHomePlatforms(agent), a2aNotifyPlatformSeparator)
 	conversations := strings.Join(a2aNotifyPlatforms(agent), a2aNotifyPlatformSeparator)

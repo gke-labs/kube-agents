@@ -35,9 +35,10 @@ const (
 	gchatSpaceNameArgument = "name"
 
 	// gchatHomeLearnedLine is the one line posted in the learning thread. It
-	// names the field that overrides the learn, never the member; Chat has no
-	// space mention, and the line stands in the space it speaks of.
-	gchatHomeLearnedLine = "This space is now the home channel for alerts and scheduled reports. To move it, set spec.integration.googleChat.homeChannel on the PlatformAgent."
+	// says in plain words who can move the home, with no field path or kind
+	// name, and never names the member; Chat has no space mention, and the
+	// line stands in the space it speaks of.
+	gchatHomeLearnedLine = "This space is now the home channel for alerts and scheduled reports. An administrator can move it in the install's settings."
 )
 
 // gchatHomeCandidate is a typed message that could set the home space,

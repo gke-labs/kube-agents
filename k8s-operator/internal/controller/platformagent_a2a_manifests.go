@@ -1600,8 +1600,8 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 
 // a2aNotifyHomePlatforms is every armed platform whose home channel the CR
 // sets, Chat first (A2A_NOTIFY_PLATFORM), and empty when none is. It reads
-// CR fields only, so a learned channel rolls no pod: the agent adds Slack
-// from the projected file, and sends home posts to every armed route when no
+// CR fields only, so a learned channel rolls no pod: the agent adds Slack or
+// Chat from its projected file, and sends home posts to every armed route when no
 // platform has a home (agents/platform/scripts/chat_notify.py,
 // routed_platforms).
 func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
@@ -6258,7 +6258,7 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				Verbs:         []string{"get"},
 			},
 			// The home-channel record, one named ConfigMap: the gateway's
-			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
+			// learn (a2a/gateway/home_channel.go) reads and patches it,
 			// and the operator reads it into the projected file both pods
 			// mount and the HomeChannelUnset condition
 			// (platformagent_home_channel_record.go).

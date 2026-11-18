@@ -313,13 +313,19 @@ const (
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
 	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
 	// meanwhile when the other armed backend has a home: the agent sends
-	// home posts only to the platforms with one, the CR's list plus a
-	// learned Slack channel (agents/platform/scripts/chat_notify.py,
+	// home posts only to the platforms with one, the CR's list and then a
+	// learned channel or space (agents/platform/scripts/chat_notify.py,
 	// routed_platforms).
 	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
 	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
 	homeChannelUnsetJoin = " "
+	// What homeChannelUnsetMessageFormat takes for Google Chat: the backend,
+	// the CR field, the install.env key and what the field holds.
+	homeChannelUnsetGchatBackend = "Google Chat"
+	homeChannelUnsetGchatField   = "spec.integration.googleChat.homeChannel"
+	homeChannelUnsetGchatEnvKey  = "GOOGLE_CHAT_HOME_CHANNEL"
+	homeChannelUnsetGchatHolds   = "a Chat space name (spaces/<id>)"
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -5748,8 +5754,8 @@ func gchatHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 	if a2aSlackHasHome(agent, rec) {
 		meanwhile = homeChannelUnsetToSlackRoute
 	}
-	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-		"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile)
+	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, homeChannelUnsetGchatBackend,
+		homeChannelUnsetGchatField, homeChannelUnsetGchatEnvKey, homeChannelUnsetGchatHolds, meanwhile)
 	switch {
 	case gchatHomeChannelPolicy(agent) == gchatHomeChannelPolicyManual:
 		return msg + homeChannelUnsetManualSuffix

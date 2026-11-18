@@ -21,6 +21,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -946,6 +948,55 @@ func TestPlatformAgentReconciler_Reconcile_GchatHomeChannelRecordDrivesTheProjec
 	}
 	if c := condition(); c != nil {
 		t.Errorf("HomeChannelUnset set with the CR field set: %s", c.Message)
+	}
+}
+
+// The values the Google Chat learn keeps in step by hand across four places
+// that cannot import one another: the bound on a recorded space name (gateway
+// and operator) and the projected file's key (gateway, operator, and the
+// agent's two readers). Each file is read as text for its one declaration.
+const (
+	gatewayGchatHomeSource  = "../../../a2a/gateway/gchat_home_channel.go"
+	agentChatNotifySource   = "../../../agents/platform/scripts/chat_notify.py"
+	kanbanChatNotifySource  = "../../../deploy/docker/patches/kanban_chat_notify.py"
+	gatewaySpaceMaxPattern  = `(?m)^\tgchatHomeSpaceMax = (\d+)$`
+	gatewayGchatKeyPattern  = `(?m)^\tgchatHomeFileKey = "([^"]+)"$`
+	gatewaySlackKeyPattern  = `(?m)^\thomeFileKey\s+= "([^"]+)"$`
+	pythonGchatKeyPattern   = `(?m)^GCHAT_HOME_FILE_KEY = "([^"]+)"$`
+	pythonSlackKeyPattern   = `(?m)^HOME_FILE_KEY = "([^"]+)"$`
+	homeValueMissingMessage = "%s declares nothing matching %s; if the declaration moved or changed shape, this test's pattern must follow it"
+)
+
+// TestGchatHomeChannelValuesMatchTheGatewayAndTheAgent fails when the bound
+// or a projected file key differs between the operator and the other side
+// that reads or writes it.
+func TestGchatHomeChannelValuesMatchTheGatewayAndTheAgent(t *testing.T) {
+	declared := func(path, pattern string) string {
+		t.Helper()
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		m := regexp.MustCompile(pattern).FindSubmatch(raw)
+		if m == nil {
+			t.Fatalf(homeValueMissingMessage, path, pattern)
+		}
+		return string(m[1])
+	}
+	if got := declared(gatewayGchatHomeSource, gatewaySpaceMaxPattern); got != strconv.Itoa(gchatHomeChannelRecordIDMax) {
+		t.Errorf("the gateway bounds a learned space at %s runes, the operator admits %d: a space one side takes the other refuses", got, gchatHomeChannelRecordIDMax)
+	}
+	for _, tc := range []struct{ path, pattern, want string }{
+		{gatewayHomeChannelSource, gatewayGchatKeyPattern, homeChannelProjectionGchatKey},
+		{gatewayHomeChannelSource, gatewaySlackKeyPattern, homeChannelProjectionKey},
+		{agentChatNotifySource, pythonGchatKeyPattern, homeChannelProjectionGchatKey},
+		{agentChatNotifySource, pythonSlackKeyPattern, homeChannelProjectionKey},
+		{kanbanChatNotifySource, pythonGchatKeyPattern, homeChannelProjectionGchatKey},
+		{kanbanChatNotifySource, pythonSlackKeyPattern, homeChannelProjectionKey},
+	} {
+		if got := declared(tc.path, tc.pattern); got != tc.want {
+			t.Errorf("%s reads the projected file %q, the operator writes %q", tc.path, got, tc.want)
+		}
 	}
 }
 

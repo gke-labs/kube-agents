@@ -96,8 +96,8 @@ const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
 // has it.
 const EnvSlackTestUsers = "A2A_SLACK_TEST_USERS"
 
-// The learned-home contract (slack_home_channel.go): the operator renders the
-// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// The learned-home contract (home_channel.go): the operator renders each
+// backend's policy from its homeChannelPolicy, the record ConfigMap's name, the
 // gateway's own image for the record's writer and reader keys, and the one
 // switch that arms the learn, which only an operator that also admits the
 // record renders.

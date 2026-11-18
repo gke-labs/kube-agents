@@ -461,7 +461,11 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	if !ok {
 		return nil
 	}
-	if cfg.GchatHomeChannel == "" {
+	switch {
+	case cfg.GchatHomeChannel != "":
+	case cfg.GchatHomeLearnArmed():
+		log.Info("chat.notify home posts wait for a home channel: none is configured, and the gateway learns one from the first mention in a space; conversation posts are armed")
+	default:
 		log.Warn("chat.notify home posts not armed: no home channel configured; conversation posts are")
 	}
 	n, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
