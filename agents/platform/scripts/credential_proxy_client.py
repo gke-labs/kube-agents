@@ -2384,11 +2384,13 @@ class ApiSession:
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 
-    The URL a caller writes stays the real endpoint, so a collector's evidence
-    label still names it, and `.get(url, params=, timeout=)` is what a
+    The URL a caller writes stays as written, so a collector's evidence label
+    still names the Google endpoint it reads, in its commercial form: when the
+    caller's environment names a custom universe domain, `relay_url` puts the
+    host in that domain. `.get(url, params=, timeout=)` is what a
     `requests.Session` offers, so code written against one runs against this
-    unchanged. `requests` is imported here and not at module scope: it is in the
-    sandbox image, where this class runs, and nowhere else this module is
+    unchanged. `requests` is imported here and not at module scope: it is in
+    the sandbox image, where this class runs, and nowhere else this module is
     imported needs it. `http` is injectable for tests and for a caller that
     already holds a configured session.
     """
