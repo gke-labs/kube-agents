@@ -444,9 +444,10 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
 # pool project then holds the same three names on each apply, with no state
 # that decides them, so a case and the state assertions can name a member. A
 # changed literal plans as a replace, which the reconciler refuses without a
-# row in reconcile-allow.json. The waste audit joins the members by the name
-# shape, and a Deployment with the exact name `calibration` in this namespace
-# stops that, so plant none. Catalogue role: generated-name-family.
+# row in reconcile-allow.json. Plant no Deployment with the exact name
+# `calibration` in this namespace: an audit that rolls the family up to its
+# parent takes that name for the parent. Catalogue role:
+# generated-name-family.
 locals {
   calibration_parent = "calibration"
   calibration_members = {

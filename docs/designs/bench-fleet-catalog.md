@@ -197,8 +197,9 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, `seeded-role=declared-zonal` on the declared
-zonal pool's, and `bench/tf/fleet/defects-b.tf` `seeded-role=no-surge` on the no-surge pool's — so
-four of the roles are called one thing by the catalogue and another by the Terraform that plants
+zonal pool's, `seeded-role=missing-reservation` on the reservation pool's, and
+`bench/tf/fleet/defects-b.tf` `seeded-role=no-surge` on the no-surge pool's — so
+five of the roles are called one thing by the catalogue and another by the Terraform that plants
 them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -344,7 +345,8 @@ today is registrable; the compute stream's declared-intent case, once the check 
 declarable, is parked until the scan reads both roles healthy on every project, which is day 91
 of the last applied project. `cost-declared-intent-no-finding`'s posture is
 observable on apply day, but the case reads the cost ledger, which exists only once some other
-cost finding does, so it waits for the idle pool's day 7.
+cost finding does: the generated-name family's findings supply it from their first hour, before
+the idle pool's day 7.
 
 The clock is per project, not per fleet. Each project's gates open from the day its own
 stack was applied, so the earliest a fleet-wide assertion can hold is the newest project's

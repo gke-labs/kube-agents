@@ -384,9 +384,10 @@ _MISSING_RESERVATION_POOL = {
 def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> dict:
     """A drift-cohort peer's cluster document (slot a or d).
 
-    Carries seeded-a's declared pool so a peer document a test rewrites for
-    its authorized-networks block still converges the pool's role; slot d's
-    document carries it too, which no role on slot d reads.
+    Carries seeded-a's declared pool and its reservation pool so a peer
+    document a test rewrites for its authorized-networks block still converges
+    the two pools' roles; slot d's document carries them too, which no role on
+    slot d reads.
     """
     doc = {"currentMasterVersion": "1.34.1-gke.1", "createTime": created or _created(), "nodePools": [_DECLARED_ZONAL_POOL, _MISSING_RESERVATION_POOL]}
     if block is not None:

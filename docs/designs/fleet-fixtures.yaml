@@ -41,7 +41,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The seeded namespaces and the two defect node pools
+    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the pool that names a missing reservation
   - slot: b
     suffix: b
     carries: The held-back control plane, and the upgrade-readiness drain defects
@@ -113,7 +113,8 @@ fixtures:
       overrequest posture, which the same knowledge/ note declares on
       purpose. The one declarable cost check with no multi-day age gate, so
       the posture is observable on apply day; its case still needs a ledger,
-      which the idle pool supplies from day 7.
+      which the generated-name family's findings supply from their first
+      hour, before the idle pool's day 7.
 
   - role: generated-name-family
     slot: a
