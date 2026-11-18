@@ -16,7 +16,15 @@ import kubeagents_switches
 import post_merge_check
 import post_merge_outcome
 import post_merge_scope
-from test_post_merge_check import MERGE, REPO, FakeCluster, FakeForge, argo_app, deployment, schema
+from test_post_merge_check import (
+    MERGE,
+    REPO,
+    FakeCluster,
+    FakeForge,
+    argo_app,
+    deployment,
+    schema,
+)
 
 NOW = datetime(2026, 11, 12, 9, 0, tzinfo=timezone.utc)
 URL = f"{REPO}/pull/1"
