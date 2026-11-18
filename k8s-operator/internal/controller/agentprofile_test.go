@@ -1665,6 +1665,57 @@ func TestDurableTiersAreWrittenOnlyBySuccessfulSync(t *testing.T) {
 	}
 }
 
+// A profile reconciled before the upgrade has every compared status field
+// already current, so a status write that skipped on "nothing changed" would
+// never record durableTiers: it is part of the comparison (#6283).
+func TestDurableTiersAreWrittenOnAnOtherwiseUnchangedStatus(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	// As an older operator left it: everything else current, no record.
+	live := h.profile(agent.Namespace, "auditor")
+	live.Status.DurableTiers = nil
+	if err := h.c.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Errorf("durableTiers = %v after a pass that changed nothing else, want [read]", got)
+	}
+}
+
+// A card withdrawn with the dispatcher on deletes the profile's durables, so
+// it clears durableTiers: a profile that recovers gets its durables at once,
+// not after a re-check of durables the operator deleted itself (#6283).
+func TestAWithdrawnCardClearsDurableTiers(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Fatalf("precondition: durableTiers = %v", got)
+	}
+	// Refused: an identity naming the session ServiceAccount.
+	live := h.profile(agent.Namespace, "auditor")
+	live.Spec.Identity.ServiceAccountName = a2aSessionServiceAccountName(agent)
+	if err := h.c.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	got := h.profile(agent.Namespace, "auditor")
+	if c := condition(got, agentv1alpha1.AgentProfileConditionCardPublished); c.Reason != reasonAgentProfileIdentityMissing {
+		t.Fatalf("card reason = %q, want %q (the withdraw path)", c.Reason, reasonAgentProfileIdentityMissing)
+	}
+	if len(got.Status.DurableTiers) != 0 {
+		t.Errorf("durableTiers = %v after the withdraw deleted the durables, want none", got.Status.DurableTiers)
+	}
+}
+
 // Dropping the unattended tier deletes the profile's unattended
 // ServiceAccount, and keeps its read one. The dispatcher Job policy's params
 // can be frozen by an upstream bug (kubernetes/kubernetes#141015); an index

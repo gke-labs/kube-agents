@@ -796,6 +796,12 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		slices.Sort(tiers)
 		p.Status.DurableTiers = slices.Compact(tiers)
 	}
+	// A withdrawn card (IdentityNotRendered, from withdrawCard) deleted the
+	// profile's durables, so none existed any more: when the profile
+	// recovers, its durables are made at once, not after a re-check.
+	if cardReason == reasonAgentProfileIdentityMissing && a2aDispatcherEnabled() {
+		p.Status.DurableTiers = nil
+	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               agentv1alpha1.AgentProfileConditionCardPublished,
 		Status:             conditionStatus(cardReason == reasonAgentProfilePublished),
@@ -844,7 +850,8 @@ func conditionStatus(ok bool) metav1.ConditionStatus {
 // times, which SetStatusCondition preserves when nothing else changed.
 func equalAgentProfileStatus(a, b *agentv1alpha1.AgentProfileStatus) bool {
 	if a.ObservedGeneration != b.ObservedGeneration || a.AgentRef != b.AgentRef || a.ServiceAccountName != b.ServiceAccountName ||
-		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || len(a.Conditions) != len(b.Conditions) {
+		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || !slices.Equal(a.DurableTiers, b.DurableTiers) ||
+		len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
 	for _, c := range b.Conditions {
