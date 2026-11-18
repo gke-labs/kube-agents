@@ -53,13 +53,15 @@ The operator also renders the task-signing key Secret `<agent>-a2a-task-signing-
 
 The bus runs [`harness.tuning.busReplicas`](/kube-agents/operator/platformagent-fields/#spec) NATS servers, three by default. They spread one per node with `DoNotSchedule`, so one drain takes one server. At three, the bus also has a routes Service and a PodDisruptionBudget of `maxUnavailable: 1`.
 
-One server isn't highly available. A node drain or an upgrade that moves its pod takes the bus down while the pod restarts, typically for about two minutes, and longer after a node scale-down (below). The operator says so once each time a new bus pod comes up, in a Normal `A2ABusSingleServer` Event on the PlatformAgent that links [Changing the bus's server count](#changing-the-buss-server-count). It writes the Event once more after an operator restart. Ready and Degraded don't change. A one-server bus has no PodDisruptionBudget and no `safe-to-evict` annotation, since on Autopilot either can hold node upgrades.
+One server isn't highly available. A node drain or an upgrade that moves its pod takes the bus down while the pod restarts, typically for about two minutes, and longer after a node scale-down (below). The operator says so once each time a new bus pod comes up, in a Normal `A2ABusSingleServer` Event on the PlatformAgent that says converting to three servers is temporarily disabled (see [Changing the bus's server count](#changing-the-buss-server-count)). It writes the Event once more after an operator restart. Ready and Degraded don't change. A one-server bus has no PodDisruptionBudget and no `safe-to-evict` annotation, since on Autopilot either can hold node upgrades.
 
 After a node scale-down, GCE can keep a NATS disk attached to the node being deleted for tens of minutes. The bus pod's replacement then waits in `ContainerCreating`, with `FailedAttachVolume` (`RESOURCE_IN_USE_BY_ANOTHER_RESOURCE`) in the pod's Events only, until the old node is gone. On three servers the bus serves on two meanwhile.
 
 The verifier's and the callout's topology spreads are `ScheduleAnyway`, so a single-node install still comes up. There the bus needs `busReplicas: 1`. On a cluster with no other schedulable node, such as a single-node install, a drain that evicts a callout waits until the node is uncordoned or the drain overrides the budget.
 
 ### Changing the bus's server count
+
+**Temporarily disabled from one server to three:** the admission webhook refuses setting `busReplicas` to 3 on a bus that runs one server until a fix for a migration that can loop ships. A new install at three servers, and three to one, are unaffected.
 
 On a bus that already runs, changing `busReplicas` between 1 and 3 starts a migration that keeps the bus's data. The operator runs it in phases, shown in `status.busMigration` and reported by the `A2ABusMigrating` condition. The admission webhook refuses another change to `busReplicas` while one runs. A run has two hours going forward; a phase still running then counts as failed, and the way back gets two hours of its own. Objects under a run's names that the PlatformAgent does not own are never used: a phase that finds one fails and names it.
 

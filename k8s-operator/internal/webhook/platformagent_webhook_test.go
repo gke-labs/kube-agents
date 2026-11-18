@@ -1309,6 +1309,45 @@ func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
 	}
 }
 
+// Setting busReplicas to 3 on an existing one-server bus is refused while
+// #6298 is open; a create, a bus with no recorded count, three to one, and an
+// edit that keeps an already-set 3 pass.
+func TestOneServerBusConversionIsRefused(t *testing.T) {
+	agent := func(spec *int, status int32) *agentv1alpha1.PlatformAgent {
+		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		if spec != nil {
+			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
+		}
+		pa.Status.BusReplicas = status
+		return pa
+	}
+	for _, tc := range []struct {
+		name     string
+		old, new *agentv1alpha1.PlatformAgent
+		refused  bool
+	}{
+		{"unset to 3 on a one-server bus", agent(nil, 1), agent(ptr.To(3), 1), true},
+		{"1 to 3 on a one-server bus", agent(ptr.To(1), 1), agent(ptr.To(3), 1), true},
+		{"a new install at 3", nil, agent(ptr.To(3), 0), false},
+		{"3 on a bus with no recorded count", agent(nil, 0), agent(ptr.To(3), 0), false},
+		{"3 to 1", agent(ptr.To(3), 3), agent(ptr.To(1), 3), false},
+		{"setting a looping 3 back to 1", agent(ptr.To(3), 1), agent(ptr.To(1), 1), false},
+		{"other edits with 3 already set", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
+		{"other edits on a three-server bus", agent(ptr.To(3), 3), agent(ptr.To(3), 3), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateBusConversion(tc.old, tc.new)
+			if tc.refused != (len(errs) == 1) {
+				t.Fatalf("errors %v, want refused = %v", errs, tc.refused)
+			}
+		})
+	}
+	_, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(nil, 1), agent(ptr.To(3), 1))
+	if err == nil || !strings.Contains(err.Error(), "converting a one-server bus is temporarily disabled") || !strings.Contains(err.Error(), "6298") {
+		t.Errorf("ValidateUpdate 1 to 3: %v, want the #6298 refusal", err)
+	}
+}
+
 // busReplicas cannot change while the bus's migration is under way; before
 // and after one, changing it is how a migration starts, so it passes.
 func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
@@ -1329,7 +1368,7 @@ func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
 		old, new *agentv1alpha1.PlatformAgent
 		refused  bool
 	}{
-		{"starting a migration", agent(nil, ""), agent(ptr.To(3), ""), false},
+		{"three to one, starting a migration", agent(ptr.To(3), "Done"), agent(ptr.To(1), "Done"), false},
 		{"turning a running migration around", agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring"), true},
 		{"removing the field mid-migration", agent(ptr.To(3), "Hashing"), agent(nil, "Hashing"), true},
 		{"other edits mid-migration", agent(ptr.To(3), "Hashing"), agent(ptr.To(3), "Hashing"), false},

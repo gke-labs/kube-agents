@@ -397,6 +397,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// 6. The bus's server count, on an update: a change while a migration
 	// runs is refused; otherwise a change is how a migration starts.
 	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
+	allErrs = append(allErrs, validateBusConversion(oldObj, platformAgent)...)
 	// 7. Leaving next while a bus migration holds the bus: the run's
 	// staging claim can hold the only copy of the bus's data.
 
@@ -450,6 +451,27 @@ func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) fie
 	}
 	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
 		fmt.Sprintf("the A2A bus's %s migration is under way (phase %s); busReplicas can change again once it has ended (status.busMigration)", run.Leg, run.Phase))}
+}
+
+// busConversionDisabledMessage is the refusal while converting a one-server
+// bus to three is switched off (#6298).
+const busConversionDisabledMessage = "converting a one-server bus is temporarily disabled; see https://github.com/gke-labs/kube-agents/issues/6298"
+
+// validateBusConversion refuses an update that sets busReplicas to 3 on an
+// existing one-server bus (status.busReplicas recorded as 1), while the
+// one-to-three migration can loop and leave the bus's credentials down
+// (#6298). A create, a bus whose count is not yet recorded, three to one,
+// and an update that leaves an already-set 3 as it is all pass, so a CR
+// caught mid-loop can still be set back to 1 or edited otherwise.
+func validateBusConversion(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
+	if oldObj == nil || oldObj.Status.BusReplicas != 1 {
+		return nil
+	}
+	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
+	if asked == nil || *asked != 3 || (previous != nil && *previous == 3) {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"), busConversionDisabledMessage)}
 }
 
 func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {

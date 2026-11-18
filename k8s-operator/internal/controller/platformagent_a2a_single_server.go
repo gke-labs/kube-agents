@@ -31,11 +31,12 @@ import (
 const (
 	// a2aBusSingleServerReason is the Normal Event a one-server A2A bus gets
 	// once per episode (noteA2ABusSingleServer): it names the outage a node
-	// drain or upgrade causes and the way out of it. Not a condition: a
+	// drain or upgrade causes. It no longer advises converting to three
+	// servers while that conversion is refused (#6298). Not a condition: a
 	// single server is a supported shape, so Ready and Degraded stay as they
 	// are.
 	a2aBusSingleServerReason  = "A2ABusSingleServer"
-	a2aBusSingleServerMessage = "the A2A bus runs one NATS server, so a node drain or upgrade takes it down, typically for about 2 minutes, and longer after a node scale-down; convert to three servers: https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count"
+	a2aBusSingleServerMessage = "the A2A bus runs one NATS server, so a node drain or upgrade takes it down, typically for about 2 minutes, and longer after a node scale-down; converting it to three servers is temporarily disabled: https://github.com/gke-labs/kube-agents/issues/6298"
 )
 
 // noteA2ABusSingleServer writes the A2ABusSingleServer Event once per

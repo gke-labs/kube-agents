@@ -63,7 +63,7 @@ func singleServerReconciler(t *testing.T, objs ...client.Object) (*PlatformAgent
 	return &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: setupScheme(), Recorder: rec}, cl, rec
 }
 
-const wantSingleServerEvent = "Normal A2ABusSingleServer the A2A bus runs one NATS server, so a node drain or upgrade takes it down, typically for about 2 minutes, and longer after a node scale-down; convert to three servers: https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count"
+const wantSingleServerEvent = "Normal A2ABusSingleServer the A2A bus runs one NATS server, so a node drain or upgrade takes it down, typically for about 2 minutes, and longer after a node scale-down; converting it to three servers is temporarily disabled: https://github.com/gke-labs/kube-agents/issues/6298"
 
 // One Event for a bus pod first seen Running, word for word, and none on the
 // passes after it while the same pod runs.
