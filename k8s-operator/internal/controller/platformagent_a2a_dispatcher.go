@@ -650,6 +650,8 @@ type a2aDispatchProfile struct {
 	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter `json:"parameters,omitempty"`
+	// Scripts is lib.DispatchProfile's: the profile's spec.scripts (#5622).
+	Scripts []a2aDispatchScript `json:"scripts,omitempty"`
 	// Durables are the shared durables the operator creates for the profile,
 	// one per (tier, kind), which its grant names list
 	// (dispatcherGrantNames). They aren't written (#5479): the dispatcher
@@ -669,6 +671,13 @@ type a2aDispatchProfile struct {
 	// DrainingTiers is lib.DispatchProfile's (#3659, 2b-ii): tiers that left
 	// a live profile and still drain (agentprofile_tier_drain.go).
 	DrainingTiers []a2aDrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// a2aDispatchScript is lib.DispatchScript.
+type a2aDispatchScript struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
 }
 
 // a2aDrainingTier is lib.DrainingTier.
@@ -813,6 +822,12 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 	}
 	for _, param := range p.Spec.Parameters {
 		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
+	}
+	// A script's run fits the task's deadline as rendered, which the
+	// install's limit may cap below spec.lifecycle's.
+	for _, sc := range p.Spec.Scripts {
+		dp.Scripts = append(dp.Scripts, a2aDispatchScript{Name: sc.Name, Path: sc.Path,
+			TimeoutSeconds: min(int(sc.TimeoutSeconds), dp.ActiveDeadlineSeconds)})
 	}
 	drains, ending := drainingTiersOf(p), endingTiersOf(p)
 	for _, tier := range p.AllowedTierList() {

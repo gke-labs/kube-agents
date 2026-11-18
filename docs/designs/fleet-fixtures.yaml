@@ -10,13 +10,12 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`
-# and `declared-mtu-peering` are project-scoped, so they have no cluster slot).
-# fixtures.json carries `startup-fail-vm`, `world-open-ingress` and
-# `declared-mtu-peering` as project-scoped roles (`cluster_slot: null`), which
-# the runner probes in the project with gcloud; `orphan-disks` is in this file
-# alone. A project-scoped role in fixtures.json must appear here with
-# `slot: null`.
+# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`,
+# `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot` are
+# project-scoped, so they have no cluster slot). fixtures.json carries all but
+# `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
+# probes in the project with gcloud; `orphan-disks` is in this file alone. A
+# project-scoped role in fixtures.json must appear here with `slot: null`.
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -260,6 +259,32 @@ fixtures:
     defect: >-
       Two unattached 10 GB persistent disks. The cost SOP's unattached-disk
       collector filters server-side on creationTimestamp<-P30D.
+
+  - role: declared-orphan-snapshot
+    slot: null # Project-scoped, a global object; not attached to any cluster.
+    available_from_day: 91
+    objects:
+      - snapshot/declared-orphan-snap-<prefix>
+    defect: >-
+      A Persistent Disk snapshot whose source disk is gone: the stack's
+      planter (orphan_snapshot.py) snapshots a 10 GB throwaway disk and
+      deletes it, and no snapshot schedule took the snapshot. The GCE compute
+      audit's orphaned-snapshots check flags it once
+      (now - creationTimestamp).days > 90, so the role is not ready, rather
+      than drifted, until day 91. The posture the pool project's GitOps
+      knowledge/ note is to declare on purpose once the check is ruled
+      declarable, so the compute audit lists it under Declared intent.
+
+  - role: orphan-snapshot
+    slot: null # Project-scoped, a global object; not attached to any cluster.
+    available_from_day: 91
+    objects:
+      - snapshot/orphan-snap-<prefix>
+    defect: >-
+      The second snapshot of the same throwaway disk, the same
+      orphaned-snapshots shape, which no note declares: the control the
+      compute audit keeps filing as a finding beside the declared one.
+      Not ready, rather than drifted, until day 91, as its sibling.
 
   - role: version-laggard
     slot: b
