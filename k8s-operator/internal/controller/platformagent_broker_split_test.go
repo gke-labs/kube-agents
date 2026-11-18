@@ -1281,7 +1281,7 @@ func TestTheManagedEnvPinsTheManagementProjectExceptOnKind(t *testing.T) {
 		want    string
 	}{
 		{"gke", &agentv1alpha1.HarnessSpec{ProjectID: "mgmt-project", Location: "us-east4", ClusterName: "mgmt"}, "GKE_PROJECT_ID=mgmt-project"},
-		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"}, ""},
+		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kube-agents"}, ""},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{
