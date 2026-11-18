@@ -613,11 +613,20 @@ always install the charts.
 
 Turning `install_helm_releases` off on an install whose releases Terraform
 already manages uninstalls them on the next apply. To hand existing releases to
-another pipeline instead, remove them from state first:
-`terraform state rm 'helm_release.kube_agents[0]' 'helm_release.cert_manager[0]'`.
-An install from before this setting holds the release at
-`helm_release.kube_agents`. The first apply moves it to
-`helm_release.kube_agents[0]` without touching the release.
+another pipeline instead, remove them from state first, whichever address the
+state holds them at:
+
+```bash
+terraform state list | grep -E '^helm_release\.(kube_agents|cert_manager)(\[0\])?$' | xargs terraform state rm
+```
+
+An install from before this setting holds the kube-agents release at
+`helm_release.kube_agents`, without `[0]`, until an apply moves it (the move
+touches nothing in the cluster). Given several addresses, `terraform state rm`
+removes the ones it finds and exits 0 even when another matches nothing, so
+naming only the `[0]` addresses on such a state would leave the kube-agents
+release in state, and the next apply with `install_helm_releases = false` would
+uninstall it.
 
 ### Installing from a mirrored registry
 
