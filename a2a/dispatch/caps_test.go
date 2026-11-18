@@ -22,7 +22,7 @@ func fill(t *testing.T, d *Dispatcher, snap lib.DispatchConfig, profile, tier, k
 	t.Helper()
 	p, _ := profileOf(snap, profile)
 	for i := 0; i < n; i++ {
-		if h, why := d.reserve(snap, p, tier, kind, fmt.Sprintf("%s-%s-%s-%d-%d", profile, tier, kind, i, len(d.active))); h == nil {
+		if h, why := d.reserve(snap, p, tier, kind, fmt.Sprintf("%s-%s-%s-%d-%d", profile, tier, kind, i, len(d.active)), false); h == nil {
 			t.Fatalf("reserve %s/%s/%s #%d refused: %s", profile, tier, kind, i, why)
 		}
 	}
@@ -30,7 +30,7 @@ func fill(t *testing.T, d *Dispatcher, snap lib.DispatchConfig, profile, tier, k
 
 func refused(d *Dispatcher, snap lib.DispatchConfig, profile, tier, kind string) string {
 	p, _ := profileOf(snap, profile)
-	h, why := d.reserve(snap, p, tier, kind, "probe")
+	h, why := d.reserve(snap, p, tier, kind, "probe", false)
 	if h != nil {
 		d.release(h, false)
 		return ""

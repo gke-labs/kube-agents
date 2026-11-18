@@ -273,6 +273,53 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, vcs_client.BROKER_ROUTE_UNSUPPORTED)
         self.assertIn("issue-update", str(caught.exception))
 
+    def test_a_2xx_whose_json_body_is_not_an_object_reads_as_an_answer_that_is_not_json(self):
+        """Through the real `vcs_call`: a 2xx whose body is valid JSON but not an
+        object. The caller gets the error of a 2xx body that is not JSON, and
+        no consumer meets an `AttributeError` on a list or on `None`."""
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        for body in (b"[]", b"null"):
+
+            def answer(request, *args, body=body, **kwargs):
+                return io.BytesIO(body)
+
+            with self.subTest(body=body), mock.patch.dict(os.environ, environment), mock.patch.object(
+                vcs_client.credential_proxy_client, "open_broker_request", answer
+            ):
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.call("capabilities", {"repository": "acme/infra"})
+                self.assertIsNone(caught.exception.code)
+                self.assertIn("not JSON", str(caught.exception))
+                with self.assertRaises(vcs_client.VcsError):
+                    vcs_client.base_branch("acme/infra")
+
+    def test_a_body_nested_too_deep_for_the_parser_reads_as_an_error_of_this_module_on_both_paths(self):
+        """Through the real `vcs_call`, with the parser's RecursionError given
+        directly: a 2xx reads as an answer that is not JSON, a refusal as its
+        status. No consumer meets the RecursionError."""
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        client = vcs_client.credential_proxy_client
+        too_deep = mock.patch.object(client.json, "load", side_effect=RecursionError("maximum recursion depth exceeded"))
+
+        def answer(request, *args, **kwargs):
+            return io.BytesIO(b"[]")
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(client, "open_broker_request", answer), too_deep:
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("capabilities", {"repository": "acme/infra"})
+        self.assertIsNone(caught.exception.code)
+        self.assertIn("not JSON", str(caught.exception))
+
+        refusal = urllib.error.HTTPError("http://127.0.0.1:1/v1/vcs/capabilities", 502, "refused", {}, io.BytesIO(b"[]"))
+        self.addCleanup(refusal.close)
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            client, "open_broker_request", side_effect=refusal
+        ), too_deep:
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("capabilities", {"repository": "acme/infra"})
+        self.assertIsNone(caught.exception.code)
+        self.assertIn("HTTP 502", str(caught.exception))
+
     def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
         """The other half: a bare 404 is the only one read as a missing route.
 
@@ -998,6 +1045,83 @@ class WorkingCopyTest(unittest.TestCase):
             vcs_client.publish("acme/infra", advance=True)
         self.assertIn("branch and target are both", str(caught.exception))
         self.assertEqual(self.published, [])
+
+    def test_publish_blocks_decision_memory_guard_and_appends_section_on_pass(self):
+        (self.origin / "knowledge" / "lessons").mkdir(parents=True)
+        (self.origin / "knowledge" / "lessons" / "LES-2026-001-checkout-memory.md").write_text(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-001\n"
+            "title: Keep checkout memory request >= 2Gi\n"
+            "status: active\n"
+            "date: 2026-03-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/checkout.yaml\n"
+            "guard:\n"
+            "  rule: Keep checkout memory request >= 2Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/checkout.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: '>='\n"
+            "    value: 2Gi\n"
+            "evidence:\n"
+            "  pull_request: '#10'\n"
+            "---\n\n"
+            "## What happened\n\nOOMKilled below 2Gi.\n"
+        )
+        git(self.origin, "add", "-A")
+        git(self.origin, "commit", "--quiet", "-m", "seed LES-2026-001 on main")
+        self.head = git(self.origin, "rev-parse", "HEAD").stdout.strip()
+
+        cloned = vcs_client.clone("acme/infra", key="fix/mem")
+        tree = Path(cloned["path"])
+        vcs_client.branch("acme/infra", "fix/mem", key="fix/mem")
+        (tree / "clusters" / "prod").mkdir(parents=True)
+        (tree / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n"
+        )
+        vcs_client.commit(
+            "lower memory to 512Mi",
+            ["clusters/prod/checkout.yaml"],
+            spec="acme/infra",
+            key="fix/mem",
+        )
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.publish("acme/infra", key="fix/mem")
+        self.assertEqual(caught.exception.code, vcs_client.DECISION_MEMORY_BLOCKED)
+        self.assertIsInstance(caught.exception, PermissionError)
+        self.assertIn("LES-2026-001", str(caught.exception))
+        self.assertEqual(self.published, [])
+
+        # Fix the manifest to satisfy the guard; publish succeeds and proposal-create gets the section.
+        (tree / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n"
+        )
+        vcs_client.commit("raise memory to 4Gi", spec="acme/infra", key="fix/mem")
+        vcs_client.publish("acme/infra", key="fix/mem")
+        self.assertEqual(len(self.published), 1)
+
+        seen_forge = []
+        with mock.patch.object(
+            vcs_client,
+            "call",
+            side_effect=lambda verb, payload: seen_forge.append((verb, payload))
+            or {"proposal": {"url": "https://forge.test/pr/1", "number": 1, "title": "t"}},
+        ):
+            vcs_client.forge(
+                "proposal-create",
+                {"title": "Raise memory", "body": "Summary.", "source": "fix/mem", "target": "main"},
+                repository="acme/infra",
+            )
+        self.assertEqual(len(seen_forge), 1)
+        self.assertIn("### Prior decisions and lessons", seen_forge[0][1]["body"])
+        self.assertIn("LES-2026-001", seen_forge[0][1]["body"])
 
 
 def build_tar(*members: tuple[tarfile.TarInfo, bytes | None]) -> bytes:

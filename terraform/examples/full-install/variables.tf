@@ -945,6 +945,13 @@ variable "backup_encryption_key" {
   default     = ""
 }
 
+variable "install_helm_releases" {
+  description = "Install the cert-manager and kube-agents Helm releases on the cluster this configuration creates. Set to false to build only the Google Cloud side (APIs, cluster, IAM, Pub/Sub, the minter) and install the charts from a separate pipeline: the kube_agents_helm_release, kube_agents_helm_values and cert_manager_helm_release outputs carry what that pipeline needs (the values output is sensitive: it holds every credential the install was given), and the Helm provider is then never used, so this run need not reach the cluster's control plane. Turning it off on an install whose releases Terraform already manages uninstalls them on the next apply; remove them from state first (terraform state rm) to hand them to the other pipeline. install.sh and upgrade.sh always install the charts; lifecycle.sh apply works with it off, and lifecycle.sh destroy still tries to reach the cluster to delete the PlatformAgent."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 variable "enable_cert_manager" {
   description = "Install cert-manager, which issues the serving certificate for the operator's admission webhooks. Set to false when the target cluster already runs cert-manager: Terraform does not detect an existing install and the apply fails on the existing CRDs (install.sh probes for one on the existing-cluster path and sets this for you). Turning this off with enable_webhooks left on leaves the webhooks without a certificate."
   type        = bool
@@ -1066,7 +1073,7 @@ variable "drift_pubsub_logging_identity_propagation_duration" {
 }
 
 variable "enable_drift_detector" {
-  description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a helm_release precondition enforces: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
+  description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a precondition on the kube_agents_helm_values output enforces on every plan: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
   type        = bool
   default     = false
 }

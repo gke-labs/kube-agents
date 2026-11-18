@@ -99,7 +99,8 @@ byte that reaches the broker by another route. The table matches exact text, and
 it saw must be what is forwarded; the query check is also what keeps a byte`http.client`will not put on a request line from surfacing as a traceback, and a`UnicodeError`or`InvalidURL` from the upstream request is answered with the same 400 as a second line
 (`UnicodeError`and not`ValueError`: `ssl.SSLCertVerificationError`is a`ValueError` too,
    and a TLS fault is answered as the upstream's, 502).
-3. Evaluates `api_policy.evaluate(method, host, path, query)`. A refusal answers 403 with the
+3. Evaluates `api_policy.evaluate(method, host, path, query, universe_domain=...)` with the
+   install's universe domain. A refusal answers 403 with the
    same body shape `/v1/exec` uses, so a caller that already reads `rule` and `message` reads
    these:
 
@@ -161,8 +162,9 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)), so
    a relayed read is in the same `tool_execution_audit` trail as a brokered command. The
    `tool` is `gcp-api`, apart from `gcloud` so that a `gcloud` record still means a process
-   ran; the `subcommand` is the service word of a host the table names (`monitoring`,
-   `cloudtrace`, `container`, `logging`) and `other` for any other host. The first line is `started`; the
+   ran; the `subcommand` is the service word of a host the table names in the install's
+   universe domain (`monitoring`, `cloudtrace`, `container`, `logging`) and `other` for any
+   other host, the commercial host on a custom universe domain included. The first line is `started`; the
    verdict is `rejected` for a 400, `blocked` with the `rule` for a 403, `completed` with
    `duration_ms` and `upstream_status` for a forwarded answer whatever its status, and
    `failed` for the disabled relay, a credential the broker cannot obtain and each upstream
@@ -202,8 +204,8 @@ Authorization: Bearer <projected caller token>
 The handler decides on the method, host and path before it reads a byte of the body. A `POST`
 that is not, exactly, a table entry with a body check is refused with `gcp.api.method` and its
 body is drained and discarded, as before. On an install with a custom universe domain the
-entry's host is that universe's Logging host, as for the `GET` routes, and the commercial host
-is refused. For the entry, in order:
+entry's host is that universe's Logging host and the commercial host is refused, by the rule
+[the policy module](#the-policy-module) states for every route. For the entry, in order:
 
 1. The query must be empty (`gcp.api.body`): the read's arguments are its body, and a query
    is a second place to put one.
@@ -292,16 +294,26 @@ validator refuses a table that names one. `PROJECT` is Google's project-id gramm
 number (a decimal int64), since an install's `projectId` may be either, and `HOST_SHAPE` the host
 grammar the table and the handler share.
 
+`evaluate` reads the table in the install's universe domain, which the handler passes to it. On
+the commercial domain, `googleapis.com`, the hosts are as the table writes them. On a custom
+universe domain each `<service>.googleapis.com` host of the table is read as
+`<service>.<universe domain>`, so the host as the table writes it is in no route there: a `GET`
+for it is refused with `gcp.api.host`, any other method at step 1. A `REFUSED_HOSTS` entry is
+refused there as written, and a `<service>.googleapis.com` entry also as
+`<service>.<universe domain>`. A universe domain that is not valid, which is a malformed one or
+one under `googleapis.com`, has no routed host, so every request is refused: a `GET` with
+`gcp.api.host`, any other method at step 1. The broker does not start with such a value.
+
 `evaluate` answers in this order, and the order is the security argument:
 
 1. A `POST` that is not exactly the host and path of an entry with a body check, or any
    method other than `GET` and `POST` → `gcp.api.method`. A `POST` that is such an entry is
    allowed here when its query is empty (`gcp.api.body` otherwise), and its body is still to
    pass `evaluate_body`.
-2. Host in `REFUSED_HOSTS` → `gcp.api.host-refused`. Listed separately from an unknown host so
+2. Host in `REFUSED_HOSTS`, in either of those forms → `gcp.api.host-refused`. Listed separately from an unknown host so
    the log distinguishes "asked for a token endpoint" from "asked for a service nobody has
    added".
-3. Host not in any route → `gcp.api.host`.
+3. Host not in any route for the universe domain → `gcp.api.host`.
 4. Host known, path matches no route → `gcp.api.path`, with the message naming the rule ids
    that host does have.
 5. Otherwise allowed, carrying the matching `rule_id` for the audit line.
@@ -380,13 +392,19 @@ class ApiSession:
 `relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
 where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set and well-formed, else
 `CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
-has the routing and the fallback). `requests` is imported inside the
+has the routing and the fallback). When the caller's environment names a custom universe domain
+(`GOOGLE_CLOUD_UNIVERSE_DOMAIN`, which the sandbox entrypoint forwards to each sandbox SSH
+session, then `CLOUDSDK_CORE_UNIVERSE_DOMAIN`), `relay_url` also rewrites a
+`<service>.googleapis.com` host to `<service>.<universe domain>`, the form in which
+[the policy module](#the-policy-module) reads the table's hosts there.
+`requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module
 stay free of it; `http` is injectable for tests and for a caller that already holds a session.
 
 Two properties of that shape are the point. A collector's URL literal,
 `https://monitoring.googleapis.com/v3/projects/{project}/timeSeries`, stays as written, so a
-manifest's evidence label still names the real endpoint. And the object satisfies a
+manifest's evidence label still names the Google endpoint the collector reads, in its commercial
+form on a custom universe domain. And the object satisfies a
 `SessionFn`-style contract — "anything with a `requests`-shaped `.get(url, params=,
 timeout=)`" — so code written against `google.auth.transport.requests.AuthorizedSession`
 runs against it unchanged.
@@ -591,7 +609,7 @@ The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py
 and `gke_cluster_reads.py` makes the Cluster Agent reconcile's GKE list and get reads;
 `logging_reads.py` makes the stockout collector's and the readiness report's log reads, and falls back to `gcloud logging read`),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
-`ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
+`ApiSession()` instead of from `google.auth`, keeps its URL literals as the commercial endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's
 `limitations` note rather than as zero usage, which is the reading the cost SOP already
 prescribes for a usage check that did not run. Nothing in the sandbox can use `google.auth`,

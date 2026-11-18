@@ -179,6 +179,22 @@ resource "null_resource" "burst" {
       MANIFEST
       echo "Planted ${var.pod_count} pods in ${local.ns}."
 
+      # ---- 1b. Record what was planted -------------------------------------
+      # The verifier joins ledger rows to these UIDs, not to the pods still
+      # there at the check: a bare pod the platform deletes mid-run (a node
+      # removed under it) is not recreated, and its admitted alert and its
+      # start still count (#5925). The verifier also requires every live pod
+      # to be in the record. Immutable, so a later write fails.
+      planted="$(${local.kubectl} get pods -l app=${local.prefix} \
+        -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{.metadata.name}{"\n"}{end}')"
+      recorded="$(printf '%s\n' "$planted" | grep -c . || true)"
+      if [ "$recorded" -ne ${var.pod_count} ]; then
+        echo "ERROR: listed $recorded pods labelled app=${local.prefix} in ${local.ns} right after planting ${var.pod_count}." >&2
+        exit 1
+      fi
+      ${local.kubectl} create configmap "${var.planted_record}" --from-literal=pods="$planted"
+      ${local.kubectl} patch configmap "${var.planted_record}" --type=merge -p '{"immutable":true}'
+
       # ---- 2. Wait for the watcher to fire for every pod --------------------
       # The same log source and the same since-time read as autoops-incident's
       # step 3. A `fire` line is written only after the daemon answered
@@ -219,6 +235,9 @@ resource "null_resource" "burst" {
         elapsed=$((elapsed + 10))
       done
       echo "k8s-event-watcher fired for all ${var.pod_count} pods in ${local.ns} after $${elapsed}s."
+      # Where each pod runs, for the gone-pod report after the wait.
+      placed="$(${local.kubectl} get pods -l app=${local.prefix} \
+        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' || true)"
 
       # ---- Let the starts finish ---------------------------------------------
       # A fire means the daemon admitted the alert and queued its start; the
@@ -230,6 +249,35 @@ resource "null_resource" "burst" {
       # plant's.
       echo "Waiting ${var.start_settle_seconds}s for the triage starts to finish."
       sleep ${var.start_settle_seconds}
+
+      # ---- 3. Report a planted pod that is gone ------------------------------
+      # Diagnostic only: the verifier grades a gone pod from the record. The
+      # node's state and events say why it went (a repair, an upgrade, a
+      # scale-down) while the API still holds them. Best effort throughout.
+      set +e
+      if ! present="$(${local.kubectl} get pods -l app=${local.prefix} \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"; then
+        echo "Could not list the pods in ${local.ns} after the wait; no gone-pod report."
+        present="$(printf '%s\n' "$planted" | awk '{print $2}')"
+      fi
+      while read -r _ name; do
+        [ -n "$name" ] || continue
+        grep -qx "$name" <<<"$present" && continue
+        node="$(awk -v n="$name" '$1 == n {print $2}' <<<"$placed")"
+        echo "NOTE: planted pod $name is gone from ${local.ns}; it ran on node '$node'. The check grades it from the record ${var.planted_record}."
+        ${local.kubectl} get events --field-selector "involvedObject.name=$name" --sort-by=.lastTimestamp | tail -10
+        [ -n "$node" ] || continue
+        if kubectl get node "$node" >/dev/null 2>&1; then
+          echo "Node $node still exists. Its taints and unschedulable flag:"
+          kubectl get node "$node" -o jsonpath='{.spec.taints}{" unschedulable="}{.spec.unschedulable}{"\n"}'
+        else
+          echo "Node $node no longer exists."
+        fi
+        echo "Events for node $node:"
+        kubectl get events -A --field-selector "involvedObject.kind=Node,involvedObject.name=$node" \
+          --sort-by=.lastTimestamp | tail -20
+      done <<<"$planted"
+      set -e
     EOT
   }
 

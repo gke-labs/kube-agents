@@ -161,6 +161,47 @@ Takes a dict: {repository, tag, name (optional), root (the root context)}.
 {{- end }}
 
 {{/*
+The A2A NATS bus's four image pins, the same as values.yaml's a2aBus.images: what
+kube-agents.a2aBusImage falls back to when the release's values carry no a2aBus key.
+`helm upgrade --reuse-values` from a release before the key renders this chart against
+that release's values, so the key is absent there, and skipping the four would leave the
+operator on its compiled Docker Hub defaults, which on a mirrored install is the one pull
+an admission policy refuses. A second copy of the pins, so hack/check-image-inventory.sh
+renders the chart without a2aBus and holds this copy to images.json; keep it in step with
+values.yaml.
+*/}}
+{{- define "kube-agents.a2aBusImageDefaults" -}}
+nats:
+  repository: docker.io/library/nats
+  tag: "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
+natsBox:
+  repository: docker.io/natsio/nats-box
+  tag: "0.14.5"
+configReloader:
+  repository: docker.io/natsio/nats-server-config-reloader
+  tag: "0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c"
+prometheusExporter:
+  repository: docker.io/natsio/prometheus-nats-exporter
+  tag: "0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255"
+{{- end }}
+
+{{/*
+One A2A NATS bus image reference for the operator's environment: a2aBus.images.<key>'s
+repository and tag, each falling back to kube-agents.a2aBusImageDefaults when the values
+carry none, rendered through kube-agents.thirdPartyImage, so a mirrored install pulls
+<prefix>/<name>:<tag> and an unmirrored one the full pin, digest included.
+
+Takes a dict: {root (the root context), key (nats, natsBox, configReloader or
+prometheusExporter)}.
+*/}}
+{{- define "kube-agents.a2aBusImage" -}}
+{{- $defaults := index (include "kube-agents.a2aBusImageDefaults" . | fromYaml) .key -}}
+{{- $images := (.root.Values.a2aBus | default dict).images | default dict -}}
+{{- $image := index $images .key | default dict -}}
+{{- include "kube-agents.thirdPartyImage" (dict "repository" ($image.repository | default $defaults.repository) "tag" ($image.tag | default $defaults.tag) "root" .root) -}}
+{{- end }}
+
+{{/*
 Whether the chart renders the A2A gateway's pod admission policy
 (templates/a2a-gateway-pod-admission-policy.yaml): the admission-policy values gate,
 on a cluster where ValidatingAdmissionPolicy is v1. The template renders on this, and
@@ -226,18 +267,18 @@ keeps the container's env free of a duplicate name. `| default dict` because
 Whether the A2A bus's pods carry the NATS exporter sidecar, so its PodMonitoring and
 scrape-alert job render: "true" unless the operator omits the sidecar, which it does when
 A2A_NATS_IMAGE is set and A2A_NATS_EXPORTER_IMAGE is not (a2aNATSExporterOmitted). The
-chart sets both from a2aBus.images (operator-deployment.yaml), so the sidecar is omitted
-only when operator.extraEnv clears the exporter's and leaves the bus image set. An entry
+chart sets both on every render (kube-agents.a2aBusImage, from a2aBus.images or its own
+defaults, so a release whose values have no a2aBus key counts as set too), so the sidecar is
+omitted only when operator.extraEnv clears the exporter's and leaves the bus image set, or
+sets the bus image alone (then the chart's exporter pin stays out: a2aBusExporterFromChart). An entry
 counts as set when it has a non-empty value or a valueFrom, and the last entry for a name
 wins, as it does in the operator container's env (operator-deployment.yaml appends extraEnv
 after the chart's own): a later empty entry clears an earlier one. Without the sidecar the
 scrape would only ever read down.
 */}}
 {{- define "kube-agents.a2aNATSExporterRendered" -}}
-{{- $bus := (.Values.a2aBus | default dict).images | default dict -}}
-{{- $set := dict -}}
-{{- if $bus.nats -}}{{- $_ := set $set "A2A_NATS_IMAGE" true -}}{{- end -}}
-{{- if and $bus.prometheusExporter (include "kube-agents.a2aBusExporterFromChart" .) -}}{{- $_ := set $set "A2A_NATS_EXPORTER_IMAGE" true -}}{{- end -}}
+{{- $set := dict "A2A_NATS_IMAGE" true -}}
+{{- if include "kube-agents.a2aBusExporterFromChart" . -}}{{- $_ := set $set "A2A_NATS_EXPORTER_IMAGE" true -}}{{- end -}}
 {{- range $e := (.Values.operator.extraEnv | default list) -}}
 {{- $e = $e | default dict -}}
 {{- $name := toString (index $e "name") -}}
@@ -1942,7 +1983,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (mulf (float64 $n) $mult) 1000.0)) -}}
 {{- end -}}
 {{- end -}}
 {{- range $unit, $mult := $decimalCores -}}
@@ -1951,14 +1992,14 @@ honest — a quota that large cannot constrain this release either way.
 {{- if not (regexMatch $numeric $n) -}}
 {{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (mulf (float64 $n) $mult) 1000.0)) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $out "" -}}
 {{- if not (regexMatch $numeric $raw) -}}
 {{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
-{{- $out = include "kube-agents.clampInt64" (mulf (float64 $raw) 1000.0) -}}
+{{- $out = include "kube-agents.clampInt64" (ceil (mulf (float64 $raw) 1000.0)) -}}
 {{- end -}}
 {{- $out -}}
 {{- end -}}
@@ -3124,6 +3165,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end -}}
 {{- $op := (index $footprint "operatorRendered") | default dict -}}
 
+{{- $session := dict -}}
 {{- $reqPods := 0 -}}
 {{- $reqCpu := 0 -}}
 {{- $limCpu := 0 -}}
@@ -3568,6 +3610,28 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
     {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
   {{- end -}}
+  {{- /* The session pods (a2a-worker): the gateway creates one per delegation or /session
+         conversation, up to maxSessions at once, in this namespace. No golden renders one,
+         so the footprint carries one pod's worth (operatorRenderedPerReplica.sessionPod,
+         read from the session env the operator renders on the gateway) and the default
+         cap. Each key a platformAgent.harness.tuning.sessionResources override sets
+         replaces the default, as the operator's resolver does; ephemeral storage is fixed.
+         The share is kube-agents.quotaSessionShare's, computed always and reported apart
+         in the requirements (the session* keys); kube-agents.quotaCountsSessions decides whether it is in the
+         totals the hard check compares. No surge term: a session pod is not rolled. Exactly
+         maxSessions: the gateway can briefly run one more while it replaces a session at the
+         cap, or overshoot in its count-then-create race; the operator's own session quota
+         has a margin for that, and this check does not. */ -}}
+  {{- $session = include "kube-agents.quotaSessionShare" . | fromJson -}}
+  {{- if eq (include "kube-agents.quotaCountsSessions" .) "true" -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.clampInt64" $session.pods | int64)) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.clampInt64" $session.requestsCpu | int64)) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.clampInt64" $session.limitsCpu | int64)) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.clampInt64" $session.requestsMemory | int64)) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.clampInt64" $session.limitsMemory | int64)) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.clampInt64" $session.requestsEphemeral | int64)) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.clampInt64" $session.limitsEphemeral | int64)) | int64 -}}
+  {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
          #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
          (operator.profileDispatcher.enabled false) it is still counted, which over-counts
@@ -3753,7 +3817,122 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       "surgeRequestsMemory" $surgeMemReq "surgeLimitsMemory" $surgeMemLim
       "surgeRequestsEphemeral" $surgeEphReq "surgeLimitsEphemeral" $surgeEphLim
       "chartSurgePods" $chartSurgePods
+      "maxSessions" (include "kube-agents.clampInt64" ($session.maxSessions | default 0) | int64)
+      "sessionPods" (include "kube-agents.clampInt64" ($session.pods | default 0) | int64)
+      "sessionRequestsCpu" (include "kube-agents.clampInt64" ($session.requestsCpu | default 0) | int64) "sessionLimitsCpu" (include "kube-agents.clampInt64" ($session.limitsCpu | default 0) | int64)
+      "sessionRequestsMemory" (include "kube-agents.clampInt64" ($session.requestsMemory | default 0) | int64) "sessionLimitsMemory" (include "kube-agents.clampInt64" ($session.limitsMemory | default 0) | int64)
+      "sessionRequestsEphemeral" (include "kube-agents.clampInt64" ($session.requestsEphemeral | default 0) | int64) "sessionLimitsEphemeral" (include "kube-agents.clampInt64" ($session.limitsEphemeral | default 0) | int64)
    | toJson -}}
+{{- end }}
+
+{{- /* Whether the hard quota check counts the session pods at the cap. The one switch for
+       that decision: the share itself is always computed and reported (the session* keys
+       of kube-agents.quotaRequirements), and the installer's summary prints it either way. */ -}}
+{{- define "kube-agents.quotaCountsSessions" -}}
+true
+{{- end }}
+
+{{- /* The session pods' quota share at the cap, as JSON: maxSessions and the totals, keyed
+       as kube-agents.quotaRequirements keys its own.
+       maxSessions is platformAgent.harness.tuning.maxSessions, else the footprint's default
+       (the operator's resolveA2AMaxSessions); requests and limits are the footprint's
+       session pod with each key a platformAgent.harness.tuning.sessionResources override
+       sets laid over it, then each request held to its limit (ResolveSessionResources in
+       k8s-operator/api/v1alpha1). A footprint with no session pod fails rather than counting
+       sessions as zero. Takes the root context. */ -}}
+{{- define "kube-agents.quotaSessionShare" -}}
+{{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
+{{- $pod := index ((index $footprint "operatorRenderedPerReplica") | default dict) "sessionPod" | default dict -}}
+{{- if not $pod -}}
+  {{- fail "quota preflight: footprint.yaml has no operatorRenderedPerReplica.sessionPod entry, so the session pods cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+{{- end -}}
+{{- $tuning := ((.Values.platformAgent | default dict).harness | default dict).tuning | default dict -}}
+{{- /* The installer summary in NOTES.txt and the preflight can render before the CR
+       template, so a malformed override must fail here naming its key, not in the
+       quantity parsers below with "please report it". */ -}}
+{{- include "kube-agents.sessionResourcesCheck" (dict "resources" $tuning.sessionResources "prefix" "platformAgent.harness.tuning.sessionResources") -}}
+{{- $count := $pod.maxSessionsDefault | int64 -}}
+{{- if and (hasKey $tuning "maxSessions") (not (kindIs "invalid" $tuning.maxSessions)) -}}
+  {{- $count = $tuning.maxSessions | int64 -}}
+{{- end -}}
+{{- $override := include "kube-agents.resourcesOverrideQuantities" ($tuning.sessionResources | default dict) | fromJson -}}
+{{- $oReq := (index $override "requests") | default dict -}}
+{{- $oLim := (index $override "limits") | default dict -}}
+{{- /* ResolveSessionResources (k8s-operator/api/v1alpha1), key by key: a key counts as
+       set only as a positive quantity, so zero or a negative one (a CR typo the gateway
+       would refuse at start) keeps its default. Negative is read off the sign before
+       parsing, since the quantity parsers take no sign. */ -}}
+{{- $set := dict -}}
+{{- $figures := dict "requests.cpu" ($pod.cpuMillisRequest | int64) "limits.cpu" ($pod.cpuMillisLimit | int64) "requests.memory" ($pod.memoryBytesRequest | int64) "limits.memory" ($pod.memoryBytesLimit | int64) -}}
+{{- range $side, $sideOverride := dict "requests" $oReq "limits" $oLim -}}
+  {{- range $resource := list "cpu" "memory" -}}
+    {{- $raw := index $sideOverride $resource -}}
+    {{- if and $raw (not (hasPrefix "-" (toString $raw))) -}}
+      {{- $v := 0 -}}
+      {{- if eq $resource "cpu" -}}
+        {{- $v = include "kube-agents.parseCpuMillis" $raw | int64 -}}
+      {{- else -}}
+        {{- $v = include "kube-agents.parseBytes" $raw | int64 -}}
+      {{- end -}}
+      {{- if gt $v 0 -}}
+        {{- $_ := set $figures (printf "%s.%s" $side $resource) $v -}}
+        {{- $_ := set $set (printf "%s.%s" $side $resource) true -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- /* Then, per resource, a request above its limit: with the request set and the limit
+       not, the limit rises to the request (requests.memory: 4Gi alone runs 4Gi/4Gi);
+       otherwise the request drops to the limit (limits.memory: 256Mi alone runs
+       256Mi/256Mi). */ -}}
+{{- range $resource := list "cpu" "memory" -}}
+  {{- $req := index $figures (printf "requests.%s" $resource) | int64 -}}
+  {{- $lim := index $figures (printf "limits.%s" $resource) | int64 -}}
+  {{- if gt $req $lim -}}
+    {{- if and (hasKey $set (printf "requests.%s" $resource)) (not (hasKey $set (printf "limits.%s" $resource))) -}}
+      {{- $_ := set $figures (printf "limits.%s" $resource) $req -}}
+    {{- else -}}
+      {{- $_ := set $figures (printf "requests.%s" $resource) $lim -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $cpuReq := index $figures "requests.cpu" | int64 -}}
+{{- $cpuLim := index $figures "limits.cpu" | int64 -}}
+{{- $memReq := index $figures "requests.memory" | int64 -}}
+{{- $memLim := index $figures "limits.memory" | int64 -}}
+{{- $ephReq := $pod.ephemeralStorageBytesRequest | int64 -}}
+{{- $ephLim := $pod.ephemeralStorageBytesLimit | int64 -}}
+{{- /* On GKE Autopilot the pod is admitted at Autopilot's figures, not the gateway's, and
+       a namespace ResourceQuota counts what is admitted. The requests are modeled as the
+       rest of this file models Autopilot, without Pod bursting: each CPU request rounds up
+       to a multiple of 250m, 250m at least; a memory request is 512Mi at least; and the
+       pair is held inside Autopilot's 1 to 6.5 GiB per vCPU, memory raised for a large CPU
+       request and CPU raised for a large memory request, as Autopilot raises them. With
+       bursting the minimums are lower, so the requests over-count there. The limits are
+       the resolved limits, each raised to its request: without bursting Autopilot sets them
+       equal to the requests, below this, and with bursting it keeps them, so counting the
+       larger is the safe side either way, as the credential proxy's limits are counted. */ -}}
+{{- if include "kube-agents.gkeAutopilot" . -}}
+  {{- /* In float64, rounded up and clamped like satAdd and satMul, so an oversized
+         override saturates rather than wrapping, and no step truncates before the
+         round-up. 1.625 GiB (1744830464 bytes) is one 250m step at 6.5 GiB per vCPU. */ -}}
+  {{- $cpuReq = max (include "kube-agents.clampInt64" (mulf (ceil (divf (float64 $cpuReq) 250.0)) 250.0) | int64) 250 | int64 -}}
+  {{- $memReq = max $memReq 536870912 | int64 -}}
+  {{- /* At least 1 GiB per vCPU. */ -}}
+  {{- $memFloor := include "kube-agents.clampInt64" (ceil (divf (mulf (float64 $cpuReq) 1073741824.0) 1000.0)) | int64 -}}
+  {{- $memReq = max $memReq $memFloor | int64 -}}
+  {{- /* At most 6.5 GiB per vCPU: CPU of at least memory / 6.5 GiB, in 250m steps. */ -}}
+  {{- $cpuFloor := include "kube-agents.clampInt64" (mulf (ceil (divf (float64 $memReq) 1744830464.0)) 250.0) | int64 -}}
+  {{- $cpuReq = max $cpuReq $cpuFloor | int64 -}}
+  {{- $cpuLim = max $cpuLim $cpuReq | int64 -}}
+  {{- $memLim = max $memLim $memReq | int64 -}}
+{{- end -}}
+{{- $perPod := dict "pods" ($pod.pods | default 1 | int64) "requestsCpu" $cpuReq "limitsCpu" $cpuLim "requestsMemory" $memReq "limitsMemory" $memLim "requestsEphemeral" $ephReq "limitsEphemeral" $ephLim -}}
+{{- $out := dict "maxSessions" $count -}}
+{{- range $key, $v := $perPod -}}
+  {{- $_ := set $out $key (include "kube-agents.satMul" (dict "a" $v "b" $count) | int64) -}}
+{{- end -}}
+{{- $out | toJson -}}
 {{- end }}
 
 {{- define "kube-agents.quotaCheckItems" -}}
@@ -3937,6 +4116,11 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- if $constrainsEphemeral -}}
         {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because the operator, the minter, the Hindsight API and several operator-rendered containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
       {{- end -}}
+      {{- /* Name the session share when the totals carry it, so a quota sized for the
+             standing release reads why it no longer fits, and what scales it. */ -}}
+      {{- if and (eq (include "kube-agents.quotaCountsSessions" $ctx) "true") (gt (include "kube-agents.clampInt64" ($r.sessionPods | default 0) | int64) 0) -}}
+        {{- $ephNote = printf "%s\n(required includes the session pods at the cap: %d pods, %dm CPU and %dMi memory requested%s; platformAgent.harness.tuning.maxSessions and sessionResources scale them)" $ephNote (include "kube-agents.clampInt64" $r.sessionPods | int64) (include "kube-agents.clampInt64" $r.sessionRequestsCpu | int64) (div (include "kube-agents.clampInt64" $r.sessionRequestsMemory | int64) 1048576) (ternary ", at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request" "" (eq (include "kube-agents.gkeAutopilot" $ctx) "true")) -}}
+      {{- end -}}
       {{- $report := printf "ResourceQuota %q in namespace %q has insufficient capacity for release %q:\n%s\n\nRemediation: increase the quota with:\n  %s\n(those values leave room for one rollout surge Pod, except for claim counts and storage, which a surge Pod does not add to)%s" $qName $ctx.Release.Namespace $ctx.Release.Name (join "\n" $shortfalls) $patchCmd $ephNote -}}
       {{- $quotaReports = append $quotaReports $report -}}
     {{- end -}}
@@ -4002,6 +4186,16 @@ us-central1
 
 {{- define "kube-agents.footprintSummary" -}}
 {{- $r := include "kube-agents.quotaRequirements" . | fromJson -}}
+{{- /* The standing release only: the session pods come and go with conversations, so
+       they are reported on their own line and kept out of the figures and the cost,
+       whether or not the quota check counts them. */ -}}
+{{- $counted := eq (include "kube-agents.quotaCountsSessions" .) "true" -}}
+{{- if $counted -}}
+  {{- $r = merge (dict
+        "requestsCpu" (sub ($r.requestsCpu | int64) (include "kube-agents.clampInt64" $r.sessionRequestsCpu | int64))
+        "requestsMemory" (sub ($r.requestsMemory | int64) (include "kube-agents.clampInt64" $r.sessionRequestsMemory | int64))
+        "pods" (sub ($r.pods | int64) (include "kube-agents.clampInt64" $r.sessionPods | int64))) $r -}}
+{{- end -}}
 {{- $bytesPerGiB := 1073741824.0 -}}
 {{- $millisPerCore := 1000.0 -}}
 {{- $cores := divf (float64 $r.requestsCpu) $millisPerCore -}}
@@ -4016,7 +4210,7 @@ us-central1
 {{- $memoryCost := mulf $memoryGiB $memoryRate $hours -}}
 {{- $diskCost := mulf $diskGiB $diskRate -}}
 {{- $total := addf $cpuCost $memoryCost $diskCost -}}
-Release footprint (pod requests, as the quota preflight sums them):
+Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):
   CPU requests:        {{ printf "%.3f" $cores }} cores
   Memory requests:     {{ printf "%.2f" $memoryGiB }} GiB
   Pods:                {{ int64 $r.pods }}
@@ -4026,7 +4220,11 @@ Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.foot
   Memory:   {{ printf "%.2f" $memoryGiB }} GiB x ${{ include "kube-agents.footprintPriceMemoryPerGiBHour" . }}/GiB-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $memoryCost }}
   Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
   Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
-  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
+{{- if gt (int64 $r.sessionPods) 0 }}
+  Not in these figures or the cost: the session pods, one per delegation or /session conversation. At the cap of {{ int64 $r.maxSessions }} they request {{ printf "%.3f" (divf (float64 $r.sessionRequestsCpu) $millisPerCore) }} cores and {{ printf "%.2f" (divf (float64 $r.sessionRequestsMemory) $bytesPerGiB) }} GiB over {{ int64 $r.sessionPods }} pods{{ if $counted }}, which the quota preflight adds to the figures above{{ else }}, which a namespace ResourceQuota needs room for too{{ end }}{{ if include "kube-agents.gkeAutopilot" . }}, at GKE Autopilot's per-Pod minimums (250m and 512Mi without Pod bursting) where those exceed the configured request{{ end }}. The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
+{{- else }}
+  The A2A workloads, the NATS bus and its JetStream claims among them, are in the figures above.
+{{- end }}
 {{- end }}
 
 {{- define "kube-agents.quotaPreflight" -}}

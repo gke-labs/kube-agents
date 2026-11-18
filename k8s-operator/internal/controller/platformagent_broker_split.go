@@ -235,7 +235,7 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	// pulls the relay hosted here, and a next install that gives it no Chat
 	// backend has no reason to widen the broker's callers by one.
 	if a2aChatArmed(agent) {
-		callers = append(callers, fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent)))
+		callers = append(callers, a2aGatewayBrokerCaller(agent))
 	}
 	// The third caller exists only under the cluster-view flag. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
@@ -261,7 +261,17 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if scopePublisherMayRun(agent, owned.scope) {
 		callers = append(callers, scopePublisherBrokerCaller(agent))
 	}
+	if a2aCuratorEnabled() {
+		callers = append(callers, a2aCuratorBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
+}
+
+// a2aGatewayBrokerCaller is the TokenReview username of the A2A gateway's
+// ServiceAccount, as the broker sees it: an allowed caller while Chat is
+// armed, and the one CREDENTIAL_PROXY_A2A_CHAT_CALLERS names.
+func a2aGatewayBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent))
 }
 
 // a2aSessionBrokerCaller is the TokenReview username of the session pods'
