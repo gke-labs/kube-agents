@@ -40,8 +40,9 @@ Usage:
   live_test_lease.py status  [--env NAME] [--json]
   live_test_lease.py acquire [--env NAME] [--pr N] [--note TEXT] [--ttl MINUTES]
   live_test_lease.py renew   [--env NAME] [--ttl MINUTES]
-  live_test_lease.py release [--env NAME] [--all]
+  live_test_lease.py release [--env NAME] [--all] [--attempts N] [--backoff SECONDS]
   live_test_lease.py steal   [--env NAME] [--force]
+  live_test_lease.py takeover [--env NAME] --if-session gha-<run id> --if-note TEXT [--ttl MINUTES]
   live_test_lease.py hook-pretooluse   # reads hook JSON on stdin
   live_test_lease.py hook-sessionend   # reads hook JSON on stdin
 
@@ -760,6 +761,7 @@ def do_release(install, attempts=1, backoff=0.0, sleep=time.sleep, log=None):
         if ok or not retryable or n == attempts:
             if not ok and retryable:
                 clear_local_token(install)
+                msg = "%s; cleared the local token only" % msg
                 if attempts > 1:
                     msg = "%s (after %d attempts)" % (msg, attempts)
             return ok, msg
@@ -775,7 +777,7 @@ def _release_once(install):
     try:
         data, _ = get_lease(install)
     except Unreachable as exc:
-        return False, "cluster unreachable (%s); cleared the local token only" % exc, True
+        return False, "cluster unreachable (%s)" % exc, True
     if not data:
         clear_local_token(install)
         return True, "already free", False

@@ -40,15 +40,15 @@ import sys
 
 SESSION_RE = re.compile(r"^gha-([0-9]+)$")
 
-# Workflows that call reconcile-environment.yml with mode apply, plus the
-# reusable workflow itself. A run of anything else is not a reconcile, whatever
+# The workflows whose runs take the lease: those that call
+# reconcile-environment.yml with mode apply (drift-detect.yml calls it with mode
+# plan, which takes no lease), plus the reusable workflow itself, for a run
+# dispatched on it directly. A run of anything else is not a reconcile, whatever
 # its lease note says.
 RECONCILE_WORKFLOWS = frozenset({
     ".github/workflows/autopush-deploy.yml",
-    ".github/workflows/deploy-environment.yml",
     ".github/workflows/reconcile-environment.yml",
     ".github/workflows/staging-deploy.yml",
-    ".github/workflows/staging-promotion-pipeline.yml",
 })
 
 

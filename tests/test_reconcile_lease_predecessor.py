@@ -72,7 +72,7 @@ class Decide(unittest.TestCase):
         callers = {
             ".github/workflows/" + p.name
             for p in (_ROOT / ".github" / "workflows").glob("*.yml")
-            if "reconcile-environment.yml" in p.read_text()
+            if "uses: ./.github/workflows/reconcile-environment.yml" in p.read_text()
         }
         callers.add(".github/workflows/reconcile-environment.yml")
         callers.discard(".github/workflows/drift-detect.yml")  # plan only: takes no lease

@@ -138,9 +138,9 @@ release_lease() {
     if ! out="$(python3 "${REPO_ROOT}/scripts/live_test_lease.py" release \
         --attempts "${LEASE_RELEASE_ATTEMPTS}" --backoff "${LEASE_RELEASE_BACKOFF}" 2>&1)"; then
       echo "${out}" >&2
-      echo "::warning title=Live-test lease not released::The live-test lease on '${ENV_NAME}' could not be released, so it stays held until it expires or the next reconcile takes it over. ${out//$'\n'/ }"
+      echo "::warning title=Live-test lease not released::The live-test lease on '${ENV_NAME}' could not be released, so it stays held until it expires or, if it is still this run's, the next reconcile takes it over. ${out//$'\n'/ }"
       summary ""
-      summary "⚠️ The live-test lease could not be released (session \`${KUBE_AGENTS_LEASE_SESSION:-?}\`). The next reconcile takes it over; until then it holds off live tests."
+      summary "⚠️ The live-test lease could not be released (session \`${KUBE_AGENTS_LEASE_SESSION:-?}\`). If it is still this run's, the next reconcile takes it over; until then it holds off live tests."
     else
       echo "${out}"
     fi
@@ -171,7 +171,9 @@ if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
     # between keeps it.
     if grep -q '"state": "held"' <<<"${holder}"; then
       predecessor="$(python3 "${REPO_ROOT}/scripts/release/reconcile_lease_predecessor.py" \
-        --env "${ENV_NAME}" <<<"${holder}" 2>/dev/null)" || predecessor='{"takeover": false}'
+        --env "${ENV_NAME}" <<<"${holder}")" || predecessor='{"takeover": false, "reason": "the predecessor check failed"}'
+      # Why it was or was not taken over, for whoever reads a deferral.
+      echo "Lease predecessor check: ${predecessor}"
       if python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("takeover") is True else 1)' "${predecessor}" 2>/dev/null; then
         prev_session="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["session"])' "${predecessor}")"
         prev_run="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["run_id"])' "${predecessor}")"

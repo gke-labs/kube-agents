@@ -1130,10 +1130,6 @@ class ReportDriftTest(unittest.TestCase):
         self.assertFalse(destructive)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LeaseLeakRecoveryTest(unittest.TestCase):
     """#6381: a failed release no longer blocks every reconcile for the lease's TTL.
 
@@ -1267,3 +1263,7 @@ class LeaseLeakRecoveryTest(unittest.TestCase):
 
     def test_the_release_output_is_no_longer_discarded(self):
         self.assertNotIn("live_test_lease.py\" release >/dev/null", self.text)
+
+
+if __name__ == "__main__":
+    unittest.main()
