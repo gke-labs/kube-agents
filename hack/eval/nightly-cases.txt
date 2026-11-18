@@ -921,6 +921,12 @@
 # namespace; the incumbent's delivery checks and safeguards.
 ./tasks/autoops-warning-event-triage-state-stamp/task.yaml
 
+# gke-cluster-autoscaler skill probe (#2528): Pods with generated names stay
+# Pending with an empty NotTriggerScaleUp reason on a pool below its maximum.
+# Graded on the fix that goes through Git: the answer names the namespace
+# default class label. deployer: noop, transcript-only.
+./tasks/autoscaler-pending-generated-workloads-probe/task.yaml
+
 # gke-cluster-autoscaler skill probe: on GKE 1.36.3-gke.1244000 or later a
 # zonal stockout cools down only its own zone, so the healthy zones keep
 # provisioning the preferred tier. deployer: noop, transcript-only.
