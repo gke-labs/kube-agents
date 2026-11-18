@@ -5849,7 +5849,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   unset EVAL_POST_MERGE_WRITE_TOKEN
   # GitHub only: on GitLab forge_write_token hands back the agent's own token.
   # Minted at launch and good for an hour, which covers the agent's turn plus
-  # the check's ten minutes of ticks; a unit that outlasts it errors its cleanup
+  # the check's fifteen minutes of ticks; a unit that outlasts it errors its cleanup
   # into the log rather than silently.
   if [ "${EVAL_FORGE_KIND:-github}" = "github" ] && grep -q 'type: post_merge_outcome' "${BENCH_DIR}/${task#./}" 2>/dev/null && [ -n "${EVAL_LEDGER_REPO:-}" ]; then
     local merge_token=""
