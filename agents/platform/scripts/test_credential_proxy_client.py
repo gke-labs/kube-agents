@@ -3392,6 +3392,44 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertLessEqual(self.sleeps[0], 4.0)
         self.assertEqual(2, len(err.getvalue().strip().splitlines()))
 
+    def test_a_refusal_whose_body_is_too_deep_for_the_parser_is_handed_back_as_one_with_no_json_body(self):
+        """`json()` raises RecursionError for a body nested very deep. The relay reads that as a
+        body that is not JSON: an upstream answer, handed back and not waited out."""
+
+        class TooDeep(self.Response):
+            def json(self):
+                raise RecursionError("maximum recursion depth exceeded")
+
+        for status in (503, 429):
+            with self.subTest(status=status):
+                self.sleeps.clear()
+                refused = TooDeep(status, None)
+                http_, session = self.session([refused, self.Response(200, {"timeSeries": []})])
+                self.assertIs(refused, session.get(self.URL, timeout=30))
+                self.assertEqual(1, len(http_.calls))
+                self.assertEqual([], self.sleeps)
+
+    def test_a_real_reply_with_a_document_that_the_parser_refuses_has_no_json_body(self):
+        """The same through a reply object of `requests` and a document that the parser of this run refuses."""
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+        depth = 1000
+        while depth <= 4_000_000:
+            document = "[" * depth + "]" * depth
+            try:
+                json.loads(document)
+            except RecursionError:
+                break
+            depth *= 2
+        else:
+            self.skipTest(f"json.loads parses {depth // 2} nested lists; no document is too deep here")
+        reply = requests.models.Response()
+        reply.status_code = 503
+        reply._content = document.encode("utf-8")
+        self.assertIsNone(credential_proxy_client.ApiSession._json_body(reply))
+
     def test_a_draining_refusal_drops_the_pooled_connections_before_the_retry(self):
         # A draining exec pod answers on the caller's keep-alive connection to
         # its Envoy; only a new connection reaches another replica.

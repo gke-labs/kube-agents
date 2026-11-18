@@ -2477,7 +2477,8 @@ class ApiSession:
     def _json_body(response):
         try:
             return response.json()
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, RecursionError):
+            # RecursionError: a body nested deeper than the parser goes.
             return None
 
     def _refused_admission(self, response) -> bool:
