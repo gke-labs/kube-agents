@@ -2286,7 +2286,13 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     )
     try:
         with open_broker_request(request) as response:
-            answer = json.load(response)
+            try:
+                answer = json.load(response)
+            except RecursionError as exc:
+                # A body nested deeper than the parser goes. A RuntimeError by
+                # type, so no clause for a body that is not JSON sees it. A
+                # ValueError, as for the answer below that is not an object.
+                raise ValueError("the broker's answer is JSON nested too deep to read") from exc
             if not isinstance(answer, dict):
                 # Valid JSON, but not an object, and every consumer reads the
                 # answer as one. A ValueError, as for a body that is not JSON:
@@ -2297,7 +2303,7 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     except urllib.error.HTTPError as exc:
         try:
             answer = json.load(exc)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):  # RecursionError: a body nested too deep to parse
             # The status arrived but the body is not a refusal document. The
             # status is the whole answer.
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc

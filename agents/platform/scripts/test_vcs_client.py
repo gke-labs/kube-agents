@@ -293,6 +293,33 @@ class ForgeCallTest(unittest.TestCase):
                 with self.assertRaises(vcs_client.VcsError):
                     vcs_client.base_branch("acme/infra")
 
+    def test_a_body_nested_too_deep_for_the_parser_reads_as_an_error_of_this_module_on_both_paths(self):
+        """Through the real `vcs_call`, with the parser's RecursionError given
+        directly: a 2xx reads as an answer that is not JSON, a refusal as its
+        status. No consumer meets the RecursionError."""
+        environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+        client = vcs_client.credential_proxy_client
+        too_deep = mock.patch.object(client.json, "load", side_effect=RecursionError("maximum recursion depth exceeded"))
+
+        def answer(request, *args, **kwargs):
+            return io.BytesIO(b"[]")
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(client, "open_broker_request", answer), too_deep:
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("capabilities", {"repository": "acme/infra"})
+        self.assertIsNone(caught.exception.code)
+        self.assertIn("not JSON", str(caught.exception))
+
+        refusal = urllib.error.HTTPError("http://127.0.0.1:1/v1/vcs/capabilities", 502, "refused", {}, io.BytesIO(b"[]"))
+        self.addCleanup(refusal.close)
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            client, "open_broker_request", side_effect=refusal
+        ), too_deep:
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("capabilities", {"repository": "acme/infra"})
+        self.assertIsNone(caught.exception.code)
+        self.assertIn("HTTP 502", str(caught.exception))
+
     def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
         """The other half: a bare 404 is the only one read as a missing route.
 

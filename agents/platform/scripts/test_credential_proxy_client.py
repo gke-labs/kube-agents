@@ -1109,6 +1109,32 @@ class VcsCallErrorTest(unittest.TestCase):
                 for content in ("busy", "503", "1.5"):
                     self.assertNotIn(content, str(caught.exception))
 
+    # `json.load` raises RecursionError for a body nested very deep. The depth
+    # where it stops depends on the Python version, so the tests give the
+    # parser's error directly.
+    _too_deep_for_the_parser = patch.object(
+        credential_proxy_client.json, "load", side_effect=RecursionError("maximum recursion depth exceeded")
+    )
+
+    def test_a_2xx_answer_nested_too_deep_for_the_parser_is_a_value_error(self):
+        with self._no_token_file, self._answer(b"[]"), self._too_deep_for_the_parser:
+            with self.assertRaises(ValueError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+        self.assertIsInstance(caught.exception.__cause__, RecursionError)
+
+    def test_a_refusal_nested_too_deep_for_the_parser_is_the_status_alone(self):
+        for status in (404, 502):
+            with self.subTest(status=status):
+                stream = io.BytesIO(b"[]")
+                error = self._held_refusal(status, stream)
+                with patch.object(credential_proxy_client, "open_broker_request", side_effect=error), \
+                        self._too_deep_for_the_parser:
+                    with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
+                self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
     def test_a_2xx_answer_that_is_an_object_comes_back_as_it_is(self):
         for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
             with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
