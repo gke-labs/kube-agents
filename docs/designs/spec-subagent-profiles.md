@@ -721,17 +721,18 @@ metadata:
     kubeagents.x-k8s.io/persona: cluster
 spec:
   description: >-
-    Read-only SRE scoped to exactly one GKE cluster.  Live runtime state and workload
-    debugging: crash loops, OOMKills, unschedulable pods, autoscaling behavior, storage
-    binding.  Returns a grounded RCA and a proposed manifest patch; never mutates, never
-    opens PRs.
+    SRE scoped to exactly one GKE cluster, read-only on it.  Live runtime state and
+    workload debugging: crash loops, OOMKills, unschedulable pods, autoscaling behavior,
+    storage binding.  Returns a grounded RCA and a proposed manifest patch; never mutates
+    the cluster, and opens a PR only when the task asks for that change.
   clusterRef:
     projectId: acme-prod
     cluster: prod-a
     location: us-east1
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
-    # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
+    # /files: persona.yaml, instructions.md, the gke-* debugging skills, the
+    # version-control skill, mcp.yaml
     # (developer_knowledge only: profile workers are refused gke and platform_control)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08

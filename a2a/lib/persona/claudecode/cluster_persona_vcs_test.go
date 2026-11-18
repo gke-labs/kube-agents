@@ -308,7 +308,9 @@ func TestPlainWordsRefusalMatchesTheBrokersRule(t *testing.T) {
 // a guessed one, and to stop at a refusal rather than probe for another verb
 // or repository. Nothing in a profile worker lists the managed repositories,
 // so without these a model asked for a change spends its turns guessing
-// names the broker refuses.
+// names the broker refuses. It also keeps a task's writes on the branch and
+// pull request that task opened: the permit is not tied to one proposal, so
+// the broker would admit an update to another of the install's own.
 func TestTheVersionControlSkillUsesTheNamedRepositoryAndStopsAtARefusal(t *testing.T) {
 	b, err := os.ReadFile(path.Join(clusterPersonaDir, "skills", vcsSkill, "SKILL.md"))
 	if err != nil {
@@ -318,6 +320,8 @@ func TestTheVersionControlSkillUsesTheNamedRepositoryAndStopsAtARefusal(t *testi
 	for _, phrase := range []string{
 		"Use the repository the task names. If the task names none, say so in your answer and stop; don't guess one.",
 		"If a verb is refused, report the refusal and stop; don't probe other verbs or repositories.",
+		"**Write only to what this task created.** `proposal update` and `publish --advance` only on the branch and pull request this task opened in this run; never on another existing `platform-agent/` branch or pull request, even one this install opened earlier.",
+		"On `proposal update`, the pull request isn't this task's to edit; report it and stop.",
 	} {
 		if !strings.Contains(text, phrase) {
 			t.Errorf("the version-control skill no longer says %q", phrase)

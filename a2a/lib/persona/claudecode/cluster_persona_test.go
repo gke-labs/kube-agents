@@ -164,8 +164,9 @@ var scriptSources = map[string]string{
 }
 
 // personaOnlySkills are persona skills with no agents/cluster/skills source,
-// so their markdown is the persona's own; their scripts still copy a source
-// in scriptSources. version-control's SKILL.md is not the platform agent's:
+// so their SKILL.md is the persona's own; any other markdown file in them is
+// still compared with a source, and their scripts still copy a source in
+// scriptSources. version-control's SKILL.md is not the platform agent's:
 // a profile reaches a narrower verb set, writes only under the task's
 // permit, and searches in plain words, so it is pinned by
 // TestTheClusterPersonaVersionControlSkillCallsOnlyProfileVerbs instead.
@@ -459,7 +460,7 @@ func TestTheClusterPersonaSkillsMatchTheirSources(t *testing.T) {
 		if !persona.IsMarkdown(rel) {
 			return nil
 		}
-		if skill, _, _ := strings.Cut(rel, "/"); personaOnlySkills[skill] {
+		if skill, file, _ := strings.Cut(rel, "/"); personaOnlySkills[skill] && file == persona.SkillFile {
 			return nil
 		}
 		name := rel

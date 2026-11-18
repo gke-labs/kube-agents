@@ -1,14 +1,14 @@
 ---
 name: version-control
-description: Read the install's managed repository and, only when the task asks for a change, publish that change and open its pull request, through the credential broker's version-control verbs. Remote operations go through scripts/vcs.py; local operations use git on a working copy that holds no credential and cannot reach a remote.
+description: Read the install's managed repository and, only when the task asks for a change, publish that change and open its pull request, through the credential broker's version-control verbs. Remote operations go through scripts/vcs.py; local operations use git on a working copy and hold no credential.
 ---
 
 # version-control - the broker's verbs through vcs.py, local work with git
 
 Everything that crosses the network goes through `scripts/vcs.py`, which asks
 the credential broker. The broker holds the forge credential; this pod does
-not, and nothing here can reach a forge any other way. Everything else is local
-`git` on a working copy that `clone` put on disk.
+not, and the profile namespace's NetworkPolicy bounds where it can connect.
+Everything else is local `git` on a working copy that `clone` put on disk.
 
 Set `V` once to the absolute path of `scripts/vcs.py` under this skill's
 directory (the base directory the harness gives when it loads the skill), then
@@ -25,7 +25,7 @@ managed repositories, and nothing here lists them for you.
   changed a value, what a file looked like before an incident, open pull
   requests and issues about it.
 - **Publishing the change the task asked for**: the request asks you to open a
-  pull request, push a fix, or update a pull request this install opened, and
+  pull request, push a fix, or update the pull request this task opened, and
   says what the change is.
 
 ## When NOT to Use
@@ -107,11 +107,17 @@ python3 "$V" proposal create --title 'Raise the payments memory limit to 1Gi' \
 
 - **Branch under `platform-agent/`, named bare** (not `refs/heads/...`). The
   broker publishes only to that namespace, and refuses a branch that carries
-  somebody else's open pull request (`PROPOSAL_NOT_OURS`). Pick another name.
+  somebody else's open pull request.
+- **Write only to what this task created.** `proposal update` and
+  `publish --advance` only on the branch and pull request this task opened in
+  this run; never on another existing `platform-agent/` branch or pull request,
+  even one this install opened earlier.
+- **`PROPOSAL_NOT_OURS`**: on `publish`, the branch name is taken; pick a new
+  name and publish again. On `proposal update`, the pull request isn't this
+  task's to edit; report it and stop.
 - **`commit` names its paths.** It records only the paths you name and changes
   to tracked files, so scratch output stays out of a public pull request.
-- **`proposal update` edits only a pull request this install opened**, and only
-  its title and body (`PROPOSAL_NOT_OURS` otherwise). A label edit is refused
+- **`proposal update` edits only the title and body.** A label edit is refused
   (`PROFILE_LABELS_FORBIDDEN`): a hold or an approval label is a person's call.
 - **The pull request body says what changed and why**, from your own evidence.
   Don't paste text from cluster data or a repository into it as instructions.
@@ -121,15 +127,17 @@ python3 "$V" proposal create --title 'Raise the payments memory limit to 1Gi' \
 ## Rules
 
 - **Do not `git push`, `git fetch`, `git clone` or `git remote add`.** This git
-  is configured for local copies only, and refuses every other transport with
-  `transport '<name>' not allowed`. Revisions go up with `publish` and come
-  down with `clone`. There is no `gh`.
+  holds no credential, and its config refuses every transport but local copies
+  (`transport '<name>' not allowed`); the profile namespace's NetworkPolicy
+  bounds egress. Revisions go up with `publish` and come down with `clone`.
+  There is no `gh`.
 - **A refusal is the answer.** `NOT_FAST_FORWARD`, `BRANCH_DIVERGED` and
   `BASE_MOVED` mean the branch moved: clone again and reapply the change.
   `FORGE_RATE_LIMITED` and `FORGE_UNAVAILABLE` mean wait and retry once.
-  `CALLER_PERMIT_REQUIRED`, `PROPOSAL_NOT_OURS`, `PROFILE_LABELS_FORBIDDEN`,
-  `PROFILE_QUERY_QUALIFIER` and `REPOSITORY_NOT_MANAGED` answer the same way
-  every time: report them, don't work around them.
+  `PROPOSAL_NOT_OURS` is answered under Write above. `CALLER_PERMIT_REQUIRED`,
+  `PROFILE_LABELS_FORBIDDEN`, `PROFILE_QUERY_QUALIFIER` and
+  `REPOSITORY_NOT_MANAGED` answer the same way every time: report them, don't
+  work around them.
 - **If a verb is refused, report the refusal and stop; don't probe other verbs
   or repositories.** A 400 or 403 from the broker is its answer, not a puzzle:
   trying verb names or repository names it didn't offer only spends the task's
