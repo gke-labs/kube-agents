@@ -89,6 +89,8 @@ class Forge:
                          ] + self.extra_files
         if "/comments" in url:
             return 200, [{"body": body} for body in self.comments]
+        if url.endswith("/labels"):
+            return 200, [{"name": "audit:obtainability-audit"}, {"name": "audit:remediation"}, {"name": "severity:major"}]
         if "/contents/" in url:
             return 200, {"sha": "abc", "content": "b2xk\n"}
         return 200, {"merged": True, "base": {"sha": "base1"}}
@@ -177,7 +179,10 @@ def test_report_merges_applies_ticks_and_passes_on_one_marked_comment(world):
     assert world.applied == [MANIFEST]
     methods = [m for m, _ in world.forge.writes]
     assert methods[0] == "PUT" and world.forge.writes[0][1].endswith("/pulls/7/merge")
-    # The merged file comes off the default branch afterwards.
+    # The merged pull request loses its audit labels, so the next audit does not bind it to the
+    # finding, and the merged file comes off the default branch.
+    unlabelled = [url.rsplit("/", 1)[1] for m, url in world.forge.writes if "/labels/" in url]
+    assert unlabelled == ["audit%3Aobtainability-audit", "audit%3Aremediation"]
     assert methods[-1] == "DELETE" and "/contents/clusters/seeded-a/" in world.forge.writes[-1][1]
 
 
@@ -191,8 +196,9 @@ def test_cleanup_restores_a_modified_file_and_survives_a_kubectl_failure(world, 
     monkeypatch.setattr(subprocess, "run", broken_kubectl)
     _verifier().verify(0)
     writes = world.forge.writes
-    assert ("DELETE", writes[1][1]) == writes[1] and writes[1][1].endswith("checkout-gateway-pdb.yaml")
-    assert writes[2][0] == "PUT" and writes[2][1].endswith("/contents/clusters/seeded-a/kustomization.yaml")
+    contents = [(m, url) for m, url in writes if "/contents/" in url]
+    assert contents[0][0] == "DELETE" and contents[0][1].endswith("checkout-gateway-pdb.yaml")
+    assert contents[1][0] == "PUT" and contents[1][1].endswith("/contents/clusters/seeded-a/kustomization.yaml")
 
 
 def test_no_outcome_by_the_deadline_fails_as_on_main(world, monkeypatch):

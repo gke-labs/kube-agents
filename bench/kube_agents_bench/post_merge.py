@@ -302,6 +302,13 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         if not token or self._repo is None:
             return
         owner, repo = self._repo
+        if self._merged is not None:
+            try:
+                why = self._unlabel(owner, repo, self._merged[2], token)
+            except Exception as exc:  # noqa: BLE001 -- the files still go back
+                why = repr(exc)
+            if why:
+                logger.warning("post_merge_outcome: %s/%s#%s keeps its audit labels: %s", owner, repo, self._merged[2], why)
         for path, file_status in self._touched:
             try:
                 why = self._restore(owner, repo, path, file_status, token)
@@ -309,6 +316,29 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                 why = repr(exc)
             if why:
                 logger.warning("post_merge_outcome: %s/%s %s not restored: %s", owner, repo, path, why)
+
+    def _unlabel(self, owner: str, repo: str, number: int, token: str) -> str:
+        """Take every ``audit:`` label off the merged pull request; "" when done.
+
+        The audit binds a finding to the newest pull request on its branch
+        among those carrying ``audit:<stream>`` and ``audit:remediation``
+        (audit_report.list_remediation_prs, state "all"), and a merged one is
+        never re-proposed (pr_closed_by_harness). Left labelled, this merge
+        would stop every later no-pdb case on the pool repository from opening
+        its fix; the reset (hack/ci_reset_agent_pulls.py) reads open pulls only.
+        """
+        api = f"{forges.github_api_root()}/repos/{owner}/{repo}/issues/{number}/labels"
+        status, labels = _forge_get_json(api, token, HTTP_TIMEOUT_SEC)
+        if status != 200 or not isinstance(labels, list):
+            return f"its labels could not be read ({status})"
+        failed = []
+        for label in labels:
+            name = str((label or {}).get("name") or "") if isinstance(label, dict) else ""
+            if name.startswith("audit:"):
+                done, _ = _github_write("DELETE", f"{api}/{urllib.parse.quote(name, safe='')}", token, {})
+                if done not in (200, 404):
+                    failed.append(f"{name} ({done})")
+        return ", ".join(failed)
 
     def _restore(self, owner: str, repo: str, path: str, file_status: str, token: str) -> str:
         """Put ``path`` on the default branch back to its content at the base; "" when done."""

@@ -968,8 +968,10 @@ A2A_OPERATOR_ENV_ARGS=()
 # meets a GitHub write it did not ask for. env[5] caps each post-merge step at
 # five records a run: the cron ticks every five minutes on every install and
 # reads the forge for each waiting record (none when there are none) on the
-# GitHub App installation every eval project shares (#4611, #6105), so at most
-# 60 reads an hour an install. An operator older than the cap drops the name.
+# GitHub App installation every eval project shares (#4611, #6105), so about
+# 60 reads an hour an install. The cap takes effect with #6308, which adds
+# reads_per_tick() and the operator's allowlist entry; before it the name is
+# dropped and each step reads up to its default of 20.
 # Hence env[6] here.
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
