@@ -68,16 +68,30 @@ func TestTheTiersConfigMapListsEveryTierSortedByName(t *testing.T) {
 // The verifier, the gateway and the callout each mount the tiers ConfigMap,
 // optionally and as a directory (so an edit reaches the file), and point
 // A2A_TIERS_FILE at it.
-func TestTheThreeTierCheckersMountTheTiersFile(t *testing.T) {
+// The three tier checkers, plus the broker and the dispatcher (#6091), which
+// key the report credential on a tier's mode: each mounts the same tiers file
+// the same way, so all of them judge a tier from one table.
+func TestEveryTierReaderMountsTheTiersFile(t *testing.T) {
 	agent := a2aTestAgent()
 	for name, tc := range map[string]struct {
 		spec      corev1.PodSpec
 		container string
 	}{
-		"verifier": {buildA2AVerifierDeployment(agent).Spec.Template.Spec, a2aVerifierContainerName},
-		"gateway":  {buildA2AGatewayDeployment(agent).Spec.Template.Spec, a2aGatewayContainerName},
-		"callout":  {buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec, "callout"},
+		"verifier":   {buildA2AVerifierDeployment(agent).Spec.Template.Spec, a2aVerifierContainerName},
+		"gateway":    {buildA2AGatewayDeployment(agent).Spec.Template.Spec, a2aGatewayContainerName},
+		"callout":    {buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec, "callout"},
+		"broker":     {buildCredentialProxyDeploymentForPlugins(agent, "hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false).Spec.Template.Spec, credentialProxyContainerName},
+		"dispatcher": {buildA2ADispatcherDeployment(agent).Spec.Template.Spec, a2aDispatcherContainerName},
 	} {
+		volumes := 0
+		for i := range tc.spec.Volumes {
+			if tc.spec.Volumes[i].Name == a2aTiersVolume {
+				volumes++
+			}
+		}
+		if volumes != 1 {
+			t.Errorf("%s: %d volumes named %s, want exactly 1", name, volumes, a2aTiersVolume)
+		}
 		var vol *corev1.Volume
 		for i := range tc.spec.Volumes {
 			if tc.spec.Volumes[i].Name == a2aTiersVolume {
@@ -115,6 +129,26 @@ func TestTheThreeTierCheckersMountTheTiersFile(t *testing.T) {
 		if env != a2aTiersMountPath+"/"+a2aTiersKey {
 			t.Errorf("%s: %s = %q", name, a2aTiersFileEnvVar, env)
 		}
+	}
+}
+
+// A CR's spec.deployment.env can't repoint the broker's tier table: the name
+// is reserved, so the broker keeps reading the file the operator rendered and
+// a CR can't choose which tiers count as unattended (#6091).
+func TestACRCannotRepointTheBrokersTiersFile(t *testing.T) {
+	agent := a2aTestAgent()
+	if agent.Spec.Deployment == nil {
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	}
+	agent.Spec.Deployment.Env = append(agent.Spec.Deployment.Env, corev1.EnvVar{Name: a2aTiersFileEnvVar, Value: "/tmp/chosen-tiers.json"})
+	var values []string
+	for _, e := range buildCredentialProxyEnv(agent) {
+		if e.Name == a2aTiersFileEnvVar {
+			values = append(values, e.Value)
+		}
+	}
+	if want := a2aTiersMountPath + "/" + a2aTiersKey; len(values) != 1 || values[0] != want {
+		t.Errorf("broker %s = %q, want only %q", a2aTiersFileEnvVar, values, want)
 	}
 }
 

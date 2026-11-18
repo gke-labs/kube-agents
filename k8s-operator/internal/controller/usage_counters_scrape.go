@@ -363,11 +363,12 @@ var (
 		},
 		"git": {
 			"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
-			"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
-			"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
-			"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
-			"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
+			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "diff-tree",
+			"fetch", "init", "log", "ls-files", "ls-remote", "ls-tree", "merge",
+			"merge-base", "mv", "pull", "push", "rebase", "remote", "reset", "restore",
+			"rev-list", "rev-parse", "revert", "rm", "show", "sparse-checkout", "stash",
+			"status", "submodule", "switch", "symbolic-ref", "tag", "update-ref",
+			"version", "worktree",
 		},
 		"gh": {
 			"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -1003,7 +1004,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						continue
 					}
 					if name == kanbanDispatcherStuckSecondsSeries {
-						// Bounded as the age is, for the condition's message.
+						// Bounded as the age is. The condition uses the value only to
+						// pick the board that it names.
 						if len(dispatcher.Stuck) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
 							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 						}

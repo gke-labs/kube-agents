@@ -139,7 +139,11 @@ func a2aDispatcherBucketedGrants() bool {
 // control connection, plus the draining profiles' names. The callout derives
 // every per-profile subject from the profile entries (lib.DispatcherGrants),
 // so the entry's size no longer grows with the profile count.
-func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+// held names the bound profiles kept out of the dispatcher
+// (a2aHeldProfileNames). Unbucketed, the entry is built from the dispatchable
+// profiles alone and leaves them out already; bucketed, the callout derives
+// grants from every profile entry, so the entry lists them for it to skip.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile, held []string) a2aAuthMapIdentity {
 	if !a2aDispatcherBucketedGrants() {
 		entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
 		return entry
@@ -158,7 +162,30 @@ func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1al
 		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
 		Narrowing:      a2aNarrowingDispatcher,
 		Draining:       drainingNames,
+		Held:           held,
 	}
+}
+
+// a2aHeldProfileNames is the profiles the map renders entries for that are
+// not dispatchable, sorted: the ones the profile hold keeps out of the
+// dispatcher. Read off the rendered profile entries rather than the bound
+// list, so a refused profile (no entry, and out of dispatchable too) is never
+// listed, every name listed has passed its entry's checks, and the list lasts
+// only as long as a hold does. Sorted, so the map's version doesn't move with
+// the order the cache lists profiles in.
+func a2aHeldProfileNames(entries []a2aAuthMapIdentity, dispatchable []agentv1alpha1.AgentProfile) []string {
+	var held []string
+	for _, e := range entries {
+		if e.Narrowing != a2aNarrowingProfile || e.Profile == "" || slices.Contains(held, e.Profile) {
+			continue
+		}
+		if slices.ContainsFunc(dispatchable, func(d agentv1alpha1.AgentProfile) bool { return d.Name == e.Profile }) {
+			continue
+		}
+		held = append(held, e.Profile)
+	}
+	slices.Sort(held)
+	return held
 }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
@@ -330,6 +357,10 @@ func a2aDispatcherResources() corev1.ResourceRequirements {
 }
 
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+	// The install's tier table (#6091), for the report-credential mint to key
+	// on a tier's mode rather than its name. Nothing reads it yet: the mount
+	// is inert until the dispatcher's mint reads A2A_TIERS_FILE.
+	tiersVolume, tiersMount, tiersEnv := a2aTiersVolumeAndMount(agent)
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)
 	podLabels := a2aLabels(agent, "dispatcher")
@@ -382,9 +413,10 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							// so the process opens its bucket connections
 							// exactly when the callout splits its grants.
 							{Name: a2aDispatcherBucketedGrantsEnvVar, Value: strconv.FormatBool(a2aDispatcherBucketedGrants())},
+							tiersEnv,
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
-							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},
+							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}, tiersMount},
 						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -403,7 +435,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 						Resources:       a2aDispatcherResources(),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent), tiersVolume},
 				},
 			},
 		},
@@ -618,6 +650,8 @@ type a2aDispatchProfile struct {
 	QueueTimeoutSeconds   int                `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter `json:"parameters,omitempty"`
+	// Scripts is lib.DispatchProfile's: the profile's spec.scripts (#5622).
+	Scripts []a2aDispatchScript `json:"scripts,omitempty"`
 	// Durables are the shared durables the operator creates for the profile,
 	// one per (tier, kind), which its grant names list
 	// (dispatcherGrantNames). They aren't written (#5479): the dispatcher
@@ -637,6 +671,13 @@ type a2aDispatchProfile struct {
 	// DrainingTiers is lib.DispatchProfile's (#3659, 2b-ii): tiers that left
 	// a live profile and still drain (agentprofile_tier_drain.go).
 	DrainingTiers []a2aDrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// a2aDispatchScript is lib.DispatchScript.
+type a2aDispatchScript struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
 }
 
 // a2aDrainingTier is lib.DrainingTier.
@@ -781,6 +822,12 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 	}
 	for _, param := range p.Spec.Parameters {
 		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
+	}
+	// A script's run fits the task's deadline as rendered, which the
+	// install's limit may cap below spec.lifecycle's.
+	for _, sc := range p.Spec.Scripts {
+		dp.Scripts = append(dp.Scripts, a2aDispatchScript{Name: sc.Name, Path: sc.Path,
+			TimeoutSeconds: min(int(sc.TimeoutSeconds), dp.ActiveDeadlineSeconds)})
 	}
 	drains, ending := drainingTiersOf(p), endingTiersOf(p)
 	for _, tier := range p.AllowedTierList() {

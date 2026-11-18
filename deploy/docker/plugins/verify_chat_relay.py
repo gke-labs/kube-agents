@@ -157,7 +157,7 @@ def main() -> None:
     #    findings queue's pacing limits take it to `findings_nudge.py` and to
     #    `bootstrap_handoff.py`, which hands them to the first inventory
     #    report's selection; a scrubbed one would silently fall back to its
-    #    default. Onboarding's delivery under next runs `a2a notify` from the
+    #    default. Onboarding's conversation-path delivery runs `a2a notify` from the
     #    `oobe` child, which needs the bus and the conversation route's
     #    platform; scrubbed, the report would wait for good. The stall watch's
     #    knobs, which the operator pins in the managed .env from

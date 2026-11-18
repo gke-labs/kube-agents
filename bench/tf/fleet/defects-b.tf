@@ -385,7 +385,7 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
   }
 }
 
-# Defect (upgrade readiness, certification): a fail-closed webhook whose dead
+# Defect (upgrade readiness, validated-capabilities): a fail-closed webhook whose dead
 # backend would refuse the writes GKE's control plane makes in the
 # autoscaling.x-k8s.io group after a 1.35+ upgrade, where it installs and
 # reconciles capacitybuffers.autoscaling.x-k8s.io and Cluster Autoscaler

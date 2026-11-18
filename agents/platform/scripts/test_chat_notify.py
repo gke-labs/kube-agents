@@ -310,7 +310,7 @@ class ThreadFromResponseTest(unittest.TestCase):
 
 
 class EnabledPlatformsTest(unittest.TestCase):
-    """The managed scope says the Hermes platform is off under next; the routed platform still counts."""
+    """The managed scope says the Hermes platform is off for a gateway-held backend; the routed platform still counts."""
 
     def test_managed_false_does_not_hide_the_routed_platform(self):
         with mock.patch.object(chat_platforms, "_platforms_enabled_in", return_value={"google_chat": False, "slack": True}), \
@@ -328,7 +328,7 @@ def _completed(stdout: str) -> subprocess.CompletedProcess:
 
 
 class SessionKVCallersTest(unittest.TestCase):
-    """The alert path and the cron relay post through the gateway under next, and read its thread."""
+    """The alert path and the cron relay post through the gateway, and read its thread."""
 
     @classmethod
     def setUpClass(cls):
@@ -522,7 +522,7 @@ class SlackRouteTest(unittest.TestCase):
         self.assertEqual(argv, ["a2a", "notify", "--platform", "slack", "--thread", "C0HOME/1700000000.000100", "--", "drift on prod"])
 
     def test_a_slack_thread_carries_its_own_channel(self):
-        # A today-era DM thread: the gateway refuses a non-home channel, so the
+        # A DM thread: the gateway refuses a non-home channel, so the
         # follow-up is not posted into home.
         with mock.patch.dict(os.environ, SLACK_ROUTED):
             argv = chat_notify.command("slack:D0DM:1700000000.000200", "follow-up")
@@ -596,7 +596,7 @@ class SlackRouteTest(unittest.TestCase):
             self.assertFalse(os.path.exists(seen["path"]))
 
     def test_the_audit_report_takes_the_gateway_as_a_chat_message_when_slack_is_routed(self):
-        # No broker relay under next (slack_blocks_post is not configured),
+        # No broker relay (slack_blocks_post is not configured),
         # so without the routed check the report would never try a card.
         headline = self.skv.AuditHeadline(text="3 findings", issue={"number": 1}, ref=None)
         with mock.patch.dict(os.environ, SLACK_ROUTED), \

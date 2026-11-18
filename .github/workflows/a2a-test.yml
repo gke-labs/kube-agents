@@ -44,11 +44,19 @@ on:
       # the next a2a pull request to inherit.
       - "k8s-operator/go.mod"
       - "k8s-operator/go.sum"
+      # gateway/session_resources_test.go holds spawn.go's session-pod defaults
+      # equal to the operator's, read from this file across the module line, so
+      # an operator-only edit of a default has to run it.
+      - "k8s-operator/api/v1alpha1/session_resources.go"
       # cmd/session-persona's tests read these from outside the module: the
       # cluster skills the worker image ships a session copy of, and the
       # broker policy the session's read tables must stay a subset of. An
-      # edit to either alone has to run those tests.
+      # edit to either alone has to run those tests. lib/persona's tests read
+      # the tse persona and the skills it copies the same way (mcp_policy.py,
+      # which bounds its servers, is listed below).
       - "agents/cluster/skills/**"
+      - "agents/tse/persona/**"
+      - "agents/tse/skills/**"
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
@@ -120,7 +128,10 @@ jobs:
               - "k8s-operator/Makefile"
               - "k8s-operator/go.mod"
               - "k8s-operator/go.sum"
+              - "k8s-operator/api/v1alpha1/session_resources.go"
               - "agents/cluster/skills/**"
+              - "agents/tse/persona/**"
+              - "agents/tse/skills/**"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
               - "agents/cluster/persona/**"

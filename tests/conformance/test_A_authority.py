@@ -471,10 +471,93 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     h.task_confinement.confine(argv, None, None)
         self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
 
-    def test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self) -> None:
+    def test_A3_the_profile_role_reaches_exec_mcp_vcs_and_the_audit_reports_alone(self) -> None:
+        # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
+        # its handler (#3658), the version-control routes to the reads and the
+        # permit-gated writes (the next row, #3993), and the audit-report routes
+        # (#5619) to the report rules (the row after) inside theirs.
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
-        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+        self.assertEqual(
+            sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX, "/v1/vcs/", h.credential_proxy.AUDIT_REPORTS_PREFIX]),
+            reached,
+        )
+
+    def test_A3_a_profile_caller_publishes_a_change_only_under_the_permit(self) -> None:
+        # #3993: the profile role reaches the forge credential only with a
+        # task credential, and the three writes that put a change up only
+        # when that credential carries the permit the dispatcher mints after a
+        # structured confirm. Every other write is outside the role's verbs.
+        cp = h.credential_proxy
+        principal = cp.Principal(workload="system:serviceaccount:ns:profile", role=cp.CALLER_ROLE_PROFILE)
+        task = type("Task", (), {"permits": frozenset()})()
+        permitted = type("Task", (), {"permits": frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})})()
+        writes = cp.PROFILE_PERMIT_GATED_VCS_VERBS
+        self.assertEqual(frozenset({"publish", "proposal-create", "proposal-update"}), writes)
+        for verb in sorted(cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE]):
+            with self.subTest(verb=verb):
+                self.assertIsNotNone(cp.profile_vcs_refusal(principal, verb), "no credential, yet admitted")
+                with_task = dataclasses.replace(principal, task=task)
+                self.assertEqual(verb in writes, cp.profile_vcs_refusal(with_task, verb) is not None)
+                self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
+        others = cp.vcs_broker.WRITE_VERBS - writes
+        self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
+
+    def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
+        # The broker's write rule for the audit-report store (#5619), driven
+        # with stand-in claims: the verdict on a real credential's shape is
+        # task_credential's, pinned by the golden fixtures in the Python suite
+        # (that module needs `cryptography`, which this suite doesn't import).
+        cp = h.credential_proxy
+        audit, key = "compliance-audit", "acme%2Fgitops"
+        allowlist = frozenset({"fleet-audit", "platform"})
+
+        def trigger(stream: str = audit, origin: str = "builtin", name: str | None = None) -> object:
+            return types.SimpleNamespace(name=name or f"schedule/{stream}", origin=origin, stream=stream)
+
+        def write(role: str = cp.CALLER_ROLE_PROFILE, profile: object = "fleet-audit", grant: object = "match",
+                  request_key: str = key, gitops_key: str | None = key) -> str | None:
+            return cp.report_write_permitted(
+                role, profile, trigger() if grant == "match" else grant, audit, request_key, gitops_key, allowlist
+            )
+
+        self.assertIsNone(write())
+        self.assertIsNone(write(request_key="no_forge%2Flocal", gitops_key=None))
+        for name, rule in (
+            ("another schedule's trigger", write(grant=trigger("obtainability-audit"))),
+            ("a trigger named for another source", write(grant=trigger(name="stall-watch"))),
+            ("a trigger that binds no stream", write(grant=trigger(stream=""))),
+            ("no trigger", write(grant=None)),
+            ("a user origin", write(grant=trigger(origin="user"))),
+            ("a profile outside the allowlist", write(profile="auditor")),
+            ("no task credential", write(profile=None)),
+            ("the wrong repository key", write(request_key="acme%2Fterraform")),
+            ("no_forge beside a GitOps repository", write(request_key="no_forge%2Flocal")),
+            ("a caller with no role", write(role="")),
+            ("another role", write(role=cp.CALLER_ROLE_SESSION)),
+        ):
+            with self.subTest(name):
+                self.assertIsNotNone(rule)
+        # Each refusal names its own rule; a missing trigger is not read as a
+        # trigger of the wrong origin.
+        self.assertEqual(cp.RULE_REPORT_NO_TRIGGER, write(grant=None))
+        # The shell writes any audit, to the install's publish key or a key of a
+        # repository the broker's own managed_repos registers; never another.
+        shell = cp.CALLER_ROLE_SHELL
+        registered = frozenset({key, "acme%2Fterraform"})
+
+        def shell_write(request_key: str) -> str | None:
+            return cp.report_write_permitted(shell, None, None, audit, request_key, key, allowlist, registered)
+
+        self.assertIsNone(shell_write(key))
+        self.assertIsNone(shell_write("acme%2Fterraform"))
+        for request_key in ("acme%2Fremoved", "ACME%2Fterraform", "github.com%2Facme%252Fterraform", "no_forge%2Flocal"):
+            with self.subTest(shell_key=request_key):
+                self.assertIsNotNone(shell_write(request_key))
+        # A profile task gets the publish key alone, whatever is registered.
+        self.assertIsNotNone(cp.report_write_permitted(
+            cp.CALLER_ROLE_PROFILE, "fleet-audit", trigger(), audit, "acme%2Fterraform", key, allowlist, registered
+        ))
 
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
         # A report credential (#5619) is the one task credential with no
@@ -525,6 +608,70 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_documents"}},
         )
         self.assertFalse(decision.allowed)
+
+    def test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist(self) -> None:
+        # The read rule for the audit-report store (#5619), with stand-in
+        # claims: the shell reads every stream, a profile task reads with a
+        # profile on the reports allowlist, and nothing else reads.
+        cp = h.credential_proxy
+        allowlist = frozenset({"fleet-audit", "platform"})
+        read = cp.report_read_permitted
+        self.assertIsNone(read(cp.CALLER_ROLE_SHELL, None, frozenset()))
+        self.assertIsNone(read(cp.CALLER_ROLE_PROFILE, "fleet-audit", allowlist))
+        for name, rule in (
+            ("a profile outside the allowlist", read(cp.CALLER_ROLE_PROFILE, "auditor", allowlist)),
+            ("an empty allowlist", read(cp.CALLER_ROLE_PROFILE, "fleet-audit", frozenset())),
+            ("no task credential", read(cp.CALLER_ROLE_PROFILE, None, allowlist)),
+            # With an allowlisted profile, so only the role check can refuse.
+            ("a caller with no role", read("", "fleet-audit", allowlist)),
+            ("another role", read(cp.CALLER_ROLE_CHAT, "fleet-audit", allowlist)),
+        ):
+            with self.subTest(name):
+                self.assertIsNotNone(rule)
+
+    def test_A3_the_broker_relays_only_whole_store_routes_and_not_from_an_exec_pod(self) -> None:
+        # The store's handler relays a request only when its method and path
+        # are one of REPORT_CREDENTIAL_ROUTES whole, for every caller, the
+        # shell (which reads every stream) included; and an exec pod, which
+        # holds no store token, serves none of them.
+        cp = h.credential_proxy
+        relayed: list = []
+
+        class Store:
+            def relay(self, method, path, body):
+                relayed.append((method, path))
+                return 200, b"{}"
+
+        def handle(method: str, path: str) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_SHELL)
+            handler.report_store = Store()
+            handler.report_profiles = frozenset()
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._write_audit_report_answer = lambda status, payload: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        stream = "/v1/audit-reports/compliance-audit/acme%2Fgitops"
+        for method, path in (
+            ("GET", "/v1/audit-reports/"),
+            ("GET", stream),
+            ("GET", f"{stream}/latest?all=1"),
+            ("GET", "/v1/audit-reports/compliance-audit/%2e%2e/latest"),
+            ("GET", "/v1/audit-reports/compliance-audit/acme%2F..%2Fother/latest"),
+            ("GET", f"{stream}/runs/../latest"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertEqual([404], handle(method, path))
+        self.assertEqual([], relayed)
+        self.assertEqual([200], handle("GET", f"{stream}/latest"))
+        for method, pattern in cp.REPORT_CREDENTIAL_ROUTES:
+            path = "/v1/audit-reports" if pattern.pattern == "/v1/audit-reports" else f"{stream}/latest"
+            with self.subTest(exec_pod=method):
+                self.assertFalse(cp.exec_pod_serves(method, path))
+                self.assertFalse(cp.exec_pod_serves(method, f"{stream}/runs/20261113T120000.123456Z"))
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches

@@ -423,6 +423,7 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     KUBEAGENTS_RESOLVED_SCOPE_FILE=/etc/kube-agents-resolved/resolved-scope.json
     RECONCILE_PROJECT=
+    KUBEAGENTS_DIAL_ADMINS=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
     STALL_WATCH_MIN_AGE_MINUTES=
@@ -1090,6 +1091,7 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.x-k8s.io/component: shell-sandbox
     spec:
       automountServiceAccountToken: false
       containers:
@@ -1118,6 +1120,12 @@ spec:
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
               value: . profiles/platform
+            - name: SANDBOX_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: shell
+                  divisor: "1"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -1526,6 +1534,14 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-a2a-chat
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
+            - name: AUDIT_REPORT_STORE_URL
+              value: http://platformagent-report-store.kubeagents-system.svc:8700
+            - name: AUDIT_REPORT_STORE_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/audit-report-store/token
+            - name: CREDENTIAL_PROXY_REPORT_PROFILES
+              value: fleet-audit,platform
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
@@ -1582,6 +1598,12 @@ spec:
               readOnly: true
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/audit-report-store
+              name: audit-report-store-ksa
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
               readOnly: true
       dnsConfig:
         options:
@@ -1651,6 +1673,18 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - name: audit-report-store-ksa
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-audit-report-store
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: policy/v1
@@ -1956,6 +1990,8 @@ spec:
                 gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" $GKE_DNS_FLAG &&
                 kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
                 kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
             - name: CREDENTIAL_PROXY_ROLE
               value: exec
             - name: CREDENTIAL_PROXY_EXEC_REPLICAS_FILE
@@ -2013,6 +2049,9 @@ spec:
               readOnly: true
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
               readOnly: true
             - mountPath: /etc/credential-proxy-exec-tier
               name: credential-proxy-exec-tier-replicas
@@ -2077,6 +2116,10 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
         - configMap:
             name: platformagent-credential-proxy-exec-tier-replicas
           name: credential-proxy-exec-tier-replicas
@@ -2736,6 +2779,12 @@ spec:
                   name: platformagent-event-watcher-alert-exclude
             - name: WATCHER_ALERT_EXCLUDE_FILE
               value: /etc/kube-agents/event-watcher/rules.json
+            - name: AUDIT_REPORT_STORE_ENABLED
+              value: "1"
+            - name: AUDIT_REPORT_STORE_ALLOWED_SUBJECT
+              value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent
+            - name: AUDIT_REPORT_STORE_ALLOWED_POD_PREFIX
+              value: platformagent-credential-proxy-
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -2762,6 +2811,8 @@ spec:
               name: proxy-api
             - containerPort: 9095
               name: event-metrics
+            - containerPort: 8700
+              name: report-store
           readinessProbe:
             failureThreshold: 3
             initialDelaySeconds: 5
@@ -3130,6 +3181,14 @@ spec:
         - port: 9119
           protocol: TCP
     - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
+      ports:
+        - port: 8700
+          protocol: TCP
+    - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
@@ -3169,6 +3228,35 @@ spec:
   policyTypes:
     - Ingress
     - Egress
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-report-store
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: report-store
+      port: 8700
+      protocol: TCP
+      targetPort: report-store
+  selector:
+    app: platformagent-gateway
+  type: ClusterIP
+status:
+  loadBalancer: {}
 ---
 apiVersion: v1
 data:
@@ -3312,7 +3400,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "6968d99c141e670f",
+      "version": "85ca76c94916249c",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -3422,6 +3510,82 @@ data:
           }
         },
         {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-gateway",
+          "user": "gateway",
+          "account": "TRUSTED",
+          "grants": {
+            "publish": [
+              "a2a.tasks.*.*.in",
+              "a2a.tasks.*.*.supervisor",
+              "a2a.submit.*.*.*.*",
+              "a2a.stop.*.*",
+              "$KV.session-state.>",
+              "$KV.feedback.>",
+              "$KV.people.>",
+              "chat.console.*.out",
+              "chat.notify.reply.agent.>",
+              "$KV.cap.root.*",
+              "chat.board",
+              "$JS.API.STREAM.INFO.TASKS",
+              "$JS.API.CONSUMER.CREATE.TASKS.>",
+              "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+              "$JS.API.DIRECT.GET.TASKS.>",
+              "$JS.API.STREAM.INFO.KV_session-state",
+              "$JS.API.DIRECT.GET.KV_session-state.>",
+              "$JS.API.CONSUMER.CREATE.KV_session-state.>",
+              "$JS.API.CONSUMER.DELETE.KV_session-state.*",
+              "$JS.API.STREAM.INFO.KV_feedback",
+              "$JS.API.DIRECT.GET.KV_feedback.>",
+              "$JS.API.CONSUMER.CREATE.KV_feedback.>",
+              "$JS.API.CONSUMER.DELETE.KV_feedback.*",
+              "$JS.API.STREAM.INFO.KV_people",
+              "$JS.API.DIRECT.GET.KV_people.>",
+              "$JS.API.CONSUMER.CREATE.KV_people.>",
+              "$JS.API.CONSUMER.DELETE.KV_people.*",
+              "$JS.API.STREAM.INFO.DIRECTORY",
+              "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+              "$JS.ACK.TASKS.>",
+              "$JS.FC.>",
+              "_INBOX.gateway.>"
+            ],
+            "subscribe": [
+              "a2a.tasks.*.*.events",
+              "a2a.tasks.*.*.supervisor",
+              "a2a.tasks.p.*.*.supervisor",
+              "a2a.agents.>",
+              "agents.hb.>",
+              "$KV.session-state.>",
+              "$KV.feedback.>",
+              "$KV.people.>",
+              "chat.console.*.in",
+              "chat.console.*.confirm",
+              "chat.notify.gchat",
+              "chat.notify.slack",
+              "chat.notify.console",
+              "chat.board.reply.gateway.>",
+              "_INBOX.gateway.>"
+            ],
+            "denyPublish": [
+              "$JS.API.*.*.KV_cap",
+              "$JS.API.*.*.KV_cap.>",
+              "$JS.API.*.*.*.KV_cap",
+              "$JS.API.*.*.*.KV_cap.>",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+              "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+              "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+            ],
+            "denySubscribe": [
+              "$KV.cap.>"
+            ]
+          }
+        },
+        {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-dispatcher",
           "user": "dispatcher",
           "account": "TRUSTED",
@@ -3453,7 +3617,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 6968d99c141e670f
+    kubeagents.x-k8s.io/a2a-authmap-version: 85ca76c94916249c
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3615,7 +3779,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "7"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "9"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -4601,7 +4765,6 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
-        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -5666,6 +5829,8 @@ spec:
               value: 6h0m0s
             - name: A2A_DISPATCHER_BUCKETED_GRANTS
               value: "true"
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-dispatcher:latest
           livenessProbe:
             failureThreshold: 6
@@ -5708,6 +5873,9 @@ spec:
             - mountPath: /var/run/kube-agents/task-signing
               name: task-signing-seed
               readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
           workingDir: /
       securityContext:
         fsGroup: 1000
@@ -5734,6 +5902,10 @@ spec:
               - key: task-signing-seed
                 path: seed
             secretName: platformagent-a2a-task-signing-key
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: v1

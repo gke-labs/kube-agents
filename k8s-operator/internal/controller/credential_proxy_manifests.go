@@ -677,6 +677,10 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
 	// are hosted in this same process, and one listener serves both.
 	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, owned, profiles)
+	// Where the audit-report store listens and the token for it. Appended
+	// after the merge with spec.deployment.env, which reserves both names, as
+	// the federation pair below is.
+	envVars = append(envVars, auditReportStoreBrokerEnv(agent)...)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -792,6 +796,11 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The scope declaration in every mode: spec.scope.exclude.clusters is
 	// refused at the broker for every caller (scope_exclude.py).
 	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
+	// The token for the audit-report store and nothing else
+	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
+	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
+	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
+	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -1014,6 +1023,12 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	// mode next the scope role reads it to bound its arguments.
 	volumes = append(volumes, scopeConfigVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
+	// The token the broker presents to the audit-report store.
+	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
+	// The install's tier table (#6091): the operator's rendered, non-secret
+	// tiers ConfigMap, mounted read-only.
+	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)
+	volumes = append(volumes, tiersVolume)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 

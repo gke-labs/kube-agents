@@ -5107,6 +5107,117 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
 
         self.assertEqual(verdicts, ["allow", "warn", "block"])
 
+    def test_build_vcs_broker_publish_passes_executor_vcs_git_subcommand_gate(self):
+        import credential_proxy
+
+        self.assertIn("diff-tree", credential_proxy.VCS_GIT_SUBCOMMANDS)
+        self.assertIn("diff-tree", credential_proxy.VCS_ONLY_GIT_SUBCOMMANDS)
+        self.assertNotIn("diff-tree", credential_proxy.ALLOWED_GIT_SUBCOMMANDS)
+        self.assertNotIn("diff", credential_proxy.VCS_GIT_SUBCOMMANDS)
+
+        (self.seed / ".kube-agents").mkdir(parents=True, exist_ok=True)
+        (self.seed / ".kube-agents" / "intent.yaml").write_text(
+            "paths:\n  - clusters/\n",
+            encoding="utf-8",
+        )
+        manifest_dir = self.seed / "clusters" / "prod"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 2Gi\n",
+            encoding="utf-8",
+        )
+        rec_dir = self.seed / "knowledge" / "decisions"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / "DEC-2026-001.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-001\n"
+            "title: Keep checkout memory >= 1Gi\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/*.yaml\n"
+            "guard:\n"
+            "  rule: memory request must be >= 1Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: \">=\"\n"
+            "    value: 1Gi\n"
+            "---\n\nKeep checkout memory at 1Gi or higher.\n",
+            encoding="utf-8",
+        )
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "seed intent and DEC-2026-001")
+        git(self.seed, "push", "--quiet", "origin", "main")
+
+        state_dir = Path(self.tmp.name) / "executor-state"
+        executor = credential_proxy.CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=1 << 20,
+            state_dir=str(state_dir),
+        )
+        executor.environment["GIT_ALLOW_PROTOCOL"] = "https:file"
+        broker = credential_proxy.build_vcs_broker(executor)
+        self.assertEqual(broker._git_runner, executor.execute_vcs_git)
+        broker.registry.hosts["local.test"] = self.forge
+
+        cloned = broker.clone({"repository": self.REPOSITORY})
+        work_ok = Path(self.tmp.name) / "exec-ok"
+        bundle_path = Path(self.tmp.name) / "exec-ok.bundle"
+        bundle_path.write_bytes(base64.b64decode(cloned["bundleBase64"]))
+        git(self.tmp.name, "clone", "--quiet", "--branch", cloned["branch"], str(bundle_path), str(work_ok))
+
+        git(work_ok, "checkout", "--quiet", "-b", "platform-agent/exec-ok")
+        (work_ok / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n",
+            encoding="utf-8",
+        )
+        git(work_ok, "add", "-A")
+        git(work_ok, "commit", "--quiet", "-m", "raise memory to 4Gi")
+        bundle_ok = self.bundle_of(work_ok, "platform-agent/exec-ok", cloned["revision"])
+
+        ans = broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/exec-ok",
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": bundle_ok,
+        })
+        self.assertEqual(ans["branch"], "platform-agent/exec-ok")
+        self.assertTrue(ans.get("revision"))
+
+        work_bad = Path(self.tmp.name) / "exec-bad"
+        git(self.tmp.name, "clone", "--quiet", "--branch", cloned["branch"], str(bundle_path), str(work_bad))
+        git(work_bad, "checkout", "--quiet", "-b", "platform-agent/exec-bad")
+        (work_bad / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 256Mi\n",
+            encoding="utf-8",
+        )
+        git(work_bad, "add", "-A")
+        git(work_bad, "commit", "--quiet", "-m", "drop memory to 256Mi")
+        bundle_bad = self.bundle_of(work_bad, "platform-agent/exec-bad", cloned["revision"])
+
+        with self.assertRaises(WorkspaceError) as caught_bad:
+            broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/exec-bad",
+                "target": "main",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle_bad,
+            })
+        self.assertEqual(caught_bad.exception.status, 409)
+        self.assertEqual(caught_bad.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("DEC-2026-001", str(caught_bad.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

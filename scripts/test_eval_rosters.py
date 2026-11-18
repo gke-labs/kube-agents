@@ -412,53 +412,53 @@ def write_tasks(root: pathlib.Path, tasks: dict[str, str]) -> pathlib.Path:
     return root
 
 
-class CertificationSuiteTest(unittest.TestCase):
-    """The certification suite is read from the task files: the bare line
-    `suite: certification` is membership, the bare line `certification_part: N`
+class ValidatedCapabilitiesSuiteTest(unittest.TestCase):
+    """The validated-capabilities suite is read from the task files: the bare line
+    `suite: validated-capabilities` is membership, the bare line `suite_part: N`
     is the section, and the text read here is held equal to the YAML read the
     validator makes, since the shell greps the same two lines."""
 
     def test_the_part_is_the_bare_line_or_one(self):
-        self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\ncertification_part: 3\n"), 3)
-        self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\n"), 1)
-        for not_the_line in ('certification_part: "2"\n', "certification_part: 2  # note\n", "  certification_part: 2\n", "certification_part: 0\n", "certification_part: 02\n"):
+        self.assertEqual(eval_rosters.suite_part("id: a\nsuite: validated-capabilities\nsuite_part: 3\n"), 3)
+        self.assertEqual(eval_rosters.suite_part("id: a\nsuite: validated-capabilities\n"), 1)
+        for not_the_line in ('suite_part: "2"\n', "suite_part: 2  # note\n", "  suite_part: 2\n", "suite_part: 0\n", "suite_part: 02\n"):
             with self.subTest(line=not_the_line):
-                self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\n" + not_the_line), 1)
+                self.assertEqual(eval_rosters.suite_part("id: a\nsuite: validated-capabilities\n" + not_the_line), 1)
 
     def test_membership_is_the_bare_line_in_id_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = write_tasks(pathlib.Path(tmp), {
-                "zed-case": "id: zed-case\nsuite: certification\n",
-                "alpha-case": "id: alpha-case\nsuite: certification\ncertification_part: 2\n",
-                "quoted-case": 'id: quoted-case\nsuite: "certification"\n',
-                "noted-case": "id: noted-case\nsuite: certification  # the page row\n",
-                "nested-case": "id: nested-case\nprompt: |\n  x\n  suite: certification\n",
+                "zed-case": "id: zed-case\nsuite: validated-capabilities\n",
+                "alpha-case": "id: alpha-case\nsuite: validated-capabilities\nsuite_part: 2\n",
+                "quoted-case": 'id: quoted-case\nsuite: "validated-capabilities"\n',
+                "noted-case": "id: noted-case\nsuite: validated-capabilities  # the page row\n",
+                "nested-case": "id: nested-case\nprompt: |\n  x\n  suite: validated-capabilities\n",
                 "plain-case": "id: plain-case\n",
             })
-            self.assertEqual(eval_rosters.certification_cases(root), ["alpha-case", "zed-case"])
-            self.assertEqual(eval_rosters.certification_parts(root), {1: ["zed-case"], 2: ["alpha-case"]})
+            self.assertEqual(eval_rosters.validated_capabilities_cases(root), ["alpha-case", "zed-case"])
+            self.assertEqual(eval_rosters.suite_parts(root), {1: ["zed-case"], 2: ["alpha-case"]})
 
     def test_a_crlf_file_is_off_the_lane_as_it_is_to_grep(self):
-        # grep sees `suite: certification\r`, not the bare line; the Python
+        # grep sees `suite: validated-capabilities\r`, not the bare line; the Python
         # read keeps the `\r` too (newline=""), so the two agree and the
         # validator's spelling rule is what reports the file.
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / "crlf-case").mkdir()
-            (root / "crlf-case" / "task.yaml").write_bytes(b"id: crlf-case\r\nsuite: certification\r\ncertification_part: 2\r\n")
+            (root / "crlf-case" / "task.yaml").write_bytes(b"id: crlf-case\r\nsuite: validated-capabilities\r\nsuite_part: 2\r\n")
             (root / "lf-case").mkdir()
-            (root / "lf-case" / "task.yaml").write_bytes(b"id: lf-case\nsuite: certification\n")
-            self.assertEqual(eval_rosters.certification_cases(root), ["lf-case"])
+            (root / "lf-case" / "task.yaml").write_bytes(b"id: lf-case\nsuite: validated-capabilities\n")
+            self.assertEqual(eval_rosters.validated_capabilities_cases(root), ["lf-case"])
 
     def test_the_order_is_by_case_id_as_the_shell_sorts(self):
         # `foo-bar` sorts before `foo` as a path (`-` before `/`) and after it
         # as an id; both readers sort by id.
         with tempfile.TemporaryDirectory() as tmp:
             root = write_tasks(pathlib.Path(tmp), {
-                "foo-bar": "id: foo-bar\nsuite: certification\n",
-                "foo": "id: foo\nsuite: certification\n",
+                "foo-bar": "id: foo-bar\nsuite: validated-capabilities\n",
+                "foo": "id: foo\nsuite: validated-capabilities\n",
             })
-            self.assertEqual(eval_rosters.certification_cases(root), ["foo", "foo-bar"])
+            self.assertEqual(eval_rosters.validated_capabilities_cases(root), ["foo", "foo-bar"])
 
     def test_the_text_read_agrees_with_the_yaml_read_on_every_task(self):
         """The grammar rule: what the validator registers by YAML is what the
@@ -468,27 +468,27 @@ class CertificationSuiteTest(unittest.TestCase):
                 text = task.read_text(encoding="utf-8")
                 doc = yaml.safe_load(text) or {}
                 self.assertEqual(
-                    doc.get("suite") == eval_rosters.CERTIFICATION_SUITE,
-                    eval_rosters.CERTIFICATION_SUITE_LINE_RE.search(text) is not None,
+                    doc.get("suite") == eval_rosters.VALIDATED_CAPABILITIES_SUITE,
+                    eval_rosters.VALIDATED_CAPABILITIES_SUITE_LINE_RE.search(text) is not None,
                     "the suite key is written in a spelling the lane does not read",
                 )
                 self.assertEqual(
-                    doc.get(eval_rosters.CERTIFICATION_PART_KEY, eval_rosters.CERTIFICATION_DEFAULT_PART),
-                    eval_rosters.certification_part(text),
+                    doc.get(eval_rosters.VALIDATED_CAPABILITIES_PART_KEY, eval_rosters.VALIDATED_CAPABILITIES_DEFAULT_PART),
+                    eval_rosters.suite_part(text),
                     "the part key is written in a spelling the lane does not read",
                 )
 
     def test_the_real_tree_shares_no_case_with_the_other_rosters(self):
-        certification = eval_rosters.certification_cases()
-        self.assertEqual(certification, sorted(set(certification)), "one entry per case, in id order")
-        shared = set(certification) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
-        self.assertEqual(shared, set(), "a certification case runs on its lane only")
-        self.assertEqual(sum(len(v) for v in eval_rosters.certification_parts().values()), len(certification))
+        validated_capabilities = eval_rosters.validated_capabilities_cases()
+        self.assertEqual(validated_capabilities, sorted(set(validated_capabilities)), "one entry per case, in id order")
+        shared = set(validated_capabilities) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
+        self.assertEqual(shared, set(), "a validated-capabilities case runs on its lane only")
+        self.assertEqual(sum(len(v) for v in eval_rosters.suite_parts().values()), len(validated_capabilities))
 
     def test_the_summary_counts_the_suite(self):
         got = eval_rosters.summary()
-        self.assertEqual(got["certification cases"], len(eval_rosters.certification_cases()))
-        self.assertEqual(got["certification parts"], len(eval_rosters.certification_parts()))
+        self.assertEqual(got["validated-capabilities cases"], len(eval_rosters.validated_capabilities_cases()))
+        self.assertEqual(got["validated-capabilities parts"], len(eval_rosters.suite_parts()))
 
 
 class NightlySortedSectionTest(unittest.TestCase):
@@ -889,6 +889,7 @@ API_LANE_EXCLUDED = [
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
     "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
+    "tse-profile-names-the-oom-kill",  # #3842: delegated_to, as above
 ]
 
 
@@ -934,6 +935,22 @@ class ApiLaneExclusionsTest(unittest.TestCase):
             if is_stopped_ask(str(doc.get("prompt") or "")):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
+    def test_every_registered_profile_ask_is_excluded(self):
+        # A [bench:profile ...] ask errors on the api transport (#5945), so an
+        # unlisted one would error there every repetition. Read from the
+        # harness's own module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.profile_hook import is_profile_ask
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_profile_ask(str(doc.get("prompt") or "")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} is a profile ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
     def test_every_registered_reply_under_pushed_report_is_excluded(self):
         # The same rule for the pushed-report replay: it errors on the api
@@ -1155,8 +1172,7 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
 # written list, each line with its issue, never a way to seat a new case.
 SEAT_BAR_EXEMPT = [
     ("agent-kanban-smoke", "c-slot", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
-    ("vcs-spent-branch-reuse", "c-repository", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
-    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
+    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing on its roles about that repository"),
 ]
 FLEET_FIXTURE_STATE_SCRIPT = REPO_ROOT / "hack" / "fleet-fixture-state.py"
 FLEET_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
@@ -1365,11 +1381,13 @@ class SeatBarTest(unittest.TestCase):
         self.assertEqual(self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": [{"op": "absent"}]})), [])
 
     def test_an_exemption_covers_its_own_mechanism_only(self):
-        # vcs-spent-branch-reuse is exempt for its pool-repository write; a
-        # slot read added to it would be a c-slot finding the entry does not cover.
+        # pdb-remediation-pr is exempt for its pool-repository write; a slot
+        # read added to it would be a c-slot finding the entry does not cover.
+        # (vcs-spent-branch-reuse lists no role, so the scan's declared-intent
+        # note assertion, anywhere in the catalog, cleared its entry.)
         exempt = {(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT}
-        self.assertIn(("vcs-spent-branch-reuse", "c-repository"), exempt)
-        self.assertNotIn(("vcs-spent-branch-reuse", "c-slot"), exempt)
+        self.assertIn(("pdb-remediation-pr", "c-repository"), exempt)
+        self.assertNotIn(("pdb-remediation-pr", "c-slot"), exempt)
         doc = {"verification_spec": [{"name": "o", "role": "objective", "check": {
             "type": "report_contains", "required_phrases": ["seeded-b"]}}]}
         self.assertEqual(sorted(r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())), ["c-repository", "c-slot"])
@@ -1601,7 +1619,7 @@ def roster_comment_lines(text: str):
     for number, raw in enumerate(text.splitlines(), start=1):
         if "#" not in raw:
             continue
-        # Section markers are not comments about a case. The certification
+        # Section markers are not comments about a case. The validated-capabilities
         # suite's `# part N` file is gone (membership is the task file), so the
         # nightly's sorted-section marker is the only one left.
         if raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
