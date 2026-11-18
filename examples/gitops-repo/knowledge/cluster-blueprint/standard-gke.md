@@ -3,7 +3,9 @@ type: cluster-blueprint
 title: Standard GKE cluster blueprint
 tags: [gke, baseline, cluster]
 resource: container.googleapis.com/Cluster
-timestamp: 2026-07-23T00:00:00Z
+generated:
+  by: human
+  at: 2026-07-23T00:00:00Z
 ---
 
 # Standard GKE cluster blueprint
