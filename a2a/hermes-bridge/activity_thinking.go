@@ -2377,9 +2377,7 @@ func markdownParenKept(content, after string) bool {
 // code. A run of backticks opens a code span the next run of the same
 // length closes; what is inside one is literal. Outside them, a run of * or
 // _ not inside a word is dropped when a later run of the same mark and
-// length closes it. A * bullet among the line's leading markers (lineMarkerEnd),
-// stacked behind a -, a >, a number or another bullet or not, is not a run:
-// it neither opens nor closes emphasis.
+// length closes it.
 func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) [][2]int {
 	inCode := func(int) bool { return false }
 	first := len(code)
@@ -2437,10 +2435,9 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) []
 		c     byte
 	}
 	var open []run
-	markers := lineMarkerEnd(s, lo, hi)
 	for i := lo; i < hi; {
 		c := s[i]
-		if c != '*' && c != '_' || inCode(i) || i < markers {
+		if c != '*' && c != '_' || inCode(i) {
 			i++
 			continue
 		}
@@ -2469,51 +2466,6 @@ func markPairedMarkdownRuns(s string, lo, hi int, drop []bool, code [][2]int) []
 		open = open[:k]
 	}
 	return code
-}
-
-// lineMarkerEnd is where the markdown line markers that open s[lo:hi]
-// (one line) end: its indentation, then any run of - + or > markers, *
-// bullets (one * then a blank), ordered-list numbers and task boxes,
-// stacked or not, each with the blanks after it. The grammar is
-// lineMarkersPattern's, except that a * counts only when a blank follows
-// it, so the * opening "*password*" is emphasis, not a bullet. lo when the
-// line has none.
-func lineMarkerEnd(s string, lo, hi int) int {
-	blanks := func(p int) int {
-		for p < hi && (s[p] == ' ' || s[p] == '\t') {
-			p++
-		}
-		return p
-	}
-	p := blanks(lo)
-	for p < hi {
-		q := p
-		switch c := s[p]; {
-		case c == '-' || c == '+' || c == '>':
-			q = p + 1
-		case c == '*':
-			if p+1 < hi && (s[p+1] == ' ' || s[p+1] == '\t') {
-				q = p + 1
-			}
-		case c >= '0' && c <= '9':
-			d := p
-			for d < hi && d-p < 3 && s[d] >= '0' && s[d] <= '9' {
-				d++
-			}
-			if d < hi && (s[d] == '.' || s[d] == ')') {
-				q = d + 1
-			}
-		case c == '[':
-			if p+2 < hi && (s[p+1] == ' ' || s[p+1] == 'x' || s[p+1] == 'X') && s[p+2] == ']' {
-				q = p + 3
-			}
-		}
-		if q == p {
-			break
-		}
-		p = blanks(q)
-	}
-	return p
 }
 
 func isWordByte(c byte) bool {
@@ -2577,13 +2529,9 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	if nl := strings.LastIndexByte(s[:matchStart], '\n'); nl >= 0 {
 		lineStart = nl + 1
 	}
-	return lineMarkersPattern.MatchString(s[lineStart:matchStart])
+	prefix := strings.TrimLeft(s[lineStart:matchStart], " \t")
+	return prefix == "" || prefix == "-"
 }
-
-// lineMarkersPattern is what may stand before a line-leading key: blanks
-// and markdown line markers (a -, * or + bullet, an ordered-list number, a
-// task box, a blockquote's >), stacked or not.
-var lineMarkersPattern = regexp.MustCompile(`^[ \t]*(?:(?:[-*+>]|[0-9]{1,3}[.)]|\[[ xX]\])[ \t]*)*$`)
 
 // inlineKVLaterKeyPattern is inlineKVSecretPattern without marks before the
 // separator. A later key that ends a value is looked for with it, so a
