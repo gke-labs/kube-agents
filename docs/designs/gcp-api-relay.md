@@ -154,7 +154,10 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    ```
 
    `host` and `path` are caller text and go through `_sanitize_for_logging` as `argv[0]`
-   does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
+   does (`path` at 256 characters, the width the exec route gives a `cwd`). The forwarded line
+   of a read with a body ends with ` resource=projects/<project>`, the one resource name its
+   body check passed: the path of such a read names no project. A refused body's resource is
+   in no line, and the `audit` mapping does not carry it. The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
    writes `api disabled request_id=%s rule=%s`. Each of these records also carries the
@@ -460,7 +463,7 @@ before the host is read.
 | Supply its own credential or an API key                              | Caller headers dropped; `key`/`access_token`/`oauth_token`/`bearer_token` stripped                                                                                                                                 |
 | Put a byte on the upstream request line the broker did not choose    | `API_RELAY_QUERY_SHAPE`: URL query characters (RFC 3986's plus `[` `]`) and complete percent-escapes only, 400 before the table                                                                                    |
 | Send the front end an over-long URL on demand                        | `API_RELAY_MAX_QUERY_BYTES`, 400 before the table; a 414 that does arrive is passed through like any other status                                                                                                  |
-| Forge an audit line                                                  | `_sanitize_for_logging` on every caller-supplied field, as on `/v1/exec`                                                                                                                                           |
+| Forge an audit line                                                  | `_sanitize_for_logging` on every caller-supplied field, as on `/v1/exec`; a body's resource name is logged only after `check_logging_entries_list` held it to `projects/<project>`                                 |
 | Call it from the gateway role                                        | `ROUTE_ROLES` admits `shell` only                                                                                                                                                                                  |
 | Exhaust the broker with a huge response, or hand it a page cut short | `API_RELAY_MAX_RESPONSE_BYTES`, read in chunks with a cap rather than `.read()`; a body short of its `Content-Length` is `UPSTREAM_TRUNCATED`, none of it relayed                                                  |
 | Park a broker thread on a stalled upstream                           | `API_RELAY_CONNECT_TIMEOUT_S` on the connect; `API_RELAY_DEADLINE_S` re-armed on the socket before every `read1`                                                                                                   |
@@ -535,7 +538,9 @@ standing in for `monitoring.googleapis.com` and the real `GoogleApiRelay.fetch` 
   included), a request that cannot be framed or has no body a 400, and one exactly at the cap
   is read. A body that stalls leaves a `started` and a `rejected` record. The chat
   and session roles are refused. Each outcome writes its audit record under the `logging`
-  subcommand, and the filter is in no log line.
+  subcommand, and the filter is in no log line. The forwarded line of an `entries:list` ends
+  with the body's `projects/<project>`, the line of a forwarded `GET` names no resource, and
+  no line of a refused body carries its project.
 - A refused `POST` carrying a body larger than the socket buffers still receives its 403,
   because the body is drained first.
 - Each policy refusal (`gcp.api.path`, `gcp.api.host-refused`, `gcp.api.host`,

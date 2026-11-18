@@ -880,6 +880,9 @@ API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
 # Longer than the default 64 because an API path is caller text that has to be
 # readable in the audit line; the same 256 the exec route gives a `cwd`.
 API_RELAY_PATH_LOG_LENGTH = 256
+# What the forwarded line of a read with a body ends with: the one resource name
+# the body check passed. The path of such a read names no project.
+API_RELAY_RESOURCE_LOG_SUFFIX = " resource={}"
 # The width a principal is logged at, on the exec route's audit records and
 # the relay's lines alike. The value comes from the TokenReview, not from the
 # request, and a ServiceAccount username truncated at the default 64 loses
@@ -15803,10 +15806,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
         forwarded_body: bytes | None = None
+        resource: str | None = None
         if has_body:
-            forwarded_body = self._api_relay_body(request_id, decision.rule_id, audit)
-            if forwarded_body is None:
+            checked = self._api_relay_body(request_id, decision.rule_id, audit)
+            if checked is None:
                 return
+            forwarded_body, resource = checked
         if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
@@ -15915,13 +15920,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
+        # `resource` has passed the route's body check, so it is logged as it is. The
+        # audit mapping stays identifiers and outcomes.
         LOGGER.info(
-            "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d",
+            "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d%s",
             request_id,
             host,
             upstream.status,
             len(upstream.body),
             duration_ms,
+            API_RELAY_RESOURCE_LOG_SUFFIX.format(resource) if resource else "",
             extra=audit(AUDIT_STATUS_COMPLETED, duration_ms=duration_ms, upstream_status=upstream.status),
         )
         self.send_response(upstream.status)
@@ -15933,13 +15941,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
 
     def _api_relay_body(
         self, request_id: str, rule_id: str, audit: Callable[..., dict[str, Any]]
-    ) -> bytes | None:
+    ) -> tuple[bytes, str | None] | None:
         """The body the broker forwards for the allowed route `rule_id`, or None after answering.
 
         The caller's body is read up to API_RELAY_MAX_BODY_BYTES, parsed as JSON
         and held to the route's body check. What is returned is the broker's own
         serialisation of the object that passed, so a duplicate key, a comment
-        or any byte the parser dropped never reaches the upstream.
+        or any byte the parser dropped never reaches the upstream, and with it
+        the one resource name of that object the forwarded line may carry
+        (`api_policy.body_resource`), or None. A refused body returns neither.
         """
         # The length `parse_request` framed the request with: None when it cannot
         # be framed (a Transfer-Encoding, a length that is not a number, two
@@ -16006,7 +16016,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return None
-        return json.dumps(parsed, separators=(",", ":")).encode()
+        return json.dumps(parsed, separators=(",", ":")).encode(), api_policy.body_resource(rule_id, parsed)
 
     def _handle_mcp_relay(self) -> None:
         """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.

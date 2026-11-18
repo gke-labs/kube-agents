@@ -20040,6 +20040,49 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertNotIn("k8s_cluster", "\n".join(r.getMessage() for r in logs.records))
         self.assertNotIn("k8s_cluster", json.dumps(self._audits(logs)))
 
+    def test_a_forwarded_entries_list_names_its_project_in_the_forwarded_line(self):
+        # The path of this read is `v2/entries:list` for every project, so the line that
+        # says the read was forwarded carries the one resource the body check passed.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertTrue(forwarded.endswith(" resource=projects/kagents-dev"), forwarded)
+        # No other line names it, and the audit fields stay identifiers and outcomes.
+        others = [r.getMessage() for r in logs.records if not r.getMessage().startswith("api forwarded request_id=")]
+        self.assertNotIn("kagents-dev", "\n".join(others))
+        self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_forwarded_get_names_no_resource_in_the_forwarded_line(self):
+        # A GET's project is in its path, which the first line of the request carries.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertNotIn("resource=", forwarded)
+
+    def test_a_refused_body_leaves_its_project_out_of_every_log_line(self):
+        # A project the check did not pass is caller text. No line carried it before
+        # the forwarded line named a project, and this holds that. Each body here
+        # names the project and is refused.
+        project = "refused-project-1"
+        cases = (
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}", "projects/kagents-dev"]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "projectIds": [project]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "orderBy": "severity desc"},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "pageSize": 100000},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}/logs/syslog"]},
+            {**self.ENTRIES_BODY, "resourceNames": f"projects/{project}"},
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                status, _, payload = self._entries_list(body)
+                self.assertEqual(403, status)
+                self.assertEqual("gcp.api.body", payload["rule"])
+                self.assertNotIn(project, "\n".join(r.getMessage() for r in logs.records))
+                self.assertNotIn(project, json.dumps(self._audits(logs)))
+        self.assertEqual([], self.upstream_requests)
+
     def test_the_upstream_gets_the_brokers_serialisation_not_the_callers_bytes(self):
         # A duplicate key: the parser keeps the last, the check reads the last,
         # and the upstream is sent one key with that value. Nothing of the
