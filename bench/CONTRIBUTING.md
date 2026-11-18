@@ -18,7 +18,10 @@ repositories that CI pulls from.
    `cluster_name` and `cluster_location`: `devops-bench` reads them after the apply and
    fails the run without them.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
-   about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
+   about a second, with PyYAML alone: no cluster, no `bench/` virtualenv. One more rule runs
+   where the bench package is installed (`make test-bench-deps`): it loads each check with the
+   harness's parser and rejects a field that the check's verifier does not have. Without the
+   package the last line of the output says that this rule did not run; CI runs it.
 3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the
    foot of `hack/eval/nightly-cases.txt`, at its place in case-id order, with the `#` lines
    directly above it saying why it's there and naming anything that still blocks it. That
@@ -28,7 +31,8 @@ repositories that CI pulls from.
    all is not registered yet: it goes in `scripts/validate_bench_cases.py`'s
    `FIXTURE_NOT_READY` with the issue that plants the fixture. The format document's
    "Registration" section says which and why.
-4. Open the pull request. `scripts/test_task_registration.py` runs the same rules in CI, and
+4. Open the pull request. `scripts/test_task_registration.py` runs the same rules in CI (the
+   harness-parser rule of step 2 runs in the bench tests), and
    the nightly runs the case from the night it merges, so a case that cannot pass or cannot
    fail shows up on its record.
 5. The case merges unadmitted. It runs and reports every night from then on and earns its
@@ -51,7 +55,8 @@ the case planted; the judge scores the prose the agent composed. That document i
 contract; this page does not restate it.
 
 **Check:** `make bench-case-check` locally, `scripts/test_task_registration.py` in CI. The CI
-lint asserts that the validator returned nothing at all, so every rule in it gates.
+lint asserts that the validator returned nothing at all, so every rule in it gates; the one
+rule that needs the harness's parser gates through `bench/tests/test_case_entries_load.py`.
 
 A pull request's eval jobs grade its cases with `main`'s `bench/`, so a new check type, case key
 or fleet role lands before any case those jobs run uses it, including a nightly case on a lane list

@@ -597,7 +597,7 @@ class TestTheValidatorItself(unittest.TestCase):
             path.parent.mkdir()
 
             path.write_text(yaml.safe_dump(spec))
-            with contextlib.redirect_stdout(io.StringIO()) as clean:
+            with contextlib.redirect_stdout(io.StringIO()) as clean, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(
                     validator.main([str(path)]),
                     0,
@@ -608,7 +608,7 @@ class TestTheValidatorItself(unittest.TestCase):
             # One rule broken -- an unknown domain -- is enough. Which rule
             # does not matter; that main() propagates any finding does.
             path.write_text(yaml.safe_dump({**spec, "domain": "not-a-real-domain"}))
-            with contextlib.redirect_stdout(io.StringIO()) as dirty:
+            with contextlib.redirect_stdout(io.StringIO()) as dirty, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(
                     validator.main([str(path)]),
                     1,
@@ -616,6 +616,106 @@ class TestTheValidatorItself(unittest.TestCase):
                     "reports success on a broken tree",
                 )
             self.assertIn("rejected", dirty.getvalue())
+
+
+class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
+    """The rule that loads each entry with the harness's reader and parser, in a job that
+    does not install the bench package (this one), with stand-ins for the two.
+    bench/tests/test_case_entries_load.py holds the rule against the real parser."""
+
+    ENTRY = {"name": "names-the-thing", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["x"]}}
+    REFUSED = "Extra inputs are not permitted: 'no_such_field'"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = pathlib.Path(self.tmp.name) / "made-up-case" / "task.yaml"
+        self.path.parent.mkdir()
+        self.sent: list[list[dict]] = []
+
+    def _write(self, *entries, **top):
+        self.path.write_text(yaml.safe_dump({**TestTheRulesReject.VALID, "verification_spec": list(entries), **top}))
+
+    def _harness(self, errors=(), raises=None):
+        """A stand-in for the harness's reader and parser that records what the parser got."""
+
+        def parse(entries):
+            self.sent.append(entries)
+            if raises:
+                raise raises
+            return [], [{"name": entries[0]["name"], "reason": reason} for reason in errors]
+
+        return mock.patch.object(validator, "spec_parser", return_value=(yaml.safe_load, parse))
+
+    def test_the_rule_reports_nothing_without_the_parser(self):
+        self._write(self.ENTRY)
+        with mock.patch.object(validator, "spec_parser", return_value=None):
+            self.assertEqual(validator.unloadable_entries(self.path, [0]), [])
+
+    def test_the_rule_reports_what_the_parser_refuses(self):
+        self._write(self.ENTRY)
+        with self._harness(errors=[self.REFUSED]):
+            self.assertEqual(
+                validator.validate_case("made-up-case", self.path, registered=None),
+                [f"check 'names-the-thing': {validator.UNLOADABLE_ENTRY}: {self.REFUSED}"],
+            )
+
+    def test_a_parser_that_raises_is_a_problem_of_its_entry(self):
+        """The command must name the case and the entry, not stop with a traceback that hides every other case."""
+        self._write(self.ENTRY)
+        with self._harness(raises=re.error("missing ), unterminated subpattern")):
+            (problem,) = validator.validate_case("made-up-case", self.path, registered=None)
+        self.assertTrue(problem.startswith(f"check 'names-the-thing': {validator.PARSER_RAISED}: "), problem)
+        self.assertIn("unterminated subpattern", problem)
+
+    def test_an_entry_that_another_rule_faults_does_not_go_to_the_parser(self):
+        """One defect is one problem: the parser would refuse the unknown type a second time."""
+        faulted = {**self.ENTRY, "name": "faulted", "check": {"type": "no_such_type"}}
+        self._write(faulted, self.ENTRY)
+        with self._harness(errors=[self.REFUSED]):
+            problems = validator.validate_case("made-up-case", self.path, registered=None)
+        self.assertEqual([[entry["name"] for entry in entries] for entries in self.sent], [["names-the-thing"]])
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("unknown check type 'no_such_type'", problems[0])
+        self.assertIn(validator.UNLOADABLE_ENTRY, problems[1])
+
+    def test_a_file_that_the_harness_cannot_read_is_a_problem_of_the_case(self):
+        self._write(self.ENTRY)
+
+        def unreadable(text):
+            raise ValueError("while constructing a mapping")
+
+        with mock.patch.object(validator, "spec_parser", return_value=(unreadable, None)):
+            self.assertEqual(
+                validator.unloadable_entries(self.path, [0]),
+                [f"{validator.HARNESS_CANNOT_READ}: ValueError: while constructing a mapping"],
+            )
+
+    def test_the_command_says_last_that_the_rule_did_not_run(self):
+        for domain, status in (("security", 0), ("not-a-real-domain", 1)):
+            self._write(self.ENTRY, domain=domain)
+            for installed in (False, True):
+                with self.subTest(exit_status=status, parser_installed=installed):
+                    # One buffer for both streams, so that the order is seen.
+                    output = io.StringIO()
+                    harness = self._harness() if installed else mock.patch.object(validator, "spec_parser", return_value=None)
+                    with harness, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                        # The note changes no exit status: the other rules decide it.
+                        self.assertEqual(validator.main([str(self.path)]), status)
+                    text = output.getvalue()
+                    self.assertIn("rejected" if status else "OK", text)
+                    if installed:
+                        self.assertNotIn(validator.FIELD_CHECK_SKIPPED, text)
+                    else:
+                        self.assertTrue(text.endswith(f"{validator.FIELD_CHECK_SKIPPED}\n"), text)
+                        # On stderr: a caller that reads stdout for "OK" still sees the note on a terminal.
+                        errors = io.StringIO()
+                        with mock.patch.object(validator, "spec_parser", return_value=None):
+                            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+                                validator.main([str(self.path)])
+                        self.assertEqual(errors.getvalue(), f"{validator.FIELD_CHECK_SKIPPED}\n")
+                        self.assertTrue(validator.FIELD_CHECK_SKIPPED.startswith("bench-case-check: the field check did NOT run"))
+                        self.assertIn("make test-bench-deps", validator.FIELD_CHECK_SKIPPED)
 
 
 class TestTheRulesReject(unittest.TestCase):
@@ -993,7 +1093,7 @@ class TestTheRulesReject(unittest.TestCase):
         problem = self._only(
             "declares no 'fixtures:'",
             fixtures=DELETE,
-            verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "name": "payments-api", "namespace": "seeded-debug", "property_path": "spec.replicas", "op": "eq", "expected": 1}),
+            verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "resource_name": "payments-api", "namespace": "seeded-debug", "path": "spec.replicas", "op": "eq", "value": 1}),
         )
         self.assertIn("reads live cluster state (fleet_resource_property)", problem)
 
@@ -1606,10 +1706,10 @@ class TestTheSanitizer(unittest.TestCase):
             path.parent.mkdir()
             path.write_text(yaml.safe_dump(spec))
             (path.parent / "values.yaml").write_text("upstream: 192.0.2.53\n")
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(validator.main([str(path)]), 0)
             (path.parent / "values.yaml").write_text("upstream: 10.0.0.53\n")
-            with contextlib.redirect_stdout(io.StringIO()) as out:
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(validator.main([str(path)]), 1)
             self.assertIn("unsanitized fixture", out.getvalue())
             self.assertIn("10.0.0.53", out.getvalue())

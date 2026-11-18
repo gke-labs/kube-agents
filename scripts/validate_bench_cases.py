@@ -20,6 +20,13 @@ valid case is. A rule added here therefore gates the day it is written, with
 no second edit anywhere. The CLI runs in no workflow; the lint is what reds a
 pull request.
 
+One rule needs more than PyYAML: each check entry that no other rule faults is
+read and loaded with the harness's own YAML reader and parser, which are in the
+bench package (`make test-bench-deps`). Where that package is not installed, as
+in the lint's job, the rule does not run and the CLI says so on its last line;
+`bench/tests/test_case_entries_load.py` gates it in the job that installs the
+package.
+
 `docs/designs/bench-case-format.md` is the contract these rules enforce,
 `docs/designs/bench-fleet-catalog.md` the fixture half of it, and
 `bench/CONTRIBUTING.md` the submission path the `owner:` and sanitization rules
@@ -35,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import functools
 import importlib.util
 import ipaddress
 import json
@@ -74,6 +82,16 @@ REQUESTED_PULL_REQUESTS_KEY = "requested_pull_requests"
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 CHECK_CHILD_KEYS = ("checks", "check")
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The harness refuses an entry that its parser (devops-bench's `parse_entries`) refuses, records
+# it in `verification_parse_errors`, and runs the case without it.
+UNLOADABLE_ENTRY = "the harness cannot load this entry and drops it at run time"
+PARSER_RAISED = "the harness's parser raises on this entry"
+HARNESS_CANNOT_READ = "the harness's YAML reader cannot read this file"
+FIELD_CHECK_SKIPPED = (
+    "bench-case-check: the field check did NOT run: the bench package is not installed here, so no "
+    "check entry was loaded with the harness's parser, and an entry with a field that its verifier "
+    "does not have passes. Install the package with `make test-bench-deps` and run this again."
+)
 # A run's record is never committed beside a case: a public file names the run
 # and its outcome, nothing from inside the record. The harness writes runs
 # under bench/results/, which is gitignored, so nothing legitimate lands here.
@@ -752,6 +770,47 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 # case's turn too, since the nightly runs every case against one install.
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
+
+
+@functools.lru_cache(maxsize=1)
+def spec_parser() -> tuple[Any, Any] | None:
+    """The harness's YAML reader and its parser of a case's entries, or None where the bench
+    package is not installed."""
+    try:
+        import kube_agents_bench  # noqa: F401, PLC0415 -- its entry points register this repository's check types
+        from devops_bench.tasks.loader import safe_parse_yaml  # noqa: PLC0415
+        from devops_bench.verification.spec import parse_entries  # noqa: PLC0415
+    except ImportError:
+        return None
+    return safe_parse_yaml, parse_entries
+
+
+def unloadable_entries(path: pathlib.Path, indexes: list[int]) -> list[str]:
+    """One problem for each of the case's entries at `indexes` that the harness does not load; none
+    where the bench package is not installed.
+
+    The entries are read with the harness's own reader, not with PyYAML: the two read `no`, `on`
+    and `22:30` as different types (YAML 1.1 and 1.2), and the parser has to see what a run sees.
+    One entry goes to the parser at a time, so a parser that raises names its entry."""
+    harness = spec_parser()
+    if harness is None or not indexes:
+        return []
+    read, parse = harness
+    try:
+        entries = read(path.read_text(encoding="utf-8"))["verification_spec"]
+    except Exception as exc:  # noqa: BLE001 -- any failure of the harness's reader is this case's problem
+        return [f"{HARNESS_CANNOT_READ}: {type(exc).__name__}: {exc}"]
+    problems: list[str] = []
+    for index in indexes:
+        where = f"verification_spec[{index}]"
+        try:
+            where = f"check {entries[index].get('name')!r}"
+            errors = parse([entries[index]])[1]
+        except Exception as exc:  # noqa: BLE001 -- a crash of the parser is a result too, and must not hide the other cases
+            problems.append(f"{where}: {PARSER_RAISED}: {type(exc).__name__}: {exc}")
+            continue
+        problems.extend(f"{where}: {UNLOADABLE_ENTRY}: {error['reason']}" for error in errors)
+    return problems
 
 
 def _populated(value: Any) -> bool:
@@ -1715,7 +1774,11 @@ def validate_case(
         used_types: set[str] = set()
         used_roles: set[str] = set()
         slot_roles: set[str] = set()
+        # The entries that no rule of this loop faults: the harness's parser gets only these, so
+        # one defect is one problem.
+        unfaulted: list[int] = []
         for index, entry in enumerate(entries):
+            faults = len(problems)
             if not isinstance(entry, dict):
                 problems.append(f"verification_spec[{index}]: entry is not a mapping")
                 continue
@@ -1737,6 +1800,9 @@ def validate_case(
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles, slot_roles)
                 _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
+            if len(problems) == faults:
+                unfaulted.append(index)
+        problems.extend(unloadable_entries(path, unfaulted))
 
         # `fixture_roles:` asks whether a role's slot was reached, which the
         # runner records for catalogue roles only; an overlay role with no
@@ -2218,9 +2284,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")
-        return 1
-    print(f"{len(results)} bench case(s) OK.")
-    return 0
+    else:
+        print(f"{len(results)} bench case(s) OK.")
+    if spec_parser() is None:
+        # Last, and on stderr: an "OK" above it does not cover the fields of a check.
+        sys.stdout.flush()
+        print(FIELD_CHECK_SKIPPED, file=sys.stderr)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
