@@ -2606,6 +2606,301 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         self.assertEqual(len(result.cards), 1)
         self.assertIn(("proposal-view", "acme/app-gitops"), queried_repos)
 
+    def test_detect_human_modification_treats_install_commit_email_as_ours(self):
+        pending_base = {
+            "id": "DEC-2026-050",
+            "type": "decision",
+            "status": "proposed",
+            "title": "Enforce PDB on web deployments",
+            "guard_rule": "PDB minAvailable must be >= 1.",
+            "pull_request": "https://github.com/acme/infra/pull/350 (#350)",
+        }
+
+        def run_case(commits_payload):
+            pending_json = json.dumps({"repo": "acme/infra", "records": [pending_base]})
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+            def fake_forge_call(verb, payload, repo, **kw):
+                if verb == "proposal-view" and not payload.get("diff"):
+                    return {
+                        "proposal": {
+                            "number": 350,
+                            "state": "merged",
+                            "url": "https://github.com/acme/infra/pull/350",
+                        },
+                        "comments": [],
+                    }
+                if verb == "proposal-commits":
+                    return {"commits": commits_payload}
+                return {"diff": ""}
+
+            rec = dict(pending_base)
+            prop = {"number": 350, "state": "merged"}
+            view_ans = {"proposal": prop, "comments": []}
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                mod = gate._detect_human_modification(
+                    rec, prop, view_ans, "kube-agents", provider=bp_cls.return_value, repo="acme/infra", pr_num=350
+                )
+                gate.sweep_memory_proposals()
+            return mod, calls
+
+        agent_only_mod, agent_calls = run_case(
+            [{"author": "platform-agent", "email": "platform-agent@kube-agents.invalid", "bot": False}]
+        )
+        self.assertIsNone(agent_only_mod)
+        self.assertEqual(len(agent_calls), 2)
+        self.assertIn("approved", agent_calls[1])
+        self.assertNotIn("modified-merged", agent_calls[1])
+
+        human_mod, human_calls = run_case(
+            [
+                {"author": "platform-agent", "email": "platform-agent@kube-agents.invalid", "bot": False},
+                {"author": "alice", "email": "alice@example.com", "bot": False},
+            ]
+        )
+        self.assertIsNotNone(human_mod)
+        self.assertEqual(len(human_calls), 2)
+        self.assertIn("modified-merged", human_calls[1])
+
+    def test_stale_post_merge_row_with_same_finding_id_does_not_poison_new_pr(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-051",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Add PDB for checkout",
+                    "path": "knowledge/lessons/LES-2026-051.md",
+                    "branch": "platform-agent/memory/LES-2026-051",
+                    "pull_request": "https://github.com/acme/infra/pull/205 (#205)",
+                    "finding_id": "no-pdb.prod.shop.Deployment/checkout",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-view":
+                return {
+                    "proposal": {
+                        "number": 205,
+                        "state": "open",
+                        "url": "https://github.com/acme/infra/pull/205",
+                    }
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=200,
+                finding_id="no-pdb.prod.shop.Deployment/checkout",
+                merged_at="2026-11-01T12:00:00Z",
+                reverted_at="2026-11-02T12:00:00Z",
+                outcome="still_broken",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                self.assertIsNone(gate._read_post_merge_record("acme/infra", 205))
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(calls), 1)  # only `curator pending`, open PR #205 untouched
+
+    def test_remediation_pr_fallback_soak_without_post_merge_record_or_applied_not_rechecked(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-052",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Raise memory limit on worker",
+                    "path": "knowledge/lessons/LES-2026-052.md",
+                    "branch": "platform-agent/memory/LES-2026-052",
+                    "pull_request": "https://github.com/acme/infra/pull/410 (#410)",
+                    "finding_id": "oom.prod.shop.Deployment/worker",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call_clean(verb, payload, repo, **kw):
+            if verb == "proposal-view" and not payload.get("diff"):
+                return {
+                    "proposal": {
+                        "number": 410,
+                        "state": "merged",
+                        "mergedAt": "2026-11-01T12:00:00Z",
+                        "url": "https://github.com/acme/infra/pull/410",
+                    },
+                    "comments": [],
+                }
+            if verb == "proposal-commits":
+                return {
+                    "commits": [
+                        {
+                            "author": "platform-agent",
+                            "email": "platform-agent@kube-agents.invalid",
+                            "bot": False,
+                        }
+                    ]
+                }
+            return {"diff": ""}
+
+        with tempfile.TemporaryDirectory() as td:
+            missing_db = Path(td) / "missing.db"
+            # (i) No post_merge_records row (non-no-pdb lesson): soaks before 24h, resolves after 24h.
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(missing_db)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_clean):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 1, 18, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 1)
+                calls.clear()
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("resolved-merged", calls[1])
+                self.assertIn("--soak-window", calls[1])
+                self.assertIn("--finding-id", calls[1])
+
+            # (i-b) Human-edited fallback soak emits modified-merged after soak elapses.
+            calls.clear()
+
+            def fake_forge_call_human(verb, payload, repo, **kw):
+                if verb == "proposal-commits":
+                    return {"commits": [{"author": "alice", "email": "alice@example.com", "bot": False}]}
+                return fake_forge_call_clean(verb, payload, repo, **kw)
+
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(missing_db)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_human):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("modified-merged", calls[1])
+
+            # (ii) pm_row with KUBEAGENTS_POST_MERGE_CHECK=silent and outcome="" waits in soaking.
+            calls.clear()
+            db_pending = Path(td) / "pending.db"
+            self._seed_post_merge_db(
+                db_pending,
+                number=410,
+                finding_id="oom.prod.shop.Deployment/worker",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "NATS_URL": "nats://localhost:4222",
+                    "SESSION_KV_DB_PATH": str(db_pending),
+                    "KUBEAGENTS_POST_MERGE_CHECK": "silent",
+                },
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_clean):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 1)
+
+            # (iii) pm_row with outcome="applied_not_rechecked" resolves after soak window.
+            calls.clear()
+            db_recheck = Path(td) / "recheck.db"
+            self._seed_post_merge_db(
+                db_recheck,
+                number=410,
+                finding_id="oom.prod.shop.Deployment/worker",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="applied_not_rechecked",
+                human_edited=None,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_recheck)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_clean):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("resolved-merged", calls[1])
+
+            # (iv) pm_row with outcome="verified_fixed" and human_edited=None runs proposal-view rather than fast-pathing.
+            calls.clear()
+            db_null_edited = Path(td) / "null_edited.db"
+            self._seed_post_merge_db(
+                db_null_edited,
+                number=410,
+                finding_id="oom.prod.shop.Deployment/worker",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=None,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_null_edited)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_human) as forge_call:
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertGreaterEqual(forge_call.call_count, 1)
+                self.assertEqual(len(calls), 2)
+                self.assertIn("modified-merged", calls[1])
+
 
 if __name__ == "__main__":
     unittest.main()

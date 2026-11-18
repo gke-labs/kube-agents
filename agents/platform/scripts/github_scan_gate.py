@@ -83,6 +83,7 @@ import post_merge_stepdown
 import pr_triggers
 import repo_ref
 import script_log
+import vcs_readings
 
 # Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
 # `SWEEPS` registry near the bottom of this file rather than written out twice.
@@ -227,6 +228,8 @@ CARD_TITLE_MAX = 200
 DEFAULT_SOAK_WINDOW = "24h"
 MEMORY_BRANCH_PREFIX = "platform-agent/memory/"
 MIN_CODE_FENCE_TICKS = 4
+POST_MERGE_DB_TIMEOUT_S = 5.0
+APPLIED_NOT_RECHECKED = "applied_not_rechecked"
 SOAK_WINDOWS_SECONDS = {
     "10m": 10 * 60,
     "24h": 24 * 3600,
@@ -1214,14 +1217,6 @@ def _detect_human_modification(
         if cand_rule and cand_rule != initial_proposal:
             edited_rule = cand_rule
 
-    human_editor = ""
-    last_author = str(prop.get("last_commit_author") or "").strip()
-    head_sha = str(prop.get("head_sha") or prop.get("sourceRevision") or "").strip()
-    initial_sha = str(prop.get("initial_sha") or rec.get("initial_sha") or "").strip()
-    if last_author and (not viewer_key or forge.normalise_login(last_author) != viewer_key):
-        if initial_sha and head_sha and initial_sha != head_sha:
-            human_editor = last_author
-
     commits = view_ans.get("commits") or prop.get("commits")
     if commits is None and pr_num and repo:
         try:
@@ -1236,16 +1231,28 @@ def _detect_human_modification(
         except Exception:  # noqa: BLE001 — optional commit enrichment
             commits = []
 
-    if not human_editor and isinstance(commits, list):
+    parsed_repo = repo_ref.try_parse(repo) if repo else None
+    repo_host = parsed_repo.host if parsed_repo and parsed_repo.host else ""
+    human_editor = ""
+    if isinstance(commits, list):
         for c in reversed(commits):
             if not isinstance(c, dict):
                 continue
-            if c.get("bot"):
+            if c.get("bot") or vcs_readings.commit_is_ours(c, viewer_key, host=repo_host):
                 continue
             c_author = str(c.get("author") or "").strip()
-            if c_author and (not viewer_key or forge.normalise_login(c_author) != viewer_key):
-                human_editor = c_author
+            c_email = str(c.get("email") or "").strip()
+            if c_author or c_email:
+                human_editor = c_author or c_email
                 break
+
+    last_author = str(prop.get("last_commit_author") or "").strip()
+    head_sha = str(prop.get("head_sha") or prop.get("sourceRevision") or "").strip()
+    initial_sha = str(prop.get("initial_sha") or rec.get("initial_sha") or "").strip()
+    if not human_editor and not commits:
+        if last_author and (not viewer_key or forge.normalise_login(last_author) != viewer_key):
+            if initial_sha and head_sha and initial_sha != head_sha:
+                human_editor = last_author
 
     if (human_editor or (initial_sha and head_sha and initial_sha != head_sha)) and not edited_rule:
         diff_text = str(view_ans.get("diff") or "")
@@ -1299,19 +1306,32 @@ def _detect_human_modification(
     }
 
 
-def _read_post_merge_record(
-    repo: str, pr_num: int | None, finding_id: str = ""
-) -> dict | None:
+def _pm_repo_key(repo: str) -> str:
+    """Normalize repo strings (URL, host/owner/repo, or legacy bare owner/repo) for post_merge_records."""
+    cleaned = str(repo or "").strip()
+    if not cleaned:
+        return ""
+    key = clean_merges.repo_key(cleaned)
+    if key:
+        return key
+    if repo_ref.is_github_slug(cleaned):
+        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{cleaned}".lower()
+    return cleaned.lower()
+
+
+def _read_post_merge_record(repo: str, pr_num: int | None) -> dict | None:
     """Read the matching ``post_merge_records`` row from Session KV (#5054)."""
+    if pr_num is None:
+        return None
     db_path = (
         os.environ.get(post_merge_check.SESSION_KV_DB_ENV)
         or post_merge_check.SESSION_KV_DB_DEFAULT
     )
     if not db_path or not os.path.isfile(db_path):
         return None
-    target_key = clean_merges.repo_key(repo) or repo.strip().lower()
+    target_key = _pm_repo_key(repo)
     try:
-        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(db_path, timeout=POST_MERGE_DB_TIMEOUT_S)) as conn:
             present = {
                 row[1]
                 for row in conn.execute(
@@ -1330,106 +1350,136 @@ def _read_post_merge_record(
 
     for row in rows:
         row_repo = str(row.get("repo") or "").strip()
-        row_key = clean_merges.repo_key(row_repo) or row_repo.lower()
-        if pr_num is not None and row.get("number") == pr_num and row_key == target_key:
+        row_key = _pm_repo_key(row_repo)
+        if row.get("number") == pr_num and row_key == target_key:
             return row
-    if finding_id:
-        for row in rows:
-            if str(row.get("finding_id") or "").strip() == finding_id:
-                return row
     return None
 
 
 def _evaluate_remediation_from_post_merge_record(
-    rec: dict, pm_row: dict | None, *, now: datetime | None = None
+    rec: dict,
+    pm_row: dict | None,
+    *,
+    prop_merged_at: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[str, str]:
-    """Evaluate a merged remediation PR from Session KV's ``post_merge_records`` (#5054).
+    """Evaluate a merged remediation PR from Session KV's ``post_merge_records`` or forge merge soak.
 
     Reuses ``post_merge_records`` (``outcome``, ``human_edited``, ``reverted_at``,
     ``merged_at``) and ``clean_merges`` (``VERIFIED_FIXED``, ``REVERT_WINDOW``,
-    ``is_clean``, ``_parse_time``) so there is a single post-merge outcome tracker.
+    ``is_clean``, ``_parse_time``) when present and active; falls back to forge
+    merge soak when ``pm_row`` is absent, ``KUBEAGENTS_POST_MERGE_CHECK`` is off,
+    or ``outcome`` is ``applied_not_rechecked``.
 
     Returns ``(state, reason)`` where ``state`` is one of:
     - ``"soaking"``: ``post_merge_check.py`` has not recorded a terminal outcome yet,
       or the soak / ``T+7d`` window is still in progress.
     - ``"persists"``: ``outcome`` is ``still_broken`` / ``not_applied``, or the fix
       was reverted within ``clean_merges.REVERT_WINDOW`` (emit ``pr-merged-persists``).
-    - ``"modified"``: ``outcome`` is ``verified_fixed`` and ``human_edited`` is 1
-      (emit ``modified-merged``).
-    - ``"resolved"``: ``clean_merges.is_clean`` holds and the soak window has elapsed
-      (emit ``resolved-merged``).
+    - ``"modified"``: soak elapsed and ``human_edited`` is 1 (emit ``modified-merged``).
+    - ``"resolved"``: soak elapsed cleanly (emit ``resolved-merged``).
     """
-    if not isinstance(pm_row, dict):
-        return (
-            "soaking",
-            "Waiting for post_merge_records entry in Session KV.",
-        )
-
-    outcome = str(pm_row.get("outcome") or "").strip().lower()
-    merged = clean_merges._parse_time(pm_row.get("merged_at"))
-    reverted = pm_row.get("reverted_at")
-    detail = str(
-        pm_row.get("outcome_detail") or pm_row.get("health_detail") or ""
-    ).strip()
-
-    if reverted not in (None, ""):
-        reverted_at = clean_merges._parse_time(reverted)
-        if (
-            merged is None
-            or reverted_at is None
-            or reverted_at - merged <= clean_merges.REVERT_WINDOW
-        ):
-            return (
-                "persists",
-                detail
-                or f"Fix pull request was reverted at {reverted} within the {clean_merges.REVERT_WINDOW.days}d post-merge window.",
-            )
-
-    if outcome in (post_merge_stepdown.STILL_BROKEN, "not_applied", "persists", "failed"):
-        return (
-            "persists",
-            detail or f"Post-merge check reported outcome={outcome}.",
-        )
-
-    if outcome != clean_merges.VERIFIED_FIXED:
-        return (
-            "soaking",
-            detail or "Waiting for post_merge_check verification in post_merge_records.",
-        )
-
-    if merged is None:
-        return (
-            "soaking",
-            "Merge timestamp unavailable in post_merge_records; holding in soak.",
-        )
-
+    cur_now = now or datetime.now(timezone.utc)
     soak_key = str(rec.get("soak_window") or DEFAULT_SOAK_WINDOW).strip().lower()
     required_sec = SOAK_WINDOWS_SECONDS.get(
         soak_key, SOAK_WINDOWS_SECONDS[DEFAULT_SOAK_WINDOW]
     )
-    cur_now = now or datetime.now(timezone.utc)
+    post_merge_enabled = os.environ.get("KUBEAGENTS_POST_MERGE_CHECK", "off").strip().lower() not in (
+        "",
+        "off",
+        "0",
+        "false",
+        "no",
+    )
+
+    if isinstance(pm_row, dict):
+        outcome = str(pm_row.get("outcome") or "").strip().lower()
+        merged = clean_merges._parse_time(pm_row.get("merged_at")) or clean_merges._parse_time(
+            prop_merged_at
+        )
+        reverted = pm_row.get("reverted_at")
+        detail = str(
+            pm_row.get("outcome_detail") or pm_row.get("health_detail") or ""
+        ).strip()
+
+        if reverted not in (None, ""):
+            reverted_at = clean_merges._parse_time(reverted)
+            if (
+                merged is None
+                or reverted_at is None
+                or reverted_at - merged <= clean_merges.REVERT_WINDOW
+            ):
+                return (
+                    "persists",
+                    detail
+                    or f"Fix pull request was reverted at {reverted} within the {clean_merges.REVERT_WINDOW.days}d post-merge window.",
+                )
+
+        if outcome in (post_merge_stepdown.STILL_BROKEN, "not_applied", "persists", "failed"):
+            return (
+                "persists",
+                detail or f"Post-merge check reported outcome={outcome}.",
+            )
+
+        if outcome == clean_merges.VERIFIED_FIXED:
+            if merged is None:
+                return (
+                    "soaking",
+                    "Merge timestamp unavailable in post_merge_records; holding in soak.",
+                )
+            elapsed_sec = (cur_now - merged).total_seconds()
+            if elapsed_sec < required_sec:
+                return (
+                    "soaking",
+                    f"Soaking post-merge ({int(max(0.0, elapsed_sec))}s / {required_sec}s).",
+                )
+            if pm_row.get("human_edited") in (1, "1", True):
+                return (
+                    "modified",
+                    detail or "Reviewer modified remediation pull request before merging.",
+                )
+            check_row = pm_row if pm_row.get("human_edited") in (0, "0", False) else {**pm_row, "human_edited": 0}
+            if clean_merges.is_clean(check_row, cur_now):
+                return (
+                    "resolved",
+                    detail or f"Verified fixed in post_merge_records across {soak_key} window.",
+                )
+            return (
+                "soaking",
+                "Waiting for clean_merges verification in post_merge_records.",
+            )
+
+        if outcome == "" and post_merge_enabled:
+            return (
+                "soaking",
+                detail or "Waiting for post_merge_check verification in post_merge_records.",
+            )
+
+    merged = clean_merges._parse_time((pm_row or {}).get("merged_at")) or clean_merges._parse_time(
+        prop_merged_at
+    )
+    if merged is None:
+        return (
+            "soaking",
+            "Merge timestamp unavailable; holding in soak.",
+        )
     elapsed_sec = (cur_now - merged).total_seconds()
     if elapsed_sec < required_sec:
         return (
             "soaking",
             f"Soaking post-merge ({int(max(0.0, elapsed_sec))}s / {required_sec}s).",
         )
-
-    if pm_row.get("human_edited") in (1, "1", True):
+    if isinstance(pm_row, dict) and pm_row.get("human_edited") in (1, "1", True):
+        detail = str(
+            pm_row.get("outcome_detail") or pm_row.get("health_detail") or ""
+        ).strip()
         return (
             "modified",
             detail or "Reviewer modified remediation pull request before merging.",
         )
-
-    if clean_merges.is_clean(pm_row, cur_now):
-        return (
-            "resolved",
-            detail or f"Verified fixed in post_merge_records across {soak_key} window.",
-        )
-
     return (
-        "soaking",
-        "Waiting for clean_merges verification in post_merge_records.",
+        "resolved",
+        f"Soak window ({soak_key}) elapsed without revert.",
     )
 
 
@@ -1585,33 +1635,39 @@ def sweep_memory_proposals(
             "modified-merged",
         )
         finding_id = str(rec.get("finding_id") or "").strip()
-        pm_row = (
-            None
-            if already_soaked
-            else _read_post_merge_record(repo, pr_num, finding_id=finding_id)
-        )
+        pm_row = None if already_soaked else _read_post_merge_record(repo, pr_num)
 
-        # When post_merge_check.py (#5054) already tracks this remediation PR in
-        # Session KV's post_merge_records and has recorded its merge without a
-        # human edit requiring diff inspection, evaluate directly from
-        # post_merge_records without a duplicate proposal-view forge call.
-        if (
+        # When post_merge_check.py already tracks this remediation PR in Session KV's
+        # post_merge_records with a definitive non-human-edited check outcome (or a
+        # revert / still-broken outcome), evaluate without a duplicate proposal-view call.
+        pm_outcome = str((pm_row or {}).get("outcome") or "").strip().lower()
+        pm_persists_signal = bool(
+            pm_row is not None
+            and (
+                pm_row.get("reverted_at") not in (None, "")
+                or pm_outcome
+                in (post_merge_stepdown.STILL_BROKEN, "not_applied", "persists", "failed")
+            )
+        )
+        pm_fast_path_ready = bool(
             pm_row is not None
             and pm_row.get("merged_at")
-            and pm_row.get("human_edited") not in (1, "1", True)
-        ):
+            and (
+                pm_persists_signal
+                or (
+                    pm_outcome
+                    and pm_outcome != APPLIED_NOT_RECHECKED
+                    and pm_row.get("human_edited") in (0, "0", False)
+                )
+            )
+        )
+        if pm_fast_path_ready:
             pm_url = str(pm_row.get("url") or "").strip()
             if pm_url:
                 pr_ref = f"{pm_url} (#{pr_num})"
             soak_state, soak_reason = _evaluate_remediation_from_post_merge_record(
                 rec, pm_row, now=now
             )
-            if soak_state == "soaking":
-                if dry_run:
-                    sys.stderr.write(
-                        f"github_scan_gate: {rec_id} soaking after merge of {pr_ref}: {soak_reason}\n"
-                    )
-                continue
             if soak_state == "persists":
                 if dry_run:
                     sys.stderr.write(
@@ -1658,6 +1714,16 @@ def sweep_memory_proposals(
                 if eff_finding:
                     emit_args.extend(["--finding-id", eff_finding])
                 _run_curator_emit(curator_bin, emit_args, rec_id)
+                continue
+            if soak_state == "soaking" and (
+                pm_outcome
+                and pm_outcome != APPLIED_NOT_RECHECKED
+                and pm_row.get("human_edited") in (0, "0", False)
+            ):
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: {rec_id} soaking after merge of {pr_ref}: {soak_reason}\n"
+                    )
                 continue
 
         try:
@@ -1707,7 +1773,10 @@ def sweep_memory_proposals(
             )
             if is_remediation_soak:
                 soak_state, soak_reason = _evaluate_remediation_from_post_merge_record(
-                    rec, pm_row, now=now
+                    rec,
+                    pm_row,
+                    prop_merged_at=prop.get("mergedAt") or prop.get("merged_at"),
+                    now=now,
                 )
                 if soak_state == "soaking":
                     if dry_run:

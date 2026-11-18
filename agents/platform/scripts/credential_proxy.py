@@ -12882,6 +12882,7 @@ def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
     pinned_bases: Mapping[tuple[str, str], str] | None = None,
+    metrics: ProxyMetrics | None = None,
 ):
     """The version-control broker. Always built; there is no switch.
 
@@ -12918,6 +12919,9 @@ def build_vcs_broker(
         # describe and a namespaced kubectl get, through the same executor,
         # kubeconfig selection and output cap as a caller's.
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
+        on_decision_memory_check=(
+            metrics.record_decision_memory_check if metrics is not None else None
+        ),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -17187,15 +17191,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         )
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
-                if verb == "publish" and (
-                    not isinstance(self.vcs, vcs_broker.VcsBroker) or self.vcs.on_decision_memory_check is None
-                ):
-                    dm_verdict = (
-                        DECISION_MEMORY_VERDICT_WARN
-                        if isinstance(result, dict) and result.get("decisionMemoryMarkdown")
-                        else DECISION_MEMORY_VERDICT_ALLOW
-                    )
-                    self.metrics.record_decision_memory_check(dm_verdict)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
@@ -17220,14 +17215,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return TOOL_STATUS_BLOCKED
         except providers.WorkspaceError as exc:
-            if verb == "publish" and (
-                not isinstance(self.vcs, vcs_broker.VcsBroker) or self.vcs.on_decision_memory_check is None
-            ):
-                exc_code = exc.fields.get("code")
-                if exc_code == vcs_broker.DECISION_MEMORY_BLOCKED:
-                    self.metrics.record_decision_memory_check(DECISION_MEMORY_VERDICT_BLOCK)
-                elif exc_code == vcs_broker.DECISION_MEMORY_CHECK_FAILED:
-                    self.metrics.record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             self._json(HTTPStatus(exc.status), _redacted_fields(exc))
             return TOOL_STATUS_ERROR
         except subprocess.CalledProcessError as exc:
@@ -18328,6 +18315,7 @@ def serve(args: argparse.Namespace) -> None:
             executor,
             base_branch=CredentialProxyHandler.base_branch,
             pinned_bases=CredentialProxyHandler.pinned_bases,
+            metrics=CredentialProxyHandler.metrics,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
     # process holds (the vcs broker swept a dead process's at start), and on

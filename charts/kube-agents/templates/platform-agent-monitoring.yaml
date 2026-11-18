@@ -158,8 +158,8 @@ spec:
 {{- /*
 The OKF memory curator's status and metrics listener (a2aCuratorStatusPort in
 the operator): outcome processing counts, OKF record gauges by type and status,
-recurrence graduations, memory queries, and guard checks. Empty while
-A2A_CURATOR is off; active once the operator renders the curator pod.
+recurrence graduations, and memory queries. Empty while A2A_CURATOR is off;
+active once the operator renders the curator pod.
 */}}
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring

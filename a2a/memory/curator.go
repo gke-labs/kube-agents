@@ -166,18 +166,6 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 	}, nil
 }
 
-// CheckChangedFiles loads the Curator's OKF records, evaluates them against changed,
-// and records the resulting verdict in kubeagents_curator_guard_checks_total.
-func (c *Curator) CheckChangedFiles(changed map[string]*string) (CheckReport, error) {
-	records, err := LoadRecords(c.cfg.RepoDir)
-	if err != nil {
-		return CheckReport{}, err
-	}
-	report := checkChangedFiles(records, changed)
-	c.metrics.recordGuardCheck(report.Verdict)
-	return report, nil
-}
-
 func recordIDFromDoc(doc HindsightDocument) string {
 	if doc.DocumentMetadata != nil {
 		if id := strings.TrimSpace(doc.DocumentMetadata["id"]); reRecordID.MatchString(id) {
@@ -342,7 +330,7 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 	c.sub = sub
 
-	// Subscribe to the dedicated Curator outcome subject (_INBOX.agent.curator.outcomes,
+	// Subscribe to the dedicated Curator outcome subject (a2a.topics.agent.platform.curator-outcomes,
 	// reserved to the agent principal by NATS auth callout so worker/session pods
 	// cannot forge approved, resolved-merged, modified-merged, or refused outcomes).
 	outcomeSubjects := []string{SubjectCuratorOutcomes}
@@ -362,7 +350,7 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 
 	// Register the NATS request-reply responder for semantic memory queries on
-	// SubjectMemoryQuery (_INBOX.agent.memory.query, covered by the agent
+	// SubjectMemoryQuery (a2a.memory.query, covered by the agent
 	// principal's publish and subscribe grants) so callers can query memory over
 	// NATS without coupling to a specific storage backend.
 	querySubjects := []string{SubjectMemoryQuery}
@@ -2053,7 +2041,11 @@ func (c *Curator) handleQueryMsg(ctx context.Context, msg *nats.Msg, expectedSub
 // memory backend (Hindsight + local OKF records) with in-memory caching that is
 // automatically invalidated whenever ProcessOutcome updates the store.
 func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp MemoryQueryResponse) {
+	isRecallQuery := req.Action == "" || req.Action == "query" || req.Action == "recall"
 	defer func() {
+		if !isRecallQuery {
+			return
+		}
 		switch {
 		case resp.Error != "":
 			c.metrics.recordQuery(queryStatusError)

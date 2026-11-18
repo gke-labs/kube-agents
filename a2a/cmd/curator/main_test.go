@@ -330,7 +330,6 @@ func TestDaemonStatusEndpoints(t *testing.T) {
 		"kubeagents_curator_records",
 		"kubeagents_curator_graduations_total",
 		"kubeagents_curator_queries_total",
-		"kubeagents_curator_guard_checks_total",
 		"process_start_time_seconds",
 	} {
 		if !strings.Contains(mText, series) {

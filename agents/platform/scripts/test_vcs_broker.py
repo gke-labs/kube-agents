@@ -5057,9 +5057,25 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         self.assertIn("DEC-2026-003", str(caught_lock.exception))
 
     def test_publish_invokes_on_decision_memory_check_callback(self):
-        self._seed_guard_on_main()
         verdicts: list[str] = []
         self.broker.on_decision_memory_check = verdicts.append
+
+        # Repo without knowledge/ or .kube-agents/intent.yaml -> callback must NOT fire.
+        work_nok, cloned_nok = self.clone_locally("dm-cb-noknowledge")
+        git(work_nok, "checkout", "--quiet", "-b", "platform-agent/dm-cb-nok")
+        (work_nok / "readme.txt").write_text("no knowledge\n", encoding="utf-8")
+        git(work_nok, "add", "-A")
+        git(work_nok, "commit", "--quiet", "-m", "no knowledge change")
+        self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/dm-cb-nok",
+            "target": "main",
+            "baseRevision": cloned_nok["revision"],
+            "bundleBase64": self.bundle_of(work_nok, "platform-agent/dm-cb-nok", cloned_nok["revision"]),
+        })
+        self.assertEqual(verdicts, [])
+
+        self._seed_guard_on_main()
 
         # Clean unrelated file -> allow
         work_clean, cloned_clean = self.clone_locally("dm-cb-clean")

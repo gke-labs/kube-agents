@@ -133,13 +133,13 @@ memory:
 # The Platform Agent is not the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls. pr_opened claims each pull
-# request record line through the broker, strips its claim token and counts the
-# claimed pull request in the proposals ledger by origin; in a kanban worker it
-# also records the pull request on the card, which is what posts the thread's PR
-# message. The Cluster Agent and TSE profiles enable it too. It also refuses
-# submit_suggestion.py from a worker whose run on its card has ended
-# (plugins/pr_opened/__init__.py).
+# pr_opened claims each pull request record line through the broker, strips its
+# claim token, counts the claimed pull request in the proposals ledger by
+# origin, and links `docs(knowledge):` proposals to Curator via `curator emit`
+# when `NATS_URL` is set; in a kanban worker it also records the pull request on
+# the card, which is what posts the thread's PR message. The Cluster Agent and
+# TSE profiles enable it too. It also refuses submit_suggestion.py from a worker
+# whose run on its card has ended (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
@@ -247,7 +247,7 @@ Hermes plugins enabled:
 - **`hermes_otel`** — OpenTelemetry export. Its trace backend is baked into the image but rewritten at container start to the endpoint the operator resolved; see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
 - **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook), and records an `apply` there so its fix [holds a recurrence](/kube-agents/concepts/chatops/#one-incident-per-workload). The work happens on the Planning Agent, which enables it too: the pod runs a single gateway and it is homed at that profile, so an incident-thread reply is dispatched there and never here. It stands aside for a message that starts with `/`. `legacy_slash_commands` is on the same hook, and prepending the triage report first would move the command off the front of the line, where that plugin's anchored pattern can no longer see it.
-- **`pr_opened`** — claims each pull or merge request the agent opens through the credential broker, which checks it with the forge (`transform_terminal_output` hook). It strips the token from the output and counts the pull request in the proposals ledger by origin ([Hermes chat metrics](/kube-agents/concepts/observability/#hermes-chat-metrics)). In a kanban worker it also records a `pr_opened` event on the card, posted to the card's chat thread with `KAGE_SLACK_UX` on ([ChatOps](/kube-agents/concepts/chatops/)). The Cluster Agent and TSE profiles enable it too. Its `pre_tool_call` hook refuses the `submit-suggestion` skill's `prepare` and `submit` from a worker whose run on its card has ended. With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the operator's overlay enables it; the back-fill never adds an entry a live file already holds.
+- **`pr_opened`** — claims each pull or merge request the agent opens through the credential broker, which checks it with the forge (`transform_terminal_output` hook). It strips the token from the output, counts the pull request in the proposals ledger by origin ([Hermes chat metrics](/kube-agents/concepts/observability/#hermes-chat-metrics)), and links `docs(knowledge):` proposals via `curator emit` when `NATS_URL` is set. In a kanban worker it records a `pr_opened` event on the card, posted to the chat thread with `KAGE_SLACK_UX` on ([ChatOps](/kube-agents/concepts/chatops/)). The Cluster Agent and TSE profiles enable it too. Its `pre_tool_call` hook refuses `submit_suggestion.py` `prepare` and `submit` after a card run ends. With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the overlay enables it.
 
 The chat-ingress plugins run on the Planning Agent profile, which owns chat ingress. `session_store` holds durable session state. `session_otel_bridge` enriches OTel spans with session context (see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)). `chat_metrics` counts inbound messages and failed turns, thumbs-down reactions and the board's cards that gave up for `status.usage`, and reads the proposals ledger by origin from Session KV. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
 

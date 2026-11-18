@@ -699,17 +699,17 @@ pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod, so it scrapes the gateway's inbound-message,
-task terminal and Google Chat pull counters from its metrics-only port 9096.
-The operator's policies on all three pods admit the
+task terminal and Google Chat pull counters from its metrics-only port 9096, and `<name>-curator-monitoring`, so it scrapes the OKF memory curator (`<name>-curator`) `kubeagents_curator_*` series from port 8080 when A2A and Hindsight run.
+The operator's policies on those pods admit the
 collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
 either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
 
-Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+Non-GMP clusters scrape the gateway, credential-proxy, and A2A gateway pods (ports 9095, 9097, 8766, and 9096) through the corresponding alternative knobs (`<name>-curator` on port 8080 is `PodMonitoring`-only):
 
-- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
-- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
+- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the gateway, credential-proxy, and A2A gateway pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
+- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the gateway, credential-proxy, and A2A gateway pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
 
 Each monitoring knob (`podMonitoring`, `serviceMonitor`, `vmPodScrape`) is an independent tri-state:
 `null`, the default, renders them when the cluster serves the corresponding API and

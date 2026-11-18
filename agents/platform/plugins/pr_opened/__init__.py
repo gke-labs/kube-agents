@@ -96,8 +96,8 @@ logger = logging.getLogger(__name__)
 #: Scoped to knowledge-record proposals so ordinary workload PRs citing `per DEC-...` in
 #: their title never overwrite an active record's `evidence.pull_request`.
 KNOWLEDGE_PR_TITLE_RE = re.compile(
-    r"(?:docs\([a-z0-9_-]*knowledge[a-z0-9_-]*\)\s*:|\brecord\s+)"
-    r"[^\r\n]*?\b((?:DEC|LES)-(?:\d{8}-\d{2,}(?:-[a-z0-9][a-z0-9-]*)?|\d{4}-\d{3,}))\b",
+    r"^\s*docs\([a-z0-9_-]*knowledge[a-z0-9_-]*\)\s*:\s*[^\r\n]*?"
+    r"\b((?:DEC|LES)-(?:\d{8}-\d{2,4}-[a-z0-9-]+|\d{4}-\d{3,5}))\b",
     re.IGNORECASE,
 )
 DEFAULT_CURATOR_BIN = "/usr/local/bin/curator"

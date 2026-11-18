@@ -77,10 +77,13 @@ To determine which users have interacted with the system via Google Chat in the 
   ```bash
   kubectl get pods -n gmp-system
   ```
-- Read the scrape configuration off the `PodMonitoring` resources, not off Deployment annotations: the operator renders none. The Helm chart renders four where the cluster serves the `PodMonitoring` API (`platformAgent.podMonitoring`, `null` by default, forces them on or off); the fourth, `<name>-a2a-gateway-monitoring` (port 9096), selects the A2A gateway pod and is empty on an install that runs none. The three that carry the watcher, the chat plugin and the broker:
+- Read the scrape configuration off the `PodMonitoring` resources, not off Deployment annotations: the operator renders none. The Helm chart renders `PodMonitoring` objects where the cluster serves the `PodMonitoring` API (`platformAgent.podMonitoring`, `null` by default, forces them on or off); optional ones include `<name>-credential-proxy-exec-tier-monitoring` (port 8766), `<name>-a2a-gateway-monitoring` (port 9096), `<name>-a2a-nats-monitoring` (port 7777), and `<name>-curator-monitoring` (port 8080, OKF memory curator `kubeagents_curator_*` series, active when `<name>-curator` runs):
   - `<name>-gateway-monitoring`: the event watcher, listening in the gateway pod's `agent-api-auth` container on its `event-metrics` port (9095), on every replica.
   - `<name>-gateway-chat-monitoring`: the `chat_metrics` plugin, listening in the gateway pod's `platform-agent` container on its `chat-metrics` port (9097) with its `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` and the rest). It selects the pod carrying `kubeagents.io/is-leader: "true"`: above one replica only the leader runs Hermes, so only the leader has the port; at one replica the operator puts the label on the one pod.
   - `<name>-credential-proxy-monitoring`: the credential broker, serving its `kubeagents_*` series on the broker pod's metrics-only `cred-metrics` port (8766).
+  - `<name>-kube-proxy-monitoring`: the Kubernetes API proxy metrics-only port (8444).
+  - `<name>-a2a-nats-monitoring`: the `prometheus-nats-exporter` sidecar on each A2A NATS bus pod (port 7777).
+  - `<name>-curator-monitoring`: the OKF memory curator (`<name>-curator`) on port 8080, serving `kubeagents_curator_*` series when `A2A_CURATOR` runs.
   ```bash
   kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml
   kubectl get podmonitoring <name>-credential-proxy-monitoring -n kubeagents-system -o yaml

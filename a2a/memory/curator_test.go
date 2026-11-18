@@ -2465,7 +2465,16 @@ func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 		t.Fatalf("SaveRecord activeBlock: %v", err)
 	}
 
-	// 4. Queries: hit, empty, and error.
+	// 4. Queries: recall hit, empty, and error increment metrics; administrative RPCs (pending/propose/resolve) do not.
+	if qPending := cur1.HandleQuery(ctx, MemoryQueryRequest{Action: "pending"}); qPending.Error != "" {
+		t.Fatalf("expected pending action ok, got %+v", qPending)
+	}
+	if qPropose := cur1.HandleQuery(ctx, MemoryQueryRequest{Action: "propose"}); qPropose.Error == "" {
+		t.Fatalf("expected propose action without outcome error, got %+v", qPropose)
+	}
+	if qResolve := cur1.HandleQuery(ctx, MemoryQueryRequest{Action: "resolve"}); qResolve.Error == "" {
+		t.Fatalf("expected resolve action without outcome error, got %+v", qResolve)
+	}
 	if qHit := cur1.HandleQuery(ctx, MemoryQueryRequest{Query: "checkout replicas"}); qHit.Error != "" || len(qHit.Results) == 0 {
 		t.Fatalf("expected query hit, got %+v", qHit)
 	}
@@ -2476,15 +2485,7 @@ func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 		t.Fatalf("expected error on user:* tag, got %+v", qErr)
 	}
 
-	// 5. Guard checks: allow, warn, and block.
-	cleanYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n"
-	if rep, err := cur1.CheckChangedFiles(map[string]*string{"unrelated/readme.txt": &cleanYAML}); err != nil || rep.Verdict != "ok" {
-		t.Fatalf("expected allow verdict, got rep=%+v err=%v", rep, err)
-	}
-	warnYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n  replicas: 1\n"
-	if rep, err := cur1.CheckChangedFiles(map[string]*string{"clusters/staging/checkout.yaml": &warnYAML}); err != nil || rep.Verdict != "warn" {
-		t.Fatalf("expected warn verdict, got rep=%+v err=%v", rep, err)
-	}
+	// 5. Seed active blocking decision and verify package CheckChangedFiles still blocks prod hostNetwork.
 	blockYAML := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: bad\nspec:\n  hostNetwork: true\n  replicas: 2\n"
 	loaded, err := LoadRecords(dir1)
 	if err != nil {
@@ -2505,6 +2506,9 @@ func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 	}
 
 	body1 := scrape(cur1.MetricsHandler())
+	if strings.Contains(body1, "kubeagents_curator_guard_checks_total") {
+		t.Errorf("cur1 /metrics unexpectedly exposed removed kubeagents_curator_guard_checks_total:\n%s", body1)
+	}
 	for _, want := range []string{
 		`kubeagents_curator_outcomes_total{kind="proposed",status="processed"} 1`,
 		`kubeagents_curator_outcomes_total{kind="proposed",status="duplicate"} 1`,
@@ -2518,9 +2522,6 @@ func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 		`kubeagents_curator_queries_total{status="hit"} 1`,
 		`kubeagents_curator_queries_total{status="empty"} 1`,
 		`kubeagents_curator_queries_total{status="error"} 1`,
-		`kubeagents_curator_guard_checks_total{verdict="allow"} 1`,
-		`kubeagents_curator_guard_checks_total{verdict="warn"} 1`,
-		`kubeagents_curator_guard_checks_total{verdict="block"} 1`,
 		`# TYPE process_start_time_seconds gauge`,
 	} {
 		if !strings.Contains(body1, want) {
@@ -2535,7 +2536,6 @@ func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 		`kubeagents_curator_records{status="proposed",type="decision"} 0`,
 		`kubeagents_curator_graduations_total 0`,
 		`kubeagents_curator_queries_total{status="hit"} 0`,
-		`kubeagents_curator_guard_checks_total{verdict="block"} 0`,
 	} {
 		if !strings.Contains(body2, wantZero) {
 			t.Errorf("cur2 /metrics expected isolated zero %q;\nfull output:\n%s", wantZero, body2)

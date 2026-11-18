@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,13 +18,11 @@ const (
 	recordsGaugeName     = "records"
 	graduationsTotalName = "graduations_total"
 	queriesTotalName     = "queries_total"
-	guardChecksTotalName = "guard_checks_total"
 	processStartTimeName = "process_start_time_seconds"
 
-	labelKind    = "kind"
-	labelStatus  = "status"
-	labelType    = "type"
-	labelVerdict = "verdict"
+	labelKind   = "kind"
+	labelStatus = "status"
+	labelType   = "type"
 
 	outcomeKindOther = "other"
 
@@ -37,10 +34,6 @@ const (
 	queryStatusHit   = "hit"
 	queryStatusEmpty = "empty"
 	queryStatusError = "error"
-
-	guardVerdictAllow = "allow"
-	guardVerdictWarn  = "warn"
-	guardVerdictBlock = "block"
 
 	metricsMaxRequestsInFlight = 16
 	metricsScrapeTimeout       = 5 * time.Second
@@ -79,14 +72,6 @@ var (
 		queryStatusEmpty,
 		queryStatusError,
 	}
-	metricsGuardVerdicts = []string{
-		guardVerdictAllow,
-		guardVerdictWarn,
-		guardVerdictBlock,
-	}
-
-	repoMetricsMu sync.RWMutex
-	repoMetrics   = map[string][]*curatorMetrics{}
 )
 
 type curatorMetrics struct {
@@ -94,7 +79,6 @@ type curatorMetrics struct {
 	outcomes     *prometheus.CounterVec
 	graduations  prometheus.Counter
 	queries      *prometheus.CounterVec
-	guardChecks  *prometheus.CounterVec
 	processStart prometheus.Gauge
 }
 
@@ -156,12 +140,6 @@ func newCuratorMetrics(repoDir string) *curatorMetrics {
 			Name:      queriesTotalName,
 			Help:      "Memory queries answered by the Curator, by status (hit, empty, error).",
 		}, []string{labelStatus}),
-		guardChecks: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      guardChecksTotalName,
-			Help:      "OKF guard evaluations against changed files, by verdict (allow, warn, block).",
-		}, []string{labelVerdict}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeName,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
@@ -184,7 +162,6 @@ func newCuratorMetrics(repoDir string) *curatorMetrics {
 		recCollector,
 		m.graduations,
 		m.queries,
-		m.guardChecks,
 		m.processStart,
 	)
 
@@ -196,35 +173,8 @@ func newCuratorMetrics(repoDir string) *curatorMetrics {
 	for _, status := range metricsQueryStatuses {
 		m.queries.WithLabelValues(status)
 	}
-	for _, verdict := range metricsGuardVerdicts {
-		m.guardChecks.WithLabelValues(verdict)
-	}
 
-	repoMetricsMu.Lock()
-	repoMetrics[cleanDir] = append(repoMetrics[cleanDir], m)
-	repoMetricsMu.Unlock()
 	return m
-}
-
-func recordGuardCheckForRepoDirs(records []Record, verdict string) {
-	seen := map[string]bool{}
-	for _, r := range records {
-		if r.repoDir != "" {
-			seen[r.repoDir] = true
-		}
-	}
-	if len(seen) == 0 {
-		return
-	}
-	repoMetricsMu.RLock()
-	var targets []*curatorMetrics
-	for dir := range seen {
-		targets = append(targets, repoMetrics[dir]...)
-	}
-	repoMetricsMu.RUnlock()
-	for _, m := range targets {
-		m.recordGuardCheck(verdict)
-	}
 }
 
 func normalizeOutcomeKindLabel(kind OutcomeKind) string {
@@ -260,24 +210,6 @@ func (m *curatorMetrics) recordQuery(status string) {
 		status = queryStatusError
 	}
 	m.queries.WithLabelValues(status).Inc()
-}
-
-func normalizeGuardVerdictLabel(verdict string) string {
-	switch verdict {
-	case guardVerdictBlock:
-		return guardVerdictBlock
-	case guardVerdictWarn:
-		return guardVerdictWarn
-	default:
-		return guardVerdictAllow
-	}
-}
-
-func (m *curatorMetrics) recordGuardCheck(verdict string) {
-	if m == nil {
-		return
-	}
-	m.guardChecks.WithLabelValues(normalizeGuardVerdictLabel(verdict)).Inc()
 }
 
 func (m *curatorMetrics) handler() http.Handler {

@@ -1891,8 +1891,7 @@ class VcsBroker:
             )
             policy_branch = _short_ref(policy_branch) if policy_branch else ""
             if not policy_branch:
-                if self.on_decision_memory_check is not None:
-                    self.on_decision_memory_check("error")
+                self._record_decision_memory_check("error")
                 raise WorkspaceError(
                     f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                     status=502,
@@ -1911,30 +1910,18 @@ class VcsBroker:
                 )
                 policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
                 if not policy_base_rev:
-                    if self.on_decision_memory_check is not None:
-                        self.on_decision_memory_check("error")
+                    self._record_decision_memory_check("error")
                     raise WorkspaceError(
                         f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                         status=502,
                         code=DECISION_MEMORY_CHECK_FAILED,
                     )
-            try:
-                dm_markdown = self._check_decision_memory_on_publish(
-                    git,
-                    root,
-                    policy_base_rev,
-                    tip,
-                )
-            except WorkspaceError as dm_exc:
-                if self.on_decision_memory_check is not None:
-                    dm_code = dm_exc.fields.get("code")
-                    if dm_code == DECISION_MEMORY_BLOCKED:
-                        self.on_decision_memory_check("block")
-                    elif dm_code == DECISION_MEMORY_CHECK_FAILED:
-                        self.on_decision_memory_check("error")
-                raise
-            if self.on_decision_memory_check is not None:
-                self.on_decision_memory_check("warn" if dm_markdown else "allow")
+            dm_markdown = self._check_decision_memory_on_publish(
+                git,
+                root,
+                policy_base_rev,
+                tip,
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
@@ -2020,6 +2007,10 @@ class VcsBroker:
                 tar_path.unlink(missing_ok=True)
         return extracted
 
+    def _record_decision_memory_check(self, verdict: str) -> None:
+        if self.on_decision_memory_check is not None:
+            self.on_decision_memory_check(verdict)
+
     def _check_decision_memory_on_publish(
         self,
         git: Callable,
@@ -2040,6 +2031,7 @@ class VcsBroker:
             "knowledge", ".kube-agents/intent.yaml", check=False,
         )
         if getattr(tree_ls, "truncated", False):
+            self._record_decision_memory_check("error")
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: base tree listing was truncated",
                 status=409,
@@ -2063,6 +2055,7 @@ class VcsBroker:
             root, "diff-tree", "-r", "--no-renames", "--name-status", "-z", diff_base, tip, check=False,
         )
         if diff_ns.returncode != 0 or getattr(diff_ns, "truncated", False):
+            self._record_decision_memory_check("error")
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: diff-tree failed or was truncated",
                 status=409,
@@ -2080,6 +2073,7 @@ class VcsBroker:
                 changed_paths.append((status, tokens[idx + 1]))
                 idx += 2
         if not changed_paths:
+            self._record_decision_memory_check("allow")
             return ""
 
         check_dir = self._scratch("dmcheck")
@@ -2115,6 +2109,7 @@ class VcsBroker:
                             policy_base_rev, "--", safe_prefix, check=False,
                         )
                         if getattr(extra_ls, "truncated", False):
+                            self._record_decision_memory_check("error")
                             raise WorkspaceError(
                                 "Decision Memory guard check failed against base branch: extra path listing was truncated",
                                 status=409,
@@ -2162,6 +2157,7 @@ class VcsBroker:
                     k_root, changed_map, oversize_files=oversize_files
                 )
             except ValueError as exc:
+                self._record_decision_memory_check("error")
                 raise WorkspaceError(
                     f"Decision Memory guard check failed against base branch: {exc}",
                     status=409,
@@ -2170,6 +2166,7 @@ class VcsBroker:
 
             markdown = str(out.get("markdown") or "") if out.get("findings") else ""
             if out.get("verdict") == "block":
+                self._record_decision_memory_check("block")
                 msg = (
                     "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
                     f"{markdown}\n\n"
@@ -2183,6 +2180,7 @@ class VcsBroker:
                     code=DECISION_MEMORY_BLOCKED,
                     detail=markdown,
                 )
+            self._record_decision_memory_check("warn" if markdown else "allow")
             return markdown
         finally:
             self._discard_scratch(check_dir)

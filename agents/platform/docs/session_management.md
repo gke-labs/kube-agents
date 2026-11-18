@@ -476,7 +476,10 @@ eight days.
 fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its
 thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table
 that does not exist yet answers an empty list; a table missing a column the count needs, or a database
-that cannot be read, answers `503`.
+that cannot be read, answers `503`. The Decision Memory sweep (`github_scan_gate.py`'s
+`sweep_memory_proposals`) also reads `post_merge_records` directly from Session KV's SQLite file
+(`SESSION_KV_DB_PATH`) when evaluating post-merge soak outcomes for remediation pull requests, and
+falls back to forge merge soak and diff inspection when no verified `post_merge_records` outcome exists.
 
 #### `incidents`
 

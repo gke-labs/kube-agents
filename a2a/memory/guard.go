@@ -685,9 +685,7 @@ func filterYAMLContentExcludingResources(content string, excludedGlobs []string)
 // Active records with failing block guards produce verdict="block" (exit code 2);
 // proposed records produce advisory warnings ("warn") until approved.
 func CheckChangedFiles(records []Record, changed map[string]*string) CheckReport {
-	report := checkChangedFiles(records, changed)
-	recordGuardCheckForRepoDirs(records, report.Verdict)
-	return report
+	return checkChangedFiles(records, changed)
 }
 
 func checkChangedFiles(records []Record, changed map[string]*string) CheckReport {

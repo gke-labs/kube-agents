@@ -1037,21 +1037,25 @@ class CuratorLinkTest(unittest.TestCase):
             self.assertIn("acme/infra", cmd)
             self.assertLessEqual(kw["timeout"], plugin.CURATOR_LINK_TIMEOUT_SECONDS)
 
-        # Ordinary workload PRs citing `per DEC-...` must NOT trigger `curator emit --kind proposed`.
-        with mock.patch.dict(
-            os.environ,
-            {"NATS_URL": "nats://localhost:4222", "CURATOR_BIN": "/usr/local/bin/curator"},
-        ), mock.patch("subprocess.run") as workload_mock:
-            plugin._notify_curator_pr_opened(
-                {
-                    "url": "https://github.com/acme/infra/pull/43",
-                    "number": 43,
-                    "title": "fix(checkout): set ttl-hours per DEC-2026-010",
-                },
-                repo="acme/infra",
-                deadline=plugin.time.monotonic() + 5.0,
-            )
-        workload_mock.assert_not_called()
+        # Ordinary workload PRs citing `per DEC-...` or containing `record ...` must NOT trigger `curator emit`.
+        for workload_title in (
+            "fix(checkout): set ttl-hours per DEC-2026-010",
+            "fix(telemetry): record request latency per DEC-2026-004",
+        ):
+            with mock.patch.dict(
+                os.environ,
+                {"NATS_URL": "nats://localhost:4222", "CURATOR_BIN": "/usr/local/bin/curator"},
+            ), mock.patch("subprocess.run") as workload_mock:
+                plugin._notify_curator_pr_opened(
+                    {
+                        "url": "https://github.com/acme/infra/pull/43",
+                        "number": 43,
+                        "title": workload_title,
+                    },
+                    repo="acme/infra",
+                    deadline=plugin.time.monotonic() + 5.0,
+                )
+            workload_mock.assert_not_called()
 
         # End-to-end `on_terminal_output` forwards `claim_repository(proposal)` into `--repo`.
         broker = _Broker(title="docs(knowledge): record DEC-2026-010 (Require ttl)")
