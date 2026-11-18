@@ -112,9 +112,12 @@ const (
 )
 
 // ConsoleInFrame is what the console door reads (gateway.ConsoleInFrame).
+// The address is absent on a turn for the conversation's route, so that
+// frame is the bytes it was before a turn could name a profile.
 type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
+	TurnAddress
 }
 
 // ConsoleOutFrame is a frame the gateway posts to a console conversation
@@ -137,6 +140,9 @@ type ConsoleOutFrame struct {
 	ReplyTo   string `json:"replyTo,omitempty"`
 	// CardsPending is set on a result whose chain handed work to cards.
 	CardsPending bool `json:"cardsPending,omitempty"`
+	// InReplyTo, on a profile task's status line, is the messageId of the
+	// console frame whose turn started the task.
+	InReplyTo string `json:"inReplyTo,omitempty"`
 }
 
 // submissionAuthority is the part of a submission's authority block that says
@@ -1235,8 +1241,15 @@ func turnFate(text string) (settled bool, texts []string) {
 // turn's own task once it appears, then the tasks delegated from it.
 type turnWatch struct {
 	conversation string
-	token        string
-	texts        []string
+	// addressed is set on a turn sent to an AgentProfile, whose submission
+	// is on a2a.submit, out of this server's sight: its task is the one the
+	// gateway's status line names (noticedTask).
+	addressed bool
+	// messageID is the id of the frame this turn published: an addressed
+	// turn takes only the status line that answers it (InReplyTo).
+	messageID string
+	token     string
+	texts     []string
 	// since is the event cursor before the turn was sent: a card's report
 	// on this turn comes after it.
 	since       uint64
@@ -1406,7 +1419,9 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 // following the turn's delegations until it is closed. A turn still running
 // on the conversation, in another call or left by an earlier one, is waited
 // on for up to wait first; past it the send fails with ErrConversationBusy.
-func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, text string, wait time.Duration) (TurnResult, *turnWatch, error) {
+// A turn addressed to an AgentProfile (to) carries the profile and its
+// parameters in its frame.
+func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, text string, to TurnAddress, wait time.Duration) (TurnResult, *turnWatch, error) {
 	res := TurnResult{Token: token}
 	if strings.TrimSpace(text) == "" {
 		return res, nil, errors.New("empty message")
@@ -1414,7 +1429,23 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	if len(text) > consoleTextCap {
 		return res, nil, fmt.Errorf("message is %d bytes; the console door takes at most %d", len(text), consoleTextCap)
 	}
+	if err := to.check(); err != nil {
+		return res, nil, err
+	}
 	settled, texts := turnFate(text)
+	if settled && to.Addressee != "" {
+		// A stop or a /session command is the conversation's, never a
+		// task for a profile: the gateway would act on it and drop the
+		// address without a word.
+		return res, nil, fmt.Errorf("%q is a command for the conversation, not a task; send it without addressee", strings.TrimSpace(text))
+	}
+	if _, ok := chattext.IsSessionCommand(strings.TrimSpace(text)); ok && to.Addressee != "" {
+		// "/session <message>" asks for a session, which an addressed turn
+		// isn't: unless sessions are the install's default route, the
+		// gateway reads it as the session command and drops the profile
+		// and its parameters. Refused here whatever the install's default.
+		return res, nil, fmt.Errorf("%q asks for a session; an addressed turn goes to the %s profile as a new task, so send the message without /session, or without addressee", strings.TrimSpace(text), to.Addressee)
+	}
 	if settled {
 		res, err := b.sendSettled(ctx, convs, token, text)
 		return res, nil, err
@@ -1451,10 +1482,11 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	}
 	w.unpin = unpin
 	w.since = b.events.Cursor()
+	w.addressed = to.Addressee != ""
 	// From here the watch holds the lock, and closing it releases it.
 	var once sync.Once
 	w.release = func() { once.Do(unlock) }
-	if err := b.publishFrame(token, text); err != nil {
+	if w.messageID, err = b.publishFrame(token, text, to); err != nil {
 		w.close()
 		return res, nil, err
 	}
@@ -1475,6 +1507,13 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		case m := <-w.notices:
 			if n := noticeText(m); n != "" {
 				res.Notices = append(res.Notices, n)
+				if ref, ok := w.noticedTask(m); ok {
+					res.Task = &ref
+					convs.setRunning(token, &ref)
+					go w.follow()
+					res.Notices = w.settleNotices(ctx, res.Notices)
+					return res, w, nil
+				}
 				if grace == nil {
 					grace = time.After(noticeGrace)
 				}
@@ -1618,7 +1657,7 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 		return res, err
 	}
 	defer w.close()
-	if err := b.publishFrame(token, text); err != nil {
+	if _, err := b.publishFrame(token, text, TurnAddress{}); err != nil {
 		return res, err
 	}
 	timeout := time.After(noticeGrace)
@@ -1637,37 +1676,40 @@ func (b *NATSBus) sendSettled(ctx context.Context, convs *Conversations, token, 
 	}
 }
 
-func (b *NATSBus) publishFrame(token, text string) error {
+// publishFrame publishes one console frame and returns its messageId.
+func (b *NATSBus) publishFrame(token, text string, to TurnAddress) (string, error) {
 	id := make([]byte, messageIDBytes)
 	if _, err := rand.Read(id); err != nil {
-		return err
+		return "", err
 	}
-	frame, err := consoleFrame(conversationTokenPrefix+"-"+hex.EncodeToString(id), text)
+	messageID := conversationTokenPrefix + "-" + hex.EncodeToString(id)
+	frame, err := consoleFrame(messageID, text, to)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
+	return messageID, b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
 }
 
-// consoleFrameFields is every field a frame this server publishes may carry.
-// The console door reads more (gateway.ConsoleInFrame): a kind, and an
-// addressee with task parameters. Those are a human's clicks in the console
-// page, and this server speaks for a model, so it sends none of them: a stop
-// is the stop word as text, which the gateway reads as a typed message.
+// consoleFrameFields is every field a frame this server publishes may carry:
+// the message id, the text, and send_message's turn address (an addressee
+// with task parameters, #6116). The console door also reads a kind, which is
+// a human's click in the console page; this server speaks for a model, so it
+// never sends one: a stop is the stop word as text, which the gateway reads
+// as a typed message.
 //
 // This is defense in depth, not the boundary. A confirm (a turn submitted
 // with TaskParameters.ChangeRequested) is a frame on
 // chat.console.<token>.confirm, which the gateway takes from that subject
 // alone, and this server logs in as console-mcp, which holds no grant there:
 // the bus refuses the publish whatever this code sends.
-var consoleFrameFields = map[string]bool{"messageId": true, "text": true}
+var consoleFrameFields = map[string]bool{"messageId": true, "text": true, "addressee": true, "parameters": true}
 
 // consoleFrame is the one way a console frame is built for publishing: from
-// a message id and the text, and checked against consoleFrameFields after
-// encoding, so a field added to ConsoleInFrame later cannot reach the bus
-// unreviewed.
-func consoleFrame(messageID, text string) ([]byte, error) {
-	frame, err := json.Marshal(ConsoleInFrame{MessageID: messageID, Text: text})
+// a message id, the text and the turn's address, and checked against
+// consoleFrameFields after encoding, so a field added to ConsoleInFrame later
+// cannot reach the bus unreviewed.
+func consoleFrame(messageID, text string, to TurnAddress) ([]byte, error) {
+	frame, err := json.Marshal(ConsoleInFrame{MessageID: messageID, Text: text, TurnAddress: to})
 	if err != nil {
 		return nil, err
 	}
@@ -1758,6 +1800,28 @@ func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority,
 // conversation, not delegated from another task, with this turn's text. A
 // message for a task already running is the gateway sending the text into
 // it, and that task is where the turn's answer is.
+// noticedTask is the task an addressed turn's status line names: a fresh
+// notice (no kind, not an edit) carrying the task's id, the profile it was
+// published to, and this turn's own frame id (InReplyTo). Only the gateway
+// publishes on the conversation's .out, and only a profile task's line names
+// a task; the frame id keeps another turn's line on the same conversation (an
+// earlier turn's, arriving late, or another client's) from being taken. A
+// plain turn takes its task from its own submission alone.
+func (w *turnWatch) noticedTask(m *nats.Msg) (TaskRef, bool) {
+	if !w.addressed {
+		return TaskRef{}, false
+	}
+	var f ConsoleOutFrame
+	if json.Unmarshal(m.Data, &f) != nil || f.Kind != "" || f.Edit || w.messageID == "" || f.InReplyTo != w.messageID ||
+		!lib.ValidSubjectToken(f.Addressee) || !lib.ValidSubjectToken(f.TaskID) {
+		return TaskRef{}, false
+	}
+	w.mu.Lock()
+	w.known[f.TaskID] = true
+	w.mu.Unlock()
+	return TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}, true
+}
+
 func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {
 	ref, a, text, corr, ok := submissionWithCorrelation(m)
 	if !ok || a.Audience.Conversation != w.conversation || a.Via != nil || !slices.Contains(w.texts, text) {
@@ -2452,6 +2516,14 @@ func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) 
 		return out, false, nil
 	}
 	if !delegated(t) {
+		return out, true, nil
+	}
+	if w != nil && w.addressed {
+		// An addressed turn's root is the profile task. A profile parent
+		// waits for the tasks it delegated and answers with its own result
+		// (the gateway ends its chain only after its children), so its end
+		// is the chain's: no wake follows, and nothing of its children's
+		// arrives after it.
 		return out, true, nil
 	}
 	ended := false

@@ -9,7 +9,7 @@ roll in step 6 and step 6b. It now reads the template once in each:
 - step 6 (the fresh install) warns, and doesn't fail, when the A2A stack is
   rendered and the bridge isn't there, and skips the read when there is no
   A2A stack;
-- step 6b (the mode upgrade) fails without the bridge, since the bridge log
+- step 6b (the A2A gates) fails without the bridge, since the bridge log
   loop after it needs the container, and gates the agent's rollout once.
 
 These tests run step 6's block against a stub kubectl and check step 6b's shape.
@@ -134,7 +134,7 @@ class BridgeFromTheFirstRolloutTest(unittest.TestCase):
         text = _CI_DEPLOY.read_text()
         first_rollout = text.index("Verifying platform-agent rollout")
         check = text.index(_START)
-        web_console = text.index("\ngate_web_console today\n")
+        web_console = text.index("\ngate_web_console\n")
         self.assertLess(first_rollout, check)
         self.assertLess(check, web_console)
 
@@ -149,8 +149,8 @@ class BridgeFromTheFirstRolloutTest(unittest.TestCase):
         self.assertNotIn("MODE_NEXT_GENERATION_ATTEMPTS", check, "step 6b no longer polls for the bridge")
 
 
-_6B_START = "  agent_containers=\"\"\n  agent_read=false"
-_6B_END = "after the mode switch\"\n"
+_6B_START = "agent_containers=\"\"\nagent_read=false"
+_6B_END = "in the agent pod template from the first render, $((SECONDS - MODE_NEXT_START))s into the A2A gates\"\n"
 
 _6B_STUB = r"""#!/bin/bash
 echo "$*" >> "$STATE/calls"

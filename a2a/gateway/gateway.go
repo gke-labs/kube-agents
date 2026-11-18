@@ -3350,7 +3350,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// (unpostableTrigger), for a child or a wake started on its record.
 	if !lineless && !g.unpostableTrigger(rec.Key) {
 		var err error
-		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
+		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID, Profile: topProfile(ts.Route), InReplyTo: topInReplyTo(ts)})
 		if err != nil {
 			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 		}

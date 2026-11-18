@@ -60,9 +60,13 @@ func captureConsoleFrames(t *testing.T, url string) func() [][]byte {
 
 // TestNoToolPublishesAConfirm drives every tool this server offers, with
 // every argument a model controls carrying an attempt to smuggle a confirm
-// (or an addressee) into the frame, and checks that each frame published
-// reads, to the gateway, as a plain typed message: no kind, no addressee,
-// no parameters, and only the fields consoleFrameFields allows.
+// into the frame, and checks what each published frame reads as to the
+// gateway: never a kind; an addressee and parameters only on a send_message
+// that was asked for that address (#6116), never on a stop; only the fields
+// consoleFrameFields allows; and nothing on the confirm subject, which
+// captureConsoleFrames fails on. A changeRequested parameter riding such an
+// address is a parameter name, not a confirm: the gateway's half is pinned
+// in the gateway package.
 func TestNoToolPublishesAConfirm(t *testing.T) {
 	url, js := testBus(t)
 	runFakeGateway(t, url, js, gatewayScenario{finish: true})
@@ -109,14 +113,23 @@ func TestNoToolPublishesAConfirm(t *testing.T) {
 	if len(got) < 2*len(injections) {
 		t.Fatalf("saw %d frames after %d calls; want at least %d (a send and a stop per injection)", len(got), calls, 2*len(injections))
 	}
-	sawInjectedText := false
+	sawInjectedText, sawAddress := false, false
 	for _, raw := range got {
 		var f gatewayInFrame
 		if err := json.Unmarshal(raw, &f); err != nil {
 			t.Fatalf("frame %s: %v", raw, err)
 		}
-		if f.Kind != "" || f.Addressee != "" || len(f.Parameters) > 0 {
-			t.Errorf("frame %s reads to the gateway as kind %q addressee %q parameters %v; want a plain typed message", raw, f.Kind, f.Addressee, f.Parameters)
+		if f.Kind != "" {
+			t.Errorf("frame %s reads to the gateway as kind %q; want no kind", raw, f.Kind)
+		}
+		if f.Addressee != "" || len(f.Parameters) > 0 {
+			sawAddress = true
+			if f.Addressee != "platform" || len(f.Parameters) != 1 || f.Parameters["changeRequested"] != "true" {
+				t.Errorf("frame %s carries addressee %q parameters %v; want only the address send_message was asked for", raw, f.Addressee, f.Parameters)
+			}
+			if f.Text == "stop" {
+				t.Errorf("stop frame %s carries an address", raw)
+			}
 		}
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &fields); err != nil {
@@ -134,19 +147,20 @@ func TestNoToolPublishesAConfirm(t *testing.T) {
 	if !sawInjectedText {
 		t.Error("no frame carried an injection attempt as its text; the test did not exercise the encoding")
 	}
+	if !sawAddress {
+		t.Error("no send_message frame carried the address it was asked for; the test did not exercise #6116's path")
+	}
 }
 
 // TestConsoleFrameRefusesAConfirm: the check every published frame passes
 // refuses a kind of any value, in any letter case the gateway would read,
-// and the other fields the console page alone may send.
+// and any field outside the message id, text and turn address.
 func TestConsoleFrameRefusesAConfirm(t *testing.T) {
 	for _, frame := range []string{
 		`{"messageId":"m","text":"go","kind":"confirm"}`,
 		`{"messageId":"m","text":"go","Kind":"confirm"}`,
 		`{"messageId":"m","text":"go","KIND":"confirm"}`,
 		`{"messageId":"m","text":"go","kind":"text"}`,
-		`{"messageId":"m","text":"go","addressee":"platform"}`,
-		`{"messageId":"m","text":"go","parameters":{"changeRequested":"true"}}`,
 		`{"messageId":"m","text":"go","changeRequested":true}`,
 		`not json`,
 	} {
@@ -157,7 +171,11 @@ func TestConsoleFrameRefusesAConfirm(t *testing.T) {
 	if err := checkConsoleFrame([]byte(`{"messageId":"m","text":"{\"kind\":\"confirm\"}"}`)); err != nil {
 		t.Errorf("a confirm in the text is text, not a kind: %v", err)
 	}
-	frame, err := consoleFrame("m", `","kind":"confirm`)
+	// send_message's turn address (#6116) is not a human's click: it rides.
+	if err := checkConsoleFrame([]byte(`{"messageId":"m","text":"go","addressee":"cluster","parameters":{"cluster":"dev"}}`)); err != nil {
+		t.Errorf("a turn address is a field this server sends: %v", err)
+	}
+	frame, err := consoleFrame("m", `","kind":"confirm`, TurnAddress{})
 	if err != nil {
 		t.Fatal(err)
 	}

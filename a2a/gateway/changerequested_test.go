@@ -423,3 +423,56 @@ func TestTheIngressLineRecordsChangeRequested(t *testing.T) {
 		})
 	}
 }
+
+// A typed console frame addressed to a profile, the shape MCP send_message
+// sends (#6116), can't carry a change request as a parameter: a parameter
+// is a name in the task's parameter map, never TaskParameters.ChangeRequested,
+// and every spelling of changeRequested refuses the turn with nothing
+// submitted: one with a capital fails the lower-case parameter-name rule
+// (lib.TaskParameterNameRE), and a lower-case one is a parameter the profile
+// doesn't declare. Only a frame on chat.console.<token>.confirm carries the
+// intent, and console-mcp can't publish there (k8s-operator's
+// TestConsoleGrantOnARealServer).
+func TestChangeRequested_AParameterNamedForItIsNeverAChangeRequest(t *testing.T) {
+	for i, tc := range []struct{ name, refusal string }{
+		{"changeRequested", "is not a lower-case identifier"},
+		{"ChangeRequested", "is not a lower-case identifier"},
+		{"CHANGEREQUESTED", "is not a lower-case identifier"},
+		{"changerequested", `doesn't take parameter "changerequested"`},
+		{"change_requested", `doesn't take parameter "change_requested"`},
+	} {
+		name := tc.name
+		t.Run(name, func(t *testing.T) {
+			console := startConsoleRig(t)
+			params := targetParams("p1", "us-east1", "prod")
+			params[name] = "true"
+			tab := "tab-cr-param-" + string(rune('a'+i))
+			console.send(t, tab, ConsoleInFrame{MessageID: "m1", Text: "open the pull request", Addressee: "cluster", Parameters: params})
+			waitFor(t, "the typed frame", func() bool { return len(console.inbound()) >= 1 })
+			turn := console.inbound()[0]
+			if turn.Intent == IntentConfirm {
+				t.Fatalf("a typed frame came through with the confirm intent: %+v", turn)
+			}
+
+			r := startProfileRig(t)
+			r.adapter.inbox <- turn
+			waitFor(t, "the refusal", func() bool {
+				for _, p := range r.adapter.postTexts() {
+					if strings.Contains(p, tc.refusal) {
+						return true
+					}
+				}
+				return false
+			})
+			got := append(streamEnvelopes(t, r.url, "a2a.tasks.>"), streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">")...)
+			for _, e := range got {
+				if _, cr := submittedChange(t, e.env); cr {
+					t.Fatalf("a parameter named %q became a change request on %s", name, e.subject)
+				}
+			}
+			if len(got) != 0 {
+				t.Fatalf("published %d message(s) for a refused turn: %s", len(got), got[0].subject)
+			}
+		})
+	}
+}

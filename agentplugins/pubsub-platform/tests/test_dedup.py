@@ -30,6 +30,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 _ADAPTER = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -214,8 +215,12 @@ class AdapterTestCase(unittest.TestCase):
 
         logging.disable(logging.CRITICAL)
         self.addCleanup(logging.disable, logging.NOTSET)
+        # The tests start with the switch not set, and two of them set it. The patch puts back
+        # the value that the process had before the test, or the absence of one.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
         os.environ.pop("DISABLE_PUBSUB_DEDUP", None)
-        self.addCleanup(os.environ.pop, "DISABLE_PUBSUB_DEDUP", None)
 
     def is_duplicate(self, payload, config=None):
         return self.adapter._is_duplicate(payload, config or dict(ROUTE_CONFIG), ROUTE)
