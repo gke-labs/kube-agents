@@ -1167,6 +1167,15 @@
 # never in front of the answer. Same seam, variant filed; no fixture.
 ./tasks/first-install-hello-filed/task.yaml
 
+# "What did onboarding find?" answered from the first-run report through the
+# `get_first_run_report` tool (#4056): prebuilt/first-run-report plants a
+# fixed INVENTORY.delivered.md on the shell sandbox (backing up and restoring
+# a real one; no agent-pod marker touched), and the case grades the worker's
+# tool call, both planted workload names in the reply, and no terminal read
+# of the file. A stack, so it takes lock-infra; the plant is one kubectl exec,
+# priced at the 200s default. Nightly from its first merge.
+./tasks/first-run-report-on-demand/task.yaml
+
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is
 # excluded" (#3933). The runner excludes slots b and d plus one cluster that
