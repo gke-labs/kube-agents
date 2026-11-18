@@ -677,6 +677,9 @@ class ReconcilersForTest(unittest.TestCase):
         self.assertTrue(calls[0][3]["retry_transient"])
         cut = {"diff": diff + "# diff cut short: only the first 1 files are shown\n"}
         maybe = {"diff": diff + "# diff may be cut short: GitLab sent page 3 again\n"}
+        quoted = diff + "@@ -0,0 +1 @@\n+# diff cut short is just text in this file\n"
+        with mock.patch.dict(sys.modules, {"forge": answering({"diff": quoted})}):
+            self.assertEqual(post_merge_check.forge_paths(REPO, 7), ["clusters/dev/pdb.yaml"])
         for answer in ({"diff": ""}, {"diff": None}, {}, ["not", "a", "dict"], cut, maybe, RuntimeError("forge down")):
             with self.subTest(answer=answer), mock.patch.dict(sys.modules, {"forge": answering(answer)}):
                 if isinstance(answer, Exception):
@@ -744,6 +747,44 @@ class MainTest(unittest.TestCase):
                     redirect_stdout(out):
                 self.assertEqual(post_merge_check.main(["health"], kubectl_json=FakeCluster()), 0)
             self.assertEqual(json.loads(out.getvalue())["applied"], [])
+
+    def test_the_install_sets_the_reads_per_tick(self):
+        from unittest import mock
+
+        for raw, expected in (("", 20), ("5", 5), ("500", 500), ("0", 20), ("-3", 20), ("501", 20), ("ten", 20),
+                              (" 7 ", 7), ("1_0", 20), ("\u0663", 20), ("+5", 20)):
+            with self.subTest(raw=raw), mock.patch.dict("os.environ", {post_merge_check.READS_PER_TICK_ENV: raw}):
+                if expected == 20 and raw.strip():
+                    with self.assertLogs("post_merge_check", level="WARNING"):
+                        self.assertEqual(post_merge_check.reads_per_tick(), expected)
+                else:
+                    self.assertEqual(post_merge_check.reads_per_tick(), expected)
+
+    def test_a_run_reads_no_more_than_the_install_s_cap(self):
+        import io
+        import kubeagents_switches
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kv.db")
+            with sqlite3.connect(db) as conn:
+                conn.execute(schema())
+                for number in range(1, 11):
+                    conn.execute(
+                        "INSERT INTO post_merge_records (url, repo, number, kind, opened_at) VALUES (?, ?, ?, 'no-pdb', ?)",
+                        (f"{REPO}/pull/{number}", REPO, number, NOW.isoformat()),
+                    )
+            forge = FakeForge({n: {"state": "open"} for n in range(1, 11)})
+            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": "silent", "SESSION_KV_DB_PATH": db,
+                                                post_merge_check.READS_PER_TICK_ENV: "3"}), \
+                    mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
+                    mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(post_merge_check.main(["notice"], view=forge), 0)
+        self.assertEqual(len(forge.reads), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

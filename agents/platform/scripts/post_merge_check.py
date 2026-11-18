@@ -2,7 +2,8 @@
 
 Step 2, notice the merge: :func:`notice_merges` reads each waiting record's
 pull request from the forge, one read per record per tick and at most
-:data:`READS_PER_TICK` records, and writes what it found back to the row:
+:func:`reads_per_tick` records (:data:`READS_PER_TICK` unless the install sets
+:data:`READS_PER_TICK_ENV`), and writes what it found back to the row:
 
 - merged: ``merged_at`` (the forge's close time, else now) and ``merge_commit``,
   the commit the merge became (the forge's ``mergeCommit``). The later steps
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections.abc import Callable
@@ -45,8 +47,13 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger("post_merge_check")
 
 RECORDS_TABLE = "post_merge_records"
-#: The most records one tick reads from the forge.
+#: The most records one tick reads from the forge, the cluster or the sandbox,
+#: per step, unless :data:`READS_PER_TICK_ENV` says otherwise.
 READS_PER_TICK = 20
+#: The agent container's variable (``spec.deployment.env``) that sets the per-step
+#: limit: a whole number from 1 to :data:`READS_PER_TICK_MAX`; anything else is the default.
+READS_PER_TICK_ENV = "POST_MERGE_READS_PER_TICK"
+READS_PER_TICK_MAX = 500
 #: The forge read's ceiling, per record, on the agent pod's hop to the sandbox
 #: (``forge.call``); a run with no sandbox reaches the broker without one.
 VIEW_TIMEOUT_SECONDS = 10.0
@@ -76,6 +83,19 @@ def forge_view(repo: str, number: int) -> dict:
     if not isinstance(proposal, dict):
         raise TypeError("the forge answered without a proposal")
     return proposal
+
+
+def reads_per_tick() -> int:
+    """:data:`READS_PER_TICK_ENV` as a whole number from 1 to :data:`READS_PER_TICK_MAX`, else :data:`READS_PER_TICK`."""
+    raw = os.environ.get(READS_PER_TICK_ENV, "").strip()
+    if not raw:
+        return READS_PER_TICK
+    value = int(raw) if raw.isascii() and raw.isdigit() else 0
+    if not 1 <= value <= READS_PER_TICK_MAX:
+        logger.warning("post-merge check: %s=%r is not a whole number from 1 to %d; using %d",
+                       READS_PER_TICK_ENV, raw, READS_PER_TICK_MAX, READS_PER_TICK)
+        return READS_PER_TICK
+    return value
 
 
 def _now_text(now: datetime) -> str:
@@ -202,6 +222,14 @@ class ClusterReadError(RuntimeError):
     """A cluster read that did not answer."""
 
 
+class ScopeRefused(Exception):
+    """The install's declared scope leaves the record's cluster out, or cannot say: nothing is read."""
+
+
+#: ``post_merge_scope.UNKNOWN_PREFIX``, repeated so this module does not import it.
+SCOPE_UNKNOWN_PREFIX = "unknown: "
+
+
 class WorkloadGone(ClusterReadError):
     """The workload the fix is for no longer exists, or cannot be judged."""
 
@@ -238,7 +266,7 @@ DIFF_PATH_RE = re.compile(r'^(?:\+\+\+|---) (?:"([ab]/(?:[^"\\]|\\.)*)"|([ab]/.*
 
 
 #: How a forge adapter says the diff it returned is not the whole change (GitLab's fallback).
-DIFF_CUT_MARKERS = ("# diff cut short", "# diff may be cut short")
+DIFF_CUT_RE = re.compile(r"^# diff (?:may be )?cut short", re.MULTILINE)
 C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 C_QUOTED_RE = re.compile(r"\\([0-7]{3}|.)")
 
@@ -313,7 +341,7 @@ def forge_paths(repo: str, number: int) -> list[str] | None:
         logger.warning("post-merge check: could not read the files of %s#%s: %r", repo, number, exc)
         return None
     diff = answer.get("diff") if isinstance(answer, dict) else None
-    if not isinstance(diff, str) or any(marker in diff for marker in DIFF_CUT_MARKERS):
+    if not isinstance(diff, str) or DIFF_CUT_RE.search(diff):
         # A cut diff lists only some of the files, and kept as the whole list it would
         # narrow the match to the reconcilers of those files for good.
         return None
@@ -513,8 +541,9 @@ class SandboxKubectl:
     once per cluster per run.
     """
 
-    def __init__(self) -> None:
-        self.kubeconfigs: dict[tuple[str, str, str], str] = {}
+    def __init__(self, kubeconfigs: dict[tuple[str, str, str], str] | None = None) -> None:
+        # Shareable with post_merge_scope.sandbox_recheck, so a cluster's credentials are fetched once per run.
+        self.kubeconfigs: dict[tuple[str, str, str], str] = {} if kubeconfigs is None else kubeconfigs
 
     def __call__(self, record: dict, argv: list) -> dict:
         import stall_watch
@@ -546,8 +575,15 @@ def watch_health(
     limit: int = READS_PER_TICK,
     contains: Contains = forge_contains,
     paths: Paths = None,
+    scope_refusal: Callable[[dict], str | None] | None = None,
 ) -> dict[str, list[str]]:
     """Step 3 for each merged record: wait until the fix is applied.
+
+    ``scope_refusal(record)`` (``post_merge_scope.scope_refusal_for``) names
+    why the install's declared scope leaves the record's cluster out, or None.
+    A refused record is not read at all, only stamped, and is returned under
+    ``out_of_scope``, or under ``scope_unknown`` when the scope cannot say
+    (``post_merge_scope.UNKNOWN_PREFIX``, also used when judging it failed).
 
     Not yet applied: read the reconcilers on the record's cluster that deliver
     its repository into its namespace (:func:`reconcilers_for`) against the
@@ -572,18 +608,35 @@ def watch_health(
     kubectl_json = kubectl_json or SandboxKubectl()
     now = now or datetime.now(timezone.utc)
     stamp = _now_text(now)
-    seen: dict[str, list[str]] = {"applied": [], "waiting": [], "failed": [], "unreadable": []}
+    seen: dict[str, list[str]] = {
+        "applied": [], "waiting": [], "failed": [], "unreadable": [], "out_of_scope": [], "scope_unknown": [],
+    }
     # A cluster's reconciler lists, or the error reading them, so a failed read is not repeated per record.
     lists_by_cluster: dict[tuple, dict | Exception] = {}
     answers: dict[tuple, bool | None] = {}
-    for values in conn.execute(HEALTH_SQL, (limit,)).fetchall():
+    reads = 0
+    # Every candidate, since a refused record costs no read: only records that are read count
+    # toward ``limit``, so refused ones never hold a tick's slots, however many there are.
+    for values in conn.execute(HEALTH_SQL, (-1,)).fetchall():
+        if reads >= limit:
+            break
         record = dict(zip(HEALTH_COLUMNS, values))
         url = record["url"]
         updates: dict[str, object] = {"health_checked_at": stamp}
+        refused = None
+        if scope_refusal is not None and all(cluster_coordinates(record)) and record["object"]:
+            try:
+                refused = scope_refusal(record)
+            except Exception as exc:  # noqa: BLE001 — a record whose scope cannot be judged is not read
+                logger.warning("post-merge check: could not judge the scope of %s: %r", url, exc)
+                refused = f"{SCOPE_UNKNOWN_PREFIX}the scope could not be judged: {exc!r}"
         try:
+            if refused:
+                raise ScopeRefused(refused)
             cluster = cluster_coordinates(record)
             if not (all(cluster) and record["object"]):
                 raise ClusterReadError("the record names no cluster or workload to read")
+            reads += 1
             if cluster not in lists_by_cluster:
                 try:
                     lists_by_cluster[cluster] = {
@@ -638,6 +691,12 @@ def watch_health(
                 bucket = "applied"
             else:
                 bucket = "waiting"
+        except ScopeRefused as exc:
+            # Not read; the reason goes on the row, and the stamp moves it to the back of the queue.
+            unknown = str(exc).startswith(SCOPE_UNKNOWN_PREFIX)
+            bucket = "scope_unknown" if unknown else "out_of_scope"
+            reason = str(exc)[len(SCOPE_UNKNOWN_PREFIX):] if unknown else str(exc)
+            updates["sync_state"] = f"{'scope unknown' if unknown else 'out of scope'}: {reason}"[:500]
         except WorkloadGone as exc:
             logger.warning("post-merge check: %s cannot be judged: %s", url, exc)
             updates.update(health_result=HEALTH_FAILED, health_detail=f"cannot judge: {exc}"[:500], health_at=stamp)
@@ -688,9 +747,16 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
         if argv == ["notice"]:
-            print(json.dumps(notice_merges(conn, view)))
+            print(json.dumps(notice_merges(conn, view, limit=reads_per_tick())))
         else:
-            print(json.dumps(watch_health(conn, kubectl_json)))
+            import post_merge_scope
+
+            try:
+                refusal = post_merge_scope.scope_refusal_for(post_merge_scope.install_scope())
+            except Exception as exc:  # noqa: BLE001 — an unknown scope reads no cluster
+                print(json.dumps({"scope": "unreadable", "error": str(exc)[:300]}))
+                return 1
+            print(json.dumps(watch_health(conn, kubectl_json, limit=reads_per_tick(), scope_refusal=refusal)))
     return 0
 
 
