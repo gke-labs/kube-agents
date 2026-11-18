@@ -46,6 +46,7 @@ from datetime import date, datetime
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,11 +72,15 @@ from check_docs_links import (  # noqa: E402
     link_target,
     strip_code_fences,
     strip_specimens,
-    tracked_paths,
     unique_slug,
 )
 
 REPO = SCRIPT_DIR.parent
+
+GIT_BIN = "git"
+GIT_LS_FILES_ARG = "ls-files"
+GIT_NULL_FLAG = "-z"
+NUL_BYTE = "\0"
 
 UTF8_ENCODING = "utf-8"
 UTF8_BOM = "\ufeff"
@@ -364,12 +369,17 @@ def validate_file_links(
             errors.append(f"line {lineno}: {MSG_BROKEN_LINK_PREFIX} '{target}'")
             continue
         if tracked is not None:
-            is_tracked = resolved in tracked or (
-                resolved.is_dir()
-                and any(
-                    resolved == parent
-                    for tracked_file in tracked
-                    for parent in tracked_file.parents
+            abs_candidate = Path(os.path.abspath(candidate))
+            is_tracked = (
+                abs_candidate in tracked
+                or resolved in tracked
+                or (
+                    resolved.is_dir()
+                    and any(
+                        abs_candidate == parent or resolved == parent
+                        for tracked_file in tracked
+                        for parent in tracked_file.parents
+                    )
                 )
             )
             if not is_tracked:
@@ -379,6 +389,30 @@ def validate_file_links(
             if fragment not in okf_page_anchors(resolved, anchors):
                 errors.append(f"line {lineno}: {MSG_BROKEN_ANCHOR_PREFIX} '{target}'")
     return errors
+
+
+def git_tracked_paths(repo: Path = REPO) -> set[Path]:
+    """Return un-dereferenced absolute paths for every git-tracked file or symlink in ``repo``.
+
+    Unlike ``check_docs_links.tracked_paths()``, this keeps symlinks (including
+    broken ``.md`` symlinks, symlinked subdirectories, and symlinked
+    ``knowledge/`` roots) under their tracked path without calling ``resolve()``
+    so symlink checks can reject them.
+    """
+    abs_repo = Path(os.path.abspath(repo))
+    out = subprocess.run(
+        [GIT_BIN, GIT_LS_FILES_ARG, GIT_NULL_FLAG],
+        cwd=abs_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split(NUL_BYTE)
+    return {
+        Path(os.path.abspath(abs_repo / rel_path))
+        for rel_path in out
+        if rel_path
+        and ((abs_repo / rel_path).is_file() or (abs_repo / rel_path).is_symlink())
+    }
 
 
 def relative_without_deref(path: Path, root: Path) -> tuple[Path, bool]:
@@ -393,6 +427,80 @@ def relative_without_deref(path: Path, root: Path) -> tuple[Path, bool]:
         if current.is_symlink():
             has_symlink = True
     return rel, has_symlink
+
+
+def format_display_label(path: Path, base: Path) -> str:
+    """Format ``path`` relative to ``base`` without dereferencing symlinks."""
+    try:
+        return Path(os.path.abspath(path)).relative_to(base).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def is_tracked_knowledge_path(path: Path, abs_root: Path, tracked: set[Path]) -> bool:
+    """True when ``path`` (or a symlinked ancestor at or under ``abs_root``) is in ``tracked``."""
+    abs_path = Path(os.path.abspath(path))
+    rel, has_symlink = relative_without_deref(abs_path, abs_root)
+    current = abs_root
+    if current in tracked or (current.parent.resolve() / current.name) in tracked:
+        return True
+    for part in rel.parts:
+        current = current / part
+        if current in tracked or (current.parent.resolve() / current.name) in tracked:
+            return True
+    if not has_symlink and abs_path.resolve() in tracked:
+        return True
+    return False
+
+
+def ancestor_realpaths(current_dir: Path, abs_root: Path) -> set[Path]:
+    """Return resolved realpaths for ``abs_root``'s parents and every prefix to ``current_dir``."""
+    realpaths = {abs_root.resolve(), *(parent.resolve() for parent in abs_root.parents)}
+    probe = abs_root
+    for part in current_dir.relative_to(abs_root).parts:
+        probe = probe / part
+        realpaths.add(probe.resolve())
+    return realpaths
+
+
+def collect_knowledge_paths(abs_root: Path, tracked: set[Path] | None) -> list[Path]:
+    """Collect ``.md`` files and symlinks under ``abs_root``, descending into symlinked subdirectories."""
+    collected: set[Path] = set()
+    symlink_dirs: list[Path] = []
+
+    for dirpath, dirnames, filenames in os.walk(abs_root, followlinks=True):
+        current_dir = Path(dirpath)
+        ancestors = ancestor_realpaths(current_dir, abs_root)
+        kept_dirs: list[str] = []
+        for dirname in sorted(dirnames):
+            subdir = current_dir / dirname
+            if subdir.is_symlink():
+                if tracked is None or is_tracked_knowledge_path(subdir, abs_root, tracked):
+                    symlink_dirs.append(subdir)
+                try:
+                    target_real = subdir.resolve()
+                except OSError:
+                    continue
+                if not subdir.is_dir() or target_real in ancestors:
+                    continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        for filename in filenames:
+            candidate = current_dir / filename
+            is_md = candidate.suffix.lower() == MARKDOWN_EXT and (
+                candidate.is_file() or candidate.is_symlink()
+            )
+            if not is_md and not candidate.is_symlink():
+                continue
+            if tracked is None or is_tracked_knowledge_path(candidate, abs_root, tracked):
+                collected.add(candidate)
+
+    for sym_dir in symlink_dirs:
+        if not any(sym_dir in path.parents for path in collected):
+            collected.add(sym_dir)
+
+    return sorted(collected)
 
 
 def validate_knowledge_file(
@@ -549,29 +657,25 @@ def validate_knowledge_root(
     """
     abs_root = Path(os.path.abspath(knowledge_root))
     base = abs_root.parent if display_root is None else Path(os.path.abspath(display_root))
+    root_has_symlink = abs_root.is_symlink()
+    if not root_has_symlink:
+        try:
+            _, root_has_symlink = relative_without_deref(abs_root, base)
+        except ValueError:
+            root_has_symlink = abs_root.is_symlink()
+    if root_has_symlink:
+        return 1, [f"{format_display_label(abs_root, base)}: {MSG_SYMLINK_NOT_ALLOWED}"]
     if not abs_root.is_dir():
         return 0, [f"{knowledge_root}: {MSG_NO_KNOWLEDGE_FILES}"]
 
-    files = sorted(
-        path
-        for path in abs_root.rglob(MARKDOWN_GLOB)
-        if (path.is_file() or path.is_symlink())
-        and (
-            tracked is None
-            or Path(os.path.abspath(path)) in tracked
-            or path.resolve() in tracked
-        )
-    )
+    files = collect_knowledge_paths(abs_root, tracked)
     if not files:
         return 0, [f"{knowledge_root}: {MSG_NO_KNOWLEDGE_FILES}"]
 
     anchors: AnchorCache = {}
     all_errors: list[str] = []
     for path in files:
-        try:
-            label = Path(os.path.abspath(path)).relative_to(base).as_posix()
-        except ValueError:
-            label = path.as_posix()
+        label = format_display_label(path, base)
         for err in validate_knowledge_file(
             path,
             abs_root,
@@ -587,20 +691,27 @@ def discover_knowledge_roots(
     *,
     tracked: set[Path] | None = None,
 ) -> list[Path]:
-    """Discover every git-tracked ``knowledge/`` root directory under ``repo``."""
+    """Discover every git-tracked ``knowledge/`` root directory (or symlink) under ``repo``."""
+    abs_repo = Path(os.path.abspath(repo))
     resolved_repo = repo.resolve()
-    paths = tracked_paths() if tracked is None else tracked
+    paths = git_tracked_paths(abs_repo) if tracked is None else tracked
     roots: set[Path] = set()
     for tracked_file in paths:
-        if tracked_file.suffix != MARKDOWN_EXT:
-            continue
+        abs_entry = Path(os.path.abspath(tracked_file))
         try:
-            rel = tracked_file.relative_to(resolved_repo)
+            rel = abs_entry.relative_to(abs_repo)
         except ValueError:
+            try:
+                rel = abs_entry.relative_to(resolved_repo)
+            except ValueError:
+                continue
+        is_symlink_entry = (abs_repo / rel).is_symlink() or abs_entry.is_symlink()
+        if abs_entry.suffix.lower() != MARKDOWN_EXT and not is_symlink_entry:
             continue
-        for index, part in enumerate(rel.parts[:-1]):
+        search_parts = rel.parts if is_symlink_entry else rel.parts[:-1]
+        for index, part in enumerate(search_parts):
             if part == KNOWLEDGE_DIR_NAME:
-                roots.add((resolved_repo / Path(*rel.parts[: index + 1])).resolve())
+                roots.add(Path(os.path.abspath(abs_repo / Path(*rel.parts[: index + 1]))))
                 break
     return sorted(roots)
 
@@ -620,7 +731,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tracked = None
         display_root = None
     else:
-        tracked = tracked_paths()
+        tracked = git_tracked_paths(REPO)
         roots = discover_knowledge_roots(REPO, tracked=tracked)
         display_root = REPO
 
