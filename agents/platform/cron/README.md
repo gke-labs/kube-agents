@@ -451,14 +451,23 @@ minutes, less when the tick budget is nearly spent), less 30 seconds, split
 across the call's waves of two clusters, at most five minutes so one stuck
 cluster can't spend the tick, and never below leeway's own one-minute default.
 A project's clusters (or `LEEWAY_WATCH_CLUSTERS`) are read in calls of at most
-14, sized so a call's clusters fit its 15 minutes at two minutes per cluster
-read, about twice the slowest read measured; a call that times out or fails
-costs only its own clusters, and the calls that returned keep their results. A
-project counts as cleanly scanned only when every call returned, and each
-failed call is its own scan error (`<project> batch i/n`). The least recently
-read clusters go first (`cluster_runs` in the ledger), and a project the
-45-minute tick budget cuts off keeps its place ahead of the projects swept that
-tick, so a project too big for one tick is covered over the next ones.
+14 clusters, sized so a call's clusters fit its 15 minutes at two minutes per
+cluster read, about twice the slowest read measured; a call started with less
+than 15 minutes of the 45-minute tick left holds only the waves of two that
+fit at the one-minute floor. A call that times out or fails costs only its own
+clusters, and the calls that returned keep their results. The least recently
+read clusters go first (`cluster_runs` in the ledger). Projects go least
+recently swept first (`project_runs`): a project whose turn starts with a full
+15 minutes rotates behind the others even if the tick ends before all its
+clusters are read, so a project too big for one tick neither starves the rest
+nor goes unread, and is covered over the next ticks; one the tick reaches late
+keeps its place unless every cluster got a call. Each project has at most one
+scan error, by counts when it took several calls (`p1: 72 of 100 clusters
+read; 14 failed (<cause>), 14 not reached (tick budget exhausted)`). Clusters
+the tick did not reach are deferred, not failed: alone they post no
+partial-scan line, do not hold back the report refresh, and are listed under
+the report's "Not Reached This Run". A finding retires per cluster: when its
+cluster is read clean, or when its project's cluster list no longer names it.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
