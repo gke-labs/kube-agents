@@ -539,7 +539,7 @@ The GitLab CE lane runs the forge table's `gitlab-ce` row: GitLab CE itself (`gi
 
 ### 5.9 The validated-capabilities lane
 
-`ci-kube-agents-certification-1` and `ci-kube-agents-certification-2` in `oss-test-infra` (`kube-agents-periodics.yaml`) run the
+`ci-kube-agents-validated-capabilities-1` and `ci-kube-agents-validated-capabilities-2` in `oss-test-infra` (`kube-agents-periodics.yaml`) run the
 validated-capabilities suite, one job a part: the first the cases whose task file carries `suite: validated-capabilities` and no `suite_part` line above 1, the second the cases with `suite_part: 2`
 (`EVAL_VALIDATED_CAPABILITIES_PART`). Each runs under
 `EVAL_TIER=validated-capabilities`, on Saturday and Sunday at 14:00 UTC and on Deck's Rerun, at 3 repetitions per
@@ -571,12 +571,12 @@ cluster, not from their public job config: `kube-agents-eval-model` in namespace
 one pair of keys per kind of lane, and every Prow job that runs `hack/ci-deploy.sh` reads
 one:
 
-| Pair                          | Jobs                                                                                                                                                                                                                                                                                                                    |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gate.provider` / `gate.name` | `pull-kube-agents-smoke-test`, `pull-kube-agents-smoke-test-today`, `pull-kube-agents-smoke-test-gitlab`, `pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, `post-kube-agents-eval-rc`                                                                                                       |
-| `nightly.*`                   | `ci-kube-agents-eval-nightly`, `-main-b`, `-main-c`, `-main-d`, `-main-e`, `-gitlab`, `-writers`, `-writers-b`, `-writers-c`, `-gitlab-next`, `ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`, `ci-kube-agents-certification-1` and `-2` (5.9), `ci-kube-agents-eval-nightly-slack` |
-| `flash.*`                     | `pull-kube-agents-smoke-test-flash`                                                                                                                                                                                                                                                                                     |
-| `alt.*`                       | `pull-kube-agents-smoke-test-alt`                                                                                                                                                                                                                                                                                       |
+| Pair                          | Jobs                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gate.provider` / `gate.name` | `pull-kube-agents-smoke-test`, `pull-kube-agents-smoke-test-today`, `pull-kube-agents-smoke-test-gitlab`, `pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, `post-kube-agents-eval-rc`                                                                                                                |
+| `nightly.*`                   | `ci-kube-agents-eval-nightly`, `-main-b`, `-main-c`, `-main-d`, `-main-e`, `-gitlab`, `-writers`, `-writers-b`, `-writers-c`, `-gitlab-next`, `ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`, `ci-kube-agents-validated-capabilities-1` and `-2` (5.9), `ci-kube-agents-eval-nightly-slack` |
+| `flash.*`                     | `pull-kube-agents-smoke-test-flash`                                                                                                                                                                                                                                                                                              |
+| `alt.*`                       | `pull-kube-agents-smoke-test-alt`                                                                                                                                                                                                                                                                                                |
 
 A lane reads its pair at the top of its script, before the image build, and stops on a
 missing or empty key; `hack/ci-deploy.sh` refuses a Prow job that arrives without the

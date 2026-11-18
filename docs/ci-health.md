@@ -545,7 +545,7 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project. Two more, `ci-kube-agents-certification-1` and `-2`, are
+daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
 not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
 their record is their logs bucket and nothing else reads a failed build of them. A sixth,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing

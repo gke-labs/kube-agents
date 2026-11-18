@@ -440,15 +440,16 @@ readonly A2A_NATS_CLAIM_DELETE_TIMEOUT="60s"
 # the flag leaking into another periodic's or postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
-# one-line edit here. Each validated-capabilities slice is listed under two
-# names: its job runs a release's own copy of this script, so a release has
-# to admit a name before a job can take it, a new slice's as much as a
-# renamed one's. Admitting a job here
+# one-line edit here. A validated-capabilities slice's job runs a release's
+# own copy of this script, so a release has to admit a name before a job
+# can take it. The first slice is therefore also listed under the name its
+# job had first, ci-kube-agents-certification-1, which goes once
+# oss-test-infra has renamed that job. Admitting a job here
 # never lets it write today's window:
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 ci-kube-agents-validated-capabilities-1 ci-kube-agents-certification-2 ci-kube-agents-validated-capabilities-2 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane ci-kube-agents-eval-nightly-slack"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-validated-capabilities-1 ci-kube-agents-validated-capabilities-2 ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane ci-kube-agents-eval-nightly-slack"
 
 # The Slack lane's nightly (EVAL_SLACK_LANE=1 on ci-kube-agents-eval-nightly-slack,
 # beside EVAL_MODE_NEXT=1): the install gets Slack through the eval Slack app, and

@@ -107,8 +107,8 @@ def archive(job, builds, podinfo=None, log=None):
     return objects
 
 
-CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-1"]
-CERT_2 = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-2"]
+CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-validated-capabilities-1"]
+CERT_2 = periodics.WATCHED_BY_JOB["ci-kube-agents-validated-capabilities-2"]
 REPLAY_LANE = periodics.WATCHED_BY_JOB["ci-kube-agents-eval-replay-lane"]
 
 
@@ -1167,8 +1167,8 @@ class WorkflowWiring(unittest.TestCase):
         # can check; a rename there is a rename here.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
-            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1",
-             "ci-kube-agents-certification-2", "ci-kube-agents-eval-replay-lane"],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-validated-capabilities-1",
+             "ci-kube-agents-validated-capabilities-2", "ci-kube-agents-eval-replay-lane"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))

@@ -234,7 +234,7 @@ RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
 # The validated-capabilities lane's slices (oss-test-infra: kube-agents-periodics.yaml),
 # by the suite part each grades: a case is in one part, so the slices hold
 # disjoint cases and each is watched on its own.
-VALIDATED_CAPABILITIES_SLICE_JOBS = {1: "ci-kube-agents-certification-1", 2: "ci-kube-agents-certification-2"}
+VALIDATED_CAPABILITIES_SLICE_JOBS = {1: "ci-kube-agents-validated-capabilities-1", 2: "ci-kube-agents-validated-capabilities-2"}
 # A week between runs, plus a day: a Saturday run that never started (no
 # cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
 VALIDATED_CAPABILITIES_STALE_AFTER = timedelta(days=8)

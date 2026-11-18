@@ -4,7 +4,7 @@
 > and first cases are on `main` (`EVAL_TIER=validated-capabilities` in `hack/ci-eval-pr.sh`,
 > the `suite: validated-capabilities` line in each case's task file, the "Validated Capabilities suite" section of
 > [`bench/README.md`](../../bench/README.md#validated-capabilities-suite)). The lane is the Prow periodics
-> `ci-kube-agents-certification-1` and `-2`, one a suite part, in GoogleCloudPlatform/oss-test-infra. The page
+> `ci-kube-agents-validated-capabilities-1` and `-2`, one a suite part, in GoogleCloudPlatform/oss-test-infra. The page
 > and its rating reader exist as a local prototype only; the constants this document cites from
 > it are the ones the check-in carries. Epic: gke-labs/kube-agents#3978.
 
@@ -101,7 +101,7 @@ gaps"). Nothing is inferred from a neighbouring release, from `main`, or from a 
 
 ```mermaid
 flowchart LR
-    GA["GA release published<br/>(version tag, published images)"] --> L["Validated Capabilities lane<br/>ci-kube-agents-certification-1 and -2, one a suite part<br/>newest GA, two builds a week each, 3 repetitions each for now"]
+    GA["GA release published<br/>(version tag, published images)"] --> L["Validated Capabilities lane<br/>ci-kube-agents-validated-capabilities-1 and -2, one a suite part<br/>newest GA, two builds a week each, 3 repetitions each for now"]
     L --> V["Per-release verdict<br/>k of n scored on release"]
     V --> C["Page cell<br/>count, date, state"]
     C --> G["Gate on the next promotion<br/>holds while the newest GA reads Not validated<br/>without a recorded waiver"]
@@ -134,7 +134,7 @@ item with its cost.
 
 ## The lane
 
-- **Trigger.** One job a suite part, `ci-kube-agents-certification-1` and `-2` in
+- **Trigger.** One job a suite part, `ci-kube-agents-validated-capabilities-1` and `-2` in
   `prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`, each with two scheduled builds a
   week, Saturday and Sunday, plus Rerun from Deck; `max_concurrency: 1` queues a Rerun behind a
   running build of the same job (oss-test-infra#2768). Each job resolves the newest GA release on
@@ -165,7 +165,7 @@ item with its cost.
   one scenario. The sizing is per scenario, and a slice runs every scenario of its roster part
   serially, so a part's size is bounded by the timeout; the rule that bounds it is an open
   item. A Rerun on the same release pools into its window.
-- **Artifacts.** The lane's logs bucket, one path a job, `logs/ci-kube-agents-certification-<N>/<build>/`:
+- **Artifacts.** The lane's logs bucket, one path a job, `logs/ci-kube-agents-validated-capabilities-<N>/<build>/`:
   `case-<id>.json` per scenario per build, written by `hack/ci-eval-pr.sh` when the scenario's
   last repetition has finished (one result per repetition inside it; a cut build has none for
   the scenario it was inside), and `artifacts/release-under-test.json`

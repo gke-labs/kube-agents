@@ -118,13 +118,13 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-weekly-ghes-next",
     "ci-kube-agents-eval-weekly-gitlab-ce-next",
-    "ci-kube-agents-certification-1",
-    # The same slice under the name its job takes next: a release admits the
-    # name before oss-test-infra can rename the job.
+    # The validated-capabilities lane's slices, one job a suite part.
     "ci-kube-agents-validated-capabilities-1",
-    # The second slice (suite part 2), under both names for the same reason.
-    "ci-kube-agents-certification-2",
     "ci-kube-agents-validated-capabilities-2",
+    # The first slice under the name its job had first: a release admits a
+    # name before oss-test-infra can rename the job, so the old one stays
+    # until the job is renamed there.
+    "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
     # The replay lane: a periodic replaying the next-mode nightlies' recordings.
