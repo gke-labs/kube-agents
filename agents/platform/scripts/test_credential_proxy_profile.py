@@ -1647,6 +1647,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
         vcs.snapshot_source.side_effect = lambda repository: (repository, None)
         forge = mock.Mock()
         forge.name = "github"
+        forge.hosts = ("github.com",)
+        self.forge_stub = forge
         vcs.registry.resolve.return_value = (forge, "acme/infra")
         CredentialProxyHandler.vcs = vcs
         self.vcs = vcs
@@ -1672,12 +1674,13 @@ class ProfileVcsRouteTest(unittest.TestCase):
         patcher = mock.patch.object(CredentialProxyHandler, "profile_task_writes", self.record)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.key = credential_proxy.task_repository_key(forge, "acme/infra")
         for branch in ("platform-agent/fix", "platform-agent/new-change"):
             self.own_branch(branch)
-        self.record.record_proposal(TASK_ID, FAR, "acme/infra", 7)
+        self.record.record_proposal(TASK_ID, FAR, self.key, 7)
 
     def own_branch(self, branch, task=None):
-        allowed, _ = self.record.claim_branch(task or TASK_ID, FAR, "acme/infra", branch, lambda: False)
+        allowed, _ = self.record.claim_branch(task or TASK_ID, FAR, self.key, branch, lambda: False)
         assert allowed
 
     # proposal-create from a profile task carries only the fields every adapter
@@ -1769,7 +1772,7 @@ class ProfileVcsRouteTest(unittest.TestCase):
     def test_another_tasks_proposal_is_refused(self):
         # The install's own (it passes the ownership bar), but another task opened it.
         self.forge.proposals[8] = _proposal(8, "platform-agent/incident")
-        self.record.record_proposal("task-2", FAR, "acme/infra", 8)
+        self.record.record_proposal("task-2", FAR, self.key, 8)
         status, body = self.post_with("proposal-update", number=8)
         self.assert_not_this_tasks("proposal-update", status, body)
 
@@ -1787,12 +1790,36 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 status, body = self.post_with("proposal-create", source=source)
                 self.assert_not_this_tasks("proposal-create", status, body)
 
+    def test_the_same_path_on_another_forge_is_another_record(self):
+        # The task opened #7 on github.com's acme/infra; GitLab's acme/infra #7,
+        # also the install's, is not this task's.
+        other = mock.Mock()
+        other.name = "gitlab"
+        other.hosts = ("gitlab.example.com",)
+        self.vcs.registry.resolve.return_value = (other, "acme/infra")
+        self.forge.proposals[7] = _proposal(7, "platform-agent/fix")
+        status, body = self.post_with("proposal-update", number=7)
+        self.assert_not_this_tasks("proposal-update", status, body)
+        self.assertNotEqual(
+            credential_proxy.task_repository_key(self.forge_stub, "acme/infra"),
+            credential_proxy.task_repository_key(other, "acme/infra"),
+        )
+        self.assertEqual(
+            credential_proxy.task_repository_key(self.forge_stub, "Acme/Infra"),
+            credential_proxy.task_repository_key(self.forge_stub, "acme/infra"),
+        )
+
+    def test_a_task_advances_its_own_branch_after_opening_its_proposal(self):
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/fix", "exists": True}}
+        status, body = self.post_with("publish", branch="platform-agent/fix", advance=True)
+        self.assertEqual(200, status, body)
+
     def test_publish_to_a_branch_already_on_the_remote_is_refused(self):
         # Unclaimed but present: another task's, or one from before a restart.
         self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/old", "exists": True}}
         status, body = self.post_with("publish", branch="platform-agent/old")
         self.assert_not_this_tasks("publish", status, body)
-        self.assertFalse(self.record.owns_branch(TASK_ID, "acme/infra", "platform-agent/old"))
+        self.assertFalse(self.record.owns_branch(TASK_ID, self.key, "platform-agent/old"))
 
     def test_publish_to_a_branch_another_task_claimed_is_refused(self):
         self.own_branch("platform-agent/theirs", task="task-2")
@@ -1809,7 +1836,7 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.routes["publish"].side_effect = credential_proxy.providers.WorkspaceError("push rejected", status=409)
         status, _ = self.post_with("publish", branch="platform-agent/fresh")
         self.assertEqual(409, status)
-        self.assertFalse(self.record.owns_branch(TASK_ID, "acme/infra", "platform-agent/fresh"))
+        self.assertFalse(self.record.owns_branch(TASK_ID, self.key, "platform-agent/fresh"))
 
     def test_every_read_verb_runs_with_the_permit_too(self):
         for verb in sorted(PROFILE_VCS_READS):

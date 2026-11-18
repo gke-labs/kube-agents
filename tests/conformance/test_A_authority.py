@@ -587,8 +587,9 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"), task=task
         )
         record = cp.ProfileTaskWrites()
-        record.record_proposal("task-1", 4_000_000_000, repo, 7)
-        record.record_proposal("task-2", 4_000_000_000, repo, 8)
+        key = cp.task_repository_key(types.SimpleNamespace(name="github"), repo)
+        record.record_proposal("task-1", 4_000_000_000, key, 7)
+        record.record_proposal("task-2", 4_000_000_000, key, 8)
 
         def update(number: int) -> list:
             body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()

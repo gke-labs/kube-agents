@@ -163,7 +163,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-write-any-tasks",
         "agents/platform/scripts/credential_proxy.py",
-        ("                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, repository)\n",
+        ("                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)\n",
          "                    refusal, fresh_branch = None, None\n"),
         "test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work",
         "let a confirmed task write on any open proposal the install owns, since "

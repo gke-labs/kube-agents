@@ -5278,6 +5278,19 @@ class _TaskOwned:
     confirmed: bool = True
 
 
+def task_repository_key(forge: Any, repository: str) -> str:
+    """The record's key for a repository: the forge's provider and host as well as the path.
+
+    `registry.resolve` answers the path alone, and two forges this install serves
+    can each have an `acme/infra`; keyed by the path, a proposal number one task
+    opened on one forge would admit another task's on the other. Lowercased, as
+    the managed list compares names.
+    """
+    hosts = getattr(forge, "hosts", None)
+    host = hosts[0] if isinstance(hosts, (tuple, list)) and hosts else ""
+    return f"{getattr(forge, 'name', '')}:{host}/{repository}".lower()
+
+
 class ProfileTaskWrites:
     """Which profile task created which branch and proposal, so a permit reaches only its own (#6400).
 
@@ -5347,19 +5360,21 @@ class ProfileTaskWrites:
                 return True, False
             if self._full_locked():
                 return False, False
-            self._branches[key] = _TaskOwned(task, expires_at, confirmed=False)
+            claim = _TaskOwned(task, expires_at, confirmed=False)
+            self._branches[key] = claim
         try:
             present = on_remote()
         except Exception:
             present = True
-        if present:
-            self.release_branch(task, repository, branch)
-            return False, False
         with self._lock:
-            owned = self._branches.get(key)
-            if owned is None or owned.task != task:
+            # Only this call's own claim: if it expired and was replaced while
+            # the remote was asked, the replacement is not this lookup's to judge.
+            if self._branches.get(key) is not claim:
                 return False, False
-            owned.confirmed = True
+            if present:
+                del self._branches[key]
+                return False, False
+            claim.confirmed = True
         return True, True
 
     def release_branch(self, task: str, repository: str, branch: str) -> None:
@@ -17352,8 +17367,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # install made; the permit names one task, so its writes reach
                 # that task's branches and proposals alone.
                 fresh_branch = None
+                task_key = task_repository_key(forge, repository) if resolves else ""
                 if role == CALLER_ROLE_PROFILE and verb in PROFILE_OWNERSHIP_GATED_VCS_VERBS:
-                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, repository)
+                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)
                     if refusal is not None:
                         LOGGER.warning(
                             "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
@@ -17380,7 +17396,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         self.profile_task_writes.release_branch(*fresh_branch)
                     raise
                 if role == CALLER_ROLE_PROFILE and verb == PROPOSAL_CREATE_VERB:
-                    self._record_task_proposal(principal, result, repository)
+                    self._record_task_proposal(principal, result, task_key)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
