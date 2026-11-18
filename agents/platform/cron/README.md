@@ -472,24 +472,31 @@ counts (`p1: 72 of 100 clusters read — 12 failed (<cause>) — 16 not reached
 that returned one are named (`c00, c01 and c02 returned an error
 (forbidden)`), more are counted, and only ok rows count as read. A row is
 matched to its call's cluster by its `source`, then its context name, then a
-short name no two clusters of the call share; a row that matches none is
-counted (`1 cluster returned an error`), never named, and holds its project's
-episode open as a whole. Clusters only the budget kept from being read are
+short name no two clusters of the call share; a row whose `source` names a
+cluster the call did not hold, or that matches nothing, is counted (`1 cluster
+returned an error (<cause>)`), never named, and marks its project's episode as
+failed as a whole. Clusters only the budget kept from being read are
 not a failure: they post nothing, keep their findings, and are listed under
 the report's "Not Reached This Run". The partial-scan line posts when a project fails that
 has no open episode, and names the projects that failed in that run, up to
-six and then "+N more". An episode remembers the clusters that failed and
-closes once each has read cleanly since or left its project's list (a project
-whose cluster list could not be read closes once a call for it starts and
-nothing fails); one line says so once every announced project's episode has
+six and then "+N more". An episode remembers the clusters that failed, and
+whether the project failed as a whole (its cluster list could not be read, or
+an error row matched none of its clusters). It closes once each remembered
+cluster has read cleanly since or left its project's list and, for a project
+that failed as a whole, a call for it has started in a run where nothing
+failed for it. One line says so once every announced project's episode has
 closed, and a project that leaves the sweep drops its episode without a line.
-A ledger from before per-project episodes keeps its signature of error kinds
-until a run where nothing fails and nothing goes unread, which posts that
-line; until then a project failing with a kind the signature holds posts
-nothing. A run in which no call returned fails the tick with one fixed
-sentence that names no project and no count, so it does not change with the
-rotation and posts once; a run of one project whose list failed, or whose one
-call held every cluster, keeps that project's message. A finding on a cluster its project no longer lists
+A ledger from before per-project episodes has its signature of error kinds
+read in the first run after the upgrade and then removed, without a line: a
+project failing in that run with a kind the signature holds opens its episode
+silently, and one failing with another kind posts. A run in which no call
+returned fails the tick with one fixed sentence that names no project and no
+count, only whether the reads timed out, failed, or both; while the tick keeps
+failing it keeps the kinds the last line named, so it does not change with the
+rotation and posts once. A run of one project whose list failed, or whose one
+call held every cluster, keeps that project's message; under
+`LEEWAY_WATCH_CLUSTERS`, one call that held every cluster keeps that call's
+own error. A finding on a cluster its project no longer lists
 retires once that list was read.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
