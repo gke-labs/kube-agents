@@ -431,7 +431,7 @@ the same switch, reads at most `READS_PER_TICK` clusters a run. A cluster
 it cannot read is retried for a day after the outcome, then given `""`. The merge step is `post_merge_check.py notice`,
 one run of which reads at most `READS_PER_TICK` (20) waiting records' pull requests, least recently
 read first, and reads nothing while the switch is `off`. `POST_MERGE_READS_PER_TICK` in
-`spec.deployment.env` (a whole number from 1 to 500) sets that cap for every step. A merge fills
+`spec.deployment.env` (a whole number from 1 to 25, so a run of forge reads fits a five-minute tick) sets that cap for every step. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply and health steps are
