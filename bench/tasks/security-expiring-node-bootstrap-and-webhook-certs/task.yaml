@@ -8,7 +8,7 @@
 id: security-expiring-node-bootstrap-and-webhook-certs
 name: "Admission Webhook CA Bundle Certificate Expired (webhook CA bundle check)"
 domain: security
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - compliance-audit

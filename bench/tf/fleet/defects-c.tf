@@ -19,7 +19,7 @@
 # Why seeded-c. The obtainability audit's 3.24 (`untargeted-compute-class-
 # workload`) files nothing while the cluster has an untainted node pool with
 # no compute-class label ("general capacity is available"), and the stockout
-# checks the certification suite waits for reuse that predicate. seeded-a's
+# checks the validated-capabilities suite waits for reuse that predicate. seeded-a's
 # default-pool must stay untainted and unlabelled for the fixtures it hosts,
 # so the family lives on the one seeded cluster whose only pool can carry the
 # class label: seeded-c, which main.tf labels for `general-ccc` and which
