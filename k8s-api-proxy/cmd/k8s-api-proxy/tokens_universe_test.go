@@ -81,3 +81,32 @@ func TestResolveKubeProxyUniverseDomainAndEndpoints(t *testing.T) {
 		t.Fatalf("explicit containerAPIURL override = %q", got)
 	}
 }
+
+func TestResolveKubeProxyUniverseDomainRefusesADomainUnderGoogleapis(t *testing.T) {
+	// <service>.mtls.googleapis.com is a host of the commercial universe, so a
+	// domain under googleapis.com names no other universe.
+	for _, under := range []string{"mtls.googleapis.com", " MTLS.GoogleAPIs.com. ", "a.b.googleapis.com"} {
+		if got, err := resolveKubeProxyUniverseDomain(context.Background(), under, false, "", nil); err == nil {
+			t.Errorf("explicit %q = (%q, nil), want an error", under, got)
+		}
+	}
+
+	meta := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("mtls.googleapis.com"))
+	}))
+	defer meta.Close()
+	if got, err := resolveKubeProxyUniverseDomain(context.Background(), "", true, meta.URL, meta.Client()); err == nil {
+		t.Errorf("metadata answer under googleapis.com = (%q, nil), want an error", got)
+	}
+
+	// The commercial domain itself, and a domain that only looks like it, are as before.
+	for raw, want := range map[string]string{
+		" GoogleAPIs.com. ":      defaultUniverse,
+		"notgoogleapis.com":      "notgoogleapis.com",
+		"googleapis.com.example": "googleapis.com.example",
+	} {
+		if got, err := resolveKubeProxyUniverseDomain(context.Background(), raw, false, "", nil); err != nil || got != want {
+			t.Errorf("explicit %q = (%q, %v), want (%q, nil)", raw, got, err, want)
+		}
+	}
+}

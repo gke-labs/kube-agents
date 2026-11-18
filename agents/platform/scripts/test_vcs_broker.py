@@ -3176,6 +3176,15 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(answer["commits"][0]["sha"], "a" * 40)
         self.assertEqual(answer["commits"][0]["committed"], "2026-01-01T00:00:00Z")
 
+    def test_proposal_reviews_lists_every_submitted_review_with_its_state(self):
+        broker, recorder = self.broker([
+            {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": "alice", "type": "User"}, "body": ""},
+            {"id": 2, "state": "PENDING", "user": {"login": "bob", "type": "User"}},
+        ])
+        answer = broker.proposal_reviews({"repository": "acme/infra", "number": 9})
+        self.assertEqual(recorder.calls[-1][4].split("?")[0], "repos/acme/infra/pulls/9/reviews")
+        self.assertEqual([(r["state"], r["author"]) for r in answer["reviews"]], [("changes_requested", "alice")])
+
     def test_acknowledge_reacts_on_comments_and_declines_reviews(self):
         broker, recorder = self.broker({"id": 1, "content": "eyes"})
         answer = broker.proposal_acknowledge(

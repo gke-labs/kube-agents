@@ -18,9 +18,8 @@ harness's ``{{AGENT_CLUSTER_*}}`` and ``{{FLEET_CLUSTER_*}}`` placeholders,
 expanded before this runs. Values hold no spaces: a field is ``key=value``,
 split on whitespace.
 
-Only the inject transport reads it. The api transport refuses a prompt that
-opens with it (it has no way to address a profile), so a case using it is listed
-in hack/eval/api-lane-exclusions.txt, which scripts/test_eval_rosters.py checks.
+Only the inject transport, which every CI lane uses, reads it. The api transport
+refuses a prompt that opens with it (it has no way to address a profile).
 It must open the prompt, and no other ``[bench:...]`` directive may follow it:
 the readers that schedule a stopped ask or a replay (stop_hook, hack/ci-eval-pr.sh,
 lane.runs_alone) read only a prompt's first line, so a combined case would run in

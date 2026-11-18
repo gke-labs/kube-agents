@@ -2418,8 +2418,9 @@ RUN rm -f /opt/defaults/config.yaml && \
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 # One COPY for the two, for the same destination-sharing reason as the three
-# below.
-COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
+# below. The bench's shell reader rides in it, because worker_transcript.py
+# loads it from its own folder; bench/kube_agents_bench/ stays its one source.
+COPY agents/chat/scripts/ agents/platform/scripts/ bench/kube_agents_bench/shell_words.py /opt/defaults/scripts/
 # One COPY for the three, not three: this is the chain the layer budget is measured
 # against, and it is bounded at 128 — see the layer-budget note at the top of the
 # file. They share a destination anyway.
@@ -2544,6 +2545,11 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 # roster as well as the scheduler: each failure line the scheduler writes still
 # carries the words the relay matches, and the roster still reads as daily.
 #
+# The inline import of worker_transcript.py rides along for the layer budget
+# too. The module loads the bench's shell reader when it is imported, and the
+# assert fails the build when that reader is not the copy in
+# /opt/defaults/scripts.
+#
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
 # image's skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
@@ -2571,6 +2577,9 @@ assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lo
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_scheduler_failure_line.py && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 -c "\
+import worker_transcript as w; \
+assert w.SHELL_READER_PATH == '/opt/defaults/scripts/shell_words.py', 'shell reader loaded from %r' % w.SHELL_READER_PATH" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
@@ -3040,6 +3049,7 @@ RUN chmod 0755 /opt/defaults
 COPY --chown=root:root --chmod=0755 \
      agents/chat/scripts/ \
      agents/platform/scripts/ \
+     bench/kube_agents_bench/shell_words.py \
      deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \

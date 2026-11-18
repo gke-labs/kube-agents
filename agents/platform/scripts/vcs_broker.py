@@ -3072,6 +3072,12 @@ class VcsBroker:
     def proposal_commits(self, payload):
         return self._forge_verb("proposal-commits", payload)
 
+    def proposal_reviews(self, payload):
+        # Every submitted review with its state, a bodiless approval included,
+        # for the post-merge check's change-request read. A library verb: no
+        # `vcs.py` command runs it.
+        return self._forge_verb("proposal-reviews", payload)
+
     def proposal_acknowledge(self, payload):
         return self._forge_verb("proposal-acknowledge", payload)
 
@@ -3595,6 +3601,7 @@ VCS_VERBS = frozenset(
         "proposal-update",
         "proposal-close",
         "proposal-commits",
+        "proposal-reviews",
         "proposal-acknowledge",
         "proposal-claim",
         "issue-update",
@@ -3632,6 +3639,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-update": broker.proposal_update,
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
+        "proposal-reviews": broker.proposal_reviews,
         "proposal-acknowledge": broker.proposal_acknowledge,
         "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,

@@ -156,6 +156,11 @@ class RelayTestCase(unittest.TestCase):
         })
         self.env.start()
         self.addCleanup(self.env.stop)
+        # The expected paths have the default universe's host. The adapter takes the universe
+        # from these two variables, so a value from the shell must not reach a test. The patch
+        # above puts the values back.
+        for name in (adapter_mod.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, adapter_mod.CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+            os.environ.pop(name, None)
         self.adapter = adapter_mod.PubSubAdapter.__new__(adapter_mod.PubSubAdapter)
         self.adapter._subscriptions_config = {ROUTE: dict(ROUTE_CONFIG)}
         self.adapter._relay = None
