@@ -465,16 +465,26 @@ stamped then and rotates behind the others, so a project too big for one tick
 is covered over the next ticks without starving the rest. A project's turn
 ends at its first sandbox timeout, so a project whose calls hang costs one
 call a tick, and a tick in which no call returned still saves the stamps.
-Each project has at most one scan error, by counts when it took several calls
-(`p1: 72 of 100 clusters read; 12 failed (<cause>), 16 not reached (out of
-time this run)`, with error rows folded in). Clusters only the budget kept
-from being read are not a failure: they post nothing, keep their findings,
-and are listed under the report's "Not Reached This Run". The partial-scan
-line posts when a project fails that has no open episode, and names every
-project that failed in that run; an episode closes when its project is read
-again without failing, and one line says so once every announced project
-reads cleanly. A finding on a cluster its project no longer lists retires once
-that list was read.
+Each project has at most one scan error. A project whose one call held all
+its clusters and raised keeps that call's message; any other is summarised by
+counts (`p1: 72 of 100 clusters read — 12 failed (<cause>) — 16 not reached
+(out of time this run)`), with error rows folded in: up to three clusters
+that returned one are named (`c01 returned an error (forbidden)`), more are
+counted, and only ok rows count as read. Clusters only the budget kept from
+being read are not a failure: they post nothing, keep their findings, and are
+listed under the report's "Not Reached This Run". They still hold back the
+retirement-only refresh of `latest.*` and the topic retry until a run reads
+every project in full. The partial-scan line posts when a project fails that
+has no open episode, and names the projects that failed in that run, up to
+six and then "+N more". An episode remembers the clusters that failed and
+closes once each has read cleanly since or left its project's list (a project
+whose cluster list could not be read closes once a call for it starts and
+nothing fails); one line says so once every announced project's episode has
+closed, and a project that leaves the sweep drops its episode without a line.
+A run in which no call returned fails the tick, naming only the projects that
+failed, or counting them when some were not reached so the line does not
+change with the rotation. A finding on a cluster its project no longer lists
+retires once that list was read.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
