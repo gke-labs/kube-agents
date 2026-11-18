@@ -189,6 +189,23 @@ class FollowupsTest(unittest.TestCase):
         self.follow(script)
         self.assertEqual((script.calls, self.row()["followup_state"]), ([], None))
 
+    def test_a_revert_an_earlier_attempt_opened_is_named_in_the_give_up(self):
+        add_record(self.conn, 1, followup_state="retry", followup_attempts=pmf.FOLLOWUP_ATTEMPTS - 1,
+                   followup_detail=json.dumps({"action": "retry", "revert": "https://x/pull/9"}))
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.follow(Script(**{pmf.STEPDOWN_SCRIPT: TimeoutError("sandbox timed out")}))
+        self.assertIn("I opened a revert (https://x/pull/9)", self.comments[0][1])
+
+    def test_the_scripts_clone_under_hermess_home(self):
+        done = types.SimpleNamespace(stdout='{"action": "none"}\n', returncode=0)
+        fake = types.ModuleType("sandbox_exec")
+        fake.run = mock.Mock(return_value=done)
+        with mock.patch.dict(sys.modules, {"sandbox_exec": fake}):
+            self.assertEqual(pmf.sandbox_script(pmf.STEPDOWN_SCRIPT, ["--number", 1]), {"action": "none"})
+        argv = fake.run.call_args.args[0]
+        self.assertEqual(argv, ["python3", "-I", f"/opt/defaults/scripts/{pmf.STEPDOWN_SCRIPT}", "--number", "1"])
+        self.assertEqual(fake.run.call_args.kwargs["remote_env"], {"KUBE_AGENTS_VCS_ROOT": "/home/hermes/kube-agents-vcs"})
+
     def test_the_give_up_names_a_revert_that_did_open(self):
         body = pmf.give_up_text({"kind": "no-pdb", "environment": "dev"},
                                 {"action": "retry", "revert": "https://x/pull/9", "errors": ["step-down: 502"]})

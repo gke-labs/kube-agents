@@ -304,7 +304,12 @@ def step_down(
         line += f" I did not open a revert: {refused['revert']}."
     if "stepDown" in refused:
         line += f" I did not change {automation_rules.RULES_FILE}: {refused['stepDown']}."
-    answer = forge("proposal-comment", {"number": number, "body": f"{line}\n\n{MARKER}"})
+    try:
+        answer = forge("proposal-comment", {"number": number, "body": f"{line}\n\n{MARKER}"})
+    except Exception as exc:  # noqa: BLE001 -- retried; the pull requests opened are kept in the answer
+        result["errors"] = [f"comment: {exc}"]
+        result["action"] = "retry"
+        return result
     result["comment"] = (answer.get("comment") or {}).get("url")
     return result
 
