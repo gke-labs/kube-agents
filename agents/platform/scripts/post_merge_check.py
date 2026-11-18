@@ -918,8 +918,10 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
          **tick_overrides) -> int:
     """With no arguments, the ``post-merge-check`` cron job: one ``post_merge_outcome.tick``, printing
     nothing to stdout. The summary goes to ``logs/post_merge_check.log``. A run in which any record or
-    step errored exits 1 with one line naming them on stderr, so chat gets the scheduler's failure
-    line; a clean run exits 0 and the scheduler relays nothing. ``notice``, ``health`` and ``report``
+    step errored exits 1 with one line naming them on stderr, kept in the run's saved output, and the
+    scheduler posts its failure line to chat; a failure already reported in the last day
+    (``post_merge_outcome.failures_to_report``) does not exit 1 again. A clean run exits 0 and the
+    scheduler relays nothing. ``notice``, ``health`` and ``report``
     run one step by hand (``report`` in the switch's mode, through ``post_merge_report``) and print
     what it saw as JSON.
 
@@ -968,7 +970,8 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
                 script_log.append(LOG_FILE, [summary])
             except Exception as exc:  # noqa: BLE001 — the log is best effort
                 print(f"post-merge check: could not write {LOG_FILE}: {exc!r}", file=sys.stderr)
-            failures = post_merge_outcome.errored(seen)
+            failures = post_merge_outcome.failures_to_report(post_merge_outcome.errored(seen),
+                                                             datetime.now(timezone.utc))
             if failures:
                 print(f"post-merge check ({mode}): {len(failures)} failed: {', '.join(failures)[:1500]}; "
                       f"the run's summary is in logs/{LOG_FILE}", file=sys.stderr)

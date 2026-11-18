@@ -55,7 +55,12 @@ CHECK_DEADLINE = timedelta(minutes=60)
 
 OPEN_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster", "namespace", "object",
                 "merged_at", "merge_checked_at", "merge_commit", "applied_at", "sync_state", "health_result",
-                "health_detail", "health_at")
+                "health_detail", "health_at", "health_checked_at")
+#: What ``watch_health`` writes to ``health_detail`` when it fails a record it cannot judge
+#: (``post_merge_check.WorkloadGone``), and the one such reason that is a judgement: the
+#: workload had no healthy reading by ``HEALTH_SETTLE_LIMIT`` past the window.
+CANNOT_JUDGE = "cannot judge: "
+NEVER_SETTLED = "no healthy reading by "
 #: Merged records with no outcome. A pull request closed without a merge never
 #: matches, so it never ends as ``not_applied`` (#5800): the merge step ends it
 #: with no outcome once ``CLOSED_GRACE`` has passed.
@@ -68,6 +73,12 @@ OPEN_SQL = (
 def _since(stamp: object, now: datetime) -> timedelta | None:
     parsed = _parse_time(stamp)
     return None if parsed is None else now - parsed
+
+
+def _merge_seen(record: dict) -> datetime | None:
+    """The later of the merge and when this job noticed it."""
+    stamps = [t for t in (_parse_time(record.get("merged_at")), _parse_time(record.get("merge_checked_at"))) if t]
+    return max(stamps) if stamps else None
 
 
 def _since_merge(record: dict, now: datetime) -> timedelta:
@@ -89,11 +100,22 @@ def _not_live(record: dict) -> str:
     return APPLIED_NOT_RECHECKED if record["applied_at"] else NOT_APPLIED
 
 
+def _read_since(record: dict, moment: datetime | None) -> bool:
+    """Whether the apply step last read the record at or after ``moment``: a deadline ends a record
+    only on a reading taken after it, never on a stale one (a pod outage, a cron gap, a backlog)."""
+    read = _parse_time(record.get("health_checked_at"))
+    return moment is not None and read is not None and read >= moment
+
+
 def decide(record: dict, now: datetime, recheck: post_merge_scope.Recheck,
            scope_refusal: post_merge_scope.ScopeRefusal | None) -> tuple[str, str] | None:
     """The one outcome ``record`` has reached, with why (``<category>: <detail>``), or None while it is in flight."""
-    if scope_refusal is not None and all(post_merge_check.cluster_coordinates(record)):
-        refusal = scope_refusal(record)
+    if scope_refusal is not None and all(post_merge_check.cluster_coordinates(record)) and record["object"]:
+        try:
+            refusal = scope_refusal(record)
+        except Exception as exc:  # noqa: BLE001 — judged as watch_health judges it: unknown, so it waits
+            logger.warning("post-merge check: could not judge the scope of %s: %r", record["url"], exc)
+            refusal = f"{post_merge_scope.UNKNOWN_PREFIX}the scope could not be judged: {exc!r}"
         if refusal and refusal.startswith(post_merge_scope.UNKNOWN_PREFIX):
             # Nothing is read; past every deadline the record ends as not checked.
             if _since_merge(record, now) > _apply_deadline(record) + CHECK_DEADLINE:
@@ -101,11 +123,22 @@ def decide(record: dict, now: datetime, recheck: post_merge_scope.Recheck,
             return None
         if refusal:
             return _not_live(record), f"{SCOPE}: {refusal}"
-    if str(record["health_detail"] or "").startswith("cannot judge"):
-        return _not_live(record), f"{UNREADABLE}: {record['health_detail']}"
+    detail = str(record["health_detail"] or "")
+    if detail.startswith(CANNOT_JUDGE + NEVER_SETTLED):
+        # Read every run and never healthy: the workload did not stay healthy after the apply.
+        return STILL_BROKEN, f"{HEALTH}: {detail}"
+    if detail.startswith(CANNOT_JUDGE):
+        # Gone, or its baseline or apply time unreadable: nothing says whether the fix worked.
+        return _not_live(record), f"{UNREADABLE}: {detail}"
     if record["applied_at"] is None:
         deadline = _apply_deadline(record)
-        if _since_merge(record, now) > deadline:
+        if not record["merge_commit"]:
+            if _since_merge(record, now) > deadline:
+                # The forge reported no merge commit, so the apply step never read this record.
+                return NOT_APPLIED, f"{UNREADABLE}: the forge reported no merge commit, so the apply could not be read"
+            return None
+        merged = _merge_seen(record)
+        if _since_merge(record, now) > deadline and _read_since(record, merged and merged + deadline):
             if str(record["sync_state"] or "").startswith(f"{UNREADABLE}:"):
                 # The cluster did not answer: nothing is known about the GitOps tool.
                 return NOT_APPLIED, f"{UNREADABLE}: the cluster could not be read before the deadline: {record['sync_state']}"
@@ -115,7 +148,8 @@ def decide(record: dict, now: datetime, recheck: post_merge_scope.Recheck,
     window = HEALTH_WINDOW.get(record["kind"] or "", max(HEALTH_WINDOW.values()))
     stalled = (_since(record["applied_at"], now) or timedelta(0)) > window + CHECK_DEADLINE
     if record["health_result"] is None:
-        if stalled:
+        applied = _parse_time(record["applied_at"])
+        if stalled and _read_since(record, applied and applied + window + CHECK_DEADLINE):
             return APPLIED_NOT_RECHECKED, (f"{UNREADABLE}: the workload could not be read after the apply: "
                                            f"{record['health_detail'] or 'no reading'}")
         return None
@@ -145,14 +179,19 @@ def decide(record: dict, now: datetime, recheck: post_merge_scope.Recheck,
     return APPLIED_NOT_RECHECKED, f"{RECHECK}: the re-check could not judge: {answer.get('reason') or 'no reason'}"
 
 
-def _stamp(conn: sqlite3.Connection, url: str, stamp: str) -> bool:
+def _locked(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
+def _stamp(conn: sqlite3.Connection, url: str, stamp: str) -> bool | str:
+    """True once stamped; ``"locked"`` when another writer held the database; False otherwise."""
     try:
         with conn:
             conn.execute(f"UPDATE {RECORDS_TABLE} SET health_checked_at = ? WHERE url = ?", (stamp, url))
         return True
     except sqlite3.Error as exc:
         logger.warning("post-merge check: could not record the re-check's attempt for %s: %r", url, exc)
-        return False
+        return "locked" if _locked(exc) else False
 
 
 def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck, now: datetime | None = None,
@@ -173,6 +212,7 @@ def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck,
     stamp = _now_text(now)
     seen: dict[str, list[str]] = {outcome: [] for outcome in OUTCOMES}
     seen["errors"] = []
+    seen["deferred"] = []
     ran: list[str] = []
 
     def bounded(record: dict) -> dict:
@@ -190,22 +230,26 @@ def decide_outcomes(conn: sqlite3.Connection, recheck: post_merge_scope.Recheck,
             seen["errors"].append(record["url"])
             continue
         if reached is None:
-            if ran and ran[-1] == record["url"] and not _stamp(conn, record["url"], stamp):
-                seen["errors"].append(record["url"])
+            if ran and ran[-1] == record["url"]:
+                stamped = _stamp(conn, record["url"], stamp)
+                if stamped is not True:
+                    seen["deferred" if stamped == "locked" else "errors"].append(record["url"])
             continue
         outcome, detail = reached
         try:
             with conn:
-                conn.execute(
+                written = conn.execute(
                     f"UPDATE {RECORDS_TABLE} SET outcome = ?, outcome_at = ?, outcome_detail = ? "
                     "WHERE url = ? AND outcome IS NULL",
                     (outcome, stamp, detail[:500], record["url"]),
-                )
+                ).rowcount
         except sqlite3.Error as exc:
             logger.warning("post-merge check: could not record the outcome of %s: %r", record["url"], exc)
-            seen["errors"].append(record["url"])
+            # A locked database is another writer, not a fault: the outcome is reached again next run.
+            seen["deferred" if _locked(exc) else "errors"].append(record["url"])
             continue
-        seen[outcome].append(record["url"])
+        if written:
+            seen[outcome].append(record["url"])
     return seen
 
 
@@ -287,3 +331,45 @@ def tick(conn: sqlite3.Connection, mode: str, *, view: post_merge_check.View = p
 def errored(seen: dict[str, dict]) -> list[str]:
     """Every record (or step fault) a tick's steps returned under ``errors``."""
     return [item for step in seen.values() if isinstance(step, dict) for item in step.get("errors") or []]
+
+
+#: Where the cron run remembers which failures it has already reported, in the agent's home.
+FAILURES_FILE = "post_merge_check_failures.json"
+#: A failure already reported is reported again only after this long.
+FAILURE_REPEAT = timedelta(days=1)
+
+
+def failures_to_report(failures: list[str], now: datetime, path: str | None = None) -> list[str]:
+    """The failures not reported within :data:`FAILURE_REPEAT`, remembered as reported now.
+
+    The scheduler posts its failure line to chat on every non-zero exit, so a
+    failure that persists (a scope that cannot be read, a record this code
+    trips on) would otherwise post every five minutes. A run whose failures
+    were all reported in the last day exits 0, and its summary still goes to
+    the log. A state file that cannot be read or written reports everything,
+    so a failure is never silenced by a broken file.
+    """
+    import json
+    from pathlib import Path
+
+    if path is None:
+        import gitops_workspace
+
+        path = str(Path(gitops_workspace.agent_home()) / FAILURES_FILE)
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+        reported = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        reported = {}
+    fresh = [f for f in failures
+             if not ((when := _parse_time(reported.get(f))) and now - when < FAILURE_REPEAT)]
+    if not fresh:
+        return []
+    kept = {f: t for f, t in reported.items() if (w := _parse_time(t)) and now - w < FAILURE_REPEAT}
+    kept.update({f: _now_text(now) for f in fresh})
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(kept, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("post-merge check: could not remember the reported failures in %s: %r", path, exc)
+    return fresh

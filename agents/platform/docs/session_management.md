@@ -459,23 +459,36 @@ neither happened, and `NULL` when either cannot be read in full. It asks again n
 check noticed the merge (`merge_checked_at`), so a merge noticed late is still asked.
 
 The last step (`post_merge_outcome.py`) stores one outcome per merged record in `outcome`,
-`outcome_at` and `outcome_detail`, written only over none, so it never changes. `verified_fixed`:
-applied, healthy, and the fleet audit's check (`recheck.py`, imported from the image's copy of the
-skill) no longer fires. `still_broken`: the health window failed, or the check still fires.
-`applied_not_rechecked`: applied, but the workload or the re-check could not be read within
-`CHECK_DEADLINE` (60 minutes) after the window, or the declared scope leaves the cluster out.
-`not_applied`: not live `APPLY_DEADLINE` (60 minutes for `no-pdb`) after the merge was noticed, or
-out of scope before the apply. `outcome_detail` starts with a fixed category (`apply`, `health`,
-`re-check`, `unreadable`, `out of scope`, `scope unknown`). A record whose scope cannot be judged waits
-until both deadlines have passed. A pull request closed without a merge never gets an outcome. At most
-the per-run cap of re-checks run each time, and one that did not answer goes behind the rest.
-`post_merge_report.py` comments on it. The `post-merge-check` cron job (every 5 minutes, `no_agent`)
-runs `post_merge_check.py` with no arguments, every step in order: notice merges, fill `human_edited`,
-the apply and health steps, the outcomes, fill `environment`, report, then the follow-ups and the
-revert watch. When the declared scope cannot be read it notices merges, fills `human_edited` and
-reports outcomes already reached, and reads no cluster. It prints nothing, keeps its summary in
-`logs/post_merge_check.log`, and exits non-zero with one line for chat when a record or step
-errored. The follow-ups below write `reverted_at`. `cleanup_old_records` leaves the table: each row
+`outcome_at` and `outcome_detail`, written only over none, so it never changes; `outcome_detail`
+starts with a fixed category (`apply`, `health`, `re-check`, `unreadable`, `out of scope`,
+`scope unknown`).
+
+- `verified_fixed`: the health window passed and the fleet audit's check (`recheck.py`, imported from
+  the image's copy of the skill) no longer fires.
+- `still_broken`: the health window failed, including a workload with no healthy reading by
+  `HEALTH_SETTLE_LIMIT` past the window, or the check still fires.
+- `applied_not_rechecked`: applied, but the workload went away or its baseline could not be read, the
+  re-check could not judge, or the workload or the re-check could not be read for `CHECK_DEADLINE`
+  (60 minutes) after the window; or the declared scope leaves the cluster out.
+- `not_applied`: not live `APPLY_DEADLINE` (60 minutes for `no-pdb`) after the merge was noticed, the
+  workload gone before the apply, no merge commit from the forge, or out of scope before the apply.
+
+A deadline ends a record only on a reading taken after it, so a gap in the runs never ends one on a
+stale reading. A record whose scope cannot be judged waits until both deadlines have passed. A pull
+request closed without a merge never gets an outcome. At most the per-run cap of re-checks run each
+time, and one that did not answer goes behind the rest. `post_merge_report.py` comments on the
+outcome.
+
+The `post-merge-check` cron job (every 5 minutes, `no_agent`) runs `post_merge_check.py` with no
+arguments, every step in order: notice merges, fill `human_edited`, the apply and health steps, the
+outcomes, fill `environment`, report, then the follow-ups and the revert watch. When the declared
+scope cannot be read it notices merges, fills `human_edited` and reports outcomes already reached,
+and reads no cluster. A clean run prints nothing and keeps its summary in
+`logs/post_merge_check.log`. A run in which a record or step errored exits non-zero with one line on
+stderr naming them, kept in the run's saved output, and the scheduler posts its failure line to
+chat. A failure already reported in the last day does not do so again
+(`post_merge_check_failures.json` in the agent home), and a locked database defers the record to the
+next run without counting as one. The follow-ups below write `reverted_at`. `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 
 The report step is `post_merge_check.py report` (`post_merge_report.py`), under the same switch. It takes each record with an `outcome` and no `reported_at`. At `silent` it

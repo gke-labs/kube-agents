@@ -43,11 +43,68 @@ class DecideTest(unittest.TestCase):
         self.assertIsNone(self.decide(10, record(applied_at=NOW.isoformat())))
 
     def test_not_live_by_the_apply_deadline_is_not_applied(self):
-        outcome, detail = self.decide(61, record(sync_state="pending: OutOfSync"))
+        read = (NOW + timedelta(minutes=61)).isoformat()
+        outcome, detail = self.decide(61, record(sync_state="pending: OutOfSync", health_checked_at=read))
         self.assertEqual(outcome, post_merge_outcome.NOT_APPLIED)
         self.assertTrue(detail.startswith("apply: not live 60 minutes"), detail)
-        outcome, detail = self.decide(61, record(sync_state="unreadable: connection refused"))
+        outcome, detail = self.decide(61, record(sync_state="unreadable: connection refused", health_checked_at=read))
         self.assertEqual((outcome, detail.split(":")[0]), (post_merge_outcome.NOT_APPLIED, "unreadable"))
+
+    def test_a_deadline_ends_a_record_only_on_a_reading_taken_after_it(self):
+        stale = (NOW + timedelta(minutes=30)).isoformat()
+        self.assertIsNone(self.decide(200, record(sync_state="pending: OutOfSync", health_checked_at=stale)))
+        self.assertIsNone(self.decide(200, record(sync_state="pending")), "never read")
+        applied = record(applied_at=NOW.isoformat(), health_detail="sampled 1", health_checked_at=stale)
+        self.assertIsNone(self.decide(200, applied))
+        applied["health_checked_at"] = (NOW + timedelta(minutes=66)).isoformat()
+        self.assertEqual(self.decide(200, applied)[0], post_merge_outcome.APPLIED_NOT_RECHECKED)
+
+    def test_a_merge_with_no_merge_commit_ends_unreadable_not_unapplied(self):
+        self.assertIsNone(self.decide(30, record(merge_commit=None)))
+        outcome, detail = self.decide(61, record(merge_commit=None))
+        self.assertEqual(outcome, post_merge_outcome.NOT_APPLIED)
+        self.assertTrue(detail.startswith("unreadable: the forge reported no merge commit"), detail)
+
+    def test_each_cannot_judge_reason_maps_to_its_own_outcome(self):
+        applied = NOW.isoformat()
+        never = "cannot judge: no healthy reading by 35 minutes after the apply; last: not settled: rollout 1/3"
+        baseline = "cannot judge: the restart baseline is unreadable"
+        gone = 'cannot judge: deployments.apps "checkout" not found'
+        cases = (
+            (record(applied_at=applied, health_result="failed", health_detail=never),
+             post_merge_outcome.STILL_BROKEN, "health"),
+            (record(applied_at=applied, health_result="failed", health_detail=baseline),
+             post_merge_outcome.APPLIED_NOT_RECHECKED, "unreadable"),
+            (record(health_result="failed", health_detail=gone), post_merge_outcome.NOT_APPLIED, "unreadable"),
+        )
+        for rec, outcome, category in cases:
+            with self.subTest(detail=rec["health_detail"]):
+                got, detail = self.decide(10, rec)
+                self.assertEqual((got, detail.split(":")[0]), (outcome, category))
+
+    def test_the_cannot_judge_prefixes_are_what_watch_health_writes(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute(schema())
+        conn.execute(
+            "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, object, "
+            "opened_at, merged_at, merge_commit, applied_at, health_baseline, health_detail) VALUES (?, ?, 1, "
+            "'no-pdb', 'p', 'l', 'prod', 'shop', 'Deployment/checkout', ?, ?, ?, ?, '{}', 'not settled: rollout 1/3')",
+            (URL, REPO, NOW.isoformat(), NOW.isoformat(), MERGE, NOW.isoformat()))
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            post_merge_check.watch_health(conn, FakeCluster(), NOW + timedelta(hours=2))
+        detail = conn.execute("SELECT health_detail FROM post_merge_records").fetchone()[0]
+        self.assertTrue(detail.startswith(post_merge_outcome.CANNOT_JUDGE + post_merge_outcome.NEVER_SETTLED), detail)
+
+    def test_a_scope_that_cannot_be_judged_waits_as_unknown(self):
+        def broken(r):
+            raise KeyError("project")
+
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertIsNone(self.decide(1, record(), refusal=broken))
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            outcome, detail = self.decide(121, record(), refusal=broken)
+        self.assertEqual((outcome, detail.split(":")[0]), (post_merge_outcome.NOT_APPLIED, "scope unknown"))
 
     def test_a_merge_noticed_late_still_gets_its_whole_deadline(self):
         late = record(merge_checked_at=(NOW + timedelta(minutes=50)).isoformat())
@@ -159,12 +216,16 @@ class DecideOutcomesTest(unittest.TestCase):
         self.add(1, merged_at=NOW.isoformat(), merge_commit=MERGE, applied_at=NOW.isoformat(), health_result="passed")
         self.add(2, merged_at=NOW.isoformat(), merge_commit=MERGE, applied_at=NOW.isoformat(), health_result="passed")
 
-        def broken_scope(r):
-            if r["number"] == 1:
-                raise KeyError("project")
+        real = post_merge_outcome.decide
 
-        with self.assertLogs("post_merge_check", level="WARNING"):
-            seen = post_merge_outcome.decide_outcomes(self.conn, clean, NOW + timedelta(minutes=10), broken_scope)
+        def broken(rec, *args):
+            if rec["number"] == 1:
+                raise KeyError("health_detail")
+            return real(rec, *args)
+
+        with mock.patch.object(post_merge_outcome, "decide", broken), \
+                self.assertLogs("post_merge_check", level="WARNING"):
+            seen = post_merge_outcome.decide_outcomes(self.conn, clean, NOW + timedelta(minutes=10))
         self.assertEqual((seen["errors"], seen[post_merge_outcome.VERIFIED_FIXED]),
                          ([f"{REPO}/pull/1"], [f"{REPO}/pull/2"]))
 
@@ -252,7 +313,8 @@ class CronRunTest(unittest.TestCase):
             db = str(Path(tmp) / "kv.db")
             with sqlite3.connect(db) as conn:
                 conn.execute(schema())
-            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": switch, "SESSION_KV_DB_PATH": db}), \
+            env = {"KUBEAGENTS_POST_MERGE_CHECK": switch, "SESSION_KV_DB_PATH": db, "PLATFORM_AGENT_HOME": tmp}
+            with mock.patch.dict("os.environ", env), \
                     mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
                     mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
                     mock.patch("script_log.append") as log, redirect_stdout(out), redirect_stderr(err):
@@ -276,6 +338,58 @@ class CronRunTest(unittest.TestCase):
         self.assertEqual((code, out), (1, ""))
         self.assertIn("failed", err)
         self.assertIn("logs/post_merge_check.log", err)
+
+
+class FailuresToReportTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = str(Path(tmp.name) / "failures.json")
+
+    def report(self, failures, hours):
+        return post_merge_outcome.failures_to_report(failures, NOW + timedelta(hours=hours), self.path)
+
+    def test_a_failure_is_reported_once_a_day_and_a_new_one_at_once(self):
+        self.assertEqual(self.report(["scope"], 0), ["scope"])
+        self.assertEqual(self.report(["scope"], 1), [], "the same failure five minutes on posts nothing")
+        self.assertEqual(self.report(["scope", f"{REPO}/pull/2"], 2), [f"{REPO}/pull/2"])
+        self.assertEqual(self.report(["scope"], 25), ["scope"], "a day later it is said again")
+
+    def test_a_broken_state_file_reports_everything(self):
+        Path(self.path).write_text("not json", encoding="utf-8")
+        self.assertEqual(self.report(["scope"], 0), ["scope"])
+        unwritable = str(Path(self.path) / "under-a-file.json")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(post_merge_outcome.failures_to_report(["scope"], NOW, unwritable), ["scope"])
+
+
+class LockedDatabaseTest(unittest.TestCase):
+    def test_a_locked_database_defers_the_outcome_and_is_not_an_error(self):
+        real = sqlite3.connect(":memory:")
+        self.addCleanup(real.close)
+        real.execute(schema())
+        real.execute(
+            "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, object, "
+            "opened_at, merged_at, merge_commit, applied_at, health_result) VALUES (?, ?, 1, 'no-pdb', 'p', 'l', "
+            "'prod', 'shop', 'Deployment/checkout', ?, ?, ?, ?, 'passed')",
+            (URL, REPO, NOW.isoformat(), NOW.isoformat(), MERGE, NOW.isoformat()))
+        real.commit()
+
+        class Locked:
+            def execute(self, sql, params=()):
+                if sql.startswith("UPDATE"):
+                    raise sqlite3.OperationalError("database is locked")
+                return real.execute(sql, params)
+
+            def __enter__(self):
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            seen = post_merge_outcome.decide_outcomes(Locked(), clean, NOW + timedelta(minutes=10))
+        self.assertEqual((seen["deferred"], seen["errors"]), ([URL], []))
 
 
 if __name__ == "__main__":
