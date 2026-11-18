@@ -365,3 +365,33 @@ func TestTheMuxTakesTheWholeLineAnswerAndPieceSizeFromTheOwningBackend(t *testin
 	var _ WholeLineAnswerer = mux
 	var _ PieceSizer = mux
 }
+
+// A rated answer past the piece size posts in pieces of the backend's size
+// too: the rated path (postMessage) reads PieceSizer as the plain one does.
+func TestAWholeLineAnswerBackendSplitsARatedAnswerAtItsPieceSize(t *testing.T) {
+	t.Parallel()
+	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, withFeedbackBucket(t, 24*time.Hour), func(a *fakeAdapter) Adapter {
+		return wholeLineAnsweringAdapter{a}
+	})
+	origin := startChatTask(t, r, "discord:g1/whole-answer-rated-too-long", false)
+	long := strings.Repeat("a line of the fleet report\n", 6) // 162 runes, past the fake's 60 and under discordChunk
+	completeTask(t, r.execFor(t, origin, "platform"), long)
+	waitFor(t, "the rated answer posted in pieces", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		n := 0
+		for _, p := range r.adapter.posts {
+			if strings.Contains(p.Text, "a line of the fleet report") {
+				n++
+			}
+		}
+		return n >= 2
+	})
+	r.adapter.mu.Lock()
+	defer r.adapter.mu.Unlock()
+	for _, p := range r.adapter.posts {
+		if n := len([]rune(p.Text)); n > 60 {
+			t.Fatalf("a rated post of %d runes; want every piece within the backend's 60", n)
+		}
+	}
+}

@@ -2138,7 +2138,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """The chat.notify route: only the agent asks, only the gateway answers.
 
         The gateway posts what arrives on `chat.notify.gchat` (or, on a
-        Slack-armed gateway, `chat.notify.slack`) to the home channel as the
+        Slack-armed gateway, `chat.notify.slack`; on a Teams-armed one,
+        `chat.notify.teams`) to the home channel as the
         install's bot, and what arrives on `chat.notify.console` into a console
         conversation, so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer

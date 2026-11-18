@@ -883,12 +883,30 @@ func teamsTableStart(header, next string) bool {
 	return len(teamsTableCells(next)) == len(teamsTableCells(header))
 }
 
-// teamsIsFence reports a fenced-code delimiter line: the fence with no
-// backtick after it (CommonMark), so a line that opens and closes an inline
-// triple-backtick span is a paragraph, not a block boundary.
-func teamsIsFence(stripped string) bool {
-	rest, ok := strings.CutPrefix(stripped, teamsCodeFence)
-	return ok && !strings.Contains(rest, teamsCodeTick)
+// teamsOpensFence reports the length of an opening code fence (CommonMark):
+// a run of three or more backticks followed by an info string with no
+// backtick in it, so a line that opens and closes an inline triple-backtick
+// span is a paragraph, not a block boundary. Zero when the line is no fence.
+func teamsOpensFence(stripped string) int {
+	n := teamsBacktickRun(stripped)
+	if n < len(teamsCodeFence) || strings.Contains(stripped[n:], teamsCodeTick) {
+		return 0
+	}
+	return n
+}
+
+// teamsClosesFence reports a closing fence for a block opened by a run of
+// open backticks: at least as many backticks and nothing after them
+// (CommonMark), so an info-string fence inside the block is content, and a
+// three-backtick line does not close a four-backtick block.
+func teamsClosesFence(stripped string, open int) bool {
+	n := teamsBacktickRun(stripped)
+	return n >= open && n == len(stripped)
+}
+
+// teamsBacktickRun is the length of the backtick run a line starts with.
+func teamsBacktickRun(stripped string) int {
+	return len(stripped) - len(strings.TrimLeft(stripped, teamsCodeTick))
 }
 
 // teamsTableCells is Slack's tableCells (one border pipe off each end, an
@@ -910,6 +928,7 @@ func teamsMarkdownToCard(text string) map[string]any {
 	var code []string
 	var table [][]string
 	inCode := false
+	fenceLen := 0
 
 	textBlock := func(t string, extra map[string]any) map[string]any {
 		block := map[string]any{"type": teamsCardTextBlock, "text": t, "wrap": true}
@@ -956,22 +975,24 @@ func teamsMarkdownToCard(text string) map[string]any {
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		stripped := strings.TrimSpace(line)
-		if fence := teamsIsFence(stripped); fence || inCode {
-			// A fence opens or closes a block before any table rule runs, so
-			// a fence line with a pipe in its info string is never a row.
-			if fence {
-				flushTable()
-				if inCode {
-					inCode = false
-					body = append(body, textBlock(strings.Join(code, "\n"), map[string]any{"fontType": teamsCardMonospace}))
-					code = nil
-				} else {
-					inCode = true
-					code = nil
-				}
+		if inCode {
+			// Only a closing fence of the block's own length ends it; an
+			// info-string fence or a shorter run inside it is content.
+			if teamsClosesFence(stripped, fenceLen) {
+				inCode, fenceLen = false, 0
+				body = append(body, textBlock(strings.Join(code, "\n"), map[string]any{"fontType": teamsCardMonospace}))
+				code = nil
 				continue
 			}
 			code = append(code, line)
+			continue
+		}
+		if n := teamsOpensFence(stripped); n > 0 {
+			// A fence opens a block before any table rule runs, so a fence
+			// line with a pipe in its info string is never a row.
+			flushTable()
+			inCode, fenceLen = true, n
+			code = nil
 			continue
 		}
 		if strings.Contains(stripped, teamsPipe) {

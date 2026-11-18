@@ -40,10 +40,12 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["kubeagents-system", "kube-system"]
-      # A pipe table: a separator row of dashes between pipes, and the agent's
-      # own namespace sitting in a pipe-delimited row. Lines such as
-      # "Namespace: kubeagents-system | Status: Active" carry pipes but no
-      # separator row, which is the shape the unpatched hint produced.
+      # A pipe table in GFM's grammar, as the gateway's builders read it: a
+      # delimiter row (one or more dashes per cell, optional colons, outer
+      # pipes optional) and the agent's own namespace in a row with a pipe
+      # beside it. Lines such as "Namespace: kubeagents-system | Status:
+      # Active" carry pipes but no delimiter row, which is the shape the
+      # unpatched hint produced.
       required_patterns:
-        - '(?m)^\s*\|?\s*:?-{3,}:?\s*\|'
-        - '(?m)^\s*\|[^\n]*kubeagents-system[^\n]*\|'
+        - '(?m)^\s*\|?\s*:?-+:?\s*\|'
+        - '(?m)^[^\n|]*\|[^\n]*kubeagents-system|kubeagents-system[^\n]*\|'

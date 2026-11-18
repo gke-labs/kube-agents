@@ -688,3 +688,30 @@ func TestTeamsAnswersWholeOnTheLineWithItsOwnPieceSize(t *testing.T) {
 	var _ WholeLineAnswerer = a
 	var _ PieceSizer = a
 }
+
+// Fences follow CommonMark: an info-string fence inside an open block is
+// content, not its close, and a four-backtick block ends only on four.
+func TestTeamsCardFencesNestAndCloseOnTheirOwnLength(t *testing.T) {
+	body := func(text string) []map[string]any {
+		b, _ := teamsMarkdownToCard(text)["body"].([]map[string]any)
+		return b
+	}
+	// An info-string fence inside the block does not close it: the table
+	// lines stay code, one monospace block, no Table.
+	if b := body("```\n```yaml\n| a | b |\n|--|--|\n```\nafter"); len(b) != 2 || b[0]["fontType"] != teamsCardMonospace || !strings.Contains(b[0]["text"].(string), "| a | b |") || b[1]["text"] != "after" {
+		t.Fatalf("info-string fence inside a block: %v", b)
+	}
+	// A four-backtick block holds a three-backtick pair as content and ends
+	// on the four-backtick line.
+	if b := body("````markdown\n```yaml\nk: v\n```\n````\nafter"); len(b) != 2 || b[0]["fontType"] != teamsCardMonospace || !strings.Contains(b[0]["text"].(string), "```yaml") || b[1]["text"] != "after" {
+		t.Fatalf("four-backtick block: %v", b)
+	}
+	// A longer closing run still closes a shorter block; an inline span is
+	// still no fence.
+	if b := body("```\nx\n`````\nafter"); len(b) != 2 || b[0]["fontType"] != teamsCardMonospace || b[1]["text"] != "after" {
+		t.Fatalf("longer closing run: %v", b)
+	}
+	if teamsOpensFence("```kubectl get pods```") != 0 || teamsOpensFence("```bash") != 3 || teamsOpensFence("````") != 4 || !teamsClosesFence("```", 3) || teamsClosesFence("```yaml", 3) || teamsClosesFence("```", 4) {
+		t.Fatal("fence helpers")
+	}
+}

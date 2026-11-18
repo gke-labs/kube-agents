@@ -220,8 +220,8 @@ CLIPPED_TAIL = (
 
 
 # The platform names as a subscription and the gateway's env carry them. The platforms whose cards get laid-out chat
-# messages (chat_ux_on) are Slack, and Google Chat where the gateway serves
-# it, which lays a ``kube-agents.chat/v1``
+# messages (chat_ux_on) are Slack, and Google Chat and Microsoft Teams where the
+# gateway serves them, which lays a ``kube-agents.chat/v1``
 # message out as text with buttons; the other patch modules read this tuple
 # rather than keep their own. The gateway's served platform is read from the
 # operator's env (kanban_chat_notify.NOTIFY_PLATFORM_ENV and
