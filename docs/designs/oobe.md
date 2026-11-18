@@ -296,7 +296,7 @@ times. It rides with the audits stage, whose eval case covers both.
   report after all once the operator projects a Slack or Google Chat home channel into the pod, by asking the chat
   relay to post it as a scheduled delivery would, while the run's claim is under
   `RESEND_WINDOW_SECONDS` (the relay posts a record older than two hours as a "did not finish" notice).
-  An audit outside the chain, a first mention later than that, today mode and Google Chat keep the
+  An audit outside the chain, a first mention later than that and today mode keep the
   request sentence.
 - **An install self-check.** Not asked for by any issue.
 
