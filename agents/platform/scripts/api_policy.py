@@ -448,7 +448,7 @@ def evaluate(
     try:
         universe = credential_proxy_client.normalize_universe_domain(universe_domain)
     except ValueError:
-        # No route has a host in a malformed universe: a POST is refused on its
+        # No route has a host in a universe domain that is not valid: a POST is refused on its
         # method below, and a GET by the answer after it.
         universe = None
     if method == API_BODY_METHOD and universe is not None:
@@ -479,7 +479,7 @@ def evaluate(
         return Decision(
             allowed=False,
             rule_id=RULE_HOST,
-            message="The configured universe domain is malformed; the credential proxy refuses every API relay.",
+            message="The configured universe domain is not valid; the credential proxy refuses every API relay.",
         )
     refused_hosts = (
         REFUSED_HOSTS
