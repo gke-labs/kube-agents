@@ -2040,9 +2040,14 @@ class TestBrokerUnreachable(unittest.TestCase):
         """A caller that reads only the URLError (vcs, workspaces) sees no change."""
         import socket
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind(probe.getsockname())
         request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
         with self.assertRaises(urllib.error.URLError) as caught:
             credential_proxy_client.open_broker_request(request)
@@ -2289,9 +2294,10 @@ class TestShimEntryRouting(unittest.TestCase):
         self.shim = self.root / "credential-proxy-exec"
         shutil.copy(credential_proxy_client.__file__, self.shim)
         (self.root / "kubectl").symlink_to(self.shim)
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        probe = socket.socket()
+        self.addCleanup(probe.close)
+        probe.bind(("127.0.0.1", 0))
+        self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
         self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
         type(self).answers.clear()
         type(self).requests.clear()
@@ -2362,6 +2368,17 @@ class TestShimEntryRouting(unittest.TestCase):
         refused = self.run_shim([str(self.shim), "--endpoint", self.live, "rm", "-rf", "/"], {})
         self.assertEqual(2, refused.returncode)
         self.assertIn("invalid choice", refused.stderr)
+
+    def test_the_unreachable_port_stays_reserved_during_the_test(self):
+        """Holding the probe socket bound without listening refuses connects while
+        preventing another process from taking the port (#6044)."""
+        import socket
+
+        parsed = urllib.parse.urlsplit(self.closed)
+        with socket.socket() as competing:
+            competing.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                competing.bind((parsed.hostname, parsed.port))
 
 
 class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):

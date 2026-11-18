@@ -150,19 +150,32 @@ _INSTALLER_REPORT_DIR_PREFIX = "kube-agents-test-reports-"
 # Made at import, so the folder exists and its removal is registered before a test forks a child.
 _INSTALLER_REPORT_DIR = tempfile.mkdtemp(prefix=_INSTALLER_REPORT_DIR_PREFIX)
 atexit.register(shutil.rmtree, _INSTALLER_REPORT_DIR, ignore_errors=True)
+#: The variable that names uninstall.sh's lock file, and the name of the file a real run locks
+#: under /tmp. The script takes the lock also when a test only sources it, and a run that finds
+#: the lock held exits 1, so a test's child gets a lock file of this test process, in the folder
+#: of the report files.
+UNINSTALL_LOCK_FILE_ENV = "KUBE_AGENTS_UNINSTALL_LOCK_FILE"
+UNINSTALL_LOCK_FILE_NAME = "kube-agents-uninstall.lock"
 
 
 def installer_report_env():
     """The report file of each front-door script, in one folder of this test process.
 
     `get_isolated_test_env` sets these. An environment that a test builds from nothing takes
-    them from here: `env={"PATH": ..., **installer_report_env()}`.
+    them from here: `env={"PATH": ..., **installer_report_env()}`. A child of uninstall.sh
+    needs `**uninstall_lock_env()` too.
     """
     return {name: os.path.join(_INSTALLER_REPORT_DIR, file) for name, file in INSTALLER_REPORT_FILE_ENV_VARS.items()}
 
 
+def uninstall_lock_env():
+    """uninstall.sh's lock file, in the folder of the report files. `get_isolated_test_env` sets it."""
+    return {UNINSTALL_LOCK_FILE_ENV: os.path.join(_INSTALLER_REPORT_DIR, UNINSTALL_LOCK_FILE_NAME)}
+
+
 # The test process has them too, for a child that inherits its environment (no `env=`).
 os.environ.update(installer_report_env())
+os.environ.update(uninstall_lock_env())
 
 
 def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
@@ -172,8 +185,8 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     see even when the developer's shell exports them: a test that relies on a
     variable being unset has to be insulated from os.environ. Popped before the
     overrides, so a caller can name a key in `overrides` and the override wins.
-    `HERMETIC_GIT_ENV` and `installer_report_env()` are set before the overrides
-    for the same reason.
+    `HERMETIC_GIT_ENV`, `installer_report_env()` and `uninstall_lock_env()` are
+    set before the overrides for the same reason.
     """
     env = {
         k: v
@@ -186,6 +199,7 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
         env.pop(key, None)
     env.update(HERMETIC_GIT_ENV)
     env.update(installer_report_env())
+    env.update(uninstall_lock_env())
     if bin_dir:
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if overrides:

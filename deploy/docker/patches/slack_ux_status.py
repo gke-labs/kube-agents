@@ -114,7 +114,7 @@ it while the card waits on the user, so the Working… the old process set
 does not stick; it can also clear Working… for another card from before the
 restart that is still running, until that card's next heartbeat or note.
 
-Under ``spec.mode: next`` the A2A gateway holds Slack, and a card reaches the
+Where the A2A gateway holds Slack, a card reaches the
 thread through the kanban notifier's chat.notify stand-in
 (``kanban_chat_notify``), which has no Slack client. The plan is the same
 state machine: :func:`_render` sends it as a ``kube-agents.chat/v1`` plan

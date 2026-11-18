@@ -3,7 +3,8 @@
 Each script writes a JSON report to one fixed file under /tmp. A script that a test only sources
 writes it too when a command fails, through its ERR trap. `tests/testing/common.py` names a file
 of the test process for each script: in `os.environ`, in `get_isolated_test_env`, and through
-`installer_report_env()` for an environment that a test builds from nothing.
+`installer_report_env()` for an environment that a test builds from nothing. The lock file of
+uninstall.sh, which the script takes also when it is only sourced, is in the same folder.
 """
 
 import ast
@@ -11,13 +12,18 @@ import json
 import os
 import pathlib
 import re
-import stat
 import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
-from tests.testing.common import INSTALLER_REPORT_FILE_ENV_VARS, get_isolated_test_env, installer_report_env
+from tests.testing.common import (
+    INSTALLER_REPORT_FILE_ENV_VARS,
+    UNINSTALL_LOCK_FILE_ENV,
+    UNINSTALL_LOCK_FILE_NAME,
+    get_isolated_test_env,
+    installer_report_env,
+    uninstall_lock_env,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _TESTS_DIR = _REPO_ROOT / "tests"
@@ -73,8 +79,14 @@ class SharedReportFilesTest(unittest.TestCase):
             with self.subTest(variable=variable):
                 self._assert_the_script_reads(variable)
 
+    def test_the_lock_file_of_uninstall_sh_is_in_the_folder_of_the_report_files(self):
+        """uninstall.sh takes its lock also when a test only sources it."""
+        lock = pathlib.Path(uninstall_lock_env()[UNINSTALL_LOCK_FILE_ENV])
+        self.assertEqual(lock.name, UNINSTALL_LOCK_FILE_NAME)
+        self.assertEqual({lock.parent}, {pathlib.Path(path).parent for path in installer_report_env().values()})
+
     def test_the_test_process_and_the_isolated_environment_have_them_and_an_override_wins(self):
-        for variable, path in installer_report_env().items():
+        for variable, path in {**installer_report_env(), **uninstall_lock_env()}.items():
             with self.subTest(variable=variable):
                 # For a child that inherits the environment of the test process.
                 self.assertEqual(os.environ[variable], path)
@@ -86,26 +98,19 @@ class SharedReportFilesTest(unittest.TestCase):
                 self.assertEqual(own[variable], "/a/file/of/the/test.json")
 
     def test_a_sourced_script_whose_command_fails_writes_the_file_of_this_process(self):
-        # uninstall.sh takes its lock also when it is only sourced, on one fixed file under /tmp.
-        # A stand-in flock keeps this test off that lock, so that it cannot meet a run of
-        # tests/test_uninstall_script.py or a real uninstall.
-        bin_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(bin_dir.cleanup)
-        flock = pathlib.Path(bin_dir.name) / "flock"
-        flock.write_text("#!/usr/bin/env bash\nexit 0\n")
-        flock.chmod(flock.stat().st_mode | stat.S_IEXEC)
         for variable, script in _SCRIPT_OF_VARIABLE.items():
             with self.subTest(script=script):
-                env = get_isolated_test_env(bin_dir=bin_dir.name)
-                # Three checks before the run. Without the variable, with the real folder in it,
-                # or with a script that reads another variable, the run would replace the report
-                # of a real run.
+                env = get_isolated_test_env()
+                # Checks before the run. Without the variable, with the real folder in it, or
+                # with a script that reads another variable, the run would replace the report
+                # of a real run. uninstall.sh takes its lock also when it is only sourced, so
+                # the lock file must be one of this process too.
                 report = pathlib.Path(env[variable])
                 self.assertNotEqual(report.parent.resolve(), _REAL_REPORT_DIR.resolve())
+                self.assertEqual(pathlib.Path(env[UNINSTALL_LOCK_FILE_ENV]).parent, report.parent)
                 self._assert_the_script_reads(variable)
                 report.unlink(missing_ok=True)
                 body = (
-                    'echo "flock=$(command -v flock)"\n'
                     f'source "{_INSTALLER_COMMON}"\n'
                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_REPO_ROOT / script}"\n'
                     "false\n"
@@ -114,7 +119,6 @@ class SharedReportFilesTest(unittest.TestCase):
                     ["bash", "-c", body], capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT), timeout=60
                 )
                 self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
-                self.assertIn(f"flock={flock}\n", proc.stdout, "the script would take the real lock")
                 self.assertEqual(json.loads(report.read_text())["status"], "FAILED", proc.stderr + proc.stdout)
 
 
@@ -175,8 +179,9 @@ class ModulesThatRunTheScriptsTest(unittest.TestCase):
                 self.assertEqual(
                     _environments_from_nothing(_TESTS_DIR / name),
                     [],
-                    f"{name}: add **installer_report_env() to the env dict on these lines, "
-                    "or build the environment with get_isolated_test_env",
+                    f"{name}: add **installer_report_env() to the env dict on these lines (and "
+                    "**uninstall_lock_env() for a child of uninstall.sh), or build the environment "
+                    "with get_isolated_test_env",
                 )
 
 

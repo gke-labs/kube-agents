@@ -2,6 +2,7 @@ Subject: Stop listing `gvnic` as a field the CRD lacks
 
 Why: Upstream took `gvnic` off the CRD field reference's never-use list but left it on SKILL.md's STRICT SCHEMA RULE, so the skill forbade and allowed the same field; `spec.nodePoolConfig.gvnic` exists in the ComputeClass CRD (checked with `kubectl explain` on 1.35.8), so the reference is right and SKILL.md follows it.
 Local-Issue: #2692
+Eval-Case: compute-class-canary-active-migration-pdb-probe
 Upstream-Issue: none filed yet
 Retire-When: when upstream SKILL.md drops `gvnic` from the STRICT SCHEMA RULE
 

@@ -89,6 +89,9 @@ from kube_agents_bench.verifiers import FleetResourcePropertyVerifier
 
 _REPO = Path(__file__).resolve().parents[2]
 _BENCH = _REPO / "bench"
+# What seeds a pool project's GitOps repository, the home of a catalog
+# `repository/<path>` subject.
+_PROVISION_SCRIPT = _REPO / "scripts" / "provision_ci_pool_project.sh"
 _CATALOG = _BENCH / "tf" / "fleet" / "fixtures.json"
 
 
@@ -1414,6 +1417,40 @@ _PATH_SCOPED_ABSENT_WITNESSES[
         },
     },
 }
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "obtainability-untargeted-compute-class-manifest/audit-did-not-add-the-compute-class-selector"
+] = {
+    # What the fix the case describes writes: the compute-class nodeSelector
+    # on the untargeted workload (`kubectl patch deployment app-worker-a -n
+    # seeded-compute-class -p '{"spec":{"template":{"spec":{"nodeSelector":{"cloud.google.com/compute-class":"general-ccc"}}}}}'`).
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {
+                    "nodeSelector": {"cloud.google.com/compute-class": "general-ccc"},
+                    "containers": [{"name": "worker"}],
+                },
+            },
+        },
+    },
+    # As planted (defects-c.tf): no nodeSelector and no affinity on the template.
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "app-worker-a", "namespace": "seeded-compute-class"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "metadata": {"labels": {"app": "app-worker-a"}},
+                "spec": {"containers": [{"name": "worker"}]},
+            },
+        },
+    },
+}
+
 
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
     """The sharp edge of `absent` when it carries a path.
@@ -2580,12 +2617,28 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
         path.read_text() for path in sorted(fleet_dir.glob("*.tf")) if not path.name.startswith("defects-")
     )
     seen = 0
+    provisioning = _PROVISION_SCRIPT.read_text()
+
+    def seeded_by_provisioning(role: str, subject: str) -> bool:
+        """A `repository/<path>` subject, on a cluster role or a project-scoped
+        one: a file in the pool project's GitOps repository, planted by
+        scripts/provision_ci_pool_project.sh, not by the Terraform, as one
+        of its `readonly GITOPS_*_PATH` variables."""
+        if not subject.startswith("repository/"):
+            return False
+        assert re.search(rf'^readonly GITOPS_\w+_PATH="{re.escape(subject[len("repository/"):])}"$', provisioning, re.M), (
+            f"role {role!r} asserts on {subject!r}, but scripts/provision_ci_pool_project.sh seeds no such path"
+        )
+        return True
+
     for role, entry in _catalog()["roles"].items():
         if entry["cluster_slot"] is None:
             # `<kind>/<name-prefix>*`: every subject must be one of the role's
             # probes, which the probe test above ties to the Terraform.
             for assertion in entry["state"]:
                 seen += 1
+                if seeded_by_provisioning(role, assertion["subject"]):
+                    continue
                 assert assertion["subject"] in entry["probes"], (role, assertion["subject"])
             continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
@@ -2595,6 +2648,9 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
             if subject == "cluster":
                 # The GKE cluster itself, which main.tf declares for every slot
                 # (test_the_catalog_agrees_with_the_terraform_it_sits_beside).
+                continue
+            if seeded_by_provisioning(role, subject):
+                seen += 1
                 continue
             if "?" in subject:
                 selector = subject.split("?", 1)[1]

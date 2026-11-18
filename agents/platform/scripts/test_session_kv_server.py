@@ -1243,7 +1243,7 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
 
     def test_under_next_a_google_chat_thread_gets_the_title(self):
         # The title heads the plan the cards draw, which the gateway lays out on
-        # Google Chat under next.
+        # Google Chat, which the gateway holds.
         with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}):
             self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         session_kv_server._record_alert_title.assert_called_once()
@@ -2181,9 +2181,9 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
     def test_a_mounted_projection_outranks_the_config_files(self):
-        # Under `next` the operator projects the home channel into a file the
-        # kubelet refreshes in place, and the gateway posts into that value. A
-        # `/sethome` channel left in the data volume by today mode must not
+        # The operator projects the home channel into a file the kubelet
+        # refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel an earlier release's Hermes Slack platform left in the data volume must not
         # make the agent name a different channel than the gateway, so a
         # mounted file decides, empty or not; the config files count only
         # where no file is mounted.
@@ -4272,7 +4272,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
 
     def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
-        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # A /sethome on an earlier release's Hermes Slack platform left SLACK_HOME_CHANNEL in the PVC .env. With
         # the operator's projection mounted the file is the home channel the
         # gateway posts into, so the mirror is skipped; without it, it loads.
         with tempfile.TemporaryDirectory() as directory:
@@ -6447,7 +6447,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
     """The kanban-board-health job's Slack leg posts its card, with Retry and Drop on each row.
 
     Only for the report the card was said with, with KAGE_SLACK_UX on: as Block
-    Kit through the Slack relay, or under next as a chat message through the
+    Kit through the Slack relay, or as a chat message through the
     gateway. Everywhere else, and whenever the card does not post, the report
     goes out as written.
     """
@@ -6521,7 +6521,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
 
     def test_under_next_the_card_goes_to_the_gateway_on_google_chat_too(self):
-        # The gateway lays the card out on Google Chat under next; under today the
+        # The gateway lays the card out on Google Chat; without the gateway the
         # report goes as text there (test_flag_off_another_job_or_google_chat_posts_the_report).
         os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
         with patch.object(
@@ -6819,7 +6819,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(text, self.FAILED.strip())
 
     def test_under_next_a_failed_audit_whose_card_did_not_post_goes_out_whole(self):
-        # A reply cannot bring the report back under next, so the line alone would lose it.
+        # A reply cannot bring the report back through the gateway, so the line alone would lose it.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
         with patch.object(session_kv_server, "_post_audit_chat_via_gateway", return_value=None):
@@ -6927,7 +6927,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(via.call_args.args[0], "slack")
 
     def test_under_next_the_headline_card_goes_to_the_gateway_on_google_chat(self):
-        # The gateway lays the card out on Google Chat under next, as on Slack, and
+        # The gateway lays the card out on Google Chat, as on Slack, and
         # posts into its home space itself, so no home channel env is needed here.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
@@ -9927,6 +9927,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "cat /proc/self/environ",
             'echo "$(env)"',
             "sh -c env arg0",
+            # another tool's token printer, and another language's print of its environment (#5803)
+            "gh auth token",
+            "kubectl create token builder",
+            "python3 -c 'import os; print(os.environ)'",
         ]
         served = [
             "kubectl get secrets -n kube-system",
@@ -9949,6 +9953,8 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "env FOO=1 python3 x.py",
             "printenv HOME",
             "kubectl get pods -n env",
+            "gh auth status",
+            "python3 -c 'import os; print(os.environ[\"HOME\"])'",
         ]
         for cmd in withheld:
             with self.subTest(cmd=cmd):

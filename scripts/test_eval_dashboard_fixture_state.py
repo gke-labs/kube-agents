@@ -54,6 +54,20 @@ NOW = datetime(2026, 9, 14, 20, 0, tzinfo=UTC)
 PROJECT = "kube-agents-evals-2"
 OTHER = "kube-agents-evals-3"
 
+# The declared-intent note the declared-* roles assert on through the pool
+# verifier (#5827): its path, and the blob sha of the content provisioning
+# seeds, read from the verifier so a content change moves the fake fleet too.
+_verifier_spec = importlib.util.spec_from_file_location("verify_ci_pool_project", REPO / "scripts" / "verify_ci_pool_project.py")
+_verifier = importlib.util.module_from_spec(_verifier_spec)
+_verifier_spec.loader.exec_module(_verifier)
+NOTE_PATH = _verifier.GITOPS_INTENT_NOTE_PATH
+SEEDED_NOTE_SHA = _verifier.gitops_seeded_blob_sha(NOTE_PATH)
+NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+
+
+def pool_repo(project: str) -> str:
+    return f"gke-agentic/{project}-infra"
+
 # The gcloud stub: the calls hack/fleet-kubeconfigs.sh and
 # hack/fleet-fixture-state.py make, answered from the world. A cluster's
 # kubeconfig names its project in the server URL so the kubectl stub can
@@ -289,8 +303,44 @@ def _cluster_b():
     }
 
 
+# The gh stub: `gh api repos/<org>/<repo>[/contents/<path>]`, answered from
+# world["github"] = {"<org>/<repo>": {"<path>": "<blob sha>"}}, the read the
+# state script makes for a `repository/<path>` subject. No "github" key is
+# the hourly job's own situation, a gh with no credential at all (exit 4, as
+# gh prints it); an empty map is a credential the repositories are not
+# visible to (gh answers 404 for a private repository it cannot see, the
+# same as for a missing file).
+_STUB_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as fh:
+    fh.write("gh " + " ".join(args) + "\n")
+world = json.load(open(os.environ["STUB_WORLD"]))
+github = world.get("github")
+if github is None:
+    print("To get started with GitHub CLI, please run:  gh auth login", file=sys.stderr)
+    sys.exit(4)
+target = next(a for a in args[args.index("api") + 1:] if not a.startswith("-") and not a.startswith("Accept:"))
+parts = target.split("/", 3)
+repo = github.get(f"{parts[1]}/{parts[2]}")
+if repo is None:
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    sys.exit(1)
+if len(parts) == 3:
+    print(json.dumps({"full_name": f"{parts[1]}/{parts[2]}", "default_branch": "main"}))
+    sys.exit(0)
+path = parts[3][len("contents/"):]
+if repo.get(path) is None:
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({"sha": repo[path], "path": path, "type": "file", "encoding": "none", "content": ""}))
+'''
+
+
 def healthy_world(*projects):
-    """Every role planted and in its designed state on each project."""
+    """Every role planted and in its designed state on each project, the pool
+    repository's declared-intent note included, as a scan holding a
+    credential for the repository would read it."""
     fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
     compute = {
         "instances": [
@@ -311,6 +361,7 @@ def healthy_world(*projects):
     return {
         "clusters": {project: fleet for project in projects},
         "compute": {project: compute for project in projects},
+        "github": {pool_repo(project): {NOTE_PATH: SEEDED_NOTE_SHA} for project in projects},
         # The startup-fail VM's console still holds the boot that ran its script.
         "serial": {project: {"startup-fail-seeded": 'Script "startup-script" failed with error: exit status 1\n'} for project in projects},
         "kubectl": {
@@ -473,7 +524,7 @@ class ScanHarness(unittest.TestCase):
         self.tmp = pathlib.Path(self._tmp.name)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        for name, body in (("gcloud", _STUB_GCLOUD), ("kubectl", _STUB_KUBECTL)):
+        for name, body in (("gcloud", _STUB_GCLOUD), ("kubectl", _STUB_KUBECTL), ("gh", _STUB_GH)):
             stub = self.bin / name
             stub.write_text(body)
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
@@ -797,6 +848,47 @@ class NotChecked(ScanHarness):
         refused = ["instance/startup-fail-* could not be read from project p (403), so fixture role 'startup-fail-vm' could not be checked."]
         self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", refused), ("not_checked", refused[0]))
         self.assertEqual(fixture_state.catalog_roles(fixture_state.FLEET_CATALOG)["startup-fail-vm"], "")
+
+    def test_without_a_credential_for_the_pool_repository_the_note_is_not_asserted_never_drifted(self):
+        # The hourly job's own situation (#5827): it holds no credential for
+        # the pool repositories, by design, so the declared-* roles' note
+        # assertion is not asserted there. The roles rest on their other
+        # assertions and stay healthy (so a fixture_drift incident on one of
+        # them can still exit, and the digest's clean line is still
+        # reachable); the state script's report names what it did not
+        # assert. The lease-time scan, which holds the grading token, is
+        # where the note is judged.
+        world = healthy_world(PROJECT)
+        del world["github"]
+        doc, err = self.scan(world)
+        self.assertEqual(set(self.states(doc).values()), {"healthy"})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": len(self.roles), "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(fixture_state.read_map(doc), {PROJECT: sorted(self.roles)})
+        self.assertEqual(err, "")
+        report = json.loads((self.workdir / PROJECT / fixture_state.REPORT_FILE).read_text())
+        self.assertEqual([u["subject"] for u in report["unasserted"]], [f"repository/{NOTE_PATH}"])
+        self.assertEqual(set(report["unasserted"][0]["roles"]), NOTE_ROLES)
+        self.assertIn("gh auth login", report["unasserted"][0]["reason"])
+        # A credential the repository is not visible to is a failed read, not
+        # a missing credential: the roles are not checked, with the reason.
+        world["github"] = {}
+        doc, _ = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual({role for role, state in states.items() if state == "not_checked"}, NOTE_ROLES)
+        self.assertEqual({state for role, state in states.items() if role not in NOTE_ROLES}, {"healthy"})
+        self.assertIn("not visible to this credential", doc["projects"][PROJECT]["roles"]["declared-single-zone-pool"]["detail"][0])
+        # A stale note read with a credential IS drift, so the lease-time
+        # scan can excuse the cases on it; the hourly scan never says so.
+        world = healthy_world(PROJECT)
+        world["github"][pool_repo(PROJECT)][NOTE_PATH] = "3c5790d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        doc, _ = self.scan(world)
+        self.assertEqual({role for role, state in self.states(doc).items() if state == "drifted"}, NOTE_ROLES)
+        line = fixture_state.drift_detail(doc, PROJECT, "declared-no-pdb-workload")[0]
+        self.assertTrue(line.startswith(f"repository/{NOTE_PATH} as_seeded: observed blob 3c5790d5"), line)
+        # No re-apply of the fleet stack clears it: the reconciler and the
+        # health bot's advice read the op off the line.
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AS_SEEDED)
+        self.assertTrue(fixture_state.reapply_clears_nothing([line]))
 
     def test_a_read_that_fails_is_not_checked_not_drift(self):
         world = healthy_world(PROJECT)

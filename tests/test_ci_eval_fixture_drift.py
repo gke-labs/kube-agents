@@ -36,7 +36,8 @@ def _lift(pattern, what, flags=re.MULTILINE):
 
 
 # A stand-in for hack/fleet-fixture-state.py under SCRIPT_DIR: it writes the
-# report its --report names, records its arguments, then exits with SCAN_RC.
+# report its --report names, records its arguments and whether a GitHub
+# token reached its environment (never the token), then exits with SCAN_RC.
 _SCAN_STUB = """\
 import json, os, sys
 args = sys.argv[1:]
@@ -44,9 +45,12 @@ report = args[args.index("--report") + 1]
 with open(report, "w") as fh:
     json.dump({"schema_version": 1, "project": "p", "roles": {}, "summary": {}}, fh)
 with open(os.environ["SCAN_ARGS"], "w") as fh:
-    fh.write(" ".join(args))
+    fh.write(" ".join(args) + " token=" + ("set" if os.environ.get("GH_TOKEN") else "unset"))
 sys.exit(int(os.environ.get("SCAN_RC", "0")))
 """
+# The note read's token: the grading token the preflight minted, in the
+# calling shell's BENCH_GITHUB_TOKEN by the time the scan runs.
+_NOTE_TOKEN = "ghs_grading_read"
 
 
 class ScanLeaseFixturesTest(unittest.TestCase):
@@ -68,7 +72,7 @@ class ScanLeaseFixturesTest(unittest.TestCase):
         # The scan asks kube_agents_bench whether a drift is sustained.
         (self.tmp / "bench").symlink_to(_CI_EVAL_PR.parents[1] / "bench", target_is_directory=True)
 
-    def _scan(self, rc="0", fleet_dir="set", stale=False, gcloud_ok=True, published_doc="published-doc"):
+    def _scan(self, rc="0", fleet_dir="set", stale=False, gcloud_ok=True, published_doc="published-doc", token=_NOTE_TOKEN, key_file="/etc/ledger-app-key/key.pem", forge_kind="github"):
         if stale:
             self.report.write_text('{"stale": true}')
         script = "\n".join(
@@ -79,6 +83,7 @@ class ScanLeaseFixturesTest(unittest.TestCase):
                 f"gcloud() {{ {'printf %s ' + shlex.quote(published_doc) if gcloud_ok else 'return 1'}; }}",
                 _lift(r"^scan_lease_fixtures\(\) \{.*?^\}", "scan_lease_fixtures", re.DOTALL | re.MULTILINE),
                 'scan_lease_fixtures "${REPORT}" "${PUBLISHED}"',
+                'if [ -n "${GH_TOKEN:-}" ]; then echo "gh-token-after=set"; else echo "gh-token-after=unset"; fi',
                 'echo "survived"',
             ]
         )
@@ -91,6 +96,9 @@ class ScanLeaseFixturesTest(unittest.TestCase):
                 "SCAN_ARGS": str(self.args),
                 "SCAN_RC": rc,
                 "BENCH_FLEET_KUBECONFIG_DIR": str(self.tmp / "fleet") if fleet_dir == "set" else "",
+                "BENCH_GITHUB_TOKEN": token,
+                "EVAL_LEDGER_APP_KEY_FILE": key_file,
+                "EVAL_FORGE_KIND": forge_kind,
             }
         )
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, check=False)
@@ -143,6 +151,32 @@ class ScanLeaseFixturesTest(unittest.TestCase):
         self.assertFalse(self.report.exists(), "a report from an earlier run must not be read as this lease's")
         self.assertFalse(self.args.exists(), "the scan did not run")
         self.assertIn("every case is graded as usual", proc.stderr)
+
+    # --- The declared-intent note's read (#5827) ---------------------------
+
+    def test_the_scan_reads_the_note_with_the_grading_token_in_its_own_environment(self):
+        # The presubmit and the nightly run this: the grading token the
+        # preflight minted (contents: read among its reads) reaches the scan
+        # as GH_TOKEN, the name its reader takes it by, inside the subshell
+        # alone; the calling shell's GH_TOKEN stays as it was.
+        proc = self._scan()
+        args = self.args.read_text()
+        self.assertIn("token=set", args)
+        self.assertNotIn(_NOTE_TOKEN, args, "the token never reaches argv")
+        self.assertNotIn(_NOTE_TOKEN, proc.stdout + proc.stderr, "the token is never printed")
+        self.assertIn("gh-token-after=unset", proc.stdout, "the export stays in the subshell")
+
+    def test_without_a_grading_token_the_scan_runs_without_one_and_says_so(self):
+        # No App key (the mounted PAT stands for grading, with a reach the
+        # scan does not assume), the gitlab kind, or a preflight that left
+        # none: the cluster fixtures are still scanned, the note is not.
+        for kwargs in ({"key_file": ""}, {"forge_kind": "gitlab"}, {"token": ""}):
+            with self.subTest(**kwargs):
+                self.args.unlink(missing_ok=True)
+                proc = self._scan(**kwargs)
+                self.assertIn("token=unset", self.args.read_text())
+                self.assertIn("declared-intent note is not asserted this lease", proc.stderr)
+                self.assertEqual(1, json.loads(self.report.read_text())["schema_version"])
 
 
 class MatchStepTest(unittest.TestCase):
@@ -243,6 +277,14 @@ class OrderTest(unittest.TestCase):
         self.assertLess(scan, state)
         self.assertLess(state, mapping)
         self.assertLess(mapping, fan_out)
+
+    def test_the_scan_runs_once_the_preflight_has_minted_the_grading_token(self):
+        # The note read uses the grading token the preflight mints, far below
+        # the fleet kubeconfigs, so the scan's call site sits after that mint.
+        text = _text()
+        scan = text.index('scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}"')
+        self.assertLess(text.index('mint_ledger_token "preflight"'), scan)
+        self.assertIn('"contents":"read"', _lift(r"^LEDGER_GRADING_MINT_BODY=.*$", "LEDGER_GRADING_MINT_BODY"), "the note read rides on the grading token's contents: read")
 
     def test_the_verifiers_wait_is_still_where_the_scan_reads_it(self):
         verifier = _CI_EVAL_PR.parents[1] / "scripts" / "verify_ci_pool_project.py"

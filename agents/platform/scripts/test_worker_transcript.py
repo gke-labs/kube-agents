@@ -1882,6 +1882,86 @@ class TestSecretReadDetector(unittest.TestCase):
         "cat /proc/thread-self/e*",
         "cat /proc/*/e*",
         "cat /proc/$PID/e*",
+        # another tool's token printer (#5803), behind the tool's own flags and behind a wrapper
+        "gh auth token",
+        "gh auth token --hostname github.com",
+        "az account get-access-token --resource https://management.azure.com",
+        "az --subscription s account get-access-token",
+        "aws sts get-session-token",
+        "aws --profile p sts get-session-token --duration-seconds 900",
+        "kubectl create token builder",
+        "kubectl -n ci create token builder --duration 10m",
+        "oc create token builder",
+        "sudo gh auth token",
+        "T=$(gh auth token)",
+        "kubectl exec p -- gh auth token",
+        'curl -H "Authorization: Bearer $(gh auth token)" https://api.github.com/user',
+        # another language's print of its whole environment, as inline code
+        "python3 -c 'import os; print(os.environ)'",
+        "python3 -c 'import os, json; print(json.dumps(dict(os.environ)))'",
+        'python -c "import os\nfor k, v in os.environ.items(): print(k, v)"',
+        "python3.12 -Ic 'import os; print(sorted(os.environ.items()))'",
+        "pypy3 -c 'import os; print(os.environ.copy())'",
+        "python3 -c 'import os\nfor k in os.environ: print(k, os.environ[k])'",
+        "python3 -c 'import os; print(os.environb)'",
+        "kubectl exec p -- python3 -c 'import os; print(os.environ)'",
+        "sh -c \"python3 -c 'import os; print(os.environ)'\"",
+        "node -e 'console.log(process.env)'",
+        "node -p process.env",
+        "node --eval 'console.log(JSON.stringify(process.env))'",
+        "node --print process.env",
+        "node --eval='console.log(process.env)'",
+        "nodejs -pe 'Object.entries(process.env)'",
+        "node -e 'console.log({...process.env})'",
+        "python3 -c 'print(__import__(\"os\").environ)'",
+        "python3 -c 'import os; print(sorted(os.environ))'",
+        # a subscript by a variable, in a loop over the names
+        "python3 -c 'import os\nfor k in sorted(os.environ.keys()): print(k, os.environ[k])'",
+        "node -e 'Object.keys(process.env).forEach(k => console.log(k, process.env[k]))'",
+        # the new commands behind a word that runs a command elsewhere, and behind a tool that runs the interpreter
+        "docker exec app gh auth token",
+        "docker run --rm ghcr.io/cli/cli gh auth token",
+        "ssh host az account get-access-token",
+        "ssh host aws sts get-session-token",
+        "docker exec app oc create token builder",
+        "docker exec app python3 -c 'import os; print(os.environ)'",
+        "ssh host node -e 'console.log(process.env)'",
+        "docker exec app nodejs -p process.env",
+        "uv run python -c 'import os; print(os.environ)'",
+        "poetry run python -c 'import os; print(os.environ)'",
+        "pipenv run python -c 'import os; print(os.environ)'",
+        "npx node -e 'console.log(process.env)'",
+        "uv run env",
+        # a key that only starts with a literal, and a `.get(` by a variable
+        "python3 -c 'import os; print([os.environ[\"\" + k] for k in os.environ.keys()])'",
+        "node -e 'Object.keys(process.env).forEach(k => console.log(process.env[\"\" + k]))'",
+        "python3 -c 'import os\nfor k in sorted(os.environ.keys()): print(k, os.environ.get(k))'",
+        "python3 -c 'import os; print([os.environ.get(\"\" + k) for k in os.environ.keys()])'",
+        "python3 -c 'import os; print([os.environ.pop(\"\" + k) for k in list(os.environ)])'",
+        # the name imported from `os`
+        "python3 -c 'from os import environ; print(environ)'",
+        "python3 -c 'from os import path, environ\nprint(dict(environ))'",
+        # the whole environment assigned to a variable: the rule cannot follow it to a print, so it decides
+        # closed. Known cost: the first form is honest code that prints nothing.
+        "python3 -c 'import os; env = os.environ.copy()'",
+        "python3 -c 'import os; env = os.environ; print(env)'",
+        "python3 -c 'import os; env = {**os.environ}; print(env)'",
+        "node -e 'const { ...env } = process.env; console.log(env)'",
+        "node -e 'console.log({env: process.env})'",
+        # code in one word with its flag
+        "python3 -c'import os; print(os.environ)'",
+        "python3 -Ic'import os; print(os.environ)'",
+        "node -e'console.log(process.env)'",
+        "node -pprocess.env",
+        # a line that cannot be split: another tool's name with its printer path, or an environment name
+        "echo 'unclosed; gh auth token",
+        "echo 'unclosed; az account get-access-token",
+        "echo 'unclosed; aws sts get-session-token",
+        "echo 'unclosed; oc create token builder",
+        "echo 'unclosed; python3 -c print(os.environ)",
+        "echo 'unclosed; node -p process.env",
+        "echo 'unclosed; python3 -c print(__import__(\"os\").environ)",
+        "echo 'unclosed; python3 -c from os import environ; print(environ)",
     ]
     # The same words where nothing of the environment is printed.
     NO_TOKEN_OR_ENVIRONMENT_PRINTS = [
@@ -2026,6 +2106,68 @@ class TestSecretReadDetector(unittest.TestCase):
         "runuser -u app -- ls env",
         "script -q /dev/null ls env",
         "docker-compose up -d env",
+        # another tool's words that print no token, and a printer's words as arguments
+        "gh auth status",
+        "gh auth login --with-token",
+        "gh search issues auth token",
+        "gh issue create --title 'auth token is stale'",
+        "az account show",
+        "aws sts get-caller-identity",
+        "kubectl create secret generic token --from-literal=a=b",
+        "kubectl create -f token.yaml",
+        "kubectl create namespace token",
+        "oc create -f token.yaml",
+        "echo gh auth token",
+        # another language's read of one variable, of the names, a membership test, the environment handed on
+        "python3 -c 'import os; print(os.environ[\"HOME\"])'",
+        "python3 -c \"import os; print(os.environ.get('PATH'))\"",
+        "python3 -c 'import os; print(\"KUBECONFIG\" in os.environ)'",
+        "python3 -c 'import os; print(\"A\" not in os.environ)'",
+        "python3 -c 'import os, subprocess; subprocess.run([\"ls\"], env=os.environ)'",
+        "python3 -c 'import os; print(sorted(os.environ.keys()))'",
+        "python3 -c 'import os; os.environ.setdefault(\"A\", \"b\")'",
+        "python3 -c 'import os; os.environ.pop(\"A\", None)'",
+        "python3 -c 'import os; os.environ.update(A=\"b\")'",
+        "python3 script.py os.environ",
+        "node -e 'console.log(process.env.HOME)'",
+        "node -e 'console.log(process.env[\"HOME\"])'",
+        "node -e 'console.log(Object.keys(process.env))'",
+        "node -e \"console.log('PATH' in process.env)\"",
+        "node script.js process.env",
+        # another name that ends in the environment's name
+        "python3 -c 'print(myos.environ)'",
+        "node -e 'console.log(subprocess.env)'",
+        # the environment handed on or taken apart
+        "python3 -c 'import os, subprocess; subprocess.run([\"ls\"], env={**os.environ, \"A\": \"b\"})'",
+        "python3 -c 'import os, subprocess; subprocess.run([\"ls\"], env=dict(os.environ, LC_ALL=\"C\"))'",
+        "node -e 'const { NODE_ENV } = process.env; console.log(NODE_ENV)'",
+        # a path word behind a flag is the flag's value
+        "kubectl create -f token",
+        "kubectl create -n token deployment web --image=nginx",
+        # the tools that run an interpreter, with other commands
+        "uv run pytest -q",
+        "uv run python -c 'print(1)'",
+        "npx prettier --check .",
+        "docker run --rm img gh auth status",
+        "ssh host aws s3 ls",
+        "uv venv env",
+        "poetry env --help",
+        "uv pip uninstall set",
+        "pipenv install env",
+        # a whole literal key, a `.get(` by a literal, and the import alone
+        "python3 -c 'import os; print(os.environ.get(\"A\", \"b\"))'",
+        "python3 -c 'from os import environ; print(environ[\"HOME\"])'",
+        "python3 -c 'from os import environ; print(environ.get(\"HOME\"))'",
+        "python3 -c 'from os import path; print(path.exists(\"environ\"))'",
+        "python3 -c 'import subprocess, os; subprocess.Popen(env=os.environ, args=[\"ls\"])'",
+        # a line that cannot be split, with another tool's name and no printer path
+        "echo 'unclosed; gh auth status",
+        "echo 'unclosed; aws s3 ls",
+        # ... and with a printer path's words and no tool's name
+        "echo 'unclosed; the auth token is stale",
+        # ... and with a read of one variable, which the walk's patterns serve
+        "echo 'unclosed; python3 -c print(os.environ[\"HOME\"])",
+        "echo 'unclosed; node -p process.env.HOME",
     ]
 
     def test_a_token_print_or_an_environment_dump_is_withheld(self):
@@ -2066,6 +2208,18 @@ class TestSecretReadDetector(unittest.TestCase):
         for _ in range(worker_transcript.MAX_NESTED_COMMAND_DEPTH):
             nested_reads = "echo " + "$(" * worker_transcript.MAX_READ_SUBSTITUTIONS + shlex.quote(nested_reads)
         self.assertTrue(worker_transcript.command_reads_a_secret(nested_reads))
+        # Past the step limit another tool's name or an interpreter's name withholds too; past the substitution
+        # limit another tool's printer path does.
+        # (Each line holds the word `token`, so that it passes the fragment gate and reaches the walk.)
+        self.assertFalse(worker_transcript.command_reads_a_secret("sudo gh api user --jq .token"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "gh api user --jq .token"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "python3 x.py --token-file f"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "node x.js --token-file f"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("sudo " * worker_transcript.MAX_READ_STEPS + "git config token"))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_substitutions + '"$(gh auth token)"'))
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_substitutions + '"$(gh auth status)"'))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_substitutions + "\"$(python3 -c 'from os import environ; print(environ)')\""))
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_substitutions + '"$(node -p process.env.HOME)"'))
         # A script word nested past the depth limit is not read, and withholds.
         nested = "sh<<<x"
         self.assertFalse(worker_transcript.command_reads_a_secret("env=1 " + nested))
