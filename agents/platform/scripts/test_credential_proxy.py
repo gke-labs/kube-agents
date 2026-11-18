@@ -10247,7 +10247,9 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
-                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining"},
+                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
+                     # Refused before the route ran anything (#6247).
+                     credential_proxy.BUSY_BEFORE_ADMISSION_KEY: True},
                     captured["payload"],
                 )
                 handler.metrics.record_refusal.assert_called_once_with(
