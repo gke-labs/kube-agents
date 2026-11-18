@@ -7979,12 +7979,11 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
         shape = _serviceentry_shape(spec)
         for host in {str(h).strip().lower() for h in spec.get("hosts") or [] if str(h).strip()}:
             declarer = by_host.setdefault(host, {}).setdefault(
-                namespace, {"public": False, "names": set(), "entries": [], "shapes": set()}
+                namespace, {"public": False, "names": set(), "items": []}
             )
             declarer["public"] = declarer["public"] or public
             declarer["names"] |= names
-            declarer["entries"].append(f"{namespace}/{name}")
-            declarer["shapes"].add(shape)
+            declarer["items"].append((f"{namespace}/{name}", public, names, shape))
 
     hits = []
     for host, declarers in by_host.items():
@@ -8008,8 +8007,18 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
         if not colliding:
             continue
         involved = sorted(colliding)
-        entries = sorted(e for ns in involved for e in declarers[ns]["entries"])
-        shapes = {s for ns in involved for s in declarers[ns]["shapes"]}
+        # Only the entries a colliding viewer can see: a namespace's other
+        # entry for the host, exported to `.` or to no affected namespace, is
+        # not part of the collision and must not name it or move its severity.
+        viewers = set(affected)
+        seen = [
+            (ref, shape)
+            for ns in involved
+            for ref, entry_public, entry_names, shape in declarers[ns]["items"]
+            if entry_public or entry_names & viewers
+        ]
+        entries = sorted(ref for ref, _ in seen)
+        shapes = {shape for _, shape in seen}
         where = (
             "every namespace that declares none of them"
             if len(public) >= SERVICEENTRY_COLLISION_MINIMUM
@@ -8017,9 +8026,7 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
         )
         if len(shapes) > 1:
             severity = SERVICEENTRY_SEVERITY_CONFLICTING
-            described = [
-                f"{ns}: {_serviceentry_shape_text(s)}" for ns in involved for s in sorted(declarers[ns]["shapes"])
-            ]
+            described = sorted({f"{ref.split('/', 1)[0]}: {_serviceentry_shape_text(shape)}" for ref, shape in seen})
             shown = described[:MAX_SERVICEENTRY_NAMED]
             more = len(described) - len(shown)
             detail = "and they disagree: " + " | ".join(shown) + (f" | and {more} more" if more > 0 else "")

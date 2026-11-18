@@ -13793,8 +13793,8 @@ class TestServiceEntryHostCollision(unittest.TestCase):
     def test_a_declaring_namespace_that_sees_the_other_entry_keeps_its_own(self):
         self.assertEqual(
             self.hits(
-                service_entry("a", "team-a", [self.HOST], export_to=["team-b"]),
-                service_entry("b", "team-b", [self.HOST], export_to=["team-a"]),
+                service_entry("a", "team-a", [self.HOST], export_to=[".", "team-b"]),
+                service_entry("b", "team-b", [self.HOST], export_to=[".", "team-a"]),
             ),
             [],
         )
@@ -13832,6 +13832,19 @@ class TestServiceEntryHostCollision(unittest.TestCase):
         )
         self.assertEqual(len(hits), 1)
         self.assertIn("namespace team-n sees", hits[0]["excerpt"])
+
+    def test_an_entry_no_colliding_viewer_sees_is_not_named_and_does_not_set_severity(self):
+        """team-a's local-only entry is exported to team-a alone, so no namespace
+        that sees two copies sees it: the copies it sees are identical."""
+        hits = self.hits(
+            service_entry("local-only", "team-a", [self.HOST], export_to=["."], addresses=["10.0.0.99"]),
+            service_entry("exported", "team-a", [self.HOST], export_to=["*"], addresses=["10.0.0.1"]),
+            service_entry("exported", "team-b", [self.HOST], export_to=["*"], addresses=["10.0.0.1"]),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
+        self.assertNotIn("local-only", hits[0]["excerpt"])
+        self.assertIn("team-a/exported", hits[0]["excerpt"])
 
     def test_two_entries_in_one_namespace_are_one_declarer(self):
         self.assertEqual(
