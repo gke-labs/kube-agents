@@ -177,8 +177,8 @@ func TestTheIdentityMapAtFleetScaleWithBucketedGrants(t *testing.T) {
 	// The entry itself: renderA2AAuthMap also applies #5394's ceiling, and
 	// at this N the dispatch config, not the entry, is past its budget
 	// (#5479), so the map would carry no dispatcher entry to compare.
-	a, _ := json.Marshal(dispatcherMapEntry(agent, profiles[:1], nil))
-	b, _ := json.Marshal(dispatcherMapEntry(agent, profiles, nil))
+	a, _ := json.Marshal(dispatcherMapEntry(agent, profiles[:1], nil, nil))
+	b, _ := json.Marshal(dispatcherMapEntry(agent, profiles, nil, nil))
 	if len(a) != len(b) {
 		t.Fatalf("the dispatcher's entry is %d bytes at 1 profile and %d at %d; with bucketed grants it must not grow", len(a), len(b), fleetScaleProfiles)
 	}

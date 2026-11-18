@@ -3,7 +3,7 @@
 id: workload-missing-memory-limits-oom-baseline
 name: "Containers Missing Memory Limits (no-memory-limit)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 audit_streams:
   - obtainability-audit
 fixtures: []

@@ -52,6 +52,10 @@ spec:
   parameters: # optional; the task parameters the persona declares
     - name: cluster
       required: true
+  scripts: # optional; helper scripts a built-in schedule may run with no model
+    - name: stall-watch
+      path: /opt/kube-agents/scripts/stall_watch.py
+      timeoutSeconds: 300
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
@@ -118,6 +122,10 @@ Before `yieldToPinned`, every profile that takes a target handed off to a pinned
 
 `parameters` lists the task parameters the profile's persona declares, at most 16, each a lower-case identifier the worker exports as `PROFILE_TASK_<NAME>`. The gateway and the dispatcher read it here because neither can read the persona image: the gateway sends cluster work to a profile that declares `project`, `location` and `cluster`, and the dispatcher refuses a submission missing a `required` one. The list must match the persona's, and a worker refuses to run a task when they differ.
 
+`scripts` lists the helper scripts the profile may run as a script-run task: a built-in schedule's run that execs one of them with no model turn. There are at most 16, each with a unique `name` that is a DNS-1123 label. Each `path` lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the worker image. Its segments start with a letter, digit or underscore and hold only those, dots and hyphens, so a path has no `..`, no empty segment and no shell metacharacter.
+
+`timeoutSeconds` may not exceed `lifecycle.activeDeadlineSeconds`, and the operator lowers it to the install's task-deadline cap when that is lower. The dispatcher refuses a task naming a script the list doesn't hold, as `script-not-allowed`. The path comes from this list, never from the task.
+
 Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates (and a kustomize `make deploy` creates). The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
 
 Deleting the PlatformAgent removes its quota from that namespace. If the delete is refused, the operator retries for two minutes and then lets the PlatformAgent go, leaving the quota and a `ProfileQuotaLeft` Warning event that names it. A later PlatformAgent in the same namespace removes the leftover quota when it renders its own (a `ProfileQuotaAdopted` event); one of the same name takes it over as its own. The NetworkPolicy stays until the chart's uninstall deletes the namespace, since removing it first would leave the namespace admitted to the bus without its own policy.
@@ -128,7 +136,9 @@ The profile's ServiceAccounts live there too. While the namespace is missing, or
 
 The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the only component that publishes directly to a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. An install runs it by default; the chart's `operator.profileDispatcher.enabled: false` switches it off.
 
-Binding or removing a profile, or one finishing its drain, changes the bus's config, whether or not the dispatcher runs. The bus reloads it in place, without a restart, usually within a minute. Session pods' bus connections drop and reconnect at the reload, within a second, and their tasks carry on. If the reload can't be confirmed within three minutes, the operator restarts the bus pod instead and records a `BusConfigReloadFailed` Warning on the PlatformAgent. Two profile changes that reach the pod in one kubelet write can't be told apart in place, so they also end in that restart, recorded as a Normal `BusConfigReloadFolded` Event. A session task running at that moment fails, as on any bus restart.
+Binding or removing a profile, or one finishing its drain, changes the bus's config, whether or not the dispatcher runs. Every bus server reloads it in place, on one server or three, without a restart or a roll, usually within a minute. The operator confirms the reload on each server separately. Session pods' bus connections drop and reconnect at the reload, within a second, and their tasks carry on.
+
+If a server's reload can't be confirmed within three minutes, the operator restarts that server's pod, one server at a time and only while the others are Ready, and records a `BusConfigReloadFailed` Warning on the PlatformAgent. Two profile changes that reach a pod in one kubelet write can't be told apart in place, so they also end in that restart, recorded as a Normal `BusConfigReloadFolded` Event. A session task running on a restarted server at that moment fails, as on any bus restart. A newly bound profile stays held (`BusConfigPending`) until every server is confirmed on the new config, including while a server restarts or can't be read.
 
 The dispatcher has a ceiling, set by whichever of two limits comes first. Its bus identity names every profile's durable and has to fit in one shard of the callout's identity map, which comes to about 650 profiles at two tiers. Its config holds an entry per profile and has to fit in one ConfigMap. Under Job mode, each profile that allows `unattended` keeps its Job template in its own `DispatchJobTemplate`, and the config carries only a reference. So the identity limit usually comes first, though profiles that declare many parameters can fill the config sooner.
 

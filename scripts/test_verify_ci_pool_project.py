@@ -573,6 +573,18 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertIn('. "${SCRIPT_DIR}/installer/min_versions.sh"', script)
         self.assertIn('version_lt "${GCLOUD_VERSION}" "${MIN_GCLOUD_VERSION}"', script)
 
+    def test_the_installer_reads_a_disabled_api_refusal_with_the_verifiers_grammar(self):
+        # Two readers of one gcloud message: the verifier's Gemini-key check and
+        # the tfvars generator's cluster probe (installer_common.sh) both take
+        # the project a SERVICE_DISABLED refusal names and compare it with the
+        # target. A gcloud rewording fixed in one and not the other would let
+        # the two disagree about the same project, so the extraction pattern is
+        # pinned equal here.
+        common = (pathlib.Path(__file__).resolve().parents[1] / "scripts" / "installer" / "installer_common.sh").read_text()
+        match = re.search(r'^readonly GKE_API_DISABLED_PROJECT_PATTERN="(.*)"$', common, re.MULTILINE)
+        self.assertIsNotNone(match, "installer_common.sh declares GKE_API_DISABLED_PROJECT_PATTERN")
+        self.assertEqual(match.group(1), checker.GEMINI_KEY_DISABLED_IN.pattern)
+
     def test_missing_seeded_cluster_fails(self):
         clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\t{checker.HOST_OTEL_SCOPE}\nseeded-a\tENCRYPTED\t\nseeded-b\tENCRYPTED\t"
         with mock.patch.object(checker, "run_cmd") as run:
@@ -688,12 +700,12 @@ class SeededFleetFixturesTest(unittest.TestCase):
     def _roles(self) -> int:
         return len(json.loads(checker._FLEET_CATALOG.read_text(encoding="utf-8"))["roles"])
 
-    def _state(self, converged: int, drifted: int = 0, unchecked: int = 0) -> str:
+    def _state(self, converged: int, drifted: int = 0, unchecked: int = 0, not_ready: int = 0) -> str:
         """The line hack/fleet-fixture-state.py prints; the third call when the
         presence pass published at least one role (#1544)."""
         return (
             f"Seeded-fleet fixture state: {converged} role(s) in their designed state, "
-            f"{drifted} drifted, {unchecked} not checked (project kube-agents-evals-5)"
+            f"{drifted} drifted, {unchecked} not checked, {not_ready} not yet ready (project kube-agents-evals-5)"
         )
 
     def test_every_role_written_passes(self):
@@ -971,7 +983,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         start = text.index("SUMMARY_FORMAT = (")
         end = text.index("\n)", start)
         literal = ast.literal_eval("(" + text[start + len("SUMMARY_FORMAT = ("):end] + ")")
-        rendered = literal.format(converged=7, drifted=0, unchecked=0, project="p")
+        rendered = literal.format(converged=7, drifted=0, unchecked=0, not_ready=2, project="p")
         match = checker._FLEET_STATE_SUMMARY.search(rendered)
         self.assertIsNotNone(match, rendered)
         # And the warning the pass branch carries as advice, read the same way.
@@ -980,6 +992,23 @@ class SeededFleetFixturesTest(unittest.TestCase):
         warning = ast.literal_eval("(" + text[start + len("UNASSERTED_WARNING = ("):end] + ")")
         self.assertIn(checker.FLEET_STATE_UNASSERTED_MARK, warning.format(subject="s", project="p", reason="r", roles="a, b"))
         self.assertEqual("7", match.group("converged"))
+        self.assertEqual("2", match.group("not_ready"))
+
+    def test_a_role_that_is_not_yet_ready_passes_and_is_named(self):
+        # The orphaned-snapshot roles report not ready, not drifted, for the 91
+        # days the compute audit ignores a snapshot: a project whose only
+        # shortfall is that clock is registrable, and the message says so.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles())),
+                (0, "", self._state(self._roles() - 2, not_ready=2)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([], result.warnings)
+        self.assertIn("2 planted and not yet ready", result.message)
+        self.assertIn(f"{self._roles() - 2} in their designed state", result.message)
 
     def test_unplanted_fixture_fails_and_names_the_role(self):
         # The clusters are up and labelled; the objects were never created.
@@ -4724,11 +4753,16 @@ FLEET_RESOURCE_ROLES = {
     # status subresources on seeded-a as the reconciler, and
     # terraform_data.config_connector's runs config_connector.py, which applies
     # seeded-a's ConfigConnector object the same way.
-    "terraform_data": {"roles/container.admin"},
+    # terraform_data.orphan_snapshots's runs orphan_snapshot.py, whose calls are
+    # `gcloud compute disks create|snapshot|delete` and `snapshots describe`:
+    # compute.storageAdmin's, the role the orphan-pd disks already need.
+    "terraform_data": {"roles/container.admin", "roles/compute.storageAdmin"},
     # Data sources: reads the plan makes before anything is created. external
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
-    # get-server-config` and `clusters describe` as the reconciler.
-    "external": {"roles/container.admin"},
+    # get-server-config` and `clusters describe` as the reconciler, and
+    # orphan_snapshot.py's probe, whose reads are `gcloud compute snapshots
+    # describe` and `disks list`: compute.storageAdmin's, held already.
+    "external": {"roles/container.admin", "roles/compute.storageAdmin"},
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
@@ -4792,11 +4826,11 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # to load no provider, and a read block whose header the scan cannot read.
     # The names tofu's loader skips are skipped here too, so a parked file
     # neither demands a role nor keeps one accounted for.
-    # seeded_b_pin.py is the program data.external runs, and gateway_status.py
-    # and config_connector.py the ones the terraform_data local-execs run, not
-    # something tofu loads; their calls are accounted for on the external and
-    # terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py"}
+    # seeded_b_pin.py is the program data.external runs, and gateway_status.py,
+    # config_connector.py and orphan_snapshot.py the ones the terraform_data
+    # local-execs run, not something tofu loads; their calls are accounted for
+    # on the external and terraform_data types above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

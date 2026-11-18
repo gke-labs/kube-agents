@@ -1000,10 +1000,14 @@ fluentBit:
 # A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and
 # A2A_NATS_EXPORTER_IMAGE, but the pins have to live somewhere the mirror can be
 # pointed at, so they live here and in images.json (the operator's compiled
-# defaults are the same pins; hack/check-image-inventory.sh holds all three in
-# step). Under global.thirdPartyImageRegistry each renders as
-# <prefix>/<trailing name>:<tag>, the digest dropped, which is the copy
-# `make mirror-images` writes.
+# defaults and templates/_helpers.tpl's kube-agents.a2aBusImageDefaults are the
+# same pins; hack/check-image-inventory.sh holds all four in step). Under
+# global.thirdPartyImageRegistry each renders as <prefix>/<trailing name>:<tag>,
+# the digest dropped, which is the copy `make mirror-images` writes. A release
+# whose values have no a2aBus key (a `helm upgrade --reuse-values` from before
+# the key) renders the four from the same pins held in templates/_helpers.tpl
+# (kube-agents.a2aBusImageDefaults), so a mirrored install upgraded that way
+# still pulls the bus from its mirror.
 a2aBus:
   images:
     nats:
@@ -1031,6 +1035,43 @@ agentSandbox:
   image:
     repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
     tag: "" # defaults to Chart.appVersion
+
+# The credential broker Deployment and the hermes-bridge sidecar the operator
+# renders beside every agent: the two images it does not take from
+# OPERATOR_IMAGE by default. It derives the broker from each agent's image, taking its
+# registry path and tag and swapping the trailing name (platform-agent to
+# credential-proxy); a digest-pinned agent image falls to the CR's
+# spec.deployment.tag, else :latest. It derives the bridge the same way only
+# when the agent image is the release platform-agent image by tag; a custom
+# repository name or a digest alone takes the bridge from the operator's
+# release set, like the other A2A images (a2a/docs/hermes-bridge.md). Both
+# keys empty, the default, renders nothing and keeps that derivation, which
+# follows a mirror and the agent's tag on its own. Set either key when the
+# derivation names an image that does not exist: an agent image at a tag the
+# two were not built for (a dev tag), a mirror or registry that holds the two
+# at a different tag than the agent image (set tag), or, for the broker alone,
+# a digest-pinned or custom-named agent image. The chart then passes
+# CREDENTIAL_PROXY_IMAGE or A2A_BRIDGE_IMAGE to the operator as
+# <repository, or ghcr.io/gke-labs/kube-agents/<name> when empty>:<tag, or
+# Chart.appVersion when empty>. Under global.imageRegistry the rendered
+# reference is <prefix>/<trailing name>:<tag>, like the other first-party
+# images, so a different repository path needs the prefix empty. The operator
+# reads the env var before anything on the CR, so the pin applies to every
+# PlatformAgent in the cluster. An `upgrade.sh --upgrade-mode=harness` or a
+# Terraform `full` upgrade moves the agent's tag but not these pins, so a
+# pinned tag is moved by hand; that run's image read-back
+# (scripts/confirm_agent_image.sh) leaves a container on a pin out of its
+# verdict. An operator.extraEnv entry with the same name
+# still wins. The broker's per-CR sizing is
+# platformAgent.deployment.credentialProxy below.
+credentialProxy:
+  image:
+    repository: ""
+    tag: ""
+hermesBridge:
+  image:
+    repository: ""
+    tag: ""
 
 platformAgent:
   enabled: true
@@ -1187,7 +1228,9 @@ platformAgent:
     # metadata server on operator-rendered workloads; set explicitly when
     # chart-rendered litellm (vertex_ai) or githubMinter run in a custom
     # universe so Helm templates render GOOGLE_CLOUD_UNIVERSE_DOMAIN and the
-    # cluster's OIDC issuer host at install time.
+    # cluster's OIDC issuer host at install time. A value under googleapis.com,
+    # such as mtls.googleapis.com, is refused: it names hosts of standard
+    # Google Cloud. Use googleapis.com or leave this empty.
     universeDomain: ""
     # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
     # own default applies — dashboardEnabled therefore lands `true` unless an
@@ -1467,6 +1510,11 @@ platformAgent:
     # opening remediation pull requests on their own; a `/remediate` on a
     # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
+    #
+    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
+    # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
+    # from; "fleet" for clusters of tens of thousands of Pods, unset for
+    # "default". Also forwarded to the shell sandbox only.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
@@ -2168,8 +2216,8 @@ profiles:
       # The GKE Support Agent's persona (agents/tse/persona), which a profile
       # worker pod mounts at /persona. The Hermes `tse` profile the gateway
       # scaffolds from `/opt/tse-template` does not use it. Under the
-      # dispatcher a tse task takes a cluster target (project, location and
-      # cluster, all required); project-wide questions wait on #5424.
+      # dispatcher a tse task takes a cluster target (project, cluster and
+      # location, all required); project-wide questions wait on #5424.
       image:
         repository: ghcr.io/gke-labs/kube-agents/persona-tse
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
@@ -2196,7 +2244,7 @@ profiles:
         cpu: "1"
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
-  # which each task names by its project, location and cluster parameters
+  # which each task names by its project, cluster and location parameters
   # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
   # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.

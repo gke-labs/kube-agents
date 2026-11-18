@@ -177,6 +177,56 @@ func TestValidateUniverseDomainMismatchAndShape(t *testing.T) {
 	}
 }
 
+func TestValidateUniverseDomainRefusesADomainUnderGoogleapis(t *testing.T) {
+	const under = "mtls.googleapis.com"
+	agent := func(location string) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Harness: &agentv1alpha1.HarnessSpec{
+					ProjectID:      "sample-project",
+					Location:       location,
+					ClusterName:    "host-cluster",
+					UniverseDomain: under,
+				},
+			},
+		}
+	}
+	detectors := map[string]func(context.Context) (string, bool){
+		"a host whose metadata server reports the commercial domain": func(context.Context) (string, bool) {
+			return agentv1alpha1.DefaultUniverseDomain, true
+		},
+		"a host with no universe route (404)": func(context.Context) (string, bool) { return "", true },
+		"a host whose metadata probe fails":   func(context.Context) (string, bool) { return "", false },
+	}
+	for name, detector := range detectors {
+		// kind has no metadata comparison, so the value must be refused before it.
+		for _, location := range []string{"us-central1", kindLocation} {
+			r := &PlatformAgentReconciler{UniverseDomainDetector: detector}
+			reason, msg, transient := r.validateUniverseDomain(context.Background(), agent(location))
+			if transient || reason != reasonUniverseDomainMismatch {
+				t.Fatalf("%s, location %q: validateUniverseDomain = (%q, transient=%v), want %q",
+					name, location, reason, transient, reasonUniverseDomainMismatch)
+			}
+			// The message names the value, the cause, and what to set.
+			for _, want := range []string{`"` + under + `" is under`, `to "` + agentv1alpha1.DefaultUniverseDomain + `"`} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("%s, location %q: message %q does not contain %q", name, location, msg, want)
+				}
+			}
+		}
+	}
+
+	// The metadata server's answer goes through the same rule.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(under))
+	}))
+	defer srv.Close()
+	if got, ok := probeUniverseDomainURL(context.Background(), srv.URL, srv.Client()); ok || got != "" {
+		t.Fatalf("probeUniverseDomainURL on %q = (%q, %v), want (\"\", false)", under, got, ok)
+	}
+}
+
 func TestCustomUniversePropagatesToManifestsAndStripsExtraEnvOverrides(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},

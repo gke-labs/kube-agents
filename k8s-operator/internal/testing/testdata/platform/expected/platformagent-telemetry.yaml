@@ -1093,6 +1093,12 @@ spec:
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
               value: . profiles/platform
+            - name: SANDBOX_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: shell
+                  divisor: "1"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -1497,6 +1503,8 @@ spec:
               value: http://platformagent-report-store.kubeagents-system.svc:8700
             - name: AUDIT_REPORT_STORE_TOKEN_FILE
               value: /var/run/secrets/kubeagents/audit-report-store/token
+            - name: CREDENTIAL_PROXY_REPORT_PROFILES
+              value: fleet-audit,platform
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
           imagePullPolicy: Always
           name: envoy-credential-proxy
@@ -3389,7 +3397,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "8"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "9"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -4375,7 +4383,6 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
-        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent

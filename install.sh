@@ -4902,6 +4902,7 @@ settle_network_policy_acceptance() {
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
     export ACCEPT_NO_NETWORK_POLICY="true"
     KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+      KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
       write_tfvars_from_state "$tfvars_file" "$image_tag"
   fi
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
@@ -7155,6 +7156,7 @@ run_menu_system() {
         # usable -- and an operator reaches it to change a model provider, not to
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+          KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
         # Again for a bot token the generator recovered from the live Secret.
         # The keys are saved by now, so a refusal restores install.env and
@@ -8951,6 +8953,7 @@ main() {
   # does not exist yet. uninstall.sh deliberately does not opt in.
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
     KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
   if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then
     memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"
