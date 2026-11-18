@@ -20,7 +20,7 @@ ticks itself rather than waiting on the five-minute cron. On its first poll it:
    Reconciler matching is covered by ``post_merge_check``'s unit tests;
 4. runs ``post_merge_check.py`` (the cron job's own entry, no arguments) in
    the agent container every :data:`TICK_INTERVAL_SEC` until the record has an
-   outcome or :data:`DRIVE_DEADLINE_SEC` (15 minutes) passes. The fix's own health window
+   outcome or :data:`DRIVE_DEADLINE_SEC` passes. The fix's own health window
    (five minutes for ``no-pdb``) is what bounds this, so one ``_check`` call
    outlasts devops-bench's 120 s polling budget: that budget spaces polls, it
    does not interrupt one.
@@ -96,12 +96,9 @@ TICK_READ = "__POST_MERGE_TICK__"
 #: Between ticks: under the 60 s the check waits after an apply, so the health
 #: window gets its two readings soon after it closes.
 TICK_INTERVAL_SEC = 45.0
-#: The no-pdb window is five minutes, and one tick may run up to the check's
-#: own four-minute budget (post_merge_outcome.RUN_BUDGET); this leaves room for
-#: two such ticks around the window.
-DRIVE_DEADLINE_SEC = 900.0
-#: Past RUN_BUDGET, so a long tick's exec is not cut off mid-run.
-TICK_TIMEOUT_SEC = 300.0
+#: The no-pdb window is five minutes; this leaves room for notice, apply and report.
+DRIVE_DEADLINE_SEC = 600.0
+TICK_TIMEOUT_SEC = 180.0
 MANIFEST_SUFFIXES = (".yaml", ".yml")
 MAX_FILES_PAGES = 5
 FILES_PAGE_SIZE = 100
