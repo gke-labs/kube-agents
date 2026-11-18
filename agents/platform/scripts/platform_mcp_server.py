@@ -94,15 +94,25 @@ FIRST_RUN_REPORT_SANDBOX_TIMEOUT_SECONDS = 30
 # What the ERROR line names when the read failed.
 FIRST_RUN_REPORT_SUBJECT = "the first-run report"
 
-# `get_alert_history`'s window and page. The ceilings are the feed route's page
-# cap (session_kv_server.FEED_EVENTS_MAX_LIMIT) and the ledger's retention
-# (CLEANUP_TTL_DAYS); a larger ask is clamped. The route cuts the window
-# (`since`); one call is one page of it.
+# `get_alert_history`'s window and page. The route cuts the window (`since`);
+# one call is one page of it, and a larger ask than either ceiling is clamped.
 ALERT_HISTORY_DEFAULT_HOURS = 24
-# The daemon runs in this container with the same environment (session_kv_server.CLEANUP_TTL_DAYS).
-ALERT_HISTORY_MAX_HOURS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14")) * 24
+# A sanity ceiling this tool owns, not a mirror of the retention. The ledger
+# holds only its retention (the daemon's CLEANUP_TTL_DAYS, 14 days by default),
+# so a wider window returns what it still holds. The tool reads no env for it:
+# this server runs as the platform_control MCP child, whose environment is the
+# `env:` block of agents/platform/config.yaml, not the pod's.
+ALERT_HISTORY_MAX_HOURS = 24 * 31
 ALERT_HISTORY_DEFAULT_LIMIT = 50
-ALERT_HISTORY_MAX_LIMIT = 500
+# The tool's own page cap, under the route's (session_kv_server.FEED_EVENTS_MAX_LIMIT,
+# 500, stays the route's): a page is text the model reads whole, and 500 rows
+# measured ~300K characters pretty-printed (#6331 review). 200 compact rows
+# with the message bound below are ~100K characters, ~25k tokens, at the worst.
+ALERT_HISTORY_MAX_LIMIT = 200
+# Each row's `message` is cut here on the way out, with the sanitizer's mark.
+# The daemon stores up to LEDGER_MESSAGE_MAX_CHARS (512 unset), which at a full
+# page would be the larger half of it; 240 keeps a cluster event's whole text.
+ALERT_HISTORY_MESSAGE_MAX_CHARS = 240
 # The route's `since` form (session_kv_server.FEED_EVENTS_SINCE_FORMAT):
 # `intercepted_events.created_at` is SQLite's CURRENT_TIMESTAMP, UTC, no zone.
 ALERT_HISTORY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -1502,9 +1512,15 @@ def get_alert_history(
     a quiet follow-up is a card comment, not a row.
 
     Args:
-        since_hours: Window back from now, in hours (default 24, at most 336).
-        limit: Most rows to return (default 50, at most 500). `truncated` true
-            means the window holds more rows than were returned.
+        since_hours: Window back from now, in hours (default 24, at most 744;
+            the ledger holds only its retention, 14 days by default, so a wider
+            window returns what it still holds).
+        limit: Most rows to return (default 50, at most 200: a page is text the
+            model reads whole). `truncated` true means the window holds more rows
+            than were returned; narrow the window rather than asking for more.
+
+    Returns compact JSON (no indentation); each row's `message` is cut at 240
+    characters and ends in ` ... [truncated]` when it was longer.
     """
     try:
         hours = max(1, min(int(since_hours), ALERT_HISTORY_MAX_HOURS))
@@ -1526,10 +1542,11 @@ def get_alert_history(
             # The route counted the window's rows, so this is its word.
             "truncated": bool(feed.get("truncated")),
             # Cluster-originated text: an event message carries what a probe or
-            # a controller wrote, as a pod's logs do.
-            "events": _sanitize_json_value(events),
+            # a controller wrote, as a pod's logs do. The bound cuts every string
+            # of a row; `message` is the only one that reaches it.
+            "events": _sanitize_json_value(events, max_len=ALERT_HISTORY_MESSAGE_MAX_CHARS),
         },
-        indent=2,
+        separators=(",", ":"),
     )
 
 

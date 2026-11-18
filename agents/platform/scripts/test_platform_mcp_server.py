@@ -1875,17 +1875,49 @@ class TestAlertHistoryTool(unittest.TestCase):
         self.feed["truncated"] = False
         self.assertFalse(json.loads(platform_mcp_server.get_alert_history(since_hours=24, limit=2))["truncated"])
 
-    def test_the_window_and_the_page_are_clamped_to_the_ledger_s_own_bounds(self):
+    def test_the_window_and_the_page_are_clamped_to_the_tool_s_own_ceilings(self):
         from datetime import datetime, timedelta, timezone
 
+        # The tool's own ceilings, not the daemon's retention or the route's
+        # page cap: the MCP child's env is the config.yaml block, which carries
+        # no SESSION_KV_CLEANUP_TTL_DAYS, and a page is what the model reads.
+        self.assertEqual(platform_mcp_server.ALERT_HISTORY_MAX_HOURS, 24 * 31)
+        self.assertEqual(platform_mcp_server.ALERT_HISTORY_MAX_LIMIT, 200)
         result = json.loads(platform_mcp_server.get_alert_history(since_hours=10_000, limit=9_999))
-        self.assertEqual(self._query()["limit"], "500")
-        self.assertEqual(result["since_hours"], 14 * 24)
+        self.assertEqual(self._query()["limit"], "200")
+        self.assertEqual(result["since_hours"], platform_mcp_server.ALERT_HISTORY_MAX_HOURS)
         since = datetime.strptime(self._query()["since"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        self.assertLess(datetime.now(timezone.utc) - since, timedelta(days=14, seconds=5))
+        self.assertLess(
+            datetime.now(timezone.utc) - since,
+            timedelta(hours=platform_mcp_server.ALERT_HISTORY_MAX_HOURS, seconds=5),
+        )
         result = json.loads(platform_mcp_server.get_alert_history(since_hours=0, limit=0))
         self.assertEqual(self._query()["limit"], "1")
         self.assertEqual(result["since_hours"], 1)
+
+    def test_the_page_is_compact_json_the_model_reads_whole(self):
+        """At the page cap a pretty-printed page is the larger part of a context window
+        (reviewer's measurement on #6331: ~300K characters at 500 indented rows), so the
+        tool writes the page with no indentation or separator spaces."""
+        self.feed["events"] = [self._row(i, 1) for i in range(1, 4)]
+        out = platform_mcp_server.get_alert_history()
+        self.assertNotIn("\n", out)
+        self.assertNotIn(": ", out)
+        self.assertEqual(out, json.dumps(json.loads(out), separators=(",", ":")))
+
+    def test_a_long_message_is_cut_per_row_at_the_tool_s_own_bound(self):
+        """The daemon stores a message at up to LEDGER_MESSAGE_MAX_CHARS (512 unset, env-set
+        higher); the page cuts each at the tool's bound with the sanitizer's own mark, so
+        a page of worst-case rows stays a bounded read."""
+        cap = platform_mcp_server.ALERT_HISTORY_MESSAGE_MAX_CHARS
+        self.assertEqual(cap, 240)
+        long_message = "x" * 512
+        self.feed["events"] = [self._row(1, 1, message=long_message), self._row(2, 1, message="short")]
+        events = json.loads(platform_mcp_server.get_alert_history())["events"]
+        self.assertTrue(events[0]["message"].startswith("x" * cap))
+        self.assertTrue(events[0]["message"].endswith(" ... [truncated]"))
+        self.assertEqual(len(events[0]["message"]), cap + len(" ... [truncated]"))
+        self.assertEqual(events[1]["message"], "short")
 
     def test_an_empty_ledger_is_an_empty_list_not_an_error(self):
         result = json.loads(platform_mcp_server.get_alert_history())
@@ -1926,7 +1958,7 @@ class TestAlertHistoryTool(unittest.TestCase):
 
     def test_a_non_numeric_argument_is_an_error_line_not_a_raise(self):
         """The model may pass "overnight" or null: the tool answers with the ERROR line the skill
-        passes through, as its siblings do, instead of raising out of the MCP call."""
+        rewrites for the user, as its siblings do, instead of raising out of the MCP call."""
         for bad in ("overnight", None, "24h"):
             with self.subTest(bad=bad):
                 out = platform_mcp_server.get_alert_history(since_hours=bad)
