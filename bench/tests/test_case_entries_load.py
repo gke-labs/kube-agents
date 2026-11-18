@@ -75,10 +75,22 @@ def test_a_missing_required_field_is_rejected(validator, tmp_path):
     assert f"check {ENTRY!r}" in problem
 
 
-def test_an_entry_that_another_rule_faults_gets_one_problem(validator, tmp_path):
-    """The parser refuses an unknown type too; the validator's own rule already says so."""
-    problems = validator.validate_paths([_case_file(tmp_path, {"type": "no_such_type"})])[CASE_ID]
-    assert len(problems) == 1
+ROLE_CHECK = {"type": "fleet_resource_property", "kind": "deployment", "resource_name": "x", "namespace": "y", "path": "spec.replicas", "op": "eq", "value": 1}
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        # A rule inside the validator's entry loop faults it.
+        {"type": "no_such_type"},
+        # Rules outside that loop fault these two; the parser refuses both values as well.
+        {**ROLE_CHECK, "fixture_role": "{{FLEET_CLUSTER_NAME:rbac-overgrant}}"},
+        {**ROLE_CHECK, "fixture_role": "Rbac-Overgrant"},
+    ],
+)
+def test_a_defect_that_another_rule_reports_is_not_reported_a_second_time(validator, tmp_path, check):
+    problems = validator.validate_paths([_case_file(tmp_path, check)])[CASE_ID]
+    assert problems
     assert _from_the_parser(validator, problems) == []
 
 

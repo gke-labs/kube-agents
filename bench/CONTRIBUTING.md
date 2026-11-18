@@ -19,8 +19,9 @@ repositories that CI pulls from.
    fails the run without them.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv. One more rule runs
-   where the bench package is installed (`make test-bench-deps`): it loads each check with the
-   harness's parser and rejects a field that the check's verifier does not have. Without the
+   where the bench package is installed (`make test-bench-deps`), on a case that passes the
+   others: it loads each check with the harness's parser and rejects a field that the check's
+   verifier does not have. Without the
    package the last line of the output says that this rule did not run; CI runs it.
 3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the
    foot of `hack/eval/nightly-cases.txt`, at its place in case-id order, with the `#` lines

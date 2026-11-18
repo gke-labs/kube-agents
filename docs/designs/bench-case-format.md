@@ -723,8 +723,8 @@ validator checks the rules above; it does not reimplement the harness's schema. 
 of mistake are caught only where the bench package is installed (`make test-bench-deps`),
 because the rule that catches them reads each entry with the harness's own YAML reader and
 loads it with the harness's own parser (`parse_entries`, with this repository's check types
-registered). It takes only an entry that no other rule faults, so one defect is one finding;
-a second defect of an entry that another rule faults shows after the first is corrected:
+registered). It runs last, and only on a case that no other rule faults, so one defect is one
+finding; a field defect of a case with another finding shows after that finding is corrected:
 
 - **An extra or misspelled key on a verification entry or a check node.** The compound
   nodes in `devops_bench/verification/spec.py` are `ConfigDict(extra="forbid")`, so
@@ -745,9 +745,9 @@ A third class gets through in both places and fails at spec-load, after a cluste
 spent:
 
 - **`critical: yes`.** This one the validator structurally cannot catch, and the reason is
-  worth knowing. The parser rule above reads only `verification_spec` with the harness's
-  reader; the validator reads the rest of a case with PyYAML, which is YAML 1.1 and parses
-  the bare `yes` into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
+  worth knowing. The parser rule above reads `verification_spec` with the harness's reader
+  and nothing else of the case; every other rule reads the case with PyYAML, which is YAML
+  1.1 and parses the bare `yes` into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
   the validator sees the field, the trap has already been parsed away. The same split hides

@@ -20,9 +20,9 @@ valid case is. A rule added here therefore gates the day it is written, with
 no second edit anywhere. The CLI runs in no workflow; the lint is what reds a
 pull request.
 
-One rule needs more than PyYAML: each check entry that no other rule faults is
-read and loaded with the harness's own YAML reader and parser, which are in the
-bench package (`make test-bench-deps`). Where that package is not installed, as
+One rule needs more than PyYAML: on a case that no other rule faults, each check
+entry is read and loaded with the harness's own YAML reader and parser, which
+are in the bench package (`make test-bench-deps`). Where that package is not installed, as
 in the lint's job, the rule does not run and the CLI says so on its last line;
 `bench/tests/test_case_entries_load.py` gates it in the job that installs the
 package.
@@ -785,27 +785,27 @@ def spec_parser() -> tuple[Any, Any] | None:
     return safe_parse_yaml, parse_entries
 
 
-def unloadable_entries(path: pathlib.Path, indexes: list[int]) -> list[str]:
-    """One problem for each of the case's entries at `indexes` that the harness does not load; none
-    where the bench package is not installed.
+def unloadable_entries(path: pathlib.Path) -> list[str]:
+    """One problem for each entry of the case that the harness does not load; none where the bench
+    package is not installed.
 
     The entries are read with the harness's own reader, not with PyYAML: the two read `no`, `on`
     and `22:30` as different types (YAML 1.1 and 1.2), and the parser has to see what a run sees.
     One entry goes to the parser at a time, so a parser that raises names its entry."""
     harness = spec_parser()
-    if harness is None or not indexes:
+    if harness is None:
         return []
     read, parse = harness
     try:
-        entries = read(path.read_text(encoding="utf-8"))["verification_spec"]
+        entries = read(path.read_text(encoding="utf-8")).get("verification_spec") or []
     except Exception as exc:  # noqa: BLE001 -- any failure of the harness's reader is this case's problem
         return [f"{HARNESS_CANNOT_READ}: {type(exc).__name__}: {exc}"]
     problems: list[str] = []
-    for index in indexes:
+    for index, entry in enumerate(entries):
         where = f"verification_spec[{index}]"
         try:
-            where = f"check {entries[index].get('name')!r}"
-            errors = parse([entries[index]])[1]
+            where = f"check {entry.get('name')!r}"
+            errors = parse([entry])[1]
         except Exception as exc:  # noqa: BLE001 -- a crash of the parser is a result too, and must not hide the other cases
             problems.append(f"{where}: {PARSER_RAISED}: {type(exc).__name__}: {exc}")
             continue
@@ -1774,11 +1774,7 @@ def validate_case(
         used_types: set[str] = set()
         used_roles: set[str] = set()
         slot_roles: set[str] = set()
-        # The entries that no rule of this loop faults: the harness's parser gets only these, so
-        # one defect is one problem.
-        unfaulted: list[int] = []
         for index, entry in enumerate(entries):
-            faults = len(problems)
             if not isinstance(entry, dict):
                 problems.append(f"verification_spec[{index}]: entry is not a mapping")
                 continue
@@ -1800,9 +1796,6 @@ def validate_case(
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles, slot_roles)
                 _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
-            if len(problems) == faults:
-                unfaulted.append(index)
-        problems.extend(unloadable_entries(path, unfaulted))
 
         # `fixture_roles:` asks whether a role's slot was reached, which the
         # runner records for catalogue roles only; an overlay role with no
@@ -1918,6 +1911,10 @@ def validate_case(
             "a reviewed KNOWN_UNREGISTERED entry with the reason it must not run"
         )
 
+    # Last, and only on a case that no rule above faults: the harness's own parser refuses most of
+    # what those rules refuse, so on a faulted case it would report one defect a second time.
+    if not problems:
+        problems.extend(unloadable_entries(path))
     return problems
 
 

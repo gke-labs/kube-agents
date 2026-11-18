@@ -17,8 +17,9 @@ module returns rather than on a hand-listed set of substrings, which is what
 TestEveryTaskIsValid's whole-set assertion is for -- see its docstring for the
 rules that leaked through before it existed. `make bench-case-check` is
 invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS in the
-Makefile and run by .github/workflows/python-tests.yml, is the whole of the
-enforcement on a pull request. A case passes by an entry in the presubmit
+Makefile and run by .github/workflows/python-tests.yml, is the enforcement on
+a pull request for every rule but one: the rule that needs the harness's parser
+is held by bench/tests/test_case_entries_load.py, in the job that installs it. A case passes by an entry in the presubmit
 file, by an entry in the nightly file (where a new case lands by default and
 earns a presubmit seat on its record -- decided 2026-09-15 on #1546/#1564),
 by a FIXTURE_NOT_READY entry in the validator naming the issue that plants
@@ -650,7 +651,7 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
     def test_the_rule_reports_nothing_without_the_parser(self):
         self._write(self.ENTRY)
         with mock.patch.object(validator, "spec_parser", return_value=None):
-            self.assertEqual(validator.unloadable_entries(self.path, [0]), [])
+            self.assertEqual(validator.unloadable_entries(self.path), [])
 
     def test_the_rule_reports_what_the_parser_refuses(self):
         self._write(self.ENTRY)
@@ -668,16 +669,24 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
         self.assertTrue(problem.startswith(f"check 'names-the-thing': {validator.PARSER_RAISED}: "), problem)
         self.assertIn("unterminated subpattern", problem)
 
-    def test_an_entry_that_another_rule_faults_does_not_go_to_the_parser(self):
-        """One defect is one problem: the parser would refuse the unknown type a second time."""
-        faulted = {**self.ENTRY, "name": "faulted", "check": {"type": "no_such_type"}}
-        self._write(faulted, self.ENTRY)
-        with self._harness(errors=[self.REFUSED]):
-            problems = validator.validate_case("made-up-case", self.path, registered=None)
-        self.assertEqual([[entry["name"] for entry in entries] for entries in self.sent], [["names-the-thing"]])
-        self.assertEqual(len(problems), 2, problems)
-        self.assertIn("unknown check type 'no_such_type'", problems[0])
-        self.assertIn(validator.UNLOADABLE_ENTRY, problems[1])
+    def test_a_case_that_another_rule_faults_does_not_go_to_the_parser(self):
+        """One defect is one problem: the parser refuses most of what the other rules refuse.
+        The rules reach an entry from inside the entry loop (an unknown type) and from outside it
+        (a fleet placeholder in `fixture_role`, a role that `fixtures:` does not declare)."""
+        role_check = {"type": "fleet_resource_property", "kind": "deployment", "resource_name": "x", "namespace": "y", "path": "spec.replicas", "op": "eq", "value": 1}
+        for needle, check in (
+            ("unknown check type 'no_such_type'", {"type": "no_such_type"}),
+            ("carries a fleet placeholder", {**role_check, "fixture_role": "{{FLEET_CLUSTER_NAME:rbac-overgrant}}"}),
+            ("own 'fixtures:' list does not declare", {**role_check, "fixture_role": "Rbac-Overgrant"}),
+        ):
+            with self.subTest(needle=needle):
+                self.sent.clear()
+                self._write({**self.ENTRY, "name": "faulted", "check": check}, self.ENTRY)
+                with self._harness(errors=[self.REFUSED]):
+                    problems = validator.validate_case("made-up-case", self.path, registered=None)
+                self.assertEqual(self.sent, [])
+                self.assertTrue(any(needle in problem for problem in problems), problems)
+                self.assertFalse(any(validator.UNLOADABLE_ENTRY in problem for problem in problems), problems)
 
     def test_a_file_that_the_harness_cannot_read_is_a_problem_of_the_case(self):
         self._write(self.ENTRY)
@@ -687,7 +696,7 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
 
         with mock.patch.object(validator, "spec_parser", return_value=(unreadable, None)):
             self.assertEqual(
-                validator.unloadable_entries(self.path, [0]),
+                validator.unloadable_entries(self.path),
                 [f"{validator.HARNESS_CANNOT_READ}: ValueError: while constructing a mapping"],
             )
 
