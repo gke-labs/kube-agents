@@ -1,0 +1,49 @@
+# Domain: chat and routing. Journey: a direct answer asked for as a table
+# arrives as a markdown table the chat renderers draw as a grid.
+#
+# Every chat turn under the A2A stack reaches Hermes through its API server
+# (the hermes-bridge calls /v1/chat/completions for Slack, Google Chat and
+# Microsoft Teams alike), and Hermes' own prompt hint for that platform told
+# the model to assume plain text and write no Markdown. The agent's rules
+# (agents/platform/SOUL.md) say the opposite: tabular data goes in one pipe
+# table, which the gateway renders as a Block Kit table, a Chat grid or an
+# Adaptive Card table. On hangdng-gkedemos on 2026-11-17 the Teams live test of
+# gke-labs/kube-agents#6086 asked for a table and got `Name: x | Location: y`
+# lines, then "I am configured to only send plain text". The agent image's
+# patch deploy/docker/patches/apply_api_platform_hint.py rewrites the hint to
+# name the chat gateway and ask for Markdown; this case is its red and green.
+#
+# It needs nothing but the cluster the agent runs in: the ask is the namespace
+# list of the agent's own cluster, which the agent answers directly from one
+# read, as chat-routing-own-cluster-namespaces does, so what is graded is the
+# shape of the answer, not the data behind it.
+id: chat-answer-writes-a-table
+name: A direct answer asked for as a table is a markdown table
+prompt: >-
+  List the namespaces in the Kubernetes cluster you are running in as a table
+  with two columns, the namespace name and its status. Answer directly in your
+  reply; do not file a task.
+# The judge's reference; verification_spec below is what passes or fails the case.
+expected_output: >-
+  A markdown pipe table with a header row (name, status), a separator row, and
+  one row per namespace, including kubeagents-system and kube-system, with no
+  "Name: x | Status: y" lines in place of the table.
+infrastructure:
+  deployer: noop
+validated: false
+domain: chat-and-routing
+owner: lapis2002
+verification_spec:
+  - name: the-answer-carries-a-markdown-table-with-the-agents-own-namespace
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kubeagents-system", "kube-system"]
+      # A pipe table: a separator row of dashes between pipes, and the agent's
+      # own namespace sitting in a pipe-delimited row. Lines such as
+      # "Namespace: kubeagents-system | Status: Active" carry pipes but no
+      # separator row, which is the shape the unpatched hint produced.
+      required_patterns:
+        - '(?m)^\s*\|?\s*:?-{3,}:?\s*\|'
+        - '(?m)^\s*\|[^\n]*kubeagents-system[^\n]*\|'

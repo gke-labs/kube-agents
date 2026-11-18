@@ -594,10 +594,10 @@ func teamsRelayError(prefix string, body []byte) error {
 }
 
 // Post writes text to a conversation as one activity and returns its id
-// (Adapter.Post). The text arrives already split: the gateway cuts every
-// backend's replies at discordChunk bytes before it posts (chatChunks), so
-// one call is one piece, and the adapter only fits it under the activity
-// budget (teamsFitActivity).
+// (Adapter.Post). The text arrives already split: the gateway cuts a
+// backend's replies at its piece size before it posts (chatChunks at
+// PieceSize, teamsPieceRunes here), so one call is one piece, and the
+// adapter only fits it under the activity budget (teamsFitActivity).
 func (a *TeamsAdapter) Post(conversation, text string) (string, error) {
 	convID := teamsConversationFromID(conversation)
 	if convID == "" {

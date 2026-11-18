@@ -3075,8 +3075,8 @@ adapter only fits it under the budget. The chat.notify route (`chat.notify.teams
 posts a kanban card's report back into the Teams conversation it came from (the bridge records
 `teams:` routes beside `gchat:` and `slack:`; the bus grants, exports and imports carry the
 subject beside the other three) and a proactive post into `homeChannel`, a Teams conversation
-id (`19:…` or `a:…`, the rule `teamsIsConversationID` and the operator's `a2aTeamsHomeConversation`
-share); a top-level post into a channel home lands in the thread it starts, a post into a group
+id (`19:…` or `a:…`, the rule `teamsIsHomeConversationID` and the operator's
+`a2aTeamsHomeConversation` share); a top-level post into a channel home lands in the thread it starts, a post into a group
 chat or a personal chat lands where it was sent, and a thread-shaped home is refused on both
 sides (every message in a thread shares one key, so the relay would store every report under it
 and the bridge splice the last one into every turn there). The agent's delivery

@@ -1662,7 +1662,7 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
     """Return the completion message: upstream's, or on a card platform the handoff alone.
 
     Flag off, or a platform the cards are not drawn for (:func:`chat_ux_on`), this
-    is upstream's f-string exactly. On a card platform (Slack, or Google Chat where
+    is upstream's f-string exactly. On a card platform (Slack, or Google Chat or Microsoft Teams where
     the gateway serves it) it drops the head line and
     leads with the worker's report, or
     its summary when there is no report (:func:`handoff_with_result`); a card
@@ -1691,7 +1691,7 @@ def explained_by_wake(
 ) -> bool:
     """Whether the creator's wake will narrate this failure, so the ping can go.
 
-    True only on a card platform (Slack, or Google Chat where the gateway serves
+    True only on a card platform (Slack, or Google Chat or Microsoft Teams where the gateway serves
     it) with the flag on, for a failure kind, on a subscription
     that asked to be woken, when ``kanban.wake_on_events`` wakes for the kind.
     Those are the conditions under which ``wake_kinds_for`` on a push adapter

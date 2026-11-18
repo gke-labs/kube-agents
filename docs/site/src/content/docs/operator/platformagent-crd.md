@@ -1753,8 +1753,9 @@ sweep.
 The people reading (`peopleSeen7d`, `peopleSeen30d`) comes from the A2A gateway: the distinct
 people who wrote on a chat platform it serves in the last 7 and 30 days, the largest count across
 gateway pods. The operator reads it only while no chat
-platform the install enables is served through Hermes, that is, Microsoft Teams.
-Otherwise both fields are absent.
+platform the install enables is served through Hermes, that is, Microsoft Teams on the
+Hermes path. With the gateway's Teams backend armed (`A2A_TEAMS_BACKEND`) every enabled
+platform is the gateway's, and the reading is present. Otherwise both fields are absent.
 
 A poll that reads no gateway body carrying both
 windows is a miss, and so is a poll that finds no running gateway pod. The second miss in a row
