@@ -682,7 +682,7 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
 repository, and no label edit. Its `issue-list` search fields may start no search
-qualifier of their own (no `:` in `query`, no quote or backslash in a label name).
+qualifier of their own (plain words in `query`, no quote or backslash in a label name).
 [`spec-subagent-profiles.md`](spec-subagent-profiles.md) owns that caller.
 
 ### No shallow clones
