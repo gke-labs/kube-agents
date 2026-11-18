@@ -295,7 +295,12 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
-		a.trace.filedCards[createdCardID] = true
+		// A filed card claims its workers' deliveries even with no title, so
+		// it takes only an id the result reports in a JSON field: free text
+		// may be an error naming some other task's card.
+		if kanbanCardIDFromJSON(d.Extra.Result) == createdCardID {
+			a.trace.filedCards[createdCardID] = true
+		}
 		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
 			a.trace.cardTitles[createdCardID] = short
 		}
@@ -2629,6 +2634,22 @@ func findUnescapedEscapedQuote(s string, q byte) int {
 // is the one thing read out of a tool result: an identifier with the card
 // token's shape, which the task's own subtask steps name again.
 func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
+	if id := kanbanCardIDFromJSON(rawResult); id != "" {
+		return id
+	}
+	if toolName == kanbanCreateTool {
+		if m := kanbanCardIDPattern.FindStringSubmatch(strings.TrimSpace(string(rawResult))); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// kanbanCardIDFromJSON is the card id a result names in a JSON field (id,
+// card_id or task_id, at the top level or in a JSON string holding an
+// object), or "". Unlike createdKanbanCardID it never reads an id out of
+// free text, which can be an error message naming some other card.
+func kanbanCardIDFromJSON(rawResult json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(rawResult))
 	if trimmed == "" || trimmed == "null" {
 		return ""
@@ -2655,11 +2676,6 @@ func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
 			if v, ok := m[k].(string); ok && isCardID(v) {
 				return strings.TrimSpace(v)
 			}
-		}
-	}
-	if toolName == kanbanCreateTool {
-		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
-			return m[1]
 		}
 	}
 	return ""

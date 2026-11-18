@@ -679,9 +679,18 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 func TestActivity_AnUntitledFiledCardStillFeedsTheSet(t *testing.T) {
 	a := newActivityState(false)
 	a.sessionID = "a2a-coord-untitled"
-	a.mu.Lock()
-	a.observeWorkerContextLocked(hookDelivery{ToolName: kanbanCreateTool, SessionID: a.sessionID}, json.RawMessage(`{"title":"  "}`), "t_card77")
-	a.mu.Unlock()
+	create := func(result string) {
+		d := hookDelivery{ToolName: kanbanCreateTool, SessionID: a.sessionID}
+		d.Extra.Result = json.RawMessage(result)
+		a.mu.Lock()
+		a.observeWorkerContextLocked(d, json.RawMessage(`{"title":"  "}`), createdKanbanCardID(kanbanCreateTool, d.Extra.Result))
+		a.mu.Unlock()
+	}
+	create(`{"id":"t_card77","status":"todo"}`)
+	// A rejected create that still reports ok names another task's card in
+	// its text: an untitled create must not file it.
+	create(`{"error":"title required; duplicate of t_other1"}`)
+	create(`"title required: see t_other2"`)
 	run := &taskRun{origin: &lib.Envelope{TaskID: "task-untitled"}, state: stateRunning}
 	run.act.Store(a)
 	other := newActivityState(false)
@@ -698,6 +707,13 @@ func TestActivity_AnUntitledFiledCardStillFeedsTheSet(t *testing.T) {
 	missed.Cwd = "/var/lib/hermes/kanban/workspaces/t_card78/repo"
 	if got := cardWorkerRun(runs, missed); got != nil {
 		t.Error("a card no task filed was claimed")
+	}
+	for _, other := range []string{"t_other1", "t_other2"} {
+		named := d
+		named.Cwd = "/var/lib/hermes/kanban/workspaces/" + other + "/repo"
+		if got := cardWorkerRun(runs, named); got != nil {
+			t.Errorf("a card an error text named (%s) was claimed", other)
+		}
 	}
 	// Waiting on its cards, the filing task, not another waiting one, takes
 	// the worker's activity.
