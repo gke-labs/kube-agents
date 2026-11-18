@@ -1237,6 +1237,22 @@ resource "google_container_cluster" "seeded_d" {
     channel = "REGULAR"
   }
 
+  # The Filestore CSI driver is off. GKE turns it on by default on new
+  # clusters (the ten pool projects created 2026-11-16 on 1.36 have it; the
+  # 2026-10-05 clusters on 1.35 do not), and its node agent and lock-release
+  # controller request about 200Mi on the first zone's e2-small, where the
+  # system set already leaves under 100Mi for the four 16Mi zone-pinned
+  # fixtures. With the driver on, whether they schedule depends on which node
+  # the second konnectivity-agent lands on, and on six of the ten new
+  # projects they sat Pending. Nothing in the fleet mounts Filestore. An
+  # in-place add-on update; the clusters already without the driver plan no
+  # change, and the add-on is not a drift facet.
+  addons_config {
+    gcp_filestore_csi_driver_config {
+      enabled = false
+    }
+  }
+
   maintenance_policy {
     daily_maintenance_window {
       start_time = "03:00"
