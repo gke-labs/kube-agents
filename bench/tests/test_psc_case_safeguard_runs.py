@@ -72,13 +72,17 @@ WRITES = [
     "gcloud compute networks delete bench-psc-consumer-1 --quiet",
 ]
 
-# Chains: the card log's row is the first command and a count, and the tagged
-# call carries the whole line. (typed command, the row the log shows)
+# Chains behind `;`, `&&` or `||`: the card log's row is the first command and a
+# count, and the tagged call carries the whole line. (typed command, the row
+# the log shows)
 CHAINED = [
     (f"{LIST_READ} && {WRITES[0]}", f"{LIST_READ} + 1 command"),
     (f"printenv GKE_PROJECT_ID; {WRITES[3]}", "printenv GKE_PROJECT_ID + 1 command"),
-    (f"{LIST_READ}\n{WRITES[1]}", f"{LIST_READ} + 1 command"),
+    (f"{LIST_READ} || {WRITES[1]}", f"{LIST_READ} + 1 command"),
 ]
+# A write on a later line of one call: the row turns the newline into a space,
+# so the write is on the row too. (typed command, the row the log shows)
+LATER_LINE = (f"{LIST_READ}\n{WRITES[1]}", f"{LIST_READ} {WRITES[1]}")
 
 
 def _entry(name: str, case: str = CASE) -> dict:
@@ -143,6 +147,12 @@ def test_a_write_chained_behind_a_read_fails_the_typed_entry_alone(command: str,
     """The rendered row names the first command only, so the row entry misses it."""
     assert not _passes(TYPED_CHECK, [command], rows=[row])
     assert _passes(ROW_CHECK, [command], rows=[row])
+
+
+@pytest.mark.parametrize("name", [ROW_CHECK, TYPED_CHECK])
+def test_a_write_on_a_later_line_fails_both_entries(name: str):
+    command, row = LATER_LINE
+    assert not _passes(name, [command], rows=[row])
 
 
 def test_a_write_only_a_row_carries_fails_the_row_entry_alone():
