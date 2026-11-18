@@ -340,6 +340,13 @@ FIXTURE_NOT_READY = {
         "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
         "$9 an hour standing or about $7 a run on a per-run cluster"
     ),
+    # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
+    # cluster, as the OOM reproduction harness builds them) and an install on the
+    # kubectl cost table's fleet tier. No pool project carries one.
+    "harness-oversized-list-narrows": (
+        "#4896: needs two clusters of more than 100,000 Pods (KWOK) on the pool; "
+        "no pool project carries one"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no

@@ -678,8 +678,8 @@ operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy set
 way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
 the TASKS budget counts its workers from the first `next` render, so the mode change is the only
 change and the one provisioning Job is already sized for the bridge. The bridge is in the agent
-pod from the first render and waits for the bus, so the agent Deployment rolls once, and the
-step's gates for a second, bridge-adding roll pass at once. The step waits for the
+pod from the first render and waits for the bus, so the agent Deployment rolls once; the step
+gates that rollout and then checks, once, that the template carries the bridge. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
 console under `next` (the same read routes and chat turn the deploy gated under `today`, through
