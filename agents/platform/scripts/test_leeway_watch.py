@@ -2344,6 +2344,43 @@ class BatchTests(unittest.TestCase):
         self.assertIn("- `p1`: 24 of 30 clusters read — 6 not reached (out of time this run)", markdown)
         self.assertNotIn("## Scan Errors", markdown)
 
+    def test_the_json_report_says_what_the_run_did_not_read(self) -> None:
+        # The JSON summary counts only clusters read this run; the coverage
+        # block lets a reader tell an unread cluster from a clean one.
+        self.roster = {"p1": triples("p1", 30)}
+        self.tick(0, findings={c: make_topology_finding(name="web") for c in self.roster["p1"]})
+        half = watch.TICK_BUDGET_SECONDS / 2
+        self.tick(1, seconds=half, findings={c: make_topology_finding(name="api") for c in self.roster["p1"]})
+        latest = self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME
+        coverage = json.loads(latest.read_text(encoding="utf-8"))[watch.COVERAGE_FIELD]
+        self.assertEqual(coverage[watch.COVERAGE_CLUSTERS_SWEPT_FIELD], 30)
+        self.assertEqual(coverage[watch.COVERAGE_CLUSTERS_READ_FIELD], 24)
+        self.assertEqual(
+            coverage[watch.COVERAGE_NOT_REACHED_FIELD],
+            {"p1": "24 of 30 clusters read — 6 not reached (out of time this run)"},
+        )
+        self.assertEqual(coverage[watch.COVERAGE_SCAN_ERRORS_FIELD], {})
+
+    def test_the_json_report_names_the_runs_scan_errors(self) -> None:
+        self.roster = {"p1": triples("p1", 3)}
+
+        def error_row(clusters, _):
+            rows = []
+            for c in clusters:
+                if c == "p1/l/c02":
+                    rows.append({"cluster": c, "status": "error", "error": "denied"})
+                else:
+                    rows.append({"cluster": c, "status": "ok", "topology_findings": [make_topology_finding(name="web")]})
+            return completed_json(make_report(rows))
+
+        self.tick(0, error_row)
+        latest = self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME
+        coverage = json.loads(latest.read_text(encoding="utf-8"))[watch.COVERAGE_FIELD]
+        self.assertEqual(coverage[watch.COVERAGE_CLUSTERS_SWEPT_FIELD], 3)
+        self.assertEqual(coverage[watch.COVERAGE_CLUSTERS_READ_FIELD], 2)
+        self.assertEqual(coverage[watch.COVERAGE_NOT_REACHED_FIELD], {})
+        self.assertEqual(list(coverage[watch.COVERAGE_SCAN_ERRORS_FIELD]), ["p1"])
+
     def test_clusters_not_reached_hold_back_the_report_refresh_and_the_topic_retry(self) -> None:
         self.roster = {"p1": triples("p1", 30)}
         half = watch.TICK_BUDGET_SECONDS / 2

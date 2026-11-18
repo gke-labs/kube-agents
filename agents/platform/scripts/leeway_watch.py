@@ -132,7 +132,10 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   which order the sweep; and the targets with an open partial-scan episode.
 - `reports/<timestamp>.md` and `reports/<timestamp>.json` (with `latest.md` and
   `latest.json` symlinks, keeping the newest 10 pairs): written whenever at
-  least one finding is due, with that run's report, partial or not. Retired
+  least one finding is due, with that run's report, partial or not. The JSON
+  carries a `coverage` block (clusters swept and read, and the targets not
+  reached or with scan errors), since `summary` counts only clusters read; a
+  cluster missing from a partial report is unread, not clean. Retired
   findings, a deferred refresh and a changed threshold override rewrite them
   only in a run that read every target in full without failing: a failure or
   clusters not reached hold that refresh back, though not reached posts
@@ -378,6 +381,14 @@ SUMMARY_FIELD = "summary"
 CLUSTERS_TOTAL_FIELD = "clusters_total"
 CLUSTERS_SUCCEEDED_FIELD = "clusters_succeeded"
 CLUSTERS_FAILED_FIELD = "clusters_failed"
+# What the run covered, added to the JSON report (`latest.json` and the topic):
+# its `summary` counts only the clusters this run read, so a reader needs these
+# to tell a cluster not read this run from one read clean.
+COVERAGE_FIELD = "coverage"
+COVERAGE_CLUSTERS_SWEPT_FIELD = "clusters_swept"
+COVERAGE_CLUSTERS_READ_FIELD = "clusters_read"
+COVERAGE_NOT_REACHED_FIELD = "not_reached"
+COVERAGE_SCAN_ERRORS_FIELD = "scan_errors"
 BY_SEVERITY_FIELD = "by_severity"
 BY_TIER_FIELD = "by_tier"
 SCORE_FIELD = "score"
@@ -2123,6 +2134,12 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     # target's entry.
     not_reached = {k: v for k, v in scan_errors.items() if error_kinds.get(k) == ERROR_KIND_BUDGET_EXHAUSTED}
     all_errors = {k: v for k, v in scan_errors.items() if k not in not_reached}
+    report[COVERAGE_FIELD] = {
+        COVERAGE_CLUSTERS_SWEPT_FIELD: len(requested_clusters),
+        COVERAGE_CLUSTERS_READ_FIELD: len(ok_clusters),
+        COVERAGE_NOT_REACHED_FIELD: dict(sorted(not_reached.items())),
+        COVERAGE_SCAN_ERRORS_FIELD: dict(sorted(all_errors.items())),
+    }
     announced = dict(ledger.get(ANNOUNCED_KEY) or {})
     lines.extend(
         announce_failed_targets(

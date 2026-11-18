@@ -521,7 +521,11 @@ of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
 clusters are retired with a single resolution line, while clusters whose scan
 failed or that were not reached retain their ledger entries so transient
 errors do not erase state and re-page tomorrow. A run with a finding due
-writes and publishes its own report, partial or not. Every other rewrite of
+writes and publishes its own report, partial or not. The JSON report carries
+a `coverage` block: `clusters_swept`, `clusters_read`, and the projects
+`not_reached` or with `scan_errors` this run (each with its summary), since
+`summary` counts only the clusters read; a cluster missing from a partial
+report is unread, not clean. Every other rewrite of
 `latest.*` waits for a run that reads every project in full without a
 failure: the refresh after findings retire, a refresh deferred from an
 earlier run, and the one after a threshold override changes. A failed project
