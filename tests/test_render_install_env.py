@@ -447,6 +447,12 @@ class RenderingTest(unittest.TestCase):
         _, _, text = render({**_COORDS, "SLACK_HOME_CHANNEL_POLICY": "manual"})
         self.assertEqual(parse(text)["SLACK_HOME_CHANNEL_POLICY"], "manual")
 
+    def test_platform_agent_sizing_profile_is_mapped_when_set(self):
+        _, _, omitted = render(dict(_COORDS))
+        self.assertNotIn("PLATFORM_AGENT_SIZING_PROFILE", parse(omitted))
+        _, _, explicit = render({**_COORDS, "PLATFORM_AGENT_SIZING_PROFILE": "fleet"})
+        self.assertEqual(parse(explicit)["PLATFORM_AGENT_SIZING_PROFILE"], "fleet")
+
     def test_the_file_is_not_readable_by_anyone_else(self):
         """It carries the model provider's API key and the Slack tokens."""
         with tempfile.TemporaryDirectory() as tmp:

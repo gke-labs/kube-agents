@@ -1144,6 +1144,12 @@ locals {
             runtimeClassName = var.agent_runtime_class != "" ? var.agent_runtime_class : (var.enable_gvisor_node_pool ? "gvisor" : "")
           }
         },
+        # Empty leaves the chart/operator default (small) in effect cleanly; the
+        # composition defaults to "auto" so installs scale automatically unless
+        # explicitly overridden or cleared.
+        var.platform_agent_sizing_profile == "" ? {} : {
+          sizingProfile = var.platform_agent_sizing_profile
+        },
         # Only when a ceiling is set. A default install then keeps the
         # release values that it had before, and a re-tag to a chart without
         # the key finds no undeclared value.

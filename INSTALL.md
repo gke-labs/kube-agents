@@ -99,10 +99,13 @@ Four behaviours worth knowing before the first run:
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone, autoscaling to two. The module's
-  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
-  installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
-  `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
-  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it;
+  `install.sh` writes none of the explicit `standard_*` or `gvisor_*` inputs, and sets or offers
+  `TF_VAR_sizing_profile=fleet` on a fresh Standard install with 25 or more visible clusters when
+  runtime sizing is `auto` or `fleet` and `TF_VAR_sizing_profile` / `TF_VAR_standard_machine_type`
+  are unset (and accepts an exported `TF_VAR_sizing_profile`). Set other inputs as `TF_VAR_` lines in
+  `install.env`, which Terraform reads where the generated tfvars
+  is silent, and keep them there for every later run: `lifecycle.sh` refuses an apply that would
   resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
   no explicit input decided at the last apply, a profile other than the one that apply recorded),
   the shape a lost line would otherwise plan. Pass
@@ -141,7 +144,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it updates only the keys listed in [The install configuration](scripts/installer/README.md#the-install-configuration-installenv)) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and, for GitHub only, Cloud KMS key creation for GitHub App private key signing).

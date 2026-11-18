@@ -1036,6 +1036,36 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
                 )
 
 
+class PlatformAgentSizingProfileGuardTest(GithubMinterInputsTest):
+    """Invalid PLATFORM_AGENT_SIZING_PROFILE refuses before teardown; valid forwards."""
+
+    def _run_recording(self, overrides):
+        return self._run(
+            overrides, install_body=f'echo "install: $*" >> "{MOCK_CALLS_LOG}"\n'
+        )
+
+    def test_invalid_sizing_profile_refuses_before_teardown(self):
+        proc, tmp_dir = self._run_recording({"PLATFORM_AGENT_SIZING_PROFILE": "giant"})
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("PLATFORM_AGENT_SIZING_PROFILE='giant'", combined)
+        self.assertIn("::error", combined)
+        self.assertNotIn("Tearing down the existing environment", combined)
+        self.assertFalse(
+            (tmp_dir / MOCK_CALLS_LOG).exists(),
+            "the guard must fire before uninstall.sh or install.sh runs",
+        )
+
+    def test_valid_and_unset_sizing_profile_forwarding(self):
+        proc_set, tmp_set = self._run_recording({"PLATFORM_AGENT_SIZING_PROFILE": "fleet"})
+        self.assertEqual(proc_set.returncode, 0, proc_set.stdout + proc_set.stderr)
+        self.assertIn("--sizing-profile=fleet", (tmp_set / MOCK_CALLS_LOG).read_text())
+
+        proc_unset, tmp_unset = self._run_recording({"PLATFORM_AGENT_SIZING_PROFILE": ""})
+        self.assertEqual(proc_unset.returncode, 0, proc_unset.stdout + proc_unset.stderr)
+        self.assertNotIn("--sizing-profile", (tmp_unset / MOCK_CALLS_LOG).read_text())
+
+
 class A2AReadinessGateTest(unittest.TestCase):
     """The rebuild path ends on the A2A readiness gate, after the install.
 

@@ -24,6 +24,7 @@ their own copies:
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                                                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins                                                                 |
 | `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`                                                                    |
+| `DEFAULT_PLATFORM_AGENT_SIZING_PROFILE`                                   | The runtime sizing preset (`auto`), wired to `spec.deployment.sizingProfile`                                                                           |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                                                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)                                                                            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                                                                                              |
@@ -150,11 +151,13 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
-`install.sh` reads it and writes to it only in these cases. The last two happen only when a run
+`install.sh` reads it and writes to it only in these cases. The last three happen only when a run
 commits (the apply, or the `--generate-only` handoff; never a declined run or `--dry-run`):
 
 - it creates one at the end of a first install, when there is nothing there;
 - it appends a chat key the file lacks, under the rule below;
+- it appends `TF_VAR_sizing_profile=fleet` when a fresh Standard cluster install with 25 or more
+  visible clusters selects fleet node pools and the existing file lacks `TF_VAR_sizing_profile`;
 - it records the GitOps keys described under [The GitOps forge](#the-gitops-forge): the forge
   keys when the run applies a different forge (apply only), and `GITOPS_ORG`, `GITOPS_REPO` and
   `GITHUB_APP_ID` when one is missing or this run applies a different value (that line only).
@@ -628,6 +631,18 @@ value: one run at a raised size followed by a run from a clean shell would drop 
 leaving the claims larger than the CR says. A value that is not a whole number of `Mi`, `Gi` or
 `Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
 regenerates.
+
+`PLATFORM_AGENT_SIZING_PROFILE` is the `PlatformAgent`'s `spec.deployment.sizingProfile` preset
+(`auto`, `small`, `medium`, or `fleet`). Empty takes `DEFAULT_PLATFORM_AGENT_SIZING_PROFILE`
+(`auto`), which lets the operator step the credential proxy, `agent-api-auth` sidecar and
+shell sandbox up at 10 and 25 clusters under `ResourceQuota` and `LimitRange` admission checks.
+Both `install.sh` (`--sizing-profile`) and `upgrade.sh` (`--sizing-profile` across `--plan`,
+`full` and `harness`; `--upgrade-mode=operator` refuses `--sizing-profile`) validate it, warn when
+`--sizing-profile` temporarily overrides a different value recorded in an existing `install.env`,
+scan visible GKE clusters in scope via `scan_visible_clusters_in_scope` (skipped by offline
+`--dry-run`), and print runtime, Standard node-pool (`TF_VAR_sizing_profile`) and storage sizing
+guidance (`report_cluster_sizing_guidance`). `uninstall.sh` exports
+`PLATFORM_AGENT_SIZING_PROFILE=""` before regenerating so a typo never blocks teardown.
 
 When Slack is on, the A2A gateway holds it, with Google Chat on or off (the operator's
 `a2aSlackArmed`), and `install.sh`, the menu's apply and a full upgrade refuse, before their apply,

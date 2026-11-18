@@ -190,5 +190,50 @@ class SizingProfileReachesTheCR(unittest.TestCase):
         self.assertIn("exceeds the sizing profile row's limits.cpu", small.stderr)
 
 
+class InstallerAndTerraformSizingParity(unittest.TestCase):
+    """installer_common.sh thresholds and install/Terraform defaults agree with the operator."""
+
+    def test_installer_thresholds_equal_operator_constants(self) -> None:
+        go_text = OPERATOR.read_text(encoding="utf-8")
+        sh_text = (REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text(encoding="utf-8")
+        for go_name, sh_name in (
+            ("sizingMediumClusterThreshold", "SIZING_MEDIUM_CLUSTER_THRESHOLD"),
+            ("sizingFleetClusterThreshold", "SIZING_FLEET_CLUSTER_THRESHOLD"),
+        ):
+            go_match = re.search(rf"^\s*{go_name}\s+int64\s*=\s*([0-9]+)$", go_text, re.MULTILINE)
+            sh_match = re.search(rf"^readonly\s+{sh_name}=([0-9]+)$", sh_text, re.MULTILINE)
+            self.assertIsNotNone(go_match, go_name)
+            self.assertIsNotNone(sh_match, sh_name)
+            self.assertEqual(sh_match.group(1), go_match.group(1), f"{sh_name} != {go_name}")
+
+    def test_installer_and_terraform_defaults_are_auto(self) -> None:
+        defaults_text = (REPO_ROOT / "install.defaults.env").read_text(encoding="utf-8")
+        vars_text = (REPO_ROOT / "terraform" / "examples" / "full-install" / "variables.tf").read_text(encoding="utf-8")
+        self.assertIn('DEFAULT_PLATFORM_AGENT_SIZING_PROFILE="auto"', defaults_text)
+        start = vars_text.index('variable "platform_agent_sizing_profile" {')
+        block = vars_text[start : vars_text.index("\n}\n", start) + 3]
+        self.assertIn('default     = "auto"', block)
+
+    def test_installer_storage_formula_constants_equal_operator(self) -> None:
+        go_manifests = (
+            REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+        ).read_text(encoding="utf-8")
+        sh_text = (REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text(encoding="utf-8")
+        units = {"Gi": 1024, "Mi": 1}
+        for go_name, sh_name in (
+            ("dataVolumeBaseSize", "SIZING_AGENT_BASE_STORAGE_MI"),
+            ("perClusterProfileStorage", "SIZING_AGENT_PER_PROFILE_MI"),
+        ):
+            go_match = re.search(rf'^\s*{go_name}\s*=\s*"(\d+)(Gi|Mi)"$', go_manifests, re.MULTILINE)
+            sh_match = re.search(rf"^readonly\s+{sh_name}=([0-9]+)$", sh_text, re.MULTILINE)
+            self.assertIsNotNone(go_match, go_name)
+            self.assertIsNotNone(sh_match, sh_name)
+            want_mi = int(go_match.group(1)) * units[go_match.group(2)]
+            self.assertEqual(int(sh_match.group(1)), want_mi, f"{sh_name} != {go_name}")
+        base_str = re.search(r'^\s*dataVolumeBaseSize\s*=\s*"(\d+(?:Gi|Mi))"$', go_manifests, re.MULTILINE).group(1)
+        per_str = re.search(r'^\s*perClusterProfileStorage\s*=\s*"(\d+(?:Gi|Mi))"$', go_manifests, re.MULTILINE).group(1)
+        self.assertIn(f"{base_str} + N x {per_str}", sh_text)
+
+
 if __name__ == "__main__":
     unittest.main()
