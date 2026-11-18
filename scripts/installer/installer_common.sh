@@ -5750,6 +5750,10 @@ write_tfvars_from_state() {
     # question sets it, so install.sh exports nothing over it. See the variable.
     echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
     echo ""
+    # The same: install.env (or the environment) only. Unset, or any spelling
+    # is_truthy does not take, renders false, the stop's default.
+    echo "card_stop_enabled = $(hcl_bool "${CARD_STOP_ENABLED:-}")"
+    echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
     echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"

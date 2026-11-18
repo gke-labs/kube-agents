@@ -1019,6 +1019,9 @@ locals {
       webhooks = {
         enabled = var.enable_webhooks
       }
+      cardStop = {
+        enabled = var.card_stop_enabled
+      }
     }
     litellm = merge(
       {

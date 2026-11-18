@@ -938,6 +938,17 @@ still works and wins over the value. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
+### Card stop (`operator.cardStop.enabled`)
+
+`operator.cardStop.enabled: true` sets `A2A_CARD_STOP=true` on the controller manager, which
+renders it onto the A2A gateway: a chat `stop`, or Slack's Stop button, then also stops the
+kanban cards the conversation filed. It defaults to `false`, because the stop needs a
+hermes-bridge sidecar and agent image that answer it; an older pair answers that it couldn't
+confirm the cards stopped. An `A2A_CARD_STOP` entry in `operator.extraEnv` wins over the value.
+The install's `CARD_STOP_ENABLED` key sets it through `terraform/examples/full-install`. The
+[ChatOps page](https://gke-labs.github.io/kube-agents/concepts/chatops/) is canonical for what a
+stop replies.
+
 ### Slack end-to-end test users (`operator.slackTestUsers`)
 
 Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
