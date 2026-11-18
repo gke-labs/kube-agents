@@ -1004,7 +1004,8 @@ class MainTest(unittest.TestCase):
         from unittest import mock
 
         for raw, expected in (("", 20), ("5", 5), ("500", 500), ("0", 20), ("-3", 20), ("501", 20), ("ten", 20),
-                              (" 7 ", 7), ("1_0", 20), ("\u0663", 20), ("+5", 20)):
+                              (" 7 ", 7), ("1_0", 20), ("\u0663", 20), ("+5", 20), ("0050", 50),
+                              ("9" * 4301, 20)):
             with self.subTest(raw=raw), mock.patch.dict("os.environ", {post_merge_check.READS_PER_TICK_ENV: raw}):
                 self.assertEqual(post_merge_check.reads_per_tick(), expected)
 
