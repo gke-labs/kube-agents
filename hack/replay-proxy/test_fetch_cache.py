@@ -452,6 +452,16 @@ class PrintCommitTest(FetchTest):
         self.assertEqual((written["builds"], written["commit_builds"]), (night.builds, night.commit_builds))
         self.assertEqual(result.night_commit_builds, written["commit_builds"])
 
+    def test_a_malformed_commit_leaves_its_build_out_of_the_night_and_the_fetch_goes_on(self):
+        self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 2 * HOUR, job=self.job("HEAD"))
+        self.record("201", 1, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night_out = os.path.join(os.path.dirname(self.runs_out), FC.NIGHT_FILE)
+        result = self.fetcher().fetch(self.dest, self.runs_out, night_out)
+        self.assertEqual(result.downloaded, 2)
+        with open(night_out) as handle:
+            self.assertEqual(json.load(handle), {"builds": ["200", "201"], "commit_builds": {COMMIT_B: ["201"]}})
+
     def test_records_without_a_commit_are_tolerated(self):
         # A night of records some of which predate the commit: they count for
         # nothing, the others decide. fetch() reads them as it always has.

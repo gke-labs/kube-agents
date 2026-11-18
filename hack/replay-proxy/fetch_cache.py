@@ -487,9 +487,8 @@ class Fetcher:
                 try:
                     commits.setdefault(build, self._commit(record))
                 except Refused:
-                    # --print-commit refused this night, so the lane is on main,
-                    # which the night file then doesn't name: no case is graded
-                    # against a night, rather than no cache fetched.
+                    # The cache is still fetched: this build counts as naming
+                    # no commit in the night file, and the others keep theirs.
                     commits.setdefault(build, "")
                 for item in items:
                     confirmed.setdefault(item[0], item)

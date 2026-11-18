@@ -16,8 +16,9 @@ which the Prow job exports). It writes, into `--out`:
   prompt tokens, how many were served); the case's outcomes on the newest
   recording night on the replayed commit (`newest_night`: the builds
   fetch_cache.py --night-out names for `--commit`, the night --print-commit
-  chose), or that it didn't run there, or that no such night is known, never
-  an older night's; the outcomes of the same case in each build an answer was
+  chose), as graded when the lane fetched (the night is usually still running
+  then, so a score can be partial), or that it had no graded run there by then,
+  or that no such night is known, never an older night's; the outcomes of the same case in each build an answer was
   served from (`nightly`), which is where answers came from, not a verdict:
   uploads are write-once, so that is the night that first wrote the answer,
   often an older one on another commit; and, per conversation that was served anything,
@@ -78,12 +79,15 @@ NO_VERDICT = "no_verdict"
 REPORT_COMMIT = "commit"
 REPORT_COMMIT_SOURCE = "commit_source"
 UNKNOWN_COMMIT = "an unknown commit"
-# Per case, `newest_night` when the case has no outcome there: no run of it in
-# the night's builds, or no night on the replayed commit is known (no night
+# Per case, `newest_night` when the case has no outcome there: no graded run of
+# it in the night's builds when the lane fetched their runs, or no night on the replayed commit is known (no night
 # file, no commit, or a commit no build of the newest night ran: main, as a fallback).
-NIGHT_NOT_RUN = "not_run"
+NIGHT_NOT_RUN = "not_graded_at_fetch"
 NIGHT_UNKNOWN = "no_night_on_commit"
 REPORT_NIGHT = "newest_night"
+# Per case and served-from build, `nightly` when the build's runs were read and
+# none is the case's; a build whose runs weren't read at all stays UNKNOWN.
+SERVED_FROM_NOT_RUN = "not_run"
 COMMIT_SOURCE_TEXT = {
     CS.COMMIT_SOURCE_RECORDING: "the commit the newest recording night ran",
     CS.COMMIT_SOURCE_MAIN: "main, as a fallback: no recording named a commit, or it could not be fetched",
@@ -231,7 +235,9 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
         })
         for build in served_from:
             outcomes = nightly_outcomes(nightly_runs, build, run.case)
-            case["nightly"][build] = outcomes if outcomes is not None else UNKNOWN
+            if outcomes is None:
+                outcomes = SERVED_FROM_NOT_RUN if build in nightly_runs else UNKNOWN
+            case["nightly"][build] = outcomes
     # Per served conversation: the lane run's verdict against the recording's.
     conversation_counts = {MATCH: 0, MISMATCH: 0, UNKNOWN: 0}
     unknown_reasons: Dict[str, int] = {}
@@ -293,11 +299,17 @@ def night_line(report: Dict[str, Any]) -> str:
     return f"newest recording night on {commit}: builds {', '.join(builds)}"
 
 
+def served_from_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return f"ran it {value['passes']}/{value['scored']}"
+    return "no run of it" if value == SERVED_FROM_NOT_RUN else UNKNOWN
+
+
 def night_text(value: Any) -> str:
     if isinstance(value, dict):
-        return f"{value['passes']}/{value['scored']}"
+        return f"as of fetch: {value['passes']}/{value['scored']}"
     if value == NIGHT_NOT_RUN:
-        return "not run on the replayed commit's night"
+        return "not graded on the replayed commit's night by the time the lane fetched"
     return "no night on the replayed commit"
 
 
@@ -315,9 +327,7 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
     for name, case in sorted(report["cases"].items()):
         lane = case["lane"]
         served = ", ".join(f"rep {r['rep']} {r['outcome']} {r['served_token_percent']}%" for r in lane["runs"])
-        served_from = "; ".join(
-            f"{build} (ran it {v['passes']}/{v['scored']})" if isinstance(v, dict) else f"{build} (no run of it)"
-            for build, v in sorted(case["nightly"].items()))
+        served_from = "; ".join(f"{build} ({served_from_text(v)})" for build, v in sorted(case["nightly"].items()))
         out.append(f"  {name}: lane {lane['passes']}/{lane['scored']} ({served});"
                    f" newest night {night_text(case.get(REPORT_NIGHT))};"
                    f" {'answers served from ' + served_from if served_from else 'served nothing'}")

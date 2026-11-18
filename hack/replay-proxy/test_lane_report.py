@@ -1,4 +1,4 @@
-"""The replay lane's verdict comparison: per case beside the nightly, and per served conversation."""
+"""The replay lane's verdict comparison: per case, and per served conversation."""
 
 import json
 import os
@@ -136,7 +136,7 @@ class LaneReportTest(unittest.TestCase):
         # Where the answers came from is kept, under its own label.
         self.assertEqual(case["nightly"][old_night]["passes"], 3)
         self.assertIn(f"newest recording night on {commit}: builds {shard_a}, {shard_b}", summary)
-        self.assertIn(f"case-a: lane 0/3 (rep 1 fail 50.0%, rep 2 fail 50.0%, rep 3 fail 50.0%); newest night 0/3;"
+        self.assertIn(f"case-a: lane 0/3 (rep 1 fail 50.0%, rep 2 fail 50.0%, rep 3 fail 50.0%); newest night as of fetch: 0/3;"
                       f" answers served from {old_night} (ran it 3/3)\n", summary)
         self.assertNotIn("nightly", summary)
 
@@ -149,8 +149,18 @@ class LaneReportTest(unittest.TestCase):
         self.conversation("t_00000001", (True, True), recorded_from=old_night)
         report, summary = self.report({old_night: [{"case": "case-a", "rep": 1, "outcome": "pass"}],
                                        shard: [{"case": "case-b", "rep": 1, "outcome": "pass"}]})
-        self.assertEqual(report["cases"]["case-a"]["newest_night"], "not_run")
-        self.assertIn("case-a: lane 1/1 (rep 1 pass 100.0%); newest night not run on the replayed commit's night;", summary)
+        self.assertEqual(report["cases"]["case-a"]["newest_night"], "not_graded_at_fetch")
+        self.assertIn("case-a: lane 1/1 (rep 1 pass 100.0%); newest night not graded on the replayed commit's night"
+                      " by the time the lane fetched;", summary)
+
+    def test_a_served_from_build_whose_runs_were_never_read_stays_unknown(self):
+        read, unread = "1790000000000000001", "1780000000000000000"
+        for card, build in (("t_00000001", read), ("t_00000002", unread)):
+            self.world.run("case-a", int(card[-1]), "pass", [card])
+            self.conversation(card, (True, True), recorded_from=build)
+        report, summary = self.report({read: [{"case": "case-b", "rep": 1, "outcome": "pass"}]})
+        self.assertEqual(report["cases"]["case-a"]["nightly"], {read: "not_run", unread: "unknown"})
+        self.assertIn(f"answers served from {unread} (unknown); {read} (no run of it)", summary)
 
     def test_without_a_night_on_the_replayed_commit_no_case_is_graded_against_one(self):
         shard = "1790000000000000001"
