@@ -6,11 +6,11 @@ directories passed on the command line) against the Open Knowledge Format v0.2
 specification and the ``kube-agents`` contract in
 ``docs/architecture/06-api-and-data-contracts.md`` §5:
 
-* Root ``index.md`` (navigation) and ``log.md`` (history) are reserved by OKF
-  v0.2 at the ``knowledge/`` root (alongside ``kube-agents`` root overview files
-  ``STATE_OF_BEING.md`` and ``README.md``): they do not require YAML
-  frontmatter, and if they carry frontmatter it must be a valid YAML mapping
-  without a ``type`` key.
+* ``index.md`` (navigation) and ``log.md`` (history) are reserved by OKF v0.2
+  at every level of ``knowledge/`` (alongside ``kube-agents`` root overview
+  files ``STATE_OF_BEING.md`` and ``README.md`` at the ``knowledge/`` root):
+  they do not require YAML frontmatter, and if they carry frontmatter it must be
+  a valid YAML mapping without a ``type`` key.
 * Entry files (every other ``.md`` file under ``knowledge/``) must not be named
   ``index.md`` or ``log.md`` (case-insensitively), must not be symlinks, must
   carry valid YAML frontmatter that parses to a mapping, and must declare a
@@ -141,8 +141,8 @@ MSG_UNCLOSED_FRONTMATTER = "frontmatter opens with '---' on line 1 but is never 
 MSG_MISSING_FRONTMATTER = "missing YAML frontmatter (must open with '---' on line 1 and close with '---')"
 MSG_INVALID_YAML_PREFIX = "frontmatter is not valid YAML"
 MSG_FRONTMATTER_NOT_MAPPING = "frontmatter must be a YAML mapping"
-MSG_ROOT_HAS_TYPE = "reserved root file must not declare 'type' in frontmatter"
-MSG_RESERVED_ENTRY_FILENAME = "filename is reserved for the knowledge/ root and must not be used for an entry"
+MSG_ROOT_HAS_TYPE = "reserved file must not declare 'type' in frontmatter"
+MSG_RESERVED_ENTRY_FILENAME = "filename is reserved at every level and must not be used for an entry"
 MSG_MISSING_TYPE = "frontmatter is missing required key 'type'"
 MSG_EMPTY_TYPE = "frontmatter 'type' must be a non-empty string"
 MSG_RESERVED_TYPE = "frontmatter 'type' must not use reserved value"
@@ -525,7 +525,7 @@ def validate_knowledge_file(
     split = split_frontmatter(text)
     errors: list[str] = []
 
-    if is_root_file and is_untyped_root_name:
+    if is_reserved_name or (is_root_file and is_untyped_root_name):
         if split.state == FRONTMATTER_UNCLOSED:
             errors.append(MSG_UNCLOSED_FRONTMATTER)
         elif split.state == FRONTMATTER_CLOSED:

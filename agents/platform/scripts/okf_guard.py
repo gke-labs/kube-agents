@@ -29,7 +29,7 @@ RECORD_TYPES = (
 STATUSES = ("proposed", "active", "rejected", "superseded", "retired")
 SEVERITIES = ("block", "warn", "info")
 VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
-SKIP_FILENAMES = frozenset({"index.md", "readme.md", "template.md", "state_of_being.md"})
+SKIP_FILENAMES = frozenset({"index.md", "log.md", "readme.md", "template.md", "state_of_being.md"})
 RECORD_ID_RE = re.compile(r"(DEC|LES)-\d{4}-\d{3,}")
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.S)
 QTY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)$")
