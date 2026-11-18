@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nkeys"
 
@@ -515,19 +516,16 @@ func TestAScriptGetsNoInheritedEnvironmentAndLeavesNoChild(t *testing.T) {
 	}
 }
 
-// A failed script's stderr is logged with credentials masked: a bearer header, and a value given to a
-// token-, secret- or password-named key, whether written key=value, key: value or as JSON. The rest
-// of the line, and the key names, stay, so the log still says what failed.
-func TestAFailedScriptsStderrIsLoggedWithSecretsMasked(t *testing.T) {
-	for in, want := range map[string]string{
-		"Authorization: Bearer abcdefghijkl0123":          "Authorization: Bearer [redacted]",
-		"GITHUB_TOKEN=ghp_abcdef123456 not set right":     "GITHUB_TOKEN=[redacted] not set right",
-		`{"api_key": "sk-123456789"}`:                     `{"api_key": "[redacted]"}`,
-		"password: hunter22, retrying":                    "password: [redacted], retrying",
-		"error: namespace kube-system not found (exit 2)": "error: namespace kube-system not found (exit 2)",
-	} {
-		if got := redactScriptOutput(in); got != want {
-			t.Errorf("redactScriptOutput(%q) = %q, want %q", in, got, want)
-		}
+// A cap that falls inside a multi-byte character drops that character's leading bytes, so the
+// truncated stdout is valid UTF-8 before its marker.
+func TestACappedOutputIsCutOnACharacterBoundary(t *testing.T) {
+	b := &cappedBuffer{max: 5}
+	_, _ = b.Write([]byte("abcd\u00e9xyz")) // "é" is two bytes, the 5th and 6th
+	got := b.text()
+	if !utf8.ValidString(got) {
+		t.Fatalf("text %q is not valid UTF-8", got)
+	}
+	if want := "abcd" + scriptTruncated; got != want {
+		t.Errorf("text = %q, want %q", got, want)
 	}
 }

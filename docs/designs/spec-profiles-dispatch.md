@@ -401,7 +401,7 @@ leave open:
   broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
   `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. Its bound is
   its `timeoutSeconds` within the task's deadline, and its process group is killed at the bound. Its
-  stdout, capped at 64 KiB, is the text result. Its stderr, capped at 16 KiB, goes to the log. Exit 0
+  stdout, capped at 64 KiB, is the text result. Its stderr is read, capped at 16 KiB, and only its size is logged: a script can print a credential, and the log is not where a redactor's misses should land. Exit 0
   completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
   A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
   name can't be a `KA_PARAM_<NAME>` (upper case, at most 32 characters, where a task parameter may have

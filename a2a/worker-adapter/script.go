@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
@@ -36,12 +37,14 @@ import (
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
 // parameters as KA_PARAM_<NAME> and nothing else from the task. Its stdout,
-// capped, is the task's text result; its stderr, capped, goes to the log.
+// capped, is the task's text result; its stderr is read, capped, and only its
+// size is logged.
 // Exit 0 completes the task, and anything else fails it.
 
 const (
 	// scriptStdoutCap bounds the text result; past it the output is cut and
-	// marked. scriptStderrCap bounds the stderr tail that's logged.
+	// marked. scriptStderrCap bounds the stderr the worker reads, whose size
+	// alone is logged.
 	scriptStdoutCap = 64 << 10
 	scriptStderrCap = 16 << 10
 	// scriptParamPrefix is the only way a task's input reaches a script's
@@ -241,7 +244,14 @@ func (b *cappedBuffer) text() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.over {
-		return b.buf.String() + scriptTruncated
+		// The cap is a byte count, so it can fall inside a multi-byte character; drop that character's
+		// leading bytes rather than publish invalid UTF-8 before the marker.
+		kept := b.buf.Bytes()
+		for len(kept) > 0 && !utf8.Valid(kept) {
+			_, size := utf8.DecodeLastRune(kept)
+			kept = kept[:len(kept)-size]
+		}
+		return string(kept) + scriptTruncated
 	}
 	return b.buf.String()
 }
@@ -383,16 +393,11 @@ func (a *adapter) runScript(ctx context.Context, origin *lib.Envelope, originSeq
 		a.abandonSeen, a.abandonReason = true, reason
 		a.mu.Unlock()
 	}})
-	// A clean run logs its stderr's size only. A failed or timed-out one logs the capped tail, which is what
-	// whoever debugs it needs, with bearer tokens and key=value secrets masked first (redactScriptOutput).
-	if res.exitCode == 0 && !res.timedOut {
-		a.log.Info("script ran", "task", a.cfg.TaskID, "script", sr.name, "exit", res.exitCode,
-			"took", time.Since(start).Round(time.Millisecond), "stderrBytes", len(res.stderr))
-	} else {
-		a.log.Warn("script failed", "task", a.cfg.TaskID, "script", sr.name, "exit", res.exitCode,
-			"took", time.Since(start).Round(time.Millisecond), "timedOut", res.timedOut,
-			"stderr", redactScriptOutput(res.stderr))
-	}
+	// The stderr's size only, never its text: a script, or a tool it calls, can print a credential, and a
+	// log line is not where a redactor's misses should land (#5954 review). Whoever debugs a failure reruns
+	// the script by hand.
+	a.log.Info("script ran", "task", a.cfg.TaskID, "script", sr.name, "exit", res.exitCode,
+		"took", time.Since(start).Round(time.Millisecond), "timedOut", res.timedOut, "stderrBytes", len(res.stderr))
 	switch {
 	case res.abandoned:
 		return done(Result{Abandoned: true}, nil)
@@ -414,19 +419,4 @@ func (a *adapter) runScript(ctx context.Context, origin *lib.Envelope, originSeq
 	}
 	r, err := a.completeWith(res.stdout)
 	return done(r, err)
-}
-
-// scriptSecretPatterns are what redactScriptOutput masks in a failed script's stderr tail before it is
-// logged: a bearer or basic credential, and a value given to a key whose name says it's secret. The
-// script's environment holds no credential, so this guards against one it fetched or printed itself.
-var scriptSecretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}`),
-	regexp.MustCompile(`(?i)\b([a-z0-9_.-]*(token|secret|password|passwd|apikey|api_key|credential)[a-z0-9_.-]*)(["']?\s*[:=]\s*["']?)[^\s"',;]+`),
-}
-
-// redactScriptOutput masks scriptSecretPatterns' matches, keeping the scheme or key name so the line
-// still says what was there.
-func redactScriptOutput(text string) string {
-	text = scriptSecretPatterns[0].ReplaceAllString(text, "$1 [redacted]")
-	return scriptSecretPatterns[1].ReplaceAllString(text, "$1$3[redacted]")
 }
