@@ -161,6 +161,47 @@ Takes a dict: {repository, tag, name (optional), root (the root context)}.
 {{- end }}
 
 {{/*
+The A2A NATS bus's four image pins, the same as values.yaml's a2aBus.images: what
+kube-agents.a2aBusImage falls back to when the release's values carry no a2aBus key.
+`helm upgrade --reuse-values` from a release before the key renders this chart against
+that release's values, so the key is absent there, and skipping the four would leave the
+operator on its compiled Docker Hub defaults, which on a mirrored install is the one pull
+an admission policy refuses. A second copy of the pins, so hack/check-image-inventory.sh
+renders the chart without a2aBus and holds this copy to images.json; keep it in step with
+values.yaml.
+*/}}
+{{- define "kube-agents.a2aBusImageDefaults" -}}
+nats:
+  repository: docker.io/library/nats
+  tag: "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
+natsBox:
+  repository: docker.io/natsio/nats-box
+  tag: "0.14.5"
+configReloader:
+  repository: docker.io/natsio/nats-server-config-reloader
+  tag: "0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c"
+prometheusExporter:
+  repository: docker.io/natsio/prometheus-nats-exporter
+  tag: "0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255"
+{{- end }}
+
+{{/*
+One A2A NATS bus image reference for the operator's environment: a2aBus.images.<key>'s
+repository and tag, each falling back to kube-agents.a2aBusImageDefaults when the values
+carry none, rendered through kube-agents.thirdPartyImage, so a mirrored install pulls
+<prefix>/<name>:<tag> and an unmirrored one the full pin, digest included.
+
+Takes a dict: {root (the root context), key (nats, natsBox, configReloader or
+prometheusExporter)}.
+*/}}
+{{- define "kube-agents.a2aBusImage" -}}
+{{- $defaults := index (include "kube-agents.a2aBusImageDefaults" . | fromYaml) .key -}}
+{{- $images := (.root.Values.a2aBus | default dict).images | default dict -}}
+{{- $image := index $images .key | default dict -}}
+{{- include "kube-agents.thirdPartyImage" (dict "repository" ($image.repository | default $defaults.repository) "tag" ($image.tag | default $defaults.tag) "root" .root) -}}
+{{- end }}
+
+{{/*
 Whether the chart renders the A2A gateway's pod admission policy
 (templates/a2a-gateway-pod-admission-policy.yaml): the admission-policy values gate,
 on a cluster where ValidatingAdmissionPolicy is v1. The template renders on this, and
@@ -226,18 +267,18 @@ keeps the container's env free of a duplicate name. `| default dict` because
 Whether the A2A bus's pods carry the NATS exporter sidecar, so its PodMonitoring and
 scrape-alert job render: "true" unless the operator omits the sidecar, which it does when
 A2A_NATS_IMAGE is set and A2A_NATS_EXPORTER_IMAGE is not (a2aNATSExporterOmitted). The
-chart sets both from a2aBus.images (operator-deployment.yaml), so the sidecar is omitted
-only when operator.extraEnv clears the exporter's and leaves the bus image set. An entry
+chart sets both on every render (kube-agents.a2aBusImage, from a2aBus.images or its own
+defaults, so a release whose values have no a2aBus key counts as set too), so the sidecar is
+omitted only when operator.extraEnv clears the exporter's and leaves the bus image set, or
+sets the bus image alone (then the chart's exporter pin stays out: a2aBusExporterFromChart). An entry
 counts as set when it has a non-empty value or a valueFrom, and the last entry for a name
 wins, as it does in the operator container's env (operator-deployment.yaml appends extraEnv
 after the chart's own): a later empty entry clears an earlier one. Without the sidecar the
 scrape would only ever read down.
 */}}
 {{- define "kube-agents.a2aNATSExporterRendered" -}}
-{{- $bus := (.Values.a2aBus | default dict).images | default dict -}}
-{{- $set := dict -}}
-{{- if $bus.nats -}}{{- $_ := set $set "A2A_NATS_IMAGE" true -}}{{- end -}}
-{{- if and $bus.prometheusExporter (include "kube-agents.a2aBusExporterFromChart" .) -}}{{- $_ := set $set "A2A_NATS_EXPORTER_IMAGE" true -}}{{- end -}}
+{{- $set := dict "A2A_NATS_IMAGE" true -}}
+{{- if include "kube-agents.a2aBusExporterFromChart" . -}}{{- $_ := set $set "A2A_NATS_EXPORTER_IMAGE" true -}}{{- end -}}
 {{- range $e := (.Values.operator.extraEnv | default list) -}}
 {{- $e = $e | default dict -}}
 {{- $name := toString (index $e "name") -}}
@@ -2499,8 +2540,40 @@ these have passed.
 {{- range $name, $quantity := $quantities | default dict -}}
 {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
 {{- $raw := toString $quantity | trim -}}
-{{- if not (regexMatch $quantityPattern (trimPrefix "-" (trimPrefix "+" $raw))) -}}
+{{- $abs := regexReplaceAll "^[-+]" $raw "" -}}
+{{- if not (regexMatch $quantityPattern $abs) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- /* The magnitude bounds containerResourcesCheck holds a quantity to, on the value
+       without its sign (the resolver reads a negative as unset, but the operator must
+       still decode it): 15 significant digits, and nothing past int64 in bytes or in
+       millicores, which a large exponent reaches and the CRD's pattern admits. */ -}}
+{{- /* resource.ParseQuantity reads an exponent into an int32 (strconv.ParseInt, then
+       int32()): past int64 it refuses the quantity, and between int32 and int64 it
+       truncates it to another value. So no exponent past int32, either sign. */ -}}
+{{- $exp := regexFind "[eE][-+]?[0-9]+$" $abs -}}
+{{- if $exp -}}
+{{- $digits := regexReplaceAll "^0+" (regexReplaceAll "^[eE][-+]?" $exp "") "" -}}
+{{- if or (gt (len $digits) 10) (and (eq (len $digits) 10) (gt (int64 $digits) 2147483647)) -}}
+{{- fail (printf "%s.%s.%s is %s, whose exponent is past the int32 the operator reads it into: past int64 the operator cannot decode the PlatformAgent, and below that it truncates the exponent to another value" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" $abs "") "" -}}
+{{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
+{{- if gt (len $significand) 15 -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits, more than the chart compares exactly (the bound the CR's other resource overrides hold to); write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $abs -}}
+{{- fail (printf "%s.%s.%s is %s, which is past the range the chart and the operator's int64 readers hold" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $abs) -}}
+{{- fail (printf "%s.%s.%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, the most the operator's readers take" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if eq $name "cpu" -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $abs "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
+{{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
+{{- fail (printf "%s.%s.%s is %s, whose millicore value exceeds the 9223372036854775807 an int64 holds, the most the scheduler represents" $prefix $side $name $raw) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

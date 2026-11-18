@@ -54,10 +54,12 @@ platformAgent:
       maxInProgress: 3
   deployment:
     # The operator copies spec.deployment.env onto the agent container only for
-    # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
-    # shell sandbox, where the audits run, and passes every name it does not
-    # reserve to the credential-proxy and agent-api-auth containers. The name
-    # here reaches the container that reads it. MALLOC_ARENA_MAX is not on the
+    # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE (and
+    # KUBEAGENTS_KUBECTL_COST_TIER, left unset here: set it to fleet only when
+    # the clusters hold tens of thousands of Pods each) to the shell sandbox,
+    # where the audits run, and passes every name it does not reserve to the
+    # credential-proxy and agent-api-auth containers. The name here reaches the
+    # container that reads it. MALLOC_ARENA_MAX is not on the
     # agent container's allowlist: set here it would reach the credential-proxy
     # and agent-api-auth containers, and not the agent container. There it
     # would reach the container's own process, and not the gcloud and kubectl

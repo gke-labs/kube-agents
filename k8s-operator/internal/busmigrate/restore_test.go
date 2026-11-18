@@ -124,14 +124,41 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 			t.Fatalf("%s to R3: %v", n, err)
 		}
 	}
-	time.Sleep(2 * time.Second)
-
 	rc, err := nats.Connect(s2.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rc.Close()
 	js, _ := rc.JetStream()
+	// RaiseReplicas only updates the stream's config: the new replicas catch
+	// up, and the restored consumer reappears on the stream leader, some time
+	// after. On a CI runner a fixed 2s read found the consumer missing (#6174),
+	// so wait for both. How long it took is logged as a diagnostic: it prints
+	// with -v, and on a failing run; CI's go test runs without -v, so a
+	// passing run there doesn't keep it.
+	waitStart := time.Now()
+	deadline := waitStart.Add(30 * time.Second)
+	for {
+		si, serr := js.StreamInfo("TASKS")
+		current := serr == nil && si.Config.Replicas == 3 && si.Cluster != nil && len(si.Cluster.Replicas) == 2
+		if current {
+			for _, r := range si.Cluster.Replicas {
+				if !r.Current {
+					current = false
+				}
+			}
+		}
+		_, cerr := js.ConsumerInfo("TASKS", "worker")
+		if current && cerr == nil {
+			t.Logf("restore-window: consumer present after %s (stream R3, replicas current)", time.Since(waitStart).Round(time.Millisecond))
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Logf("restore-window: not settled after %s: stream %v, consumer %v", time.Since(waitStart).Round(time.Millisecond), serr, cerr)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	si, err := js.StreamInfo("TASKS")
 	if err != nil || si.State.Msgs != 5 || si.State.FirstSeq != 1 || si.State.LastSeq != 5 || si.Config.Replicas != 3 {
 		t.Fatalf("TASKS after the restore: %+v, err %v; want 5 msgs at 1-5, R3", si, err)

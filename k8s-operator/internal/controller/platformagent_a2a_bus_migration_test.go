@@ -1046,7 +1046,7 @@ func TestAPhaseCreatesItsJobAndIdentity(t *testing.T) {
 		"--ca-file " + a2aNATSCAFile(),
 		"--user " + busMigrationPrincipal("pin", "3-1"),
 		"--token-file " + a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams " + strings.Join(a2aProvisionedStreams, ","),
+		"--streams " + strings.Join(a2aBusMigrationStreams(), ","),
 		"--target " + a2aNATSName(m.agent) + "-0",
 	} {
 		if !strings.Contains(args, want) {
@@ -2849,5 +2849,21 @@ func TestAGivenUpShrinkClaimsNoFreezeOrRecreatedStreams(t *testing.T) {
 	agent.Status.BusMigration.Leg = string(busMigrationGrow)
 	if got := busMigrationFailedActions(agent); !strings.Contains(got, "recreated empty") {
 		t.Errorf("given-up grow says %q, want the recreated streams named", got)
+	}
+}
+
+// The migration walks every provisioned stream once, with PROFILE_SUBMITS
+// after both streams that index it: the clear deletes last to first, so a
+// partial clear never leaves the submits without their leases or stops.
+func TestTheMigrationWalksTheSubmitsAfterTheirIndexes(t *testing.T) {
+	order := a2aBusMigrationStreams()
+	if !slices.Equal(slices.Sorted(slices.Values(order)), slices.Sorted(slices.Values(a2aProvisionedStreams))) {
+		t.Fatalf("migration order %v, want exactly the provisioned streams %v", order, a2aProvisionedStreams)
+	}
+	submits := slices.Index(order, a2aProfileSubmitStream)
+	for _, index := range []string{"KV_PROFILE_LEASES", "DISPATCH_STOPS"} {
+		if i := slices.Index(order, index); i < 0 || i > submits {
+			t.Errorf("migration order %v: %s at %d, PROFILE_SUBMITS at %d; the index must come first", order, index, i, submits)
+		}
 	}
 }

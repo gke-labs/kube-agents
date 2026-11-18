@@ -81,7 +81,13 @@ not block the user's initial request.** If asked for YAML/recommendations:
         matching toleration (normal K8s contract). Judge intent before deleting;
         only the compute-class key is redundant. **Manual pools STILL require
         `cloud.google.com/compute-class=<NAME>` as label AND taint to bind to
-        the ComputeClass — never remove that.** **Schema limit:** a
+        the ComputeClass — never remove that.** A manual pool with the label
+        and **no** taint (class status `NodepoolMisconfigured`/`TaintMissing`)
+        still runs Pods that name no class on its existing nodes; when those
+        fill, the Pods stay `Pending`, because on some GKE versions the
+        autoscaler does not grow the pool for them (seen on 1.35.8-gke.1796000,
+        not on 1.36.4-gke.2377000; Symptom 13 in
+        `references/compute-class-debug.md`). **Schema limit:** a
         `nodePoolConfig.taints` key may NOT contain the reserved `kubernetes.io`
         substring (GKE Warden rejects it) — so the Cluster-Autoscaler-ignored
         prefixes
@@ -363,7 +369,8 @@ spec:
 -   **[Karpenter Migration](./references/compute-class-karpenter-migration.md):**
     Translating EKS Karpenter NodePools.
 -   **[Debugging Guide](./references/compute-class-debug.md):** GPU tolerations,
-    `ScaleUpAnyway` traps, PV deadlocks, fragmentation.
+    `ScaleUpAnyway` traps, PV deadlocks, fragmentation, Pods with no class
+    `Pending` on a labelled pool.
 -   **[Autopilot Mode on Standard](./references/compute-class-autopilot-mode.md):**
     Built-in `autopilot`/`autopilot-spot`, pod-based billing,
     `spec.autopilot.enabled`, privileged limits.

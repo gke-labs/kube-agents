@@ -25,7 +25,7 @@
 id: security-webhook-blocks-config-management-system
 name: "Fail-Closed Admission Webhook Whose Backend Service Does Not Exist (webhook backend reachability check)"
 domain: security
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - compliance-audit

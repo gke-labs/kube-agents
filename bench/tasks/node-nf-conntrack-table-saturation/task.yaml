@@ -19,8 +19,8 @@
 id: node-nf-conntrack-table-saturation
 name: "Node conntrack table saturation (declared gap; nothing planted until a reader of conntrack counts exists)"
 domain: fleet-audits
-suite: certification
-certification_part: 2
+suite: validated-capabilities
+suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -30,7 +30,7 @@ prompt: >-
   gce-compute-fleet-audit SOP.
 expected_output: >-
   Nothing planted. Customer failure: a node's conntrack table full, packets
-  dropped. Certified needs a reader of node conntrack counts and then a
+  dropped. Validated needs a reader of node conntrack counts and then a
   bounded plant; the ledger issue would then carry a finding that names the
   node's pool `default-pool` at or above 80 percent of nf_conntrack_max. The
   closing response is the SOP's one line with the ledger URL.

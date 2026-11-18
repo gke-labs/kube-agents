@@ -20,6 +20,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
+# The audit-log reads ask the credential broker's relay first when its URL is set
+# (audit_log._relay_page); with it unset they make no request, so no test here reaches
+# the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import readiness_rules as shared  # noqa: E402
 import upgrade_shape_tables as tables  # noqa: E402
 from readiness_rules import audit_log  # noqa: E402
@@ -463,6 +467,150 @@ class AuditLogReadTest(unittest.TestCase):
         bare = FakeRunner()
         audit_log.read_removed(context_with(bare, timeout=None))
         self.assertEqual(bare.timeouts, [None])
+
+
+class RelayReadTest(unittest.TestCase):
+    """A page the broker's Cloud API relay answers reads as the page `gcloud` prints."""
+
+    @staticmethod
+    def relay_from(runner):
+        """`_relay_page` answered by `runner`: the same filter gets the same entries."""
+
+        def relay_page(project, filter_text, timeout):
+            rc, stdout, _ = runner(["gcloud", "logging", "read", filter_text], timeout)
+            return (0, stdout, "") if rc == 0 else None
+
+        return relay_page
+
+    def both_reads(self, context):
+        return {which: audit_log.read(context, which) for which in (audit_log.READ_REMOVED, audit_log.READ_DEPRECATED)}
+
+    def test_the_relay_read_gives_the_same_result_as_the_gcloud_read(self):
+        removed, deprecated = split_sample()
+        by_gcloud = self.both_reads(context_with(FakeRunner(removed, deprecated)))
+        refused = FakeRunner(rc=1, stderr="gcloud must not run")
+        with patch.object(audit_log, "_relay_page", self.relay_from(FakeRunner(removed, deprecated))):
+            by_relay = self.both_reads(context_with(refused))
+        self.assertEqual(by_gcloud, by_relay)
+        self.assertEqual([], refused.calls)
+        self.assertTrue(by_relay[audit_log.READ_REMOVED]["callers"])
+        # The command recorded is still the gcloud command, the read a person can repeat.
+        self.assertTrue(by_relay[audit_log.READ_REMOVED]["commands"][0].startswith("gcloud logging read "))
+
+    def test_whole_entries_group_as_the_projected_entries_do(self):
+        """`gcloud` prints the projected fields; the relay answers with whole entries."""
+        removed, deprecated = split_sample()
+        whole = json.loads(json.dumps(removed))
+        for entry in whole:
+            entry["resource"] = {"type": "k8s_cluster", "labels": {"cluster_name": "upg-06"}}
+            entry["logName"] = "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity"
+            entry.setdefault("protoPayload", {})["request"] = {"spec": {"padding": "x" * 64}}
+        by_gcloud = audit_log.read_removed(context_with(FakeRunner(removed, deprecated)))
+        with patch.object(audit_log, "_relay_page", self.relay_from(FakeRunner(whole, deprecated))):
+            by_relay = audit_log.read_removed(context_with(FakeRunner(rc=1)))
+        self.assertEqual(by_gcloud, by_relay)
+
+    def test_the_relay_pages_follow_the_oldest_timestamp_as_the_gcloud_pages_do(self):
+        removed, _ = split_sample()
+        first = full_page(removed[0], tables.AUDIT_LOG_PAGE_LIMIT)
+        second = full_page(removed[0], 400, start=datetime(2026, 9, 29, 11, 0, tzinfo=timezone.utc))
+        relay = FakeRunner(pages={audit_log.READ_REMOVED: [first, second]})
+        with patch.object(audit_log, "_relay_page", self.relay_from(relay)):
+            result = audit_log.read_removed(context_with(FakeRunner(rc=1)))
+        self.assertEqual((result["entries"], result["pages"], result["sampled"], result["error"]), (1400, 2, False, None))
+        self.assertIn(' AND timestamp<="' + first[-1]["timestamp"] + '"', relay.calls[1][3])
+
+    def test_a_page_the_relay_does_not_answer_is_read_by_gcloud(self):
+        removed, _ = split_sample()
+        first = full_page(removed[0], tables.AUDIT_LOG_PAGE_LIMIT)
+        second = full_page(removed[0], 400, start=datetime(2026, 9, 29, 11, 0, tzinfo=timezone.utc))
+        relay = FakeRunner(pages={audit_log.READ_REMOVED: [first, FAIL]})
+        gcloud = FakeRunner(pages={audit_log.READ_REMOVED: [second]})
+        with patch.object(audit_log, "_relay_page", self.relay_from(relay)):
+            result = audit_log.read_removed(context_with(gcloud))
+        self.assertEqual((result["entries"], result["pages"], result["error"]), (1400, 2, None))
+        self.assertEqual(1, len(gcloud.calls))
+        self.assertTrue(paged(gcloud.calls[0][3]))
+
+    class Helper:
+        """A stand-in for the shared `logging_reads` module."""
+
+        class ReadTimedOut(TimeoutError):
+            pass
+
+        def __init__(self, answer):
+            self.answer, self.asked = answer, []
+
+        def read_json(self, project, filter_text, limit, **kwargs):
+            self.asked.append((project, filter_text, limit, kwargs))
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+    def test_the_relay_page_asks_the_shared_helper_for_the_page_limit_under_the_cap(self):
+        helper = self.Helper("[]")
+        with patch.dict(sys.modules, {"logging_reads": helper}):
+            self.assertEqual((0, "[]", ""), audit_log._relay_page("example-project", "a-filter", 45))
+            self.assertEqual((0, "[]", ""), audit_log._relay_page("example-project", "a-filter", None))
+        self.assertEqual(
+            [
+                ("example-project", "a-filter", tables.AUDIT_LOG_PAGE_LIMIT, {"timeout_s": 45}),
+                ("example-project", "a-filter", tables.AUDIT_LOG_PAGE_LIMIT, {"timeout_s": audit_log.RELAY_TIMEOUT_SECONDS}),
+            ],
+            helper.asked,
+        )
+
+    def test_a_relay_that_does_not_answer_is_none(self):
+        with patch.dict(sys.modules, {"logging_reads": self.Helper(None)}):
+            self.assertIsNone(audit_log._relay_page("example-project", "a-filter", 45))
+
+    def test_a_relay_page_that_spends_the_cap_is_the_runners_timed_out_call(self):
+        """The same error a `gcloud` call past its cap is, and `gcloud` is not run after it."""
+        helper = self.Helper(self.Helper.ReadTimedOut())
+        gcloud = FakeRunner()
+        with patch.dict(sys.modules, {"logging_reads": helper}):
+            result = audit_log.read_removed(context_with(gcloud))
+        self.assertEqual([], gcloud.calls)
+        self.assertEqual(1, len(helper.asked))
+        self.assertIn("failed (rc=-1): timed out after 45 seconds", result["error"])
+
+    def test_with_no_cap_in_the_context_an_absent_relay_leaves_the_command_as_it_was(self):
+        gcloud = FakeRunner()
+        with patch.object(audit_log, "_relay_page", lambda project, filter_text, timeout: None):
+            result = audit_log.read_removed(context_with(gcloud, timeout=None))
+        self.assertEqual([None], gcloud.timeouts, "the runner's own default, as before the relay")
+        self.assertIsNone(result["error"])
+
+    def test_with_no_cap_in_the_context_a_slow_relay_leaves_the_command_the_rest_of_the_relays_cap(self):
+        gcloud = FakeRunner()
+        ticks = iter([100.0, 140.2, 200.0, 200.0])
+        with patch.object(audit_log, "_relay_page", lambda project, filter_text, timeout: None), \
+                patch.object(audit_log.time, "monotonic", lambda: next(ticks)):
+            audit_log.read_removed(context_with(gcloud, timeout=None, clock=lambda: 0.0))
+        self.assertEqual([audit_log.RELAY_TIMEOUT_SECONDS - 40], gcloud.timeouts)
+
+    def test_with_no_cap_in_the_context_the_relays_page_is_used(self):
+        removed, deprecated = split_sample()
+        refused = FakeRunner(rc=1)
+        with patch.object(audit_log, "_relay_page", self.relay_from(FakeRunner(removed, deprecated))):
+            result = audit_log.read_removed(context_with(refused, timeout=None))
+        self.assertEqual([], refused.calls)
+        self.assertTrue(result["callers"])
+
+    def test_gcloud_gets_what_the_relay_left_of_the_per_call_cap(self):
+        def slow_then_absent(project, filter_text, timeout):
+            return None
+
+        gcloud = FakeRunner()
+        ticks = iter([100.0, 130.4, 200.0, 200.0])
+        with patch.object(audit_log, "_relay_page", slow_then_absent), \
+                patch.object(audit_log.time, "monotonic", lambda: next(ticks)):
+            audit_log.read_removed(context_with(gcloud, clock=lambda: 0.0))
+        self.assertEqual([TIMEOUT - 30], gcloud.timeouts)
+
+    def test_without_the_shared_helper_the_page_is_gclouds(self):
+        with patch.dict(sys.modules, {"logging_reads": None}):
+            self.assertIsNone(audit_log._relay_page("example-project", "a-filter", 45))
 
 
 if __name__ == "__main__":

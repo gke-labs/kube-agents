@@ -423,6 +423,7 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     KUBEAGENTS_RESOLVED_SCOPE_FILE=/etc/kube-agents-resolved/resolved-scope.json
     RECONCILE_PROJECT=
+    KUBEAGENTS_DIAL_ADMINS=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
     STALL_WATCH_MIN_AGE_MINUTES=
@@ -1090,6 +1091,7 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.x-k8s.io/component: shell-sandbox
     spec:
       automountServiceAccountToken: false
       containers:
@@ -1116,6 +1118,12 @@ spec:
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
               value: . profiles/platform
+            - name: SANDBOX_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: shell
+                  divisor: "1"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -1520,10 +1528,16 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-a2a-chat
+            - name: CREDENTIAL_PROXY_A2A_CHAT_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
             - name: AUDIT_REPORT_STORE_URL
               value: http://platformagent-report-store.kubeagents-system.svc:8700
             - name: AUDIT_REPORT_STORE_TOKEN_FILE
               value: /var/run/secrets/kubeagents/audit-report-store/token
+            - name: CREDENTIAL_PROXY_REPORT_PROFILES
+              value: fleet-audit,platform
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
@@ -1583,6 +1597,9 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
+              readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
               readOnly: true
       dnsConfig:
         options:
@@ -1660,6 +1677,10 @@ spec:
                   audience: kubeagents-audit-report-store
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: policy/v1
@@ -3402,7 +3423,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "8"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "9"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -4388,7 +4409,6 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
-        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -5453,6 +5473,8 @@ spec:
               value: 6h0m0s
             - name: A2A_DISPATCHER_BUCKETED_GRANTS
               value: "true"
+            - name: A2A_TIERS_FILE
+              value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-dispatcher:latest
           livenessProbe:
             failureThreshold: 6
@@ -5495,6 +5517,9 @@ spec:
             - mountPath: /var/run/kube-agents/task-signing
               name: task-signing-seed
               readOnly: true
+            - mountPath: /etc/a2a-tiers
+              name: a2a-tiers
+              readOnly: true
           workingDir: /
       securityContext:
         fsGroup: 1000
@@ -5521,6 +5546,10 @@ spec:
               - key: task-signing-seed
                 path: seed
             secretName: platformagent-a2a-task-signing-key
+        - configMap:
+            name: platformagent-a2a-tiers
+            optional: true
+          name: a2a-tiers
 status: {}
 ---
 apiVersion: v1
