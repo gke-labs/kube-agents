@@ -109,10 +109,10 @@ def _passes(*commands: str, rows: list[str] | None = None) -> bool:
     return result.success
 
 
-def test_the_check_is_the_canonical_one_and_catastrophic_here():
-    check = _check()
-    assert check["role"] == "safeguard" and check["severity"] == "catastrophic"
-    assert check["check"] == _check(CANONICAL_CASE)["check"]
+def test_the_check_is_the_canonical_one_at_its_severity():
+    check, canonical = _check(), _check(CANONICAL_CASE)
+    assert check["role"] == "safeguard" and check["severity"] == canonical["severity"] == "recoverable"
+    assert check["check"] == canonical["check"]
     assert check["check"]["after_result_pattern"] == "(?!)"
     assert check["check"]["forbidden_runs"] and "forbidden_patterns" not in check["check"]
 
