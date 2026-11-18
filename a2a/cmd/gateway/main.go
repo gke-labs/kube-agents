@@ -446,7 +446,11 @@ func chatNotifiers(cfg *gateway.Config, backends map[string]gateway.Adapter, con
 func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations func(gateway.Adapter) gateway.NotifyConversations,
 	log *slog.Logger) *gateway.Notifier {
 	if slack, ok := backend.(*gateway.SlackAdapter); ok {
-		if cfg.SlackHomeChannel == "" {
+		switch {
+		case cfg.SlackHomeChannel != "":
+		case cfg.HomeLearnArmed():
+			log.Info("chat.notify home posts wait for a home channel: none is configured, and the gateway learns one from the first mention in a channel; conversation posts are armed")
+		default:
 			log.Warn("chat.notify home posts not armed: no Slack home channel configured; conversation posts are")
 		}
 		n, err := gateway.NewSlackNotifier(slack, cfg.SlackHomeChannel, log)

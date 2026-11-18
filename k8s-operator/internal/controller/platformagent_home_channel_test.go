@@ -959,9 +959,9 @@ const (
 	gatewayGchatHomeSource  = "../../../a2a/gateway/gchat_home_channel.go"
 	agentChatNotifySource   = "../../../agents/platform/scripts/chat_notify.py"
 	kanbanChatNotifySource  = "../../../deploy/docker/patches/kanban_chat_notify.py"
-	gatewaySpaceMaxPattern  = `(?m)^\tgchatHomeSpaceMax = (\d+)$`
-	gatewayGchatKeyPattern  = `(?m)^\tgchatHomeFileKey = "([^"]+)"$`
-	gatewaySlackKeyPattern  = `(?m)^\thomeFileKey\s+= "([^"]+)"$`
+	gatewaySpaceMaxPattern  = `(?m)^\tgchatHomeSpaceMax\s+=\s+(\d+)$`
+	gatewayGchatKeyPattern  = `(?m)^\tgchatHomeFileKey\s+=\s+"([^"]+)"$`
+	gatewaySlackKeyPattern  = `(?m)^\thomeFileKey\s+=\s+"([^"]+)"$`
 	pythonGchatKeyPattern   = `(?m)^GCHAT_HOME_FILE_KEY = "([^"]+)"$`
 	pythonSlackKeyPattern   = `(?m)^HOME_FILE_KEY = "([^"]+)"$`
 	homeValueMissingMessage = "%s declares nothing matching %s; if the declaration moved or changed shape, this test's pattern must follow it"
