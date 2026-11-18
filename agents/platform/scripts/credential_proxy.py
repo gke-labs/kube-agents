@@ -1490,6 +1490,15 @@ RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
 # A profile caller's proposal-update that edits labels (#3993): refused whoever
 # owns the proposal (vcs_broker.ProfileLabelsRefused).
 RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
+# A profile caller's permitted write on a branch or proposal its own task did not
+# create (#6400), refused under RULE_CALLER_VCS_OWNERSHIP with this code.
+PROPOSAL_NOT_THIS_TASKS_CODE = "PROPOSAL_NOT_THIS_TASKS"
+# How long after its task credential expires a task's record is kept, so a write
+# racing the expiry is judged by the record rather than by its absence.
+PROFILE_TASK_RECORD_MARGIN_SECONDS = 300
+# The most branches and proposals the record holds at once; past it the entries
+# whose tasks expire first are dropped, which refuses their later writes.
+PROFILE_TASK_RECORD_MAX_ENTRIES = 4096
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
 DIAL_PATH = "/v1/dial"
@@ -5257,6 +5266,109 @@ class ClaimTokens:
         if entry is None or entry.expires_at <= now:
             return None
         return entry
+
+
+@dataclass
+class _TaskOwned:
+    task: str
+    expires_at: float
+
+
+class ProfileTaskWrites:
+    """Which profile task created which branch and proposal, so a permit reaches only its own (#6400).
+
+    The permit is per task, and the ownership check (`VcsBroker.require_agent_
+    proposal`) admits anything that is the install's, so without this one
+    confirmed task could retitle or advance another open `platform-agent/`
+    proposal. This holds each permit-gated write to what the same task made:
+
+      * a branch is claimed by the first task that publishes it while it is
+        absent from the remote, under one lock, so of two tasks publishing the
+        same new name the first wins and the second is refused;
+      * a proposal is recorded for the task whose `proposal-create` opened it.
+
+    Process-local, which is only right because one broker pod serves
+    `/v1/vcs/`: the stateful broker renders one replica with the Recreate
+    strategy, so no second pod ever holds a different record (an operator test
+    pins both). If that route ever scales out, this record moves to shared
+    state first. Lost on a restart, which refuses rather than permits: a
+    branch on the remote with no claim, or a proposal with no record, is not
+    this task's. Entries expire with the task's credential plus
+    PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the credential's own
+    expiry is stated in.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.time,
+        max_entries: int = PROFILE_TASK_RECORD_MAX_ENTRIES,
+    ) -> None:
+        self._clock = clock
+        self._max_entries = max_entries
+        self._branches: dict[tuple[str, str], _TaskOwned] = {}
+        self._proposals: dict[tuple[str, int], _TaskOwned] = {}
+        self._lock = threading.Lock()
+
+    def _prune_locked(self) -> None:
+        now = self._clock()
+        for table in (self._branches, self._proposals):
+            for key in [key for key, owned in table.items() if owned.expires_at <= now]:
+                del table[key]
+            while len(self._branches) + len(self._proposals) > self._max_entries and table:
+                del table[min(table, key=lambda key: table[key].expires_at)]
+
+    def claim_branch(
+        self, task: str, expires_at: float, repository: str, branch: str, on_remote: Callable[[], bool]
+    ) -> tuple[bool, bool]:
+        """(allowed, fresh): may ``task`` publish ``branch``, and is the claim new to this call.
+
+        Allowed when the task already holds the branch, or when nobody holds it
+        and it is absent from the remote (``on_remote``, asked outside the lock;
+        an error there counts as present). A fresh claim is taken before the
+        remote is asked, so a second task racing the same new name finds it held.
+        """
+        key = (repository, branch)
+        with self._lock:
+            self._prune_locked()
+            owned = self._branches.get(key)
+            if owned is not None:
+                if owned.task != task:
+                    return False, False
+                owned.expires_at = max(owned.expires_at, expires_at)
+                return True, False
+            self._branches[key] = _TaskOwned(task, expires_at)
+        try:
+            present = on_remote()
+        except Exception:
+            present = True
+        if present:
+            self.release_branch(task, repository, branch)
+            return False, False
+        return True, True
+
+    def release_branch(self, task: str, repository: str, branch: str) -> None:
+        """Drop ``task``'s claim on ``branch``, if it holds it (a publish that failed)."""
+        with self._lock:
+            owned = self._branches.get((repository, branch))
+            if owned is not None and owned.task == task:
+                del self._branches[(repository, branch)]
+
+    def owns_branch(self, task: str, repository: str, branch: str) -> bool:
+        with self._lock:
+            self._prune_locked()
+            owned = self._branches.get((repository, branch))
+            return owned is not None and owned.task == task
+
+    def record_proposal(self, task: str, expires_at: float, repository: str, number: int) -> None:
+        with self._lock:
+            self._proposals[(repository, number)] = _TaskOwned(task, expires_at)
+            self._prune_locked()
+
+    def owns_proposal(self, task: str, repository: str, number: int) -> bool:
+        with self._lock:
+            self._prune_locked()
+            owned = self._proposals.get((repository, number))
+            return owned is not None and owned.task == task
 
 
 class ServiceAccountAuthenticator:
@@ -14323,6 +14435,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # The claim tokens `proposal-create` answers carry and `proposal-claim`
     # burns. One store per process, shared by every handler thread.
     claim_tokens: ClaimTokens = ClaimTokens()
+    # The branches and proposals each profile task made (#6400): one per process,
+    # which is one per /v1/vcs/ server -- see ProfileTaskWrites.
+    profile_task_writes: ProfileTaskWrites = ProfileTaskWrites()
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
@@ -16906,6 +17021,61 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         status = self._dispatch_vcs_post(verb)
         self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
 
+    def _profile_task_bar(
+        self, principal: Any, verb: str, payload: dict[str, Any], repository: str
+    ) -> tuple[str | None, tuple[str, str, str] | None]:
+        """(refusal, fresh claim): why this permitted profile write isn't its task's, or None.
+
+        The fresh claim is (task, repository, branch) when this call claimed a
+        new branch for a publish, so a failed publish can release it.
+        """
+        task = getattr(principal, "task", None)
+        task_id = str(getattr(task, "task", "") or "")
+        if not task_id:
+            return "this write needs the task its credential names, and the credential names none", None
+        expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
+        record = self.profile_task_writes
+        if verb == "publish":
+            branch = str(payload.get("branch") or "")
+            allowed, fresh = record.claim_branch(
+                task_id, expires_at, repository, branch, lambda: self._remote_branch_exists(payload, branch)
+            )
+            if not allowed:
+                return (
+                    f"{branch} is not a branch this task created: it is on the remote already, or "
+                    "another task published it first, so this task does not publish to it."
+                ), None
+            return None, (task_id, repository, branch) if fresh else None
+        if verb == PROPOSAL_CREATE_VERB:
+            source = str(payload.get("source") or "")
+            if not record.owns_branch(task_id, repository, source):
+                return (
+                    f"{source} is not a branch this task published, so this task does not open a "
+                    "proposal from it."
+                ), None
+            return None, None
+        if verb == "proposal-update":
+            number = payload.get("number")
+            if isinstance(number, bool) or not isinstance(number, int) or not record.owns_proposal(task_id, repository, number):
+                return f"proposal #{number} is not one this task opened, so this task does not update it.", None
+            return None, None
+        return f"{verb} is not a write the task bar knows, so it is refused", None
+
+    def _remote_branch_exists(self, payload: dict[str, Any], branch: str) -> bool:
+        """Whether ``branch`` is on the remote, through the broker's own branch-view."""
+        view = vcs_broker.route_table(self.vcs)["branch-view"]({"repository": payload.get("repository"), "branch": branch})
+        return bool((view or {}).get("branch", {}).get("exists"))
+
+    def _record_task_proposal(self, principal: Any, result: Any, repository: str) -> None:
+        """Record the proposal a profile task's `proposal-create` opened, for its later updates."""
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        number = proposal.get("number") if isinstance(proposal, dict) else None
+        task = getattr(principal, "task", None)
+        task_id = str(getattr(task, "task", "") or "")
+        if task_id and isinstance(number, int) and not isinstance(number, bool):
+            expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
+            self.profile_task_writes.record_proposal(task_id, expires_at, repository, number)
+
     def _mint_claim(self, result: Any, repository: Any) -> None:
         """Add a one-time claim token to a `proposal-create` answer that names its proposal.
 
@@ -17158,7 +17328,40 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                             },
                         )
                         return TOOL_STATUS_BLOCKED
-                result = route(payload)
+                # The task bar (#6400): under the permit, only what this task
+                # itself created. The ownership bar above admitted anything the
+                # install made; the permit names one task, so its writes reach
+                # that task's branches and proposals alone.
+                fresh_branch = None
+                if role == CALLER_ROLE_PROFILE and verb in PROFILE_OWNERSHIP_GATED_VCS_VERBS:
+                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, repository)
+                    if refusal is not None:
+                        LOGGER.warning(
+                            "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
+                            _sanitize_for_logging(verb),
+                            RULE_CALLER_VCS_OWNERSHIP,
+                            refusal,
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": refusal,
+                                "code": PROPOSAL_NOT_THIS_TASKS_CODE,
+                                "rule": RULE_CALLER_VCS_OWNERSHIP,
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
+                try:
+                    result = route(payload)
+                except BaseException:
+                    if fresh_branch is not None:
+                        # The publish that would have made the branch failed;
+                        # the name goes back to nobody.
+                        self.profile_task_writes.release_branch(*fresh_branch)
+                    raise
+                if role == CALLER_ROLE_PROFILE and verb == PROPOSAL_CREATE_VERB:
+                    self._record_task_proposal(principal, result, repository)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)

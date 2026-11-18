@@ -1523,6 +1523,62 @@ PROFILE_VCS_READS = frozenset(
 )
 PROFILE_VCS_WRITES = frozenset({"publish", "proposal-create", "proposal-update"})
 PERMIT = CASES["a permit"]
+# The task both fixture credentials name, and an expiry well past any test's clock.
+TASK_ID = PERMIT["claims"]["task"]
+FAR = 4_000_000_000.0
+
+
+class ProfileTaskWritesTest(unittest.TestCase):
+    """The per-task record on its own (#6400): the race, expiry, eviction and a restart."""
+
+    def test_of_two_tasks_publishing_the_same_new_name_the_first_wins(self):
+        record = credential_proxy.ProfileTaskWrites()
+        asked = []
+
+        def absent_while_the_second_task_arrives():
+            # The first task's remote lookup is in flight when the second claims.
+            asked.append("first")
+            second = record.claim_branch("task-2", FAR, "r", "platform-agent/x", lambda: False)
+            self.assertEqual((False, False), second)
+            return False
+
+        self.assertEqual((True, True), record.claim_branch("task-1", FAR, "r", "platform-agent/x", absent_while_the_second_task_arrives))
+        self.assertEqual(["first"], asked)
+        self.assertTrue(record.owns_branch("task-1", "r", "platform-agent/x"))
+        self.assertFalse(record.owns_branch("task-2", "r", "platform-agent/x"))
+        # The owner publishes again: allowed, not fresh.
+        self.assertEqual((True, False), record.claim_branch("task-1", FAR, "r", "platform-agent/x", lambda: True))
+
+    def test_entries_expire_with_the_task(self):
+        now = [1000.0]
+        record = credential_proxy.ProfileTaskWrites(clock=lambda: now[0])
+        record.claim_branch("t", 1100.0, "r", "b", lambda: False)
+        record.record_proposal("t", 1100.0, "r", 5)
+        self.assertTrue(record.owns_branch("t", "r", "b") and record.owns_proposal("t", "r", 5))
+        now[0] = 1100.0
+        self.assertFalse(record.owns_branch("t", "r", "b"))
+        self.assertFalse(record.owns_proposal("t", "r", 5))
+
+    def test_a_fresh_record_owns_nothing(self):
+        record = credential_proxy.ProfileTaskWrites()
+        self.assertFalse(record.owns_branch("t", "r", "b"))
+        self.assertFalse(record.owns_proposal("t", "r", 1))
+
+    def test_past_the_cap_the_soonest_expiring_go_first(self):
+        record = credential_proxy.ProfileTaskWrites(max_entries=2)
+        record.record_proposal("t", FAR + 1, "r", 1)
+        record.record_proposal("t", FAR + 3, "r", 3)
+        record.record_proposal("t", FAR + 2, "r", 2)
+        self.assertFalse(record.owns_proposal("t", "r", 1))
+        self.assertTrue(record.owns_proposal("t", "r", 2) and record.owns_proposal("t", "r", 3))
+
+    def test_a_release_drops_only_the_holders_claim(self):
+        record = credential_proxy.ProfileTaskWrites()
+        record.claim_branch("t1", FAR, "r", "b", lambda: False)
+        record.release_branch("t2", "r", "b")
+        self.assertTrue(record.owns_branch("t1", "r", "b"))
+        record.release_branch("t1", "r", "b")
+        self.assertFalse(record.owns_branch("t1", "r", "b"))
 
 
 class ProfileVcsRouteTest(unittest.TestCase):
@@ -1573,6 +1629,19 @@ class ProfileVcsRouteTest(unittest.TestCase):
         patcher = mock.patch.object(credential_proxy, "repository_is_managed", self.managed)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The task bar (#6400): a fresh record per test, seeded with what the
+        # permit's task made, so the write tests below write on its own work.
+        self.record = credential_proxy.ProfileTaskWrites()
+        patcher = mock.patch.object(CredentialProxyHandler, "profile_task_writes", self.record)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for branch in ("platform-agent/fix", "platform-agent/new-change"):
+            self.own_branch(branch)
+        self.record.record_proposal(TASK_ID, FAR, "acme/infra", 7)
+
+    def own_branch(self, branch, task=None):
+        allowed, _ = self.record.claim_branch(task or TASK_ID, FAR, "acme/infra", branch, lambda: False)
+        assert allowed
 
     # proposal-create from a profile task carries only the fields every adapter
     # reads, so it gets a payload of its own.
@@ -1640,6 +1709,70 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.assert_ran("proposal-list", status, body)
         self.assertEqual([credential_proxy.CALLER_ROLE_PROFILE], sessions)
         self.assertEqual([credential_proxy.CLASS_BACKGROUND], classes)
+
+    # -- the task bar: only what this task made (#6400) -------------------------
+
+    def assert_not_this_tasks(self, verb, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual(credential_proxy.PROPOSAL_NOT_THIS_TASKS_CODE, body.get("code"), body)
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_OWNERSHIP, body["rule"])
+        self.routes[verb].assert_not_called()
+
+    def test_a_task_publishes_a_new_branch_opens_its_proposal_and_updates_it(self):
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/fresh", "exists": False}}
+        self.routes["proposal-create"].return_value = {"proposal": {"number": 9, "url": "https://github.com/acme/infra/pull/9"}}
+        status, body = self.post_with("publish", branch="platform-agent/fresh")
+        self.assertEqual(200, status, body)
+        status, body = self.post_with("proposal-create", source="platform-agent/fresh")
+        self.assertEqual(200, status, body)
+        self.forge.proposals[9] = _proposal(9, "platform-agent/fresh")
+        status, body = self.post_with("proposal-update", number=9)
+        self.assertEqual(200, status, body)
+
+    def test_another_tasks_proposal_is_refused(self):
+        # The install's own (it passes the ownership bar), but another task opened it.
+        self.forge.proposals[8] = _proposal(8, "platform-agent/incident")
+        self.record.record_proposal("task-2", FAR, "acme/infra", 8)
+        status, body = self.post_with("proposal-update", number=8)
+        self.assert_not_this_tasks("proposal-update", status, body)
+
+    def test_a_proposal_no_task_recorded_is_refused(self):
+        # A restart drops the record: refused, never permitted.
+        self.forge.proposals[8] = _proposal(8, "platform-agent/incident")
+        status, body = self.post_with("proposal-update", number=8)
+        self.assert_not_this_tasks("proposal-update", status, body)
+
+    def test_proposal_create_from_a_branch_this_task_did_not_publish_is_refused(self):
+        self.own_branch("platform-agent/incident", task="task-2")
+        for source in ("platform-agent/incident", "platform-agent/never-published"):
+            with self.subTest(source=source):
+                self.reset()
+                status, body = self.post_with("proposal-create", source=source)
+                self.assert_not_this_tasks("proposal-create", status, body)
+
+    def test_publish_to_a_branch_already_on_the_remote_is_refused(self):
+        # Unclaimed but present: another task's, or one from before a restart.
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/old", "exists": True}}
+        status, body = self.post_with("publish", branch="platform-agent/old")
+        self.assert_not_this_tasks("publish", status, body)
+        self.assertFalse(self.record.owns_branch(TASK_ID, "acme/infra", "platform-agent/old"))
+
+    def test_publish_to_a_branch_another_task_claimed_is_refused(self):
+        self.own_branch("platform-agent/theirs", task="task-2")
+        status, body = self.post_with("publish", branch="platform-agent/theirs")
+        self.assert_not_this_tasks("publish", status, body)
+
+    def test_a_remote_lookup_that_fails_counts_as_present(self):
+        self.routes["branch-view"].side_effect = credential_proxy.providers.WorkspaceError("forge down", status=502)
+        status, body = self.post_with("publish", branch="platform-agent/fresh")
+        self.assert_not_this_tasks("publish", status, body)
+
+    def test_a_failed_publish_releases_its_new_claim(self):
+        self.routes["branch-view"].return_value = {"branch": {"name": "platform-agent/fresh", "exists": False}}
+        self.routes["publish"].side_effect = credential_proxy.providers.WorkspaceError("push rejected", status=409)
+        status, _ = self.post_with("publish", branch="platform-agent/fresh")
+        self.assertEqual(409, status)
+        self.assertFalse(self.record.owns_branch(TASK_ID, "acme/infra", "platform-agent/fresh"))
 
     def test_every_read_verb_runs_with_the_permit_too(self):
         for verb in sorted(PROFILE_VCS_READS):

@@ -2843,7 +2843,10 @@ reaches only a proposal the install opened from its own `platform-agent/` branch
 repository, `publish` only a `platform-agent/` branch, and onto one carrying open proposals
 only when they are all the install's, and `proposal-create` only from the install's own
 `platform-agent/` branch of this repository, each named by its bare branch name (rule
-`caller.vcs-ownership`). A profile `proposal-update` changes only the title and body; a
+`caller.vcs-ownership`). Beyond the install's own, each write reaches only what the same task
+made: a branch it published while the name was free on the remote, and a proposal it opened
+(`PROPOSAL_NOT_THIS_TASKS`, same rule), from a record the one stateful broker pod keeps in
+memory and loses on a restart, which refuses rather than permits. A profile `proposal-update` changes only the title and body; a
 label edit is refused under `caller.vcs-labels`. The shell is held to none of this. No
 other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
