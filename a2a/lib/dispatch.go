@@ -513,11 +513,6 @@ func (p DispatchProfile) JobTemplatesPerTier() bool {
 	return p.JobTemplateRef != nil && p.JobTemplateRef.PerTier && len(p.JobTemplate) == 0
 }
 
-// HasAnyJobTemplate says the config names some template for p.
-func (p DispatchProfile) HasAnyJobTemplate() bool {
-	return len(p.JobTemplate) > 0 || p.JobTemplateRef != nil
-}
-
 // DispatchProfile is one profile's limits, from its AgentProfile.
 type DispatchProfile struct {
 	Name  string   `json:"name"`

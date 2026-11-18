@@ -192,12 +192,12 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 //
 // pods covers the three kinds of pod the namespace runs: the warm workers
 // (warmReplicas for each interactive (profile, tier)), one rollout surge pod
-// per warm pool, and the unattended tier's Job pods, which the dispatcher
-// holds to the ceiling. Interactive tasks run in the warm workers, so they
+// per warm pool, and the Job pods (unattended tasks', and at any tier
+// permit-carrying ones', #5646), which the dispatcher holds to the ceiling. Interactive tasks run in the warm workers, so they
 // add no pods. Like the session quota, the key is `pods`, which counts
 // non-terminal pods only, and a pod in its deletion grace period is not yet
-// terminal. Where Job mode can run (the chart's Job policy signal and a
-// profile allowing the unattended tier), a task's slot is free once its Job
+// terminal. Where Job mode can run (the chart's Job policy signal and any
+// bound profile, since every profile has Job templates), a task's slot is free once its Job
 // is deleted, so the next Job's pod can start while the last one's still
 // terminates: a second ceiling's worth covers one terminating Job pod per
 // slot. It is the only key for now; requests.cpu and

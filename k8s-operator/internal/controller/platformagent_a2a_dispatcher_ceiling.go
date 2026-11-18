@@ -156,8 +156,8 @@ func dispatcherIdentityShare(agent *agentv1alpha1.PlatformAgent, base int, p *ag
 // and the bytes each of these profiles' entries adds to it, as
 // buildA2ADispatchConfigMapWith writes it (compact JSON): no durables and a
 // Job template referenced by its hash alone, which the dispatcher resolves
-// (#5479). A profile with a live unattended-mode tier under Job mode carries
-// that reference, whose hash is fixed-width, so which rendering the cluster
+// (#5479). Under Job mode every profile carries that reference (its
+// templates are per tier, #5646), whose hash is fixed-width, so which rendering the cluster
 // takes doesn't change its size. Each share is measured alone and charged
 // one more byte for the comma it takes in the array: exact for every entry
 // after the first, one over for the first, never under.

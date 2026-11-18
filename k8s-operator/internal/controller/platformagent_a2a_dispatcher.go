@@ -1058,7 +1058,8 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 	// profile namespaces by labels it may lack), or a policy not in place,
 	// revokes the Jobs Role alone and leaves the templates out, so unattended
 	// tasks have no worker (the warm pools serve the read tier only) and are
-	// refused no-worker at admission; Jobs already running stay, since the policy holds
+	// refused no-worker at admission, and confirmed changes are refused
+	// change-needs-job; Jobs already running stay, since the policy holds
 	// only creates and each was held to its template when made. Only the
 	// signal off (a deliberate gate-off) tears Job mode down, below.
 	// revokeErr is the !jobMode arm's revoke, which the gate-off sweep

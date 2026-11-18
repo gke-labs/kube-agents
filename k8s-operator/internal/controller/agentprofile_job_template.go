@@ -42,9 +42,10 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// Job mode for the unattended tier (#3655 PR 6). The dispatcher runs each
-// unattended task as a Job in the profile namespace, from a pod template the
-// operator renders per profile. The same template goes two places: into the
+// Job mode (#3655 PR 6, per tier since #5646). The dispatcher runs each
+// unattended task, and at any tier each permit-carrying task, as a Job in the
+// profile namespace, from a pod template the operator renders per profile
+// and tier. The same template goes two places: into the
 // dispatch config (a2aDispatchProfile.JobTemplate), which the dispatcher
 // stamps a Job from, and, defaulted by a server-side dry run, into a
 // DispatchJobTemplate in the profile namespace, which the admission policy
@@ -251,7 +252,8 @@ func autopilotRatioProblem(p *agentv1alpha1.AgentProfile) string {
 // without the policy the dispatcher's Job create would be as wide as its Role,
 // so the operator renders no Job templates and no Jobs Role, and unattended
 // tasks have no worker (the warm pools serve the read tier only) and are
-// refused no-worker at admission. It says the policy was rendered, not that it still
+// refused no-worker at admission, and confirmed changes, which run only in a
+// Job of their own, are refused change-needs-job. It says the policy was rendered, not that it still
 // holds.
 const a2aDispatcherJobPolicyEnvVar = "A2A_DISPATCHER_JOB_POLICY"
 
@@ -507,8 +509,8 @@ func dispatchJobParamTemplate(param *agentv1alpha1.DispatchJobTemplate) (corev1.
 // server-side dry-run create of a PodTemplate in ns (nothing is stored). The
 // policy compares a Job's defaulted pod template with its param field for
 // field, and the API server doesn't default a DispatchJobTemplate's
-// contents, so the param holds the defaulted form. Run every reconcile, so
-// it follows the API server's defaults across upgrades. The operator's only
+// contents, so the param holds the defaulted form. Run for each param the
+// pass writes; one already current is left alone, without a dry run. The operator's only
 // podtemplate verb is create, for this.
 func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, param string, tmpl *corev1.PodTemplateSpec) (*corev1.PodTemplateSpec, error) {
 	// A generated name: nothing is stored, and no PodTemplate of a fixed
@@ -520,8 +522,8 @@ func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, 
 	return &dry.Template, nil
 }
 
-// buildA2ADispatcherJobsRole lets the dispatcher run unattended tasks as
-// Jobs in the profile namespace: create, read and delete jobs, and get the
+// buildA2ADispatcherJobsRole lets the dispatcher run unattended tasks, and
+// permit-carrying tasks at any tier, as Jobs in the profile namespace: create, read and delete jobs, and get the
 // DispatchJobTemplates the dispatch config names a profile's template by
 // (its pod-read Role covers pods). No update or patch on jobs, so the
 // admission policy on CREATE is the whole of what it can shape, and no write
@@ -563,7 +565,7 @@ func a2aDispatcherJobsRoleName(agent *agentv1alpha1.PlatformAgent) string {
 type errForeignDispatchJobParam struct{ name string }
 
 func (e errForeignDispatchJobParam) Error() string {
-	return fmt.Sprintf("DispatchJobTemplate %s in the profile namespace is not this agent's (it lacks the agent's labels), so it is left alone and Job mode is off for every profile (unattended tasks have no worker, and are refused no-worker at admission) until it is removed", e.name)
+	return fmt.Sprintf("DispatchJobTemplate %s in the profile namespace is not this agent's (it lacks the agent's labels), so it is left alone and Job mode is off for every profile (unattended tasks have no worker and are refused no-worker at admission, and confirmed changes are refused change-needs-job) until it is removed", e.name)
 }
 
 // reconcileDispatchJobParams brings the policy's params in line with
