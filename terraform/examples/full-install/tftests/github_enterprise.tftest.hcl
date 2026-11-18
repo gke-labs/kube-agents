@@ -110,7 +110,7 @@ run "a_github_ca_needs_a_ghes_host" {
     github_repo           = "acme/infra"
     github_ca_secret_name = "github-forge-ca"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "a_github_ca_is_not_for_gitlab" {
@@ -121,7 +121,7 @@ run "a_github_ca_is_not_for_gitlab" {
     gitlab_repo           = "g/p"
     github_ca_secret_name = "github-forge-ca"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "the_github_ca_secret_name_is_a_kubernetes_name" {
@@ -140,7 +140,7 @@ run "a_host_github_operates_is_refused" {
     gitops_host = "acme.ghe.com"
     github_repo = "platform/infra"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "github_com_as_a_host_is_refused" {
@@ -149,7 +149,7 @@ run "github_com_as_a_host_is_refused" {
     gitops_host = "github.com"
     github_repo = "platform/infra"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "a_gitlab_host_is_not_a_ghes" {
@@ -158,7 +158,7 @@ run "a_gitlab_host_is_not_a_ghes" {
     gitops_host = "gitlab.com"
     github_repo = "platform/infra"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "ghes_needs_owner_and_name" {
@@ -167,7 +167,7 @@ run "ghes_needs_owner_and_name" {
     gitops_host = "github.acme.corp"
     github_repo = "https://github.acme.corp/platform/infra"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "ghes_needs_a_repo" {
@@ -175,7 +175,7 @@ run "ghes_needs_a_repo" {
   variables {
     gitops_host = "github.acme.corp"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "ghes_release_values" {
@@ -188,21 +188,21 @@ run "ghes_release_values" {
     github_app_id         = "12"
   }
   assert {
-    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration) == jsonencode({
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.integration) == jsonencode({
       forges = [{
         caBundleRef = { name = "github-forge-ca" }, host = "github.acme.corp", name = "github", namespace = "platform", provider = "github"
       }]
       github       = null
       repositories = [{ forge = "github", repository = "infra", role = "gitops" }]
     })
-    error_message = "integration: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration)}"
+    error_message = "integration: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.integration)}"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter.enabled == true
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).githubMinter.enabled == true
     error_message = "a GitHub Enterprise Server install lost its minter"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter.org == "platform" && yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter.repo == "infra"
-    error_message = "minter scope: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter)}"
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).githubMinter.org == "platform" && yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).githubMinter.repo == "infra"
+    error_message = "minter scope: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).githubMinter)}"
   }
 }

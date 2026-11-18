@@ -1078,6 +1078,42 @@ class VcsCallErrorTest(unittest.TestCase):
                     self.assertEqual(caught.exception.payload, {"error": f"HTTP {status}"})
                     self.assertTrue(stream.closed, "vcs_call left the refusal open")
 
+    # No token file: the call sends no header, whatever the shell exports.
+    _no_token_file = patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": ""})
+
+    @staticmethod
+    def _answer(body):
+        """A 2xx reply with `body`."""
+
+        def answer(request, *args, **kwargs):
+            return io.BytesIO(body)
+
+        return patch.object(credential_proxy_client, "open_broker_request", answer)
+
+    def test_a_2xx_answer_whose_json_body_is_not_an_object_is_a_value_error(self):
+        # Valid JSON of another type, from something between the client and the
+        # broker, or a broker fault. Every consumer reads the answer as an
+        # object. A ValueError is what a 2xx body that does not parse leaves
+        # as, and `vcs_client.call` has an arm for it.
+        # Each type that `json.load` gives, apart from an object.
+        bodies = (
+            (b"[]", "list"), (b'"busy"', "str"), (b"503", "int"), (b"1.5", "float"), (b"true", "bool"),
+            (b"null", "NoneType"),
+        )
+        for body, type_name in bodies:
+            with self.subTest(body=body):
+                with self._no_token_file, self._answer(body), self.assertRaises(ValueError) as caught:
+                    credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                # The type's name, and nothing of the body.
+                self.assertIn(type_name, str(caught.exception))
+                for content in ("busy", "503", "1.5"):
+                    self.assertNotIn(content, str(caught.exception))
+
+    def test_a_2xx_answer_that_is_an_object_comes_back_as_it_is(self):
+        for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
+            with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
+                self.assertEqual(credential_proxy_client.vcs_call(self.endpoint, "capabilities", {}), answer)
+
 
 class TestCallerCredential(SubmittedPayloadTestCase):
     """The client half of the broker's authentication.
@@ -1200,6 +1236,32 @@ class TestTaskCredential(SubmittedPayloadTestCase):
         sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
         self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
         self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def run_vcs_call(self, environ):
+        captured = {}
+
+        def fake_open(request, *args, **kwargs):
+            captured["request"] = request
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return RecordingResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                captured["answer"] = credential_proxy_client.vcs_call(
+                    self.LOCAL_ENDPOINT, "proposal-create", {"repository": "acme/infra"}
+                )
+        return captured
+
+    def test_a_vcs_call_sends_the_credential_in_its_header(self):
+        # The broker refuses a profile caller's version-control verbs without
+        # it, and reads the write permit off it (#3993).
+        sent = self.run_vcs_call(self.task_env())
+        self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
+        self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def test_a_vcs_call_outside_a_task_sends_no_credential(self):
+        sent = self.run_vcs_call({credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
 
     def test_the_credential_is_read_on_every_call(self):
         # A warm pod's next task writes its own credential to the same file.

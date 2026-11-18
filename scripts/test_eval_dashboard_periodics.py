@@ -130,7 +130,7 @@ def finished(when, passed=True):
 
 class FetchTest(unittest.TestCase):
     def test_a_job_that_logs_beside_the_nightlies_is_read_from_its_own_bucket(self):
-        # The certification slice and the replay lane are decorated like the
+        # The validated-capabilities slice and the replay lane are decorated like the
         # nightlies, so their builds live under EVAL_NIGHTLY_LOGS_ROOT; a read
         # under the periodic-logs root would find nothing and the lane would be
         # unwatched without anyone knowing.
