@@ -96,11 +96,11 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Fifty-one fixtures: forty-five across the four cluster slots and six project-scoped. Five of the project-scoped ones, `startup-fail-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Fifty-two fixtures: forty-six across the four cluster slots and six project-scoped. Five of the project-scoped ones, `startup-fail-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
-fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
+fixtures are on slot `a`, across the fourteen seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
 defect node pools and the declared zonal pool. Slot `c` is the configuration outlier, on its control plane and on its default
 pool, and since the ComputeClass fixtures (`defects-c.tf`) also the one cluster whose only pool
 carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool,
@@ -125,6 +125,7 @@ its roles are never published.
 | `declared-no-pdb-workload`          | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, in a namespace with no NetworkPolicy; both declared on purpose in the GitOps repository's `knowledge/`                                                                                                                                                              |
 | `declared-token-workload`           | a       | 0   | `deployment/token-reader` and `deployment/token-sidecar` in `seeded-token`, on the default ServiceAccount with the token mounted; `token-reader` declared on purpose in the GitOps repository's `knowledge/`, `token-sidecar` not                                                                                                             |
 | `declared-overrequest-workload`     | a       | 0   | `deployment/burst-ingest` in `seeded-headroom`, two pause replicas requesting `10m` / `128Mi` each and using almost none of the memory; declared on purpose in the GitOps repository's `knowledge/`                                                                                                                                           |
+| `generated-name-family`             | a       | 0   | three Deployments named `calibration-<uuid>` in `seeded-family`, the shape a spawner leaves, with one common `app.kubernetes.io/part-of` label and no owner reference; each is two pause replicas requesting `10m` / `128Mi`. The names are literals in the stack, the same on every project; nothing declares them                           |
 | `guaranteed-qos-workload`           | a       | 0   | `deployment/ledger-writer` in `seeded-qos`, two replicas with requests equal to limits (`10m` / `32Mi`), so Guaranteed QoS, burning the whole CPU limit                                                                                                                                                                                       |
 | `stalled-controller`                | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                                                                                                                            |
 | `crashloop-workload`                | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                                                                                                                                         |
@@ -293,8 +294,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-two of the forty-five are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
-`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `declared-single-zone-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
+Forty-three of the forty-six are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `declared-single-zone-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,

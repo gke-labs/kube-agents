@@ -115,6 +115,23 @@ fixtures:
       the posture is observable on apply day; its case still needs a ledger,
       which the idle pool supplies from day 7.
 
+  - role: generated-name-family
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6
+      - deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b
+      - deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132
+    namespace: seeded-family
+    defect: >-
+      Three Deployments named calibration-<uuid>, the shape a spawner leaves,
+      with one common app.kubernetes.io/part-of label and no owner reference.
+      Each is two pause replicas requesting 10m / 128Mi and using almost none
+      of the memory, behind a budget and a default-deny policy: the waste
+      audit's overrequest posture on objects whose names no repository file
+      declares. The names are literals in the stack, the same on every
+      project. No multi-day age gate.
+
   - role: guaranteed-qos-workload
     slot: a
     available_from_day: 0

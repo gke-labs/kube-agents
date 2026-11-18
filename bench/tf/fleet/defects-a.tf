@@ -432,6 +432,110 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
   }
 }
 
+# Posture (waste, generated names): three Deployments that a spawner would
+# make, each named `calibration-<uuid>`, with one common parent label. No
+# file in a GitOps repository declares a member's name; only the parent is a
+# stable object. Each member has burst-ingest's shape (two pause replicas,
+# 10m / 128Mi, a budget, the default-deny policy, the restricted settings), so
+# the cost SOP's 3.1 `overrequest` names each one on memory and no other
+# stream names the namespace. No note declares them: they are findings.
+#
+# The names are literals, not `random_uuid` and not `generate_name`. Each
+# pool project then holds the same three names on each apply, with no state
+# that decides them, so a case and the state assertions can name a member. A
+# changed literal plans as a replace, which the reconciler refuses without a
+# row in reconcile-allow.json. The waste audit joins the members by the name
+# shape, and a Deployment with the exact name `calibration` in this namespace
+# stops that, so plant none. Catalogue role: generated-name-family.
+locals {
+  calibration_parent = "calibration"
+  calibration_members = {
+    one   = { name = "calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6" }
+    two   = { name = "calibration-374472b8-d3be-4c23-879f-9a44a5775c2b" }
+    three = { name = "calibration-20192efa-2b20-4f64-87c3-a3919cdcd132" }
+  }
+}
+
+resource "kubernetes_namespace_v1" "seeded_family" {
+  metadata {
+    name   = "seeded-family"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "calibration" {
+  for_each = local.calibration_members
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_family.metadata[0].name
+    labels    = { "app.kubernetes.io/part-of" = local.calibration_parent }
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = each.value.name }
+    }
+    template {
+      metadata {
+        labels = {
+          app                         = each.value.name
+          "app.kubernetes.io/part-of" = local.calibration_parent
+        }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = each.value.name }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "calibration"
+          image = "registry.k8s.io/pause:3.9"
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "128Mi" }
+            limits   = { memory = "256Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "calibration" {
+  for_each = local.calibration_members
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_family.metadata[0].name
+  }
+  spec {
+    min_available = "1"
+    selector {
+      match_labels = { app = each.value.name }
+    }
+  }
+}
+
 # Posture (rightsizing dependency): a Guaranteed-QoS workload, the second
 # dependency a request cut must name besides inference-server's HPA. Two
 # replicas whose one container sets requests equal to limits on both
@@ -791,6 +895,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
     token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
     headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+    family      = kubernetes_namespace_v1.seeded_family.metadata[0].name
     qos         = kubernetes_namespace_v1.seeded_qos.metadata[0].name
     shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
     defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
