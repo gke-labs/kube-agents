@@ -1011,7 +1011,9 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
 `helm upgrade` on an install whose served `PlatformAgent` CRD predates
-`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. A value under
+`googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
+of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
 `GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
 renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.

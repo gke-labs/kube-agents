@@ -176,6 +176,11 @@ render. On a Helm install (`platformAgent.harness.universeDomain`), setting the 
 `GOOGLE_CLOUD_UNIVERSE_DOMAIN` on chart-rendered `litellm` (`vertex_ai`) and `githubMinter` (plus
 `githubMinter`'s `ISSUER_ALLOWLIST`) when non-default.
 
+A value under `googleapis.com`, such as `mtls.googleapis.com`, names hosts of standard Google
+Cloud and no other universe. The operator refuses it with `phase: Degraded`
+(`UniverseDomainMismatch`) and a message that says what to set, and `helm upgrade` fails on it.
+Set `googleapis.com` or omit the field.
+
 [PlatformAgent fields → Spec](/kube-agents/operator/platformagent-fields/#spec) lists every `spec.harness` field with its type, default and constraints. The sections below cover what each block does.
 
 `dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
@@ -1908,7 +1913,7 @@ With the A2A gateway's election on, `Ready` follows the elected leader. That is 
 - **No current leader:** with no holder, a holder whose pod is gone, a holder that stopped renewing, or a failed read, the gateway counts by its ready replicas.
 - **Unchanged:** at one replica, or with the election off (the operator's `A2A_GATEWAY_ELECTION=false`), the gateway counts by its ready replicas.
 
-`UniverseDomainMismatch` returns before rendering workloads whenever `spec.harness.universeDomain` is malformed or disagrees with the host cluster's GKE metadata server. Of the reasons that park `phase: Degraded`, `ShellSandboxKeysMissing` renders the stack in full and reports at the end rather than returning early, because the objects are wanted in place so the Pod starts by itself once the Secret appears.
+`UniverseDomainMismatch` returns before rendering workloads whenever `spec.harness.universeDomain` is malformed, is under `googleapis.com`, or disagrees with the host cluster's GKE metadata server. Of the reasons that park `phase: Degraded`, `ShellSandboxKeysMissing` renders the stack in full and reports at the end rather than returning early, because the objects are wanted in place so the Pod starts by itself once the Secret appears.
 
 A failed A2A provisioning Job parks the phase the same way with `A2AProvisionFailed`, naming the Job to inspect. That signal is prompt where the refusal is deterministic. The script exits 2 for a refusal a re-run cannot clear, the Job's `podFailurePolicy` matches exit 2 with `FailJob`, and the Job fails from its first pod, so the condition is written in seconds. Any other failure (NATS unreachable, an unexpected command failure) matches no rule and still spends the `backoffLimit: 20` retry budget, which is the slow path it used to take.
 
