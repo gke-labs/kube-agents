@@ -148,7 +148,8 @@ def _kubectl(args: list[str], timeout: float) -> subprocess.CompletedProcess[str
 
 def read_planted_record(namespace: str, name: str, timeout: float) -> dict[str, str] | str | None:
     """The pods the stack recorded planting, UID to name; ``RECORD_ABSENT`` if the namespace
-    holds no record of that name; ``None`` if it could not be read or is malformed."""
+    holds no record of that name; ``None`` if it could not be read or is malformed (a line
+    that is not two fields, a repeated UID, or no pods at all)."""
     proc = _kubectl([*KUBECTL_GET_CONFIGMAP, name, "-n", namespace], timeout)
     if proc is None:
         return None
@@ -166,10 +167,10 @@ def read_planted_record(namespace: str, name: str, timeout: float) -> dict[str, 
         parts = line.split()
         if not parts:
             continue
-        if len(parts) != 2:
+        if len(parts) != 2 or parts[0] in pods:
             return None
         pods[parts[0]] = parts[1]
-    return pods
+    return pods or None
 
 
 def read_planted_pods(namespace: str, timeout: float) -> dict[str, str] | None:
