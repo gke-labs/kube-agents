@@ -47,6 +47,17 @@ class TestScrubStepText(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(worker_transcript.scrub_step_text(None, kind, "x", WITHHELD), WITHHELD)
 
+    # The search for the JSON parser's depth limit tries no document deeper than this: 4 million levels, 8 MB.
+    DEEPEST_DOCUMENT_TRIED = 1 << 22
+
+    @staticmethod
+    def _parses(text):
+        try:
+            json.loads(text)
+        except RecursionError:
+            return False
+        return True
+
     def test_withheld_when_the_walk_exceeds_the_recursion_limit(self):
         class _TooDeep:
             @staticmethod
@@ -56,8 +67,24 @@ class TestScrubStepText(unittest.TestCase):
         for kind in ("tool_call", "tool_result", "reply"):
             with self.subTest(kind=kind):
                 self.assertEqual(worker_transcript.scrub_step_text(_TooDeep, kind, "x", WITHHELD), WITHHELD)
+        # A document that parses and is too deep to walk is withheld.
+        depth = 2 * sys.getrecursionlimit()
+        nested = "[" * depth + "]" * depth
+        with self.subTest(levels=depth):
+            if not self._parses(nested):
+                self.skipTest("the JSON parser refuses %d levels here, so no document of this depth parses" % depth)
+            self.assertEqual(_scrub("tool_result", nested), WITHHELD)
         # A document too deep to parse is scrubbed as text rather than dropped.
-        deep = "[" * 100000 + "]" * 100000
+        # The parser's depth limit is the interpreter's: some thousands of
+        # levels on Python 3.12 and 3.13, and on 3.14 as many as the stack
+        # holds (more than 100,000 with a 16 MB stack). So the test finds a
+        # depth above it and holds no fixed one.
+        deep = nested
+        while self._parses(deep):
+            if 2 * depth > self.DEEPEST_DOCUMENT_TRIED:
+                self.skipTest("the JSON parser of this Python parses %d levels; the search stops there" % depth)
+            depth *= 2
+            deep = "[" * depth + "]" * depth
         self.assertEqual(_scrub("tool_result", deep), deep)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
