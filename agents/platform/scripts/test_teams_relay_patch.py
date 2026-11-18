@@ -455,6 +455,53 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         code_body = markdown_to_adaptive_card("```\n| a | b |\n```")["body"]
         self.assertEqual([b["type"] for b in code_body], ["TextBlock"])
 
+    def test_a_table_opens_only_on_a_delimiter_row(self):
+        # GitHub's rule: a header followed by a delimiter row. A lone line with
+        # pipes is prose, and a delimiter row needs one dash per cell, not three.
+        lone = markdown_to_adaptive_card("|x| + |y| = 1")["body"]
+        self.assertEqual([b["type"] for b in lone], ["TextBlock"])
+        self.assertEqual(lone[0]["text"], "|x| + |y| = 1")
+        short = markdown_to_adaptive_card("| a | b |\n| - | :-: |\n| 1 | 2 |")["body"]
+        self.assertEqual([b["type"] for b in short], ["Table"])
+        rows = short[0]["rows"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["cells"][1]["items"][0]["text"], "2")
+        # A header whose delimiter row has another cell count is not a table.
+        off = markdown_to_adaptive_card("| a | b | c |\n|---|---|\n| 1 | 2 |")["body"]
+        self.assertEqual([b["type"] for b in off], ["TextBlock"] * 3)
+
+    def test_a_continuation_piece_of_a_split_table_is_still_a_table(self):
+        # Hermes splits a long reply into pieces; pieces after the first open
+        # on body rows with no header or delimiter row.
+        body = markdown_to_adaptive_card("| 3 | 4 |\n| 5 | 6 | (2/3)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(len(body[0]["rows"]), 2)
+        self.assertEqual(body[1]["text"], "(2/3)")
+        body = markdown_to_adaptive_card("| c | Running |\n| d | Pending |\n\nTwo pods are pending.")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+
+    def test_a_list_item_or_heading_with_a_pipe_ends_the_table(self):
+        body = markdown_to_adaptive_card("| a | b |\n|---|---|\n| 1 | 2 |\n- see `x | y`\n# Next | part")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock", "TextBlock"])
+        self.assertEqual(len(body[0]["columns"]), 2)
+        self.assertEqual(body[1]["text"], "• see `x | y`")
+        self.assertEqual(body[2]["text"], "Next | part")
+
+    def test_split_marker_after_a_borderless_table_row_is_not_a_cell(self):
+        body = markdown_to_adaptive_card("a | b\n---|---\n1 | 2 (2/3)")["body"]
+        self.assertEqual([b["type"] for b in body], ["Table", "TextBlock"])
+        self.assertEqual(body[0]["rows"][1]["cells"][1]["items"][0]["text"], "2")
+        self.assertEqual(body[1]["text"], "(2/3)")
+
+    def test_an_escaped_pipe_stays_in_its_cell(self):
+        split = teams_relay_patch._split_table_row
+        self.assertEqual(split("| a \\| b | c |"), ["a | b", "c"])
+        self.assertEqual(split("a | b \\|"), ["a", "b |"])
+        body = markdown_to_adaptive_card("| cmd | out |\n|---|---|\n| a \\| b | c |")["body"]
+        table = body[0]
+        self.assertEqual(len(table["columns"]), 2)
+        self.assertEqual(table["rows"][1]["cells"][0]["items"][0]["text"], "a | b")
+
     def test_split_marker_after_a_table_row_is_not_a_cell(self):
         # Hermes appends " (i/n)" to each piece of a split reply; when the piece
         # ends on a table row the marker must not become an extra column.
@@ -1279,6 +1326,26 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         converted = teams_relay_patch.relayed_teams_error(err)
         self.assertEqual(converted.status, 400)
         self.assertEqual(str(converted), "HTTP 400: Teams relay refuses endpoint: v3/conversations/x/members")
+
+    def test_relayed_teams_error_keeps_the_reason_when_microsoft_sent_no_words(self):
+        import io
+
+        def relayed(answer):
+            body = json.dumps(answer).encode()
+            err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
+            return str(teams_relay_patch.relayed_teams_error(err))
+
+        # A Microsoft fault with a non-JSON body: the broker's ``teams`` object
+        # holds the status alone, and the reason is in its ``detail``.
+        self.assertEqual(
+            relayed({"error": "Teams operation failed", "detail": "HTTP 503: Service Unavailable", "teams": {"status": 503}}),
+            "HTTP 502: Teams operation failed HTTP 503: Service Unavailable",
+        )
+        # Microsoft's own words win when it gave any.
+        self.assertEqual(
+            relayed({"error": "Teams operation failed", "detail": "x", "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}),
+            "HTTP 502: 403 BotNotInConversationRoster not in roster",
+        )
 
     async def test_a_full_chunk_of_four_byte_characters_is_posted_whole(self):
         """The chunkers count characters and the cap counts bytes: a chunk of

@@ -1766,12 +1766,14 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	// union contract the AgentPlugin CRD page states outright. The []string values below
 	// are fine: toSlice already handles them.
 	//
-	// Both platform keys unconditionally, matching the adapters the managed scope pins
-	// whether or not each is enabled: a platform turned on later must not also need its
-	// toolsets remembered, and a key for a platform with no adapter is never resolved.
+	// All three platform keys unconditionally, matching the adapters the managed scope
+	// pins whether or not each is enabled: a platform turned on later must not also need
+	// its toolsets remembered, and a key for a platform with no adapter is never resolved.
+	// Teams ingress resolves under `teams` (agents/chat/config.yaml pins the same key).
 	platformToolsets := map[string]any{
 		"google_chat": slices.Clone(frontDoorToolsets),
 		"slack":       slices.Clone(frontDoorToolsets),
+		"teams":       slices.Clone(frontDoorToolsets),
 	}
 
 	return map[string]any{

@@ -21207,6 +21207,42 @@ class TeamsRelayTest(unittest.TestCase):
         # Settle again is False because receipt is deleted
         self.assertFalse(relay.settle(receipt, acknowledge=True))
 
+    def test_teams_pull_failure_is_counted_and_answers_503(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/chat/teams/events"
+        handler._authenticated = lambda: object()
+        handler.metrics = mock.Mock()
+        captured = {}
+        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        def pull():
+            raise RuntimeError("queue gone")
+
+        handler.teams_relay = types.SimpleNamespace(pull=pull)
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            handler.do_GET()
+
+        self.assertEqual(captured["status"], HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(captured["payload"], {"error": "Teams event pull failed"})
+        handler.metrics.record_failure.assert_called_once_with(
+            credential_proxy.BROKER_FAILURE_CHAT_PULL_FAILED
+        )
+
+    def test_teams_upstream_error_reads_a_json_null_as_absent(self):
+        import io
+
+        def converted(status, answer):
+            body = json.dumps(answer).encode("utf-8")
+            err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/", status, "x", {}, io.BytesIO(body))
+            return credential_proxy._teams_upstream_error(err)
+
+        bot = converted(400, {"error": {"code": None, "message": "boom"}})
+        self.assertEqual(str(bot), "HTTP 400: boom")
+        self.assertEqual(bot.fields, {"status": 400, "code": "", "message": "boom"})
+        entra = converted(401, {"error": "invalid_client", "error_description": None})
+        self.assertEqual(str(entra), "HTTP 401: invalid_client")
+        self.assertEqual(entra.fields["message"], "")
+
     def test_teams_relay_token_acquisition_and_caching(self):
         relay = TeamsRelay(
             app_id="app-id-123",
