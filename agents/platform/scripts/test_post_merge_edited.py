@@ -128,6 +128,28 @@ class ForgeEditedTest(unittest.TestCase):
         self.assertIsNone(self.forge({"commits": [self.INSTALL], "truncated": True}, {"reviews": []}))
         self.assertIsNone(self.forge({"commits": [self.INSTALL]}, {"reviews": [], "truncated": True}))
 
+    def test_an_edit_on_a_truncated_listing_still_settles_it(self):
+        change = {"id": 1, "state": "changes_requested", "author": "alice", "bot": False}
+        self.assertTrue(self.forge({"commits": [self.INSTALL], "truncated": True}, {"reviews": [change]}))
+
+    def test_commits_are_read_page_by_page_and_reviews_at_the_conversation_size(self):
+        full = [dict(self.INSTALL, sha=str(n)) for n in range(100)]
+        pages = {1: {"commits": full, "truncated": True}, 2: {"commits": [self.INSTALL]}}
+        asked = []
+
+        def call(verb, payload, repo, **kw):
+            asked.append((verb, payload.get("page"), payload.get("limit")))
+            if verb == "identity":
+                return {"identity": {"login": "kube-agents-app[bot]"}}
+            return pages[payload["page"]] if verb == "proposal-commits" else {"reviews": []}
+
+        fake = types.ModuleType("forge")
+        fake.call = call
+        with mock.patch.dict(sys.modules, {"forge": fake}):
+            self.assertFalse(post_merge_edited.forge_human_edited(REPO, 1))
+        self.assertEqual(asked[1:], [("proposal-commits", 1, 100), ("proposal-commits", 2, 100),
+                                     ("proposal-reviews", None, 1000)])
+
     def test_no_install_login_is_unknown(self):
         answers = {"identity": {"identity": {"login": ""}}, "proposal-commits": {"commits": [self.INSTALL]},
                    "proposal-reviews": {"reviews": []}}

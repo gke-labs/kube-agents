@@ -447,7 +447,7 @@ retried. `post_merge_edited.py fill`, under the same switch and per-run cap and 
 fills `human_edited` for each merged record without one: `1` when anyone but the install, a person or
 another automation such as a dependency bot, committed to the pull request or requested changes on it
 (the pull-request sweep's rule, read through `proposal-commits` and `proposal-reviews`), `0` when
-neither happened, and `NULL` when either cannot be read in full. It asks again next run, until a day after the
+neither happened, and `NULL` when what was read shows neither but cannot be read in full. It asks again next run, until a day after the
 check noticed the merge (`merge_checked_at`), so a merge noticed late is still asked. The revert and outcome columns are left for the later steps. `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 
