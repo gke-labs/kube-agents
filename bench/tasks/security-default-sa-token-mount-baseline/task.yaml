@@ -10,7 +10,7 @@
 id: security-default-sa-token-mount-baseline
 name: "Workload on the default ServiceAccount With Its Token Mounted (default-sa-automount)"
 domain: security
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - compliance-audit

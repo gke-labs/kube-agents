@@ -1099,6 +1099,14 @@
 # fixture, 200s default until it has a record.
 ./tasks/cluster-agent-storage-audit-collector/task.yaml
 
+# gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
+# Pending on a labelled, untainted pool that does not grow. Graded on two
+# verdict lines: the cause is the missing class and not a stockout, and the
+# skill records that the pool was seen to grow on the version the cluster
+# upgrades to.
+# deployer: noop, transcript-only.
+./tasks/compute-class-untargeted-pending-probe/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # agent model of the day it missed on unrelated pull requests and on main's
 # eval-next across 42 runs, the store's record at would-demote. Part of the

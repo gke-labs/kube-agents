@@ -696,9 +696,20 @@ type PlatformAgentReconciler struct {
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
-	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
-	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
-	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+	// busConfigLoadTime stands in for reading a bus server's config_load_time
+	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
+	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
+	// tests; it wins over busConfigLoadTime, which answers a fixed start.
+	busVarz func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error)
+	// busConfigWrittenAt stands in for reading when the live bus config
+	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
+	// keeps no managedFields.
+	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
+	// busTLSWrittenAt stands in for reading when the bus's TLS Secret was
+	// last written (a2aBusWatched), in tests: the fake client keeps no
+	// managedFields.
+	busTLSWrittenAt func(tls *corev1.Secret) (time.Time, bool)
 	// busStreamState stands in for reading each bus stream's state from the
 	// monitoring endpoint (a2aBusStreamState), in tests.
 	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
@@ -778,8 +789,8 @@ type PlatformAgentReconciler struct {
 // The markers below are the operator's whole Kubernetes authority: controller-gen renders them
 // into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. A
 // marker without `namespace=` lands in the ClusterRole; one with it lands in the Role document
-// beside it, which both install paths bind in the install namespace and, under mode next, in the
-// profile namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
+// beside it, which both install paths bind in the install namespace and in the profile
+// namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
 // or the group it sits in:
 //
 //   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
@@ -850,8 +861,8 @@ type PlatformAgentReconciler struct {
 // exists, so a namespaced read would be a 403 wherever that RoleBinding is
 // absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
-// namespaced Role there in the same apply (the chart under mode next,
-// config/profiles under make deploy), which is what lets the namespaced
+// namespaced Role there in the same apply (the chart, or config/profiles
+// under make deploy), which is what lets the namespaced
 // writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
 // and 2026-10-31, #3655 PR 6, predates that binding).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list

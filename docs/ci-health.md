@@ -193,7 +193,12 @@ evidence says the storm is unconfirmed; the evidence line and the Chat
 sentence also quote the repetitions' own words for how they died, as the
 harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
-not as the bot's guess), or setup
+not as the bot's guess), a forge outage (6+ forge repetitions,
+below, across 2+ pull requests among the runs that finished in the last 2
+hours: the evals repositories share one GitHub App installation and its
+hourly REST budget, so a second pull request already shows the fleet's
+budget rather than one branch; it ranks below the storm and the ceiling,
+which lose the agent's run rather than its grading), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
@@ -209,7 +214,8 @@ above decides which one the message carries; the others stay in the evidence.
 For a storm, retest after the time the message gives; for lost pods, once new
 jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
-dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
+dispatcher stalled); for a forge outage, once the GitHub App's hourly rate
+limit has reset; for fixture drift, once the daily reconcile has re-applied
 the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
 spare again; for drift no re-apply clears, at the time or event the message
 names) — a case whose grade depends on the drifted fixture is recorded as
@@ -286,7 +292,7 @@ drift covers the held one (it spread, so every held project stays in the exit's
 reads): the state would otherwise leave through a scan exit that never read
 the held incident's projects. Fixture drift, which ranks above pool drift, and
 any run-based condition displace it as before, and a held-back newcomer takes
-over once the hold lifts. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
+over once the hold lifts. Entering a shared-break OUTAGE or a storm, delegation-ceiling or forge-outage DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it. Setup deaths,
 lost pods, deadline kills, fixture drift and pool drift have no such signature
 on a completed run; their count is the currency. Returning to GREEN needs 3
@@ -540,7 +546,7 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
-not a pool job but the certification lane's weekly slice, watched here because
+not a pool job but the validated-capabilities lane's weekly slice, watched here because
 its record is its logs bucket and nothing else reads a failed build of it. A fifth,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
@@ -550,7 +556,7 @@ its messages are built from, so adding the next periodic is one entry. The 15-mi
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
 identities cannot write the Prow archive), or from the nightlies' bucket
-`gs://kube-agents-evals-nightly-logs` for the certification slice and the replay lane, which are
+`gs://kube-agents-evals-nightly-logs` for the validated-capabilities slice and the replay lane, which are
 decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
@@ -590,7 +596,7 @@ recovery needs a build that passed, or for the postsubmit reconcile a later
 daily run that reached its projects (below): a failed check under the
 threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile and the daily replay lane, eight days for the weekly validated-capabilities slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -658,7 +664,10 @@ when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
-  with no gate case collapsing (an absolute check, or a truncated log);
+  with no gate case collapsing (an absolute check, or a truncated log); during
+  a `forge_outage` condition the hard-failure box of a run that carries its
+  signature (three forge repetitions) also names the outage, with no repetition count; a hard failure
+  without it is left as it is;
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
   the gate is healthy and what failed passes on other pull requests' recent
@@ -705,7 +714,18 @@ connection, a GitHub rate limit on grading's own token). It is not a storm
 repetition either, so the storm rule and the pass-rate denominators leave it
 out, and a case whose ungraded repetitions are of this kind, with no storm
 repetition, is classed `forge-unavailable` on the run page (its Do is a
-retest).
+retest, after the hourly reset when the reason names a rate limit). A rung-2 block whose reason leads with `KUBE_AGENTS_FORGE_SAFEGUARD`
+is a forge repetition too: the scorer would have graded it `infra` as above,
+but an errored check was a catastrophic safeguard, such as the GitHub-write
+safeguard the inject lane adds to every case, which keeps it on rung 2. The
+run stays red, and the run page keeps it red: it says a catastrophic safeguard
+could not read GitHub and, while the forge-outage condition is declared,
+ties the run to it. The health bot counts these repetitions as forge, not fail.
+The scorer writes that marker only when the forge alone explains the block (no
+failed check, no parse error, coverage present, a real run), so an unmarked
+block stays a fail. A case with passes beside a marked block is partial, not passed, since the scorer blocks the case, and the gate comment still comments on a run whose every case is blocked. Six forge repetitions across two pull requests in two hours
+are the forge-outage condition: DEGRADED under its own name, its own
+message and advice, which names the GitHub App's rate limit.
 
 Three other shapes get a comment, each one line with the same marker and
 dedupe. A run the suite marked **not evaluated** — an admitted case, or every
@@ -1543,14 +1563,28 @@ provisioned or not visible scans as "not checked".
 **The document.** `fixture-state.json` is `{schema_version, scanned_at,
 duration_s, projects{}, summary, previous}`. `projects` has one entry per
 pool project, `{roles{}, summary, duration_s, reader, error?}`, and `roles`
-one entry per catalog role: `{"state": "healthy" | "drifted" | "absent" | "not_checked",
+one entry per catalog role: `{"state": "healthy" | "drifted" | "absent" | "not_ready" | "not_checked",
 "detail": [...]}` — for a drifted role, the assertion and what the scan
 observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gateway
 status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
-slot), a rollout the next reconcile finishes; for one not checked, why (the reader
+slot), a rollout the next reconcile finishes; for one not ready (the orphaned-snapshot
+roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours` line
+with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
+in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). `summary` counts projects, projects checked (at least one role
+read failed). One assertion this job never makes: the five `declared-*` roles
+assert the pool repository's declared-intent note, and the job holds no
+credential for the pool repositories by design, so the state script leaves
+that assertion out, judges those roles on their cluster assertions (healthy,
+as before) and names the subject in its own `--report`'s `unasserted` list,
+which this document does not carry; the note is judged at lease time by the
+presubmit and the nightly, never here, and a stale note surfaces as
+`fixture-drift:<role>` on their runs, with the replace command's printer in
+the drift line. The digest's fixture line and `health.json`'s `fixture_state` block carry
+drifted, absent and unread roles only, so a project whose two snapshots are young reads
+there as every fixture in its designed state; the document's `summary` and each project's
+carry `not_ready` beside the other counts. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
 document's `scanned_at` and its `{project: [drifted roles]}` map, carried so
 the adjudicator can ask "drifted last scan too?" from one file.
@@ -1560,9 +1594,10 @@ read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
-firewall-rules list`, `gcloud compute networks list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress` and
-`declared-mtu-peering`, which have no cluster slot; the account holds
+firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots list`,
+`gcloud compute disks list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm`, `world-open-ingress`,
+`declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
@@ -1651,7 +1686,10 @@ so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` 
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
 to retest after, and a `version-laggard` line reading `not_ahead_of_channel` with "newer than
 every", a master ahead of its channel, clears when REGULAR ships a newer patch of the minor `seeded_b_pin.py` holds, or sooner when seeded-b is
-re-created under a lease; one ordinary drift line beside them keeps the re-apply advice, the
+re-created under a lease, and a `declared-*` line reading `as_seeded`, the pool repository's
+declared-intent note not the one provisioning seeds (reachable from a hand-published document
+only, since this job reads no repository), clears when the pool owner runs the command the drift
+line names, which prints the replace command; one ordinary drift line beside them keeps the re-apply advice, the
 issue lists both as exceptions, and a hand run of `hack/fleet_reconcile.py --drifted` skips a
 project whose only drift is these) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies

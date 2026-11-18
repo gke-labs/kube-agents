@@ -117,7 +117,7 @@ const (
 	// "create secrets (in namespace team-a)", "create deployments.apps (in
 	// namespace kubeagents-system-profiles)". The namespaced Role is bound in
 	// the install namespace and the profile namespace by both install paths
-	// (the chart under mode next, make deploy in every mode); those two
+	// (the chart and make deploy alike, in every mode); those two
 	// namespaces, and an agent elsewhere, are what the operator-namespace
 	// probe cannot see.
 	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
@@ -205,7 +205,7 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	// The bus StatefulSet's revisions: which profiles every server has
-	// loaded (a2aClusterLoadedProfiles).
+	// loaded (a2aRevisionLoadedProfiles).
 	{Group: "apps", Resources: []string{"controllerrevisions"}, Verbs: []string{"get"}},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},

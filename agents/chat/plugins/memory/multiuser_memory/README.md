@@ -1,8 +1,9 @@
 # `multiuser_memory` — the file-backed memory provider
 
 Keeps `MEMORY.md` global and gives every user their own `USER.md`, keyed by the user
-identity (`agent._user_id` under `spec.mode: today`, or `conversation_route.user_id`
-in `session_kv.db` for `a2a-*` sessions under `spec.mode: next`). Entries are `§`-delimited and written with an atomic replace,
+identity (`conversation_route.user_id` in `session_kv.db` for the `a2a-*` sessions the gateway
+relays, or `agent._user_id` for a session a Hermes chat platform the operator still renders
+opened, such as Teams; Google Chat and Slack are the gateway's). Entries are `§`-delimited and written with an atomic replace,
 so a `SIGKILL` mid-write cannot leave a half-file behind.
 
 It needs nothing outside the pod: no API server, no database, no embedding model, no LLM

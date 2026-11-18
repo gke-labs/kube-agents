@@ -34,6 +34,8 @@ readonly BINARY_PLATFORMS=(
 # The same flags deploy/kube-proxy/Dockerfile builds the image's binary with,
 # plus -trimpath so the binary carries no runner path.
 readonly BINARY_LDFLAGS="-s -w"
+# The variable the release version is stamped into, which --version prints.
+readonly BINARY_VERSION_SYMBOL="main.version"
 # The toolchain already installed, as the Dockerfile sets: a release commit
 # needing a newer one fails rather than downloads one mid-release.
 readonly BINARY_GOTOOLCHAIN="local"
@@ -105,7 +107,7 @@ for platform in "${BINARY_PLATFORMS[@]}"; do
   (
     cd "${source_dir}/${BINARY_MODULE_DIR}"
     CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOFLAGS=-mod=readonly GOTOOLCHAIN="${BINARY_GOTOOLCHAIN}" \
-      go build -trimpath -ldflags="${BINARY_LDFLAGS}" -o "${stage}/${BINARY_NAME}" "${BINARY_MAIN_PACKAGE}"
+      go build -trimpath -ldflags="${BINARY_LDFLAGS} -X ${BINARY_VERSION_SYMBOL}=${TAG_NAME}" -o "${stage}/${BINARY_NAME}" "${BINARY_MAIN_PACKAGE}"
   )
   if [ ! -f "${stage}/${BINARY_NAME}" ]; then
     echo "❌ ERROR: go build produced no ${BINARY_NAME} for ${goos}/${goarch}." >&2

@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,24 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# The seeded files' content, shared with hack/fleet-fixture-state.py through a
+# module of its own; this script's directory is not on sys.path when another
+# script loads this file by path.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from gitops_seed_files import (  # noqa: E402
+    GITOPS_INTENT_NOTE_CONTENT,
+    GITOPS_INTENT_NOTE_MESSAGE,
+    GITOPS_INTENT_NOTE_PATH,
+    GITOPS_SEEDED_FILES,
+    GITOPS_WORKLOAD_MANIFEST_CONTENT,
+    GITOPS_WORKLOAD_MANIFEST_MESSAGE,
+    GITOPS_WORKLOAD_MANIFEST_PATH,
+    gitops_seeded_blob_sha,
+    gitops_seeded_bytes,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _UPSTREAM_SLUG = "gke-labs/kube-agents"
@@ -83,9 +102,32 @@ GITHUB_PATH_FAILED = "failed"
 # The body came back but is not UTF-8. run_cmd decodes strictly, so this is
 # caught in the reader rather than ending the verifier in a traceback.
 GITHUB_PATH_UNDECODABLE = "undecodable"
+# gitops_seeded_file_state alone: no credential to read with at all (gh with
+# nothing to authenticate as, or no gh and no GITOPS_READ_TOKEN_ENV). Not a
+# read that failed but one never made, which the seeded-fleet scan leaves out
+# of a role's verdict rather than counting as unread: the hourly scan holds no
+# credential for the pool repositories by design.
+GITHUB_PATH_NO_CREDENTIAL = "no_credential"
 # The contents API's `type` for a symlink at the last component of a path. The
 # audit's walk follows none, so a prefix that is one names nothing to it.
 GITHUB_CONTENT_TYPE_SYMLINK = "symlink"
+# The same reads without `gh`, for the seeded-fleet scan on the presubmit's
+# image, which has no gh (gitops_seeded_file_state): the API host gh talks
+# to, the media type and the agent name it sends, and the statuses that mean
+# the read did not happen (no credential, a refusal, a rate limit, a 5xx),
+# which _UNREAD_PATTERNS and _DENIAL_PATTERNS read off gh's wording.
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_JSON_MEDIA_TYPE = "application/vnd.github+json"
+GITHUB_READ_USER_AGENT = "kube-agents-verify-ci-pool-project"
+GITHUB_UNREAD_STATUSES = frozenset({401, 403, 408, 429, 500, 502, 503, 504})
+HTTP_NOT_FOUND = 404
+# What a bearer credential this script puts in a header may look like: one
+# line of printable ASCII. A value with a line break or a control character
+# (a credential file with a second line, a header file cut another way)
+# would make http.client refuse the header with the whole value in its
+# message, and that message would land in a report; such a value is refused
+# before any request, and never echoed.
+BEARER_CREDENTIAL_LINE_RE = re.compile(r"[!-~]+")
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
 GITOPS_REPO_ORG = "gke-agentic"
 GITOPS_REPO_SUFFIX = "-infra"
@@ -292,9 +334,16 @@ FLEET_TIMEOUT_SECONDS = 600
 # fixtures are there but not in the shape the cases depend on. It prints one
 # summary line of its own, parsed the same way as the presence line above.
 _FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
+# The state script's WARNING for an assertion it had no credential to make
+# (its `unasserted` report list: the declared-intent note with no `gh` login),
+# carried into this check's advice rather than read as an unread role.
+FLEET_STATE_UNASSERTED_MARK = "was not asserted"
+# The fourth count: a role that is not yet ready is planted and in shape, and
+# its audit's age gate (the orphaned-snapshot roles' 91 days) has not passed;
+# it fails nothing here.
 _FLEET_STATE_SUMMARY = re.compile(
     r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
-    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked"
+    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked, (?P<not_ready>\d+) not yet ready"
 )
 # How long the state pass may wait for a fixture to converge before calling it
 # drifted. An operator usually runs this minutes after `tofu apply`, when the
@@ -535,51 +584,10 @@ DEFAULT_GITHUB_APP_ID = 4675512
 GITOPS_SEED_FILE = "README.md"
 GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
-# The declared-intent note provisioning seeds after the first commit
-# (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
-# declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
-# repository lacks it.
-GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
-# The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
-# verifier prints is the note provisioning seeds; a test pins the two copies
-# to each other. The body read back is judged by the audit's parser, not
-# compared to this text.
-GITOPS_INTENT_NOTE_CONTENT = """---
-type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
-declares:
-  - check: no-pdb
-    namespace: seeded-intent
-    object: Deployment/notification-relay
-  - check: netpol-missing
-    namespace: seeded-intent
-    object: Namespace/seeded-intent
-  - check: default-sa-automount
-    namespace: seeded-token
-    object: Deployment/token-reader
-  - check: no-notifications
-    namespace: ""
-    object: Cluster/seeded-c
-  - check: overrequest
-    namespace: seeded-headroom
-    object: Deployment/burst-ingest
-  - check: single-zone-nodepool
-    namespace: ""
-    object: NodePool/declared-zonal-pool
----
-
-`notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
-it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
-in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
-design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
-`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
-the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
-`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
-pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
-waste and capacity audits list the six postures under Declared intent rather than as findings."""
+# The declared-intent note and checkout-gateway's manifest, the two files
+# provisioning seeds into a pool repository, live in gitops_seed_files.py
+# beside this script (imported above): the verifier reads them back, the
+# seeded-fleet scan holds a pool repository's file to their blob sha.
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -605,58 +613,27 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
     ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
 )
-# checkout-gateway's declaration, which provisioning seeds beside the note
-# (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
-# remediation cases propose a PodDisruptionBudget beside it; in a repository
-# without it the agent finds nothing to fix and refuses the pull request. The
-# path is the one the fleet audit's workload_declarations reads a cluster off
-# (clusters/<cluster>/...), the tie #2228's cases wait for. The script's
-# content, byte for byte, pinned by a test as the note is.
-GITOPS_WORKLOAD_MANIFEST_PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
-GITOPS_WORKLOAD_MANIFEST_MESSAGE = "Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
-GITOPS_WORKLOAD_MANIFEST_CONTENT = """apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: checkout-gateway
-  namespace: seeded-reliability
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: checkout-gateway
-  template:
-    metadata:
-      labels:
-        app: checkout-gateway
-    spec:
-      automountServiceAccountToken: false
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65534
-        seccompProfile:
-          type: RuntimeDefault
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: checkout-gateway
-      containers:
-        - name: gateway
-          image: registry.k8s.io/pause:3.9
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              memory: 32Mi"""
 # The key the audit's index (collect.py workload_declarations) must hold for
 # the seeded file: cluster off the path's second segment, then kind, namespace
 # and name. Presence alone is not the check: a file at the path that declares
 # another object leaves the finding manual and the cases red with a presence
 # check green, so the body is handed to that index and the key looked up.
 GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
+# The repair the scan names for a seeded file out of shape: one line that
+# prints the replace command (the seed command below, with the live file's
+# sha) for the operator to run. The command itself carries the whole
+# multi-line file inline, so the drift line names what prints it rather than
+# the command. Not the declaration check: that check judges the note by the
+# audit's parser and passes a note that differs from the seed by bytes alone,
+# which the scan still reads as drift.
+GITOPS_SEEDED_FILE_SEED_COMMANDS = {
+    GITOPS_INTENT_NOTE_PATH: "gitops_note_seed_command",
+    GITOPS_WORKLOAD_MANIFEST_PATH: "gitops_manifest_seed_command",
+}
+GITOPS_SEEDED_FILE_REPAIR = (
+    "replace it with the seeded file: python3 -c 'import sys; sys.path.insert(0, \"scripts\"); "
+    "import verify_ci_pool_project as v; print(v.{seed_command}(\"{repo}\", \"{sha}\"))' prints the command"
+)
 # The index refuses an object two files declare (`declaration_for` returns
 # None on more than one path), so every YAML under the seeded cluster's tree is
 # handed to it with the seeded file, read from the repository's tree listing.
@@ -1289,6 +1266,9 @@ _DENIAL_PATTERNS = (
 # A failed command with no stderr: nothing to match, nothing that says absent.
 NO_OUTPUT_REASON = "the command failed without output (killed, or gone before it could say why)"
 
+# gh with no credential at all (exit 4) names the login command; the read
+# never left the machine, so no path it was asked for is absent.
+_GH_NO_CREDENTIAL = re.compile(r"gh auth login")
 _UNREAD_PATTERNS = (
     re.compile(r"timed out after \d+s", re.I),
     re.compile(r"invalid_grant", re.I),
@@ -1303,6 +1283,7 @@ _UNREAD_PATTERNS = (
     # A token the API rejected is a credential that expired mid-run, not an
     # absent resource: gcloud prints the gRPC status, or the HTTP 401 below.
     re.compile(r"\bUNAUTHENTICATED\b|Request had invalid authentication credentials"),
+    _GH_NO_CREDENTIAL,
     # A separator between the word and the code is required (`code=`, `status:
     # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
     # not a status.
@@ -2757,9 +2738,10 @@ def _fleet_state_result(
     converged = int(match.group("converged"))
     drifted = int(match.group("drifted"))
     unchecked = int(match.group("unchecked"))
+    not_ready = int(match.group("not_ready"))
     counts = (
         f"{converged} role(s) in their designed state, {drifted} drifted, "
-        f"{unchecked} whose state could not be read"
+        f"{unchecked} whose state could not be read, {not_ready} planted and not yet ready"
     )
     if drifted:
         return CheckResult(
@@ -2786,10 +2768,22 @@ def _fleet_state_result(
                 )),
             ],
         )
+    # An assertion the script had no credential to make (the declared-intent
+    # note, with no `gh` login) is outside every verdict, so it is advice
+    # here, not an unread: the roles were read, the note was not.
+    unasserted = [note for note in notes if FLEET_STATE_UNASSERTED_MARK in note]
     if presence.warnings:
+        presence.warnings = [*presence.warnings, *unasserted]
         return presence
+    if not_ready:
+        return CheckResult(
+            name,
+            True,
+            f"All {expected} fixture roles planted and reachable: {converged} in their designed state, "
+            f"{not_ready} planted and not yet ready (an age gate the clock clears)",
+        )
     return CheckResult(
-        name, True, f"All {expected} fixture roles planted, reachable and in their designed state"
+        name, True, f"All {expected} fixture roles planted, reachable and in their designed state", warnings=unasserted
     )
 
 
@@ -3049,11 +3043,16 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
     audit's reader admits `#` in a prefix, which an unencoded URL would drop
     as a fragment and probe a different path than the audit checks.
     """
+    return _gh_api_state(f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}", raw=raw)
+
+
+def _gh_api_state(api_path: str, raw: bool = False) -> tuple[str, str]:
+    """One `gh api <api_path>` read, classified as _gitops_path_state says."""
     cmd = ["gh", "api"]
     if raw:
         cmd += ["-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}"]
     try:
-        rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}"])
+        rc, out, err = run_cmd(cmd + [api_path])
     except UnicodeDecodeError as exc:
         return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
     if rc == 0:
@@ -3066,6 +3065,102 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
     if _GH_NOT_FOUND_SPELLING.search(err or ""):
         return GITHUB_PATH_ABSENT, ""
     return GITHUB_PATH_FAILED, (err or "").strip()
+
+
+def _github_api_state_with_token(api_path: str, token: str) -> tuple[str, str]:
+    """The same read as _gh_api_state over urllib with a bearer token, for a
+    host without `gh`: the presubmit's image. Classified the same way: a
+    status in GITHUB_UNREAD_STATUSES, or no answer at all, is unread; 404 is
+    absent (of the path, or of the repository to this credential; the caller
+    tells them apart); anything else the API refused is a failure."""
+    request = urllib.request.Request(
+        f"{GITHUB_API_BASE}/{api_path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": GITHUB_JSON_MEDIA_TYPE, "User-Agent": GITHUB_READ_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_net_timeout(DEFAULT_TIMEOUT_SECONDS)) as response:
+            return GITHUB_PATH_PRESENT, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            return GITHUB_PATH_ABSENT, ""
+        if exc.code in GITHUB_UNREAD_STATUSES:
+            return GITHUB_PATH_UNREAD, f"HTTP {exc.code} from {api_path}"
+        return GITHUB_PATH_FAILED, f"HTTP {exc.code} from {api_path}"
+    except UnicodeDecodeError as exc:
+        return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
+    except ValueError:
+        # http.client refusing a header, or a response that was not HTTP: its
+        # message can quote a header value whole, so it is not repeated.
+        return GITHUB_PATH_UNREAD, f"the request to {api_path} could not be made: a header or the response was malformed"
+    except (urllib.error.URLError, OSError) as exc:
+        # URLError for a refused or unresolved connection, OSError (TimeoutError
+        # among them) for one that stalled: no answer, so nothing is known.
+        return GITHUB_PATH_UNREAD, f"no answer from {api_path}: {exc}"
+
+
+def gitops_seeded_file_repair(project_id: str, path: str, sha: str = "") -> str:
+    """The repair the scan names for a seeded file out of shape in `project_id`'s
+    repository: the one line that prints its replace command, naming the live
+    file's blob `sha` so the PUT replaces rather than conflicts (none for a
+    file that is missing)."""
+    return GITOPS_SEEDED_FILE_REPAIR.format(
+        seed_command=GITOPS_SEEDED_FILE_SEED_COMMANDS[path], repo=_gitops_repo_slug(project_id), sha=sha
+    )
+
+
+def gitops_seeded_file_state(project_id: str, path: str) -> tuple[str, str]:
+    """The blob a pool project's GitOps repository carries at a seeded path, for the seeded-fleet scan.
+
+    (GITHUB_PATH_PRESENT, <blob sha>) when the path is a file there;
+    (GITHUB_PATH_ABSENT, "") when the repository answered and the path is
+    not in it; (GITHUB_PATH_NO_CREDENTIAL, reason) when there was nothing to
+    read with, so no read was made; (GITHUB_PATH_UNREAD, reason) when a read
+    was made and nothing was learned: a refusal, a transient, or a 404 the
+    repository itself also answers, which is a private repository this
+    credential cannot see as often as a missing file; (GITHUB_PATH_FAILED,
+    reason) for a path that is a directory or an answer the API refused
+    outright. One contents read, plus one repository read on a 404. Through
+    `gh` where it is on PATH (its own credential store, or
+    GITOPS_READ_TOKEN_ENV, which gh honours); otherwise over urllib with the
+    token in GITOPS_READ_TOKEN_ENV, the presubmit's case.
+    """
+    repo_slug = _gitops_repo_slug(project_id)
+    token = os.environ.get(GITOPS_READ_TOKEN_ENV, "").strip()
+    if shutil.which("gh"):
+        read = _gh_api_state
+    elif token:
+        if not BEARER_CREDENTIAL_LINE_RE.fullmatch(token):
+            # Refused before any request, and never echoed: see BEARER_CREDENTIAL_LINE_RE.
+            return GITHUB_PATH_UNREAD, (
+                f"the credential in {GITOPS_READ_TOKEN_ENV} is not one line of printable characters "
+                "(a line break or a control character inside it), so nothing was read with it"
+            )
+
+        def read(api_path: str) -> tuple[str, str]:
+            return _github_api_state_with_token(api_path, token)
+    else:
+        return GITHUB_PATH_NO_CREDENTIAL, f"no GitHub credential: {GITOPS_READ_TOKEN_ENV} is unset and gh is not on PATH"
+    state, out = read(f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}")
+    if state == GITHUB_PATH_UNREAD and _GH_NO_CREDENTIAL.search(out):
+        return GITHUB_PATH_NO_CREDENTIAL, out
+    if state == GITHUB_PATH_PRESENT:
+        try:
+            payload = _load_json(out)
+        except Exception as exc:
+            return GITHUB_PATH_FAILED, f"the contents of {path} in {repo_slug} did not parse: {exc}"
+        sha = payload.get("sha") if isinstance(payload, dict) else None
+        if not sha:
+            return GITHUB_PATH_FAILED, f"{path} in {repo_slug} is not a file"
+        return GITHUB_PATH_PRESENT, str(sha)
+    if state == GITHUB_PATH_ABSENT:
+        visible, detail = read(GITOPS_REPO_API_PATH.format(repo=repo_slug))
+        if visible == GITHUB_PATH_PRESENT:
+            return GITHUB_PATH_ABSENT, ""
+        return GITHUB_PATH_UNREAD, (
+            f"{repo_slug} answers 404 for {path} and for the repository itself, so it is not visible to this "
+            f"credential (or does not exist); nothing is known about the file" + (f": {detail}" if detail else "")
+        )
+    return state, out
 
 
 def _names_nothing_to_the_audit(contents_json: str) -> bool:
