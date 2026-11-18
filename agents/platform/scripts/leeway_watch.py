@@ -79,9 +79,11 @@ State ledger, blackboard topic, and 7-day reminder gate. Under
   topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
   once in chat on failure and retrying on later clean ticks. A report too
   large for one bus message (`NATS_MAX_PAYLOAD_BYTES`, less room for the
-  envelope) is published capped (`cap_topic_report`): each cluster's findings
-  cut to the most severe that fit, the full report's `summary`, and a
-  `truncated` block with the counts left out and the full report's path.
+  envelope) is published capped (`cap_topic_report`): the fleet's most severe
+  findings that fit, each kept in its cluster, the full report's `summary`, a
+  `truncated` block with the counts left out and the full report's path (the
+  bare clusters too, counted, when even they do not fit), and a `--text`
+  suffix naming the cap.
 A finding is due for reporting when:
 1. It is **new** (not present in `ledger.json`),
 2. Its **suspected cause changed or severity escalated** since the last report,
@@ -334,8 +336,8 @@ PART_KIND_TEXT = "text"
 PART_KIND_DATA = "data"
 # A comma between two findings in a list, counted for every finding kept.
 JSON_LIST_SEPARATOR_BYTES = 1
-# The capped document: the report's own fields with each cluster's findings cut
-# to the most severe that fit (severity, then tier, then report order), the
+# The capped document: the report's own fields keeping the fleet's most severe
+# findings that fit (severity, then tier, then report order) in their clusters, the
 # full report's summary unchanged, and this block saying what was left out.
 TRUNCATED_FIELD = "truncated"
 TRUNCATED_REASON_FIELD = "reason"

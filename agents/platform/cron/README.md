@@ -473,14 +473,19 @@ of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
 clusters are retired with a single resolution line (and a clean `latest.*`
 refresh once all clusters scan cleanly), while clusters whose scan failed
 retain their ledger entries so transient errors do not erase state and re-page
-tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
-`topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
-if that write fails, it warns once in chat and retries on subsequent clean
-ticks until the write recovers. A report too large for one bus message (NATS's
-1 MiB `max_payload`, less room for the envelope) is published capped: the same
-document with each cluster's findings cut to the most severe that fit, the full
-report's `summary`, and a `truncated` block counting what was left out and
-naming the full report's path on disk.
+tomorrow. When `NATS_URL` is set, the watch also writes the JSON report it just
+saved to the `topology-skew` (`a2a.topics.agent.platform.topology-skew`)
+blackboard topic; if that write fails, it warns once in chat and retries with
+`latest.json` on subsequent clean ticks until the write recovers. A report too
+large for one bus message (NATS's 1 MiB `max_payload`, less room for the
+envelope) is published capped: the same document keeping the fleet's most
+severe findings that fit, each in its own cluster, the full report's `summary`,
+and a `truncated` block counting what was left out. Its `full_report` is the
+timestamped report's path on the Platform Agent profile's disk, which
+leeway-watch prunes once ten newer reports exist. When even the clusters
+stripped of findings do not fit, `clusters` is emptied and counted in
+`truncated.clusters_omitted`. The `--text` summary gains a suffix naming the
+cap.
 
 ## `session-retention` gives every profile's history an end
 
