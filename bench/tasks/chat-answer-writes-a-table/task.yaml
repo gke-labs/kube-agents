@@ -41,11 +41,12 @@ verification_spec:
       type: report_contains
       required_phrases: ["kubeagents-system", "kube-system"]
       # A pipe table in GFM's grammar, as the gateway's builders read it: a
-      # delimiter row (one or more dashes per cell, optional colons, outer
-      # pipes optional) and the agent's own namespace in a row with a pipe
-      # beside it. Lines such as "Namespace: kubeagents-system | Status:
-      # Active" carry pipes but no delimiter row, which is the shape the
-      # unpatched hint produced.
+      # delimiter row (a whole line of two or more delimiter cells, one or
+      # more dashes each, optional colons, outer pipes optional; horizontal
+      # whitespace only, so a "---" rule above a pipe-led line is not one)
+      # and the agent's own namespace in a row with a pipe beside it. Lines
+      # such as "Namespace: kubeagents-system | Status: Active" carry pipes
+      # but no delimiter row, which is the shape the unpatched hint produced.
       required_patterns:
-        - '(?m)^\s*\|?\s*:?-+:?\s*\|'
+        - '(?m)^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$'
         - '(?m)^[^\n|]*\|[^\n]*kubeagents-system|kubeagents-system[^\n]*\|'
