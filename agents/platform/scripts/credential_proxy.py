@@ -2299,6 +2299,9 @@ DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE = "kubeagents-credential-proxy-scope"
 SCOPE_AUDIENCE_ENV = "CREDENTIAL_PROXY_SCOPE_AUDIENCE"
 SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
+DEFAULT_CREDENTIAL_PROXY_CURATOR_AUDIENCE = "kubeagents-credential-proxy-curator"
+CURATOR_AUDIENCE_ENV = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"
+CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
 # The A2A gateway's ServiceAccount, the one caller the a2a-chat audience is for
 # (#6090). The operator renders it beside CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE,
 # only while Google Chat is armed on the A2A stack.
@@ -2348,6 +2351,10 @@ CALLER_ROLE_PROFILE = "profile"
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
+# The OKF memory curator pod. Version-control snapshot route only, on a
+# managed repository only, so the curator can verify active and superseded
+# records from Git without holding a forge credential of its own.
+CALLER_ROLE_CURATOR = "curator"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -2374,6 +2381,7 @@ CALLER_ROLES = (
     CALLER_ROLE_MCP,
     CALLER_ROLE_PROFILE,
     CALLER_ROLE_SCOPE,
+    CALLER_ROLE_CURATOR,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -2487,6 +2495,7 @@ def executable_refusal_message(role: str, executable: str) -> str:
 # does not stretch to the rest.
 ROLE_VCS_VERBS: dict[str, frozenset[str]] = {
     CALLER_ROLE_MCP: frozenset({"proposal-view"}),
+    CALLER_ROLE_CURATOR: frozenset({"snapshot"}),
     CALLER_ROLE_PROFILE: frozenset(
         {
             "clone",
@@ -2588,11 +2597,12 @@ def _validate_role_vcs_verbs(
             raise ValueError(
                 f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unknown))} is not a vcs verb"
             )
-    writes = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.WRITE_VERBS
-    if writes:
-        raise ValueError(
-            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(writes))} writes to the forge"
-        )
+    for read_only_role in (CALLER_ROLE_MCP, CALLER_ROLE_CURATOR):
+        writes = table.get(read_only_role, frozenset()) & vcs_broker.WRITE_VERBS
+        if writes:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{read_only_role!r}]: {', '.join(sorted(writes))} writes to the forge"
+            )
     # The profile role's writes are claim-gated: every write in its set must be
     # one `_dispatch_vcs_post` checks the permit for, so a write added to the
     # set without the gate is a red import rather than an ungated write.
@@ -2844,11 +2854,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # subscription sets, and the prefix is what this table keys the role on.
     (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
-    # The MCP pod reaches this family and no other; the profile role reaches
-    # it beside the exec route. Which verbs within it is ROLE_VCS_VERBS's to
-    # say, and for a profile caller the task credential's, checked in
+    # The MCP and curator pods reach this family and no other; the profile role
+    # reaches it beside the exec route. Which verbs within it is ROLE_VCS_VERBS's
+    # to say, and for a profile caller the task credential's, checked in
     # _dispatch_vcs_post.
-    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),
+    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE, CALLER_ROLE_CURATOR)),
     # The autonomy dial's level (vcs_broker.dial_level), reported from the agent
     # pod after an install admin's pick. The chat role alone: the agent pod holds
     # that token and the sandbox the model drives does not, so no command the
@@ -5312,6 +5322,7 @@ class ServiceAccountAuthenticator:
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
         scope_callers: frozenset[str] = frozenset(),
+        curator_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
         a2a_chat_callers: frozenset[str] = frozenset(),
     ) -> None:
@@ -5326,6 +5337,7 @@ class ServiceAccountAuthenticator:
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
         self.scope_callers = scope_callers
+        self.curator_callers = curator_callers
         self.a2a_chat_callers = a2a_chat_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
@@ -5470,6 +5482,10 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a scope caller may present only the scope audience")
         if role == CALLER_ROLE_SCOPE and username not in self.scope_callers:
             raise AuthenticationError("the scope audience is only for scope callers")
+        if username in self.curator_callers and role != CALLER_ROLE_CURATOR:
+            raise AuthenticationError("a curator caller may present only the curator audience")
+        if role == CALLER_ROLE_CURATOR and username not in self.curator_callers:
+            raise AuthenticationError("the curator audience is only for curator callers")
         # The a2a-chat binding, as the session one: empty leaves the audience
         # deciding, for an operator that renders no a2a-chat callers.
         if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:
@@ -5696,6 +5712,11 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(SCOPE_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    curator_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(CURATOR_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     a2a_chat_callers = frozenset(
         caller.strip()
         for caller in os.getenv(A2A_CHAT_CALLERS_ENV, "").split(",")
@@ -5791,6 +5812,21 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; the scope role is bound to the callers named there, so every "
                     "caller presenting the scope audience is refused"
                 )
+        curator_audience = os.getenv(CURATOR_AUDIENCE_ENV, "").strip()
+        if curator_audience and curator_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_CURATOR_AUDIENCE equals the %s audience; the curator "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[curator_audience] or CALLER_ROLE_SHELL,
+            )
+        elif curator_audience:
+            audience_roles[curator_audience] = CALLER_ROLE_CURATOR
+            if not curator_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_CURATOR_AUDIENCE is set but CREDENTIAL_PROXY_CURATOR_CALLERS "
+                    "is not; the curator role is bound to the callers named there, so every "
+                    "caller presenting the curator audience is refused"
+                )
         # The profile workers' audience (#3889), read raw for the same reason,
         # and refused on a collision for the mcp one's. Its callers come from
         # the identity map rather than a list of their own: one rendering
@@ -5866,6 +5902,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         session_callers=session_callers,
         mcp_callers=mcp_callers,
         scope_callers=scope_callers,
+        curator_callers=curator_callers,
         a2a_chat_callers=a2a_chat_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
@@ -8185,12 +8222,16 @@ VCS_SCRATCH_DIR = "vcs"
 # `archive` and `ls-tree` are on it for one caller: `snapshot` lists one
 # revision's tree to size the tar, then writes the tree as a tar, to a file in
 # its scratch directory (`--output`), from a bare clone.
+#
+# `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
+# against the policy base's merge-base before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
         "bundle",
         "checkout",
         "clone",
+        "diff-tree",
         "fetch",
         "init",
         "ls-remote",
@@ -8208,9 +8249,9 @@ VCS_GIT_SUBCOMMANDS = frozenset(
 # The broker's own git subcommands that no caller's argv may name. `archive`
 # takes `--output=<path>` and `--remote=<url>`, and only `snapshot` issues it,
 # with a path and a revision the broker chose, so it stays off the `/v1/exec`
-# argument gate below. `ls-tree` is there for the same caller, and stays off
-# the gate because no caller of `/v1/exec` needed it before.
-VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "ls-tree"})
+# argument gate below. `ls-tree` and `diff-tree` stay off `/v1/exec` too so
+# `ALLOWED_GIT_SUBCOMMANDS` does not widen for sandbox callers.
+VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "diff-tree", "ls-tree"})
 
 
 def _allowed_git_subcommands() -> frozenset[str]:
@@ -17053,10 +17094,21 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         )
                         return TOOL_STATUS_BLOCKED
                     payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
-                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
+                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS and role != CALLER_ROLE_CURATOR
                 named, outside = payload.get("repository"), None
                 if role_selected:
                     named, outside = self.vcs.snapshot_source(named)
+                elif verb == "snapshot" and role == CALLER_ROLE_CURATOR:
+                    named, outside = self.vcs.snapshot_source(named)
+                    if outside is not None:
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "the curator caller may snapshot only managed repositories",
+                                "code": "REPOSITORY_NOT_MANAGED",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
                 resolves = verb not in vcs_broker.UNGATED_VERBS and outside is None
                 if resolves:
                     try:
