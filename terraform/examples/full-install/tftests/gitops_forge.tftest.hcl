@@ -141,7 +141,7 @@ run "a_gitlab_ca_needs_the_gitlab_forge" {
   variables {
     gitlab_ca_secret_name = "gitlab-forge-ca"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "a_gitlab_ca_needs_a_self_managed_host" {
@@ -151,7 +151,7 @@ run "a_gitlab_ca_needs_a_self_managed_host" {
     gitlab_repo           = "g/p"
     gitlab_ca_secret_name = "gitlab-forge-ca"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "a_gitlab_ca_is_refused_for_gitlab_com_by_name" {
@@ -162,7 +162,7 @@ run "a_gitlab_ca_is_refused_for_gitlab_com_by_name" {
     gitlab_repo           = "g/p"
     gitlab_ca_secret_name = "gitlab-forge-ca"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "the_ca_secret_name_is_a_kubernetes_name" {
@@ -185,7 +185,7 @@ run "gitlab_refuses_a_minter" {
     github_repo          = "acme/infra"
     github_app_id        = "1"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "gitlab_needs_a_repo" {
@@ -193,7 +193,7 @@ run "gitlab_needs_a_repo" {
   variables {
     gitops_forge = "gitlab"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "gitlab_inputs_need_the_gitlab_forge" {
@@ -201,7 +201,7 @@ run "gitlab_inputs_need_the_gitlab_forge" {
   variables {
     gitlab_repo = "g/p"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 # gitops_host under the default forge is a GitHub Enterprise Server host
@@ -212,7 +212,7 @@ run "a_gitlab_host_needs_the_gitlab_forge" {
   variables {
     gitops_host = "gitlab.example.com"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "the_forge_is_a_registered_one" {
@@ -275,7 +275,7 @@ run "bitbucket_needs_a_repo_path" {
   variables {
     gitops_forge = "bitbucket"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_refuses_an_uppercase_workspace" {
@@ -284,7 +284,7 @@ run "bitbucket_refuses_an_uppercase_workspace" {
     gitops_forge     = "bitbucket"
     gitops_repo_path = "Acme/infra"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_cloud_refuses_a_host" {
@@ -294,7 +294,7 @@ run "bitbucket_cloud_refuses_a_host" {
     gitops_repo_path = "acme/infra"
     gitops_host      = "bitbucket.example.com"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_cloud_refuses_an_identity_that_is_not_a_uuid" {
@@ -304,7 +304,7 @@ run "bitbucket_cloud_refuses_an_identity_that_is_not_a_uuid" {
     gitops_repo_path = "acme/infra"
     gitops_identity  = "svc-bot"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_datacenter_needs_a_host" {
@@ -313,7 +313,7 @@ run "bitbucket_datacenter_needs_a_host" {
     gitops_forge     = "bitbucket-datacenter"
     gitops_repo_path = "INFRA/gitops"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_datacenter_refuses_an_atlassian_host" {
@@ -323,7 +323,7 @@ run "bitbucket_datacenter_refuses_an_atlassian_host" {
     gitops_host      = "acme.atlassian.net"
     gitops_repo_path = "INFRA/gitops"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_refuses_a_minter" {
@@ -335,7 +335,7 @@ run "bitbucket_refuses_a_minter" {
     github_repo          = "acme/infra"
     github_app_id        = "1"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_inputs_need_a_bitbucket_forge" {
@@ -343,7 +343,7 @@ run "bitbucket_inputs_need_a_bitbucket_forge" {
   variables {
     gitops_repo_path = "acme/infra"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "the_host_is_bare" {
@@ -365,7 +365,7 @@ run "github_values_are_unchanged" {
     github_repo = "acme/infra"
   }
   assert {
-    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tftests/testdata/github.values.golden")
+    condition     = nonsensitive(helm_release.kube_agents[0].values[0]) == file("tftests/testdata/github.values.golden")
     error_message = "a GitHub install's release values changed"
   }
 }
@@ -378,7 +378,7 @@ run "github_minter_values_are_unchanged" {
     github_app_id        = "123"
   }
   assert {
-    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tftests/testdata/github_minter.values.golden")
+    condition     = nonsensitive(helm_release.kube_agents[0].values[0]) == file("tftests/testdata/github_minter.values.golden")
     error_message = "a GitHub minter install's release values changed"
   }
 }
@@ -392,14 +392,14 @@ run "gitlab_release_values" {
     gitlab_token_secret_name = "gl-token"
   }
   assert {
-    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration) == jsonencode({
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.integration) == jsonencode({
       forges       = [{ credentialsRef = { name = "gl-token" }, host = "gitlab.example.com", name = "gitlab", provider = "gitlab" }]
       repositories = [{ forge = "gitlab", repository = "platform/infra/gitops", role = "gitops" }]
     })
-    error_message = "integration: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration)}"
+    error_message = "integration: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).platformAgent.integration)}"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter.enabled == false
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).githubMinter.enabled == false
     error_message = "a GitLab install enabled the GitHub minter"
   }
 }
@@ -423,7 +423,34 @@ run "web_console_refuses_no_network_policy" {
     accept_no_network_policy = true
     web_console_enabled      = true
   }
-  expect_failures = [helm_release.kube_agents]
+  # Checked on the release as well as the output: on an adopted cluster's first
+  # apply network_policy_enforced is only known at apply, and the release's own
+  # precondition is what stops the install then.
+  expect_failures = [output.kube_agents_helm_values, helm_release.kube_agents]
+}
+
+run "web_console_refuses_no_network_policy_without_the_releases" {
+  command = plan
+  override_module {
+    target = module.gke_cluster
+    outputs = {
+      cluster_endpoint        = "10.0.0.1"
+      cluster_endpoint_is_dns = false
+      cluster_ca_certificate  = "Y2E="
+      cluster_location        = "us-central1"
+      cluster_name            = "c"
+      network_policy_enforced = false
+      workload_identity_pool  = "tftest-project.svc.id.goog"
+    }
+  }
+  variables {
+    create_cluster           = false
+    accept_no_network_policy = true
+    web_console_enabled      = true
+    install_helm_releases    = false
+  }
+  # No release to install, so the values output alone refuses the plan.
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 
@@ -435,7 +462,7 @@ run "bitbucket_datacenter_refuses_an_identity_outside_the_crd_pattern" {
     gitops_repo_path = "INFRA/gitops"
     gitops_identity  = "svc bot"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "bitbucket_datacenter_refuses_a_github_service_host" {
@@ -445,7 +472,7 @@ run "bitbucket_datacenter_refuses_a_github_service_host" {
     gitops_host      = "acme.ghe.com"
     gitops_repo_path = "INFRA/gitops"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
 
 run "ghes_refuses_an_atlassian_host" {
@@ -454,5 +481,5 @@ run "ghes_refuses_an_atlassian_host" {
     github_repo = "acme/infra"
     gitops_host = "git.atlassian.net"
   }
-  expect_failures = [helm_release.kube_agents]
+  expect_failures = [output.kube_agents_helm_values]
 }
