@@ -964,7 +964,7 @@ A2A_OPERATOR_ENV_ARGS=()
 # forge calls failed with FORGE_RATE_LIMITED (#4611). env[4], also on every
 # lane, turns the post-merge check on in silent mode: the pr_opened plugin
 # records each fix and the check stores outcomes for the case that grades it
-# (bench/tasks/post-merge-verified-fixed), and nothing is posted, so no case
+# (gke-labs/kube-agents#6343), and nothing is posted, so no case
 # meets a GitHub write it did not ask for. env[5] caps each post-merge step at
 # five records a run: the cron ticks every five minutes on every install and
 # reads the forge for each waiting record (none when there are none) on the

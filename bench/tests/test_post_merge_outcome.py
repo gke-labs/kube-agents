@@ -27,13 +27,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
 from devops_bench.verification.spec import parse_node
 from kube_agents_bench import fleet, forges, onboarding, post_merge, transcript
 
 PR = "https://github.com/gke-agentic/pool-infra/pull/7"
 MANIFEST = "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata: {name: checkout-gateway}\n"
-TASK = Path(__file__).resolve().parents[1] / "tasks" / "post-merge-verified-fixed" / "task.yaml"
 
 
 REAL_RUN = subprocess.run
@@ -259,12 +257,8 @@ def test_read_record_needs_the_sentinel():
     assert answer == {"record": None, "error": None}
 
 
-def test_the_case_parses_and_names_the_check():
-    spec = yaml.safe_load(TASK.read_text())["verification_spec"]
-    types = [entry["check"]["type"] for entry in spec]
-    assert types == ["pull_request_opened", "post_merge_outcome"]
-    for entry in spec:
-        parse_node(entry["check"])
+def test_a_spec_with_the_check_parses():
+    parse_node({"type": "post_merge_outcome", "outcome": "verified_fixed", "apply_fixture_role": "no-pdb-workload"})
 
 
 def test_the_entry_point_is_published():
