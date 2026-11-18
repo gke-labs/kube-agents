@@ -3051,6 +3051,79 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the command may have run", err)
         self.assertNotIn("retrying", err)
 
+    def test_a_2xx_answer_that_cannot_be_read_is_one_line_and_exit_1_and_is_never_sent_again(self):
+        """The broker ran the command before it answered. The line names the shape, never the body."""
+        not_json = credential_proxy_client.NON_JSON_RESPONSE_TEXT
+        shapes = {
+            "<html>upstream answer</html>": not_json,
+            "": not_json,
+            "[1, 2]": "the response is JSON of type list, not an object",
+            "null": "the response is JSON of type NoneType, not an object",
+            "7": "the response is JSON of type int, not an object",
+            '"NAME STATUS"': "the response is JSON of type str, not an object",
+            "true": "the response is JSON of type bool, not an object",
+        }
+        for body, shape in shapes.items():
+            with self.subTest(body=body):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, body), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+        # The status in the line is the answer's own.
+        _, _, err = self.run_shim(self.broker([(201, {}, "[1, 2]")]))
+        self.assertIn("credential proxy error (HTTP 201): ", err)
+
+    def test_an_answer_that_cannot_be_read_is_not_sent_to_the_fallback(self):
+        """With an exec-tier target and a stateful fallback, the command stays where it may have run."""
+        for body in ("not json", "null"):
+            with self.subTest(body=body):
+                exec_tier, stateful = self.broker([(200, {}, body)]), self.broker([(200, {}, OK)])
+                out, err = io.StringIO(), io.StringIO()
+                with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+                    code = credential_proxy_client.execute(
+                        exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                        sleep_fn=self.sleeps.append, rng=self.rng,
+                    )
+                self.assertEqual(1, code)
+                self.assertEqual("", out.getvalue())
+                self.assertEqual(1, len(exec_tier.requests))
+                self.assertEqual([], stateful.requests)
+                self.assertNotIn(credential_proxy_client.EXEC_FALLBACK_NOTICE, err.getvalue())
+                self.assertIn("the command may have run", err.getvalue())
+
+    def test_the_line_for_an_answer_that_cannot_be_read_is_the_shim_s_own_for_the_failure_classifiers(self):
+        import cluster_agent_profile
+
+        for body in ("not json", "[1, 2]"):
+            with self.subTest(body=body):
+                _, _, err = self.run_shim(self.broker([(200, {}, body)]))
+                self.assertIsNotNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(err), err)
+                self.assertIsNone(cluster_agent_profile.CONNECTIVITY_FAILURE_RE.search(err), err)
+
+    def test_a_2xx_body_that_breaks_while_it_is_read_is_still_a_dropped_connection(self):
+        """Only the parse is guarded: a read that ends early is not an answer of the wrong shape."""
+
+        class BrokenBody(RecordingResponse):
+            status = 200
+
+            def read(self, *_args):
+                raise http.client.IncompleteRead(b'{"stdout": "NAME')
+
+        err = io.StringIO()
+        with patch.object(credential_proxy_client, "open_broker_request", lambda _request: BrokenBody()), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                "http://broker.invalid:8765", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        self.assertEqual(1, code)
+        self.assertEqual([], self.sleeps)
+        self.assertIn("the connection dropped after the request was sent", err.getvalue())
+        self.assertNotIn("HTTP 200", err.getvalue())
+
     def test_a_policy_block_still_exits_77_at_once(self):
         blocked = {"code": "SECURITY_POLICY_BLOCKED", "message": "Command blocked.", "rule": "no-delete"}
         broker = self.broker([(403, {}, blocked), (200, {}, OK)])
