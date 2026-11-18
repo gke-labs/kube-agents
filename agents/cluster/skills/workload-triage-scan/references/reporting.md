@@ -30,7 +30,7 @@ When `workload_triage.py` ends with `unhealthy: 0` and `system unhealthy: 0` and
 
 ```
 kanban_complete(
-  result="No failing workloads. <pods: N (healthy N, initializing N, unhealthy 0) ...>. <initializing pods>. <warning-event rows, if any>. <restarted-earlier rows, if asked>. <system namespace lines>. Scanned <UTC time> on <context>.",
+  result="No failing workloads. <pods: N (healthy N, initializing N, unhealthy 0) ...>. <initializing pods>. <warning-event rows, if any>. <restarted-earlier rows, if asked>. <system namespace lines>.",
   summary="No failing workloads: N pods healthy, N initializing",
   metadata={"unhealthy": 0, "system_unhealthy": 0}
 )

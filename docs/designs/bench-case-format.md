@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -85,6 +85,18 @@ door a default install doesn't have. The harness writes two entries for any of t
 it writes a third, `harness_cancel_reported`: completed only when the canceled task carries a
 `cardStop` result whose stopped cards are exactly the cards the board shows archived (less any the
 result calls settled) and whose text opens `canceled; ` (#5528).
+
+A prompt that starts with `[bench:profile name=<profile> <key>=<value> ...]` sends its ask to that
+AgentProfile as a new top task, with the other fields as the task's parameters, rather than to the
+platform agent ([`bench/kube_agents_bench/profile_hook.py`](../../bench/kube_agents_bench/profile_hook.py),
+#5945). The directive ends at its first `]`, so the ask may follow on the same line, and its values
+take the `{{AGENT_CLUSTER_*}}` and `{{FLEET_CLUSTER_*}}` placeholders. It must open the prompt, and the
+lint refuses one that doesn't. No other `[bench:...]` directive may follow it, because the readers that
+schedule a stopped ask or a replay read only a prompt's first line, so a combined case would run in
+the wrong phase; combining one is a later change.
+It runs only over the inject transport (the door's `profile` and `parameters`); the api transport
+errors on it, so the case needs an entry in `hack/eval/api-lane-exclusions.txt`, which
+`scripts/test_eval_rosters.py` checks.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -458,7 +470,10 @@ job's threads since the fire, and the chat report the run's `finish` left on the
 passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
 silent run or one that never ended is an error. `triage_starts`, in its own module
-(`bench/kube_agents_bench/triage_starts.py`), lists the pods in its `namespace` on the agent's cluster,
+(`bench/kube_agents_bench/triage_starts.py`), reads the planted pods from the ConfigMap the stack
+records them in (`planted_record`, optional; without it, or when the namespace holds no such ConfigMap,
+the pods in its `namespace` on the agent's cluster), so a pod deleted mid-run is still graded and is
+named in the reason; a live pod the record leaves out is an error. It
 joins the Session KV server's admitted `intercepted_events` rows for them (by pod UID) to the default
 profile's Hermes `state.db`, and passes when at least `min_alerts` pods have an admitted alert and every
 one of those alerts has a session with a message, a started triage turn; a session with no message is a
@@ -593,7 +608,7 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
 job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
-`EVAL_TIER=certification`, every case whose task file carries the bare line `suite: certification`. A case
+`EVAL_TIER=validated-capabilities`, every case whose task file carries the bare line `suite: validated-capabilities`. A case
 runs because a file names it or its task file carries that line; other cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
@@ -620,10 +635,10 @@ for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
-The one exception is a case with the bare line `suite: certification` in its task file: that
-line is its registration (with `certification_part: N` for a section other than 1), it runs only under `EVAL_TIER=certification`, and never
+The one exception is a case with the bare line `suite: validated-capabilities` in its task file: that
+line is its registration (with `suite_part: N` for a section other than 1), it runs only under `EVAL_TIER=validated-capabilities`, and never
 in the presubmit or nightly files
-([`bench/README.md`](../../bench/README.md#certification-suite)).
+([`bench/README.md`](../../bench/README.md#validated-capabilities-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was

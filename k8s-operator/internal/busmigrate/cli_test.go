@@ -283,8 +283,9 @@ func TestTheRestoreLegTakesAStreamItAlreadyRestoredAsDone(t *testing.T) {
 	}
 }
 
-// The clear leg deletes every named stream and reports each; a stream
-// already gone counts as cleared, so a second clear (a retry) succeeds.
+// The clear leg deletes every named stream, last to first, and reports each;
+// a stream already gone counts as cleared, so a second clear (a retry)
+// succeeds.
 func TestTheClearLegDeletesTheStreamsAndCanRunAgain(t *testing.T) {
 	s := startServer(t, "a2a-nats-0", t.TempDir(), 0)
 	defer shutdown(s)
@@ -296,7 +297,7 @@ func TestTheClearLegDeletesTheStreamsAndCanRunAgain(t *testing.T) {
 			t.Fatalf("clear run %d exited %d: %s", i, code, e.String())
 		}
 		r := readReport(t, log)
-		if strings.Join(r.Cleared, ",") != "TASKS,KV_cap,NEVER_MADE" || r.Error != "" {
+		if strings.Join(r.Cleared, ",") != "NEVER_MADE,KV_cap,TASKS" || r.Error != "" {
 			t.Errorf("clear run %d report %+v", i, r)
 		}
 	}

@@ -38,8 +38,8 @@ TASKS stream's consumer budget from the CR's maxSessions and from the bridge
 workers the pod runs, creates the stream at the larger of that budget and a
 floor of 64, never edits a stream that exists, and refuses a later render
 whose budget the live stream cannot hold. The operator budgets the bridge from
-the first next render, with the concurrency step 5 sets on it, and adds it to
-the agent pod once the bus is provisioned, so the mode change, a `helm upgrade`
+the first next render, with the concurrency step 5 sets on it, and puts it in
+the agent pod from the first render (#5962), so the mode change, a `helm upgrade`
 that sets platformAgent.mode, is the only change and the one provision Job
 already counts the bridge's workers. That change still carries a maxSessions sized so that
 budget fits the floor, computed from four constants copied from the
@@ -94,15 +94,16 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_BRIDGE_URI",
     "_A2A_DISPATCHER_URI",
     "_PERSONA_CLUSTER_URI",
+    "_PERSONA_TSE_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse")
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
 # nightly's eight parts, the GitLab next nightly, the forge lanes' weekly
-# jobs and the certification lane's first slice; the retired today-mode GitLab
+# jobs and the validated-capabilities lane's first slice; the retired today-mode GitLab
 # nightly's name and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
@@ -118,6 +119,9 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-weekly-ghes-next",
     "ci-kube-agents-eval-weekly-gitlab-ce-next",
     "ci-kube-agents-certification-1",
+    # The same slice under the name its job takes next: a release admits the
+    # name before oss-test-infra can rename the job.
+    "ci-kube-agents-validated-capabilities-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
     # The replay lane: a periodic replaying the next-mode nightlies' recordings.
@@ -443,11 +447,13 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             f"operator.extraEnv[10].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
         ]
-        # The cluster profile's images, at this build: its persona and worker.
-        # Unset, the chart would take ghcr at the CI tag.
+        # The cluster and tse profiles' images, at this build: their personas
+        # and worker. Unset, the chart would take ghcr at the CI tag.
         for key, image in (
             ("profiles.cluster.persona", "persona-cluster"),
             ("profiles.cluster.harness", "a2a-worker"),
+            ("profiles.tse.persona", "persona-tse"),
+            ("profiles.tse.harness", "a2a-worker"),
         ):
             expected += [
                 "--set-string",
@@ -765,10 +771,9 @@ class FlagSetIsNextTest(unittest.TestCase):
             gated,
             [
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
-                "deployment/${AGENT_DEPLOYMENT_NAME}",
-                # Twice: the operator adds the bridge to the agent pod only
-                # once the bus is provisioned, so the agent rolls a second
-                # time after the Job, and that roll is gated like the first.
+                # Once: the operator renders the bridge in the agent pod from
+                # the first render (#5962), so the agent doesn't roll a second
+                # time after the Job (#5973).
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 # Last, not after the Job its bucket comes from: see the
                 # step header. A verifier still in its crash-loop backoff
@@ -782,8 +787,7 @@ class FlagSetIsNextTest(unittest.TestCase):
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
             'wait_provision_job "the mode upgrade"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
-            '*" ${BRIDGE_SIDECAR_NAME} "*) break ;;',
-            'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
+            'has no ${BRIDGE_SIDECAR_NAME} container after its rollout',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"',
@@ -994,10 +998,11 @@ class TasksBudgetSizingTest(unittest.TestCase):
         assert block is not None
         self.assertIn('--set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
         self.assertIn('--set-string "platformAgent.deployment.env[4].value=false"', block.group(1))
-        # The cluster profile, which a delegation case reads (#5194). Not tse,
-        # whose placeholder persona a dispatched worker can't stage (#3842).
+        # The cluster profile, which a delegation case reads (#5194), and tse,
+        # which the Kanban escalation case reads (#3492), on its own persona
+        # image since #3842.
         self.assertIn('--set "profiles.cluster.enabled=true"', block.group(1))
-        self.assertNotIn("profiles.tse", block.group(1))
+        self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
@@ -1969,6 +1974,10 @@ class BridgeImageBuildTest(unittest.TestCase):
         # The cluster persona, from its own directory, as the ghcr workflow builds it.
         uri = f"{_AR_REPO}/persona-cluster:{_TAG}"
         expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster agents/cluster/persona")
+        expected.append(f"docker push {uri}")
+        # The tse persona, the same way (#3842).
+        uri = f"{_AR_REPO}/persona-tse:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse agents/tse/persona")
         expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 

@@ -2,6 +2,7 @@ Subject: Filter logging read by timestamp instead of time flags
 
 Why: `gcloud logging read` has no --start-time/--end-time flags; the time window goes in the filter as timestamp bounds.
 Local-Issue: #843 (fixed in #885)
+Eval-Case: none (came with the migration to overlays, a byte-identical move)
 Upstream-Issue: none filed yet
 Retire-When: upstream's command filters by timestamp
 

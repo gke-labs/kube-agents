@@ -115,6 +115,9 @@ type holding struct {
 	// cluster is the cluster admission checked the task against, nil when
 	// it names none: the target of its credential-proxy token (#3889).
 	cluster *taskcred.Target
+	// changeRequested is the submission's ChangeRequested: whether its
+	// credential-proxy token carries the vcs:proposal-create permit (#3993).
+	changeRequested bool
 	// trigger is the trigger the verifier found equal to the grant's, nil
 	// when the submission names none: its credential-proxy token carries it
 	// (#4685).
@@ -139,7 +142,8 @@ type holding struct {
 	stopRequested bool
 	stopc         chan struct{}
 	// tierEnded is an administrator ending the drain of this task's tier
-	// (syncEndingTiers, #5850): the hold ends the task at once.
+	// (syncEndingTiers, #5850): the hold ends the task at once, and so does
+	// runJob for a task whose Job is still starting (#6134).
 	tierEnded bool
 
 	renewals chan renewal
@@ -857,19 +861,20 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.offeringWaiting(hk)
-	h.cluster = adm.cluster
+	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 	h.trigger = adm.trigger
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobs != nil && prof.HasJobTemplate() {
+	if h.unattended && d.jobRunner(prof, h.tier) {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
 		if ended {
-			// The Job path ended the task itself (no worker): it no
+			// The Job path ended the task itself (no worker, or its tier
+			// ended while the Job started): it no
 			// longer waits.
 			d.clearWaiting(hk)
 			return
@@ -1297,7 +1302,10 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
-// refuses one as too long-lived. Each is read back with the key's public
+// refuses one as too long-lived. The proxy token carries the
+// vcs:proposal-create permit when the submission asked for a change and the
+// task runs on a Job of its own (#5646), and no permits claim at all
+// otherwise (#3993); the bus credential never carries one. Each is read back with the key's public
 // half before it is used, and only its jti is logged, never the token.
 func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid string, deadline time.Time) (natsToken, proxyToken string, err error) {
 	if now := d.pool.PodUID(h.profile, h.tier, pod); now != uid {
@@ -1314,7 +1322,19 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		return "", "", err
 	}
 	if h.cluster != nil {
-		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
+		proxy := base
+		// The permit goes only on a Job's pod, the task's alone. A pool
+		// pod runs the next task too, so a permit task that reached one
+		// (admission refuses it) is minted no permit, and its writes are
+		// refused.
+		if carriesPermit(h.changeRequested, h.cluster) {
+			if h.onJob {
+				proxy.Permits = []taskcred.Permit{taskcred.PermitVCSProposalCreate}
+			} else {
+				log.Error("a task with a confirmed change reached a pool pod; minting no write permit", "task", h.taskID, "profile", h.profile, "tier", h.tier)
+			}
+		}
+		proxyToken, err = d.mintOne(log, proxy, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
 		if err != nil {
 			return "", "", err
 		}
@@ -1346,7 +1366,7 @@ func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.A
 	if err != nil {
 		return "", fmt.Errorf("the %s credential just minted does not verify: %w", aud, err)
 	}
-	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires)
+	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires, "permits", back.Permits)
 	return token, nil
 }
 

@@ -24,6 +24,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "a2a-gateway",
     "a2a-worker",
     "persona-cluster",
+    "persona-tse",
     "a2a-authcallout",
     "a2a-verifier",
     "a2a-dispatcher",
