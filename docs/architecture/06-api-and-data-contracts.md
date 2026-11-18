@@ -313,26 +313,28 @@ kube-agents integrates with the customer's existing pipeline and IaC rather than
 
 ## 5. OKF knowledge contract
 
-OKF = markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (a dedicated repo stays
+OKF ([Open Knowledge Format](https://github.com/GoogleCloudPlatform/open-knowledge-format), v0.2
+[`SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)) =
+markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (a dedicated repo stays
 optional for later). It lives outside the paths the pipeline deploys (`clusters/<cluster>/`,
 `fleet/`), so it is never applied to a cluster. Required frontmatter field: `type`. Convention for
 kube-agents knowledge types:
 
 | `type`              | Purpose                                            | Key frontmatter                             |
 | ------------------- | -------------------------------------------------- | ------------------------------------------- |
-| `cluster-blueprint` | Standard cluster config baseline                   | `title, tags, resource, timestamp`          |
+| `cluster-blueprint` | Standard cluster config baseline                   | `title, tags, resource, generated`          |
 | `tenancy-model`     | Namespace isolation standard                       | `title, tags`                               |
-| `runbook`           | Operational procedure (SRE CUJ)                    | `title, tags, timestamp`                    |
+| `runbook`           | Operational procedure (SRE CUJ)                    | `title, tags, generated`                    |
 | `metric-definition` | Named metric/KPI definition                        | `title, tags, resource`                     |
-| `escalation`        | A cross-tier request not yet a change              | `title, tags, timestamp, resource`          |
-| `observation`       | A durable finding worth sharing                    | `title, tags, timestamp`                    |
+| `escalation`        | A cross-tier request not yet a change              | `title, tags, generated, resource`          |
+| `observation`       | A durable finding worth sharing                    | `title, tags, generated`                    |
 | `decision`          | Forward-looking architectural choice _(proposed)_  | `id, title, status, scope, guard`           |
 | `lesson`            | Verified incident / PR outcome lesson _(proposed)_ | `id, title, status, scope, guard, evidence` |
 
 The six baseline types (`cluster-blueprint`, `tenancy-model`, `runbook`, `metric-definition`,
 `escalation`, `observation`) ship today, and [`docs/designs/memory.md`](../designs/memory.md) proposes adding `decision` and `lesson`; `type` is an **open convention, not a hard enum** — new
 types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}` (singular `<type>/` canonical, with plural aliases such as `decisions/` and `lessons/` also accepted when ingesting existing repos); markdown
-links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
+links form the knowledge graph; optional `log.md` for history. Root `index.md` (navigation) and `log.md` (history) are reserved filenames at the `knowledge/` root: they carry no `type` frontmatter, and `index` and `log` must not be used as `type` values or entry filenames. Any entry may include the OKF v0.2 recommended trust and lifecycle fields (`sources`, `generated` with `by` and `at`, `verified` with `by` and `at`, `status`, and `stale_after`), which are validated for shape when present while legacy `timestamp` remains tolerated on existing notes. For `status`, `decision` and `lesson` notes use `proposed`, `active`, `rejected`, `superseded`, and `retired` as a `kube-agents` lifecycle extension ([`docs/designs/memory.md`](../designs/memory.md)), while all other OKF types use the OKF v0.2 values `draft`, `stable`, and `deprecated`. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
 **not** session state. Baseline posture entries may carry `declares:`, a list of
 `{check, namespace, object}` items (plus `cluster` for a one-cluster choice and `expires`, a `YYYY-MM-DD`
@@ -404,8 +406,14 @@ The concrete code delta that enforces [03](03-security-model.md):
   (`renderConfigYAML()` / the ConfigMap) and the baked configs it is merged with at startup;
   the `platform_mcp_server.py` `apply_manifest` / `delete_cluster_manifest` helpers are removed; agent
   RBAC read-only (grep + SAR).
-- **OKF:** a validator script confirms every `knowledge/` file carries a valid `type` frontmatter and
-  its markdown links resolve. (A richer OKF _visualizer_ is optional tooling to build later, not a gate.)
+- **OKF:** `scripts/check_okf_knowledge.py` (run in `make docs-check-links`) confirms every `knowledge/`
+  tree conforms to the
+  [Open Knowledge Format v0.2 `SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)
+  and `kube-agents` conventions: root `index.md` and `log.md` carry no `type`, entry files carry valid
+  YAML frontmatter with a non-reserved `type`, present recommended fields (`sources`, `generated`,
+  `verified`, `status`, `stale_after`, plus tolerated legacy `timestamp`) match their expected shape and
+  per-type `status` vocabulary, and relative markdown links resolve. (A richer OKF _visualizer_ is
+  optional tooling to build later, not a gate.)
 - **Review-gate:** the security-review suite runs on the trigger paths and **blocks** a PR with an
   unmitigated high/critical finding.
 - **ChatOps routing (§2b):** a slash command (`/cluster-<c>`) and a direct handle (`@cluster-<c>`)

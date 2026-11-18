@@ -13,6 +13,9 @@
 
 set -uo pipefail
 
+readonly FORBIDDEN_OKF_NAME_PATTERN='Operational Knowledge Framework'
+readonly FORBIDDEN_OKF_NAME_REASON='Wrong OKF expansion. The published specification is Open Knowledge Format (https://github.com/GoogleCloudPlatform/open-knowledge-format).'
+
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 FAILED=0
@@ -104,6 +107,11 @@ forbid 'claude-[a-z0-9.-]*-kubeagents(-mcp)?' \
 # --- Namespace ------------------------------------------------------------
 forbid 'platform-agent-system' \
   "Stale namespace. install.defaults.env sets DEFAULT_NAMESPACE=kubeagents-system."
+
+# --- Open Knowledge Format (OKF) ------------------------------------------
+# Ground truth: https://github.com/GoogleCloudPlatform/open-knowledge-format
+# (linked from docs/architecture/06-api-and-data-contracts.md §5).
+forbid "$FORBIDDEN_OKF_NAME_PATTERN" "$FORBIDDEN_OKF_NAME_REASON"
 
 # --- GKE host-discovery label -------------------------------------------
 # Ground truth: scripts/installer/common.sh. The Terraform full-install
