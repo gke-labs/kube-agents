@@ -52,7 +52,10 @@ READS_PER_TICK = 20
 #: The agent container's variable (``spec.deployment.env``) that sets the per-step
 #: limit: a whole number from 1 to :data:`READS_PER_TICK_MAX`; anything else is the default.
 READS_PER_TICK_ENV = "POST_MERGE_READS_PER_TICK"
-READS_PER_TICK_MAX = 500
+#: The ceiling fits a run inside the five-minute tick the step is scheduled at: 25
+#: forge reads at :data:`VIEW_TIMEOUT_SECONDS` each is under 4.5 minutes even when
+#: every read times out.
+READS_PER_TICK_MAX = 25
 #: The forge read's ceiling, per record, on the agent pod's hop to the sandbox
 #: (``forge.call``); a run with no sandbox reaches the broker without one.
 VIEW_TIMEOUT_SECONDS = 10.0
