@@ -112,6 +112,15 @@ MUTATIONS: list[Mutation] = [
         "as the shell does with no per-task identity",
     ),
     Mutation(
+        "A3-profile-update-not-owned",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                        self.vcs.require_agent_proposal(verb, payload)\n",
+         "                        pass\n"),
+        "test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals",
+        "drop the ownership read on a profile worker's permitted write, trusting "
+        "the permit, which names no proposal, to keep it off a person's",
+    ),
+    Mutation(
         "A3-report-credential-any-route",
         "agents/platform/scripts/credential_proxy.py",
         ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",

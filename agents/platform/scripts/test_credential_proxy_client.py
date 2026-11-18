@@ -1062,6 +1062,88 @@ class VcsCallErrorTest(unittest.TestCase):
                     # The status is read off the error after the close.
                     self.assertEqual(caught.exception.status, status)
 
+    # -- admission refusals are sent again (#6247) ---------------------------
+
+    def _replies(self, *replies):
+        """open_broker_request answering each reply in turn: an (status, body, headers)
+        refusal, or a dict for a 200."""
+        calls = []
+
+        def answer(request, *args, **kwargs):
+            reply = replies[len(calls)]
+            calls.append(request)
+            if isinstance(reply, dict):
+                return contextlib.nullcontext(io.BytesIO(json.dumps(reply).encode()))
+            status, body, headers = reply
+            raise urllib.error.HTTPError(request.full_url, status, "refused", headers, io.BytesIO(body))
+
+        return calls, patch.object(credential_proxy_client, "open_broker_request", answer)
+
+    @staticmethod
+    def _busy(bound):
+        return json.dumps({"error": "busy", "code": credential_proxy_client.BUSY_CODE, "bound": bound}).encode()
+
+    def _call(self, verb="proposal-create"):
+        sleeps = []
+        clock = iter(range(0, 10_000, 1))
+        result = credential_proxy_client.vcs_call(
+            self.endpoint, verb, {"repository": "r"},
+            sleep_fn=sleeps.append, clock=lambda: next(clock), rng=random.Random(0),
+        )
+        return result, sleeps
+
+    def test_a_profile_cap_refusal_is_sent_again(self):
+        calls, opener = self._replies((503, self._busy("profile"), {}), {"proposal": {"number": 3}})
+        with opener, patch("sys.stderr", new_callable=io.StringIO) as err:
+            result, sleeps = self._call()
+        self.assertEqual({"proposal": {"number": 3}}, result)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(1, len(sleeps))
+        self.assertIn("retrying in", err.getvalue())
+
+    def test_every_retryable_admission_refusal_is_sent_again(self):
+        cases = {
+            "the slot cap": (503, self._busy("slot"), {}),
+            "the background cap": (503, self._busy("background"), {}),
+            "draining": (503, self._busy("draining"), {}),
+            "memory pressure": (429, b'{"error": "pressure", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE"}', {}),
+            "an Envoy overload 503": (503, b"overloaded", {credential_proxy_client.ENVOY_OVERLOADED_HEADER: "true"}),
+        }
+        for name, refusal in cases.items():
+            with self.subTest(name):
+                calls, opener = self._replies(refusal, {"ok": True})
+                with opener, patch("sys.stderr", new_callable=io.StringIO):
+                    result, sleeps = self._call()
+                self.assertEqual({"ok": True}, result)
+                self.assertEqual(2, len(calls))
+
+    def test_a_refusal_that_may_have_run_or_is_the_callers_own_is_not_sent_again(self):
+        cases = {
+            "the session cap": (503, self._busy("session"), {}),
+            "a bare non-JSON 503": (503, b"upstream reset", {}),
+            "a conflict": (409, b'{"error": "the base branch moved", "code": "BASE_MOVED"}', {}),
+            "a permit refusal": (403, b'{"error": "no permit", "code": "CALLER_PERMIT_REQUIRED"}', {}),
+        }
+        for name, refusal in cases.items():
+            with self.subTest(name):
+                calls, opener = self._replies(refusal, {"ok": True})
+                with opener, self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                    self._call()
+                self.assertEqual(1, len(calls))
+                self.assertEqual(refusal[0], caught.exception.status)
+
+    def test_the_last_admission_refusal_is_raised_once_the_retries_are_spent(self):
+        busy = (503, self._busy("profile"), {})
+        calls, opener = self._replies(*([busy] * 10))
+        with opener, patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                self._call()
+        self.assertEqual(503, caught.exception.status)
+        self.assertEqual("profile", caught.exception.payload["bound"])
+        self.assertLessEqual(len(calls), credential_proxy_client.CREDENTIAL_PROXY_CLIENT_MAX_RETRIES + 1)
+        self.assertGreater(len(calls), 1)
+        self.assertIn("credential proxy throttled", err.getvalue())
+
     def test_a_refusal_whose_json_body_is_not_an_object_is_the_status_alone(self):
         # Valid JSON, but no refusal document: something between the client and
         # the broker answered. The caller gets the same error as for a body

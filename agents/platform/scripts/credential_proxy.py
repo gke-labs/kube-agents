@@ -1482,6 +1482,11 @@ RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
 # A profile caller's proposal-update that edits labels (#3993): refused whoever
 # owns the proposal (vcs_broker.ProfileLabelsRefused).
 RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
+# A profile caller's issue-list whose `query` carries a search qualifier
+# (#6247): GitHub composes `query` ahead of its own `repo:` qualifier, so a
+# `repo:` or `org:` in it would widen the search past the managed repository.
+RULE_CALLER_VCS_QUERY = "caller.vcs-query"
+PROFILE_QUERY_QUALIFIER_CODE = "PROFILE_QUERY_QUALIFIER"
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
 DIAL_PATH = "/v1/dial"
@@ -2463,7 +2468,9 @@ def executable_refusal_message(role: str, executable: str) -> str:
 #   * the reads a change needs: clone (the working copy publish builds on),
 #     proposal-view, proposal-list, proposal-commits, branch-view, identity
 #     (the forge login a submission checks it is not proposing as), issue-list
-#     and issue-view. Each is held to the managed list like every other verb.
+#     and issue-view. Each is held to the managed list like every other verb,
+#     and an issue-list `query` may carry no search qualifier
+#     (profile_issue_query_refusal, rule caller.vcs-query).
 #   * publish, proposal-create and proposal-update, the writes that put a
 #     change up for review, each further gated in `_dispatch_vcs_post` on the
 #     task credential's permit (PROFILE_PERMIT_GATED_VCS_VERBS).
@@ -2545,6 +2552,26 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
         return (
             f"this task's credential carries no {VCS_PROPOSAL_CREATE_PERMIT} permit; a change is "
             "published only for a request that asked for one"
+        )
+    return None
+
+
+def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
+    """Why a profile caller's ``issue-list`` ``query`` is refused, or None.
+
+    A forge may compose ``query`` into its own search grammar: GitHub puts it
+    ahead of the ``repo:<managed repository>`` qualifier it adds, so a
+    ``repo:``, ``org:`` or ``user:`` in it widens the search to whatever the
+    forge credential can read. Every qualifier needs a colon, so a ``query``
+    holding one is refused, as ``LOGIN_RE`` refuses one in ``author``. Free
+    text with no colon is kept. A ``query`` that is not a string is left to
+    the adapter, which refuses it.
+    """
+    query = payload.get("query")
+    if isinstance(query, str) and ":" in query:
+        return (
+            "a profile caller's issue-list query may not contain ':', which starts a search "
+            "qualifier; search the managed repository with plain words"
         )
     return None
 
@@ -16141,6 +16168,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # principal with no role is the socket posture and keeps every verb.
         principal = getattr(self, "principal", None)
         role = principal.role if principal is not None else ""
+        # Every answer below up to the body read is given with the body still
+        # unsent or unread, so each drains it first: closing on unread bytes
+        # resets the connection, and a caller still sending a large body (a
+        # publish bundle) reads a broken pipe in place of the refusal, which
+        # vcs_client reports as a broker fault (#6247).
+        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         if not vcs_verb_permitted(role, verb):
             LOGGER.warning(
                 "vcs verb refused for role role=%s verb=%s rule=%s",
@@ -16148,6 +16181,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(verb),
                 RULE_CALLER_VCS_VERB,
             )
+            drain_request_body(self, body_limit)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -16182,6 +16216,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 }
                 if detail := vcs_broker.write_mode_detail(raw):
                     refusal["detail"] = detail
+                drain_request_body(self, body_limit)
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return TOOL_STATUS_BLOCKED
         if role == CALLER_ROLE_PROFILE:
@@ -16194,6 +16229,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     RULE_CALLER_VCS_PERMIT,
                     refusal,
                 )
+                drain_request_body(self, body_limit)
                 self._json(
                     HTTPStatus.FORBIDDEN,
                     {
@@ -16205,6 +16241,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return TOOL_STATUS_BLOCKED
         if self.vcs is None:
+            drain_request_body(self, body_limit)
             self._json(
                 HTTPStatus.NOT_FOUND,
                 {
@@ -16215,9 +16252,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return TOOL_STATUS_ERROR
         route = vcs_broker.route_table(self.vcs).get(verb)
         if route is None:
+            drain_request_body(self, body_limit)
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return TOOL_STATUS_BLOCKED
-        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
             # One slot for the whole request: the body, which may carry a
             # bundle of tens of MiB and is not read until the request is
@@ -16255,6 +16292,23 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "request body not received verb=%s type=%s", verb, type(exc).__name__
                     )
                     return TOOL_STATUS_ERROR
+                if role == CALLER_ROLE_PROFILE and verb == "issue-list":
+                    query_refusal = profile_issue_query_refusal(payload)
+                    if query_refusal is not None:
+                        LOGGER.warning(
+                            "vcs issue-list query refused for a profile caller rule=%s",
+                            RULE_CALLER_VCS_QUERY,
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": query_refusal,
+                                "code": PROFILE_QUERY_QUALIFIER_CODE,
+                                "rule": RULE_CALLER_VCS_QUERY,
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
                 # The managed-repository control: the broker holds the forge credential, so "is this a repository we act
                 # on" can only be answered here. Nothing downstream answers it
                 # -- a forge is handed a repository and spends the token on it
