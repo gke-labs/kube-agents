@@ -338,9 +338,12 @@ _FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
 # (its `unasserted` report list: the declared-intent note with no `gh` login),
 # carried into this check's advice rather than read as an unread role.
 FLEET_STATE_UNASSERTED_MARK = "was not asserted"
+# The fourth count: a role that is not yet ready is planted and in shape, and
+# its audit's age gate (the orphaned-snapshot roles' 91 days) has not passed;
+# it fails nothing here.
 _FLEET_STATE_SUMMARY = re.compile(
     r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
-    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked"
+    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked, (?P<not_ready>\d+) not yet ready"
 )
 # How long the state pass may wait for a fixture to converge before calling it
 # drifted. An operator usually runs this minutes after `tofu apply`, when the
@@ -2735,9 +2738,10 @@ def _fleet_state_result(
     converged = int(match.group("converged"))
     drifted = int(match.group("drifted"))
     unchecked = int(match.group("unchecked"))
+    not_ready = int(match.group("not_ready"))
     counts = (
         f"{converged} role(s) in their designed state, {drifted} drifted, "
-        f"{unchecked} whose state could not be read"
+        f"{unchecked} whose state could not be read, {not_ready} planted and not yet ready"
     )
     if drifted:
         return CheckResult(
@@ -2771,6 +2775,13 @@ def _fleet_state_result(
     if presence.warnings:
         presence.warnings = [*presence.warnings, *unasserted]
         return presence
+    if not_ready:
+        return CheckResult(
+            name,
+            True,
+            f"All {expected} fixture roles planted and reachable: {converged} in their designed state, "
+            f"{not_ready} planted and not yet ready (an age gate the clock clears)",
+        )
     return CheckResult(
         name, True, f"All {expected} fixture roles planted, reachable and in their designed state", warnings=unasserted
     )
