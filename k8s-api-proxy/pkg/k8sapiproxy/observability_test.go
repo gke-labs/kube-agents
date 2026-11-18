@@ -266,7 +266,7 @@ func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
 	}{
 		{
 			name:     "authentication unavailable",
-			authn:    staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))},
+			authn:    staticAuthenticator{err: fmt.Errorf("%w: %w", ErrAuthenticationUnavailable, errors.New("connection refused"))},
 			upstream: podList,
 			target:   "/clusters/in-cluster/api/v1/namespaces/default/pods",
 			wantCode: http.StatusServiceUnavailable,
