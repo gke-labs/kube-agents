@@ -452,6 +452,15 @@ marker first, so a restart between the comment and the stamp never posts twice. 
 comments do not fit in one read is not commented, and a comment the forge refuses is retried for a
 day. No step writes `outcome` yet, so it reports nothing.
 
+The follow-ups (`post_merge_followups.py`, likewise unscheduled) act once on a `still_broken` or
+`verified_fixed` record with an `environment`, within a day of the outcome. `still_broken` runs
+`post_merge_stepdown.py` in the shell sandbox; `verified_fixed` reads `clean_merges.ready_in` here and
+runs `post_merge_offer.py` only when it says ready. The script's answer goes in `followup_state` and
+`followup_detail`. A `retry` is run again, `FOLLOWUP_ATTEMPTS` (5) times in all, and then
+`followup_state` is `failed`; a step-down that fails that way comments once on the fix, behind the
+step-down's marker. `reverted_at` is stamped once the revert a step-down opened merges, watched for
+eight days.
+
 `GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
 fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its
 thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table

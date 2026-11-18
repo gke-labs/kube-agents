@@ -12,9 +12,12 @@ ordinary pull requests and says so once on the fix:
 Both go through normal review. kube-agents never merges either, and closes,
 reopens or edits nothing it did not open here.
 
-Only with `KUBEAGENTS_AUTOMERGE=on`. Under `off` or `practice` nothing merged
-unattended, so the post-merge report is the whole answer and this does
-nothing. It runs in the shell sandbox, where `vcs_client` has its git, for the
+The fix's label decides the revert, whatever `KUBEAGENTS_AUTOMERGE` says now:
+an operator who turns the switch off after a bad auto-merge still gets the
+revert. The deny rule needs the switch `on`; under `off` or `practice` nothing
+else merges unattended, so the comment says no rule was added. A rules file
+that already denies the kind in that environment gets no second deny pull
+request, and the comment says so. It runs in the shell sandbox, where `vcs_client` has its git, for the
 post-merge driver to run with the record's repository, number, kind,
 environment and outcome. The forge, not the caller, says whether the fix merged
 and whether it carries the label.
@@ -23,9 +26,10 @@ Safe to run again: the branches are named after the fix's number, an existing
 pull request on either is reused, and the comment is written once, found again
 by `MARKER`.
 
-Nothing calls this yet. The reference page
+`post_merge_followups.run_followups` calls this, at most
+`FOLLOWUP_ATTEMPTS` times per fix, and nothing schedules that yet. The reference page
 (`docs/site/src/content/docs/reference/automation-rules.md`) gains a section
-when the post-merge driver wires the call.
+when the post-merge driver is scheduled.
 """
 
 from __future__ import annotations
@@ -170,8 +174,12 @@ def _revert_writer(fix: dict, number: int, diff: str) -> Callable[[Path, Any, st
 def _step_down_writer(kind: str, environment: str, fix_url: str) -> Callable[[Path, Any, str, str], None]:
     def write(tree: Path, vcs_client: Any, repo: str, branch: str) -> None:
         path = tree / automation_rules.RULES_FILE
-        if automation_rules.load(tree).status != automation_rules.LOADED:
+        rules = automation_rules.load(tree)
+        if rules.status != automation_rules.LOADED:
             raise StepDownError(f"{automation_rules.RULES_FILE} is absent or refused on the base branch")
+        if any(rule.matches(kind, environment) for rule in rules.deny):
+            # Nothing is published: a second failed fix of the kind opens no duplicate rule.
+            raise StepDownError(f"it already denies {kind} fixes in {environment}")
         # `newline=""` both ways: a CRLF file comes back CRLF, not rewritten whole.
         with path.open(encoding="utf-8", newline="") as handle:
             text = handle.read()
@@ -209,8 +217,6 @@ def step_down(
         import kubeagents_switches
 
         automerge = kubeagents_switches.switch("AUTOMERGE")
-    if automerge != "on":
-        return {"action": "none", "reason": f"KUBEAGENTS_AUTOMERGE is {automerge}; report only"}
     if outcome != STILL_BROKEN:
         return {"action": "none", "reason": f"outcome is {outcome}"}
     forge = forge or _forge(repo)
@@ -263,6 +269,8 @@ def step_down(
 
     step_down_branch = STEP_DOWN_BRANCH.format(number=number)
     try:
+        if automerge != "on":
+            raise StepDownError(f"KUBEAGENTS_AUTOMERGE is {automerge}, so nothing else merges on its own")
         existing = _existing_proposal(forge, step_down_branch)
         if existing:
             result["stepDown"] = existing.get("url")
@@ -310,7 +318,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--environment", required=True)
     parser.add_argument("--outcome", required=True)
     args = parser.parse_args(argv)
-    result = step_down(args.repo, args.number, args.kind, args.environment, args.outcome)
+    try:
+        result = step_down(args.repo, args.number, args.kind, args.environment, args.outcome)
+    except Exception as exc:  # noqa: BLE001 -- a forge call outside the per-PR blocks: the driver retries
+        result = {"action": "retry", "reason": f"{type(exc).__name__}: {exc}"}
     print(json.dumps(result, indent=2))
     return 1 if result["action"] == "retry" else 0
 
