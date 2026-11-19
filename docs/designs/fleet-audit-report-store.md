@@ -37,6 +37,8 @@ no-forge run uses the reserved one below):
   write time: two weeks of a daily stream.
 - `latest.json` — a byte-identical copy of the newest envelope. A copy rather than a symlink, so the
   store asks nothing of the mount.
+- `runs/<stamp>.writer` and `latest.writer` — who wrote that envelope, kept only for a write
+  through the broker (§3).
 
 The repository is part of the path because a stream can publish to more than one repository over
 time. One run publishes to one repository: the `role: gitops` repository, or the one a person gave
