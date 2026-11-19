@@ -73,23 +73,37 @@ const (
 	CloudSDKEndpointOverridesEnvPrefix = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
 )
 
+// commercialUniverseSuffix ends every name under the commercial universe
+// domain. <service>.mtls.googleapis.com and the like are hosts of that
+// universe, so such a name is no other universe's domain.
+const commercialUniverseSuffix = "." + DefaultUniverseDomain
+
 var universeDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
 // NormalizeUniverseDomain trims whitespace and a single trailing DNS dot,
 // lowercases the candidate, and validates it as a multi-label DNS hostname of
-// at most MaxUniverseDomainLength bytes.
+// at most MaxUniverseDomainLength bytes that is not under
+// DefaultUniverseDomain.
 func NormalizeUniverseDomain(raw string) (string, bool) {
 	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
-	if candidate == "" || len(candidate) > MaxUniverseDomainLength || !universeDomainRegex.MatchString(candidate) {
+	if !IsValidUniverseDomain(candidate) {
 		return "", false
 	}
 	return candidate, true
 }
 
 // IsValidUniverseDomain reports whether raw is already a canonical lower-case
-// multi-label DNS hostname within MaxUniverseDomainLength.
+// multi-label DNS hostname within MaxUniverseDomainLength, and not a name
+// under DefaultUniverseDomain.
 func IsValidUniverseDomain(raw string) bool {
-	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw)
+	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw) &&
+		!IsUnderCommercialUniverseDomain(raw)
+}
+
+// IsUnderCommercialUniverseDomain reports whether domain is a name under
+// DefaultUniverseDomain, such as mtls.googleapis.com.
+func IsUnderCommercialUniverseDomain(domain string) bool {
+	return strings.HasSuffix(domain, commercialUniverseSuffix)
 }
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -1109,6 +1123,26 @@ type TuningSpec struct {
 	// +optional
 	SessionResources *corev1.ResourceRequirements `json:"sessionResources,omitempty"`
 
+	// DefaultRoute is the addressee the A2A gateway sends a plain
+	// conversation's first message to: `session` opens a session pod of the
+	// conversation's own, `platform` hands it to the platform agent. Unset
+	// means `platform` for now; a later change flips the default to
+	// `session`. `platform` stays reachable by handle either way, and a
+	// `delegate:` still opens a session pod on either route. The operator
+	// renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
+	// on the platform agent container (which the hermes-bridge sidecar
+	// copies), so a change rolls the gateway and the platform agent pod.
+	//
+	// `session` widens the TASKS consumer budget: each session also counts
+	// the replays of its conversation's task, 7 consumers rather than 3, so
+	// 40 more at the default 10 sessions. TASKS cannot be widened once it
+	// exists, so on an install whose stream was created narrower the
+	// provision Job refuses until maxSessions is lowered to fit or TASKS is
+	// recreated; its message names both.
+	// +kubebuilder:validation:Enum=session;platform
+	// +optional
+	DefaultRoute *string `json:"defaultRoute,omitempty"`
+
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
 	// runs a cluster with R3 streams, which keeps the bus up through a node
@@ -1230,6 +1264,16 @@ type ProfileTuning struct {
 // spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
 // streams. An existing bus keeps its own count.
 const DefaultBusReplicas = 3
+
+// The values spec.harness.tuning.defaultRoute takes. DefaultRouteSession is
+// the A2A gateway's session-route sentinel (RouteSession in a2a/gateway),
+// DefaultRoutePlatform the Hermes bridge's addressee. The Enum marker on
+// DefaultRoute spells the same two by hand, since a marker cannot name a
+// constant.
+const (
+	DefaultRouteSession  = "session"
+	DefaultRoutePlatform = "platform"
+)
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
@@ -2990,8 +3034,11 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place).
-	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	// freeze) or ThreeToOne (in place). Reshape is reserved for a later
+	// release's leg; nothing in this one starts it, and a run of a leg this
+	// operator does not run is held (A2ABusMigrationLegUnknown) until the
+	// operator that started it carries it on or a person abandons it.
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 
 	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
@@ -3021,6 +3068,14 @@ type BusMigrationStatus struct {
 	// Message is the manual step a Failed migration names.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// SettleTime is how long the one to three restore waited, from raising
+	// the last restored stream to three replicas, for every stream's replicas
+	// to be current and every restored durable consumer to answer from its
+	// leader, as a Go duration ("1.2s"). Set when a restore that succeeded
+	// reports it.
+	// +optional
+	SettleTime string `json:"settleTime,omitempty"`
 
 	// Cause is why the run turned back: the phase that failed, and whether
 	// it was still running at Deadline. Set at the first failure and kept
@@ -3321,6 +3376,33 @@ type AgentUsageStatus struct {
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
+	// AutonomousNegativeFeedbackTotal is the cumulative count of
+	// thumbs-downs verified chat users gave the posts the agent made on its
+	// own (alerts and scheduled or audit reports), counted apart from the
+	// answers NegativeFeedbackTotal counts so a thumbs-down on a noisy alert
+	// reads as noise rather than a bad answer:
+	// kubeagents_a2a_gateway_post_feedback_total under rating down, summed
+	// over its other labels, one count each time a user's rating of a post
+	// becomes down, so a repeated tap adds nothing. Read every five minutes
+	// and kept monotonic the same way as ToolExecutionsTotal. Next mode
+	// only: on a today-mode install this stays at 0. Does not move
+	// LastActiveTime: a rating is a person's verdict on a post, not the
+	// agent at work.
+	// +optional
+	AutonomousNegativeFeedbackTotal int64 `json:"autonomousNegativeFeedbackTotal,omitempty"`
+	// AutonomousPositiveFeedbackTotal is the cumulative count of thumbs-ups
+	// verified chat users gave the posts the agent made on its own (alerts
+	// and scheduled or audit reports), counted apart from the answers
+	// PositiveFeedbackTotal counts so a post's rating never reads as an
+	// answer's: kubeagents_a2a_gateway_post_feedback_total under rating up,
+	// summed over its other labels, one count each time a user's rating of a
+	// post becomes up, so a repeated tap adds nothing. Read every five
+	// minutes and kept monotonic the same way as ToolExecutionsTotal. Next
+	// mode only: on a today-mode install this stays at 0. Does not move
+	// LastActiveTime: a rating is a person's verdict on a post, not the
+	// agent at work.
+	// +optional
+	AutonomousPositiveFeedbackTotal int64 `json:"autonomousPositiveFeedbackTotal,omitempty"`
 	// InputTokensTotal is the cumulative count of prompt tokens the inference
 	// gateway (LiteLLM) billed for the install's model calls, every model and
 	// every caller together. Read every five minutes from each LiteLLM pod's
@@ -3534,9 +3616,10 @@ type AgentUsageStatus struct {
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
 	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
-	// NegativeFeedbackTotal, PositiveFeedbackTotal and the three inference
-	// totals (InputTokensTotal, OutputTokensTotal, SpendMicrosUSDTotal) alone
-	// leave it where it was, and the six proposal readings never move it.
+	// NegativeFeedbackTotal, PositiveFeedbackTotal, the two autonomous
+	// feedback totals and the three inference totals (InputTokensTotal,
+	// OutputTokensTotal, SpendMicrosUSDTotal) alone leave it where it was,
+	// and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

@@ -177,11 +177,12 @@ spec:
 | `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-Everything here is dark content: the dispatcher and the profile CRD render nothing unless
-the mode switch says `next`.
+Everything here renders on every install; the `spec.mode` switch that once held it dark
+is gone.
 
 As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
-executor, and `resources` and `concurrency` are required rather than defaulted. The example
+executor, and refuses a new profile named `session`, the gateway's session route (one created
+before that rule keeps working), and `resources` and `concurrency` are required rather than defaulted. The example
 above and the platform worked profile below are design sketches from before the CRD existed.
 
 ## How a profile becomes a pod
@@ -199,7 +200,7 @@ carried a Role with pod create/delete/watch; that goes away.)
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
 binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. The
 dispatcher and the janitor run under the operator manager's leader election - the
-`--leader-elect` machinery the operator already ships, required on under `mode: next` -
+`--leader-elect` machinery the operator already ships, required on the operator Deployment (the chart passes `--leader-elect`) -
 so "one dispatcher" and "exactly one final event" are elected properties, not deployment
 accidents. Scaling the operator for HA changes nothing here: followers hold no
 consumers. Only a
@@ -397,7 +398,16 @@ What the operator renders per profile, as built (amended 10/6):
   - Version control (#3993). `/v1/vcs/` admits the profile role, and every verb there needs a
     valid task credential: one with no credential is refused before the body is read, not
     run local-only. The reads (`clone`, `proposal-view`, `proposal-list`, `proposal-commits`,
-    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more. `publish`,
+    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more, except that an
+    `issue-list` whose `query` is not plain words (a `:`, quote, backslash or parenthesis,
+    or `OR`, `AND` or `NOT` as a word), or whose label names hold a quote or a backslash, is
+    refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
+    fields into a search ahead of its own `repo:` qualifier, and any of them could add a
+    qualifier, swallow that one, or make it an alternative, reaching past the managed
+    repository. An `identity` with no `repository` answers the install's managed
+    repositories instead (`{managedRepositories: [host/path, …]}`), the names every verb is
+    held to, with no repository resolved and no forge called, so a task that names none can
+    find the one it may use. `publish`,
     `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
     `vcs:proposal-create`, which the dispatcher mints only when the submission's
     `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
@@ -474,20 +484,20 @@ What the operator renders per profile, as built (amended 10/6):
 
 Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
 task connection) land, a worker's pod connection still reaches every task of its profile, so
-two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
-tombstone, because there is no bus to publish one on. The directory survives a flip to
-`today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
-Nothing sweeps directory entries that have no profile. Fixing that means either holding
-deletion on a `today` install or giving the operator a read of the whole directory.
+two pods of one profile can reach each other's task subjects. And nothing sweeps directory entries
+that have no profile: a profile deleted while its agent was still on `spec.mode: today`, before
+that mode went, released its finalizer with no tombstone, because there was no bus to publish one
+on, and its entry stays on the bus's PVC until the operator gains a read of the whole directory.
 
 Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
 exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events
-subject. Only `platform` is reserved. Matching the session shape would mean a regex that has
+subject. Only `platform` and `session` are reserved. Matching the session shape would mean a regex that has
 to track how the gateway mints names, and creating an AgentProfile is already a privileged act.
 
 The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
 two agents in one namespace (only possible with the singleton webhook off) a profile renders
-nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.
+nothing. The name `platform` is reserved: it is the Hermes bridge's addressee. So is `session`,
+the gateway's session route, for new profiles.
 
 Spawn latency is the demo's: roughly 5-10 seconds to first streamed output with a warm
 node and pre-pulled image. Fine for delegated tasks, which today sit in a 5-second

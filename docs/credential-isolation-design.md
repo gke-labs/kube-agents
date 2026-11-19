@@ -123,7 +123,8 @@ window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
 roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
 idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` step of the
-catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+catch-up policy on the same jobs, the `POST_MERGE_READS_PER_TICK` cap on the post-merge check's reads,
+and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
@@ -252,13 +253,14 @@ audience-bound projected ServiceAccount token (one hour; the audience is per
 caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
-broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
+audit-report reader on every install and, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
-consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
 `kubeagents-credential-proxy-profile`; see
 [spec-subagent-profiles.md](designs/spec-subagent-profiles.md)), and does not vary on
@@ -1139,7 +1141,7 @@ file and never a `.git` it can write into.
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
-  is not literal under `spec.mode: next`: the A2A render strips reserved-name
+  is not literal: the A2A render strips reserved-name
   volume mounts and bus-credential mounts from a sidecar, and writes two env
   names onto it because both feed the capability check rather than the
   container's own configuration - `A2A_CAPABILITY_REQUIRED` as an override
@@ -1165,7 +1167,7 @@ file and never a `.git` it can write into.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with
-  one deliberate exception: under `mode: next` the capability verifier is not
+  one deliberate exception: the capability verifier is not
   counted. It is a request-path workload, and a rollout of it should not flip a
   serving install to Provisioning. Because an install whose verifier is down
   refuses every submission, it reports itself through the `A2AVerifier`

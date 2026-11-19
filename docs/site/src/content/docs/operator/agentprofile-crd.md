@@ -23,7 +23,7 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:
   # A dot-free DNS-1123 label: it is the addressee on the bus. The name plus its
-  # longest listed tier is at most 54 characters. `platform` is reserved.
+  # longest listed tier is at most 54 characters. `platform` and `session` are reserved.
   name: auditor
   namespace: kubeagents-system
 spec:
@@ -152,8 +152,8 @@ With the dispatcher on, each admitted profile also gets a warm pool for each of 
 
 [AgentProfile fields → Status](/kube-agents/operator/agentprofile-fields/#status) lists the status fields. The conditions carry the detail:
 
-| Condition                 | Meaning                                                                                                                                                                                                                                                                                          |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `TierUnknown` or `TierModeConflict` when no listed tier renders). |
-| `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                             |
-| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`).                                             |
+| Condition                 | Meaning                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`, `DispatcherCeiling`, `TierUnknown` or `TierModeConflict` when no listed tier renders).                                                            |
+| `TiersRendered` condition | Every listed tier renders (`AllTiersRendered`), or which don't and why (`TierUnknown`, `TierModeConflict`). Its message names the tiers that render.                                                                                                                                                                                                        |
+| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, `BusConfigPending` while the bus loads a new profile's config, or the same mode and binding reasons as `IdentityReady`). `DurableRecheck` means a durable that existed can't be found, and waits a pass before it's re-created. |

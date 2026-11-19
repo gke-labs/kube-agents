@@ -527,6 +527,19 @@ FIXTURE_NOT_READY = {
         "read fails for a reason that is not the case's, and the blocked path is "
         "graded by the rule's unit tests on a recorded list"
     ),
+    # Needs the two orphaned-snapshot roles past their age gate: the GCE
+    # compute audit's 2.5 flags a snapshot only when
+    # (now - creationTimestamp).days > 90, and the timestamp is server-set,
+    # so the pool's snapshots of 2026-11-18 are invisible to the check until
+    # 2027-02-17. The entry goes in the pull request that moves the case to
+    # the nightly file on that date, once the fixture-state scan reads both
+    # roles ready on every pool project.
+    "compute-declared-intent-no-finding": (
+        "#1408: needs the declared-orphan-snapshot and orphan-snapshot roles past their "
+        "91-day age gate (bench/tf/fleet/fixtures.json ready_after_hours); the pool's "
+        "snapshots date from 2026-11-18, so the compute audit first sees them on "
+        "2027-02-17 and the case cannot be red or green before then"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -654,6 +667,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # session daemon folded into its newest incident. The count is the
     # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
     "workload_incident_folded": ("min_folded",),
+    "post_merge_outcome": ("outcome",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
@@ -1350,9 +1364,10 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
     singular and `fixtures:` accept."""
     if not isinstance(node, dict):
         return
-    role = node.get("fixture_role")
-    if isinstance(role, str):
-        found.add(role)
+    for key in ("fixture_role", "apply_fixture_role"):
+        role = node.get(key)
+        if isinstance(role, str):
+            found.add(role)
     roles = node.get("fixture_roles")
     if isinstance(roles, list):
         for role in roles:
@@ -1365,12 +1380,13 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
 
 
 def _singular_fixture_roles(node: Any, found: set[str]) -> None:
-    """Every singular `fixture_role:` in one check subtree."""
+    """Every singular `fixture_role:` (and post_merge_outcome's `apply_fixture_role:`) in one check subtree."""
     if not isinstance(node, dict):
         return
-    role = node.get("fixture_role")
-    if isinstance(role, str):
-        found.add(role)
+    for key in ("fixture_role", "apply_fixture_role"):
+        role = node.get(key)
+        if isinstance(role, str):
+            found.add(role)
     for child in node.get("checks") or []:
         _singular_fixture_roles(child, found)
 

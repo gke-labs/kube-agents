@@ -48,7 +48,13 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. The sandbox is always on — `harness.experimental.shellSandbox.enabled`
+  itself. With `create=false`, the template reads `SANDBOX_SSH_PUBLIC_KEY` via
+  Helm `lookup`, so offline `helm template` renders (such as Argo CD) omit
+  `<platformAgent.name>-shell-authorized-keys` and you must provision that
+  Secret alongside `platform-agent-secrets`; see
+  [Deploying kube-agents via Argo CD without Helm lookup](../../docs/site/src/content/docs/deploy/gitops-argocd.md#deploying-kube-agents-via-argo-cd-without-helm-lookup)
+  for the `ExternalSecret` layout and SSH keypair rotation procedure. The sandbox
+  is always on — `harness.experimental.shellSandbox.enabled`
   is not a toggle, the operator refuses `false`, and this chart fails at template
   time — so without the pair the agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
@@ -413,6 +419,41 @@ conversation a Vertex `session_id` so a new conversation's first turn can read
 a prompt another conversation warmed:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
 
+To override the Vertex AI endpoint host through `litellm.envFromSecret`
+([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)) with
+`VERTEXAI_API_BASE` or render a custom-universe Vertex `api_base` in
+`config.yaml` via `platformAgent.harness.universeDomain`, pair them with
+`litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and
+`litellm.vertex.location`:
+
+```bash
+kubectl create secret generic vertex-endpoint -n kubeagents-system \
+  --from-literal=VERTEXAI_API_BASE=https://us-east4-aiplatform.universe.example.com
+
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.modelDefaultName=gemini-3.8-flash \
+  --set litellm.vertex.projectId=my-serving-project \
+  --set litellm.vertex.location=us-east4 \
+  --set litellm.envFromSecret=vertex-endpoint
+```
+
+When `api_base` is empty in `config.yaml`, LiteLLM reads `VERTEXAI_API_BASE`
+from the environment and appends
+`/v1/projects/<VERTEXAI_PROJECT>/locations/<VERTEXAI_LOCATION>/...` to a
+host-only base, so the chart's project and location still apply. Setting a
+non-default `platformAgent.harness.universeDomain` renders `api_base`
+(`https://aiplatform.<universeDomain>` for `global` or
+`https://<location>-aiplatform.<universeDomain>` for a regional location) in
+`config.yaml`, which wins over `VERTEXAI_API_BASE`. Container `env` entries
+(`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+when `platformAgent.harness.universeDomain` is non-default) always override
+matching keys in `litellm.envFromSecret`. Full precedence and examples:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -476,8 +517,8 @@ including `/v1`) are required, and the render fails without them. Set
 mounts whole into the gateway container as environment variables (`envFrom`,
 optional, so the pod starts without it). You create it; the chart only names
 it, and a Helm upgrade never touches it. It carries whatever the LiteLLM
-provider reads from the environment, which is how the providers without a
-key in the credentials Secret get theirs:
+provider reads from the environment — credentials for providers without a key
+in the credentials Secret, or custom environment variables for `vertex_ai`:
 
 - **SAP AI Core (`litellm.modelProvider=sap`).** LiteLLM's `sap/` driver
   exchanges the service key's client credentials at your tenant's token URL
@@ -496,10 +537,21 @@ key in the credentials Secret get theirs:
   in the Secret, the chart ships a pre-call hook that fetches the bearer token,
   caches it and renews it before expiry
   ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
+- **Vertex AI custom environment variables (`litellm.modelProvider=vertex_ai`).**
+  Set `VERTEXAI_API_BASE` (matching `litellm.vertex.location`) or other custom
+  variables in the Secret (`envFrom`, which does not render `api_base` in
+  `config.yaml`, so a non-default `platformAgent.harness.universeDomain`
+  rendering `api_base` wins over `VERTEXAI_API_BASE`); pair with
+  `litellm.vertex.projectId` (or `projectSecretRef`) and
+  `litellm.vertex.location`
+  ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
 
-A variable the chart also sets from the credentials Secret (`GEMINI_API_KEY`,
-`HOSTED_VLLM_API_KEY`, ...) wins over the same name in this Secret. Rotating
-the Secret does not roll the pods: `kubectl rollout restart deployment/litellm`.
+A variable the chart sets directly in container `env` — keys from the
+credentials Secret (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY`, ...), plus
+`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+(when `platformAgent.harness.universeDomain` is non-default) on `vertex_ai` —
+wins over the same name in this Secret. Rotating the Secret does not roll the
+pods: `kubectl rollout restart deployment/litellm`.
 
 ```bash
 kubectl create secret generic sap-aicore -n kubeagents-system \
@@ -1017,10 +1069,14 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
 `helm upgrade` on an install whose served `PlatformAgent` CRD predates
-`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. A value under
+`googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
+of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
-`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
-renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter`,
+renders `api_base` on `litellm` (`vertex_ai`) `model_list` entries in
+`config.yaml`, and renders `githubMinter`'s `ISSUER_ALLOWLIST` against
+`https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
@@ -1035,7 +1091,9 @@ has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
-significant digits is refused at render as well: the chart compares quantities as
+significant digits is refused at render as well, and so is one with an exponent
+below -18 (`1e-19`), which the operator decodes only slowly and no resource
+needs: the chart compares quantities as
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
@@ -1098,6 +1156,13 @@ rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent
 wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
 says what is counted and what a held triage does.
+
+`platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
+LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
+agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
+proxy logs and does not forward. `false`, the default, renders nothing. A literal entry with the
+same name in `platformAgent.deployment.env` wins. A `valueFrom` entry with the key `true` fails the
+render, because the operator forwards only literal values and would drop it.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,

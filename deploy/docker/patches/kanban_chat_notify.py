@@ -88,7 +88,9 @@ message that is edited in place (the thread's plan, a card's question, the
 alert). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
 --chat-file`` and ``--update``; the text stays the fallback, and a gateway that
 does not read them posts the text. A failure wake's reply with a Try again
-offer (``slack_ux_failure.chat_for``) is laid out the same way.
+offer (``slack_ux_failure.chat_for``) is laid out the same way. The settled
+card's report post also carries ``REPORT_METADATA_KEY`` (``--report``), the
+mark the gateway keeps a post by for the reply under it.
 :func:`conversation_ask` reads back the kind of ask the hermes-bridge recorded
 on the conversation's route, which the plan's ``mark`` keeps while its cards run.
 """
@@ -226,10 +228,18 @@ UPDATE_METADATA_KEY = "kage_update"
 #: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
 #: draws its rating controls on it, under the ask the plan is bound to.
 ANSWER_METADATA_KEY = "kage_answer"
+#: Metadata key marking a conversation post as a card's report: set by
+#: ``kanban_progress_lines._with_answer`` on the settled card's report post
+#: alone, never on a progress note, heartbeat, queued or plan line. Sent as
+#: ``a2a notify --report``; the gateway keeps only such a post for the reply
+#: under it (``a2a/gateway/reports.go``). ``--reply-to`` rides every post into
+#: a console thread, so it cannot tell a report from a note.
+REPORT_METADATA_KEY = "kage_report"
 #: The ``a2a notify`` flags a conversation post and its answer ride on.
 CONVERSATION_FLAG = "--conversation"
 ANSWER_FLAG = "--answer-to"
 UPDATE_FLAG = "--update"
+REPORT_FLAG = "--report"
 CONVERSATION_ASK_KEY = "ask"
 # The chat message's file for `a2a notify --chat-file`: written mode 0600 by
 # tempfile, removed once the command returns.
@@ -935,6 +945,8 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
         if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
             argv += [ANSWER_FLAG, answer_to]
+        if (metadata or {}).get(REPORT_METADATA_KEY) and CONVERSATION_FLAG in argv:
+            argv += [REPORT_FLAG]
         # The chat message above was laid out from the text as written; what a person reads has no step line.
         argv += ["--", _visible(content)]
         try:

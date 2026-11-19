@@ -570,6 +570,14 @@ type fakeConversations struct {
 	// posts made by then.
 	marks       []string
 	postsAtMark []int
+	// kept records KeepReport calls as "conversation root text".
+	kept []string
+}
+
+func (f *fakeConversations) KeepReport(conversation, root, text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kept = append(f.kept, conversation+" "+root+" "+text)
 }
 
 func (f *fakeConversations) MarkConversation(conversation, update string, mark MarkState) {

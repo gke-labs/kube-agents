@@ -388,6 +388,34 @@ def carries_body(rule_id: str) -> bool:
     return rule_id in _BODY_CHECKS
 
 
+def _logging_resource_name(body: dict) -> str:
+    """The one `projects/<project>` of an `entries:list` body the route's check passed."""
+    return body[LOGGING_RESOURCE_NAMES][0]
+
+
+# For a route whose path does not name what it reads: where the one resource name
+# is in a body the route's check passed. The broker's log carries it on a line at
+# the check and on the forwarded line. `body_resource` runs the check; a reader
+# here only extracts.
+_BODY_RESOURCES: dict[str, Callable[[dict], str]] = {LOGGING_ENTRIES_LIST_RULE: _logging_resource_name}
+
+
+def body_resource(rule_id: str, body: object) -> str | None:
+    """The resource name the broker may log for the body of route `rule_id`, or None.
+
+    For the body of a request `evaluate_body` allowed. The name is read only from
+    a body the route's own check passes here, so what comes back has passed the
+    check's grammar and is never caller text the check refused; a body the check
+    refuses gives None, and so does a route whose body names no single resource.
+    Never raises.
+    """
+    check = _BODY_CHECKS.get(rule_id)
+    resource = _BODY_RESOURCES.get(rule_id)
+    if check is None or resource is None or check(body) is not None:
+        return None
+    return resource(body)
+
+
 def evaluate_body(rule_id: str, body: object) -> Decision:
     """Allow or refuse the parsed JSON body of a request `evaluate` allowed.
 
@@ -448,7 +476,7 @@ def evaluate(
     try:
         universe = credential_proxy_client.normalize_universe_domain(universe_domain)
     except ValueError:
-        # No route has a host in a malformed universe: a POST is refused on its
+        # No route has a host in a universe domain that is not valid: a POST is refused on its
         # method below, and a GET by the answer after it.
         universe = None
     if method == API_BODY_METHOD and universe is not None:
@@ -479,7 +507,7 @@ def evaluate(
         return Decision(
             allowed=False,
             rule_id=RULE_HOST,
-            message="The configured universe domain is malformed; the credential proxy refuses every API relay.",
+            message="The configured universe domain is not valid; the credential proxy refuses every API relay.",
         )
     refused_hosts = (
         REFUSED_HOSTS

@@ -93,6 +93,13 @@ readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
 # (bench/kube_agents_bench/lane.py); the files under bench/tasks/ are
 # untouched.
 readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
+# The ledger-reader Apps grading mints from (#6240), one per line in shard
+# order, LEDGER_READER_SHARD_SIZE pool projects per App in number order
+# (select_ledger_reader, in the ledger credential section).
+# scripts/verify_ci_pool_project.py and scripts/provision_ci_pool_project.sh
+# carry the same size; a test holds the three equal.
+readonly EVAL_LEDGER_READER_APPS_FILE="eval/ledger-reader-apps.txt"
+readonly LEDGER_READER_SHARD_SIZE=10
 # The fan-out's launch pacing. Every unit is launched this many seconds after
 # the one before, so N units do not open their first model call in the same
 # second (burst 429s at the model quota). A unit of a case that requests a
@@ -175,6 +182,10 @@ readonly EVAL_TIMING_FILE="timing.json"
 # The delivered reply's shape beside results.json, where
 # bench/kube_agents_bench/scoring.py (_SHAPE_FILE) reads it. Reported, never scored.
 readonly EVAL_SHAPE_FILE="shape.json"
+# The invocation's eval run tag (<run>/<case>/<rep>) and run id beside
+# results.json (harness.py, KUBE_AGENTS_EVAL_RUN_FILE), so a retried
+# repetition's attempt is told apart from the first in the replay proxy's log.
+readonly EVAL_RUN_TAG_FILE="eval_run.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
 # Where each unit writes a repetition's log (run_one_unit) and grading reads it
@@ -1362,17 +1373,104 @@ export BENCH_TF_ROOT="./tf"
 # passed every onboarding check, was registered, and 404'd on the first pull
 # request that leased it (gke-labs/kube-agents#994).
 #
-# EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
-# instead, once per fan-out unit, because a token lasts an hour and units
-# launch across the whole run; grading's mint asks for its four reads
-# explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
-# own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
-# fails after its retries stops the run at preflight and costs a unit its
-# repetition inside the fan-out; it never falls back to the PAT, which would
-# let a smoke test pass while proving nothing about the credential it was added
-# to exercise.
-export EVAL_LEDGER_APP_ID="${EVAL_LEDGER_APP_ID:-4739812}"
-export EVAL_LEDGER_INSTALLATION_ID="${EVAL_LEDGER_INSTALLATION_ID:-157029058}"
+# EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from a
+# ledger-reader App instead, once per fan-out unit, because a token lasts an
+# hour and units launch across the whole run; grading's mint asks for its four
+# reads explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints
+# its own, narrowed to one repository and issues: write. Unset: the mounted PAT
+# stands. A mint that fails after its retries stops the run at preflight and
+# costs a unit its repetition inside the fan-out; it never falls back to the
+# PAT, which would let a smoke test pass while proving nothing about the
+# credential it was added to exercise.
+#
+# Which App (#6240): one installation serving every pool project gave every
+# concurrent run one hourly budget, and on 2026-11-18 forty smoke runs and
+# the nightlies spent it every hour. The pool's repositories are spread over
+# copies of the App instead, listed in EVAL_LEDGER_READER_APPS_FILE in shard
+# order, LEDGER_READER_SHARD_SIZE projects per App in number order: the
+# first ten on the first row, the next ten on the second (ledger_reader_shard),
+# the rule scripts/verify_ci_pool_project.py and
+# scripts/provision_ci_pool_project.sh apply too, so a repository added to
+# the wrong App fails the project's onboarding check rather than a lease. A
+# project whose row or key is not there yet reads through the first App,
+# with a warning, while the rollout catches up.
+# Prow mounts one key per App and lists them in row order in
+# EVAL_LEDGER_APP_KEY_FILES; unset, EVAL_LEDGER_APP_KEY_FILE alone is the
+# list, which with a one-line file is the single App of before. Ids already
+# in the environment stand with the key file as given (a local run against
+# another App). Every later mint -- the units, the renewals, the resets, the
+# GitOps write token -- reads the three exports, so one choice here is the
+# run's.
+
+# The shard a pool project's repository sits in: LEDGER_READER_SHARD_SIZE
+# projects per App in number order, so (number - 1) / size; the bare
+# kube-agents-evals is number 1. <project id>; prints the index.
+ledger_reader_shard() {
+  local ordinal=1
+  if [[ "$1" =~ -([0-9]+)$ ]]; then ordinal="${BASH_REMATCH[1]}"; fi
+  echo $(( (10#${ordinal} - 1) / LEDGER_READER_SHARD_SIZE ))
+}
+
+# Exports EVAL_LEDGER_APP_ID, EVAL_LEDGER_INSTALLATION_ID and
+# EVAL_LEDGER_APP_KEY_FILE for the App whose installation holds <project
+# id>'s repository. Both ids already set: they stand, and so does the key
+# file. Returns 1 only when the file names no App at all; a shard with no
+# row or no mounted key reads through the first App with a warning (below).
+select_ledger_reader() { # <project id>
+  local -a apps=() keys=() fields=()
+  local line shard number
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    [[ "${line}" =~ [^[:space:]] ]] && apps+=("${line}")
+  done < "${SCRIPT_DIR}/${EVAL_LEDGER_READER_APPS_FILE}"
+  if [ "${#apps[@]}" -eq 0 ]; then
+    echo "ERROR: ${EVAL_LEDGER_READER_APPS_FILE} names no ledger-reader App; nothing can mint the grading token." >&2
+    return 1
+  fi
+  # Only the list is split on whitespace; the single key file is one entry
+  # whatever it contains, and a list that is set but blank falls back to it
+  # rather than leaving a later App's ids paired with the first App's key.
+  if [ -n "${EVAL_LEDGER_APP_KEY_FILES:-}" ]; then
+    read -r -a keys <<< "${EVAL_LEDGER_APP_KEY_FILES}"
+  fi
+  if [ "${#keys[@]}" -eq 0 ] && [ -n "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    keys=("${EVAL_LEDGER_APP_KEY_FILE}")
+  fi
+  shard="$(ledger_reader_shard "$1")"
+  # Messages count Apps from 1, as the App names and the file's rows do:
+  # "reader App 2 of 5" is the second row, which holds projects 11 to 20.
+  number=$((shard + 1))
+  if [ -n "${EVAL_LEDGER_APP_ID:-}" ] && [ -n "${EVAL_LEDGER_INSTALLATION_ID:-}" ]; then
+    # Exported, not assumed: a shell that sourced this file may have assigned
+    # them without export, and the mint reads the environment.
+    export EVAL_LEDGER_APP_ID EVAL_LEDGER_INSTALLATION_ID
+    echo "Ledger reader: App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID} from the environment (reader App ${number} of ${#apps[@]} not consulted for ${1:-an unnamed project})"
+    return 0
+  fi
+  # A shard with no row yet, or whose key the job did not mount, reads
+  # through the first App with a warning: that installation keeps every
+  # repository until a shard's are moved off it, the last step of adding an
+  # App (docs/ci-pool-projects.md 5.4), so the run goes on and the log
+  # names what is missing. scripts/test_verify_ci_pool_project.py holds the
+  # table to the pool's mapping, so a project with no row is a pull request
+  # that forgot one, not a merged state.
+  if [ "${shard}" -ge "${#apps[@]}" ]; then
+    echo "WARNING: Ledger reader: ${1} is on reader App ${number} (${LEDGER_READER_SHARD_SIZE} projects per App, in number order) and ${EVAL_LEDGER_READER_APPS_FILE} has ${#apps[@]} row(s); reading through reader App 1, whose installation must still hold the repository. Register App ${number} and append its row (docs/ci-pool-projects.md 5.4)." >&2
+    shard=0
+  elif [ "${#keys[@]}" -gt 0 ] && [ "${shard}" -ge "${#keys[@]}" ]; then
+    echo "WARNING: Ledger reader: ${1} is on reader App ${number} and the job mounted ${#keys[@]} key file(s) (EVAL_LEDGER_APP_KEY_FILES); reading through reader App 1, whose installation must still hold the repository. Mount reader App ${number}'s key in the job configs (docs/ci-pool-projects.md 5.4)." >&2
+    shard=0
+  fi
+  read -r -a fields <<< "${apps[${shard}]}"
+  export EVAL_LEDGER_APP_ID="${fields[0]}"
+  export EVAL_LEDGER_INSTALLATION_ID="${fields[1]}"
+  if [ "${#keys[@]}" -gt 0 ]; then
+    export EVAL_LEDGER_APP_KEY_FILE="${keys[${shard}]}"
+  fi
+  echo "Ledger reader: reader App $((shard + 1)) of ${#apps[@]} for ${1:-an unnamed project}: App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE:-none (the mounted PAT stands)}"
+}
+
+select_ledger_reader "${PROJECT_ID:-}" || exit 1
 # Re-exported so the mint reads it however it was set: the Prow job exports it,
 # a shell that sourced this file may not have, and python reads it from the
 # environment rather than from an argument.
@@ -1439,6 +1537,10 @@ KCC_EVAL_CONTEXT_ACCOUNT="kcc-eval-context"
 # The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
 # _ledger_token_mint below.
 LEDGER_MINT_SCRIPT="${SCRIPT_DIR}/ledger_token_mint.py"
+# The line the mint writes after a successful mint with the installation's
+# remaining hourly budget (hack/ledger_token_mint.py, LEDGER_BUDGET_PREFIX;
+# tests/test_ci_eval_ledger_mint.py holds the two equal).
+LEDGER_BUDGET_PREFIX="budget:"
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
@@ -1514,9 +1616,15 @@ mint_ledger_token() { # <label>
     attempt=$((attempt + 1))
     delay=$((delay * 4))
   done
+  # The installation's hourly budget as the mint read it (LEDGER_BUDGET_PREFIX
+  # in hack/ledger_token_mint.py; empty when that read failed), kept beside
+  # the mint so a day of runs shows how much of the shard one run spends
+  # (#6240). Taken from the file, so a renewal's discarded stderr keeps it.
+  local budget
+  budget="$(grep -m 1 "^${LEDGER_BUDGET_PREFIX}" "${diagnostics}" || true)"
   rm -f "${diagnostics}"
   export BENCH_GITHUB_TOKEN="${minted%% *}"
-  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }" >> "${EVAL_GRADING_LOG}"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"
 }
 
 # Keeps a unit's grading token alive for as long as its devops-bench runs.
@@ -4758,6 +4866,10 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # The full compliance audit with its ledger write (#1983), after a plant of
+    # four namespaces and at most one CRD on the host. Unmeasured: priced at
+    # the audit band.
+    security-serviceentry-host-collision) echo 900 ;;
     # Written to outrun the worker turn budget: about 150 trivial model calls,
     # twice (the dispatcher retries the timed-out card once), on the agent's
     # own cluster. 13-26 min a repetition at 90 turns on a dev install on
@@ -5685,6 +5797,23 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
       return 0
     fi
   fi
+  # A case graded by post_merge_outcome (bench/kube_agents_bench/post_merge.py)
+  # merges the agent's fix pull request itself, as no reconciler or reviewer
+  # does inside a run, and afterwards takes the merged pull request's audit
+  # labels off and puts its files back. The ledger App mints it a token
+  # narrowed to this repository with the reset's permissions (a merge, a
+  # label, a file); the agent never sees it. Without one the check errors, which grades the repetition MISSING.
+  unset EVAL_POST_MERGE_WRITE_TOKEN
+  # GitHub only: on GitLab forge_write_token hands back the agent's own token.
+  # Minted at launch and good for an hour, which covers the agent's turn plus
+  # the check's fifteen minutes of ticks; a unit that outlasts it errors its cleanup
+  # into the log rather than silently.
+  if [ "${EVAL_FORGE_KIND:-github}" = "github" ] && grep -q 'type: post_merge_outcome' "${BENCH_DIR}/${task#./}" 2>/dev/null && [ -n "${EVAL_LEDGER_REPO:-}" ]; then
+    local merge_token=""
+    merge_token="$(forge_write_token "${EVAL_LEDGER_REPO}" '{"pull_requests":"write","contents":"write","issues":"write"}')" ||
+      echo "WARNING: ${name} rep ${rep}: no merge token for ${EVAL_LEDGER_REPO}; post_merge_outcome will error" >&2
+    [ -n "${merge_token}" ] && export EVAL_POST_MERGE_WRITE_TOKEN="${merge_token}"
+  fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
     export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
@@ -5746,6 +5875,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The same for the delivered reply's shape (harness.py, KUBE_AGENTS_SHAPE_FILE).
   local shape="${STATE_DIR}/${name}.rep${rep}.${EVAL_SHAPE_FILE}"
   rm -f "${shape}"
+  # The same for the eval run tag (harness.py, KUBE_AGENTS_EVAL_RUN_FILE).
+  local eval_run="${STATE_DIR}/${name}.rep${rep}.${EVAL_RUN_TAG_FILE}"
+  rm -f "${eval_run}"
   # A stack that writes to the leased GitOps repository gets its own write
   # token, minted here, after the waits, as the grading token is above, and
   # renewed until devops-bench returns, which is after the stack's destroy
@@ -5770,7 +5902,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
   start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" KUBE_AGENTS_EVAL_RUN_FILE="${eval_run}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   stop_ledger_token_renewal "${token_file}"
   if [ -n "${gitops_writer}" ]; then
@@ -5789,6 +5921,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
   if [ -n "${dir}" ] && [ -f "${shape}" ]; then
     cp "${shape}" "${dir}/${EVAL_SHAPE_FILE}" 2>/dev/null || true
+  fi
+  if [ -n "${dir}" ] && [ -f "${eval_run}" ]; then
+    cp "${eval_run}" "${dir}/${EVAL_RUN_TAG_FILE}" 2>/dev/null || true
   fi
   # A gated judged score the judge failed to return is asked for once more
   # from the saved answer (kube_agents_bench/rejudge.py), before the .dir

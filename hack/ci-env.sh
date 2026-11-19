@@ -916,6 +916,20 @@ replay_shadow_helm_args() {
   esac
 }
 
+# The chart value that turns on per-request eval run tags
+# (deploy/docker/patches/eval_run_tag.py), into EVAL_RUN_TAGS_HELM_ARGS: on
+# whenever the replay proxy is, since the proxy is what logs the tag and keeps
+# the header from LiteLLM; EVAL_RUN_TAGS=false turns it off. Empty otherwise,
+# so a run without the proxy installs exactly what it did before.
+eval_run_tags_helm_args() {
+  EVAL_RUN_TAGS_HELM_ARGS=()
+  if [ "${REPLAY_SHADOW_ACTIVE:-false}" != "true" ] || [ "${EVAL_RUN_TAGS:-true}" = "false" ]; then
+    return 0
+  fi
+  # shellcheck disable=SC2034 # read by hack/ci-deploy.sh, which sources this file
+  EVAL_RUN_TAGS_HELM_ARGS=(--set "platformAgent.deployment.evalRunTags=true")
+}
+
 # ─── Inference-replay shadow mode: the collector (the eval's lifetime) ───────
 # Starts collect_shadow.py in the background when resolve_replay_shadow says
 # the proxy is on, pinned to AGENT_CLUSTER_CONTEXT; call once the context is

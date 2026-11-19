@@ -79,3 +79,53 @@ func TestTwoProfilesSharingATaskIDEachStoreTheirTerminal(t *testing.T) {
 		t.Errorf("a repeat terminal for the same task was stored again: %d stored", n)
 	}
 }
+
+// Under the operator's switch (DispatchConfig.ProfileSupervisorForm, #5301)
+// the terminal goes on the profile's six-token supervisor subject, and the
+// gateway's agreement still takes it; without the switch it stays on the
+// five-token one.
+func TestTheTerminalTakesTheConfiguredSupervisorForm(t *testing.T) {
+	for _, tc := range []struct {
+		form, want string
+	}{
+		{"", lib.TaskSupervisorSubject("tse", "task-form")},
+		{lib.ProfileSupervisorFormProfile, lib.ProfileSupervisorSubject("tse", "task-form")},
+	} {
+		t.Run("form="+tc.form, func(t *testing.T) {
+			b := newBus(t, "tse-0")
+			b.ensure("tse", 2, 0, "read")
+			got := make(chan *nats.Msg, 4)
+			sub, err := b.admin.ChanSubscribe("a2a.tasks.>", got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sub.Unsubscribe() })
+			ti := oneProfile("tse", 2, "tse-0")
+			ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = tc.form })
+			b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+			b.submitWith("tse", "read", lib.SubmitKindTop, "task-form", "", map[string]string{})
+			deadline := time.After(15 * time.Second)
+			for {
+				select {
+				case msg := <-got:
+					if !lib.IsTaskSupervisorSubject(msg.Subject, "tse", "task-form") {
+						continue
+					}
+					if msg.Subject != tc.want {
+						t.Fatalf("terminal on %q, want %q", msg.Subject, tc.want)
+					}
+					env, err := lib.ParseEnvelope(msg.Data)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := lib.CheckSubjectAgreement(msg.Subject, env, gateway.SupervisorAgreement(nil)); err != nil {
+						t.Errorf("the gateway refuses the dispatcher's terminal on %q: %v", msg.Subject, err)
+					}
+					return
+				case <-deadline:
+					t.Fatal("no terminal on a supervisor subject")
+				}
+			}
+		})
+	}
+}

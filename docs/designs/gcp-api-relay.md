@@ -144,17 +144,27 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
 
 6. Writes two audit lines per request, on the pattern of the exec route: one before the
    decision and exactly one verdict after it. The request id is minted by the broker, so the
-   two lines of one request share it:
+   lines of one request share it. A read with a body that names one resource (today
+   `entries:list`) writes one more line between the two, when its body passes the route's
+   check:
 
    ```
    api request_id=%s principal=%s host=%s path=%s
    api rejected request_id=%s code=%s reason=%s
    api blocked request_id=%s rule=%s
-   api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d
+   api body checked request_id=%s rule=%s resource=%s
+   api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d[ resource=%s]
    ```
 
    `host` and `path` are caller text and go through `_sanitize_for_logging` as `argv[0]`
-   does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
+   does (`path` at 256 characters, the width the exec route gives a `cwd`). The forwarded line
+   of a read with a body ends with ` resource=projects/<project>`, the one resource name its
+   body check passed: the path of such a read names no project. The `api body checked` line
+   names the same resource before the upstream call, so a verdict that is not `forwarded`
+   (over the cap, a redirect, an upstream or credential failure, a disabled relay) also
+   follows a line that says which project the read asked for. A refused body returns before
+   that line: its resource is in no line. The `audit` mapping does not carry the resource,
+   and the `api body checked` line carries no `audit` mapping. The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
    writes `api disabled request_id=%s rule=%s`. Each of these records also carries the
@@ -300,8 +310,9 @@ universe domain each `<service>.googleapis.com` host of the table is read as
 `<service>.<universe domain>`, so the host as the table writes it is in no route there: a `GET`
 for it is refused with `gcp.api.host`, any other method at step 1. A `REFUSED_HOSTS` entry is
 refused there as written, and a `<service>.googleapis.com` entry also as
-`<service>.<universe domain>`. A universe domain that is malformed has no routed host, so every
-request is refused: a `GET` with `gcp.api.host`, any other method at step 1.
+`<service>.<universe domain>`. A universe domain that is not valid, which is a malformed one or
+one under `googleapis.com`, has no routed host, so every request is refused: a `GET` with
+`gcp.api.host`, any other method at step 1. The broker does not start with such a value.
 
 `evaluate` answers in this order, and the order is the security argument:
 
@@ -459,7 +470,7 @@ before the host is read.
 | Supply its own credential or an API key                              | Caller headers dropped; `key`/`access_token`/`oauth_token`/`bearer_token` stripped                                                                                                                                 |
 | Put a byte on the upstream request line the broker did not choose    | `API_RELAY_QUERY_SHAPE`: URL query characters (RFC 3986's plus `[` `]`) and complete percent-escapes only, 400 before the table                                                                                    |
 | Send the front end an over-long URL on demand                        | `API_RELAY_MAX_QUERY_BYTES`, 400 before the table; a 414 that does arrive is passed through like any other status                                                                                                  |
-| Forge an audit line                                                  | `_sanitize_for_logging` on every caller-supplied field, as on `/v1/exec`                                                                                                                                           |
+| Forge an audit line                                                  | `_sanitize_for_logging` on every caller-supplied field, as on `/v1/exec`; a body's resource name is logged only after `check_logging_entries_list` held it to `projects/<project>`                                 |
 | Call it from the gateway role                                        | `ROUTE_ROLES` admits `shell` only                                                                                                                                                                                  |
 | Exhaust the broker with a huge response, or hand it a page cut short | `API_RELAY_MAX_RESPONSE_BYTES`, read in chunks with a cap rather than `.read()`; a body short of its `Content-Length` is `UPSTREAM_TRUNCATED`, none of it relayed                                                  |
 | Park a broker thread on a stalled upstream                           | `API_RELAY_CONNECT_TIMEOUT_S` on the connect; `API_RELAY_DEADLINE_S` re-armed on the socket before every `read1`                                                                                                   |
@@ -534,7 +545,12 @@ standing in for `monitoring.googleapis.com` and the real `GoogleApiRelay.fetch` 
   included), a request that cannot be framed or has no body a 400, and one exactly at the cap
   is read. A body that stalls leaves a `started` and a `rejected` record. The chat
   and session roles are refused. Each outcome writes its audit record under the `logging`
-  subcommand, and the filter is in no log line.
+  subcommand, and the filter is in no log line. The forwarded line of an `entries:list` ends
+  with the body's `projects/<project>`, the line of a forwarded `GET` names no resource, and
+  no line of a refused body carries its project. An `entries:list` whose body passed the
+  check writes the `api body checked` line with the project before its verdict, when the
+  verdict is `forwarded` and when it is a failure (over the cap, no relay, no credential,
+  an unreachable upstream).
 - A refused `POST` carrying a body larger than the socket buffers still receives its 403,
   because the body is drained first.
 - Each policy refusal (`gcp.api.path`, `gcp.api.host-refused`, `gcp.api.host`,

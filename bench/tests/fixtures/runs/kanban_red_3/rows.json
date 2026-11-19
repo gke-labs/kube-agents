@@ -1,7 +1,7 @@
 [
   {
-    "setupId": "gemini-3-1-pro-preview-kubeagents-mcp",
-    "model": "gemini-3.1-pro-preview",
+    "setupId": "setup-x",
+    "model": "model-x",
     "harness": "kubeagents",
     "augmentation": [
       "mcp"

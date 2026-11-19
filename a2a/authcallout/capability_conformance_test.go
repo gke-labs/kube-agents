@@ -501,9 +501,9 @@ func TestCalloutMintedPrincipalsCannotJoinTheVerifyQueue(t *testing.T) {
 // The bridge -- the executor a stock install actually runs -- can verify, and
 // cannot ask in anybody else's name.
 //
-// The operator renders A2A_SPAWN_SESSIONS=true and renders no
-// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default of `platform`
-// and every turn a user types lands on this executor. A session pod is
+// The operator renders A2A_SPAWN_SESSIONS=true and renders
+// A2A_DEFAULT_ADDRESSEE as `platform` unless the install sets defaultRoute to
+// `session`, so by default every turn a user types lands on this executor. A session pod is
 // reached only by an explicit `delegate:`. That makes this test, not the
 // session one above, the one that covers the shipped path.
 //

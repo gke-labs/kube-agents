@@ -547,6 +547,34 @@ class LoggingEntriesListRouteTest(unittest.TestCase):
             with self.subTest(names=names):
                 self.assertFalse(api_policy.evaluate_body(ENTRIES_LIST_RULE, {**self.BODY, "resourceNames": names}).allowed)
 
+    def test_the_resource_of_an_allowed_body_is_its_one_project(self):
+        self.assertEqual("projects/kagents-dev", api_policy.body_resource(ENTRIES_LIST_RULE, self.BODY))
+        self.assertEqual(
+            "projects/123456789012",
+            api_policy.body_resource(ENTRIES_LIST_RULE, {"resourceNames": ["projects/123456789012"]}),
+        )
+
+    def test_a_refused_body_has_no_resource(self):
+        # A name the check did not pass is caller text: nothing of it comes back,
+        # whatever is wrong with the body, and nothing raises.
+        for body in (
+            {**self.BODY, "resourceNames": ["projects/kagents-dev", "projects/other-project"]},
+            {**self.BODY, "resourceNames": ["folders/123"]},
+            {**self.BODY, "resourceNames": ["projects/kagents-dev\n"]},
+            {**self.BODY, "resourceNames": ["projects/kagents-dev resource=projects/other-project"]},
+            {**self.BODY, "resourceNames": "projects/kagents-dev"},
+            {**self.BODY, "projectIds": ["kagents-dev"]},
+            {**self.BODY, "pageSize": 100000},
+            {"filter": "x"},
+            [], None, "projects/kagents-dev", 7,
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(api_policy.body_resource(ENTRIES_LIST_RULE, body))
+
+    def test_a_route_whose_body_names_no_resource_has_none(self):
+        self.assertIsNone(api_policy.body_resource("gcp.api.monitoring.timeseries-list", self.BODY))
+        self.assertIsNone(api_policy.body_resource("no.such.rule", self.BODY))
+
     def test_a_route_with_no_body_check_refuses_every_body(self):
         decision = api_policy.evaluate_body("gcp.api.monitoring.timeseries-list", self.BODY)
         self.assertFalse(decision.allowed)

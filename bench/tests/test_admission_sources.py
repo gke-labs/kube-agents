@@ -50,7 +50,7 @@ from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS
 from kube_agents_bench.gate import main
 
 ADMISSION = Path(__file__).parent / "fixtures" / "admission"
-JUDGE = "gemini-3.1-pro-preview"
+JUDGE = "model-x"
 BRIDGE = "record-demotes,record-stale,record-collecting,no-record"
 BRIDGE_SENTENCE = "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
 REDS = [FIXTURE_RUNS / n for n in RED_RUNS]
