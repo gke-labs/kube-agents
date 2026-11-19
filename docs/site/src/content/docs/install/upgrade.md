@@ -347,8 +347,8 @@ list, add the entry to that list, because Helm replaces a list as a whole. See
 
   Under an implicit default, `harness` mode warns and leaves `sizingProfile` unset only when the
   release has no recorded profile yet. An already-recorded value stays unchanged even against an
-  older or unreadable CRD. On a rollback to a chart schema without `sizingProfile`, `retag_values`
-  stops on that recorded key unless `--drop-undeclared-values` drops it.
+  older or unreadable CRD. On a rollback to a chart schema without `sizingProfile`,
+  `--upgrade-mode=harness` stops on that recorded key unless `--drop-undeclared-values` drops it.
 
   On an upgrade the usual cause of an undeclared key is a setting the new chart
   renamed or removed: take that upgrade through `--upgrade-mode=full`. On a rollback to a release

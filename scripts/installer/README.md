@@ -636,15 +636,16 @@ regenerates.
 (`auto`, `small`, `medium`, or `fleet`). Empty takes `DEFAULT_PLATFORM_AGENT_SIZING_PROFILE`
 (`auto`), which lets the operator step the credential proxy, `agent-api-auth` sidecar and
 shell sandbox up at 10 and 25 clusters under `ResourceQuota` and `LimitRange` admission checks.
-Both `install.sh` (`--sizing-profile`) and `upgrade.sh` (`--sizing-profile` across `--plan`,
-`full` and `harness`; `--upgrade-mode=operator` refuses `--sizing-profile`, and `--menu` refuses
-`PLATFORM_AGENT_SIZING_PROFILE`) validate it, warn when
-`--sizing-profile` temporarily overrides a different value recorded in an existing `install.env`,
-and run `scan_visible_clusters_in_scope` + `report_cluster_sizing_guidance` to print runtime, Standard
-node-pool (`TF_VAR_sizing_profile`) and storage sizing guidance (`upgrade.sh --dry-run` skips the scan
-offline, whereas `install.sh --dry-run` still scans visible clusters, prints guidance and exports
-`TF_VAR_sizing_profile=fleet` when triggered without writing `install.env`). `uninstall.sh` exports
-`PLATFORM_AGENT_SIZING_PROFILE=""` before regenerating so a typo never blocks teardown.
+Both `install.sh` (`--sizing-profile`; `--menu` refuses `--sizing-profile` and reads
+`PLATFORM_AGENT_SIZING_PROFILE` from `install.env`) and `upgrade.sh` (`--sizing-profile` across
+`--plan`, `full` and `harness`; `--upgrade-mode=operator` refuses `--sizing-profile`) validate it,
+warn when `--sizing-profile` temporarily overrides a different value recorded in an existing
+`install.env`, and run `scan_visible_clusters_in_scope` + `report_cluster_sizing_guidance` to print
+runtime, Standard node-pool (`TF_VAR_sizing_profile`) and storage sizing guidance
+(`upgrade.sh --dry-run` skips the scan offline, whereas `install.sh --dry-run` still scans visible
+clusters, prints guidance and exports `TF_VAR_sizing_profile=fleet` when triggered without writing
+`install.env`). `uninstall.sh` exports `PLATFORM_AGENT_SIZING_PROFILE=""` before regenerating so a
+typo never blocks teardown.
 
 When Slack is on, the A2A gateway holds it, with Google Chat on or off (the operator's
 `a2aSlackArmed`), and `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
