@@ -18,6 +18,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/testing/testutil"
 )
 
 // Setting and lifting spec.scope.hold rolls nothing: every Deployment's and
@@ -44,7 +45,9 @@ func TestAScopeHoldRollsNoPod(t *testing.T) {
 			}
 			scheme := newTestScheme()
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
-			r := &controller.PlatformAgentReconciler{Client: c, Scheme: scheme, OperatorNamespace: goldenOperatorNamespace}
+			// The reconciler goes through the golden tests' TrackingClient, which turns
+			// a server-side apply into the create or update the fake client can do.
+			r := &controller.PlatformAgentReconciler{Client: testutil.NewTrackingClient(c, scheme, agent), Scheme: scheme, OperatorNamespace: goldenOperatorNamespace}
 			key := types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}
 			ctx := context.Background()
 

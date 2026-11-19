@@ -40,7 +40,7 @@ func TestTheScopeHoldRendersItsOwnFile(t *testing.T) {
 		Reason:   "INC-123",
 	}}
 	cm := buildScopeHoldConfigMap(agent)
-	if cm.Name != "test-agent-scope-hold" {
+	if cm.Name != agent.Name+"-scope-hold" {
 		t.Errorf("ConfigMap name = %q", cm.Name)
 	}
 	want := `{"clusters":[{"projectId":"p1","location":"us-east1","clusterName":"a"},{"projectId":"p2","location":"us-east1","clusterName":"b"}],"reason":"INC-123"}` + "\n"
@@ -100,7 +100,7 @@ func TestKubeProxyAndTheBrokerReadTheScopeHold(t *testing.T) {
 			mounted = mounted || (m.Name == scopeHoldVolumeName && m.MountPath == "/etc/kube-agents/hold" && m.ReadOnly && m.SubPath == "")
 		}
 		for _, v := range volumes {
-			volume = volume || (v.Name == scopeHoldVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == "test-agent-scope-hold" &&
+			volume = volume || (v.Name == scopeHoldVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == agent.Name+"-scope-hold" &&
 				v.ConfigMap.Optional != nil && *v.ConfigMap.Optional)
 		}
 		if !mounted || !volume {
