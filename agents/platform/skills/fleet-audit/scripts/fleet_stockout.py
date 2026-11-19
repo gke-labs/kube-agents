@@ -59,8 +59,9 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
 
 The rest need a read this collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
-and workload shapes for 3.3, and the region's unreserved production workloads
-for 3.10(c)'s qualifier.
+and workload shapes for 3.3, the region's unreserved production workloads
+for 3.10(c)'s qualifier, and the cluster's default-class setting for 3.13's
+`default` class.
 
 The ComputeClass field names and family-generation lists below (Gen 2 vs
 Gen 4/Hyperdisk-compatible in `ccc-mixed-disk-generations`, the
@@ -2162,9 +2163,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     autopilot = bool(cluster.get("autopilot"))
     # Not attempted on Autopilot: `node-pools list` answers HTTP 400 there
     # ("Autopilot node pools cannot be accessed or modified"), so the record
-    # would be a guaranteed failure for a read whose only consumers -- §3.9's
-    # single-zone-nodepool, §3.13's manual pools and the node pool labels
-    # below -- cannot apply to a cluster with no user node pools anyway.
+    # would be a guaranteed failure for a read that has nothing to say there:
+    # §3.9's single-zone-nodepool and the node pool labels below need a user
+    # node pool, and §3.13 does not apply because GKE creates the nodes for
+    # every class.
     #
     # `pools_readable` rather than testing `node_pools` for emptiness. A read
     # that failed and a Standard cluster that genuinely holds no pools both
