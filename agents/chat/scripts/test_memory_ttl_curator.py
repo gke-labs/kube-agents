@@ -345,7 +345,7 @@ class _Http:
 class TestHindsightClient(unittest.TestCase):
     def api(self, script):
         http = _Http(script)
-        patcher = patch("urllib.request.urlopen", http)
+        patcher = patch("urllib.request.OpenerDirector.open", http)
         patcher.start()
         self.addCleanup(patcher.stop)
         # The backoff is real time.sleep; a test must not pay it.

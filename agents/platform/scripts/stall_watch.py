@@ -713,6 +713,10 @@ MAX_ROWS_IN_RECORD = 500
 SESSION_KV_URL = "http://127.0.0.1:8699"
 SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 SESSION_KV_TIMEOUT_SECONDS = 30
+#: The server is on the pod's loopback: a proxy from the environment must not
+#: get the request and its bearer token, and urllib does not leave out a
+#: loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 CONTENT_TYPE_HEADER = "Content-Type"
 JSON_CONTENT_TYPE = "application/json"
 AUTH_HEADER = "Authorization"
@@ -2409,7 +2413,7 @@ def session_kv(path: str, body: dict | None = None, method: str = "") -> dict:
     # Callers handle HTTPError, OSError and ValueError, so every other way the
     # answer can fail to arrive whole is a ValueError here.
     try:
-        with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
+        with _SESSION_KV_OPENER.open(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read().decode("utf-8") or "{}")
     except http.client.HTTPException as exc:  # a body cut short, a status line that is not HTTP
         if isinstance(exc, OSError):
