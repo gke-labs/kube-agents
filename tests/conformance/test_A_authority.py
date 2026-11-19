@@ -19,6 +19,8 @@ import io
 import json
 import dataclasses
 import email.message
+import io
+import json
 import types
 import re
 import textwrap
@@ -505,6 +507,91 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
         others = cp.vcs_broker.WRITE_VERBS - writes
         self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
+
+    def test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals(self) -> None:
+        # #3993, #6247: the permit says a requester asked for a change, not
+        # which proposal, so under it a profile worker's proposal-update still
+        # reaches only a proposal the install opened from its own branch here.
+        # Driven through the handler's own dispatch, with the real
+        # VcsBroker.require_agent_proposal reading a stand-in forge, so a
+        # dispatch that stops asking it is red, not only the method.
+        cp = h.credential_proxy
+        vb = cp.vcs_broker
+        login, repo = "kube-agents[bot]", "acme/infra"
+
+        def proposal(number, source, author=login, source_repo=repo):
+            return {
+                "number": number, "source": source, "sourceRepo": source_repo, "author": author,
+                "state": "open", "url": f"https://github.com/{repo}/pull/{number}",
+            }
+
+        proposals = {
+            7: proposal(7, "platform-agent/fix"),
+            8: proposal(8, "platform-agent/fix-2", author="alice"),
+            9: proposal(9, "platform-agent/fix", source_repo="someone/infra"),
+        }
+
+        class Forge:
+            name = "github"
+
+            def proposal_view(self, api, bound_repo, payload):
+                return {"proposal": proposals[payload["number"]]}
+
+            def proposal_list(self, api, bound_repo, query):
+                return {"proposals": []}
+
+        bound = types.SimpleNamespace(forge=Forge(), repo=repo, api=lambda *a, **k: None)
+        ownership = types.SimpleNamespace(_bind=lambda payload: bound, _viewer=lambda b: login)
+        ran: list = []
+        class Vcs(types.SimpleNamespace):
+            # Every other route the table names: none of them is reached.
+            def __getattr__(self, name):
+                return lambda payload: {}
+
+        vcs = Vcs(
+            registry=types.SimpleNamespace(resolve=lambda named: (Forge(), repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: vb.VcsBroker.require_agent_proposal(
+                ownership, verb, payload
+            ),
+            proposal_update=lambda payload: ran.append(payload) or {"proposal": proposals[payload["number"]]},
+        )
+        permitted = types.SimpleNamespace(
+            task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})
+        )
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+        principal = dataclasses.replace(principal, task=permitted)
+        # Every proposal here is this task's own (#6400), so only the ownership read can refuse one.
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(Forge(), repo)
+        for number in proposals:
+            record.record_proposal("task-1", 4_000_000_000, key, number)
+
+        def update(number: int) -> list:
+            body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, forge: True
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._dispatch_vcs_post("proposal-update")
+            return replies
+
+        self.assertEqual(200, update(7)[0][0], "the install's own proposal must stay updatable")
+        self.assertEqual(1, len(ran))
+        for number, case in ((8, "a person's proposal"), (9, "a fork's, with the install's login")):
+            with self.subTest(case=case):
+                replies = update(number)
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual(cp.RULE_CALLER_VCS_OWNERSHIP, replies[0][1]["rule"])
+                self.assertNotEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1].get("code"), replies)
+        self.assertEqual(1, len(ran), "a refused update reached the forge")
 
     def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
         # The broker's write rule for the audit-report store (#5619), driven

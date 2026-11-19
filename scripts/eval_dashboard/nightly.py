@@ -30,7 +30,7 @@ instead of reporting the counts as if the whole matrix had run. Since
 2026-09-22 ``hack/ci-eval-pr.sh`` grades each case inside its fan-out, the
 moment the case's last repetition finishes, so a truncated night still
 carries every case graded before the deadline and its counts are those
-cases, flagged truncated (the collector's fixture 2102186223282950144);
+cases, flagged truncated (the collector's fixture 2090000000000000100);
 before that a deadline-cut night recorded nothing at all (#1491).
 
 One night can be up to eight builds. The matrix can run split across
@@ -96,7 +96,7 @@ REP_RESULTS = ("pass", "fail", "infra")
 # Prow's verdict on the job (SCHEMA.md: runs[].result) and the eval loop's
 # own (runs[].eval_verdict; None when the log has no verdict line). ABORTED
 # is an interrupt. The periodic's deadline is not one: it arrives as SIGTERM
-# and Prow records FAILURE (collect.py's fixture 2092688354838581248), so a
+# and Prow records FAILURE (collect.py's fixture 2090000000000000010), so a
 # non-SUCCESS run with no verdict line is the truncated night this module
 # exists to name. A record from before the collector wrote eval_verdict has
 # no key at all: unknown, not truncated.

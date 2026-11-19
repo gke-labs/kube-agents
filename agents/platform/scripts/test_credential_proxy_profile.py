@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import http.client
+import inspect
 import json
 import logging
 import os
@@ -1775,6 +1776,34 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.assertEqual([credential_proxy.CALLER_ROLE_PROFILE], sessions)
         self.assertEqual([credential_proxy.CLASS_BACKGROUND], classes)
 
+    def test_a_busy_answer_says_whether_it_came_before_admission(self):
+        """vcs_call sends a request again only on a refusal that ran nothing (#6247)."""
+        busy = credential_proxy.CommandSlotUnavailable("at the profile share", bound="profile")
+
+        def refusing_slot(handler, role):
+            raise busy
+
+        with mock.patch.object(CredentialProxyHandler, "_session_slot", refusing_slot):
+            status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(503, status, body)
+        self.assertIs(True, body.get(credential_proxy.BUSY_BEFORE_ADMISSION_KEY), body)
+        self.routes["proposal-create"].assert_not_called()
+
+        # Past admission -- a credential refresh's wait inside the route, after
+        # the forge may have been called -- the answer does not say so.
+        self.reset()
+        self.routes["proposal-create"].side_effect = credential_proxy.CommandSlotUnavailable(
+            "waiting on the refresh", bound="budget"
+        )
+        status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(503, status, body)
+        self.assertNotIn(credential_proxy.BUSY_BEFORE_ADMISSION_KEY, body)
+        import credential_proxy_client
+
+        self.assertEqual(
+            credential_proxy.BUSY_BEFORE_ADMISSION_KEY, credential_proxy_client.BUSY_BEFORE_ADMISSION_KEY
+        )
+
     # -- the task bar: only what this task made (#6400) -------------------------
 
     def assert_not_this_tasks(self, verb, status, body):
@@ -1920,6 +1949,81 @@ class ProfileVcsRouteTest(unittest.TestCase):
                     status, body = self.vcs_post(spelling, VALID["token"])
                     self.assert_permit_refused(verb, status, body)
                     self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, body["error"])
+
+    def test_a_refused_write_with_a_large_body_still_reads_its_403(self):
+        """The refusal comes before the body is read; the broker drains it first,
+        or a caller still sending reads a reset in place of the 403 (#6247)."""
+        payload = json.dumps({**self.PAYLOAD, "bundle": "x" * (3 << 20)}).encode("utf-8")
+        self.assertGreater(len(payload), CredentialProxyHandler.max_request_bytes)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=30)
+        self.addCleanup(connection.close)
+        connection.request(
+            "POST", "/v1/vcs/publish", body=payload,
+            headers={"Content-Type": "application/json", credential_proxy.TASK_CREDENTIAL_HEADER: VALID["token"]},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        self.assert_permit_refused("publish", response.status, body)
+
+    def test_every_answer_before_the_body_is_read_drains_it_first(self):
+        source = inspect.getsource(CredentialProxyHandler._dispatch_vcs_post)
+        before_read = source.split("payload = self._read_json_body", 1)[0]
+        answers = before_read.count("self._json(")
+        self.assertEqual(5, answers, "an answer was added or removed ahead of the body read; drain it")
+        self.assertEqual(answers, before_read.count("self._drain_vcs_body(body_limit)"))
+
+    # -- the issue-list query (#6247) ----------------------------------------
+
+    def test_an_issue_list_query_with_a_qualifier_is_refused(self):
+        fields = [
+            {"query": q}
+            for q in (
+                "repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x",
+                # No colon, yet each would change what GitHub reads after it.
+                '"crash', "crash (", "crash\\", "crash OR", "NOT crash", "a AND b",
+                "crash\x00", "crash\nmore", "x" * 257,
+            )
+        ]
+        fields += [
+            {"labels": ['bug" repo:other/secret "']},
+            {"excludeLabels": ["ok", 'x" org:acme "']},
+            {"labels": ["a\\"]},
+        ]
+        for extra in fields:
+            with self.subTest(extra=extra):
+                self.reset()
+                status, body = self.post(
+                    {**self.PAYLOAD, **extra}, token=VALID["token"], path="/v1/vcs/issue-list"
+                )
+                self.assertEqual(403, status, body)
+                self.assertEqual(credential_proxy.PROFILE_QUERY_QUALIFIER_CODE, body["code"])
+                self.assertEqual(credential_proxy.RULE_CALLER_VCS_QUERY, body["rule"])
+                self.routes["issue-list"].assert_not_called()
+                # Refused before the forge or the managed list were asked.
+                self.vcs.registry.resolve.assert_not_called()
+
+    def test_an_issue_list_query_of_plain_words_runs(self):
+        for extra in (
+            {"query": "node pressure"}, {}, {"query": ""}, {"query": "or and not ORbit it's #42 a-b/c"},
+            {"labels": ["area: networking", "good first issue"], "excludeLabels": ["platform-agent/claimed"]},
+        ):
+            with self.subTest(extra=extra):
+                self.reset()
+                payload = {**self.PAYLOAD, **extra}
+                status, body = self.post(payload, token=VALID["token"], path="/v1/vcs/issue-list")
+                self.assertEqual(200, status, body)
+                self.routes["issue-list"].assert_called_once_with(payload)
+
+    def test_the_query_rule_is_the_profile_roles_alone(self):
+        refusal = credential_proxy.profile_issue_query_refusal
+        self.assertIsNotNone(refusal({"query": "repo:x/y"}))
+        self.assertIsNone(refusal({"query": "plain words"}))
+        self.assertIsNone(refusal({}))
+        self.assertIsNone(refusal({"query": 7}))  # the adapter refuses a non-string
+        self.assertIsNotNone(refusal({"labels": ['x" repo:y/z "']}))
+        self.assertIsNone(refusal({"labels": "not-a-list"}))
+        source = inspect.getsource(CredentialProxyHandler._dispatch_vcs_post)
+        self.assertIn('if role == CALLER_ROLE_PROFILE and verb == "issue-list":', source)
 
     def test_every_write_verb_runs_with_the_permit(self):
         for verb in sorted(PROFILE_VCS_WRITES):

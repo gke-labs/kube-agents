@@ -2847,7 +2847,10 @@ only when they are all the install's, and `proposal-create` only from the instal
 made: a branch it published while the name was free on the remote, and a proposal it opened
 (`PROPOSAL_NOT_THIS_TASKS`, same rule), from a record the one stateful broker pod keeps in
 memory and loses on a restart, which refuses rather than permits. A profile `proposal-update` changes only the title and body; a
-label edit is refused under `caller.vcs-labels`. The shell is held to none of this. No
+label edit is refused under `caller.vcs-labels`. A profile `issue-list` may not widen its
+search past the managed repository: a `query` that is not plain words (a `:`, quote,
+backslash or parenthesis, or `OR`, `AND` or `NOT` as a word), or a quote or backslash in a
+label name, is refused under `caller.vcs-query`. The shell is held to none of this. No
 other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in

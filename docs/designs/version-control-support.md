@@ -681,7 +681,9 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `vcs:proposal-create` permit. Each write is held to the install's own work: a
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
-repository, and no label edit. Within that, each write reaches only what the same task
+repository, and no label edit. Its `issue-list` search fields may start no search
+qualifier of their own (plain words in `query`, no quote or backslash in a label name).
+Within that, each write reaches only what the same task
 made (#6400): a branch it published while the name was free on the remote, and a
 proposal it opened. A later task can't continue an earlier task's branch or proposal
 (#6423). [`spec-subagent-profiles.md`](spec-subagent-profiles.md) owns that caller.
@@ -993,7 +995,7 @@ a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
 than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
 requires. `issue-list`'s `query?` is free text each forge composes into
-its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own search grammar (plain words only for the profile role, above), and its `excludeLabels?` is what a sweep that must skip
 its own claim marker asks with. `proposal-list` filters on the branches instead
 — `source?` and `target?` — because "is there already a proposal for this
 branch" is the question every write flow opens with. A comment carries `id` and
