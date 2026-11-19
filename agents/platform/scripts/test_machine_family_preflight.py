@@ -917,7 +917,7 @@ class MachineFamilyPreflightTests(unittest.TestCase):
                     )
 
     def test_two_component_minor_versions_and_unparseable_versions_and_cluster_version_validation(self):
-        """Two-component MAJOR.MINOR versions parse cleanly; unparseable versions emit gke-version-unparseable or fail closed on CLI."""
+        """Two-component MAJOR.MINOR versions compare at minor precision; unparseable versions emit gke-version-unparseable or fail closed on CLI."""
         kcc_minor_pool = {
             "spec": {
                 "resourceID": "minor-pool",
@@ -932,9 +932,79 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             node_pool_json_sources=[json.dumps(kcc_minor_pool)],
             target_specs=["n4"],
             cluster_version_override="1.35",
+            require_dynamic_rwo=True,
         )
         self.assertEqual(code_ok, preflight.EXIT_OK)
         self.assertTrue(report_ok["compatible"])
+        self.assertEqual(report_ok["results"][0]["warnings"], [])
+
+        # Two-component MAJOR.MINOR equal to each target family's non-zero patch floor minor is compatible.
+        for target_fam, minor_ver, boot_disk in (
+            ("n4", "1.29", "hyperdisk-balanced"),
+            ("c4", "1.30", "hyperdisk-balanced"),
+            ("c3", "1.25", "pd-balanced"),
+            ("n2d", "1.16", "pd-balanced"),
+        ):
+            with self.subTest(target_fam=target_fam, minor_ver=minor_ver):
+                floor_pool = {
+                    "spec": {
+                        "resourceID": f"{target_fam}-pool",
+                        "version": minor_ver,
+                        "nodeConfig": {
+                            "machineType": "n1-standard-4",
+                            "diskType": boot_disk,
+                        },
+                    }
+                }
+                res = preflight.evaluate_node_pool_transition(
+                    floor_pool,
+                    target_fam,
+                    cluster_version_override=minor_ver,
+                )
+                self.assertTrue(res.compatible, f"unexpected blockers for {target_fam} at {minor_ver}: {res.blockers}")
+
+        # Confidential TDX on c3 with two-component version "1.28" (floor 1.28.6-gke.1317000) is compatible.
+        tdx_minor_pool = {
+            "name": "tdx-pool",
+            "version": "1.28",
+            "config": {
+                "machineType": "c3-standard-4",
+                "diskType": "pd-balanced",
+                "confidentialNodes": {
+                    "enabled": True,
+                    "confidentialInstanceType": "TDX",
+                },
+            },
+        }
+        res_tdx = preflight.evaluate_node_pool_transition(
+            tdx_minor_pool,
+            "c3",
+            cluster_version_override="1.28",
+        )
+        self.assertTrue(res_tdx.compatible)
+
+        # Two-component minor below the floor's minor ("1.28" targeting n4, floor 1.29.2-gke.1521000) is rejected.
+        below_minor_pool = {
+            "name": "old-minor-pool",
+            "version": "1.28",
+            "config": {
+                "machineType": "n1-standard-4",
+                "diskType": "hyperdisk-balanced",
+            },
+        }
+        res_below = preflight.evaluate_node_pool_transition(
+            below_minor_pool,
+            "n4",
+            cluster_version_override="1.28",
+        )
+        self.assertFalse(res_below.compatible)
+        self.assertEqual(
+            {b.rule for b in res_below.blockers},
+            {
+                preflight.RULE_GKE_MASTER_VERSION_FLOOR,
+                preflight.RULE_GKE_NODE_VERSION_FLOOR,
+            },
+        )
 
         # Non-numeric version in a manifest ('latest') emits gke-version-unparseable rather than a false below-floor message.
         latest_pool = {
@@ -952,13 +1022,15 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             {preflight.RULE_GKE_VERSION_UNPARSEABLE},
         )
 
-        # Unparseable --cluster-version raises ValueError in run_preflight.
-        with self.assertRaises(ValueError):
-            preflight.run_preflight(
-                node_pool_json_sources=[json.dumps(kcc_minor_pool)],
-                target_specs=["n4"],
-                cluster_version_override="latest",
-            )
+        # Unparseable or whitespace --cluster-version raises ValueError in run_preflight.
+        for bad_ver in ("latest", "   "):
+            with self.subTest(bad_ver=bad_ver):
+                with self.assertRaises(ValueError):
+                    preflight.run_preflight(
+                        node_pool_json_sources=[json.dumps(kcc_minor_pool)],
+                        target_specs=["n4"],
+                        cluster_version_override=bad_ver,
+                    )
 
     def test_multiple_cluster_wrappers_or_mixed_cluster_sources_fail_closed(self):
         """Combining a cluster wrapper in --node-pool-json with another wrapper, --cluster-json, or live flags fails closed."""
@@ -1036,6 +1108,143 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         ]
         self.assertEqual(len(machine_type_cvm_blockers), 1)
         self.assertIn("cannot be combined on target family c3", machine_type_cvm_blockers[0].message)
+
+    def test_kcc_container_cluster_and_terraform_cluster_fields_normalized(self):
+        """Config Connector ContainerCluster spec fields and Terraform min_master_version/master_version are enforced at cluster level."""
+        kcc_cluster = {
+            "apiVersion": "container.cnrm.cloud.google.com/v1beta1",
+            "kind": "ContainerCluster",
+            "metadata": {"name": "kcc-prod-cluster"},
+            "spec": {
+                "location": "us-central1",
+                "minMasterVersion": "1.28.5-gke.1000000",
+                "enableShieldedNodes": False,
+                "nodeConfig": {
+                    "shieldedInstanceConfig": {
+                        "enableSecureBoot": False,
+                        "enableVtpm": False,
+                    }
+                },
+                "confidentialNodes": {
+                    "enabled": True,
+                    "confidentialInstanceType": "SEV",
+                },
+            },
+        }
+        pool = {
+            "name": "worker-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n2d-standard-4",
+                "diskType": "hyperdisk-balanced",
+            },
+        }
+        code_kcc, report_kcc = preflight.run_preflight(
+            cluster_json_source=json.dumps(kcc_cluster),
+            node_pool_json_sources=[json.dumps(pool)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_kcc, preflight.EXIT_INCOMPATIBLE)
+        self.assertEqual(report_kcc["cluster"], "kcc-prod-cluster")
+        self.assertEqual(report_kcc["location"], "us-central1")
+        self.assertEqual(report_kcc["control_plane_version"], "1.28.5-gke.1000000")
+        kcc_rules = {b["rule"] for b in report_kcc["results"][0]["blockers"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, kcc_rules)
+        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, kcc_rules)
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, kcc_rules)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, kcc_rules)
+        self.assertIn(preflight.RULE_CVM_UNSUPPORTED_FAMILY, kcc_rules)
+        self.assertIn(preflight.RULE_GKE_MASTER_VERSION_FLOOR, kcc_rules)
+
+        # Terraform google_container_cluster with min_master_version and master_version.
+        tf_cluster = {
+            "name": "tf-prod-cluster",
+            "location": "us-east1",
+            "min_master_version": "1.28.5-gke.1000000",
+            "enable_shielded_nodes": False,
+        }
+        code_tf, report_tf = preflight.run_preflight(
+            cluster_json_source=json.dumps(tf_cluster),
+            node_pool_json_sources=[json.dumps(pool)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_tf, preflight.EXIT_INCOMPATIBLE)
+        self.assertEqual(report_tf["control_plane_version"], "1.28.5-gke.1000000")
+        tf_rules = {b["rule"] for b in report_tf["results"][0]["blockers"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, tf_rules)
+        self.assertIn(preflight.RULE_GKE_MASTER_VERSION_FLOOR, tf_rules)
+
+        tf_master_ver_cluster = {
+            "name": "tf-master-ver-cluster",
+            "master_version": "1.28.1-gke.100",
+        }
+        res_tf_master = preflight.evaluate_node_pool_transition(
+            pool,
+            "c3",
+            cluster={
+                **tf_master_ver_cluster,
+                "confidential_nodes": [{"enabled": True, "confidential_instance_type": "TDX"}],
+            },
+        )
+        self.assertFalse(res_tf_master.compatible)
+        self.assertIn(
+            preflight.RULE_GKE_CVM_TDX_VERSION_FLOOR,
+            {b.rule for b in res_tf_master.blockers},
+        )
+
+    def test_compute_class_storage_local_ssd_count_enforced(self):
+        """ComputeClass priority-shaped objects with storage.localSSDCount enforce Local SSD blockers on n4, c3, and c4."""
+        cc_priority_pool = {
+            "name": "cc-priority-pool",
+            "machineType": "n2-standard-8",
+            "storage": {
+                "bootDiskType": "hyperdisk-balanced",
+                "localSSDCount": 2,
+            },
+        }
+        res_n4 = preflight.evaluate_node_pool_transition(cc_priority_pool, "n4")
+        self.assertFalse(res_n4.compatible)
+        self.assertIn(
+            preflight.RULE_LSSD_UNSUPPORTED_ON_N4,
+            {b.rule for b in res_n4.blockers},
+        )
+
+        res_c3 = preflight.evaluate_node_pool_transition(cc_priority_pool, "c3")
+        self.assertFalse(res_c3.compatible)
+        self.assertEqual(
+            {b.rule for b in res_c3.blockers},
+            {
+                preflight.RULE_LSSD_REQUIRES_LSSD_SHAPE,
+                preflight.RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4,
+            },
+        )
+
+    def test_blank_node_pool_raises_and_duplicate_targets_deduplicated(self):
+        """Blank --node-pool values raise ValueError and duplicate --target-family entries are deduplicated."""
+        pool = {
+            "name": "pool-a",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n2-standard-4",
+                "diskType": "hyperdisk-balanced",
+            },
+        }
+        for blank_pool in ("", "   "):
+            with self.subTest(blank_pool=blank_pool):
+                with self.assertRaises(ValueError):
+                    preflight.run_preflight(
+                        node_pool_json_sources=[json.dumps(pool)],
+                        node_pool_names=[blank_pool],
+                        target_specs=["n4"],
+                    )
+
+        code_dup, report_dup = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(pool)],
+            target_specs=["n4,n4", "n4"],
+        )
+        self.assertEqual(code_dup, preflight.EXIT_OK)
+        self.assertEqual(report_dup["target_families"], ["n4"])
+        self.assertEqual(len(report_dup["results"]), 1)
 
 
 if __name__ == "__main__":
