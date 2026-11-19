@@ -64,6 +64,9 @@ verification_spec:
     check:
       type: report_contains
       # A kube-system pod name with its ReplicaSet or DaemonSet suffix, as
-      # `kubectl get pods` prints it on GKE Standard and Autopilot.
+      # `kubectl get pods` prints it on GKE Standard and Autopilot: any
+      # Deployment pod (`<name>-<pod-template-hash>-<5>`), and the
+      # DaemonSet pods GKE runs by name (`<name>-<5>`).
       forbidden_patterns:
+        - '\b[a-z][a-z0-9]*(?:-[a-z0-9]+)*-[a-z0-9]{8,10}-[a-z0-9]{5}\b'
         - '\b(?:kube-dns|kube-dns-autoscaler|konnectivity-agent|konnectivity-agent-autoscaler|fluentbit-gke|gke-metrics-agent|pdcsi-node|metrics-server|event-exporter-gke|l7-default-backend|kube-proxy-gke|netd|anetd|antrea-controller|antrea-agent|calico-node|gke-metadata-server|ip-masq-agent|filestore-node)(?:-[a-z0-9]+)*-[a-z0-9]{5}\b'
