@@ -4370,20 +4370,20 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         hit = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")])
         self.assertIn("2 of 2 priority rules have no manual node pool", hit["excerpt"])
         self.assertIn("No rule is backed; the node pools with the class label: e2-pool (e2-medium)", hit["excerpt"])
+        workload = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "general-ccc"})
+        cc = compute_class("general-ccc", [{"machineFamily": "n4"}, {"machineFamily": "c3"}], node_pool_auto_creation=False)
+        self.assertIsNone(fs.check_dangling_compute_class(workload, {"general-ccc": cc}, {"general-ccc"}))
 
     def test_the_procedure_carries_the_collector_s_impact_sentence(self):
         sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
         section = sop.read_text().split(f"(`{fs.UNBACKED_MANUAL_FALLBACK}`)")[1]
         impact_line = next(line for line in section.splitlines() if line.startswith("- **Impact:**"))
         self.assertIn(fs.IMPACT[fs.UNBACKED_MANUAL_FALLBACK], impact_line)
-        workload = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "general-ccc"})
-        cc = compute_class("general-ccc", [{"machineFamily": "n4"}, {"machineFamily": "c3"}], node_pool_auto_creation=False)
-        self.assertIsNone(fs.check_dangling_compute_class(workload, {"general-ccc": cc}, {"general-ccc"}))
 
     def test_the_cluster_default_class_is_not_judged_by_the_check(self):
-        """Node pools serve the default class without the class label, so the
-        pool list does not say which pools are its own; the collector files
-        the check unevaluated for it."""
+        """Node pools serve the default class without the class label where the
+        cluster's setting is on, which the collector does not read; the
+        procedure's by-hand list has the class."""
         cc = compute_class(fs.CLUSTER_DEFAULT_CLASS, [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}], node_pool_auto_creation=False)
         for pools in ([manual_pool("default-pool", "e2-medium")], [manual_pool("default-pool", "e2-medium"), manual_pool("n4-pool", "n4-standard-4")]):
             self.assertIsNone(fs.check_ccc_unbacked_manual_fallback(cc, pools))
@@ -4463,22 +4463,22 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         # The failed read is named once, by the sentence before this one.
         self.assertNotIn("the node pools were not read (", entry["limitations"])
 
-    def test_the_cluster_default_class_leaves_the_check_unevaluated_and_the_other_classes_filed(self):
+    def test_the_cluster_default_class_files_nothing_and_leaves_the_check_run(self):
+        """A standing unevaluated entry would keep the whole stream partial on
+        every run; the class is the procedure's by-hand sub-condition."""
         default_class = compute_class(fs.CLUSTER_DEFAULT_CLASS, FLEET_CLASS_RULES, node_pool_auto_creation=False)
+        for pools_rc in (0, 1):
+            entry = self.run_with(dump_items=[default_class], pools=[FLEET_POOL], pools_rc=pools_rc)
+            self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+            self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+            self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
         entry = self.run_with(dump_items=[default_class, self.fleet_class()], pools=[FLEET_POOL])
-        [filed] = [c for c in entry["candidates"] if c["check"] == self.SLUG]
-        self.assertEqual(filed["object"], "ComputeClass/general-ccc")
-        self.assertIn("kubectl get computeclasses", filed.get("command", ""))
-        [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == self.SLUG]
-        self.assertIn(f"ComputeClass/{fs.CLUSTER_DEFAULT_CLASS} is the cluster default class", reason)
-        self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
-        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/{fs.CLUSTER_DEFAULT_CLASS}", entry["limitations"])
+        self.assertEqual([c["object"] for c in entry["candidates"] if c["check"] == self.SLUG], ["ComputeClass/general-ccc"])
 
-    def test_a_default_class_out_of_scope_leaves_the_check_run(self):
-        """Auto-creation on, or one rule: nothing to judge, so nothing unevaluated."""
-        entry = self.run_with(dump_items=[compute_class(fs.CLUSTER_DEFAULT_CLASS, FLEET_CLASS_RULES)], pools=[FLEET_POOL])
-        self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
-        self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+    def test_the_procedure_lists_the_default_class_as_a_by_hand_sub_condition(self):
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        by_hand = sop.read_text().split("These sub-conditions are not in the collector")[1].split("**A cluster the collector covered")[0]
+        self.assertIn(f"3.13 for the cluster default class (`{fs.CLUSTER_DEFAULT_CLASS}`)", by_hand)
 
     def test_autopilot_declares_the_check_not_applicable(self):
         entry = self.run_with(dump_items=[self.fleet_class()], cluster={**self.CLUSTER, "autopilot": True})
