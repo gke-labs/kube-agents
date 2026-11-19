@@ -667,11 +667,13 @@ SHUTDOWN_DRAIN_SECONDS = 30
 # drain that followed a longer timeout would outlast them.
 EXEC_SHUTDOWN_DRAIN_SECONDS = 360
 # The variable that stops gcloud writing a log file for each command, set in
-# the commands an exec pod runs. gcloud logs under CLOUDSDK_CONFIG on the
-# state volume and keeps 30 days; at the tier's 8-slot cap that measured about
-# 386 KiB a command, some 3.3 GiB a day, past any emptyDir the pod could carry
-# (#4536). The caller still gets the command's stderr and the audit line; only
-# the pod's own log files, for debugging a gcloud failure on the pod, are lost.
+# the commands the proxy runs, in every role. gcloud logs under CLOUDSDK_CONFIG
+# on the state volume and keeps 30 days; at the exec tier's 8-slot cap that
+# measured about 386 KiB a command, some 3.3 GiB a day, past any emptyDir a pod
+# could carry (#4536), and the stateful broker's state volume took the same
+# files (#5417). The caller still gets the command's stderr and the audit line;
+# only the pod's own log files, for debugging a gcloud failure on the pod, are
+# lost.
 GCLOUD_FILE_LOGGING_OFF_ENV = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
 CLOUDSDK_CLIENT_CERT_ENV = "CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE"
 CLIENT_CERT_DISABLED_VALUE = "false"
@@ -10406,7 +10408,6 @@ class CommandExecutor:
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
         metrics: "ProxyMetrics | None" = None,
-        gcloud_file_logging: bool = True,
         exclusions: "scope_exclude.Exclusions | None" = None,
         universe_domain: str | None = None,
         probe_metadata_universe: bool = False,
@@ -10701,10 +10702,9 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
-        # After the forwarded names, so the pod's environment cannot turn it
-        # back on (GCLOUD_FILE_LOGGING_OFF_ENV).
-        if not gcloud_file_logging:
-            self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
+        # In every role, and after the forwarded names, so the pod's
+        # environment cannot turn it back on (GCLOUD_FILE_LOGGING_OFF_ENV).
+        self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
         # Prevent workstation/host mTLS client-certificate env vars from
         # rewriting Google API endpoints to *.mtls.<universe_domain> inside
         # brokered gcloud invocations, and propagate non-default universe
@@ -18944,9 +18944,6 @@ def serve(args: argparse.Namespace) -> None:
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
         metrics=CredentialProxyHandler.metrics,
-        # An exec pod's state volume is sized for no gcloud log files
-        # (GCLOUD_FILE_LOGGING_OFF_ENV); the other roles keep gcloud's default.
-        gcloud_file_logging=role != EXEC_ROLE,
         probe_metadata_universe=True,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)

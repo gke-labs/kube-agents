@@ -1049,7 +1049,7 @@ operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads
 credential-proxy and `agent-api-auth` containers, and is left out.
 `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is left out because it has no effect on `gcloud` there: the
 credential proxy does not pass the pod's value to the commands it runs, and sets the variable
-itself for the commands its exec tier runs. Pass the file beside your own values with
+itself for every command it runs. Pass the file beside your own values with
 `-f charts/kube-agents/examples/values-fleet.yaml`,
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
