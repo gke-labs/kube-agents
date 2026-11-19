@@ -254,7 +254,7 @@ not the whole output story: the gateway authors a small set of posts of its own.
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
 edits, posted and edited with `OutMessage.Stop` while the task runs so that a backend that
 draws a Stop control draws it there, which Google Chat does, below; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
-Agent Sessions, where a submission that never reached the bus is posted instead), the status card, the steer acknowledgement, the release line for a task that
+Agent Sessions, where a submission that never reached the bus is posted instead, except for a single child delegated to an AgentProfile, which keeps its line there too (#6532): that status never carries a profile worker's progress), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
 below), the notice the reap scan posts once when that grace passes with no turn to
 carry the release line, and failure notices (a submission or steer that never reached the bus). All
@@ -522,7 +522,7 @@ refused here, with the same target-only notice and an audit line, and nothing re
 parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
 incarnation that asked. The conversation's rolling line for it, on a backend that keeps one (not
 Slack, a `StatusShower`), is the same "working on" line any task gets, suffixed
-`(delegated to platform)`; the parent's own line is left in place on the
+`(delegated to platform)`. A single child delegated to an AgentProfile gets its `(delegated to <profile>)` line on Slack as well (#6532), since Slack's own status carries nothing of a profile worker's progress; the parent's own line is left in place on the
 parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
 the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
 reports it. A heal releases the child from the conversation's active-task slot, and retires its
@@ -2661,7 +2661,7 @@ the label check included; anything else shows as written. Every field goes out a
 (`blocksMention`, the notify route's check), which the renderer no longer writes. The blocks go on
 the wire as the renderer wrote them, not through slack-go's types.
 With Agent Sessions wired (every Slack adapter the gateway builds) there is no live message in a
-Slack thread, since the adapter is a `StatusShower` for any conversation with a thread; where a backend keeps one, the live message shows
+Slack thread, since the adapter is a `StatusShower` for any conversation with a thread, except a single child delegated to an AgentProfile, which keeps its line (#6532); where a backend keeps one, the live message shows
 the newest progress chat message under every display mode, and keeps it when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress
 chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,

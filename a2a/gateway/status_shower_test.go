@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -142,5 +144,108 @@ func TestSlackShowsTaskStatusWithAgentSessions(t *testing.T) {
 	}
 	if (&SlackAdapter{}).ShowsTaskStatus("slack:C1/1700000000.000100") {
 		t.Error("without Agent Sessions: want the rolling line kept")
+	}
+}
+
+// statusShowingProfileRig is a spawner rig on a status-showing backend
+// whose session can delegate to a pinned cluster profile.
+func statusShowingProfileRig(t *testing.T) (*rig, *fakeSpawner) {
+	t.Helper()
+	r, spawn := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
+		return statusShowingAdapter{a}
+	})
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.g.cfg.ScopeFile = scope
+	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	return r, spawn
+}
+
+// A task delegated to a profile keeps its rolling line on a backend that
+// shows task status itself (#6532): that status never carries a profile
+// worker's progress, so without the line the room sees nothing from the
+// child until its answer. The line moves with the child's events.
+func TestAProfileChildKeepsItsLineOnAStatusShowingBackend(t *testing.T) {
+	t.Parallel()
+	r, spawn := statusShowingProfileRig(t)
+	ctx := context.Background()
+	exec, _, _ := sessionTurn(t, r, spawn, "discord:g1/t-profile-line", "why is prod unhappy?")
+	if err := exec.PublishArtifact(ctx, delegateArtifactWithParameters(t, "prod-east", "diagnose prod", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child's line", postedContaining(r, "(delegated to prod-east)"))
+	var child *lib.Envelope
+	waitFor(t, "the child's submission", func() bool {
+		if got := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>"); len(got) == 1 {
+			child = got[0].env
+			return true
+		}
+		return false
+	})
+	cexec := r.execFor(t, child, "prod-east")
+	if err := cexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child's line at working", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "working") && strings.Contains(e, "(delegated to prod-east)") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// A child delegated to platform keeps the backend's own status, as a
+// platform task does: no line of its own.
+func TestAPlatformChildGetsNoLineOnAStatusShowingBackend(t *testing.T) {
+	t.Parallel()
+	r, spawn := statusShowingProfileRig(t)
+	ctx := context.Background()
+	exec, _, _ := sessionTurn(t, r, spawn, "discord:g1/t-platform-line", "how is the fleet?")
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "check the fleet")); err != nil {
+		t.Fatal(err)
+	}
+	child := r.awaitTask(t, "platform")
+	// The delegating turn ends, as a session's does once it has delegated.
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "delegated to platform"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the delegating turn's answer", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, "platform")
+	if err := cexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := cexec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "the fleet is fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cexec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	// The child's end wakes its session; the relay takes a task's events in
+	// order, so by the wake its working event has been through the relay.
+	waitFor(t, "the session woken by the child's end", func() bool {
+		rec, err := r.g.reg.Get(ctx, "discord:g1/t-platform-line")
+		if err != nil || rec == nil || rec.ActiveTask == nil {
+			return false
+		}
+		ref, ok := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		return ok && ref.Role == taskRoleWake
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "submitted") {
+			t.Fatalf("posts = %q, want no line for a platform child", r.adapter.postTexts())
+		}
+	}
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "working") {
+			t.Fatalf("edits = %q, want no line for a platform child", r.adapter.editTexts())
+		}
 	}
 }
