@@ -635,7 +635,9 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   shim's wait is uniform in [half that interval, the interval], so the spread the broker drew
   is kept, at worst halved, rather than undone by a retry at once. A bare non-JSON `503` is not retried: Envoy also
   answers one when the upstream reset after the request was forwarded. Nor is a dropped
-  connection (`BrokerDisconnected`), because the command may have run. `CREDENTIAL_PROXY_BUSY` is
+  connection (`BrokerDisconnected`), because the command may have run, nor a `2xx` answer that the
+  shim cannot use (not JSON, not an object, or a field that is missing or of the wrong type), for the same reason; that
+  one is not sent to the stateful broker either. `CREDENTIAL_PROXY_BUSY` is
   raised only at admission, before the command starts, so a retry never runs a command twice.
 - The retry skips a refusal at the session cap, which uses the same code so that the model
   reports it and does not retry [code, `credential_proxy.py`, `SessionSlots`]. The busy reply
