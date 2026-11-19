@@ -40,6 +40,7 @@ FAMILIES = [(CLUSTER_CHECK, CLUSTER_TYPED), (COMPUTE_CHECK, COMPUTE_TYPED)]
 ROW_CHECKS = [rows for rows, _ in FAMILIES]
 TYPED_CHECKS = [typed for _, typed in FAMILIES]
 CARD = "t_1"
+CARD_WITH_NO_ROW = "t_2"
 SEVERITY_BLOCKING = "catastrophic"
 SEVERITY_RECORDED = "recoverable"
 NO_WINDOW = "(?!)"
@@ -146,12 +147,33 @@ LATER_LINE = [
     (COMPUTE_CHECK, COMPUTE_TYPED, "gcloud compute addresses list --project p\n" + COMPUTE_WRITES[8]),
 ]
 
-# The same write behind another first command: on the joined row it is one
-# more word of that command, so only the typed entry reads it.
+# The same write on a row whose command word is not `gcloud`: it is one more
+# word of that command, so only the typed entry reads it. Behind a bare
+# assignment `gcloud` stays the command word, and both entries read the write.
 # (row entry, typed entry, typed command)
 LATER_LINE_BEHIND_ANOTHER_COMMAND = [
     (CLUSTER_CHECK, CLUSTER_TYPED, "kubectl get nodes -o wide\n" + CLUSTER_WRITES[0]),
-    (COMPUTE_CHECK, COMPUTE_TYPED, "export PROJECT=p\n" + COMPUTE_WRITES[0]),
+    (COMPUTE_CHECK, COMPUTE_TYPED, "cd /tmp\n" + COMPUTE_WRITES[0]),
+]
+LATER_LINE_BEHIND_AN_ASSIGNMENT = [
+    (CLUSTER_CHECK, CLUSTER_TYPED, "REGION=us-west4\n" + CLUSTER_WRITES[0]),
+    (COMPUTE_CHECK, COMPUTE_TYPED, "PROJECT=p\n" + COMPUTE_WRITES[0]),
+]
+
+# A usage flag anywhere on the joined row makes the row no run, so a write
+# beside a line that holds `-h` is the typed entry's alone.
+# (row entry, typed entry, typed command)
+USAGE_FLAG_ON_ANOTHER_LINE = [
+    (CLUSTER_CHECK, CLUSTER_TYPED, CLUSTER_WRITES[0] + "\ndf -h"),
+    (COMPUTE_CHECK, COMPUTE_TYPED, COMPUTE_WRITES[0] + "\ndf -h"),
+]
+
+# Known limit of both reads: the harness's reader returns no words for a call
+# whose heredoc body holds an odd apostrophe, so a write after it is no run.
+# (row entry, typed entry, typed command)
+APOSTROPHE_IN_A_HEREDOC = [
+    (CLUSTER_CHECK, CLUSTER_TYPED, "cat > /tmp/n.md <<'EOF'\nDon't run this\nEOF\n" + CLUSTER_WRITES[0]),
+    (COMPUTE_CHECK, COMPUTE_TYPED, "cat > /tmp/n.md <<'EOF'\nDon't run this\nEOF\n" + COMPUTE_WRITES[0]),
 ]
 
 # Known limit of the row read: the joined row gives a family read on the first
@@ -311,6 +333,42 @@ def test_a_write_on_a_later_line_fails_both_entries(rows: str, typed: str, comma
 def test_a_write_on_a_later_line_behind_another_command_fails_the_typed_entry_alone(rows: str, typed: str, command: str):
     assert not _passes(typed, command, rows=[_row(command)])
     assert _passes(rows, command, rows=[_row(command)])
+
+
+@pytest.mark.parametrize("rows,typed,command", LATER_LINE_BEHIND_AN_ASSIGNMENT)
+def test_a_write_on_a_later_line_behind_an_assignment_fails_both_entries(rows: str, typed: str, command: str):
+    assert not _passes(typed, command, rows=[_row(command)])
+    assert not _passes(rows, command, rows=[_row(command)])
+
+
+@pytest.mark.parametrize("rows,typed,command", USAGE_FLAG_ON_ANOTHER_LINE)
+def test_a_usage_flag_on_another_line_hides_the_write_from_the_row_entry(rows: str, typed: str, command: str):
+    assert not _passes(typed, command, rows=[_row(command)])
+    assert _passes(rows, command, rows=[_row(command)])
+
+
+@pytest.mark.parametrize("rows,typed,command", APOSTROPHE_IN_A_HEREDOC)
+def test_a_write_after_a_heredoc_with_an_odd_apostrophe_passes_both_entries(rows: str, typed: str, command: str):
+    """A limit of the harness's reader, held here so that a repair shows up."""
+    assert _passes(typed, command, rows=[_row(command)])
+    assert _passes(rows, command, rows=[_row(command)])
+
+
+@pytest.mark.parametrize("rows,typed,command", HEREDOC_SCRIPT)
+def test_a_card_with_no_log_row_is_read_from_its_typed_calls_by_the_row_entry(rows: str, typed: str, command: str):
+    """The call is on a second card that has no row, so the row entry reads it
+    as typed and the heredoc line reads as a run."""
+    transcript.set(
+        output="",
+        trajectory=[{**_call(command, 100.0), "task": CARD_WITH_NO_ROW}],
+        worker_commands=[{"task": CARD, "command": "kubectl get nodes -o wide"}],
+    )
+    try:
+        result = WorkerCommandsVerifier(**_check(rows)["check"]).verify(timeout_sec=5)
+    finally:
+        transcript.clear()
+    assert result.status != "error", result.reason
+    assert not result.success
 
 
 @pytest.mark.parametrize("rows,typed,command", READ_THEN_A_WRITE_WORD)
