@@ -1029,8 +1029,9 @@ in-place updates, so the running pod would have kept the old file indefinitely.
 
 Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
-no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
-neither key), which only openai_compatible passes, and the optional
+no reasoning_effort), plus apiBase (optional; passed by openai_compatible and,
+when platformAgent.harness.universeDomain is non-default, vertex_ai) and
+sslVerify (optional; passed only by openai_compatible), and the optional
 dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds,
 numRetries and retryAfterSeconds. Every optional input renders nothing when
 unset, so the default render is unchanged.

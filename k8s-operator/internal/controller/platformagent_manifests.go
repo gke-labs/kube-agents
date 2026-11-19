@@ -1777,12 +1777,14 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	// union contract the AgentPlugin CRD page states outright. The []string values below
 	// are fine: toSlice already handles them.
 	//
-	// Both platform keys unconditionally, matching the adapters the managed scope pins
-	// whether or not each is enabled: a platform turned on later must not also need its
-	// toolsets remembered, and a key for a platform with no adapter is never resolved.
+	// All three platform keys unconditionally, matching the adapters the managed scope
+	// pins whether or not each is enabled: a platform turned on later must not also need
+	// its toolsets remembered, and a key for a platform with no adapter is never resolved.
+	// Teams ingress resolves under `teams` (agents/chat/config.yaml pins the same key).
 	platformToolsets := map[string]any{
 		"google_chat": slices.Clone(frontDoorToolsets),
 		"slack":       slices.Clone(frontDoorToolsets),
+		"teams":       slices.Clone(frontDoorToolsets),
 	}
 
 	return map[string]any{
@@ -5941,6 +5943,20 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  chatMetricsPortEnv,
 		Value: strconv.Itoa(int(chatMetricsPort)),
 	})
+	// The A2A gateway's default route, the same entry the gateway Deployment
+	// carries (a2aDefaultAddresseeEnv, one resolver for both), so the agent
+	// can tell whether a plain conversation reaches it or a session pod. The
+	// hermes-bridge sidecar copies this container's env
+	// (buildA2ABridgeContainer), so the bridge's runs carry it too. Nothing
+	// in the pod reads it yet: the reader is coming with the platform agent
+	// side of the sessions-by-default work (gke-labs#3658, part 4c: its
+	// prompts, skills and session-kv scripts), and rendering it now means the
+	// value is already in the pod the day that lands. Unconditional because
+	// the A2A stack is: spec.mode is ignored and every install runs the
+	// gateway. Appended after the merge like the entries
+	// above, so an AgentPlugin's env cannot tell the agent a route the
+	// gateway does not take.
+	gatewayEnvVars = append(gatewayEnvVars, a2aDefaultAddresseeEnv(agent))
 
 	// Every "appended after the merge" comment above rests on the kubelet collapsing a
 	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`

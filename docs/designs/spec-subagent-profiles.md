@@ -181,7 +181,8 @@ Everything here is dark content: the dispatcher and the profile CRD render nothi
 the mode switch says `next`.
 
 As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
-executor, and `resources` and `concurrency` are required rather than defaulted. The example
+executor, and refuses a new profile named `session`, the gateway's session route (one created
+before that rule keeps working), and `resources` and `concurrency` are required rather than defaulted. The example
 above and the platform worked profile below are design sketches from before the CRD existed.
 
 ## How a profile becomes a pod
@@ -403,7 +404,10 @@ What the operator renders per profile, as built (amended 10/6):
     refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
     fields into a search ahead of its own `repo:` qualifier, and any of them could add a
     qualifier, swallow that one, or make it an alternative, reaching past the managed
-    repository. `publish`,
+    repository. An `identity` with no `repository` answers the install's managed
+    repositories instead (`{managedRepositories: [host/path, …]}`), the names every verb is
+    held to, with no repository resolved and no forge called, so a task that names none can
+    find the one it may use. `publish`,
     `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
     `vcs:proposal-create`, which the dispatcher mints only when the submission's
     `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
@@ -494,12 +498,13 @@ deletion on a `today` install or giving the operator a read of the whole directo
 
 Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
 exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events
-subject. Only `platform` is reserved. Matching the session shape would mean a regex that has
+subject. Only `platform` and `session` are reserved. Matching the session shape would mean a regex that has
 to track how the gateway mints names, and creating an AgentProfile is already a privileged act.
 
 The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
 two agents in one namespace (only possible with the singleton webhook off) a profile renders
-nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.
+nothing. The name `platform` is reserved: it is the Hermes bridge's addressee. So is `session`,
+the gateway's session route, for new profiles.
 
 Spawn latency is the demo's: roughly 5-10 seconds to first streamed output with a warm
 node and pre-pulled image. Fine for delegated tasks, which today sit in a 5-second

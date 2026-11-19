@@ -682,7 +682,10 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
 repository, and no label edit. Its `issue-list` search fields may start no search
-qualifier of their own (plain words in `query`, no quote or backslash in a label name).
+qualifier of their own (plain words in `query`, no quote or backslash in a label name), and
+its `identity` with no repository answers the managed list's names (`{managedRepositories:
+[host/path, …]}`, the entries the managed check compares against, without their provider
+prefix), so a task that names no repository can find the one it may use.
 Within that, each write reaches only what the same task
 made (#6400): a branch it published while the name was free on the remote, and a
 proposal it opened. A later task can't continue an earlier task's branch or proposal

@@ -81,6 +81,11 @@ another `busReplicas` change while one runs.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **A run of a leg this operator does not run** (one a later release started, found after a
+  rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
+  the bus keeps its count, until the operator that started it is back or a person gives it up
+  with the same abandon annotation. It is never retried. `Reshape` is reserved in the leg enum
+  for such a leg (amended 11/19).
 
 **Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
 The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
@@ -106,6 +111,16 @@ A server still outside after 3 minutes is restarted once, under every one of the
 The record is an annotation the operator writes before the delete, with its own patch, so the
 StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
 its one restart stays named in the condition, for a person.
+
+**Amended 11/18 (#6273): a fresh bus that agrees no meta leader at all is restarted whole, once.**
+Once in a nightly, one server campaigned alone and its peers' votes never reached it, so no leader was
+ever agreed, and there was no single stray to restart. After the same 3 minutes, every server is
+restarted once, under the same guards: the bus hasn't been provisioned, no server holds a stream or
+consumer, every server's meta node has started, and the record names none of them yet. The record is
+written first, with every server, so a pass that dies part-way, or an operator restarted mid-way,
+never tries again: a partial restart counts as the one attempt. An `A2ABusMetaGroupRestarted`
+Warning names the servers. A bus still without a leader after that keeps the condition, which says
+every server was restarted once and leaves it for a person.
 
 If a server isn't running while the others are (its pod absent, being deleted, or not Running,
 as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
@@ -938,9 +953,12 @@ pod may publish, the consumers it may create over `.in`, and its capability veri
 reply subjects on that name, so a pod named after another addressee would be handed that
 addressee's task subjects. The gateway never mints such a name, but anyone who can create a
 pod under a narrowed ServiceAccount can, so the same check refuses a narrowed pod whose name
-is a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
-the operator leaves unset so the gateway keeps its own default, and the only addressee the
-bridge's grants name. The operator renders the list into the callout's
+is a fixed-name addressee. Today that is `platform` and `session`. `platform` is the only
+addressee the bridge's grants name, and the gateway's default addressee unless the
+PlatformAgent's `spec.harness.tuning.defaultRoute` says `session`; the operator renders that
+default as `A2A_DEFAULT_ADDRESSEE`. `session` is the gateway's session route: a sentinel it
+routes on rather than an addressee it publishes to, reserved so nothing holds the name. The
+operator renders the list into the callout's
 `A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
