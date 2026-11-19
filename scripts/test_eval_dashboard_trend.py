@@ -2,7 +2,7 @@
 -- when headless Chrome is present -- trend.html, the Cases page's link to it
 and the Brief's last-incident link, as a browser renders them.
 
-The records are the four real objects of night one (testdata_store/, read
+The records are the four synthetic objects of night one (testdata_store/, read
 through store.py's parser) plus synthetic later nights, so the trailing
 window, the spread band and a version-key change all have something to
 draw. Every asserted time is America/Toronto.
@@ -19,6 +19,7 @@ import unittest
 import unittest.mock
 
 from eval_dashboard import nightly, render, store, trend
+from test_eval_dashboard_store import day_of
 from test_eval_dashboard_pages import (
     chrome,
     clicked_page,
@@ -33,14 +34,14 @@ from test_eval_dashboard_pages import (
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_store" / "evidence"
 LOCATION = "gs://kube-agents-evals-bench/evidence"
-NOW = "2026-09-17T14:30:00+00:00"  # Thu 10:30 AM ET
-NIGHT_1_BUILD = "2100374258805903360"  # the real night: Wed 8 PM ET start, recorded Thu 1:54 AM ET
-KEY_1 = "gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1"
-KEY_2 = "gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.5-pro/v1-f1-v1"
+NOW = "2025-09-18T14:30:00+00:00"  # Thu 10:30 AM ET
+NIGHT_1_BUILD = "2090000000000000080"  # night one: Wed 8 PM ET start, recorded Thu 1:54 AM ET
+KEY_1 = "setup-x/model-x/v1-f1-v1"
+KEY_2 = "setup-x/model-y/v1-f1-v1"
 
 
 def night_one_records():
-    """The four real records, parsed the way store.py parses a cat."""
+    """The four night-one records, parsed the way store.py parses a cat."""
     warnings = []
     records = []
     for path in sorted(FIXTURE.rglob("*.jsonl")):
@@ -50,12 +51,13 @@ def night_one_records():
     return records
 
 
+
 def later_night(records, day, build, passes=None, judged=None, key=None):
     """Night one's records replayed on another day, with overrides."""
     out = []
     for record in records:
         r = copy.deepcopy(record)
-        r["recorded_at"] = f"2026-09-{day:02d}T05:50:00Z"
+        r["recorded_at"] = f"{day_of(day)}T05:50:00Z"
         r["build"] = build
         r["object"] = f"{LOCATION}/{r['case']}/x/{day}.jsonl"
         r["commit"] = f"c{day:02d}" + "0" * 38
@@ -71,7 +73,7 @@ def later_night(records, day, build, passes=None, judged=None, key=None):
 
 
 def store_doc(records, **extra):
-    doc = {"schema_version": 1, "source": LOCATION, "read_at": "2026-09-17T14:09:02Z", "window_days": 90, "max_objects": 200,
+    doc = {"schema_version": 1, "source": LOCATION, "read_at": "2025-09-18T14:09:02Z", "window_days": 90, "max_objects": 200,
            "listed": len(records), "fetched": len(records), "truncated": {}, "warnings": [], "error": None, "records": records}
     doc.update(extra)
     return doc
@@ -93,11 +95,11 @@ def data_with_nightly(cases, runs=()):
 
 
 HOSTILE_CASE = "<img src=x onerror=alert(2)>"
-NIGHT_1_RUN = {"build_id": NIGHT_1_BUILD, "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None, "head_sha": "b458323",
-               "started": "2026-09-17T00:00:10+00:00", "finished": "2026-09-17T05:55:00+00:00", "result": "SUCCESS", "eval_verdict": "RED",
+NIGHT_1_RUN = {"build_id": NIGHT_1_BUILD, "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None, "head_sha": "0808080",
+               "started": "2025-09-18T00:00:10+00:00", "finished": "2025-09-18T05:55:00+00:00", "result": "SUCCESS", "eval_verdict": "RED",
                "duration_s": 21290, "log_url": f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/{NIGHT_1_BUILD}", "tasks": []}
-DOMAINS = [("agent-kanban-smoke", "chat-and-routing"), ("cluster-agent-crashloop-debug", "cluster-debugging"),
-           ("rca-remediation-pr", "remediation"), ("upgrades-fleet-version-table", "upgrades")]
+DOMAINS = [("case-19", "cluster-debugging"), ("case-23", "remediation"),
+           ("case-24", "chat-and-routing"), ("case-31", "upgrades")]
 
 
 def rep(n, result, agent=None, turn1=None):
@@ -118,39 +120,39 @@ def timed_task(name, *reps):
 
 
 # Three nights of timing in data.json's nightly runs, around night one in
-# the store. Tue 09-15: rca timed. Wed 09-16: rca ran without timing (a
-# gap), kanban timed. Thu 09-17, night one, split across the main job and
-# the writers job: rca with an infra rep (out of the pool), kanban, and a
-# writers case in rca's domain; the writers part also recorded rca, which
+# the store. Tue 09-16: c23 timed. Wed 09-17: c23 ran without timing (a
+# gap), c24 timed. Thu 09-18, night one, split across the main job and
+# the writers job: c23 with an infra rep (out of the pool), c24, and a
+# writers case in c23's domain; the writers part also recorded c23, which
 # counts as the main part recorded it. And one night in May, outside the
 # store's 90-day window.
 WRITER_CASE = "pr-writer-case"
 LATENCY_DOMAINS = DOMAINS + [(WRITER_CASE, "remediation")]
-NIGHT_0_BUILD, NIGHT_B_BUILD, WRITERS_1_BUILD, OLD_BUILD = "2100374000000000000", "2100374000000000001", "2100374258805903361", "2100300000000000000"
+NIGHT_0_BUILD, NIGHT_B_BUILD, WRITERS_1_BUILD, OLD_BUILD = "2100374000000000000", "2100374000000000001", "2090000000000000081", "2100300000000000000"
 TIMED_RUNS = [
-    timed_run(OLD_BUILD, NIGHT_1_RUN["job"], "2026-05-01T00:00:10+00:00", "2026-05-01T05:00:00+00:00",
-              [timed_task("rca-remediation-pr", rep(1, "pass", 1.0, 1.0))]),
-    timed_run(NIGHT_0_BUILD, NIGHT_1_RUN["job"], "2026-09-15T00:00:10+00:00", "2026-09-15T05:00:00+00:00",
-              [timed_task("rca-remediation-pr", rep(1, "pass", 120.0, 5.0), rep(2, "pass", 140.0, 7.0))]),
-    timed_run(NIGHT_B_BUILD, NIGHT_1_RUN["job"], "2026-09-16T00:00:10+00:00", "2026-09-16T05:00:00+00:00",
-              [timed_task("rca-remediation-pr", rep(1, "pass"), rep(2, "pass")), timed_task("agent-kanban-smoke", rep(1, "pass", 70.0, 3.0))]),
+    timed_run(OLD_BUILD, NIGHT_1_RUN["job"], "2025-05-02T00:00:10+00:00", "2025-05-02T05:00:00+00:00",
+              [timed_task("case-23", rep(1, "pass", 1.0, 1.0))]),
+    timed_run(NIGHT_0_BUILD, NIGHT_1_RUN["job"], "2025-09-16T00:00:10+00:00", "2025-09-16T05:00:00+00:00",
+              [timed_task("case-23", rep(1, "pass", 120.0, 5.0), rep(2, "pass", 140.0, 7.0))]),
+    timed_run(NIGHT_B_BUILD, NIGHT_1_RUN["job"], "2025-09-17T00:00:10+00:00", "2025-09-17T05:00:00+00:00",
+              [timed_task("case-23", rep(1, "pass"), rep(2, "pass")), timed_task("case-24", rep(1, "pass", 70.0, 3.0))]),
     dict(NIGHT_1_RUN, tasks=[
-        timed_task("rca-remediation-pr", rep(1, "pass", 100.0, 4.0), rep(2, "fail", 300.0, 12.0), rep(3, "infra", 900.0, 80.0)),
-        timed_task("agent-kanban-smoke", rep(1, "pass", 50.0, 2.0), rep(2, "pass", 60.0), rep(3, "pass")),
+        timed_task("case-23", rep(1, "pass", 100.0, 4.0), rep(2, "fail", 300.0, 12.0), rep(3, "infra", 900.0, 80.0)),
+        timed_task("case-24", rep(1, "pass", 50.0, 2.0), rep(2, "pass", 60.0), rep(3, "pass")),
     ]),
-    timed_run(WRITERS_1_BUILD, nightly.NIGHTLY_WRITERS_JOB, "2026-09-17T00:00:05+00:00", "2026-09-17T02:10:00+00:00",
-              [timed_task(WRITER_CASE, rep(1, "pass", 200.0, 6.0), rep(2, "pass", 400.0, 8.0)), timed_task("rca-remediation-pr", rep(1, "pass", 999.0, 99.0))]),
+    timed_run(WRITERS_1_BUILD, nightly.NIGHTLY_WRITERS_JOB, "2025-09-18T00:00:05+00:00", "2025-09-18T02:10:00+00:00",
+              [timed_task(WRITER_CASE, rep(1, "pass", 200.0, 6.0), rep(2, "pass", 400.0, 8.0)), timed_task("case-23", rep(1, "pass", 999.0, 99.0))]),
 ]
 
-# Two more nights for the page only. Tue 09-01: rca's one rep is lost to
+# Two more nights for the page only. Tue 09-02: c23's one rep is lost to
 # infra though it carries timing, so the night has no timed rep that counts
 # and lies outside the drawn range (untimed nights do not widen it). Mon
-# 09-14: a turn 1 over 40 s for upgrades, a scale in 20 s steps.
+# 09-15: a turn 1 over 40 s for c31, a scale in 20 s steps.
 PAGE_ONLY_RUNS = [
-    timed_run("2100374000000000002", NIGHT_1_RUN["job"], "2026-09-01T00:00:10+00:00", "2026-09-01T05:00:00+00:00",
-              [timed_task("rca-remediation-pr", rep(1, "infra", 900.0, 80.0))]),
-    timed_run("2100374000000000003", NIGHT_1_RUN["job"], "2026-09-14T00:00:10+00:00", "2026-09-14T05:00:00+00:00",
-              [timed_task("upgrades-fleet-version-table", rep(1, "pass", 200.0, 45.0))]),
+    timed_run("2100374000000000002", NIGHT_1_RUN["job"], "2025-09-02T00:00:10+00:00", "2025-09-02T05:00:00+00:00",
+              [timed_task("case-23", rep(1, "infra", 900.0, 80.0))]),
+    timed_run("2100374000000000003", NIGHT_1_RUN["job"], "2025-09-15T00:00:10+00:00", "2025-09-15T05:00:00+00:00",
+              [timed_task("case-31", rep(1, "pass", 200.0, 45.0))]),
 ]
 
 
@@ -179,14 +181,14 @@ class ModeSeriesTest(unittest.TestCase):
         self.assertEqual(list(nxt["keys"]), [KEY_1 + "-next"])
         self.assertEqual(nxt["keys"][KEY_1 + "-next"]["mode"], "next")
         self.assertEqual(sorted(nxt["cases"]), [n for n, _ in DOMAINS])
-        point = nxt["cases"]["agent-kanban-smoke"]["points"][0]
+        point = nxt["cases"]["case-24"]["points"][0]
         self.assertEqual(point["judged"]["OutcomeValidity"]["mean"], 0.5)
         self.assertEqual([n["build"] for n in nxt["nights"]], ["9001"])
 
     def test_a_next_night_dates_its_latency_like_its_bar(self):
         nxt = [dict(r, key=dict(r["key"], mode="next")) for r in night_one_records()]
         doc = trend.trend_document(store_doc(nxt), data_with_nightly(LATENCY_DOMAINS, TIMED_RUNS))
-        self.assertEqual(doc["latency"]["nights"][-1], {"id": f"build:{NIGHT_1_BUILD}", "at": "2026-09-17T05:54:31Z", "build": NIGHT_1_BUILD},
+        self.assertEqual(doc["latency"]["nights"][-1], {"id": f"build:{NIGHT_1_BUILD}", "at": "2025-09-18T05:54:31Z", "build": NIGHT_1_BUILD},
                          "the store's stamp for the night, from the next series")
 
     def test_the_key_path_carries_the_mode_as_the_writer_files_it(self):
@@ -198,7 +200,7 @@ class ModeSeriesTest(unittest.TestCase):
 
 
 class NightOneTest(unittest.TestCase):
-    """The real first night, alone: one point per case, no line, no band."""
+    """The first night, alone: one point per case, no line, no band."""
 
     @classmethod
     def setUpClass(cls):
@@ -206,38 +208,38 @@ class NightOneTest(unittest.TestCase):
 
     def test_the_document_shape(self):
         d = self.doc
-        self.assertEqual((d["source"], d["read_at"], d["error"], d["window_days"], d["max_objects"]), (LOCATION, "2026-09-17T14:09:02Z", None, 90, 200))
+        self.assertEqual((d["source"], d["read_at"], d["error"], d["window_days"], d["max_objects"]), (LOCATION, "2025-09-18T14:09:02Z", None, 90, 200))
         self.assertEqual(d["records"], 4)
         self.assertEqual(d["metrics"], ["OutcomeValidity", "OutcomeScore", "ToolInvocation"], "rung 6's metric first, then by name")
         self.assertEqual(d["default_metric"], "OutcomeValidity")
         self.assertEqual(d["bar"], {"rate": 0.9, "min_runs": 20})
         self.assertEqual(list(d["keys"]), [KEY_1])
-        self.assertEqual(d["keys"][KEY_1], {"setup_id": "gemini-3-1-pro-preview-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1})
+        self.assertEqual(d["keys"][KEY_1], {"setup_id": "setup-x", "scoring_version": "v1", "judge_model": "model-x", "fleet": 1, "verifiers": 1})
         self.assertEqual(sorted(d["cases"]), [n for n, _ in DOMAINS])
         self.assertEqual(sorted(d["domains"]), sorted({dom for _, dom in DOMAINS}))
 
     def test_the_night_is_joined_to_the_collectors_nightly_run(self):
         (night,) = self.doc["nights"]
-        self.assertEqual(night, {"id": f"build:{NIGHT_1_BUILD}", "at": "2026-09-17T05:54:31Z", "build": NIGHT_1_BUILD, "commit": "b458323d9c1dbf36551b498e6ab097828b4c2cba",
+        self.assertEqual(night, {"id": f"build:{NIGHT_1_BUILD}", "at": "2025-09-18T05:54:31Z", "build": NIGHT_1_BUILD, "commit": "0808080808080808080808080808080808080808",
                                  # The run's log_url is a Spyglass link into the private nightly bucket: linked in the Console.
-                                 "started": "2026-09-17T00:00:10+00:00", "cases": 4,
+                                 "started": "2025-09-18T00:00:10+00:00", "cases": 4,
                                  "log_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/{NIGHT_1_BUILD}"})
         # Without the run in data.json the night stands on its own stamp.
         alone = trend.trend_document(store_doc(night_one_records()), data_with_nightly(DOMAINS))
         self.assertEqual((alone["nights"][0]["started"], alone["nights"][0]["log_url"]), (None, None))
 
     def test_a_case_with_one_night_has_a_partial_window_and_no_spread(self):
-        rca = self.doc["cases"]["rca-remediation-pr"]
-        self.assertEqual(rca["domain"], "remediation")
-        (point,) = rca["points"]
+        c23 = self.doc["cases"]["case-23"]
+        self.assertEqual(c23["domain"], "remediation")
+        (point,) = c23["points"]
         self.assertEqual((point["runs"], point["passes"], point["key"], point["build"]), (3, 2, KEY_1, NIGHT_1_BUILD))
         self.assertEqual(point["window"], {"runs": 3, "passes": 2, "lines": 1, "full": False, "cut": False})
         self.assertEqual(point["judged"]["OutcomeValidity"]["n"], 3)
         self.assertEqual(point["judged"]["OutcomeValidity"]["spread"]["nights"], 1, "one night is no spread")
-        self.assertEqual(rca["key_changes"], [])
-        self.assertEqual(rca["record"]["state"], "collecting")
-        self.assertEqual((rca["record"]["runs"], rca["record"]["passes"], rca["record"]["lines"]), (3, 2, 1))
-        self.assertAlmostEqual(rca["record"]["rate"], 2 / 3)
+        self.assertEqual(c23["key_changes"], [])
+        self.assertEqual(c23["record"]["state"], "collecting")
+        self.assertEqual((c23["record"]["runs"], c23["record"]["passes"], c23["record"]["lines"]), (3, 2, 1))
+        self.assertAlmostEqual(c23["record"]["rate"], 2 / 3)
 
     def test_a_domain_pools_its_cases_per_night_with_the_range_across_them(self):
         # Two cases share a domain here only by the test's map; use a map that pools two.
@@ -246,9 +248,9 @@ class NightOneTest(unittest.TestCase):
         self.assertEqual((point["runs"], point["passes"], point["cases"], point["keys"]), (12, 11, 4, [KEY_1]))
         ov = point["judged"]["OutcomeValidity"]
         self.assertEqual((ov["n"], ov["cases"]), (12, 4))
-        self.assertAlmostEqual(ov["low"], 0.7667, places=3)
+        self.assertAlmostEqual(ov["low"], 0.6333, places=3)
         self.assertAlmostEqual(ov["high"], 1.0)
-        self.assertAlmostEqual(ov["mean"], (1.0 + 0.9 + 0.7666666666666666 + 0.8) / 4, places=6)
+        self.assertAlmostEqual(ov["mean"], (1.0 + 0.8666666666666667 + 0.6333333333333333 + 0.7333333333333333) / 4, places=6)
         self.assertEqual(doc["domains"]["one"]["cases"], [n for n, _ in DOMAINS])
 
     def test_a_case_the_checkout_does_not_know_lands_in_the_unknown_domain(self):
@@ -265,39 +267,39 @@ class ManyNightsTest(unittest.TestCase):
         base = night_one_records()
         records = list(base)
         for day in range(18, 24):  # six more nights at key 1: 21 runs from the seventh
-            records += later_night(base, day, f"21007{day}0000000000000", passes={"rca-remediation-pr": 3 if day % 2 else 2}, judged={"OutcomeValidity": 0.6 + day / 100})
-        records += later_night(base, 24, "2100724000000000000", judged={"OutcomeValidity": 0.95}, key={"judge_model": "gemini-3.5-pro"})
+            records += later_night(base, day, f"21007{day}0000000000000", passes={"case-23": 3 if day % 2 else 2}, judged={"OutcomeValidity": 0.6 + day / 100})
+        records += later_night(base, 24, "2100724000000000000", judged={"OutcomeValidity": 0.95}, key={"judge_model": "model-y"})
         cls.doc = trend.trend_document(store_doc(records), data_with_nightly(DOMAINS, [NIGHT_1_RUN]))
-        cls.rca = cls.doc["cases"]["rca-remediation-pr"]
+        cls.c23 = cls.doc["cases"]["case-23"]
 
     def test_the_trailing_window_pools_whole_nights_to_the_bar_and_never_across_a_key(self):
-        windows = [(p["window"]["runs"], p["window"]["lines"], p["window"]["full"]) for p in self.rca["points"]]
+        windows = [(p["window"]["runs"], p["window"]["lines"], p["window"]["full"]) for p in self.c23["points"]]
         self.assertEqual(windows[:7], [(3, 1, False), (6, 2, False), (9, 3, False), (12, 4, False), (15, 5, False), (18, 6, False), (21, 7, True)])
         self.assertEqual(windows[7], (3, 1, False), "the new key starts its own window")
-        self.assertEqual(self.rca["record"]["state"], "collecting")
-        self.assertEqual(self.rca["record"]["key"], KEY_2)
+        self.assertEqual(self.c23["record"]["state"], "collecting")
+        self.assertEqual(self.c23["record"]["key"], KEY_2)
 
     def test_the_spread_is_the_range_of_nightly_means_at_one_key(self):
-        spreads = [p["judged"]["OutcomeValidity"]["spread"] for p in self.rca["points"]]
+        spreads = [p["judged"]["OutcomeValidity"]["spread"] for p in self.c23["points"]]
         self.assertEqual([s["nights"] for s in spreads], [1, 2, 3, 4, 5, 6, 7, 1])
-        self.assertAlmostEqual(spreads[6]["low"], 0.7667, places=3)
+        self.assertAlmostEqual(spreads[6]["low"], 0.6333, places=3)
         self.assertAlmostEqual(spreads[6]["high"], 0.83)
         self.assertEqual(spreads[7], {"low": 0.95, "high": 0.95, "nights": 1})
 
     def test_the_key_change_is_marked_with_the_components_that_moved(self):
-        self.assertEqual(self.rca["key_changes"], [{"night": "build:2100724000000000000", "at": "2026-09-24T05:50:00Z", "from": KEY_1, "to": KEY_2, "changed": ["judge_model"]}])
+        self.assertEqual(self.c23["key_changes"], [{"night": "build:2100724000000000000", "at": "2025-09-25T05:50:00Z", "from": KEY_1, "to": KEY_2, "changed": ["judge_model"]}])
         self.assertEqual(sorted(self.doc["keys"]), [KEY_1, KEY_2])
-        self.assertEqual(self.doc["domains"]["remediation"]["key_changes"], self.rca["key_changes"], "a domain carries its cases' changes once")
+        self.assertEqual(self.doc["domains"]["remediation"]["key_changes"], self.c23["key_changes"], "a domain carries its cases' changes once")
         self.assertEqual([n["id"] for n in self.doc["nights"]][:2], [f"build:{NIGHT_1_BUILD}", "build:21007180000000000000"])
         self.assertEqual(len(self.doc["nights"]), 8)
 
     def test_a_full_window_is_judged_against_the_bar(self):
-        seven = self.rca["points"][6]
+        seven = self.c23["points"][6]
         self.assertTrue(seven["window"]["full"])
-        state = trend.record_state(self.rca["points"][:7])
+        state = trend.record_state(self.c23["points"][:7])
         self.assertEqual(state["state"], "would-demote")
         self.assertEqual((state["runs"], state["passes"]), (21, 2 + 3 + 2 + 3 + 2 + 3 + 2))
-        clean = trend.record_state(self.doc["cases"]["agent-kanban-smoke"]["points"][:7])
+        clean = trend.record_state(self.doc["cases"]["case-24"]["points"][:7])
         self.assertEqual((clean["state"], clean["runs"], clean["passes"]), ("would-admit", 21, 21))
 
 
@@ -306,8 +308,8 @@ class LeadInTest(unittest.TestCase):
     nights pool into the first drawn nights' windows and spreads and are
     drawn nowhere; a window that is still short while the listing left
     older objects behind at its key (``older``) is ``cut``, not
-    ``collecting``. Read at Thu 2026-09-17 14:09 UTC with a 10-day window
-    and a 14-day lead-in: drawn from 09-07 14:09, read from 08-24 14:09."""
+    ``collecting``. Read at Thu 2025-09-18 14:09 UTC with a 10-day window
+    and a 14-day lead-in: drawn from 09-08 14:09, read from 08-25 14:09."""
 
     @classmethod
     def setUpClass(cls):
@@ -319,16 +321,16 @@ class LeadInTest(unittest.TestCase):
             records += later_night(base, day, f"21007{day:02d}0000000000000", judged={"OutcomeValidity": 0.9})
 
         def one(case, at, build):
-            r = copy.deepcopy(base[0])  # agent-kanban-smoke: 3 of 3
+            r = copy.deepcopy(base[0])  # case-24: 3 of 3
             r.update(case=case, recorded_at=at, build=build, object=f"{LOCATION}/{case}/x/{build}.jsonl")
             return r
 
         extra = [
-            one("gone-case", "2026-09-03T05:50:00Z", "2100903000000000001"),  # lead-in only
-            one("sparse-case", "2026-08-25T05:50:00Z", "2100825000000000002"),  # two records inside the read...
-            one("sparse-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...and, per the listing, four older ones at this key
-            one("young-case", "2026-09-05T05:50:00Z", "2100905000000000003"),  # two records inside the read...
-            one("young-case", "2026-09-09T05:50:00Z", "21007090000000000000"),  # ...and nothing older: genuinely short
+            one("gone-case", "2025-09-04T05:50:00Z", "2100903000000000001"),  # lead-in only
+            one("sparse-case", "2025-08-26T05:50:00Z", "2100825000000000002"),  # two records inside the read...
+            one("sparse-case", "2025-09-10T05:50:00Z", "21007090000000000000"),  # ...and, per the listing, four older ones at this key
+            one("young-case", "2025-09-06T05:50:00Z", "2100905000000000003"),  # two records inside the read...
+            one("young-case", "2025-09-10T05:50:00Z", "21007090000000000000"),  # ...and nothing older: genuinely short
         ]
         older = {"sparse-case": {KEY_1: 4}, "young-case": {KEY_2: 2}}  # young's older objects are at another key
         cls.doc = trend.trend_document(store_doc(records + extra, window_days=10, lead_days=14, older=older), data_with_nightly(DOMAINS))
@@ -337,18 +339,18 @@ class LeadInTest(unittest.TestCase):
         doc = self.doc
         self.assertEqual((doc["window_days"], doc["lead_days"]), (10, 14))
         self.assertEqual(sorted(doc["cases"]), sorted([n for n, _ in DOMAINS] + ["sparse-case", "young-case"]), "a case recorded in the lead-in only is not on the page")
-        kanban = doc["cases"]["agent-kanban-smoke"]
-        self.assertEqual([p["at"][:10] for p in kanban["points"]], ["2026-09-08", "2026-09-09", "2026-09-10"])
-        self.assertEqual(kanban["points"][0]["window"], {"runs": 21, "passes": 21, "lines": 7, "full": True, "cut": False}, "the first drawn night pools the six lead-in nights before it")
-        self.assertEqual(kanban["points"][0]["judged"]["OutcomeValidity"]["spread"]["nights"], 7)
-        self.assertEqual(kanban["record"]["state"], "would-admit")
+        c24 = doc["cases"]["case-24"]
+        self.assertEqual([p["at"][:10] for p in c24["points"]], ["2025-09-09", "2025-09-10", "2025-09-11"])
+        self.assertEqual(c24["points"][0]["window"], {"runs": 21, "passes": 21, "lines": 7, "full": True, "cut": False}, "the first drawn night pools the six lead-in nights before it")
+        self.assertEqual(c24["points"][0]["judged"]["OutcomeValidity"]["spread"]["nights"], 7)
+        self.assertEqual(c24["record"]["state"], "would-admit")
         self.assertEqual(doc["records"], 3 * 4 + 2)
-        self.assertEqual([n["at"][:10] for n in doc["nights"]], ["2026-09-08", "2026-09-09", "2026-09-10"])
-        self.assertEqual(doc["domains"]["chat-and-routing"]["points"][0]["at"][:10], "2026-09-08")
+        self.assertEqual([n["at"][:10] for n in doc["nights"]], ["2025-09-09", "2025-09-10", "2025-09-11"])
+        self.assertEqual(doc["domains"]["chat-and-routing"]["points"][0]["at"][:10], "2025-09-09")
 
     def test_a_short_pool_with_older_objects_at_its_key_is_cut_and_one_without_is_collecting(self):
         sparse = self.doc["cases"]["sparse-case"]
-        self.assertEqual([p["at"][:10] for p in sparse["points"]], ["2026-09-09"])
+        self.assertEqual([p["at"][:10] for p in sparse["points"]], ["2025-09-10"])
         self.assertEqual(sparse["points"][0]["window"], {"runs": 6, "passes": 6, "lines": 2, "full": False, "cut": True})
         self.assertEqual((sparse["record"]["state"], sparse["record"]["runs"], sparse["record"]["lines"]), ("cut", 6, 2))
         young = self.doc["cases"]["young-case"]
@@ -360,11 +362,11 @@ class LeadInTest(unittest.TestCase):
         # (evidence_store._key_segments); the record carries the raw key.
         # store.py's tally, end to end, then the page's lookup.
         odd_key = {"setup_id": "s", "scoring_version": "v1", "judge_model": "vertex_ai/gemini-x:tag", "fleet": 1, "verifiers": 1}
-        urls = [f"{LOCATION}/odd-case/s/vertex_ai-gemini-x-tag/v1-f1-v1/2026-05-01T05-00-00Z-1.jsonl",  # the writer files case "odd case" here
-                f"{LOCATION}/odd-case/s/vertex_ai-gemini-x-tag/v1-f1-v1/2026-09-10T05-00-00Z-2.jsonl",
-                f"{LOCATION}/bare-case/unkeyed/2026-05-01T05-00-00Z-3.jsonl",
-                f"{LOCATION}/bare-case/unkeyed/2026-09-10T05-00-00Z-4.jsonl"]
-        now = datetime.datetime(2026, 9, 17, 14, 9, 2, tzinfo=datetime.timezone.utc)
+        urls = [f"{LOCATION}/odd-case/s/vertex_ai-gemini-x-tag/v1-f1-v1/2025-05-02T05-00-00Z-1.jsonl",  # the writer files case "odd case" here
+                f"{LOCATION}/odd-case/s/vertex_ai-gemini-x-tag/v1-f1-v1/2025-09-11T05-00-00Z-2.jsonl",
+                f"{LOCATION}/bare-case/unkeyed/2025-05-02T05-00-00Z-3.jsonl",
+                f"{LOCATION}/bare-case/unkeyed/2025-09-11T05-00-00Z-4.jsonl"]
+        now = datetime.datetime(2025, 9, 18, 14, 9, 2, tzinfo=datetime.timezone.utc)
         chosen, _truncated, older, skipped = store.select_objects(urls, LOCATION, now_ms=now.timestamp() * 1000, window_days=10, lead_days=14, max_objects=200)
         self.assertEqual(skipped, [])
         self.assertEqual(len(chosen), 2)
@@ -373,7 +375,7 @@ class LeadInTest(unittest.TestCase):
 
         def one(case, key):
             r = copy.deepcopy(base[0])
-            r.update(case=case, key=key, recorded_at="2026-09-10T05:00:00Z", build="21007100000000000000", object=f"{LOCATION}/{case}/x/1.jsonl")
+            r.update(case=case, key=key, recorded_at="2025-09-11T05:00:00Z", build="21007100000000000000", object=f"{LOCATION}/{case}/x/1.jsonl")
             return r
 
         doc = trend.trend_document(store_doc([one("odd case", odd_key), one("bare-case", {})], window_days=10, lead_days=14, older=older), data_with_nightly(DOMAINS))
@@ -389,9 +391,9 @@ class LeadInTest(unittest.TestCase):
         base = night_one_records()
         doc = trend.trend_document(store_doc(base, read_at="junk"), data_with_nightly(DOMAINS))
         self.assertEqual((doc["read_at"], doc["window_days"], doc["lead_days"], doc["records"]), (None, 90, 0, 4))
-        self.assertFalse(doc["cases"]["agent-kanban-smoke"]["points"][0]["window"]["cut"], "with nothing left behind nothing is cut")
-        odd = trend.trend_document(store_doc(base, older={"agent-kanban-smoke": {KEY_1: "many"}, "x": None}), data_with_nightly(DOMAINS))
-        self.assertFalse(odd["cases"]["agent-kanban-smoke"]["points"][0]["window"]["cut"], "an unusable count is no count")
+        self.assertFalse(doc["cases"]["case-24"]["points"][0]["window"]["cut"], "with nothing left behind nothing is cut")
+        odd = trend.trend_document(store_doc(base, older={"case-24": {KEY_1: "many"}, "x": None}), data_with_nightly(DOMAINS))
+        self.assertFalse(odd["cases"]["case-24"]["points"][0]["window"]["cut"], "an unusable count is no count")
 
 
 class LatencyTest(unittest.TestCase):
@@ -408,24 +410,24 @@ class LatencyTest(unittest.TestCase):
     def test_the_nights_are_the_nightly_pages_joined_and_dated_by_the_store_when_it_holds_them(self):
         self.assertEqual((self.latency["target_s"], self.latency["pct"]), (10, {"turn1": 95, "agent": 90}))
         self.assertEqual(self.latency["nights"], [
-            {"id": f"build:{NIGHT_0_BUILD}", "at": "2026-09-15T05:00:00+00:00", "build": NIGHT_0_BUILD},
-            {"id": f"build:{NIGHT_B_BUILD}", "at": "2026-09-16T05:00:00+00:00", "build": NIGHT_B_BUILD},
+            {"id": f"build:{NIGHT_0_BUILD}", "at": "2025-09-16T05:00:00+00:00", "build": NIGHT_0_BUILD},
+            {"id": f"build:{NIGHT_B_BUILD}", "at": "2025-09-17T05:00:00+00:00", "build": NIGHT_B_BUILD},
             # The split night: one night under its main part's build, at the store's stamp for it.
-            {"id": f"build:{NIGHT_1_BUILD}", "at": "2026-09-17T05:54:31Z", "build": NIGHT_1_BUILD},
+            {"id": f"build:{NIGHT_1_BUILD}", "at": "2025-09-18T05:54:31Z", "build": NIGHT_1_BUILD},
         ], "the May night is outside the store's window")
         self.assertEqual(self.doc["nights"][0]["id"], self.latency["nights"][-1]["id"], "the same id as the store's night")
 
     def test_a_case_pools_its_reps_without_infra_and_a_night_without_timing_is_a_gap(self):
-        rca = self.latency["cases"]["rca-remediation-pr"]
-        self.assertEqual([p["night"] for p in rca], [f"build:{NIGHT_0_BUILD}", f"build:{NIGHT_B_BUILD}", f"build:{NIGHT_1_BUILD}"])
-        self.assertEqual(self.values(rca[0]), {"n_turn1": 2, "turn1_p50_s": 5.0, "turn1_p95_s": 7.0, "n_agent": 2, "agent_p50_s": 120.0, "agent_p90_s": 140.0})
-        self.assertEqual(self.values(rca[1]), {"n_turn1": 0, "turn1_p50_s": None, "turn1_p95_s": None, "n_agent": 0, "agent_p50_s": None, "agent_p90_s": None}, "ran, no timing: a point without values, never zero")
-        # The infra rep (900 s, 80 s) is out; the writers part's rca row (999 s) counts as the main part's.
-        self.assertEqual(self.values(rca[2]), {"n_turn1": 2, "turn1_p50_s": 4.0, "turn1_p95_s": 12.0, "n_agent": 2, "agent_p50_s": 100.0, "agent_p90_s": 300.0})
-        kanban = self.latency["cases"]["agent-kanban-smoke"]
-        self.assertEqual([p["night"] for p in kanban], [f"build:{NIGHT_B_BUILD}", f"build:{NIGHT_1_BUILD}"], "no point on a night the case did not run")
-        self.assertEqual(self.values(kanban[1]), {"n_turn1": 1, "turn1_p50_s": 2.0, "turn1_p95_s": 2.0, "n_agent": 2, "agent_p50_s": 50.0, "agent_p90_s": 60.0}, "each series counts the reps that carry it")
-        self.assertNotIn("cluster-agent-crashloop-debug", self.latency["cases"], "a case no nightly run recorded has no series")
+        c23 = self.latency["cases"]["case-23"]
+        self.assertEqual([p["night"] for p in c23], [f"build:{NIGHT_0_BUILD}", f"build:{NIGHT_B_BUILD}", f"build:{NIGHT_1_BUILD}"])
+        self.assertEqual(self.values(c23[0]), {"n_turn1": 2, "turn1_p50_s": 5.0, "turn1_p95_s": 7.0, "n_agent": 2, "agent_p50_s": 120.0, "agent_p90_s": 140.0})
+        self.assertEqual(self.values(c23[1]), {"n_turn1": 0, "turn1_p50_s": None, "turn1_p95_s": None, "n_agent": 0, "agent_p50_s": None, "agent_p90_s": None}, "ran, no timing: a point without values, never zero")
+        # The infra rep (900 s, 80 s) is out; the writers part's c23 row (999 s) counts as the main part's.
+        self.assertEqual(self.values(c23[2]), {"n_turn1": 2, "turn1_p50_s": 4.0, "turn1_p95_s": 12.0, "n_agent": 2, "agent_p50_s": 100.0, "agent_p90_s": 300.0})
+        c24 = self.latency["cases"]["case-24"]
+        self.assertEqual([p["night"] for p in c24], [f"build:{NIGHT_B_BUILD}", f"build:{NIGHT_1_BUILD}"], "no point on a night the case did not run")
+        self.assertEqual(self.values(c24[1]), {"n_turn1": 1, "turn1_p50_s": 2.0, "turn1_p95_s": 2.0, "n_agent": 2, "agent_p50_s": 50.0, "agent_p90_s": 60.0}, "each series counts the reps that carry it")
+        self.assertNotIn("case-19", self.latency["cases"], "a case no nightly run recorded has no series")
 
     def test_a_domain_pools_the_cases_of_both_parts_and_all_domains_pool_every_case(self):
         remediation = self.latency["domains"]["remediation"][-1]
@@ -435,7 +437,7 @@ class LatencyTest(unittest.TestCase):
         everything = self.latency["all"]
         self.assertEqual([p["night"] for p in everything], [n["id"] for n in self.latency["nights"]])
         self.assertEqual(self.values(everything[-1]), {"n_turn1": 5, "turn1_p50_s": 6.0, "turn1_p95_s": 12.0, "n_agent": 6, "agent_p50_s": 100.0, "agent_p90_s": 300.0})
-        self.assertEqual(self.values(everything[1])["n_turn1"], 1, "kanban's rep the night rca had none")
+        self.assertEqual(self.values(everything[1])["n_turn1"], 1, "c24's rep the night c23 had none")
 
     def test_turn1_takes_the_p95_its_target_is_on_and_agent_time_the_p90(self):
         # 21 reps, nearest rank: p90 is index round(0.9 * 20) == 18 and p95
@@ -448,8 +450,8 @@ class LatencyTest(unittest.TestCase):
         self.assertNotIn("agent_p95_s", point)
 
     def test_a_main_rerun_night_does_not_borrow_the_writers_part(self):
-        rerun = timed_run("2100374258805903999", NIGHT_1_RUN["job"], "2026-09-17T10:00:00+00:00", "2026-09-17T12:00:00+00:00",
-                          [timed_task("rca-remediation-pr", rep(1, "pass", 10.0, 1.0))])
+        rerun = timed_run("2090000000000000089", NIGHT_1_RUN["job"], "2025-09-18T10:00:00+00:00", "2025-09-18T12:00:00+00:00",
+                          [timed_task("case-23", rep(1, "pass", 10.0, 1.0))])
         latency = trend.trend_document(store_doc(night_one_records()), data_with_nightly(LATENCY_DOMAINS, TIMED_RUNS + [rerun]))["latency"]
         self.assertEqual([p["night"] for p in latency["cases"][WRITER_CASE]], [f"build:{NIGHT_1_BUILD}"], "the writers reps count once")
         self.assertEqual(self.values(latency["all"][-1])["n_turn1"], 1, "the re-run night pools its own part only")
@@ -464,20 +466,20 @@ class StoreStatesTest(unittest.TestCase):
     def test_no_store_an_error_and_odd_records_all_yield_a_document(self):
         empty = trend.trend_document(None, data_with_nightly(DOMAINS))
         self.assertEqual((empty["source"], empty["read_at"], empty["records"], empty["cases"], empty["domains"], empty["metrics"], empty["default_metric"]), (None, None, 0, {}, {}, [], None))
-        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gcloud storage ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
-        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2026-09-17T14:30:00Z: gcloud storage ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
+        failed = trend.trend_document(store_doc(night_one_records(), error="2025-09-18T14:30:00Z: gcloud storage ls: 403", truncated={"case-23": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
+        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2025-09-18T14:30:00Z: gcloud storage ls: 403", {"case-23": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
         self.assertIsNone(empty["partial"])
         self.assertIsNone(trend.trend_document(store_doc(night_one_records(), partial={"fetched": 4, "remaining": 0}), data_with_nightly(DOMAINS))["partial"], "nothing left is not partial")
         # A non-finite mean is what json.loads makes of a `NaN` or `Infinity`
         # literal in a record; json.dumps would write it back and the page's
         # JSON.parse would refuse the whole document.
-        nan = json.loads('{"case": "y", "key": {}, "recorded_at": "2026-09-17T06:00:00Z", "runs": 3, "passes": 3, "judged": {"OutcomeValidity": {"mean": NaN, "n": 3}, "OutcomeScore": {"mean": Infinity, "n": 3}, "ToolInvocation": {"mean": 1, "n": 3}}}')
-        odd = store_doc(night_one_records() + [None, {"case": 3}, {"case": "x", "key": {}, "recorded_at": "junk"}, {"case": "y", "key": {}, "recorded_at": "2026-09-17T05:00:00Z", "runs": "three", "judged": {"OutcomeValidity": {"mean": "high", "n": 3}, "Other": {"mean": 0.5, "n": 0}}}, nan])
+        nan = json.loads('{"case": "y", "key": {}, "recorded_at": "2025-09-18T06:00:00Z", "runs": 3, "passes": 3, "judged": {"OutcomeValidity": {"mean": NaN, "n": 3}, "OutcomeScore": {"mean": Infinity, "n": 3}, "ToolInvocation": {"mean": 1, "n": 3}}}')
+        odd = store_doc(night_one_records() + [None, {"case": 3}, {"case": "x", "key": {}, "recorded_at": "junk"}, {"case": "y", "key": {}, "recorded_at": "2025-09-18T05:00:00Z", "runs": "three", "judged": {"OutcomeValidity": {"mean": "high", "n": 3}, "Other": {"mean": 0.5, "n": 0}}}, nan])
         doc = trend.trend_document(odd, data_with_nightly(DOMAINS))
         self.assertEqual(doc["records"], 6)
         y, later = doc["cases"]["y"]["points"]
         self.assertEqual((y["runs"], y["passes"], y["judged"]), (0, 0, {}), "unusable numbers are zero and an unusable metric is absent")
-        self.assertEqual(y["night"], "at:2026-09-17T05:00:00Z")
+        self.assertEqual(y["night"], "at:2025-09-18T05:00:00Z")
         self.assertEqual(sorted(later["judged"]), ["ToolInvocation"], "a non-finite mean is no score")
         json.dumps(doc, allow_nan=False)  # the whole document is JSON a browser will parse
 
@@ -499,7 +501,7 @@ class StoreStatesTest(unittest.TestCase):
             self.assertIsNone(brief["trend"], "every page polls brief.json; the block rides in trend.json")
             self.assertEqual(json.loads((out / "trend.json").read_text())["records"], 4)
             self.assertEqual(sorted(p.name for p in out.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "store.json", "trend.html", "trend.json"])
-            self.assertEqual(json.loads((out / "store.json").read_text())["records"][0]["case"], "agent-kanban-smoke")
+            self.assertEqual(json.loads((out / "store.json").read_text())["records"][0]["case"], "case-19")
             self.assertIsNone(json.loads((without / "trend.json").read_text())["source"])
             self.assertFalse((without / "store.json").exists())
             self.assertFalse((unreadable / "store.json").exists(), "a store that did not parse is not republished over the good prior")
@@ -515,19 +517,19 @@ class TrendPageTest(unittest.TestCase):
         base = night_one_records()
         records = list(base)
         for day in range(18, 24):
-            records += later_night(base, day, f"21007{day}0000000000000", passes={"rca-remediation-pr": 3 if day % 2 else 2}, judged={"OutcomeValidity": 0.6 + day / 100})
-        records += later_night(base, 24, "2100724000000000000", judged={"OutcomeValidity": 0.95}, key={"judge_model": "gemini-3.5-pro"})
+            records += later_night(base, day, f"21007{day}0000000000000", passes={"case-23": 3 if day % 2 else 2}, judged={"OutcomeValidity": 0.6 + day / 100})
+        records += later_night(base, 24, "2100724000000000000", judged={"OutcomeValidity": 0.95}, key={"judge_model": "model-y"})
         (root / "store.json").write_text(json.dumps(store_doc(records)))
         data = load_fixture()
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "domain": d, "active": True, "nightly_active": True} for n, d in DOMAINS]
         data["cases"].append({"name": HOSTILE_CASE, "domain": "cost", "active": True, "nightly_active": True})
         data["runs"].append(copy.deepcopy(NIGHT_1_RUN))
-        # Health history with one past incident on the crashloop case, for the Brief's link.
+        # Health history with one past incident on case-19, for the Brief's link.
         history = history_lines(
-            dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
-            dict(health_doc(), tick="2026-09-08T09:00:00+00:00"),
-            dict(health_doc("GREEN"), tick="2026-09-08T12:00:00+00:00", since="2026-09-08T12:00:00+00:00"),
+            dict(health_doc("GREEN"), tick="2025-09-07T01:00:00+00:00", since="2025-09-07T01:00:00+00:00"),
+            dict(health_doc(failing_cases=["case-19", "case-18", "case-14"], since="2025-09-09T09:00:00+00:00"), tick="2025-09-09T09:00:00+00:00"),
+            dict(health_doc("GREEN"), tick="2025-09-09T12:00:00+00:00", since="2025-09-09T12:00:00+00:00"),
         )
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
                 unittest.mock.patch.object(render, "demotion_dates", return_value={}), \
@@ -536,8 +538,8 @@ class TrendPageTest(unittest.TestCase):
             cls.bare = render_to(root / "bare", data, health=health_doc("GREEN"))
             # A read that failed this tick: the prior document with error set,
             # a cap that trimmed one case and a line that would not parse.
-            stale = store_doc(records, error="2026-09-17T14:30:00Z: gcloud storage ls gs://kube-agents-evals-bench/evidence: HTTPError 403",
-                              truncated={"rca-remediation-pr": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"],
+            stale = store_doc(records, error="2025-09-18T14:30:00Z: gcloud storage ls gs://kube-agents-evals-bench/evidence: HTTPError 403",
+                              truncated={"case-23": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"],
                               partial={"fetched": 800, "remaining": 2600})
             (root / "stale.json").write_text(json.dumps(stale))
             cls.stale = render_to(root / "stale", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "stale.json")])
@@ -545,27 +547,27 @@ class TrendPageTest(unittest.TestCase):
             (root / "empty.json").write_text(json.dumps(empty))
             cls.empty = render_to(root / "empty", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "empty.json")])
             # A month of nights at one key (the density a quarter's chart works
-            # at; rca fails two of three every night), read with a lead-in,
+            # at; c23 fails two of three every night), read with a lead-in,
             # plus a sparse case whose pool runs out at the read's edge.
             # A key change on night 11; night 20 recorded no OutcomeValidity;
             # the listing left three older objects behind at sparse-case's key.
             dense = []
             for day in range(1, 31):
-                night = later_night(base, day, f"21007{day:02d}0000000000000", passes={"rca-remediation-pr": 1}, key={"judge_model": "gemini-3.5-pro"} if day >= 11 else None)
+                night = later_night(base, day, f"21007{day:02d}0000000000000", passes={"case-23": 1}, key={"judge_model": "model-y"} if day >= 11 else None)
                 if day == 20:
                     for r in night:
                         r["judged"].pop("OutcomeValidity")
                 dense += night
-            for at, build in (("2026-06-20T05:50:00Z", "2100620000000000009"), ("2026-09-15T05:50:00Z", "21007150000000000000")):
+            for at, build in (("2025-06-21T05:50:00Z", "2100620000000000009"), ("2025-09-16T05:50:00Z", "21007150000000000000")):
                 r = copy.deepcopy(base[0])
                 r.update(case="sparse-case", recorded_at=at, build=build, object=f"{LOCATION}/sparse-case/x/{build}.jsonl")
                 dense.append(r)
             # A record whose own case name is hostile (parse_records only asks
             # for a string): the store is the one input that reaches the page.
             hostile = copy.deepcopy(base[0])
-            hostile.update(case=HOSTILE_CASE, recorded_at="2026-09-30T05:50:00Z", build="21007300000000000000", object=f"{LOCATION}/hostile/x/30.jsonl")
+            hostile.update(case=HOSTILE_CASE, recorded_at="2025-10-01T05:50:00Z", build="21007300000000000000", object=f"{LOCATION}/hostile/x/30.jsonl")
             dense.append(hostile)
-            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z", lead_days=14, older={"sparse-case": {KEY_1: 3}})))
+            (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2025-10-02T14:09:02Z", lead_days=14, older={"sparse-case": {KEY_1: 3}})))
             cls.dense = render_to(root / "dense", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "dense.json")])
             # Night one at today, then two later nights at next.
             modes = list(base)
@@ -605,8 +607,8 @@ class TrendPageTest(unittest.TestCase):
         self.assertNotIn("<img src=x", app)
 
     def test_a_case_view_draws_the_window_the_band_and_the_record(self):
-        app = dom_text(self.page, fragment="#cases=rca-remediation-pr")
-        self.assertIn("<h1><code>rca-remediation-pr</code> on main</h1>", app)
+        app = dom_text(self.page, fragment="#cases=case-23")
+        self.assertIn("<h1><code>case-23</code> on main</h1>", app)
         self.assertEqual(app.count('class="tcard"'), 1)
         self.assertIn('<path class="line"', app, "the trailing window and the judged means are lines once there are two nights")
         self.assertIn('<path class="band"', app, "the spread band spans the nights at one key")
@@ -620,10 +622,10 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("<b>Record today: collecting.</b> 2/3 across 1 night at the current key, 17 more runs before the window is full", app)
         self.assertIn("<b>Version key changed</b>", app)
         self.assertIn("<b>judge_model</b> changed", app)
-        self.assertIn('href="cases.html#rca-remediation-pr"', app)
+        self.assertIn('href="cases.html#case-23"', app)
         self.assertIn('href="trend.html#domain=remediation"', app)
         self.assertIn("trailing window: 81% (17/21) across 7 nights", app, "the tooltip carries the pooled window")
-        self.assertIn("range of the last 7 nightly means: 0.77 – 0.83", app)
+        self.assertIn("range of the last 7 nightly means: 0.63 – 0.83", app)
         self.assertIn(f"key {KEY_1}", app)
 
     def test_a_domain_view_pools_then_lists_each_case(self):
@@ -631,7 +633,7 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("<h1>cluster debugging on main</h1>", app)
         self.assertIn('<button type="button" data-scope="cluster-debugging" class="on">cluster debugging</button>', app)
         self.assertIn("<h2>Each case in cluster debugging</h2>", app)
-        self.assertIn('<a href="trend.html#cases=cluster-agent-crashloop-debug"><code>cluster-agent-crashloop-debug</code></a>', app)
+        self.assertIn('<a href="trend.html#cases=case-19"><code>case-19</code></a>', app)
         self.assertEqual(app.count('class="tcard"'), 2)
 
     def test_the_no_domain_group_is_labelled_so_and_its_slug_still_scopes(self):
@@ -652,19 +654,19 @@ class TrendPageTest(unittest.TestCase):
 
     def test_the_incident_link_from_the_brief_marks_the_night_it_started(self):
         brief_app = dom_text(self.out / "index.html")
-        link = "trend.html#since=2026-09-08T09:00:00Z&until=2026-09-08T12:00:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom"
+        link = "trend.html#since=2025-09-09T09:00:00Z&until=2025-09-09T12:00:00Z&cases=case-19,case-18,case-14"
         self.assertIn(f'<a href="{link.replace("&", "&amp;")}">The record on main around the night it started →</a>', brief_app)
         app = dom_text(self.page, fragment="#" + link.split("#", 1)[1])
         self.assertIn("<h1>3 cases on main</h1>", app)
-        self.assertIn("Marked: the incident that started Sep 8, 5:00 AM ET and ended Sep 8, 8:00 AM ET.", app)
+        self.assertIn("Marked: the incident that started Sep 9, 5:00 AM ET and ended Sep 9, 8:00 AM ET.", app)
         self.assertIn(">incident start</text>", app)
         self.assertIn(">healthy again</text>", app)
         self.assertIn("No record in the store for these cases inside the window", app)
-        self.assertIn("<code>cluster-agent-crashloop-evidence-chain</code>, <code>cluster-agent-crashloop-misleading-symptom</code>", app)
+        self.assertIn("<code>case-18</code>, <code>case-14</code>", app)
 
     def test_the_cases_page_links_each_case_to_its_trend(self):
         app = dom_text(self.out / "cases.html")
-        self.assertIn('<small><a href="trend.html#cases=rca-remediation-pr">trend on main →</a></small>', app)
+        self.assertIn('<small><a href="trend.html#cases=case-23">trend on main →</a></small>', app)
         self.assertNotIn('trend.html#cases=<img', app)
 
     def test_chips_change_the_scope_and_the_metric(self):
@@ -678,10 +680,10 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("No record in the store for this case inside the window", dom_text(self.page, fragment="#cases=no-such-case"))
 
     def test_the_record_line_and_the_window_labels_say_admit_demote_and_cut_on_the_page(self):
-        admit = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
+        admit = dom_text(self.dense / "trend.html", fragment="#cases=case-24")
         self.assertIn("<b>Record today: the record would admit it.</b> 21/21 across 7 nights at the current key against a bar of 90% over 20", admit)
         self.assertIn("100% of 21</text>", admit, "the window label of a full window carries no caveat")
-        demote = dom_text(self.dense / "trend.html", fragment="#cases=rca-remediation-pr")
+        demote = dom_text(self.dense / "trend.html", fragment="#cases=case-23")
         self.assertIn("<b>Record today: the record would demote it.</b> 7/21 across 7 nights at the current key against a bar of 90% over 20", demote)
         # The sparse case: two records inside the read and three older ones the listing showed.
         cut = dom_text(self.dense / "trend.html", fragment="#cases=sparse-case")
@@ -692,7 +694,7 @@ class TrendPageTest(unittest.TestCase):
         self.assertNotIn("window not full", cut)
         self.assertNotIn(" · not full yet", cut, "the legend's '(hollow: not full yet)' is the only mention")
         # A short pool that started inside the read stays "not full" / collecting (the main fixture's eighth night).
-        short = dom_text(self.page, fragment="#cases=rca-remediation-pr")
+        short = dom_text(self.page, fragment="#cases=case-23")
         self.assertIn("<b>Record today: collecting.</b> 2/3 across 1 night at the current key, 17 more runs before the window is full", short)
         self.assertIn("67% of 3 · window not full</text>", short)
         self.assertIn(" · not full yet", short)
@@ -700,7 +702,7 @@ class TrendPageTest(unittest.TestCase):
 
     def test_the_stale_banner_also_names_a_trimmed_case_and_an_unreadable_line(self):
         stale = dom_text(self.stale / "trend.html")
-        self.assertIn('<p class="stale">The read was capped at 200 objects per case per version key for 1 case (rca-remediation-pr); their oldest nights inside the window are not drawn.</p>', stale)
+        self.assertIn('<p class="stale">The read was capped at 200 objects per case per version key for 1 case (case-23); their oldest nights inside the window are not drawn.</p>', stale)
         self.assertIn('<p class="stale">1 record in the store could not be read and is left out: <code>gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value</code></p>', stale)
         self.assertIn('<p class="stale">The last read stopped at its time budget after 800 of 3400 objects; the cases the rest belong to are drawn without them until the next refresh finishes the read.</p>', stale)
         self.assertNotIn('class="stale"', dom_text(self.page), "a clean read carries neither note")
@@ -710,16 +712,16 @@ class TrendPageTest(unittest.TestCase):
         # focus a night, then let the poll's renderAll (the failed fetch
         # from file://) rebuild #app inside the virtual-time budget.
         script = ('document.querySelector("details.tv").open = true;'
-                  'document.querySelector(\'[data-hit="case:rca-remediation-pr:rate:2"]\').focus();'
+                  'document.querySelector(\'[data-hit="case:case-23:rate:2"]\').focus();'
                   'setTimeout(() => { const a = document.activeElement; document.body.dataset.focused = a && a.dataset ? a.dataset.hit || "other" : "none";'
                   ' document.body.dataset.tip = document.getElementById("ttip").style.display; }, 1500);')
-        html = dom_html(scripted_page(self.page, script), fragment="#cases=rca-remediation-pr")
-        self.assertIn('<details class="tv" data-tv="case:rca-remediation-pr" open="">', html)
-        self.assertIn('data-focused="case:rca-remediation-pr:rate:2"', html)
+        html = dom_html(scripted_page(self.page, script), fragment="#cases=case-23")
+        self.assertIn('<details class="tv" data-tv="case:case-23" open="">', html)
+        self.assertIn('data-focused="case:case-23:rate:2"', html)
         self.assertIn('data-tip="block"', html, "the focused night's tooltip is showing again")
 
     def test_the_band_and_the_window_line_break_at_a_key_change_and_the_band_at_an_unrecorded_night(self):
-        app = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
+        app = dom_text(self.dense / "trend.html", fragment="#cases=case-24")
         rate, judged = re.findall(r'<svg class="tchart".*?</svg>', app, re.DOTALL)[:2]
         self.assertIn("key: judge_model", app)
         self.assertEqual(rate.count('<path class="line"'), 2, "the trailing-window line restarts at the new key")
@@ -753,11 +755,11 @@ class TrendPageTest(unittest.TestCase):
     def test_hit_targets_are_disjoint_and_cover_the_plot_at_a_months_density(self):
         # SVG hit-testing returns the topmost element: overlapping rects
         # would name a later night than the one under the pointer.
-        app = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
+        app = dom_text(self.dense / "trend.html", fragment="#cases=case-24")
         svg = re.search(r'<svg class="tchart"[^>]*pass rate by night.*?</svg>', app, re.DOTALL).group(0)
         rects = [(float(x), float(w)) for x, w in re.findall(r'<rect class="hit" tabindex="0" data-hit="[^"]*" x="([0-9.]+)" y="\d+" width="([0-9.]+)"', svg)]
         self.assertEqual(len(rects), 30)
-        self.assertIn('data-hit="case:agent-kanban-smoke:rate:0"', svg)
+        self.assertIn('data-hit="case:case-24:rate:0"', svg)
         for (x0, w0), (x1, _) in itertools.pairwise(rects):
             self.assertLessEqual(x0 + w0, x1 + 0.11, "adjacent hit targets overlap")
             self.assertGreaterEqual(x0 + w0, x1 - 0.11, "a gap between adjacent hit targets")
@@ -770,9 +772,9 @@ class TrendPageTest(unittest.TestCase):
         # because the chip wrote the fragment instead of pinning a state
         # the hashchange would not clear.
         script = ('document.querySelector(\'button[data-scope="upgrades"]\').click();'
-                  'window.addEventListener("hashchange", () => { document.querySelector(\'a[href="trend.html#cases=upgrades-fleet-version-table"]\').click(); }, { once: true });')
+                  'window.addEventListener("hashchange", () => { document.querySelector(\'a[href="trend.html#cases=case-31"]\').click(); }, { once: true });')
         app = dom_text(scripted_page(self.page, script))
-        self.assertIn("<h1><code>upgrades-fleet-version-table</code> on main</h1>", app)
+        self.assertIn("<h1><code>case-31</code> on main</h1>", app)
         self.assertNotIn("<h1>upgrades on main</h1>", app)
         # A metric chip keeps the scope it was clicked in and lands in the fragment
         # (recorded beside #app: the poll's re-render would wipe it inside).
@@ -808,8 +810,8 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn('<a href="trend.html#domain=remediation&amp;mode=today">remediation</a>', today, "a domain title keeps the series")
         self.assertIn('<a href="trend.html#domain=remediation">remediation</a>', app, "and adds none the link did not carry")
         domain = dom_text(page, fragment="#domain=remediation&mode=today")
-        self.assertIn('<a href="trend.html#cases=rca-remediation-pr&amp;mode=today"><code>rca-remediation-pr</code></a>', domain, "a domain view's case links keep the series")
-        case = dom_text(page, fragment="#cases=rca-remediation-pr&mode=today")
+        self.assertIn('<a href="trend.html#cases=case-23&amp;mode=today"><code>case-23</code></a>', domain, "a domain view's case links keep the series")
+        case = dom_text(page, fragment="#cases=case-23&mode=today")
         self.assertIn('<a href="trend.html#domain=remediation&amp;mode=today">its domain, remediation →</a>', case, "a case's domain link keeps the series")
         # The chip writes the fragment, and a scope chip keeps the series.
         script = ('document.querySelector(\'button[data-mode="today"]\').click();'
@@ -875,7 +877,7 @@ class TrendLatencyPageTest(unittest.TestCase):
         self.assertEqual(app.count('class="tcard"'), 4, "one card per domain the store holds; the all-domains row is not a card")
 
     def test_a_case_card_draws_p50_and_the_slow_percentile_on_seconds_with_the_target_and_a_gap(self):
-        app = dom_text(self.page, fragment="#cases=rca-remediation-pr")
+        app = dom_text(self.page, fragment="#cases=case-23")
         charts = re.findall(r'<svg class="tchart".*?</svg>', app, re.DOTALL)
         self.assertEqual(len(charts), 4, "pass rate and judged, then turn 1 and agent time")
         turn1, agent = charts[2:]
@@ -899,11 +901,11 @@ class TrendLatencyPageTest(unittest.TestCase):
         self.assertIn("chat turn 1: p50 4.0 s · p95 12.0 s · 2 reps", turn1, "the tooltip has the values and n")
         self.assertIn("agent time: p50 100.0 s · p90 300.0 s · 2 reps", agent)
         self.assertIn("p50 4.0 s · p95 12.0 s · n=2</text>", turn1, "the newest night is labelled")
-        self.assertIn('data-hit="case:rca-remediation-pr:turn1:0"', turn1)
-        self.assertIn('data-hit="case:rca-remediation-pr:agent:0"', agent)
+        self.assertIn('data-hit="case:case-23:turn1:0"', turn1)
+        self.assertIn('data-hit="case:case-23:agent:0"', agent)
 
     def test_the_latency_table_has_every_value_and_a_dash_for_the_gap(self):
-        app = dom_text(self.page, fragment="#cases=rca-remediation-pr")
+        app = dom_text(self.page, fragment="#cases=case-23")
         self.assertIn("Latency table · 3 nights", app)
         self.assertIn("<th>Night</th><th>Turn 1 p50</th><th>Turn 1 p95</th><th>Turn 1 reps</th><th>Agent p50</th><th>Agent p90</th><th>Agent reps</th>", app)
         self.assertIn(f'<a href="nightly.html#build={NIGHT_1_BUILD}">Thu 1:54 AM ET</a></td><td>4.0 s</td><td>12.0 s</td><td>2</td><td>100.0 s</td><td>300.0 s</td><td>2</td></tr>', app, "night one, dated by the store's record")
@@ -911,31 +913,31 @@ class TrendLatencyPageTest(unittest.TestCase):
         self.assertIn("<td>5.0 s</td><td>7.0 s</td><td>2</td><td>120.0 s</td><td>140.0 s</td><td>2</td></tr>", app)
 
     def test_the_y_axis_names_the_target_when_no_tick_does(self):
-        upgrades = re.findall(r'<svg class="tchart".*?</svg>', dom_text(self.page, fragment="#cases=upgrades-fleet-version-table"), re.DOTALL)[2]
-        self.assertIn(">20 s</text>", upgrades, "a 45 s p95 in 20 s steps")
-        self.assertIn('text-anchor="end">10 s</text>', upgrades, "the target's value on the y-axis")
-        self.assertIn('<text class="thr-l"', upgrades)
-        rca = re.findall(r'<svg class="tchart".*?</svg>', dom_text(self.page, fragment="#cases=rca-remediation-pr"), re.DOTALL)[2]
-        self.assertEqual(rca.count(">10 s</text>"), 1, "a 5 s step has the tick already: not drawn twice")
-        self.assertNotIn('<text class="thr-l"', rca)
+        c31 = re.findall(r'<svg class="tchart".*?</svg>', dom_text(self.page, fragment="#cases=case-31"), re.DOTALL)[2]
+        self.assertIn(">20 s</text>", c31, "a 45 s p95 in 20 s steps")
+        self.assertIn('text-anchor="end">10 s</text>', c31, "the target's value on the y-axis")
+        self.assertIn('<text class="thr-l"', c31)
+        c23 = re.findall(r'<svg class="tchart".*?</svg>', dom_text(self.page, fragment="#cases=case-23"), re.DOTALL)[2]
+        self.assertEqual(c23.count(">10 s</text>"), 1, "a 5 s step has the tick already: not drawn twice")
+        self.assertNotIn('<text class="thr-l"', c23)
 
     def test_a_night_outside_the_drawn_range_is_in_neither_the_chart_nor_the_table(self):
-        app = dom_text(self.page, fragment="#cases=rca-remediation-pr")
+        app = dom_text(self.page, fragment="#cases=case-23")
         turn1 = re.findall(r'<svg class="tchart".*?</svg>', app, re.DOTALL)[2]
-        self.assertEqual(turn1.count('<rect class="hit"'), 3, "Tue 09-15 to Thu 09-17, not 09-01")
-        table = re.search(r'<details class="tv" data-tv="case:rca-remediation-pr:latency".*?</details>', app, re.DOTALL).group(0)
+        self.assertEqual(turn1.count('<rect class="hit"'), 3, "Tue 09-16 to Thu 09-18, not 09-02")
+        table = re.search(r'<details class="tv" data-tv="case:case-23:latency".*?</details>', app, re.DOTALL).group(0)
         self.assertIn("Latency table · 3 nights", table)
         self.assertEqual(table.count("<tr><td>"), 3, "the chart's nights only")
 
     def test_a_scope_without_timing_says_so_from_the_data(self):
-        app = dom_text(self.page, fragment="#cases=cluster-agent-crashloop-debug")
+        app = dom_text(self.page, fragment="#cases=case-19")
         self.assertIn("No timing on record for this scope yet: no timed nightly rep in the window counts (infra reps never count).", app)
         self.assertEqual(app.count('<svg class="tchart"'), 2)
         self.assertNotIn("Latency table", app)
         # The domain's card and its timed case's card both draw the row.
         domain = dom_text(self.page, fragment="#domain=chat-and-routing")
         self.assertIn('aria-label="chat and routing: agent time by night"', domain)
-        self.assertIn('aria-label="agent-kanban-smoke: agent time by night"', domain)
+        self.assertIn('aria-label="case-24: agent time by night"', domain)
 
 
 if __name__ == "__main__":

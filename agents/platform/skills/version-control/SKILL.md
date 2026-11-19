@@ -23,7 +23,10 @@ The remote verbs are exactly these:
 reacts to a comment (its `id` and `kind` come from `view --comments`) so its
 author sees it was read — `capabilities` says whether this forge supports it.
 `issue list --query <text>` searches, and `--without-labels` skips issues
-carrying any of them — that is how a queue is read for unclaimed work.
+carrying any of them — that is how a queue is read for unclaimed work. On an
+AgentProfile worker `--query` takes plain words only (no `:`, quotes or
+parentheses, no `OR`/`AND`/`NOT`), and a label name no quote: anything else is
+refused with `PROFILE_QUERY_QUALIFIER`, so filter with `--labels` instead.
 `label ensure` creates a label or updates it if it exists. `identity` says
 who this install is on the forge and, with `--login`, whether that login may
 write to the repository. `remote-branch view` says whether the shared

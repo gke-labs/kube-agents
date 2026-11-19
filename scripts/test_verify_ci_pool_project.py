@@ -2274,9 +2274,10 @@ class GitopsSeededFileStateTest(unittest.TestCase):
                 self.assertEqual(data.decode(), checker.GITOPS_SEEDED_FILES[path] + "\n")
                 hashed = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True)
                 self.assertEqual(hashed.stdout.decode().strip(), checker.gitops_seeded_blob_sha(path))
-        # The six-item note, as the forty repositories carry it since the
-        # 2026-11-13 repair (blob cd9d2500 in the issue's record).
-        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("cd9d2500"))
+        # The seven-item note, the one the forty repositories carry once the
+        # re-seed that follows the compute slice's merge runs; the six-item
+        # note of the 2026-11-13 repair was blob cd9d2500.
+        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("3d3a1388"))
         with self.assertRaises(KeyError):
             checker.gitops_seeded_bytes("knowledge/other.md")
 
@@ -4830,7 +4831,8 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # config_connector.py and orphan_snapshot.py the ones the terraform_data
     # local-execs run, not something tofu loads; their calls are accounted for
     # on the external and terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
+    # config_sync.py is a writer of the same kind that no resource runs yet.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py", "config_sync.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

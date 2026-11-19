@@ -961,5 +961,76 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                 self.assertEqual(offenders, [], f"steps in {path.name} still mint with the deprecated app-id input")
 
 
+_GA_DISPATCH_JOB = "step-6b-dispatch-ga-scheduler"
+_GA_DISPATCH_SCRIPT_NAME = "dispatch_release_scheduler.sh"
+_GA_SCHEDULER = _WORKFLOWS / "release-scheduler.yml"
+
+
+class GASchedulerDispatchWiringTest(unittest.TestCase):
+    """Step 6b asks the GA scheduler to evaluate as soon as the staging tag exists.
+
+    On 2026-11-18 the promotion tagged three minutes after the scheduler's daily
+    tick had read the tag graph, and the candidate shipped a day late. The job
+    that closes that gap must run only after a real promotion, dispatch through
+    the one script, and send the scheduler nothing it does not declare.
+    """
+
+    def setUp(self):
+        self.jobs = _doc(_PROMOTION)["jobs"]
+        self.job = self.jobs[_GA_DISPATCH_JOB]
+
+    def test_it_runs_only_after_the_staging_tag_is_pushed(self):
+        self.assertIn(_PROMOTE_JOB, self.job["needs"])
+        self.assertIn("step-1-resolve-candidate", self.job["needs"])
+        condition = " ".join(self.job["if"].split())
+        for status_function in _STATUS_FUNCTIONS:
+            self.assertNotIn(status_function, condition)
+
+    def test_it_repeats_the_promotions_own_guards(self):
+        """A skipped promotion pushed no tag, so there is nothing to evaluate."""
+        condition = " ".join(self.job["if"].split())
+        self.assertIn("github.repository == 'gke-labs/kube-agents'", condition)
+        # The scheduler evaluates on main only (its job guard), so a dispatch from
+        # any other ref would produce a skipped run and nothing else.
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+        self.assertIn("skip_pipeline != 'true'", condition)
+        self.assertIn("skip_promotion != 'true'", condition)
+        self.assertNotIn("||", condition)
+
+    def test_the_default_token_can_write_actions_and_nothing_more(self):
+        permissions = self.job["permissions"]
+        self.assertEqual(permissions.get("actions"), "write")
+        self.assertEqual(permissions.get("contents"), "read")
+        self.assertEqual(set(permissions), {"actions", "contents"})
+
+    def test_it_dispatches_only_through_the_script(self):
+        runs = [step.get("run") or "" for step in self.job["steps"]]
+        dispatching = [run for run in runs if _GA_DISPATCH_SCRIPT_NAME in run]
+        self.assertEqual(len(dispatching), 1, runs)
+        for run in runs:
+            self.assertNotIn("gh workflow run", run)
+        step = next(step for step in self.job["steps"] if _GA_DISPATCH_SCRIPT_NAME in (step.get("run") or ""))
+        self.assertIn("github.token", step["env"]["GH_TOKEN"])
+        self.assertIn("staging_tag", step["env"]["STAGING_TAG"])
+
+    def test_the_scheduler_accepts_a_dispatch_with_no_inputs(self):
+        """The script passes none, and the scheduler must keep declaring none."""
+        scheduler = _doc(_GA_SCHEDULER)
+        triggers = scheduler.get(True, scheduler.get("on", {}))
+        self.assertIn("workflow_dispatch", triggers)
+        self.assertFalse(
+            (triggers.get("workflow_dispatch") or {}).get("inputs"),
+            "release-scheduler.yml declares inputs the promotion's dispatch does not send",
+        )
+        source = (_REPO_ROOT / "scripts" / "release" / _GA_DISPATCH_SCRIPT_NAME).read_text()
+        self.assertIn("release-scheduler.yml", source)
+        self.assertNotIn(" -f ", source)
+
+    def test_the_teardown_does_not_wait_on_it(self):
+        """Teardown must not inherit the eval wait through the new job."""
+        teardown_needs = self.jobs[_TEARDOWN_JOB]["needs"]
+        self.assertNotIn(_GA_DISPATCH_JOB, teardown_needs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -75,15 +75,15 @@ In Cloud Monitoring the collector's own `cluster` and `location` labels take pre
 
 The `kind` label of `kubeagents_broker_execution_failures_total`:
 
-| `kind`                 | Counted                                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------------------ |
-| `exec_timeout`         | a command past its deadline                                                                      |
-| `exec_failed`          | a 500 on the exec route                                                                          |
-| `vcs_failed`           | a 500 or 502 on the version-control route, and its 503 for an unreadable managed-repository list |
-| `forge_refresh_failed` | a 502 on the forge route                                                                         |
-| `api_relay_failed`     | any 5xx on the Cloud API, MCP or watcher relays, whose upstream status passes through            |
-| `chat_pull_failed`     | the broker's own chat or Slack event pull failing on its subscription                            |
-| `other_failed`         | a 500, 502 or 504 on any other route                                                             |
+| `kind`                 | Counted                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `exec_timeout`         | a command past its deadline                                                                                                          |
+| `exec_failed`          | a 500 on the exec route                                                                                                              |
+| `vcs_failed`           | a 500 or 502 on the version-control route, and its 503 for an unreadable managed-repository list                                     |
+| `forge_refresh_failed` | a 502 on the forge route                                                                                                             |
+| `api_relay_failed`     | any 5xx on the Cloud API, MCP or watcher relays, whose upstream status passes through                                                |
+| `chat_pull_failed`     | the broker's own chat event pull failing on any chat platform's route (its Pub/Sub subscription, or the in-pod Slack or Teams queue) |
+| `other_failed`         | a 500, 502 or 504 on any other route                                                                                                 |
 
 Read the two admission series by bound. A median wait in the tens of seconds, or refusals, under `budget` is the broker telling you to raise the proxy's memory limit (`spec.deployment.credentialProxy.resources`, or a `spec.deployment.sizingProfile` row that raises it). The same under `slot` says the slot cap of eight binds, and raising the limit changes nothing: narrow what the fleet reconcile and the stall watch list at once. At the operator's 2Gi default the budget admits ten, so `slot` is the bound a default install sees; the design behind the figures is [`docs/designs/credential-proxy-child-memory-budget.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/credential-proxy-child-memory-budget.md).
 
