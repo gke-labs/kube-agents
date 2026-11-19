@@ -721,7 +721,6 @@ class WorkerEnvironmentTest(unittest.TestCase):
         self.assertNotIn(inherited.name, paths)
 
 
-
 #: What the fixtures below pass to `gcloud`. Not a gcloud command: a call that
 #: gets past every stand-in still does nothing.
 GCLOUD_FIXTURE_COMMAND = "sweep-fixture"
@@ -734,6 +733,10 @@ OWN_STUB_FILE = "test_gcloud_own_stub.py"
 MOCKED_FILE = "test_gcloud_mocked.py"
 MANY_CALLS_FILE = "test_gcloud_many_calls.py"
 SIBLING_FILE = "test_gcloud_sibling.py"
+SLOW_TOLERANT_FILE = "test_gcloud_slow_tolerant.py"
+#: How long the slow fixture waits before its gcloud call: long against the
+#: time that a second worker needs to fail on the folder of the first.
+SLOW_FIXTURE_SECONDS = 2
 #: How many calls MANY_CALLS_FILE makes: more than the block shows.
 MANY_CALLS = 7
 
@@ -797,7 +800,7 @@ class ManyCallsTest(unittest.TestCase):
         for number in range(1, {MANY_CALLS} + 1):
             subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", f"call-{{number}}"])
 """
-SIBLING_SOURCE = """\
+SIBLING_SOURCE = f"""\
 import os
 import unittest
 
@@ -809,6 +812,30 @@ class SiblingTest(unittest.TestCase):
         work = os.path.dirname(own)
         others = sorted(name for name in os.listdir(work) if name.endswith(".gcloud") and os.path.join(work, name) != own)
         self.assertEqual([], others)
+
+    def test_only_a_files_log_holds_the_calls_of_an_earlier_file(self):
+        # The record of an earlier file is gone; the lines that its block shows are in its log.
+        own = os.environ["PATH"].split(os.pathsep)[0]
+        self.assertTrue(own.endswith(".gcloud"), own)
+        work = os.path.dirname(own)
+        holders = []
+        for folder, _, names in os.walk(work):
+            for name in names:
+                with open(os.path.join(folder, name), "rb") as handle:
+                    if b"{GCLOUD_FIXTURE_COMMAND}" in handle.read():
+                        holders.append(name)
+        self.assertEqual([], [name for name in holders if not name.endswith(".log")])
+"""
+SLOW_TOLERANT_SOURCE = f"""\
+import subprocess
+import time
+import unittest
+
+
+class SlowTolerantTest(unittest.TestCase):
+    def test_runs_gcloud_after_a_wait_and_tolerates_its_failure(self):
+        time.sleep({SLOW_FIXTURE_SECONDS})
+        subprocess.run(["gcloud", "{GCLOUD_FIXTURE_COMMAND}", "slow"])
 """
 GCLOUD_FIXTURES = {
     UNSTUBBED_FILE: UNSTUBBED_SOURCE,
@@ -817,6 +844,7 @@ GCLOUD_FIXTURES = {
     MOCKED_FILE: MOCKED_SOURCE,
     MANY_CALLS_FILE: MANY_CALLS_SOURCE,
     SIBLING_FILE: SIBLING_SOURCE,
+    SLOW_TOLERANT_FILE: SLOW_TOLERANT_SOURCE,
 }
 
 
@@ -903,6 +931,15 @@ class GcloudStandInTest(unittest.TestCase):
                 failed, files, blocks = self._sweep([first, SIBLING_FILE], jobs=1)
                 self.assertIn("\nOK", blocks[SIBLING_FILE])
                 self.assertNotIn(files[SIBLING_FILE], failed)
+
+    def test_a_second_entry_of_a_file_does_not_remove_the_stand_in_of_the_first(self):
+        # The same file two times and two workers: one worker makes the folder,
+        # the other cannot and stops at once. The first one's test runs gcloud
+        # after that, and must still get the stand-in.
+        failed, files, blocks = self._sweep([SLOW_TOLERANT_FILE, SLOW_TOLERANT_FILE], jobs=2)
+        self.assertIn(files[SLOW_TOLERANT_FILE], failed)
+        self.assertIn(GCLOUD_RECORD_HEADER, blocks[SLOW_TOLERANT_FILE])
+        self.assertIn(f"gcloud {GCLOUD_FIXTURE_COMMAND} slow", blocks[SLOW_TOLERANT_FILE])
 
 
 if __name__ == "__main__":

@@ -423,15 +423,20 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 #
 # Each file also runs with a stand-in gcloud first on PATH, in a folder of its
 # own. A test that runs gcloud with no stub of its own gets the stand-in: it
-# appends its arguments as one line to `calls` in that folder, says so on
-# stderr and fails with the code tests/testing/no_live_gcloud.py uses. A record
-# that is not empty fails the file, also when its tests passed, because a test
-# that tolerates the failure here runs the real gcloud, with the developer's
-# login, on a machine that has one. The file's block shows the count and the
-# first calls only: an argument can hold a project id or an account name. The
-# two files and the folder are removed after the file's run, on a failure too.
-# Not seen: a test that builds a PATH of its own without this folder, one that
-# names gcloud by an absolute path, and a `python3 -m unittest` run outside make.
+# appends its arguments as a line to `calls` in that folder, says so on stderr
+# and fails with the code tests/testing/no_live_gcloud.py uses. A record that
+# is not empty fails the file, also when its tests passed: a test that
+# tolerates the failure here is a test that, run outside this sweep on a
+# machine with gcloud, runs the real one with the developer's login. The
+# file's block shows the count and the first calls only: an argument can hold
+# a project id or an account name. An argument with a newline takes more than
+# one line, and the count is then high by those lines. The two files and the
+# folder are removed after the file's run, on a failure too, by the worker
+# that made the folder and by no other.
+# Not seen: a test that builds a PATH of its own without this folder; one that
+# names gcloud by an absolute path, or through a link to the stand-in, which
+# then writes its record beside the link; and a run outside this sweep, which
+# is `test-python` and `coverage` only.
 # A test's own gcloud ahead on PATH, or a mock, never reaches the stand-in.
 #
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
@@ -439,7 +444,8 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
 # arrive silently truncated at the comma. Both callers avoid each.
 
-# How many recorded gcloud calls a file's block shows.
+# How many recorded gcloud calls a file's block shows: REPORTED_CALLS of
+# tests/testing/no_live_gcloud.py, on purpose the same number.
 PYTHON_TEST_GCLOUD_SHOWN := 5
 # The stand-in's exit code: STAND_IN_EXIT_CODE of tests/testing/no_live_gcloud.py.
 PYTHON_TEST_GCLOUD_EXIT := 97
@@ -466,9 +472,10 @@ xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	dir="$$(dirname "$$file")"; \
 	name="$$(basename "$$file")"; \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
+	made=0; mkdir "$$stem.gcloud" 2>/dev/null && made=1; \
 	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
+	     [ "$$made" = "1" ] || { echo "could not make the stand-in gcloud folder for $$file"; exit 1; }; \
 	     : >"$$stem.kubeconfig" && export KUBECONFIG="$$stem.kubeconfig" && \
-	     mkdir "$$stem.gcloud" && \
 	     printf "$(PYTHON_TEST_GCLOUD_STAND_IN)" >"$$stem.gcloud/gcloud" && \
 	     chmod +x "$$stem.gcloud/gcloud" && export PATH="$$stem.gcloud:$$PATH" && \
 	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
@@ -476,13 +483,15 @@ xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	else \
 		rc=1; \
 	fi; \
-	if [ -s "$$stem.gcloud/calls" ]; then \
-		rc=1; \
-		{ echo "$(PYTHON_TEST_GCLOUD_HEADER): $$(wc -l <"$$stem.gcloud/calls" | tr -d " ") call(s). The first $(PYTHON_TEST_GCLOUD_SHOWN) at most:"; \
-		  head -n $(PYTHON_TEST_GCLOUD_SHOWN) "$$stem.gcloud/calls" | sed "s/^/  gcloud /"; } >>"$$stem.log"; \
+	if [ "$$made" = "1" ]; then \
+		if [ -s "$$stem.gcloud/calls" ]; then \
+			rc=1; \
+			{ echo "$(PYTHON_TEST_GCLOUD_HEADER): $$(wc -l <"$$stem.gcloud/calls" | tr -d " ") call(s). The first $(PYTHON_TEST_GCLOUD_SHOWN) at most:"; \
+			  head -n $(PYTHON_TEST_GCLOUD_SHOWN) "$$stem.gcloud/calls" | sed "s/^/  gcloud /"; } >>"$$stem.log"; \
+		fi; \
+		rm -f "$$stem.gcloud/gcloud" "$$stem.gcloud/calls"; \
+		rmdir "$$stem.gcloud" 2>/dev/null; \
 	fi; \
-	rm -f "$$stem.gcloud/gcloud" "$$stem.gcloud/calls"; \
-	rmdir "$$stem.gcloud" 2>/dev/null; \
 	if [ "$$rc" = "0" ]; then printf "    ok  %s\n" "$$file"; else printf "  FAIL  %s\n" "$$file"; fi; \
 	echo "$$rc" >"$$stem.rc" \
 ' _ {} <"$$work/shard.list"; \
