@@ -16,7 +16,7 @@ accept constructs
 (anchors, merge keys, tags) whose meaning this editor cannot hold constant.
 
 What the target document may contain: block mappings and block sequences of
-plain, single- or double-quoted single-line scalars. Flow collections and
+plain, single- or double-quoted single-line scalars. Single-line flow collections and
 block scalars (`|`, `>`) are skipped as opaque values when they are not on the
 edited path, and refused when they are. Anywhere in the target document it
 refuses anchors, aliases, tags, merge keys, complex keys, duplicate keys and
@@ -113,7 +113,7 @@ _BLOCK_HEADER = re.compile(r"^[|>](?:[1-9][+-]?|[+-][1-9]?)?(?: +#.*)? *$")
 _PLAIN_KEY_COLON = re.compile(r":(?= |$)")
 # The body of a double-quoted scalar whose every backslash starts an escape
 # YAML (and PyYAML, and go-yaml) accepts.
-_VALID_ESCAPES = re.compile(r'(?:[^\\"]|\\(?:[0abtnvfre "/\\N_LP]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*')
+_VALID_ESCAPES = re.compile(r'(?:[^\\"]|\\(?:[0abtnvfre "/\\N_LP]|x[0-9A-Fa-f]{2}|u(?:[0-9A-CEFa-cef][0-9A-Fa-f]{3}|[Dd][0-7][0-9A-Fa-f]{2})|U00(?:0(?:[0-9A-CEFa-cef][0-9A-Fa-f]{3}|[Dd][0-7][0-9A-Fa-f]{2})|(?:0[1-9A-Fa-f]|10)[0-9A-Fa-f]{4})))*')
 _INDICATORS = set("-?:,[]{}#&*!|>'\"%@`")
 # Scalars YAML 1.1 (PyYAML, and the go-yaml v2 that Kubernetes tooling still
 # embeds) resolves to something other than a string: null, bool, int (including
@@ -446,11 +446,10 @@ def _flow_tokens(lines: list[str], lineno: int, col: int, end: int):
         if pos >= len(text):
             if depth == 0:
                 break
-            line_no += 1
-            if line_no >= end:
-                raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: unclosed flow collection")
-            text, pos = lines[line_no], 0
-            continue
+            # A flow collection that wraps onto another line is refused, not
+            # parsed: line breaks inside flow carry simple-key rules this
+            # editor does not model.
+            raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: flow collection spans lines")
         ch = text[pos]
         if ch == " ":
             pos += 1
@@ -488,6 +487,8 @@ def _flow_tokens(lines: list[str], lineno: int, col: int, end: int):
             after = text[stop : stop + 2]
             if after[:1] not in ("", " ", ",", "]", "}") and after not in (":", ": "):
                 raise RefusedEdit("unsupported-syntax", f"line {line_no + 1}: text after quoted scalar")
+            if stop - pos > MAX_KEY_CHARS:
+                raise RefusedEdit("unsupported-syntax", f"line {line_no + 1}: flow scalar longer than {MAX_KEY_CHARS}")
             tokens.append(("scalar", line_no, _unquote(text[pos:stop], line_no)))
             pos = stop
         elif ch in _INDICATORS and not (ch == "-" and nxt not in ("", " ")):
@@ -511,6 +512,8 @@ def _flow_tokens(lines: list[str], lineno: int, col: int, end: int):
             plain = text[start:pos].rstrip(" ")
             if plain in ("=", "<<"):
                 raise RefusedEdit("unsupported-syntax", f"line {line_no + 1}: plain {plain!r} has no string reading")
+            if len(plain) > MAX_KEY_CHARS:
+                raise RefusedEdit("unsupported-syntax", f"line {line_no + 1}: flow scalar longer than {MAX_KEY_CHARS}")
             tokens.append(("scalar", line_no, plain))
     return tokens, line_no
 

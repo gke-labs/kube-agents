@@ -87,9 +87,7 @@ spec:
           - -c
         livenessProbe:
           exec:
-            command: [
-              "true",
-            ]
+            command: ["true"]
 """
 
 MULTI = """\
@@ -349,6 +347,11 @@ class Refusals(unittest.TestCase):
         ("bad indentation", "a:\n    b: 1\n  c: 2\n", 0, ["a", "b"], 2, "unsupported-syntax"),
         ("colon in plain value", "a: b: c\n", 0, ["a"], 2, "unsupported-syntax"),
         ("unclosed flow", "a: [1,\nb: 2\n", 0, ["b"], 2, "unsupported-syntax"),
+        ("flow spans lines", "a: {\n  k\n  : v\n}\nb: 1\n", 0, ["b"], 2, "unsupported-syntax"),
+        ("long flow key", "a: {" + "k" * 1025 + ": 1}\nb: 1\n", 0, ["b"], 2, "unsupported-syntax"),
+        ("long quoted flow key", 'a: {"' + "k" * 1025 + '": 1}\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
+        ("escape above U+10FFFF", 'a: "\\U00110000"\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
+        ("surrogate escape", 'a: "\\ud800"\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
         ("api version", PDB, 0, ["apiVersion"], "v2", "protected-path"),
         ("kind", PDB, 0, ["kind"], "Pod", "protected-path"),
         ("name", PDB, 0, ["metadata", "name"], "x", "protected-path"),
@@ -412,7 +415,7 @@ class Refusals(unittest.TestCase):
         self.assertEqual(set_scalar(text, 0, ["b"], 2), text.replace("b: 1", "b: 2"))
 
     def test_valid_escapes_are_accepted(self):
-        text = 'a: "tab\\t nl\\n \\x41 \\u00e9 \\\\ \\" \\/"\nb: 1\n'
+        text = 'a: "tab\\t nl\\n \\x41 \\u00e9 \\U0010FFFF \\uFFFD \\\\ \\" \\/"\nb: 1\n'
         yaml.safe_load(text)
         self.assertEqual(set_scalar(text, 0, ["b"], 2), text.replace("b: 1", "b: 2"))
 
