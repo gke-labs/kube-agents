@@ -428,28 +428,52 @@ func TestAgentScheduleWithNoPlatformAgentFiresNothing(t *testing.T) {
 	}
 }
 
-// A schedule is builtin only when the install's PlatformAgent controls it:
-// the origin label, which its creator sets, unlocks nothing. Anything else is
-// a user schedule, and user schedules are deferred to Track 7 (#5624, decided
-// B on #5635): it reads Accepted=False and never submits.
-func TestAgentScheduleOriginComesFromTheControllerNotTheLabel(t *testing.T) {
-	f := newScheduleFixture(t, nil)
-	f.at(t, hourAt(0, 45))
-	f.at(t, hourAt(1, 0))
-	if len(f.gw.origins) != 1 || f.gw.origins[0] != agentv1alpha1.AgentScheduleOriginBuiltin {
-		t.Fatalf("controlled by the install: origins = %v, want [builtin]", f.gw.origins)
-	}
-
-	f = newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.OwnerReferences = nil })
-	f.at(t, hourAt(0, 45))
-	f.at(t, hourAt(1, 0))
-	if len(f.gw.origins) != 0 {
-		t.Fatalf("labelled builtin, not controlled: submitted %v; a user schedule must not fire yet", f.gw.origins)
-	}
-	got := f.get(t)
-	cond := meta.FindStatusCondition(got.Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != agentScheduleReasonUserDeferred {
-		t.Fatalf("Accepted = %+v, want False/%s", cond, agentScheduleReasonUserDeferred)
+// A schedule is builtin only when the install's PlatformAgent controls it
+// and its origin label reads builtin: a broker kept to origin: user by the
+// admission policy can add the controller reference but not the label, and a
+// hand-written schedule can set the label but has no controller reference.
+// Anything else is a user schedule, and user schedules are deferred to Track 7
+// (#5624, decided B on #5635): it reads Accepted=False and never submits.
+func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		controlled bool
+		label      string
+		builtin    bool
+	}{
+		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, false},
+		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, false},
+		{"controlled, unlabelled", true, "", false},
+		{"controlled by the install, labelled builtin", true, agentv1alpha1.AgentScheduleOriginBuiltin, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+				if tc.label == "" {
+					delete(s.Labels, agentv1alpha1.AgentScheduleOriginLabel)
+				} else {
+					s.Labels[agentv1alpha1.AgentScheduleOriginLabel] = tc.label
+				}
+				if !tc.controlled {
+					s.OwnerReferences = nil
+				}
+			})
+			f.at(t, hourAt(0, 45))
+			f.at(t, hourAt(1, 0))
+			if tc.builtin {
+				if len(f.gw.origins) != 1 || f.gw.origins[0] != agentv1alpha1.AgentScheduleOriginBuiltin {
+					t.Fatalf("origins = %v, want [builtin]", f.gw.origins)
+				}
+				return
+			}
+			if len(f.gw.origins) != 0 {
+				t.Fatalf("submitted %v; a user schedule must not fire yet", f.gw.origins)
+			}
+			got := f.get(t)
+			cond := meta.FindStatusCondition(got.Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != agentScheduleReasonUserDeferred {
+				t.Fatalf("Accepted = %+v, want False/%s", cond, agentScheduleReasonUserDeferred)
+			}
+		})
 	}
 }
 

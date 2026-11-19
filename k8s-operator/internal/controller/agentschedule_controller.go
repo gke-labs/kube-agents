@@ -215,13 +215,17 @@ func AgentScheduleTriggerName(sched *agentv1alpha1.AgentSchedule) string {
 }
 
 // agentScheduleOrigin is builtin only for a schedule the operator rendered:
-// one whose controller is the install's PlatformAgent. The origin label is
-// informational and never trusted, since whoever creates a schedule sets its
-// labels, and a builtin origin unlocks a built-in audit's report stream
-// (design section 1). The gateway checks the stream against the trigger
-// again, and the set of built-in names arrives with the schedules themselves.
+// its controller is the install's PlatformAgent and its origin label reads
+// builtin. Neither alone is enough. Whoever creates a schedule sets both its
+// labels and its owner references, but the admission policy keeps the broker
+// to origin: user (design section 6), so the label is the half a compromised
+// broker can't forge, and the controller reference is the half a person
+// writing a schedule by hand won't have. A builtin origin unlocks a built-in
+// audit's report stream (design section 1); the gateway checks the stream
+// against the trigger again.
 func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha1.PlatformAgent) string {
-	if agent != nil && metav1.IsControlledBy(sched, agent) {
+	if agent != nil && metav1.IsControlledBy(sched, agent) &&
+		sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin {
 		return agentv1alpha1.AgentScheduleOriginBuiltin
 	}
 	return agentv1alpha1.AgentScheduleOriginUser
