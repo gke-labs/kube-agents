@@ -204,6 +204,51 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(proxy_port, "GET", "/healthz"))
         self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(health_port, "GET", "/healthz"))
 
+    def test_handoff_draining_and_drained_refusals_set_expected_retry_after_headers(self) -> None:
+        self.assertEqual(10.0, credential_proxy.HANDOFF_DRAIN_SECONDS)
+        fake_relay = _FakeRelay(unsettled=1)
+        lifecycle = BrokerLifecycle(
+            enabled=True,
+            control_file=self.token_path,
+            relays=[fake_relay],
+            settle_seconds=0.5,
+            drain_seconds=1.0,
+            end_wait_seconds=0.1,
+        )
+        lifecycle.set_warm()
+        lifecycle.activate()
+        CredentialProxyHandler.lifecycle = lifecycle
+        CredentialProxyHandler.draining.set()
+
+        seen_headers = []
+
+        class _FakeBusyHandler(CredentialProxyHandler):
+            def __init__(self) -> None:
+                self.metrics = ProxyMetrics()
+
+            def _json(self, status, payload, headers=None):
+                seen_headers.append((lifecycle.state, status, payload.get("bound"), headers))
+
+        handler = _FakeBusyHandler()
+        lifecycle.drain()
+        self.assertEqual(BROKER_STATE_DRAINING, lifecycle.state)
+        handler._busy(credential_proxy.CommandSlotUnavailable("draining", bound=credential_proxy.ADMISSION_BOUND_DRAINING), before_admission=True)
+
+        fake_relay.settle_all()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_DRAINED:
+            time.sleep(0.02)
+        self.assertEqual(BROKER_STATE_DRAINED, lifecycle.state)
+        handler._busy(credential_proxy.CommandSlotUnavailable("draining", bound=credential_proxy.ADMISSION_BOUND_DRAINING), before_admission=True)
+
+        self.assertEqual(
+            [
+                (BROKER_STATE_DRAINING, HTTPStatus.SERVICE_UNAVAILABLE, "draining", {"Retry-After": str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)}),
+                (BROKER_STATE_DRAINED, HTTPStatus.SERVICE_UNAVAILABLE, "draining", {"Retry-After": str(credential_proxy.HANDOFF_DRAINED_RETRY_AFTER_SECONDS)}),
+            ],
+            seen_headers,
+        )
+
     def test_drain_waits_for_in_flight_and_unsettled_chat_before_marking_drained(self) -> None:
         fake_relay = _FakeRelay(unsettled=2)
         lifecycle = BrokerLifecycle(

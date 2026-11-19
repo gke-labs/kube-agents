@@ -1629,7 +1629,7 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 	}
 	from := tier - 1
 	rollbackTier := tier - 1
-	if isStepDown {
+	if hasActiveDiff {
 		from = activeTier
 		rollbackTier = activeTier
 	}
@@ -1861,7 +1861,7 @@ func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent 
 		return nil, 0
 	}
 	rollbackTier := tier - 1
-	if isStepDown {
+	if hasActiveDiff {
 		rollbackTier = activeTier
 	}
 	wantRes := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)
@@ -2062,7 +2062,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			nextSizing.LastObservedWorkload = prevStatus.LastObservedWorkload
 		}
 		if previous := agent.Status.EffectiveSizingTier; previous != "" && previous != tier.String() {
-			t := metav1.NewTime(now)
+			t := metav1.NewTime(now.Truncate(time.Second))
 			nextSizing.LastTransitionTime = &t
 		}
 		r.sizingNextRequeue.Delete(client.ObjectKeyFromObject(agent))
@@ -2083,7 +2083,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			nextSizing.DesiredTier = desired.String()
 			nextSizing.ScaleUpSustainedSince = nil
 			nextSizing.ScaleDownSustainedSince = nil
-			t := metav1.NewTime(now)
+			t := metav1.NewTime(now.Truncate(time.Second))
 			nextSizing.LastTransitionTime = &t
 			if nextSizing.Trigger == "" {
 				nextSizing.Trigger = sizingTriggerClusterCount
@@ -2091,9 +2091,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			r.sizingNextRequeue.Delete(client.ObjectKeyFromObject(agent))
 		} else {
 			var surgeWait time.Duration
-			if _, heldBack := r.sizingStepBackHeld(agent); !heldBack {
-				stalled, surgeWait = r.sizingSurgeStalled(ctx, agent, tier, now)
-			}
+			stalled, surgeWait = r.sizingSurgeStalled(ctx, agent, tier, now)
 			if stalled != nil {
 				from := tier
 				tier = stalled.rollbackTier
@@ -2108,7 +2106,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 				nextSizing.DesiredTier = desired.String()
 				nextSizing.ScaleUpSustainedSince = nil
 				nextSizing.ScaleDownSustainedSince = nil
-				t := metav1.NewTime(now)
+				t := metav1.NewTime(now.Truncate(time.Second))
 				nextSizing.LastTransitionTime = &t
 				if nextSizing.Trigger == "" {
 					nextSizing.Trigger = sizingTriggerUtilization
@@ -2290,7 +2288,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					nextSizing.ActiveTier = tier.String()
 					nextSizing.ScaleUpSustainedSince = nil
 					nextSizing.ScaleDownSustainedSince = nil
-					t := metav1.NewTime(now)
+					t := metav1.NewTime(now.Truncate(time.Second))
 					nextSizing.LastTransitionTime = &t
 				}
 			}

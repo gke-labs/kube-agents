@@ -10229,7 +10229,9 @@ class GracefulDrainTest(unittest.TestCase):
         handler._authenticated = lambda: object()
         handler._counted_in_flight = False
         captured = {}
-        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+        handler._json = lambda status, payload, headers=None: captured.update(
+            status=status, payload=payload, headers=headers
+        )
         return handler, captured
 
     def test_a_new_request_is_refused_with_the_draining_bound(self):
@@ -10248,6 +10250,10 @@ class GracefulDrainTest(unittest.TestCase):
                 with mock.patch.object(credential_proxy, "drain_request_body") as drained:
                     getattr(handler, f"do_{method}")()
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+                self.assertEqual(
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)},
+                    captured["headers"],
+                )
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
                      "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
@@ -21933,7 +21939,13 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.metrics = credential_proxy.ProxyMetrics()
         handler.replies = []
-        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        handler.reply_headers = []
+
+        def _capture_json(status, payload, headers=None):
+            handler.replies.append((status, payload))
+            handler.reply_headers.append(headers)
+
+        handler._json = _capture_json
         handler._busy(credential_proxy.CommandSlotUnavailable("held", bound=bound))
         return handler
 
@@ -21952,6 +21964,12 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
                        credential_proxy_client.BUSY_BOUND_KEY: bound, "error": "held"})],
                     handler.replies,
                 )
+                expected_headers = (
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)}
+                    if bound == credential_proxy_client.ADMISSION_BOUND_DRAINING
+                    else None
+                )
+                self.assertEqual([expected_headers], handler.reply_headers)
                 self.assertIn(
                     f'{credential_proxy.ADMISSION_REFUSALS_METRIC}{{bound="{bound}",class="interactive"}} 1',
                     handler.metrics.render(),

@@ -1201,6 +1201,104 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		}
 	})
 
+	t.Run("small to fleet two-tier stall or quota refusal rolls directly back to active small tier", func(t *testing.T) {
+		t.Parallel()
+		now := time.Date(2026, 11, 18, 19, 15, 0, 750_000_000, time.UTC)
+		since := metav1.NewTime(now.Truncate(time.Second))
+		// Step 1: confirm sub-second transition timestamps truncate to whole seconds so a pod created
+		// at the same second matches minCreatedAt rather than failing Before(minCreatedAt).
+		setupAgent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](3), nil)
+		setupCl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(setupAgent).WithStatusSubresource(setupAgent).Build()
+		rTime := &PlatformAgentReconciler{
+			Client: setupCl, APIReader: setupCl, Scheme: setupScheme(),
+			nowFn: func() time.Time { return now },
+		}
+		setupAgent.Status.EffectiveSizingTier = sizingProfileSmall
+		setupAgent.Status.Usage.ClustersRegistered = ptr.To[int64](25)
+		if err := rTime.resolveSizingTier(context.Background(), setupAgent); err != nil {
+			t.Fatal(err)
+		}
+		if setupAgent.Status.Sizing == nil || setupAgent.Status.Sizing.LastTransitionTime == nil {
+			t.Fatalf("expected LastTransitionTime to be recorded")
+		}
+		if !setupAgent.Status.Sizing.LastTransitionTime.Time.Equal(since.Time) {
+			t.Fatalf("LastTransitionTime = %v, want second-truncated %v", setupAgent.Status.Sizing.LastTransitionTime.Time, since.Time)
+		}
+
+		// Step 2: two-tier jump small -> fleet stalls with pending fleet surge pod + active small pod ->
+		// rolls straight back to small (not untested medium), even while a prior step-back hold is active.
+		later := since.Add(sizingSurgePendingTimeout + time.Second)
+		agentStall := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		agentStall.Status.Sizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:         sizingProfileFleet,
+			DesiredTier:        sizingProfileFleet,
+			Trigger:            sizingTriggerClusterCount,
+			LastTransitionTime: &since,
+		}
+		activeSmallPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: credentialProxyName(agentStall) + "-small-active", Namespace: agentStall.Namespace,
+				Labels: credentialProxySelector(agentStall), CreationTimestamp: metav1.NewTime(since.Add(-time.Hour)),
+			},
+			Spec:   *buildCredentialProxyDeployment(sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil), "small").Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		pendingFleetPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: credentialProxyName(agentStall) + "-fleet-surge", Namespace: agentStall.Namespace,
+				Labels: credentialProxySelector(agentStall), CreationTimestamp: since,
+			},
+			Spec: *buildCredentialProxyDeployment(agentStall, "fleet").Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{{
+					Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
+					Reason: string(corev1.PodReasonUnschedulable), Message: "0/3 nodes are available: Insufficient cpu",
+					LastTransitionTime: since,
+				}},
+			},
+		}
+		scheme := setupScheme()
+		clStall := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agentStall, activeSmallPod, pendingFleetPod).WithStatusSubresource(agentStall).Build()
+		rStall := &PlatformAgentReconciler{
+			Client: clStall, APIReader: clStall, Scheme: scheme,
+			Recorder: record.NewFakeRecorder(8),
+			nowFn:    func() time.Time { return later },
+		}
+		// Seed a prior stepBackHold to confirm SurgeUnschedulable is never blinded for 10m on new surge pods.
+		rStall.steppedBackAt.Store(client.ObjectKeyFromObject(agentStall), later.Add(-time.Minute))
+		if err := rStall.resolveSizingTier(context.Background(), agentStall); err != nil {
+			t.Fatal(err)
+		}
+		if agentStall.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("small->fleet surge stall tier = %q, want direct rollback to active small", agentStall.Status.EffectiveSizingTier)
+		}
+
+		// Step 3: two-tier small -> fleet quota refusal also rolls back to active small.
+		agentRefused := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		fleetWorkloads := sizedWorkloadsAt(agentRefused, sizingTierFleet)
+		fleetProxyDep := fleetWorkloads[0].(*appsv1.Deployment)
+		fleetProxyDep.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type: appsv1.DeploymentReplicaFailure, Status: corev1.ConditionTrue, Reason: "FailedCreate",
+			Message: `pods "` + credentialProxyName(agentRefused) + `-flt-" is forbidden: exceeded quota: cpu-cap, requested: requests.cpu=4, used: requests.cpu=4, limited: requests.cpu=6`,
+		}}
+		objsRefused := append([]client.Object{agentRefused, activeSmallPod.DeepCopy()}, fleetWorkloads...)
+		clRefused := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objsRefused...).WithStatusSubresource(agentRefused).Build()
+		rRefused := &PlatformAgentReconciler{
+			Client: clRefused, APIReader: clRefused, Scheme: scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			autopilot:         false,
+			autopilotResolved: true,
+			nowFn:             func() time.Time { return later },
+		}
+		if err := rRefused.resolveSizingTier(context.Background(), agentRefused); err != nil {
+			t.Fatal(err)
+		}
+		if agentRefused.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("small->fleet quota refusal tier = %q, want direct rollback to active small", agentRefused.Status.EffectiveSizingTier)
+		}
+	})
+
 	t.Run("mid-rollout active old-tier broker pod pauses utilization soak to prevent false escalation", func(t *testing.T) {
 		t.Parallel()
 		now := time.Date(2026, 11, 18, 19, 20, 0, 0, time.UTC)

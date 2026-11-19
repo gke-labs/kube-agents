@@ -237,10 +237,9 @@ caveat beside it:
   ([The data volume](#the-data-volume)), which raises the agent's claim alone.
 - `platformAgent.harness.tuning.maxInProgress: 3`: kanban workers at once, board-wide.
 - `platformAgent.deployment.credentialProxy.resources`: 4 vCPU and 8 GiB requests, 8 vCPU and
-  8 GiB limits. The broker admits at most eight commands at once, a cap the operator fixes, and
-  the 2 GiB default already covers the eight at 176 MiB a slot. The raise is headroom for a
-  child that outgrows its reserve on a large cluster, close to 1 GiB a slot (modeled), and it
-  admits nothing more in parallel.
+  8 GiB limits. Because `values-fleet.yaml` leaves `sizingProfile` unset (`small`), the broker keeps
+  its eight-slot default cap while `2 GiB -> 8 GiB` gives each command about `1 GiB` of headroom
+  (modeled); set `sizingProfile` to `medium` (12) or `fleet` (16) to raise the slot cap.
 - `platformAgent.deployment.agentAPIAuth.resources`: 0.5 vCPU and 2 GiB requests, a 4 GiB
   memory limit, `limits.cpu` left at its default because the watcher's `GOMAXPROCS` follows it.
 - `platformAgent.deployment.env`: `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, which keeps the fleet

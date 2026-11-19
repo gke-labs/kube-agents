@@ -783,27 +783,21 @@ The arithmetic behind `6`:
   request (above).
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
   request only when its children fit the proxy's memory limit: 176 MiB per request after a 192 MiB
-  reserve for the broker and Envoy. At its default 2Gi limit that is 10 at once
-  (`credentialProxyAdmittedRequests` in
-  `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
-  the old 1Gi it was 4.
+  reserve for the broker and Envoy. At `small` (default `2Gi` limit), that fits 10 at once, held to
+  8 by `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (`12` on `medium`, `16` on `fleet`).
 
-  The 8 slots are shared. The stall watch runs four commands at a time for the whole of its tick,
-  the listing and then the cluster reads, up to 25 minutes of every 30; the cluster-agent
-  reconcile lists four projects at a time. With neither running, all 8 are free for the six
-  workers; while one runs, 4 are; while both run at once, none, and a worker command waits up to
-  60 s for a slot and is then refused busy.
+  The proxy slots are shared. The stall watch runs four commands at a time for most of its tick,
+  and cluster-agent reconcile lists four projects at a time. When both run under the 8-slot `small`
+  default, worker commands wait up to 60 s for a slot and are then refused busy.
 
 - **Model quota.** Per-install model rate limits are not measured. A small quota may see 429s at 6;
   if worker logs show them, lower `maxInProgress`.
 
 If you raise `maxInProgress`, check your model quota, and know where the credential proxy stops it.
-The proxy's default 2Gi already admits more than its slot cap of 8, so up to about eight workers'
-worth of commands fit, fewer while the stall watch's tick or a listing runs. Past that the slot cap binds, and the operator
-owns it. No CR field moves it, so raising the proxy's memory in
-`spec.deployment.credentialProxy.resources` does not help, and a command beyond eight waits up to
-60 s for a slot and is then refused busy. Keep that limit at 2Gi or more, because below it the
-memory budget binds first.
+At `small` (2Gi default), the memory budget admits 10 while the slot cap binds at 8 (`12` on
+`medium` with 4Gi, `16` on `fleet` with 8Gi). Raising `spec.deployment.credentialProxy.resources`
+alone does not raise the slot cap; set `spec.deployment.sizingProfile` to scale slots too. Keep
+the memory limit at 2Gi or more, because below it the memory budget binds first.
 
 The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
 waiting on work it fanned out is discounted, or it would hold the slot its own children need
@@ -1055,7 +1049,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   | Tier     | Credential proxy                                                                                                   | `agent-api-auth`   | Shell            |
   | -------- | ------------------------------------------------------------------------------------------------------------------ | ------------------ | ---------------- |
-  | `small`  | the defaults above (`CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS=8`)                                                 | the defaults above | the defaults     |
+  | `small`  | the defaults above (8 slots)                                                                                       | the defaults above | the defaults     |
   | `medium` | 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE Autopilot), 2 CPU and 4Gi limits, 8Gi ephemeral-storage, 12 slots     | 4Gi memory limit   | the defaults     |
   | `fleet`  | 4 CPU and 8Gi requests, 8 CPU and 8Gi limits, 8Gi ephemeral-storage, 16 slots                                      | 8Gi memory limit   | 4Gi memory limit |
 
@@ -1069,7 +1063,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   A workload that is not there has not settled either. The quota charges nothing of it while the step is measured from its row, and a `Pod`-type LimitRange item is read against its template. So the pass that creates it is the one that lifts the hold.
 
-  On GKE Autopilot without Pod bursting admission sets every limit equal to its request. The operator reads that clamp from Autopilot's own record, the `autopilot.gke.io/resource-adjustment` annotation on the running templates. A limit the record shows lowered to its request is read through the requests side when the settled check compares a template with the tier's figures and when utilization denominators are evaluated. When any record shows the cluster clamps, every `limits.*` key of a step is compared with the requests' movement, the figure admission charges there, rather than with the rows' limits. With no such record (GKE Standard, Autopilot with bursting) limits are compared and counted as written.
+  On GKE Autopilot without Pod bursting admission sets every limit equal to its request. The operator reads that clamp from `autopilot.gke.io/resource-adjustment` on the running templates. A clamped limit is read through the requests side for settled checks and utilization denominators. When clamped, every `limits.*` key of a step (including replacement surge room on `credential-proxy`) uses the requests movement instead of the row limits. On GKE Standard or bursting Autopilot, limits are compared and counted as written.
 
   Any refused step sets the `SizingCappedByQuota` condition ([`status`](#status) below) naming the quota and the key, rather than leaving an unschedulable rollout stuck. The message names the tier earned, the running tier the refused step was measured from, and the tier that stays. A count or load that earns `fleet` with room for the `medium` step therefore reads as the step up from `small` until the `medium` pods settle. The step from `medium` is then measured, the message changes once, and the Warning event carries that step's figures.
 
@@ -1081,17 +1075,17 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   `credential-proxy` uses `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated active-standby handoff. The surge pod warms in standby (`/healthz` returning `503` while the old pod stays active) until the operator drains the old pod, transfers the `<agent>-credential-proxy` Lease, and activates the new pod. Across drain, the old pod keeps `/healthz` at `200` so Service Endpoints remain non-empty while refusing new commands with retryable `503 draining`; Kubernetes terminates it once the replacement passes readiness.
 
-  If node capacity cannot schedule that surge pod and it remains `Pending` past `2m`, `auto` rolls back one tier, keeps the running active pod untouched, and sets `SizingCappedByQuota` with reason `SurgeUnschedulable`. Similarly, if the proxy or gateway Deployment carries `ReplicaFailure` with `exceeded quota`, the next pass steps back one tier and sets `SizingCappedByQuota` naming the quota.
+  If node capacity cannot schedule that surge pod and it remains `Pending` past `2m`, `auto` rolls back to the active running tier, keeps the running active pod untouched, and sets `SizingCappedByQuota` with reason `SurgeUnschedulable`. Similarly, if the proxy or gateway Deployment carries `ReplicaFailure` with `exceeded quota` on a step up or step down, the next pass reverts to the active tier (or `tier - 1` when no running tier differs) and sets `SizingCappedByQuota` naming the quota.
 
-  The quota refusal is read when a key it names is one the step up raised on that pod (or `pods`/`count/pods` on a `credential-proxy` surge) and is under the row above's. A key no row moves, or the old ReplicaSet's refusal lingering after a step back, is left to the settled hold instead.
+  The quota refusal is read when a key it names is one the step moved on that pod (or `pods`/`count/pods` on a `credential-proxy` surge) and is not a stale leftover from an earlier row. A key no row moves, or an old ReplicaSet refusal lingering after a rollback, is left to the settled hold instead.
 
-  The lower row is rendered, and once its pods settle the step up is measured again, after a hold of ten minutes from the step back; a pod refused at the lower row too is stepped back from in turn. The shell StatefulSet carries no such condition, so its refused pod shows as the settled hold in the operator log.
+  The lower row is rendered, and once its pods settle the step up waits ten minutes from the step back (though `SurgeUnschedulable` still monitors new surge pods after `2m`). A pod refused at a lower row steps back in turn, while the shell StatefulSet shows its refused pod as a settled hold in the operator log.
 
   The check also reads the namespace's LimitRanges, before the quotas, as admission does. Each `Container`-type item's `max`, `min` and `maxLimitRequestRatio` are compared with the three sized containers' requests and limits at the candidate row. Each `Pod`-type item's are compared with the sums of the pods those containers run in, read off the running templates with the sized container's figures swapped for the candidate row's. The limits are read through the Autopilot clamp where the running templates show one. A row that crosses a bound is refused and the condition names the LimitRange, the item's scope, the bound, the resource and the container, with reason `LimitRangeShort` and the figures in a `SizingCappedByLimitRange` Warning event.
 
   Neither preflight check reads node capacity. On GKE Standard the `medium` and `fleet` rows' broker requests (1 and 4 CPU) have to fit on one node before a surge or new broker pod can start. A Standard pool therefore needs nodes that fit the `fleet` row's 4 CPU request (`e2-standard-8` or larger) before load or cluster count reaches `fleet` under `auto` ([the sizing guide](/kube-agents/deploy/fleet-sizing/#option-b-gke-standard)).
 
-  Any tier change rolls `credential-proxy` via active-standby handoff without dropping traffic, and restarts `<name>-gateway` via `agent-api-auth` (`2Gi`/`4Gi`/`8Gi` unless overridden). Only `fleet` transitions restart `<name>-shell` (`2Gi -> 4Gi`). The usage poller runs 30 seconds after election and every five minutes, while `auto` utilization polling runs every 100 seconds.
+  Any tier change rolls `credential-proxy` via active-standby handoff without dropping Service endpoints (in-flight commands drain up to 10s while CLI/VCS callers and MCP relays retry pre-admission `503 draining` with `Retry-After`) and restarts `<name>-gateway` via `agent-api-auth` (`2Gi`/`4Gi`/`8Gi` unless overridden). Only `fleet` transitions restart `<name>-shell` (`2Gi -> 4Gi`), and fixed-`2Gi` `credential-proxy-exec` pods stay at 8 slots unchanged. The usage poller runs 30 seconds after election and every five minutes, while `auto` utilization polling runs every 100 seconds.
 
   Admission and the reconciler validate an override against the row the CR renders: the explicit profile's, or under `auto` the tier `status.effectiveSizingTier` holds, `small` before the first pass writes one. A CR run at an explicit `fleet` with an override the fleet row admits, a 3 CPU request on the proxy, say, keeps it when switched to `auto` while load or count supports `fleet`. A higher row never refuses an override a lower one admitted; a step back to a lower row that refuses one renders that row and reports `Degraded` until the override is corrected, as an override that was never valid does.
 

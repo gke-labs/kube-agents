@@ -115,7 +115,7 @@ _SURGE_FIRST_BY_DESIGN = {
     "platformagent-credential-proxy": (
         "active-standby RollingUpdate (maxSurge: 1, maxUnavailable: 0) warms a "
         "standby replacement pod on :8766 before the operator drains the active "
-        "broker and flips the lease, avoiding broker and relay downtime (#proactive-sizing)"
+        "broker and flips the lease, avoiding broker and relay downtime"
     ),
 }
 

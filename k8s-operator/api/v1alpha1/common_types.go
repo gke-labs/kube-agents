@@ -994,23 +994,25 @@ type TuningSpec struct {
 	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
 	// coordinator waiting on its own children gives its slot back but stays resident, so
 	// processes can sit above six. The credential proxy at its default 2Gi memory limit
-	// admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
-	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
-	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
+	// admits 10 brokered commands at once, held to 8 by its small/default slot cap, which
+	// the stall watch's and cluster-agent reconcile's four-wide listings share. Per-install
+	// model rate limits are not measured: a small quota may see 429s at 6, so lower this if
 	// worker logs show them.
 	//
 	// Set it higher once a deployment has measured its own worker footprint and model
-	// quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
-	// already admits more than its slot cap of 8, so up to about eight workers' worth of
-	// commands fit at the defaults, fewer while the listings above run. Past that the
-	// slot cap binds, and no CR field moves it, so raising the memory limit in
-	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
-	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-	// more, since below it the memory budget (176 MiB per command after the 192 MiB
-	// resident reserve) binds first. Set it to 1 to serialise all delegated work. When
-	// quota rather than memory binds, note the related failure mode: workers that exhaust their retry
-	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
-	// as a "protocol violation" rather than as the quota exhaustion it actually is.
+	// quota. The credential proxy sets the ceiling on brokered commands: its small/default
+	// 2Gi already admits more than its slot cap of 8, so up to about eight workers' worth
+	// of commands fit at the defaults, fewer while the listings above run. Past that the
+	// slot cap binds (8 on small/default, 12 on medium, 16 on fleet via
+	// spec.deployment.sizingProfile); raising only the proxy memory limit in
+	// spec.deployment.credentialProxy.resources without raising sizingProfile does not
+	// raise the slot cap, and a command beyond the cap waits up to 60 s for a slot and is
+	// then refused busy. Keep that limit at 2Gi or more, since below it the memory budget
+	// (176 MiB per command after the 192 MiB resident reserve) binds first. Set it to 1 to
+	// serialise all delegated work. When quota rather than memory binds, note the related
+	// failure mode: workers that exhaust their retry budget exit without calling a terminal
+	// kanban tool, and the dispatcher reports that as a "protocol violation" rather than
+	// as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
@@ -1607,7 +1609,8 @@ type DeploymentSpec struct {
 	// written, without either check. The agent container's own resources are
 	// not part of a profile. A change of tier rolls credential-proxy with
 	// active-standby maxSurge 1 / maxUnavailable 0 handoff and restarts the
-	// gateway (every tier change) and the shell pod (on fleet transitions only).
+	// gateway (every tier change) and the shell pod (on fleet transitions only),
+	// while fixed-2Gi credential-proxy-exec pods keep their 8-slot cap unchanged.
 	// +kubebuilder:validation:Enum=small;medium;fleet;auto
 	// +optional
 	SizingProfile string `json:"sizingProfile,omitempty"`
@@ -1647,10 +1650,10 @@ type CredentialProxySpec struct {
 	// their number: the broker charges each command about 128Mi, the size of
 	// a listing of a small cluster, and a kubectl listing thousands of objects
 	// holds several hundred Mi on its own, so size the limit to the largest
-	// listing the fleet produces for every command that runs at once (eight
-	// at the slot cap) plus the 192Mi resident reserve for the broker and
-	// Envoy; the broker's child peak and memory high-water series give the
-	// figure.
+	// listing the fleet produces for every command that runs at once (8 at
+	// small/default, 12 at medium, 16 at fleet) plus the 192Mi resident reserve
+	// for the broker and Envoy; the broker's child peak and memory high-water
+	// series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a request

@@ -296,7 +296,9 @@ func credentialProxyExecTierLimitBytes(size string) string {
 //     ConfigMap;
 //   - cpu, memory and ephemeral-storage fixed at the tier's figures, its own
 //     state and /tmp emptyDir caps (credentialProxyExecTierStateSizeLimit),
-//     and the watermark gate's two limits set to those caps;
+//     the watermark gate's two limits set to those caps, and the slot cap pinned
+//     to credentialProxyMaxConcurrentCommands ("8") so stateful sizing-profile
+//     steps do not roll fixed-2Gi exec pods unnecessarily;
 //   - no Secret: no Secret-backed volume (forge credentials and CA bundles
 //     included) and no env read from one (chat, Teams and plugin credentials),
 //     dropped by source rather than by name so a Secret the broker gains later
@@ -395,12 +397,15 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 				continue
 			}
 			// The watermark gate measures each scratch volume against the
-			// figure the kubelet evicts it on: the tier's own caps.
+			// figure the kubelet evicts it on: the tier's own caps, and the
+			// slot cap stays at credentialProxyMaxConcurrentCommands ("8") on fixed 2Gi.
 			switch e.Name {
 			case credentialProxyStateLimitEnv:
 				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierStateSizeLimit)
 			case credentialProxyTmpLimitEnv:
 				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierTmpSizeLimit)
+			case credentialProxyMaxConcurrentCommandsEnv:
+				e.Value = credentialProxyMaxConcurrentCommands
 			}
 			env = append(env, e)
 		}

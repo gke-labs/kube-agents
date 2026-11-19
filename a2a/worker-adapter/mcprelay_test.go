@@ -13,7 +13,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
@@ -384,5 +386,95 @@ func TestTheRelayClientUsesNoProxy(t *testing.T) {
 	tr, ok := newRelayClient().Transport.(*http.Transport)
 	if !ok || tr.Proxy != nil {
 		t.Fatalf("relay transport = %#v, want one with no proxy", newRelayClient().Transport)
+	}
+}
+
+func TestRelayRetriesPreAdmissionDrainingBusy(t *testing.T) {
+	var attempts atomic.Int32
+	b := newRelayBroker(t)
+	b.reply = func(w http.ResponseWriter, _ []byte) {
+		n := attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n <= 2 {
+			w.Header().Set("Retry-After", "4")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"draining","bound":"draining","before_admission":true}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`)
+	}
+	relayEnv(t, b.URL, "a.b.c")
+	var sleeps []time.Duration
+	var out bytes.Buffer
+	err := serveMCPRelayWith(
+		context.Background(),
+		b.URL+"/v1/mcp/developer_knowledge",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`+"\n"),
+		&out,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			return nil
+		},
+		func(lo, hi float64) float64 { return lo },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out.String()) != `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}` {
+		t.Fatalf("out = %q", out.String())
+	}
+	if len(sleeps) != 2 || sleeps[0] != 2*time.Second || sleeps[1] != 2*time.Second {
+		t.Fatalf("sleeps = %v, want [2s 2s]", sleeps)
+	}
+}
+
+func TestRelayDoesNotRetryUnsafe503(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing before_admission",
+			body: `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"draining","bound":"draining"}`,
+		},
+		{
+			name: "non-draining slot busy",
+			body: `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"slot","bound":"slot","before_admission":true}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newRelayBroker(t)
+			b.reply = func(w http.ResponseWriter, _ []byte) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, tc.body)
+			}
+			relayEnv(t, b.URL, "a.b.c")
+			var sleeps []time.Duration
+			var out bytes.Buffer
+			err := serveMCPRelayWith(
+				context.Background(),
+				b.URL+"/v1/mcp/developer_knowledge",
+				strings.NewReader(`{"jsonrpc":"2.0","id":7,"method":"ping"}`+"\n"),
+				&out,
+				slog.New(slog.NewTextHandler(io.Discard, nil)),
+				func(_ context.Context, d time.Duration) error {
+					sleeps = append(sleeps, d)
+					return nil
+				},
+				func(lo, hi float64) float64 { return hi },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(sleeps) != 0 {
+				t.Fatalf("sleeps = %v, want 0", sleeps)
+			}
+			if len(b.bodies) != 1 {
+				t.Fatalf("requests = %d, want 1", len(b.bodies))
+			}
+			assertRelayError(t, strings.TrimSpace(out.String()), 7, "HTTP 503")
+		})
 	}
 }

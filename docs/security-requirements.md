@@ -109,7 +109,8 @@ alone to the runtime through a cluster with its own small circuit breaker, and i
 peer by the Service or the NetworkPolicy. The runtime's
 health-only one, closed unless `CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers `GET /healthz`
 and nothing else with a fixed `{"status":"ok"}` body, holds no route, credential or policy,
-shares the metrics listener's connection cap and deadline, and is opened by the broker's
+shares the metrics listener's connection cap and deadline, and is opened to no peer by the broker's
+Service or NetworkPolicy.
 The listener on 8766 serves unauthenticated Prometheus `/metrics` (whose label values are static enums and closed vocabularies) plus operator-only active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`) gated by a bearer token from `<name>-credential-proxy-control`. It holds no workload CLI/API route or upstream credential, answers at most sixteen connections at a time with a ten-second deadline on each, and is the one port the broker's NetworkPolicy opens to `gke-gmp-system` (Managed Prometheus collector) and to the operator's own pods (for `status.usage`, `status.sizing`, and `/control/*` handoffs). No other peer reaches it by selector; the site's security reference states the one residual above one replica, a shape the operator does not render today ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount and the sandbox's (and, under that flag, the
 session pods') and does not vary on which one

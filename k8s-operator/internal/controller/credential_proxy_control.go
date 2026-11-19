@@ -460,6 +460,26 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 		targetCandidates = append(targetCandidates, p)
 	}
 	if len(targetCandidates) == 0 {
+		if len(retireOnly) > 0 {
+			deletedDrained := false
+			for _, p := range retireOnly {
+				if p.pod.DeletionTimestamp != nil || p.snap == nil || p.snap.State != credentialProxyStateDrained {
+					continue
+				}
+				// Delete a non-terminating drained pod when no replacement candidate is runnable
+				// and either the reverted template matches it or no pending/warming replacement exists.
+				if p.matches || !hasPendingOrWarming {
+					if delErr := r.Delete(ctx, p.pod); client.IgnoreNotFound(delErr) != nil {
+						return 0, delErr
+					}
+					log.Info("deleting drained credential-proxy pod with no runnable candidate", "pod", p.pod.Name, "namespace", agent.Namespace, "matchesTemplate", p.matches)
+					deletedDrained = true
+				}
+			}
+			if deletedDrained {
+				return credentialProxyControlRequeueInterval, nil
+			}
+		}
 		if hasPendingOrWarming || len(retireOnly) > 0 || len(deletingPods) > 0 {
 			return credentialProxyControlRequeueInterval, nil
 		}

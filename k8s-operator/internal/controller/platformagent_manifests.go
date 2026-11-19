@@ -91,8 +91,9 @@ const (
 	// it admits from that limit, so the limit is the CR's knob and the admitted
 	// count follows it; the two caps stay the operator's constants, and a CR
 	// override of either would detach them from the limit again.
-	credentialProxyMaxOutputBytes        = "8388608"
-	credentialProxyMaxConcurrentCommands = "8"
+	credentialProxyMaxOutputBytes           = "8388608"
+	credentialProxyMaxConcurrentCommands    = "8"
+	credentialProxyMaxConcurrentCommandsEnv = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS" // #nosec G101 -- Environment variable name, not a credential
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -4852,7 +4853,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// 12 medium, 16 fleet); the child memory budget further caps admission
 		// if a custom override lowers memory. Setting it here pins it as the
 		// operator's value rather than an overridable spec.deployment.env key.
-		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyTierMaxConcurrentCommands(renderedSizingTier(agent))},
+		{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyTierMaxConcurrentCommands(renderedSizingTier(agent))},
 		// The container's own memory limit, for the broker's child memory
 		// budget. See credentialProxyMemoryLimitEnv for why it is a
 		// resourceFieldRef and why it is reserved.

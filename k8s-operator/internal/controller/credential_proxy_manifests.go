@@ -117,7 +117,7 @@ const credentialProxyPDBMaxUnavailable = 1
 // agents/platform/scripts/credential_proxy.py), ends the commands still
 // running and waits up to 5s for their answers, then hands its Chat receipts
 // back; the entrypoint waits up to 40s for that (BROKER_RUNTIME_DRAIN_SECONDS
-// in docker/agent-entrypoint.sh) so the entries in flight end with it. On
+// in deploy/shared/start-services.sh) so the entries in flight end with it. On
 // operator-coordinated cutovers, /control/drain drains gracefully first while active-standby RollingUpdate keeps serving; on
 // abrupt SIGTERM it falls back to the 30s drain above. An idle broker exits after
 // its 3s settle window (SHUTDOWN_SETTLE_SECONDS), as before, so this lengthens

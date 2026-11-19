@@ -1158,7 +1158,13 @@ BROKER_STATE_STANDBY = "standby"
 BROKER_STATE_ACTIVE = "active"
 BROKER_STATE_DRAINING = "draining"
 BROKER_STATE_DRAINED = "drained"
-HANDOFF_DRAIN_SECONDS = 15.0
+HANDOFF_DRAIN_SECONDS = 10.0
+# Backoff hints returned with pre-admission 503 bound="draining" refusals.
+# Once DRAINED, only Lease swap and readiness remain (~2-4s); while DRAINING,
+# settle (3s) + drain (10s) + end_wait (5s) + cutover can take up to ~22s, so
+# 12s guarantees four jittered [6s, 12s] retries outlast the worst-case drain.
+HANDOFF_DRAINING_RETRY_AFTER_SECONDS = 12
+HANDOFF_DRAINED_RETRY_AFTER_SECONDS = 3
 HANDOFF_SETTLE_POLL_SECONDS = 0.05
 HANDOFF_THREAD_NAME = "broker-handoff-drain"
 # Metric names, and the vocabulary of every label value. Nothing served is
@@ -18255,10 +18261,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         # `bound` names which limit refused it, so a caller can tell a
         # stopping broker (`draining`) from one at a cap.
-        self._json(
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound, **flag},
-        )
+        payload = {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound, **flag}
+        if bound == ADMISSION_BOUND_DRAINING:
+            retry_after = (
+                HANDOFF_DRAINED_RETRY_AFTER_SECONDS
+                if self.lifecycle is not None and self.lifecycle.state == BROKER_STATE_DRAINED
+                else HANDOFF_DRAINING_RETRY_AFTER_SECONDS
+            )
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, payload, headers={RETRY_AFTER_HEADER: str(retry_after)})
+            return
+        self._json(HTTPStatus.SERVICE_UNAVAILABLE, payload)
 
 
 def start_agent_api_proxy(max_threads: int | None = None) -> ThreadingHTTPServer:

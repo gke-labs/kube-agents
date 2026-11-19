@@ -851,3 +851,27 @@ func TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier(t *testing.T) {
 		})
 	}
 }
+
+func TestTheExecTierPinsSlotCapAcrossSizingProfiles(t *testing.T) {
+	for _, profile := range []string{sizingProfileSmall, sizingProfileMedium, sizingProfileFleet} {
+		t.Run(profile, func(t *testing.T) {
+			agent := execTierTestAgent(ptr.To(int32(1)))
+			agent.Spec.Deployment.SizingProfile = profile
+			dep := buildCredentialProxyExecTierDeployment(agent, buildCredentialProxyDeployment(agent, brokerTestPolicyHash))
+			for _, c := range dep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				var found string
+				for _, e := range c.Env {
+					if e.Name == credentialProxyMaxConcurrentCommandsEnv {
+						found = e.Value
+					}
+				}
+				if found != credentialProxyMaxConcurrentCommands {
+					t.Fatalf("exec %s at profile %q = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, profile, found, credentialProxyMaxConcurrentCommands)
+				}
+			}
+		})
+	}
+}

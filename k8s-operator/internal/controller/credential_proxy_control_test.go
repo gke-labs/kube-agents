@@ -649,4 +649,92 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 			t.Fatalf("expected stale drained pod %s to be deleted once active pod is Ready", oldPod.Name)
 		}
 	})
+
+	t.Run("rollback after drain with no active candidate deletes drained pod instead of deadlocking", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
+		rSeed := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+		if err := rSeed.ensureCredentialProxyControlSecret(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		bearer, ok, err := rSeed.readCredentialProxyControlBearer(context.Background(), agent)
+		if err != nil || !ok {
+			t.Fatalf("bearer read failed: ok=%v err=%v", ok, err)
+		}
+
+		oldSrv := newFakeBrokerPodServer(bearer, credentialProxyStateDraining, true, 1, false)
+		defer oldSrv.close()
+		rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			cloned := req.Clone(req.Context())
+			if req.URL.Hostname() == "127.0.0.18" {
+				cloned.URL.Host = oldSrv.host + ":" + oldSrv.port
+			}
+			return http.DefaultTransport.RoundTrip(cloned)
+		})
+
+		revertedDep := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+		newDep := buildCredentialProxyDeployment(sizingAgent(sizingProfileMedium, sizingProfileMedium, nil, nil), brokerTestPolicyHash)
+		// OldPod matches the reverted template (Deployment will NOT replace it while it looks Ready),
+		// while the rolled-back surge pod has DeletionTimestamp set.
+		oldPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        credentialProxyName(agent) + "-old",
+				Namespace:   agent.Namespace,
+				Labels:      credentialProxySelector(agent),
+				Annotations: maps.Clone(revertedDep.Spec.Template.Annotations),
+			},
+			Spec:   *revertedDep.Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.18"},
+		}
+		terminatingNewPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        credentialProxyName(agent) + "-new",
+				Namespace:   agent.Namespace,
+				Labels:      credentialProxySelector(agent),
+				Annotations: maps.Clone(newDep.Spec.Template.Annotations),
+				Finalizers:  []string{"test/hold"},
+			},
+			Spec:   *newDep.Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.19"},
+		}
+		if err := cl.Create(context.Background(), oldPod); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.Create(context.Background(), terminatingNewPod); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.Delete(context.Background(), terminatingNewPod); err != nil {
+			t.Fatal(err)
+		}
+		r := &PlatformAgentReconciler{
+			Client:              cl,
+			APIReader:           cl,
+			Scheme:              scheme,
+			BrokerControlClient: &http.Client{Transport: rt, Timeout: 5 * time.Second},
+		}
+
+		// Pass 1: while still DRAINING, requeues without deleting in-flight pod.
+		req1, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, revertedDep)
+		if err != nil || req1 != credentialProxyControlRequeueInterval {
+			t.Fatalf("while draining: req=%v err=%v", req1, err)
+		}
+		var stillThere corev1.Pod
+		if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: oldPod.Name}, &stillThere); err != nil || stillThere.DeletionTimestamp != nil {
+			t.Fatalf("pod should stay alive while DRAINING: err=%v del=%v", err, stillThere.DeletionTimestamp)
+		}
+
+		// Pass 2: once DRAINED with no runnable candidate, oldPod is deleted to unblock Deployment.
+		oldSrv.finishDrain()
+		req2, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, revertedDep)
+		if err != nil || req2 != credentialProxyControlRequeueInterval {
+			t.Fatalf("once drained: req=%v err=%v", req2, err)
+		}
+		var afterDrain corev1.Pod
+		err = cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: oldPod.Name}, &afterDrain)
+		if err == nil && afterDrain.DeletionTimestamp == nil {
+			t.Fatalf("expected matching DRAINED pod %s with no candidate to be deleted", oldPod.Name)
+		}
+	})
 }
