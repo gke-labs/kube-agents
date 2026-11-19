@@ -103,7 +103,8 @@ func TestTierMembershipAdmissionOnUpdateChecksTheEdit(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(
 		&agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: ns}, Spec: agentv1alpha1.TierSpec{Mode: tierModeUnattended}}).Build()
 	stale := agentv1alpha1.TierMember{Backend: "slack", User: "U1", Tier: "nightly"}
-	old := withMembers(a2aTestAgent(), stale)
+	alice := agentv1alpha1.TierMember{Backend: "gchat", User: "alice@x.com", Tier: "read"}
+	old := withMembers(a2aTestAgent(), stale, alice)
 	path := field.NewPath("spec", "tiers", "membership")
 	for _, tc := range []struct {
 		name    string
@@ -113,6 +114,11 @@ func TestTierMembershipAdmissionOnUpdateChecksTheEdit(t *testing.T) {
 		{"the stale entry left as it was", []agentv1alpha1.TierMember{stale, {Backend: "slack", User: "U2", Tier: "read"}}, false},
 		{"someone new at the unattended tier", []agentv1alpha1.TierMember{stale, {Backend: "slack", User: "U2", Tier: "nightly"}}, true},
 		{"a new repeat of a listed person", []agentv1alpha1.TierMember{stale, {Backend: "slack", User: "U1", Tier: "read"}}, true},
+		// The walk sees the unchanged entries first, so a repeat added above
+		// the person it repeats is caught too (#6082 review).
+		{"a new repeat above a listed person", []agentv1alpha1.TierMember{{Backend: "slack", User: "U1", Tier: "read"}, stale}, true},
+		{"a Google Chat repeat in another case, above", []agentv1alpha1.TierMember{stale, {Backend: "gchat", User: "Alice@x.com", Tier: "oncall"}, alice}, true},
+		{"the listed people left as they were", []agentv1alpha1.TierMember{alice, stale}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs, err := ValidateTierMembership(context.Background(), c, old, withMembers(a2aTestAgent(), tc.members...), path)

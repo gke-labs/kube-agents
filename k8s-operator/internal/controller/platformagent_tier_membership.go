@@ -58,18 +58,25 @@ func ValidateTierMembership(ctx context.Context, c client.Reader, old, agent *ag
 		}
 	}
 	var errs field.ErrorList
+	// Every unchanged entry's person is seen first, so an added entry naming
+	// one of them is a duplicate wherever it sits in the list, above the
+	// existing entry as well as below it.
 	seen := map[string]bool{}
+	for _, m := range agent.Spec.Tiers.Membership {
+		if unchanged[m] {
+			seen[tierMemberKey(m)] = true
+		}
+	}
 	for i, m := range agent.Spec.Tiers.Membership {
-		p := path.Index(i)
-		key := tierMemberKey(m)
-		repeat := seen[key]
-		seen[key] = true
 		if unchanged[m] {
 			continue
 		}
-		if repeat {
+		p := path.Index(i)
+		key := tierMemberKey(m)
+		if seen[key] {
 			errs = append(errs, field.Duplicate(p, m.Backend+":"+m.User))
 		}
+		seen[key] = true
 		switch {
 		case slices.Contains(legacyTierNames, m.Tier):
 			errs = append(errs, field.Invalid(p.Child("tier"), m.Tier,
