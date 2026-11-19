@@ -166,15 +166,15 @@ operator:
     enabled: true
   # The MCP server (<agent>-a2a-mcp), a Model Context Protocol endpoint that lets
   # an external coding agent or IDE talk to the install over its message bus.
-  # true sets A2A_MCP_DOOR=true on the controller manager, which then renders
-  # the server's Deployment, Service, deny-all ingress NetworkPolicy and
-  # bearer-token Secret beside every PlatformAgent it manages; the quota
-  # preflight counts its pod. Setting this back to false removes all of it, the
-  # token included. An A2A_MCP_DOOR entry in extraEnv wins: the chart then
-  # renders only that entry. What it renders and how to connect: the site's
-  # "MCP server" reference page.
+  # Rendered beside every PlatformAgent the operator manages: Deployment,
+  # Service, ServiceAccount, deny-all ingress NetworkPolicy and bearer-token
+  # Secret. false sets A2A_MCP_DOOR=false on the controller manager, which
+  # removes all of it, the token included; the quota preflight still counts its
+  # one pod from footprint.yaml (an over-count in the safe direction). An
+  # A2A_MCP_DOOR entry in extraEnv wins: the chart then renders only that entry.
+  # What it renders and how to connect: the site's "MCP server" reference page.
   mcpServer:
-    enabled: false
+    enabled: true
   # The AgentProfile dispatcher (<agent>-a2a-dispatcher), which offers each
   # profile task to a worker in the profile's warm pool, or runs an unattended
   # one as a Job. Rendered beside every PlatformAgent the operator manages.

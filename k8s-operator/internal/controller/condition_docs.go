@@ -156,7 +156,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    a2aMCPIdentityConditionType,
-		Written: "With the operator's `A2A_MCP_DOOR` flag on, while a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control",
+		Written: "While the operator runs the MCP server (on by default; `operator.mcpServer.enabled`) and a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control",
 		Meaning: "`status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included.",
 	},
 	{
