@@ -20,7 +20,7 @@ The helper script does not import any agent harness packages.
 | Propose a change (`submit-suggestion`, `fleet-audit`, manifest generation) | `check --base <base> --semantic`       | Stop on any `violates` finding with `severity: block`. Revise the change or ask the user. Include the `--markdown` output under **Prior decisions and lessons** in the PR body.                            |
 | Review a pull request                                                      | `check --base <base> --head <pr-head>` | Post a comment for each `violates` finding with the record ID and its evidence PR URL. Never approve or merge the PR.                                                                                      |
 | Answer "why is X configured this way?"                                     | `why <path> [<path2> ...]`             | Cite every matching record ID (`DEC-YYYY-NNN`, `LES-YYYY-NNN`), its evidence PR link, and any `rejected_proposals` directly in your answer. When `status` is `"no_match"`, follow the no-match rule below. |
-| Record a verified fix or rejected PR                                       | `from-outcome <outcome.json>`          | Open a pull request with the drafted lesson record for human review.                                                                                                                                       |
+| Record a verified fix or rejected PR                                       | `from-outcome <outcome.json>`          | Open a pull request on `platform-agent/memory/<ID>` titled `docs(knowledge): record <ID> (<title>)` for human review.                                                                                      |
 
 ## Verdicts
 

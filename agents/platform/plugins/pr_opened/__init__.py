@@ -571,7 +571,8 @@ def _notify_curator_pr_opened(confirmed, repo=None, deadline=None):
         timeout_s = min(timeout_s, deadline - time.monotonic())
         if timeout_s <= CURATOR_MIN_BUDGET_SECONDS:
             return
-    rec_id = match.group(1)
+    prefix, _, rest = match.group(1).partition("-")
+    rec_id = f"{prefix.upper()}-{rest.lower()}" if rest else prefix.upper()
     curator_bin = os.environ.get("CURATOR_BIN", "").strip()
     if not curator_bin:
         if os.path.isfile(DEFAULT_CURATOR_BIN) and os.access(DEFAULT_CURATOR_BIN, os.X_OK):

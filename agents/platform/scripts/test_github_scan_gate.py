@@ -2901,6 +2901,121 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 self.assertEqual(len(calls), 2)
                 self.assertIn("modified-merged", calls[1])
 
+    def test_unrecognized_post_merge_switch_normalizes_to_off_and_falls_back_to_forge_soak(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-053",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Add PDB for checkout",
+                    "path": "knowledge/lessons/LES-2026-053.md",
+                    "branch": "platform-agent/memory/LES-2026-053",
+                    "pull_request": "https://github.com/acme/infra/pull/411 (#411)",
+                    "finding_id": "no-pdb.prod.shop.Deployment/checkout",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-view" and not payload.get("diff"):
+                return {
+                    "proposal": {
+                        "number": 411,
+                        "state": "merged",
+                        "mergedAt": "2026-11-01T12:00:00Z",
+                        "url": "https://github.com/acme/infra/pull/411",
+                    },
+                    "comments": [],
+                }
+            if verb == "proposal-commits":
+                return {
+                    "commits": [
+                        {
+                            "author": "Platform Agent",
+                            "email": "platform-agent@users.noreply.github.com",
+                            "bot": False,
+                        }
+                    ]
+                }
+            return {"diff": ""}
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "pending_on.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=411,
+                finding_id="no-pdb.prod.shop.Deployment/checkout",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="",
+                human_edited=0,
+            )
+            missing = Path(td) / "absent"
+            import kubeagents_switches
+            with mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", missing), \
+                 mock.patch.object(kubeagents_switches, "SWITCH_DIR", missing), \
+                 mock.patch.dict(
+                     "os.environ",
+                     {
+                         "NATS_URL": "nats://localhost:4222",
+                         "SESSION_KV_DB_PATH": str(db_path),
+                         "KUBEAGENTS_POST_MERGE_CHECK": "on",
+                     },
+                 ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("resolved-merged", calls[1])
+
+    def test_detect_human_modification_ignores_workspace_noreply_emails_for_github_and_self_managed(self):
+        for repo_name, noreply_email in (
+            ("acme/infra", "platform-agent@users.noreply.github.com"),
+            ("ghe.example.com/acme/infra", "platform-agent@users.noreply.ghe.example.com"),
+        ):
+            with self.subTest(repo=repo_name, email=noreply_email):
+                rec = {
+                    "id": "DEC-2026-054",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Enforce PDB",
+                    "guard_rule": "PDB minAvailable >= 1.",
+                    "pull_request": f"https://forge.example/acme/infra/pull/412 (#412)",
+                }
+                prop = {"number": 412, "state": "merged"}
+                view_ans = {
+                    "proposal": prop,
+                    "comments": [],
+                    "commits": [
+                        {
+                            "author": "Platform Agent",
+                            "email": noreply_email,
+                            "bot": False,
+                        }
+                    ],
+                }
+                mod = gate._detect_human_modification(
+                    rec,
+                    prop,
+                    view_ans,
+                    "kube-agents",
+                    provider=mock.Mock(),
+                    repo=repo_name,
+                    pr_num=412,
+                )
+                self.assertIsNone(mod)
+
 
 if __name__ == "__main__":
     unittest.main()

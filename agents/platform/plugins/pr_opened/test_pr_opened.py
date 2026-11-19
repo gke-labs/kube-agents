@@ -1014,7 +1014,9 @@ class CuratorLinkTest(unittest.TestCase):
     def test_links_short_and_dated_okf_ids_ignores_workload_prs_and_respects_deadline(self):
         for title, expected_id in (
             ("docs(knowledge): record DEC-2026-010 (Require ttl)", "DEC-2026-010"),
+            ("docs(knowledge): record dec-2026-010 (Require ttl)", "DEC-2026-010"),
             ("docs(knowledge): record LES-20260401-02-checkout-oom", "LES-20260401-02-checkout-oom"),
+            ("docs(knowledge): record les-20260401-02-Checkout-Oom", "LES-20260401-02-checkout-oom"),
         ):
             calls = []
             with mock.patch.dict(

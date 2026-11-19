@@ -146,6 +146,10 @@ _INCOMING = "refs/vcs/incoming"
 DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
 DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
 DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
 DECISION_OVERRIDE_PREFIX = "decision-override:"
 FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
 DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
@@ -1891,7 +1895,7 @@ class VcsBroker:
             )
             policy_branch = _short_ref(policy_branch) if policy_branch else ""
             if not policy_branch:
-                self._record_decision_memory_check("error")
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                 raise WorkspaceError(
                     f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                     status=502,
@@ -1910,7 +1914,7 @@ class VcsBroker:
                 )
                 policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
                 if not policy_base_rev:
-                    self._record_decision_memory_check("error")
+                    self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                     raise WorkspaceError(
                         f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                         status=502,
@@ -2031,7 +2035,7 @@ class VcsBroker:
             "knowledge", ".kube-agents/intent.yaml", check=False,
         )
         if getattr(tree_ls, "truncated", False):
-            self._record_decision_memory_check("error")
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: base tree listing was truncated",
                 status=409,
@@ -2055,7 +2059,7 @@ class VcsBroker:
             root, "diff-tree", "-r", "--no-renames", "--name-status", "-z", diff_base, tip, check=False,
         )
         if diff_ns.returncode != 0 or getattr(diff_ns, "truncated", False):
-            self._record_decision_memory_check("error")
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: diff-tree failed or was truncated",
                 status=409,
@@ -2073,7 +2077,7 @@ class VcsBroker:
                 changed_paths.append((status, tokens[idx + 1]))
                 idx += 2
         if not changed_paths:
-            self._record_decision_memory_check("allow")
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ALLOW)
             return ""
 
         check_dir = self._scratch("dmcheck")
@@ -2109,7 +2113,7 @@ class VcsBroker:
                             policy_base_rev, "--", safe_prefix, check=False,
                         )
                         if getattr(extra_ls, "truncated", False):
-                            self._record_decision_memory_check("error")
+                            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                             raise WorkspaceError(
                                 "Decision Memory guard check failed against base branch: extra path listing was truncated",
                                 status=409,
@@ -2157,7 +2161,7 @@ class VcsBroker:
                     k_root, changed_map, oversize_files=oversize_files
                 )
             except ValueError as exc:
-                self._record_decision_memory_check("error")
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                 raise WorkspaceError(
                     f"Decision Memory guard check failed against base branch: {exc}",
                     status=409,
@@ -2166,7 +2170,7 @@ class VcsBroker:
 
             markdown = str(out.get("markdown") or "") if out.get("findings") else ""
             if out.get("verdict") == "block":
-                self._record_decision_memory_check("block")
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_BLOCK)
                 msg = (
                     "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
                     f"{markdown}\n\n"
@@ -2180,7 +2184,9 @@ class VcsBroker:
                     code=DECISION_MEMORY_BLOCKED,
                     detail=markdown,
                 )
-            self._record_decision_memory_check("warn" if markdown else "allow")
+            self._record_decision_memory_check(
+                DECISION_MEMORY_VERDICT_WARN if markdown else DECISION_MEMORY_VERDICT_ALLOW
+            )
             return markdown
         finally:
             self._discard_scratch(check_dir)

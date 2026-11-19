@@ -78,7 +78,9 @@ from urllib.parse import urlsplit
 import clean_merges
 import forge
 import gitops_workspace
+import kubeagents_switches
 import post_merge_check
+import post_merge_report
 import post_merge_stepdown
 import pr_triggers
 import repo_ref
@@ -229,7 +231,14 @@ DEFAULT_SOAK_WINDOW = "24h"
 MEMORY_BRANCH_PREFIX = "platform-agent/memory/"
 MIN_CODE_FENCE_TICKS = 4
 POST_MERGE_DB_TIMEOUT_S = 5.0
-APPLIED_NOT_RECHECKED = "applied_not_rechecked"
+_PM_OUTCOME_PERSISTS = "persists"
+_PM_OUTCOME_FAILED = "failed"
+_PM_PERSISTS_OUTCOMES = frozenset({
+    post_merge_stepdown.STILL_BROKEN,
+    post_merge_report.NOT_APPLIED,
+    _PM_OUTCOME_PERSISTS,
+    _PM_OUTCOME_FAILED,
+})
 SOAK_WINDOWS_SECONDS = {
     "10m": 10 * 60,
     "24h": 24 * 3600,
@@ -1190,6 +1199,24 @@ def _extract_rule_from_diff(diff_text: str) -> str:
     return ""
 
 
+def _repo_host(repo: str) -> str:
+    """Resolve the forge hostname for a repository string (URL, host-qualified, or bare GitHub slug)."""
+    cleaned = str(repo or "").strip()
+    if not cleaned:
+        return repo_ref.GITHUB_CANONICAL_HOST
+    parsed = repo_ref.try_parse(cleaned)
+    if parsed is not None and parsed.host:
+        return parsed.host
+    host, _ = gitops_workspace.split_host(cleaned)
+    if host:
+        return host
+    if repo_ref.is_github_slug(cleaned):
+        return repo_ref.GITHUB_CANONICAL_HOST
+    if parsed is not None and len(parsed.segments) >= 2 and "." in parsed.segments[0]:
+        return parsed.segments[0].lower()
+    return repo_ref.GITHUB_CANONICAL_HOST
+
+
 def _detect_human_modification(
     rec: dict,
     prop: dict,
@@ -1231,8 +1258,7 @@ def _detect_human_modification(
         except Exception:  # noqa: BLE001 — optional commit enrichment
             commits = []
 
-    parsed_repo = repo_ref.try_parse(repo) if repo else None
-    repo_host = parsed_repo.host if parsed_repo and parsed_repo.host else ""
+    repo_host = _repo_host(repo)
     human_editor = ""
     if isinstance(commits, list):
         for c in reversed(commits):
@@ -1384,13 +1410,7 @@ def _evaluate_remediation_from_post_merge_record(
     required_sec = SOAK_WINDOWS_SECONDS.get(
         soak_key, SOAK_WINDOWS_SECONDS[DEFAULT_SOAK_WINDOW]
     )
-    post_merge_enabled = os.environ.get("KUBEAGENTS_POST_MERGE_CHECK", "off").strip().lower() not in (
-        "",
-        "off",
-        "0",
-        "false",
-        "no",
-    )
+    post_merge_enabled = kubeagents_switches.switch("POST_MERGE_CHECK") != kubeagents_switches.OFF
 
     if isinstance(pm_row, dict):
         outcome = str(pm_row.get("outcome") or "").strip().lower()
@@ -1415,7 +1435,7 @@ def _evaluate_remediation_from_post_merge_record(
                     or f"Fix pull request was reverted at {reverted} within the {clean_merges.REVERT_WINDOW.days}d post-merge window.",
                 )
 
-        if outcome in (post_merge_stepdown.STILL_BROKEN, "not_applied", "persists", "failed"):
+        if outcome in _PM_PERSISTS_OUTCOMES:
             return (
                 "persists",
                 detail or f"Post-merge check reported outcome={outcome}.",
@@ -1645,8 +1665,7 @@ def sweep_memory_proposals(
             pm_row is not None
             and (
                 pm_row.get("reverted_at") not in (None, "")
-                or pm_outcome
-                in (post_merge_stepdown.STILL_BROKEN, "not_applied", "persists", "failed")
+                or pm_outcome in _PM_PERSISTS_OUTCOMES
             )
         )
         pm_fast_path_ready = bool(
@@ -1656,7 +1675,7 @@ def sweep_memory_proposals(
                 pm_persists_signal
                 or (
                     pm_outcome
-                    and pm_outcome != APPLIED_NOT_RECHECKED
+                    and pm_outcome != post_merge_report.APPLIED_NOT_RECHECKED
                     and pm_row.get("human_edited") in (0, "0", False)
                 )
             )
@@ -1717,7 +1736,7 @@ def sweep_memory_proposals(
                 continue
             if soak_state == "soaking" and (
                 pm_outcome
-                and pm_outcome != APPLIED_NOT_RECHECKED
+                and pm_outcome != post_merge_report.APPLIED_NOT_RECHECKED
                 and pm_row.get("human_edited") in (0, "0", False)
             ):
                 if dry_run:
