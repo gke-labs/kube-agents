@@ -49,8 +49,9 @@ def _from_the_parser(validator, problems: list[str]) -> list[str]:
 
 
 def test_the_parser_is_importable_in_this_job(validator):
-    """Without it the rule does not run, and every test below would pass on nothing."""
-    assert validator.spec_parser() is not None
+    """Without it, or with another checkout's, the rule does not run, and every test below would
+    pass on nothing."""
+    assert not isinstance(validator.spec_parser(), str)
 
 
 def test_a_field_that_the_verifier_does_not_have_is_rejected(validator, tmp_path):

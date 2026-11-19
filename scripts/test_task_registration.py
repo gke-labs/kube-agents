@@ -47,6 +47,7 @@ import re
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from unittest import mock
 import unittest.mock
@@ -648,10 +649,51 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
 
         return mock.patch.object(validator, "spec_parser", return_value=(yaml.safe_load, parse))
 
+    def _installed(self, package_dir):
+        """Stand-in modules for a bench package that is installed with its files in `package_dir`."""
+        bench = types.ModuleType("kube_agents_bench")
+        bench.__file__ = str(package_dir / "__init__.py")
+        loader = types.ModuleType("devops_bench.tasks.loader")
+        loader.safe_parse_yaml = yaml.safe_load
+        spec = types.ModuleType("devops_bench.verification.spec")
+        spec.parse_entries = lambda entries: ([], [{"name": entries[0]["name"], "reason": self.REFUSED}])
+        modules = {name: types.ModuleType(name) for name in ("devops_bench", "devops_bench.tasks", "devops_bench.verification")}
+        modules.update({"kube_agents_bench": bench, "devops_bench.tasks.loader": loader, "devops_bench.verification.spec": spec})
+        validator.spec_parser.cache_clear()
+        self.addCleanup(validator.spec_parser.cache_clear)
+        return mock.patch.dict(sys.modules, modules)
+
     def test_the_rule_reports_nothing_without_the_parser(self):
         self._write(self.ENTRY)
-        with mock.patch.object(validator, "spec_parser", return_value=None):
+        with mock.patch.object(validator, "spec_parser", return_value=validator.FIELD_CHECK_SKIPPED):
             self.assertEqual(validator.unloadable_entries(self.path), [])
+
+    def test_a_bench_package_of_this_checkout_gives_the_parser(self):
+        self._write(self.ENTRY)
+        with self._installed(validator.BENCH_DIR / "kube_agents_bench"):
+            self.assertNotIsInstance(validator.spec_parser(), str)
+            self.assertEqual(
+                validator.unloadable_entries(self.path),
+                [f"check 'names-the-thing': {validator.UNLOADABLE_ENTRY}: {self.REFUSED}"],
+            )
+
+    def test_a_bench_package_of_another_checkout_gives_a_note_and_no_verdict(self):
+        """An older checkout's package does not know a check type or a field that this tree added,
+        so its verdict on this tree's cases would be a false one."""
+        self._write(self.ENTRY)
+        other = pathlib.Path(self.tmp.name).resolve() / "older-checkout" / "bench" / "kube_agents_bench"
+        with self._installed(other):
+            note = validator.spec_parser()
+            self.assertEqual(note, validator.FIELD_CHECK_STALE.format(path=other))
+            self.assertTrue(note.startswith("bench-case-check: the field check did NOT run"))
+            self.assertIn("installed, but behind the tree", note)
+            self.assertIn("make test-bench-deps", note)
+            # The stand-in parser refuses the entry; the rule must not ask it.
+            self.assertEqual(validator.unloadable_entries(self.path), [])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                self.assertEqual(validator.main([str(self.path)]), 0)
+            self.assertTrue(output.getvalue().endswith(f"{note}\n"), output.getvalue())
 
     def test_the_rule_reports_what_the_parser_refuses(self):
         self._write(self.ENTRY)
@@ -707,7 +749,7 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
                 with self.subTest(exit_status=status, parser_installed=installed):
                     # One buffer for both streams, so that the order is seen.
                     output = io.StringIO()
-                    harness = self._harness() if installed else mock.patch.object(validator, "spec_parser", return_value=None)
+                    harness = self._harness() if installed else mock.patch.object(validator, "spec_parser", return_value=validator.FIELD_CHECK_SKIPPED)
                     with harness, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                         # The note changes no exit status: the other rules decide it.
                         self.assertEqual(validator.main([str(self.path)]), status)
@@ -719,7 +761,7 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
                         self.assertTrue(text.endswith(f"{validator.FIELD_CHECK_SKIPPED}\n"), text)
                         # On stderr: a caller that reads stdout for "OK" still sees the note on a terminal.
                         errors = io.StringIO()
-                        with mock.patch.object(validator, "spec_parser", return_value=None):
+                        with mock.patch.object(validator, "spec_parser", return_value=validator.FIELD_CHECK_SKIPPED):
                             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
                                 validator.main([str(self.path)])
                         self.assertEqual(errors.getvalue(), f"{validator.FIELD_CHECK_SKIPPED}\n")

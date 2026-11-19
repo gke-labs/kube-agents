@@ -23,7 +23,8 @@ pull request.
 One rule needs more than PyYAML: on a case that no other rule faults, each check
 entry is read and loaded with the harness's own YAML reader and parser, which
 are in the bench package (`make test-bench-deps`). Where that package is not installed, as
-in the lint's job, the rule does not run and the CLI says so on its last line;
+in the lint's job, or is another checkout's, the rule does not run and the CLI says so on its
+last line;
 `bench/tests/test_case_entries_load.py` gates it in the job that installs the
 package.
 
@@ -91,6 +92,15 @@ FIELD_CHECK_SKIPPED = (
     "bench-case-check: the field check did NOT run: the bench package is not installed here, so no "
     "check entry was loaded with the harness's parser, and an entry with a field that its verifier "
     "does not have passes. Install the package with `make test-bench-deps` and run this again."
+)
+# The rule's verdict comes from the bench package that the interpreter resolves. One from another
+# checkout does not know a check type or a field that this tree added, and would refuse entries
+# that a run loads.
+BENCH_DIR = REPO_ROOT / "bench"
+FIELD_CHECK_STALE = (
+    "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
+    "tree: this interpreter resolves it to {path}, not to this checkout's bench/. Install this "
+    "checkout's with `make test-bench-deps` and run this again."
 )
 # A run's record is never committed beside a case: a public file names the run
 # and its outcome, nothing from inside the record. The harness writes runs
@@ -773,15 +783,18 @@ GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
 
 @functools.lru_cache(maxsize=1)
-def spec_parser() -> tuple[Any, Any] | None:
-    """The harness's YAML reader and its parser of a case's entries, or None where the bench
-    package is not installed."""
+def spec_parser() -> tuple[Any, Any] | str:
+    """The harness's YAML reader and its parser of a case's entries, or the note that says why
+    the rule cannot run here: the bench package is not installed, or it is another checkout's."""
     try:
-        import kube_agents_bench  # noqa: F401, PLC0415 -- its entry points register this repository's check types
+        import kube_agents_bench  # noqa: PLC0415 -- the package whose installed entry points register this repository's check types
         from devops_bench.tasks.loader import safe_parse_yaml  # noqa: PLC0415
         from devops_bench.verification.spec import parse_entries  # noqa: PLC0415
     except ImportError:
-        return None
+        return FIELD_CHECK_SKIPPED
+    package = pathlib.Path(kube_agents_bench.__file__).resolve().parent
+    if not package.is_relative_to(BENCH_DIR.resolve()):
+        return FIELD_CHECK_STALE.format(path=package)
     return safe_parse_yaml, parse_entries
 
 
@@ -793,7 +806,7 @@ def unloadable_entries(path: pathlib.Path) -> list[str]:
     and `22:30` as different types (YAML 1.1 and 1.2), and the parser has to see what a run sees.
     One entry goes to the parser at a time, so a parser that raises names its entry."""
     harness = spec_parser()
-    if harness is None:
+    if isinstance(harness, str):
         return []
     read, parse = harness
     try:
@@ -2283,10 +2296,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")
     else:
         print(f"{len(results)} bench case(s) OK.")
-    if spec_parser() is None:
+    harness = spec_parser()
+    if isinstance(harness, str):
         # Last, and on stderr: an "OK" above it does not cover the fields of a check.
         sys.stdout.flush()
-        print(FIELD_CHECK_SKIPPED, file=sys.stderr)
+        print(harness, file=sys.stderr)
     return 1 if failed else 0
 
 

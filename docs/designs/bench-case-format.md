@@ -729,15 +729,22 @@ finding; a field defect of a case with another finding shows after that finding 
 - **An extra or misspelled key on a verification entry or a check node.** The compound
   nodes in `devops_bench/verification/spec.py` are `ConfigDict(extra="forbid")`, so
   `requried_phrases:` is a hard rejection there. The harness does not stop on it: it drops
-  the entry and runs the case without that check.
+  the entry and runs the case without that check. The gate turns a repetition with such a
+  parse error red, but only after a cluster lease is spent.
 - **A missing required field on a check.** That surfaces as pydantic's `Field required`
   against the verifier's own model.
 
 The rule reads with the harness's reader because of the YAML split described below: PyYAML
 would hand the parser `required_phrases: [no]` as a boolean, and the rule would then refuse
-an entry that a run loads.
+an entry that a run loads. The rule reads an entry as the file has it; the harness
+substitutes its placeholders first, so a field whose whole value is a placeholder can be
+refused here and load in a run. No case in the tree has one.
 
 Without the package the rule does not run, and the target's last line, on stderr, says so.
+The same holds when the installed package is another checkout's: the line then says that the
+package is installed, but behind the tree. The rule knows the check types and the fields of
+the installed package, so after a pull that changes `bench/pyproject.toml` (a new check
+type, a new devops-bench pin), run `make test-bench-deps` again.
 The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
 the rule in the job that does, over every case in the tree.
 
