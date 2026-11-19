@@ -5334,9 +5334,12 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		if err != nil {
 			return err
 		}
-		if busMigrationLeg(run.Leg) == busMigrationReshape && running != 0 {
+		if busMigrationLeg(run.Leg) == busMigrationReshape {
 			// A reshape runs at the count the bus runs and never changes it.
 			n = running
+			if n == 0 {
+				n = busReshapeServers(agent)
+			}
 		}
 		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
 		return nil

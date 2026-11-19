@@ -546,8 +546,8 @@ type PlatformAgentReconciler struct {
 	heldBusMigrationWarned sync.Map
 	// busReshapeRefused records, per CR, the bus-reshape request and the
 	// reason this process last reported for not starting it, so the Event
-	// goes once per request and reason, not once per pass. Keyed by
-	// ObjectKey, value "<nonce>/<reason>".
+	// goes once per request and kind of reason, not once per pass. Keyed by
+	// ObjectKey, value "<nonce>/<kind>".
 	busReshapeRefused sync.Map
 	// prunedBusMigrationStatus records, per CR, that a status write carrying
 	// status.busMigration came back without it: the served CRD predates the

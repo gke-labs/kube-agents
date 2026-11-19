@@ -46,72 +46,85 @@ func busReshapeServers(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // busReshapeRefusal says why a reshape asked for with nonce can't start, or
-// "" when it can. In order:
-//   - a run under way, or a Failed run not given up, decides first;
+// "" when it can, and kind, a short name for the reason that keys its Event.
+// In order:
 //   - the request was answered already, which the last run's ID records
-//     (busReshapeRunSuffix);
+//     (busReshapeRunSuffix), whether that run is still under way or not;
+//   - a run under way, or a Failed run not given up;
 //   - the bus must be provisioned, and the operator must have its own image
 //     to run the work;
-//   - the live TASKS must be narrower than the CR renders. This is the guard
-//     that makes a request left in place harmless: once a reshape (or a one
-//     to three migration) has widened TASKS, a stale annotation finds it at
-//     the width and does nothing, even after a later run has replaced the
-//     record of the one that answered it. A TASKS with no limit is never
-//     narrower;
+//   - the served CRD must keep status.busMigration, or a run started here
+//     would be gone by the next pass;
+//   - the live TASKS must be narrower than the CR renders. This is the
+//     primary guard, the run ID's record the secondary one: once a reshape
+//     (or a one to three migration) has widened TASKS, a value left in place
+//     finds it at the width and does nothing, even after a later run has
+//     replaced the record of the one that answered it. It is not a
+//     complete guard: if that later run left TASKS as it was and the render
+//     then grew (maxSessions raised), the old value would start a reshape
+//     no one asked for again. So the docs say to remove the annotation once
+//     the reshape is done. A TASKS with no limit is never narrower;
 //   - TASKS must fit the limits the restore puts on it, as one to three
 //     checks every stream.
-func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *agentv1alpha1.PlatformAgent, nonce string) (refusal string, answered bool) {
+func (r *PlatformAgentReconciler) busReshapeRefusal(ctx context.Context, agent *agentv1alpha1.PlatformAgent, nonce string) (refusal, kind string, answered bool) {
 	if run := agent.Status.BusMigration; run != nil {
+		if busMigrationLeg(run.Leg) == busMigrationReshape && strings.HasSuffix(run.RunID, busReshapeRunSuffix(nonce)) {
+			return "", "", true
+		}
 		phase := busMigrationPhase(run.Phase)
 		if !busMigrationTerminal(phase) {
-			return "a bus migration is under way", false
+			return "a bus migration is under way", "running", false
 		}
 		if phase == busMigrationFailed && !run.GivenUp {
-			return "the last bus migration failed and waits for a person (retry or abandon it first)", false
-		}
-		if busMigrationLeg(run.Leg) == busMigrationReshape && strings.HasSuffix(run.RunID, busReshapeRunSuffix(nonce)) {
-			return "", true
+			return "the last bus migration failed and waits for a person (retry or abandon it first)", "failed", false
 		}
 	}
 	if !busProvisioned(agent) {
-		return "the bus is not provisioned yet", false
+		return "the bus is not provisioned yet", "unprovisioned", false
 	}
 	if busMigrationImage() == "" {
-		return "this operator was deployed without OPERATOR_IMAGE, which runs the reshape's work", false
+		return "this operator was deployed without OPERATOR_IMAGE, which runs the reshape's work", "image", false
+	}
+	if r.busMigrationStatusPruned(agent) {
+		return "the served PlatformAgent CRD drops status.busMigration, so a run started here would be lost; apply this release's CRD, then restart the operator", "pruned", false
 	}
 	streams, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
-		return "TASKS's width could not be read (" + err.Error() + ")", false
+		return "TASKS's width could not be read (" + err.Error() + ")", "unreadable", false
 	}
 	tasks, ok := streams["TASKS"]
 	if !ok {
-		return "the bus has no TASKS stream", false
+		return "the bus has no TASKS stream", "no-tasks", false
 	}
 	rendered := a2aTasksMaxConsumers(agent)
-	if tasks.MaxConsumers <= 0 || tasks.MaxConsumers >= rendered {
-		return fmt.Sprintf("TASKS already holds max_consumers %d, at least the %d this PlatformAgent renders", tasks.MaxConsumers, rendered), false
+	switch {
+	case tasks.MaxConsumers == 0:
+		return "the bus did not report TASKS's max_consumers", "unreported", false
+	case tasks.MaxConsumers < 0 || tasks.MaxConsumers >= rendered:
+		return fmt.Sprintf("TASKS already holds max_consumers %d, at least the %d this PlatformAgent renders", tasks.MaxConsumers, rendered), "wide", false
 	}
 	if over := r.busMigrationStreamsOverCapIn(ctx, agent, []string{"TASKS"}); over != "" {
-		return over, false
+		return over, "over-cap", false
 	}
-	return "", false
+	return "", "", false
 }
 
 // maybeStartBusReshape starts a reshape when the annotation asks for one
 // that busReshapeRefusal allows, persisted before the pass goes on as any
 // run's start is. A request it refuses gets one Normal Event per nonce and
-// reason, from this operator process (a restart may repeat it once).
+// kind of reason (an unreadable bus whose error text varies is one), from
+// this operator process (a restart may repeat it once).
 func (r *PlatformAgentReconciler) maybeStartBusReshape(ctx context.Context, agent *agentv1alpha1.PlatformAgent, running int) error {
 	nonce := agent.Annotations[a2aBusReshapeAnnotation]
 	if nonce == "" {
 		return nil
 	}
-	refusal, answered := r.busReshapeRefusal(ctx, agent, nonce)
+	refusal, kind, answered := r.busReshapeRefusal(ctx, agent, nonce)
 	if answered {
 		return nil
 	}
 	if refusal != "" {
-		key, seen := client.ObjectKeyFromObject(agent), nonce+"/"+refusal
+		key, seen := client.ObjectKeyFromObject(agent), nonce+"/"+kind
 		if prev, ok := r.busReshapeRefused.Load(key); !ok || prev != seen {
 			r.busReshapeRefused.Store(key, seen)
 			r.recordEvent(agent, corev1.EventTypeNormal, reasonA2ABusReshapeNotStarted,

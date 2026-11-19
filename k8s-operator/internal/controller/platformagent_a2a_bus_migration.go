@@ -66,7 +66,7 @@ const (
 	// the server count the bus runs, by snapshot and restore behind a write
 	// freeze: JetStream never changes a stream's max_consumers after it is
 	// created. Started only by a person, with the bus-reshape annotation
-	// (busReshapeWanted). Its phases are only names #6479's operator knows
+	// (maybeStartBusReshape). Its phases are only names #6479's operator knows
 	// (busReshapePhases), so an operator rolled back to that release holds
 	// the run, with an identity in the frozen map for every pod it has.
 	busMigrationReshape busMigrationLeg = "Reshape"
@@ -514,8 +514,8 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		want := int32(busMigrationReplicas(leg, phase, run.Abandoning)) // #nosec G115 -- 1 or 3
 		if leg == busMigrationReshape {
 			// A reshape never changes the count: the bus is rolled out at
-			// whatever it runs.
-			want = ptr.Deref(sts.Spec.Replicas, 1)
+			// the count it runs.
+			want = int32(busReshapeServers(agent)) // #nosec G115 -- 1 or 3
 		}
 		if !busNATSRolledOutAt(sts, want) {
 			return busMigrationPending, false, nil

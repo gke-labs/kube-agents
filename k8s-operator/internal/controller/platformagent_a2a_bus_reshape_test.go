@@ -224,6 +224,12 @@ func TestTheReshapeAnnotationStartsAReshape(t *testing.T) {
 	if stored.Status.BusMigration == nil || stored.Status.BusMigration.RunID != run.RunID {
 		t.Errorf("stored run %+v, want the started run persisted", stored.Status.BusMigration)
 	}
+	// The next pass, with the same value still set, reports nothing: the
+	// run under way answers it.
+	m.pass(busMigrationFreezing, 1)
+	if ev := m.reshapeEvents(); len(ev) != 0 {
+		t.Errorf("events %q on the pass after the start, want none", ev)
+	}
 }
 
 // Each guard refuses with a Normal Event naming why, once per request and
@@ -269,6 +275,17 @@ func TestTheReshapeGuards(t *testing.T) {
 		{"no operator image", func(t *testing.T, m *migrationRig) {
 			t.Setenv(operatorImageEnvVar, "")
 		}, "without OPERATOR_IMAGE"},
+		{"a run under way", func(t *testing.T, m *migrationRig) {
+			m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationRestoring), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+		}, "under way"},
+		{"width unreported", func(t *testing.T, m *migrationRig) {
+			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				return map[string]a2aBusStream{"TASKS": {}}, nil
+			}
+		}, "did not report"},
+		{"CRD drops the run", func(t *testing.T, m *migrationRig) {
+			m.r.prunedBusMigrationStatus.Store(client.ObjectKeyFromObject(m.agent), true)
+		}, "drops status.busMigration"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := reshapeTrigger(t, rendered-20)
@@ -280,8 +297,11 @@ func TestTheReshapeGuards(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if run := m.agent.Status.BusMigration; run != before && (run == nil || run.Leg == string(busMigrationReshape)) {
+			if run := m.agent.Status.BusMigration; run != nil && run.Leg == string(busMigrationReshape) {
 				t.Errorf("a reshape started: %+v", run)
+			}
+			if before != nil && (m.agent.Status.BusMigration == nil || m.agent.Status.BusMigration.RunID != before.RunID) {
+				t.Errorf("the run %s was replaced: %+v", before.RunID, m.agent.Status.BusMigration)
 			}
 			events := m.reshapeEvents()
 			if len(events) != 1 || !strings.Contains(events[0], c.want) || !strings.Contains(events[0], "Normal") {

@@ -107,16 +107,16 @@ JetStream fixes a stream's `max_consumers` when the stream is created, and refus
 kubectl annotate platformagent <name> -n <namespace> --overwrite kubeagents.x-k8s.io/bus-reshape=<any new value>
 ```
 
-A reshape is a migration run of leg `Reshape`, at the count the bus runs. It freezes writes as one to three does, snapshots TASKS alone, deletes it, and restores it at the rendered width, never narrower, with its messages, sequences and consumers. Then it lifts the freeze. Nothing else on the bus is touched. The freeze lasts as long as the snapshot and restore of TASKS, which is expected to be a minute or two. The failure paths, the retry and the give-up are as for one to three. A failed restore puts TASKS back as it was.
+A reshape is a migration run of leg `Reshape`, at the count the bus runs. It freezes writes as one to three does, snapshots TASKS alone, deletes it, and restores it at the rendered width, never narrower, with its messages, sequences and consumers. Then it lifts the freeze. Nothing else on the bus is touched. The freeze lasts as long as the bus's restart into it, the snapshot and restore of TASKS, and the restart out of it, which is expected to be a few minutes. The failure paths, the retry and the give-up are as for one to three. A failed restore puts TASKS back as it was.
 
 It starts only when all of these hold. Otherwise a Normal `A2ABusReshapeNotStarted` Event says why:
 
 - no migration is under way, and the last one isn't a `Failed` run waiting for a person;
 - the bus is provisioned (`BusProvisioned`), and the operator has its own image (`OPERATOR_IMAGE`);
-- the live TASKS is narrower than the width this PlatformAgent renders. This is also why an annotation left in place is harmless: once TASKS is wide enough, it does nothing. A TASKS with no limit is never narrower;
+- the live TASKS is narrower than the width this PlatformAgent renders. A TASKS with no limit is never narrower;
 - TASKS fits the limits the restore puts on it, as for one to three.
 
-A value already acted on starts nothing again. To ask again, after a reshape that was undone, set a new value. An operator rolled back to a release before reshapes holds a reshape under way ([below](#a-run-this-operator-does-not-run)), so roll back only to a release that has that hold.
+A value already acted on starts nothing again while the record of its run is the last one, and an annotation left in place does nothing while TASKS is wide enough. Remove the annotation once the reshape is done: if a later migration left TASKS as it was and the render then grew, a value left in place would start a reshape again. To ask again, after a reshape that was undone, set a new value. An operator rolled back to a release before reshapes holds a reshape under way ([below](#a-run-this-operator-does-not-run)), so roll back only to a release that has that hold.
 
 #### A run this operator does not run
 
