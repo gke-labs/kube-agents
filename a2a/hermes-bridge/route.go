@@ -217,7 +217,7 @@ func hasSharedPrincipal(key string, auth routeAuthority) bool {
 }
 
 // identityRouteFor extracts an identity-only record for doors without a chat
-// notify route (such as the Google-token A2A door or Discord) when the gateway
+// notify route (such as the Google- or Entra-token A2A door, or Discord) when the gateway
 // supplies a non-shared requester principal. Doors whose credential is shared
 // across callers (console, inject, and static-token A2A) clear userID and do
 // not record a user route, since any a2a-* session without a stored user_id

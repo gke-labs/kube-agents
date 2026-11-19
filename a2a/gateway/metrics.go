@@ -150,7 +150,7 @@ const (
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
-	// ingress. The doors (inject, a2a, a2a-google) carry programs' turns, not
+	// ingress. The doors (inject, a2a, a2a-google, a2a-entra) carry programs' turns, not
 	// chat, and are not counted.
 	platformGoogleChat = "googlechat"
 	platformSlack      = "slack"

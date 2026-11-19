@@ -561,11 +561,11 @@ func New(o Options) (*Gateway, error) {
 			gchatAllowed[strings.ToLower(u)] = true
 		}
 	}
-	a2aGoogleAllowed := googleAllowlist(o.Config.A2ADoorAllowedUsers)
+	a2aGoogleAllowed := doorAllowlist(o.Config.A2ADoorAllowedUsers)
 	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
 		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; the door refuses every Google-verified caller")
 	}
-	a2aEntraAllowed := googleAllowlist(o.Config.A2ADoorEntraAllowedUsers)
+	a2aEntraAllowed := doorAllowlist(o.Config.A2ADoorEntraAllowedUsers)
 	if o.Config.A2ADoorEntraTenantID != "" && len(a2aEntraAllowed) == 0 {
 		log.Warn("the A2A door's Microsoft Entra sign-in is armed but " + envA2ADoorEntraAllowedUsers + " is empty; the door refuses every Entra-verified caller")
 	}
@@ -3962,7 +3962,7 @@ func (g *Gateway) rosterResolver(backend string) func(string) string {
 	// class's verified object id are the mechanism. Neither door class may
 	// fall through to principalMapFor, whose default is the chat map, or a
 	// door caller's id would resolve as a chat identity.
-	if backend == consoleBackend || backend == a2aEntraBackend || backend == a2aGoogleBackend {
+	if backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {
 		return func(id string) string { return g.resolvePrincipal(backend, id) }
 	}
 	if backend == slackBackend {

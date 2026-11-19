@@ -2617,7 +2617,7 @@ Mutation(
     Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aEntraBackend || backend == a2aGoogleBackend {",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
          "\tif backend == consoleBackend || backend == a2aEntraBackend {"),
         "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
         "send the Google class's roster through principalMapFor, whose default "
@@ -2634,7 +2634,7 @@ Mutation(
     Mutation(
         "A3-a2a-entra-token-any-tenant",
         "a2a/gateway/a2adoor_entra.go",
-        ("\tif !issued || claims.Tid != v.tenantID {", "\tif false {"),
+        ("\tif !issued || !strings.EqualFold(claims.Tid, v.tenantID) {", "\tif false {"),
         "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
         "accept a token from any tenant whose key happens to be in the set, so "
         "an account outside the install's directory signs in",
@@ -2646,6 +2646,14 @@ Mutation(
         "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
         "accept a token the tenant issued for some other application, so a "
         "token a person granted another app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-entra-id-token-admitted",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\tif strings.TrimSpace(claims.Scp) == "" {', "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "admit a token that grants no delegated scope, so an ID token lifted "
+        "from a browser or a client log signs its subject in",
     ),
     Mutation(
         "A3-a2a-entra-any-bearer-parsed",
@@ -2692,7 +2700,7 @@ Mutation(
     Mutation(
         "A3-a2a-entra-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aEntraBackend || backend == a2aGoogleBackend {",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
          "\tif backend == consoleBackend || backend == a2aGoogleBackend {"),
         "test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map",
         "send the Entra class's roster through principalMapFor, whose default "

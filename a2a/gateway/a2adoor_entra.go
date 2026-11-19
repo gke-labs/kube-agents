@@ -39,8 +39,9 @@ import (
 // principal: it is immutable for the account's life, while a user principal
 // name is renamed. It is the same string the Teams backend reads for the
 // same person (from.aadObjectId), so a person's Teams turns and API calls
-// share one principal. The preferred_username claim is kept for the ingress
-// log and nothing else.
+// share one principal. The preferred_username claim is read for one log
+// line, the refusal of an account off the allowlist, so an admin can tell
+// whose object id to add, and for nothing else.
 
 const (
 	// a2aEntraBackend names the class in authority blocks and in the
@@ -94,9 +95,15 @@ const (
 	// serialization has.
 	a2aEntraSegments = 3
 	// a2aEntraMaxTokenBytes bounds a bearer this class will parse. An Entra
-	// token with the usual claims is one to three kilobytes; a bearer past
-	// this bound is refused by shape, so a junk bearer costs no decode.
-	a2aEntraMaxTokenBytes = 8 << 10
+	// token with the usual claims is one to three kilobytes; one that also
+	// carries group membership claims grows by about fifty bytes per group
+	// up to Entra's own ceiling of 200 groups in a token, so the bound sits
+	// well above that. A bearer past it is refused by shape, so a junk
+	// bearer costs no decode.
+	a2aEntraMaxTokenBytes = 32 << 10
+	// a2aEntraMinExponent is the least RSA public exponent a published key
+	// may carry; a smaller one is not a key, and crypto/rsa refuses it.
+	a2aEntraMinExponent = 3
 
 	// a2aEntraClockSkew is the tolerance on exp and nbf: a token is live
 	// from nbf minus this to exp plus this. Microsoft's own token
@@ -148,16 +155,20 @@ type entraTokenVerifier struct {
 	client  *http.Client
 	now     func() time.Time
 
-	// keysMu serialises fetches: concurrent tokens naming an unknown key
-	// cost one fetch, not one each.
+	// keysMu guards the fields below. No fetch runs under it: a fetch in
+	// progress is announced through pending, so tokens under a cached key
+	// are checked while it runs, and tokens that need it wait for that one
+	// rather than starting another.
 	keysMu sync.Mutex
 	keys   map[string]*rsa.PublicKey
-	// fetched is when keys was last fetched, successfully or not; it is
+	// fetched is when the last fetch started, successful or not; it is
 	// what a2aEntraKeysTTL and a2aEntraKeysMinRefresh are measured from.
 	fetched time.Time
 	// fetchErr is the last fetch's failure, kept so a token naming an
 	// unknown key can say whether the set is current or unreachable.
 	fetchErr error
+	// pending is closed when the fetch in progress ends; nil when none is.
+	pending chan struct{}
 }
 
 // entraIdentity is what a verified token says about its holder.
@@ -183,8 +194,15 @@ type entraClaims struct {
 	Tid      string        `json:"tid"`
 	Oid      string        `json:"oid"`
 	Username string        `json:"preferred_username"`
-	Exp      int64         `json:"exp"`
-	Nbf      int64         `json:"nbf"`
+	// Upn is what a v1.0 access token carries in place of preferred_username.
+	Upn string `json:"upn"`
+	Exp int64  `json:"exp"`
+	Nbf int64  `json:"nbf"`
+	// Scp (the delegated scopes) is what makes the token an access token a
+	// person obtained for the application; an ID token for the same
+	// application carries the same audience and no scp (it may carry
+	// roles, so roles are no substitute).
+	Scp string `json:"scp"`
 }
 
 type entraAudience []string
@@ -316,23 +334,34 @@ func (v *entraTokenVerifier) verify(ctx context.Context, token string) (entraIde
 // returns the identity they assert.
 func (v *entraTokenVerifier) identity(claims entraClaims) (entraIdentity, error) {
 	var id entraIdentity
+	// Tenant and client ids are GUIDs, which compare without case: an
+	// operator who pastes either in upper case from the portal must not
+	// have every token refused for it.
 	issued := false
 	for _, iss := range v.issuers {
-		if claims.Iss == iss {
+		if strings.EqualFold(claims.Iss, iss) {
 			issued = true
 		}
 	}
-	if !issued || claims.Tid != v.tenantID {
+	if !issued || !strings.EqualFold(claims.Tid, v.tenantID) {
 		return id, fmt.Errorf("%w: it was not issued by this install's tenant", errEntraTokenRefused)
 	}
 	audience := false
 	for _, aud := range claims.Aud {
-		if aud == v.clientID || aud == a2aEntraAudienceURIPrefix+v.clientID {
+		if strings.EqualFold(aud, v.clientID) || strings.EqualFold(aud, a2aEntraAudienceURIPrefix+v.clientID) {
 			audience = true
 		}
 	}
 	if !audience {
-		return id, fmt.Errorf("%w: it was not issued for this install's application", errEntraTokenRefused)
+		return id, fmt.Errorf("%w: it was not issued for this install's application (its audience must be %s or %s%s)", errEntraTokenRefused, v.clientID, a2aEntraAudienceURIPrefix, v.clientID)
+	}
+	// An ID token for the application has the same audience, issuer and
+	// object id, and reaches browser scripts, redirect fragments and client
+	// logs far more readily than an access token does. Only a token that
+	// grants a delegated scope is one a person obtained to call this API;
+	// an app role is no substitute, since an ID token carries roles too.
+	if strings.TrimSpace(claims.Scp) == "" {
+		return id, fmt.Errorf("%w: it grants no scope for this install's application (an ID token is not an access token; request the exposed scope)", errEntraTokenRefused)
 	}
 	now := v.now()
 	if claims.Exp == 0 || !time.Unix(claims.Exp, 0).Add(a2aEntraClockSkew).After(now) {
@@ -345,7 +374,11 @@ func (v *entraTokenVerifier) identity(claims entraClaims) (entraIdentity, error)
 	if err := entraObjectIDWellFormed(oid); err != nil {
 		return id, fmt.Errorf("%w: %v", errEntraTokenRefused, err)
 	}
-	return entraIdentity{objectID: oid, username: strings.TrimSpace(claims.Username)}, nil
+	username := strings.TrimSpace(claims.Username)
+	if username == "" {
+		username = strings.TrimSpace(claims.Upn)
+	}
+	return entraIdentity{objectID: oid, username: username}, nil
 }
 
 // entraObjectIDWellFormed holds the object id to the GUID shape, which is
@@ -362,48 +395,62 @@ func entraObjectIDWellFormed(oid string) error {
 
 // key is the tenant's public key named kid: from the cached set when it
 // holds it, else from a fresh fetch, rate-limited so invented key ids cost
-// at most one fetch a minute between them. A key a fresh set does not hold
-// is a refusal: the token was not signed by this tenant. A key that could
-// not be looked for, because the set could not be fetched or was fetched
-// too recently to fetch again, is a failure to check, not a refusal.
+// at most one fetch a minute between them. Concurrent tokens that need the
+// fetch share the one in progress. A key a fresh set does not hold is a
+// refusal: the token was not signed by this tenant. A key that could not be
+// looked for, because the set could not be fetched or was fetched too
+// recently to fetch again, is a failure to check, not a refusal.
 func (v *entraTokenVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	v.keysMu.Lock()
-	defer v.keysMu.Unlock()
 	now := v.now()
 	age := now.Sub(v.fetched)
 	if key, ok := v.keys[kid]; ok && age < a2aEntraKeysTTL {
+		v.keysMu.Unlock()
 		return key, nil
 	}
-	fetchedNow := false
-	if age >= a2aEntraKeysMinRefresh {
-		v.fetchLocked(ctx, now)
-		fetchedNow = true
+	fresh := false
+	switch {
+	case v.pending != nil:
+		done := v.pending
+		v.keysMu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, errors.New("the Microsoft Entra token could not be checked: the request ended while the tenant's signing keys were being fetched")
+		}
+		v.keysMu.Lock()
+		fresh = true
+	case age >= a2aEntraKeysMinRefresh:
+		done := make(chan struct{})
+		v.pending = done
+		v.fetched = now
+		v.keysMu.Unlock()
+		// Not on the requester's context: others may be waiting on this
+		// fetch, and a client that leaves must not fail theirs or leave
+		// the set unread for the next minute. The HTTP client's timeout
+		// bounds it. A fetch that fails leaves the old set in place, so an
+		// outage costs nothing to tokens under a key already held.
+		keys, err := v.fetchKeys(context.WithoutCancel(ctx))
+		v.keysMu.Lock()
+		v.fetchErr = err
+		if err == nil {
+			v.keys = keys
+		}
+		v.pending = nil
+		close(done)
+		fresh = true
 	}
+	defer v.keysMu.Unlock()
 	if key, ok := v.keys[kid]; ok {
 		return key, nil
 	}
-	if fetchedNow && v.fetchErr == nil {
+	if fresh && v.fetchErr == nil {
 		return nil, fmt.Errorf("%w: it names a signing key the tenant does not publish", errEntraTokenRefused)
 	}
 	if v.fetchErr != nil {
 		return nil, v.fetchErr
 	}
 	return nil, errors.New("the Microsoft Entra token could not be checked: it names a signing key the cached set does not hold, and the set was refreshed too recently to refresh again; retry shortly")
-}
-
-// fetchLocked replaces the cached set with the tenant's current one. A fetch
-// that fails leaves the old set in place, so a transient outage costs
-// nothing to tokens signed with a key already held, and records the failure
-// for the ones it cannot check.
-func (v *entraTokenVerifier) fetchLocked(ctx context.Context, now time.Time) {
-	v.fetched = now
-	v.fetchErr = nil
-	keys, err := v.fetchKeys(ctx)
-	if err != nil {
-		v.fetchErr = err
-		return
-	}
-	v.keys = keys
 }
 
 // fetchKeys reads the tenant's JWK Set and returns its RSA keys by id. A
@@ -463,7 +510,7 @@ func entraRSAKey(n, e string) (*rsa.PublicKey, error) {
 		return nil, errors.New("empty modulus or exponent")
 	}
 	ex := new(big.Int).SetBytes(exponent)
-	if !ex.IsInt64() || ex.Int64() > int64(^uint32(0)) || ex.Int64() < 3 {
+	if !ex.IsInt64() || ex.Int64() > int64(^uint32(0)) || ex.Int64() < a2aEntraMinExponent {
 		return nil, errors.New("exponent out of range")
 	}
 	return &rsa.PublicKey{N: new(big.Int).SetBytes(modulus), E: int(ex.Int64())}, nil
@@ -481,10 +528,8 @@ func a2aEntraOpenIDConfigURL(tenantID string) string {
 
 // identifyEntra is identify's arm for a bearer shaped like a JWT when the
 // class is armed: the verified caller if its object id is on the door's
-// allowlist, else the refusal. The split of refusals is the Google class's:
-// a verdict against the token is a 401 a client answers by signing in again,
-// an account off the list is a 403 that signing in again cannot help, and a
-// failure to reach a verdict (the tenant's keys unreachable) is a 503.
+// allowlist, else the refusal. An account off the list is a 403 that signing
+// in again cannot help; every other refusal is refuseDoorBearer's split.
 func (d *A2ADoor) identifyEntra(w http.ResponseWriter, r *http.Request, presented string) (verified string, ok bool) {
 	id, err := d.entra.verify(r.Context(), presented)
 	if err == nil && !d.entraAllowed[strings.ToLower(id.objectID)] {
@@ -498,12 +543,7 @@ func (d *A2ADoor) identifyEntra(w http.ResponseWriter, r *http.Request, presente
 	}
 	if err != nil {
 		d.log.Warn("the A2A door refused a bearer as a Microsoft Entra token", "reason", err.Error())
-		if errors.Is(err, errEntraTokenRefused) {
-			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-			injectError(w, http.StatusUnauthorized, "the bearer is neither the A2A door's token nor a Microsoft Entra token this install accepts: "+err.Error())
-		} else {
-			injectError(w, http.StatusServiceUnavailable, err.Error())
-		}
+		refuseDoorBearer(w, err, errEntraTokenRefused, "a Microsoft Entra token")
 		return "", false
 	}
 	return a2aEntraCaller(id.objectID), true

@@ -1901,8 +1901,9 @@ func (g *Gateway) resolveInjectPrincipal(authorID string) string {
 // refusal for anything else. The caller named itself in a header or the
 // message metadata, so the map is the only thing standing between a
 // bearer-token holder and a principal of their choosing, exactly as on the
-// inject door. The developer and unattended identity classes, when they
-// land, resolve through a verifier beside this and never through this map.
+// inject door. The Google and Entra classes resolve through verifiers beside
+// this (resolveA2AGooglePrincipal, resolveA2AEntraPrincipal), as the
+// unattended class will, never through this map.
 func (g *Gateway) resolveA2APrincipal(authorID string) string {
 	if g.a2aPM == nil {
 		return ""

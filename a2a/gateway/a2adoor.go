@@ -23,7 +23,8 @@ import (
 // through a door-scoped principal map into eval identities and nothing else -
 // and differs in what it speaks: JSON-RPC 2.0 in the A2A protocol's method
 // set, and an agent card at the well-known path so a client can find it. Its
-// second class, a developer signed in with Google, is in a2adoor_google.go.
+// second class, a developer signed in with Google, is in a2adoor_google.go;
+// its third, a person signed in with Microsoft Entra ID, in a2adoor_entra.go.
 //
 // Everything a caller does here becomes an ordinary gateway turn. The door
 // holds no bus credential, mints no id the bus sees, writes no authority
@@ -437,9 +438,9 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		taskDeadline:     deadline,
 		log:              log,
 		google:           googleVerifierFor(o.GoogleClientID),
-		googleAllowed:    googleAllowlist(o.GoogleAllowedUsers),
+		googleAllowed:    doorAllowlist(o.GoogleAllowedUsers),
 		entra:            entraVerifierFor(o.EntraTenantID, o.EntraClientID),
-		entraAllowed:     googleAllowlist(o.EntraAllowedUsers),
+		entraAllowed:     doorAllowlist(o.EntraAllowedUsers),
 		conversations:    map[string]*a2aConversation{},
 		tasks:            map[string]*a2aTask{},
 		submissions:      map[string]*a2aOutcome{},
@@ -487,7 +488,7 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 		"address", ln.Addr().String(), "rpc", d.publicURL)
 	if d.google != nil {
 		d.log.Warn("the A2A door's Google sign-in is armed: a Google account on the door's allowlist that reaches this listener "+
-			"can submit tasks as itself, and any bearer that is not the door's token is sent to Google's tokeninfo endpoint to be checked",
+			"can submit tasks as itself, and a bearer shaped like a Google access token (ya29.) is sent to Google's tokeninfo endpoint to be checked",
 			"allowedUsers", len(d.googleAllowed))
 	}
 	if d.entra != nil {

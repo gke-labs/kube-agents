@@ -26,7 +26,8 @@ import (
 // Google Chat adapter carries for the same person (it keeps the case for the
 // audit join, and so does this). It sits beside the eval class, never instead of it: a request
 // whose bearer is the door's static token is the eval class exactly as
-// before, and only a bearer that is not reaches this verifier.
+// before, and a bearer that is neither that nor, with the Entra class armed,
+// shaped like a JWT (a2adoor_entra.go takes those) reaches this verifier.
 //
 // A Google access token is opaque, so it is checked through the tokeninfo
 // endpoint rather than locally. Nothing here holds a refresh token, a client
@@ -100,6 +101,10 @@ const (
 	// a2aMaxEmailRunes bounds the verified email: with the prefix it must
 	// still fit the caller bound every key segment is held to.
 	a2aMaxEmailRunes = a2aMaxCallerRunes - len(a2aGoogleCallerPrefix)
+
+	// a2aDoorBearerChallenge is the WWW-Authenticate value every sign-in
+	// class's 401 carries.
+	a2aDoorBearerChallenge = `Bearer error="invalid_token"` // #nosec G101 -- a WWW-Authenticate challenge, not a credential
 )
 
 // googleTokenVerifier checks Google access tokens for one client id and
@@ -402,9 +407,9 @@ func a2aBackendForCaller(caller string) string {
 	return a2aBackend
 }
 
-// googleAllowlist is the door's copy of the class's allowlist, keyed
-// lower-cased; the gateway builds its own from the same config.
-func googleAllowlist(users []string) map[string]bool {
+// doorAllowlist is a sign-in class's allowlist, keyed lower-cased: the
+// door's copy and the gateway's are built from the same config by it.
+func doorAllowlist(users []string) map[string]bool {
 	allowed := map[string]bool{}
 	for _, u := range users {
 		if u = strings.TrimSpace(u); u != "" {
@@ -435,17 +440,34 @@ func bearerOf(r *http.Request) (string, bool) {
 	return "", false
 }
 
+// refuseDoorBearer answers a sign-in class's error for a bearer that is not
+// the static token. A verdict against the token (an error under root) is a
+// 401 with the challenge, said as both kinds of bearer the door takes, since
+// a holder of a stale static token lands here too and must not be pointed
+// at one sign-in alone; a failure to reach a verdict is a 503, so a client
+// does not loop through a sign-in that cannot help. kind names the class's
+// token ("a Google access token", "a Microsoft Entra token").
+func refuseDoorBearer(w http.ResponseWriter, err, root error, kind string) {
+	if errors.Is(err, root) {
+		w.Header().Set("WWW-Authenticate", a2aDoorBearerChallenge)
+		injectError(w, http.StatusUnauthorized, "the bearer is neither the A2A door's token nor "+kind+" this install accepts: "+err.Error())
+		return
+	}
+	injectError(w, http.StatusServiceUnavailable, err.Error())
+}
+
 // identify authenticates a request. The door's static token is the eval
 // class, as it always was: ok with no verified caller, and each method
-// names its caller (callerOf). Any other bearer, when the developer class is
-// armed, is checked as a Google access token, and the verified caller is
-// returned if its email is on the door's allowlist. Everything else is the
-// 401 it was before.
+// names its caller (callerOf). A bearer shaped like a JWT, when the Entra
+// class is armed, goes to identifyEntra; any other bearer, when the Google
+// class is armed, is checked as a Google access token, and the verified
+// caller is returned if its email is on the door's allowlist. Everything
+// else is the 401 it was before.
 //
 // A refusal on the token's merits is a 401 a client answers by signing in
-// again; a failure to reach a verdict (Google unreachable, the door's
-// check concurrency spent) is a 503, so a client does not loop through a
-// sign-in that cannot help.
+// again; a failure to reach a verdict (Google or the tenant's key set
+// unreachable, the door's Google check concurrency spent) is a 503, so a
+// client does not loop through a sign-in that cannot help.
 func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified string, ok bool) {
 	presented, hasBearer := bearerOf(r)
 	if hasBearer && subtle.ConstantTimeCompare([]byte(presented), []byte(d.token)) == 1 {
@@ -454,11 +476,12 @@ func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified str
 	if !hasBearer || (d.google == nil && d.entra == nil) {
 		return "", d.authorized(w, r)
 	}
-	// The Entra class (a2adoor_entra.go) takes a bearer shaped like a JWT,
-	// and every other bearer when it is the only class armed; the Google
-	// class takes the rest. A Google access token is not a JWT, so a
-	// bearer meant for one class is never checked as the other's.
-	if d.entra != nil && (d.google == nil || entraTokenShaped(presented)) {
+	// A bearer shaped like a Google access token (its fixed prefix) goes to
+	// the Google class when it is armed; every other bearer goes to the
+	// Entra class when that is armed, else to the Google class, whose own
+	// shape check refuses it. The Google prefix decides, not the JWT shape:
+	// some Google access tokens carry dots of their own.
+	if d.entra != nil && !(d.google != nil && strings.HasPrefix(presented, a2aGoogleAccessTokenPrefix)) {
 		return d.identifyEntra(w, r, presented)
 	}
 	email, err := d.google.verify(r.Context(), presented)
@@ -476,15 +499,7 @@ func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified str
 	}
 	if err != nil {
 		d.log.Warn("the A2A door refused a bearer as a Google access token", "reason", err.Error())
-		if errors.Is(err, errGoogleTokenRefused) {
-			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-			// Said as both doors of the class: a holder of a stale static
-			// token lands here too, and must not be pointed at Google
-			// sign-in alone.
-			injectError(w, http.StatusUnauthorized, "the bearer is neither the A2A door's token nor a Google access token this install accepts: "+err.Error())
-		} else {
-			injectError(w, http.StatusServiceUnavailable, err.Error())
-		}
+		refuseDoorBearer(w, err, errGoogleTokenRefused, "a Google access token")
 		return "", false
 	}
 	return a2aGoogleCaller(email), true

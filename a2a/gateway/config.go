@@ -430,8 +430,8 @@ type Config struct {
 	// A2ADoorPrincipalMapPath is the door's OWN principal map
 	// (A2A_DOOR_PRINCIPAL_MAP): keys prefixed a2a:, values eval-only
 	// identities, never a fallback to the chat map or the inject map. The
-	// developer identity class (ID tokens) arrives as a second resolver
-	// beside this file, not as an entry in it.
+	// Google and Entra sign-in classes resolve through verifiers beside
+	// this file, never as entries in it.
 	A2ADoorPrincipalMapPath string
 
 	// A2ADoorPublicURL is the URL the agent card advertises for the door's
@@ -1090,6 +1090,23 @@ func FromEnv() (*Config, error) {
 	}
 	if (cfg.A2ADoorEntraTenantID == "") != (cfg.A2ADoorEntraClientID == "") {
 		return nil, fmt.Errorf("%s and %s are set together or not at all: the Microsoft Entra sign-in class checks a token against one tenant's keys for one application", envA2ADoorEntraTenantID, envA2ADoorEntraClientID)
+	}
+	// The token's tid claim is always the directory's GUID, and the door
+	// compares it to this value, so the tenant's domain name (which the
+	// Entra authority also accepts in a URL) would fetch the keys and then
+	// refuse every token as another tenant's. The client id is a GUID too.
+	for name, value := range map[string]string{envA2ADoorEntraTenantID: cfg.A2ADoorEntraTenantID, envA2ADoorEntraClientID: cfg.A2ADoorEntraClientID} {
+		if value != "" && !a2aEntraObjectIDPattern.MatchString(value) {
+			return nil, fmt.Errorf("%s is %q, not a GUID: use the portal's \"Directory (tenant) ID\" and \"Application (client) ID\" values, not a domain name", name, value)
+		}
+	}
+	// The allowlist names object ids; a UPN or an email can never match the
+	// GUID a token carries, so a list of them would admit nobody with no
+	// sign of why.
+	for _, u := range cfg.A2ADoorEntraAllowedUsers {
+		if !a2aEntraObjectIDPattern.MatchString(u) {
+			return nil, fmt.Errorf("%s entry %q is not an object id (a GUID): the Entra class lists people by object id, not by UPN or email", envA2ADoorEntraAllowedUsers, u)
+		}
 	}
 	if cfg.A2ADoorEntraTenantID != "" && cfg.A2ADoorListen == "" {
 		return nil, fmt.Errorf("%s is set but A2A_DOOR_LISTEN is not: the Microsoft Entra sign-in class is part of the A2A door and has nothing to arm without it", envA2ADoorEntraTenantID)

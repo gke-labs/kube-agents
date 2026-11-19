@@ -125,8 +125,8 @@ func entraClaimsAt(now time.Time) map[string]any {
 	return map[string]any{
 		"iss": fmt.Sprintf(a2aEntraIssuerV2Format, entraTestTenant),
 		"aud": entraTestClientID, "tid": entraTestTenant, "oid": entraTestObjectID,
-		"preferred_username": entraTestUsername,
-		"exp":                now.Add(time.Hour).Unix(), "nbf": now.Add(-time.Minute).Unix(), "iat": now.Add(-time.Minute).Unix(),
+		"preferred_username": entraTestUsername, "scp": "access",
+		"exp": now.Add(time.Hour).Unix(), "nbf": now.Add(-time.Minute).Unix(), "iat": now.Add(-time.Minute).Unix(),
 	}
 }
 
@@ -193,6 +193,10 @@ func TestEntraVerifierAdmitsEveryShapeTheTenantIssues(t *testing.T) {
 		"upper-case oid": func(c map[string]any) {
 			c["oid"] = strings.ToUpper(entraTestObjectID)
 		},
+		"v1 upn, no preferred_username": func(c map[string]any) {
+			delete(c, "preferred_username")
+			c["upn"] = entraTestUsername
+		},
 	} {
 		claims := entraClaimsFor()
 		edit(claims)
@@ -206,6 +210,9 @@ func TestEntraVerifierAdmitsEveryShapeTheTenantIssues(t *testing.T) {
 		}
 		if name == "upper-case oid" && id.objectID != strings.ToUpper(entraTestObjectID) {
 			t.Errorf("the object id was not returned as the tenant sent it: %q", id.objectID)
+		}
+		if name == "v1 upn, no preferred_username" && id.username != entraTestUsername {
+			t.Errorf("a v1.0 token's upn was not read as the username: %q", id.username)
 		}
 	}
 }
@@ -228,30 +235,34 @@ func TestEntraVerifierRefusals(t *testing.T) {
 		// unknown key is a refusal only once a fresh set has been read.
 		fresh bool
 	}{
-		"not a JWT":          {token: "ya29.not-a-jwt", want: "not shaped"},
-		"two segments":       {token: "aGVhZGVy.cGF5bG9hZA", want: "not shaped"},
-		"empty segment":      {token: "aGVhZGVy..c2ln", want: "not shaped"},
-		"oversized":          {token: strings.Repeat("a", a2aEntraMaxTokenBytes) + ".b.c", want: "not shaped"},
-		"header not JSON":    {token: "bm90LWpzb24.cGF5bG9hZA.c2ln", want: "header does not decode"},
-		"alg none":           {token: mintEntra(t, signing, map[string]any{"alg": "none", "kid": entraTestKid}, entraClaimsFor()), want: "not signed with RS256"},
-		"alg HS256":          {token: mintEntra(t, signing, map[string]any{"alg": "HS256", "kid": entraTestKid}, entraClaimsFor()), want: "not signed with RS256"},
-		"no kid":             {token: mintEntra(t, signing, map[string]any{"alg": a2aEntraAlgorithm}, entraClaimsFor()), want: "names no signing key"},
-		"unknown kid":        {token: mintEntra(t, signing, rs256("invented"), entraClaimsFor()), want: "does not publish", fresh: true},
-		"stranger's key":     {token: mintEntra(t, stranger, nil, entraClaimsFor()), want: "signature does not verify"},
-		"wrong issuer":       {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "iss", "https://login.microsoftonline.com/other-tenant/v2.0")), want: "not issued by this install's tenant"},
-		"wrong tid":          {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "tid", "other-tenant")), want: "not issued by this install's tenant"},
-		"wrong audience":     {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "aud", "another-app")), want: "not issued for this install's application"},
-		"no audience":        {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "aud", nil)), want: "not issued for this install's application"},
-		"expired":            {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "exp", time.Now().Add(-a2aEntraClockSkew-time.Minute).Unix())), want: "expired"},
-		"no exp":             {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "exp", nil)), want: "expired"},
-		"not yet valid":      {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "nbf", time.Now().Add(a2aEntraClockSkew+time.Minute).Unix())), want: "not valid yet"},
-		"no oid":             {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "oid", nil)), want: "carries no object id"},
-		"oid not a GUID":     {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "oid", "dev@example.com")), want: "not shaped like one"},
-		"oid with a colon":   {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "oid", "entra:"+entraTestObjectID)), want: "not shaped like one"},
-		"claims not JSON":    {token: tamperedPayload(t, signing, "not-json"), want: "claims do not decode"},
-		"tampered claims":    {token: tamperedClaims(t, liveEntraToken(t), "oid", entraTestOtherOID), want: "signature does not verify"},
-		"signature garbage":  {token: strings.Join(strings.Split(liveEntraToken(t), ".")[:2], ".") + ".c2ln", want: "signature does not verify"},
-		"signature not b64u": {token: strings.Join(strings.Split(liveEntraToken(t), ".")[:2], ".") + ".c2ln=", want: "not shaped"},
+		"not a JWT":                       {token: "ya29.not-a-jwt", want: "not shaped"},
+		"two segments":                    {token: "aGVhZGVy.cGF5bG9hZA", want: "not shaped"},
+		"empty segment":                   {token: "aGVhZGVy..c2ln", want: "not shaped"},
+		"oversized":                       {token: strings.Repeat("a", a2aEntraMaxTokenBytes) + ".b.c", want: "not shaped"},
+		"header not JSON":                 {token: "bm90LWpzb24.cGF5bG9hZA.c2ln", want: "header does not decode"},
+		"alg none":                        {token: mintEntra(t, signing, map[string]any{"alg": "none", "kid": entraTestKid}, entraClaimsFor()), want: "not signed with RS256"},
+		"alg HS256":                       {token: mintEntra(t, signing, map[string]any{"alg": "HS256", "kid": entraTestKid}, entraClaimsFor()), want: "not signed with RS256"},
+		"no kid":                          {token: mintEntra(t, signing, map[string]any{"alg": a2aEntraAlgorithm}, entraClaimsFor()), want: "names no signing key"},
+		"unknown kid":                     {token: mintEntra(t, signing, rs256("invented"), entraClaimsFor()), want: "does not publish", fresh: true},
+		"stranger's key":                  {token: mintEntra(t, stranger, nil, entraClaimsFor()), want: "signature does not verify"},
+		"wrong issuer":                    {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "iss", "https://login.microsoftonline.com/other-tenant/v2.0")), want: "not issued by this install's tenant"},
+		"wrong tid":                       {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "tid", "other-tenant")), want: "not issued by this install's tenant"},
+		"wrong audience":                  {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "aud", "another-app")), want: "not issued for this install's application"},
+		"no audience":                     {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "aud", nil)), want: "not issued for this install's application"},
+		"ID token (no scp)":               {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "scp", nil)), want: "grants no scope"},
+		"ID token with app roles, no scp": {token: mintEntra(t, signing, nil, edited(edited(entraClaimsFor(), "scp", nil), "roles", []string{"Door.Call"})), want: "grants no scope"},
+		"blank scp":                       {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "scp", "  ")), want: "grants no scope"},
+		"custom audience URI":             {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "aud", "https://contoso.example/kube-agents")), want: "its audience must be " + entraTestClientID},
+		"expired":                         {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "exp", time.Now().Add(-a2aEntraClockSkew-time.Minute).Unix())), want: "expired"},
+		"no exp":                          {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "exp", nil)), want: "expired"},
+		"not yet valid":                   {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "nbf", time.Now().Add(a2aEntraClockSkew+time.Minute).Unix())), want: "not valid yet"},
+		"no oid":                          {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "oid", nil)), want: "carries no object id"},
+		"oid not a GUID":                  {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "oid", "dev@example.com")), want: "not shaped like one"},
+		"oid with a colon":                {token: mintEntra(t, signing, nil, edited(entraClaimsFor(), "oid", "entra:"+entraTestObjectID)), want: "not shaped like one"},
+		"claims not JSON":                 {token: tamperedPayload(t, signing, "not-json"), want: "claims do not decode"},
+		"tampered claims":                 {token: tamperedClaims(t, liveEntraToken(t), "oid", entraTestOtherOID), want: "signature does not verify"},
+		"signature garbage":               {token: strings.Join(strings.Split(liveEntraToken(t), ".")[:2], ".") + ".c2ln", want: "signature does not verify"},
+		"signature not b64u":              {token: strings.Join(strings.Split(liveEntraToken(t), ".")[:2], ".") + ".c2ln=", want: "not shaped"},
 	}
 	for name, c := range cases {
 		verifier := v
@@ -686,6 +697,14 @@ func TestA2ADoorDispatchesBetweenTheGoogleAndEntraClasses(t *testing.T) {
 	if tokeninfo.calls.Load() != 1 {
 		t.Error("a junk bearer was sent to Google")
 	}
+	// A Google access token with dots of its own is still Google's: the
+	// prefix decides the class, not the JWT shape.
+	if _, code := identify("ya29.c.dotted-token"); code != http.StatusUnauthorized {
+		t.Errorf("a dotted Google token: HTTP %d, want 401 from Google's refusal", code)
+	}
+	if tokeninfo.calls.Load() != 2 {
+		t.Error("a dotted Google access token was routed to the Entra class instead of Google's tokeninfo")
+	}
 }
 
 func TestA2ACardListsEntraSignInOnlyWhenArmed(t *testing.T) {
@@ -740,12 +759,31 @@ func TestA2AEntraConfigGuards(t *testing.T) {
 	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), envA2ADoorEntraClientID) {
 		t.Fatalf("a tenant without a client id was accepted: %v", err)
 	}
+	t.Setenv(envA2ADoorEntraTenantID, "")
 	t.Setenv(envA2ADoorEntraClientID, entraTestClientID)
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), envA2ADoorEntraTenantID) {
+		t.Fatalf("a client id without a tenant was accepted: %v", err)
+	}
+	t.Setenv(envA2ADoorEntraTenantID, entraTestTenant)
 	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_DOOR_LISTEN") {
 		t.Fatalf("the class without the door was accepted: %v", err)
 	}
 	t.Setenv("A2A_DOOR_LISTEN", "127.0.0.1:9999")
 	t.Setenv("A2A_DOOR_TOKEN", "t")
+	t.Setenv(envA2ADoorEntraTenantID, "kubeagents.onmicrosoft.com")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "not a GUID") {
+		t.Fatalf("a domain-form tenant id was accepted: %v", err)
+	}
+	t.Setenv(envA2ADoorEntraTenantID, entraTestTenant)
+	t.Setenv(envA2ADoorEntraClientID, "kube-agents-door")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "not a GUID") {
+		t.Fatalf("a client id that is a name was accepted: %v", err)
+	}
+	t.Setenv(envA2ADoorEntraClientID, entraTestClientID)
+	t.Setenv(envA2ADoorEntraAllowedUsers, entraTestObjectID+",admin@kubeagents.onmicrosoft.com")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "not an object id") {
+		t.Fatalf("a UPN on the allowlist was accepted: %v", err)
+	}
 	t.Setenv(envA2ADoorEntraAllowedUsers, " "+entraTestObjectID+", ,"+entraTestOtherOID+" ")
 	cfg, err := FromEnv()
 	if err != nil {
@@ -832,5 +870,125 @@ func TestA2AEntraBackendIsADoorBackendEverywhere(t *testing.T) {
 	}
 	if got := a2aBackendForCaller(a2aEntraCaller(entraTestObjectID)); got != a2aEntraBackend {
 		t.Errorf("backend for an Entra caller = %q", got)
+	}
+}
+
+// TestEntraVerifierAcceptsIdsInEitherCase: tenant and client ids are GUIDs;
+// an operator who pastes them in upper case from the portal is not refused
+// for it, and a token spelling them in upper case is not either.
+func TestEntraVerifierAcceptsIdsInEitherCase(t *testing.T) {
+	t.Parallel()
+	f := newFakeTenant(t)
+	v := newEntraTokenVerifier(strings.ToUpper(entraTestTenant), strings.ToUpper(entraTestClientID))
+	v.keysURL = f.srv.URL
+	if _, err := v.verify(context.Background(), liveEntraToken(t)); err != nil {
+		t.Errorf("upper-case configured ids refused a lower-case token: %v", err)
+	}
+	signing, _, _ := entraKeys(t)
+	claims := entraClaimsFor()
+	claims["tid"] = strings.ToUpper(entraTestTenant)
+	claims["aud"] = strings.ToUpper(entraTestClientID)
+	if _, err := testEntraVerifier(f).verify(context.Background(), mintEntra(t, signing, nil, claims)); err != nil {
+		t.Errorf("an upper-case tid and aud were refused: %v", err)
+	}
+}
+
+// TestEntraVerifierFetchOutlivesTheRequester: the key-set fetch runs on its
+// own context, so a client that leaves mid-fetch neither fails the fetch
+// for the others nor leaves the set unread for the next minute.
+func TestEntraVerifierFetchOutlivesTheRequester(t *testing.T) {
+	t.Parallel()
+	f := newFakeTenant(t)
+	v := testEntraVerifier(f)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := v.verify(ctx, liveEntraToken(t)); err != nil {
+		t.Fatalf("a requester that had already left failed the fetch: %v", err)
+	}
+	if n := f.fetches.Load(); n != 1 {
+		t.Errorf("fetched %d times", n)
+	}
+}
+
+// TestEntraVerifierSharesOneFetchAcrossConcurrentTokens: tokens that arrive
+// while the set is being fetched wait for that fetch rather than starting
+// their own, and tokens under a cached key are not held up by it.
+func TestEntraVerifierSharesOneFetchAcrossConcurrentTokens(t *testing.T) {
+	t.Parallel()
+	signing, _, _ := entraKeys(t)
+	release := make(chan struct{})
+	var fetches atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fetches.Add(1)
+		<-release
+		set := entraKeySet{}
+		set.Keys = append(set.Keys, struct {
+			Kty string `json:"kty"`
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		}{Kty: "RSA", Kid: entraTestKid, N: base64.RawURLEncoding.EncodeToString(signing.N.Bytes()), E: base64.RawURLEncoding.EncodeToString(big.NewInt(int64(signing.E)).Bytes())})
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	t.Cleanup(srv.Close)
+	v := newEntraTokenVerifier(entraTestTenant, entraTestClientID)
+	v.keysURL = srv.URL
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := v.verify(context.Background(), liveEntraToken(t))
+			errs <- err
+		}()
+	}
+	// Every caller is parked on the one fetch; the lock is free meanwhile.
+	deadline := time.Now().Add(5 * time.Second)
+	for fetches.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	locked := make(chan struct{})
+	go func() { v.keysMu.Lock(); v.keysMu.Unlock(); close(locked) }()
+	select {
+	case <-locked:
+	case <-time.After(2 * time.Second):
+		t.Error("keysMu is held while the fetch is in flight")
+	}
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a waiting caller failed: %v", err)
+		}
+	}
+	if n := fetches.Load(); n != 1 {
+		t.Errorf("%d concurrent tokens drove %d fetches, want one", callers, n)
+	}
+}
+
+// TestA2ADoorWithGoogleAloneRefusesAJWTWithoutAskingGoogle: with only the
+// Google class armed a JWT-shaped bearer is refused by the Google class's
+// shape check, and never leaves the cluster.
+func TestA2ADoorWithGoogleAloneRefusesAJWTWithoutAskingGoogle(t *testing.T) {
+	tokeninfo := newFakeTokeninfo(t)
+	door, err := NewA2ADoor("127.0.0.1:0", a2aTestToken, A2ADoorOptions{
+		GoogleClientID: googleTestClientID, GoogleAllowedUsers: []string{googleTestEmail},
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.google.tokeninfoURL = tokeninfo.srv.URL
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, a2aRPCPath, nil)
+	r.Header.Set(authorizationHeader, "Bearer "+liveEntraToken(t))
+	if verified, ok := door.identify(w, r); ok || verified != "" || w.Code != http.StatusUnauthorized {
+		t.Errorf("a JWT on a Google-only door: verified=%q ok=%v HTTP %d", verified, ok, w.Code)
+	}
+	if tokeninfo.calls.Load() != 0 {
+		t.Error("the JWT was sent to Google's tokeninfo")
 	}
 }

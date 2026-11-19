@@ -1280,7 +1280,7 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
         body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
         self.assertRegex(
             body,
-            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend \{\s*return func",
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend[^{]*\{\s*return func",
             "the Google class's roster falls through to principalMapFor, whose default is the chat map",
         )
 
@@ -1326,7 +1326,7 @@ class A3TheA2ADoorsEntraClassAssertsOnlyAVerifiedObjectID(unittest.TestCase):
         body = h.go_function_body(h.text("a2a_door_entra"), "identity")
         self.assertRegex(
             body,
-            r"if !issued \|\| claims\.Tid != v\.tenantID \{\s*return id, fmt\.Errorf",
+            r"if !issued \|\| !strings\.EqualFold\(claims\.Tid, v\.tenantID\) \{\s*return id, fmt\.Errorf",
             "a token of another tenant is no longer refused",
         )
         self.assertRegex(
@@ -1338,6 +1338,11 @@ class A3TheA2ADoorsEntraClassAssertsOnlyAVerifiedObjectID(unittest.TestCase):
             body,
             r'"%w: it has expired"',
             "an expired token is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if strings\.TrimSpace\(claims\.Scp\) == "" \{\s*return id, fmt\.Errorf',
+            "a token that grants no delegated scope (an ID token) is no longer refused",
         )
 
     def test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys(self) -> None:
