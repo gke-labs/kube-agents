@@ -413,31 +413,39 @@ conversation a Vertex `session_id` so a new conversation's first turn can read
 a prompt another conversation warmed:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
 
-To pass custom Vertex AI environment variables through `litellm.envFromSecret`
-([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)) or render
-a custom-universe Vertex `api_base` in `config.yaml` via
-`platformAgent.harness.universeDomain`, pair them with
+To override the Vertex AI endpoint host through `litellm.envFromSecret`
+([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)) with
+`VERTEXAI_API_BASE` or render a custom-universe Vertex `api_base` in
+`config.yaml` via `platformAgent.harness.universeDomain`, pair them with
 `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and
 `litellm.vertex.location`:
 
 ```bash
---set platformAgent.harness.universeDomain=universe.example.com \
---set litellm.modelProvider=vertex_ai \
---set litellm.modelDefaultName=gemini-3.8-flash \
---set litellm.vertex.projectId=my-serving-project \
---set litellm.vertex.location=us-east4 \
---set litellm.envFromSecret=vertex-endpoint
+kubectl create secret generic vertex-endpoint -n kubeagents-system \
+  --from-literal=VERTEXAI_API_BASE=https://us-east4-aiplatform.universe.example.com
+
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.modelDefaultName=gemini-3.8-flash \
+  --set litellm.vertex.projectId=my-serving-project \
+  --set litellm.vertex.location=us-east4 \
+  --set litellm.envFromSecret=vertex-endpoint
 ```
 
-`litellm.envFromSecret` mounts environment variables via `envFrom` without
-rendering `api_base` in `config.yaml`, and container `env` entries
-(`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
-when `platformAgent.harness.universeDomain` is non-default) always override
-matching keys in `litellm.envFromSecret`; only a non-default
-`platformAgent.harness.universeDomain` renders `api_base`
+When `api_base` is empty in `config.yaml`, LiteLLM reads `VERTEXAI_API_BASE`
+from the environment and appends
+`/v1/projects/<VERTEXAI_PROJECT>/locations/<VERTEXAI_LOCATION>/...` to a
+host-only base, so the chart's project and location still apply. Setting a
+non-default `platformAgent.harness.universeDomain` renders `api_base`
 (`https://aiplatform.<universeDomain>` for `global` or
 `https://<location>-aiplatform.<universeDomain>` for a regional location) in
-`config.yaml`. Full precedence and examples:
+`config.yaml`, which wins over `VERTEXAI_API_BASE`. Container `env` entries
+(`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+when `platformAgent.harness.universeDomain` is non-default) always override
+matching keys in `litellm.envFromSecret`. Full precedence and examples:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden).
 
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
@@ -524,9 +532,13 @@ in the credentials Secret, or custom environment variables for `vertex_ai`:
   caches it and renews it before expiry
   ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
 - **Vertex AI custom environment variables (`litellm.modelProvider=vertex_ai`).**
-  Mounts environment variables via `envFrom` without rendering `api_base` in
-  `config.yaml`; pair with `litellm.vertex.projectId` (or `projectSecretRef`)
-  and `litellm.vertex.location` ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
+  Set `VERTEXAI_API_BASE` (matching `litellm.vertex.location`) or other custom
+  variables in the Secret (`envFrom`, which does not render `api_base` in
+  `config.yaml`, so a non-default `platformAgent.harness.universeDomain`
+  rendering `api_base` wins over `VERTEXAI_API_BASE`); pair with
+  `litellm.vertex.projectId` (or `projectSecretRef`) and
+  `litellm.vertex.location`
+  ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
 
 A variable the chart sets directly in container `env` — keys from the
 credentials Secret (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY`, ...), plus

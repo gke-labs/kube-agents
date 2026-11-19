@@ -357,11 +357,11 @@ Where Workload Identity is not available, the chart can read a service-account k
 
 Both fields are chart-only and read only with `modelProvider: vertex_ai`; the render fails if either is set for another provider or omits `name` or `key`. Mint the key for a dedicated service account holding only `roles/aiplatform.user` on the serving project (see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity)), rotate it in the Secret, and prefer Workload Identity wherever the cluster supports it. Changing either Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it so the process reloads `VERTEXAI_PROJECT` and the key file.
 
-To pass custom Vertex AI environment variables to the gateway container through the [gateway environment Secret](#a-credentials-secret-for-the-gateway), pair `--litellm-env-secret` (`LITELLM_ENV_SECRET_NAME` / `litellm.envFromSecret`) with `--vertex-project-id` (`VERTEX_PROJECT_ID` / `litellm.vertex.projectId`) and `--vertex-location` (`VERTEX_LOCATION` / `litellm.vertex.location`):
+To override the Vertex AI endpoint host through the [gateway environment Secret](#a-credentials-secret-for-the-gateway), set `VERTEXAI_API_BASE` in the Secret to a host matching `--vertex-location` (`VERTEX_LOCATION` / `litellm.vertex.location`) and pair `--litellm-env-secret` (`LITELLM_ENV_SECRET_NAME` / `litellm.envFromSecret`) with `--vertex-project-id` (`VERTEX_PROJECT_ID` / `litellm.vertex.projectId`):
 
 ```bash
 kubectl create secret generic vertex-endpoint -n kubeagents-system \
-  --from-literal=GOOGLE_CLOUD_UNIVERSE_DOMAIN=universe.example.com
+  --from-literal=VERTEXAI_API_BASE=https://us-east4-aiplatform.universe.example.com
 
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --model-provider=vertex_ai \
@@ -371,9 +371,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --litellm-env-secret=vertex-endpoint
 ```
 
-`litellm.envFromSecret` mounts its keys into the gateway container via `envFrom` and does not render `api_base` in `config.yaml`. Because Kubernetes resolves explicit container `env` entries after `envFrom`, the `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` entries rendered by the chart always override those keys in `litellm.envFromSecret`. Set the serving project and model location through the installer flags or `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and `litellm.vertex.location` rather than inside the Secret.
+When a model entry in `config.yaml` has no `api_base`, LiteLLM reads `VERTEXAI_API_BASE` from the environment and appends `/v1/projects/<VERTEXAI_PROJECT>/locations/<VERTEXAI_LOCATION>/...` to a host-only base, so the chart's project and location still apply. (`GOOGLE_CLOUD_UNIVERSE_DOMAIN` does not set LiteLLM's Vertex AI URL.) `litellm.envFromSecret` mounts its keys via `envFrom` and does not render `api_base` in `config.yaml`. Because Kubernetes resolves explicit container `env` entries after `envFrom`, the `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` entries rendered by the chart always override those keys in `litellm.envFromSecret`. Set the serving project and model location through the installer flags or `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and `litellm.vertex.location` rather than inside the Secret.
 
-To render a custom Vertex AI `api_base` on each `model_list` entry in `config.yaml`, set `platformAgent.harness.universeDomain` to a domain other than `googleapis.com` (`install.sh` has no flag for `universeDomain`, so set it via Helm or `TF_VAR_extra_helm_values`). The chart then renders `api_base` as `https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`, or `https://<location>-aiplatform.<universeDomain>` for a regional location. It also sets `GOOGLE_CLOUD_UNIVERSE_DOMAIN` directly in container `env`, overriding any `GOOGLE_CLOUD_UNIVERSE_DOMAIN` key in `litellm.envFromSecret`:
+To render a custom Vertex AI `api_base` on each `model_list` entry in `config.yaml`, set `platformAgent.harness.universeDomain` to a domain other than `googleapis.com` (`install.sh` has no flag for `universeDomain`, so set it via Helm or `TF_VAR_extra_helm_values`). The chart then renders `api_base` as `https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`, or `https://<location>-aiplatform.<universeDomain>` for a regional location, and that rendered `api_base` wins over `VERTEXAI_API_BASE`. It also sets `GOOGLE_CLOUD_UNIVERSE_DOMAIN` directly in container `env`, overriding any `GOOGLE_CLOUD_UNIVERSE_DOMAIN` key in `litellm.envFromSecret`:
 
 ```bash
 helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
