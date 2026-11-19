@@ -101,6 +101,67 @@ func TestSplitClusterPath(t *testing.T) {
 	}
 }
 
+func TestSplitClusterPathWithDefault(t *testing.T) {
+	tests := []struct {
+		name        string
+		target      string
+		defaultID   string
+		wantCluster string
+		wantPath    string
+		wantErr     bool
+		wantMsg     string
+	}{
+		{name: "bare resource path", target: "/api/v1/namespaces/default/pods", defaultID: InClusterID, wantCluster: InClusterID, wantPath: "/api/v1/namespaces/default/pods"},
+		{name: "bare discovery path", target: "/apis/metrics.k8s.io/v1beta1/nodes", defaultID: InClusterID, wantCluster: InClusterID, wantPath: "/apis/metrics.k8s.io/v1beta1/nodes"},
+		{name: "bare root path", target: "/", defaultID: InClusterID, wantCluster: InClusterID, wantPath: "/"},
+		{name: "explicit in-cluster prefix still strips", target: "/clusters/in-cluster/api/v1/pods", defaultID: InClusterID, wantCluster: InClusterID, wantPath: "/api/v1/pods"},
+		{name: "explicit fleet prefix overrides default", target: "/clusters/" + gkeFleet + "/api/v1/pods", defaultID: InClusterID, wantCluster: gkeFleet, wantPath: "/api/v1/pods"},
+		{name: "invalid default cluster ID", target: "/api/v1/pods", defaultID: "bad$default", wantErr: true, wantMsg: "invalid default cluster ID"},
+		{name: "missing cluster ID after /clusters/", target: "/clusters/", defaultID: InClusterID, wantErr: true, wantMsg: "missing cluster ID"},
+		{name: "invalid explicit cluster ID", target: "/clusters/bad$cluster/api/v1/pods", defaultID: InClusterID, wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "encoded slash on bare path", target: "/api/v1/namespaces/default%2fsecrets/pods", defaultID: InClusterID, wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded dots on bare path", target: "/api/v1/namespaces/%2e%2e/secrets", defaultID: InClusterID, wantErr: true, wantMsg: "percent-encoded"},
+		{name: "dot-dot on bare path", target: "/api/v1/namespaces/default/pods/../../secrets", defaultID: InClusterID, wantErr: true, wantMsg: "dot segments"},
+		{name: "double slash on bare path", target: "//api/v1/pods", defaultID: InClusterID, wantErr: true, wantMsg: "empty path segments"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			u, err := url.ParseRequestURI(tc.target)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tc.target, err)
+			}
+			cluster, apiPath, perr := SplitClusterPathWithDefault(u, tc.defaultID)
+			if tc.wantErr {
+				if perr == nil {
+					t.Fatalf("accepted (cluster=%q, path=%q)", cluster, apiPath)
+				}
+				if perr.Code != http.StatusBadRequest || perr.RejectionReason != ReasonInvalidRoute {
+					t.Errorf("refusal = %d %q, want 400 %q", perr.Code, perr.RejectionReason, ReasonInvalidRoute)
+				}
+				if !strings.Contains(perr.Error(), tc.wantMsg) {
+					t.Errorf("refusal %q, want it to say %q", perr.Error(), tc.wantMsg)
+				}
+				return
+			}
+			if perr != nil {
+				t.Fatalf("refused: %v", perr)
+			}
+			if cluster != tc.wantCluster || apiPath != tc.wantPath {
+				t.Errorf("got (%q, %q), want (%q, %q)", cluster, apiPath, tc.wantCluster, tc.wantPath)
+			}
+		})
+	}
+	if cluster, apiPath, perr := SplitClusterPathWithDefault(&url.URL{Path: ""}, InClusterID); perr != nil || cluster != InClusterID || apiPath != "/" {
+		t.Errorf("empty URL path with default = (%q, %q, %v), want (%q, \"/\", nil)", cluster, apiPath, perr, InClusterID)
+	}
+	if _, _, perr := SplitClusterPathWithDefault(&url.URL{Path: "api"}, InClusterID); perr == nil {
+		t.Error("accepted a relative path")
+	}
+	if _, _, perr := SplitClusterPathWithDefault(nil, InClusterID); perr == nil {
+		t.Error("accepted a nil URL")
+	}
+}
+
 type policyCase struct {
 	name    string
 	method  string
@@ -361,6 +422,93 @@ func TestRefusalWithoutMarkers(t *testing.T) {
 		}
 		if !strings.Contains(perr.Message, "permission boundary") {
 			t.Errorf("%s %s: refusal lacks the boundary notice: %q", tc.method, tc.target, perr.Message)
+		}
+	}
+}
+
+func TestPolicyDenyStreaming(t *testing.T) {
+	factory := NewRequestInfoFactory()
+	tests := []struct {
+		name    string
+		method  string
+		target  string
+		headers map[string]string
+		want    RejectionReason
+	}{
+		{name: "list pods allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods", want: ""},
+		{name: "get pod allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p", want: ""},
+		{name: "watch=false allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=false", want: ""},
+		{name: "watch=FALSE allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=FALSE", want: ""},
+		{name: "watch=0 allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=0", want: ""},
+		{name: "pod log finite allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?tailLines=20", want: ""},
+		{name: "pod log follow=false allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=false", want: ""},
+		{name: "pod log follow=FALSE allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=FALSE", want: ""},
+		{name: "pod log follow=0 allowed", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=0", want: ""},
+
+		{name: "watch=true blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=true", want: ReasonStreamingBlocked},
+		{name: "watch=1 blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=1", want: ReasonStreamingBlocked},
+		{name: "watch=yes blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=yes", want: ReasonStreamingBlocked},
+		{name: "bare watch key blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch", want: ReasonStreamingBlocked},
+		{name: "empty watch= blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=", want: ReasonStreamingBlocked},
+		{name: "duplicate watch=false&watch=true blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=false&watch=true", want: ReasonStreamingBlocked},
+		{name: "semicolon watch smuggle blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?limit=5;watch=true", want: ReasonStreamingBlocked},
+		{name: "percent-encoded watch key blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?%77atch=true", want: ReasonStreamingBlocked},
+		{name: "unicode long-s watch=falſe blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=fal%C5%BFe", want: ReasonStreamingBlocked},
+		{name: "padded watch=+false+ blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods?watch=+false+", want: ReasonStreamingBlocked},
+		{name: "single-resource named watch blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p?watch=true", want: ReasonStreamingBlocked},
+		{name: "legacy /api/v1/watch/pods blocked", method: http.MethodGet, target: "/api/v1/watch/pods", want: ReasonStreamingBlocked},
+		{name: "legacy /api/v1/watch/namespaces/default/pods blocked", method: http.MethodGet, target: "/api/v1/watch/namespaces/default/pods", want: ReasonStreamingBlocked},
+		{name: "legacy /apis/apps/v1/watch/deployments blocked", method: http.MethodGet, target: "/apis/apps/v1/watch/namespaces/default/deployments", want: ReasonStreamingBlocked},
+		{name: "secrets watch blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets?watch=true", want: ReasonStreamingBlocked},
+
+		{name: "pod log follow=true blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=true", want: ReasonStreamingBlocked},
+		{name: "pod log follow=1 blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=1", want: ReasonStreamingBlocked},
+		{name: "pod log bare follow blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow", want: ReasonStreamingBlocked},
+		{name: "pod log empty follow= blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=", want: ReasonStreamingBlocked},
+		{name: "pod log duplicate follow=false&follow=true blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=false&follow=true", want: ReasonStreamingBlocked},
+		{name: "pod log semicolon follow blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?tailLines=5;follow=true", want: ReasonStreamingBlocked},
+		{name: "pod log percent-encoded follow key blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?%66ollow=true", want: ReasonStreamingBlocked},
+		{name: "pod log unicode long-s follow=falſe blocked", method: http.MethodGet, target: "/api/v1/namespaces/default/pods/p/log?follow=fal%C5%BFe", want: ReasonStreamingBlocked},
+
+		{name: "exec blocked even in read-write with AllowUpgradeSubresources", method: http.MethodPost, target: "/api/v1/namespaces/default/pods/p/exec?command=sh", headers: upgradeHeaders, want: ReasonSubresourceBlocked},
+		{name: "portforward blocked even in read-write with AllowUpgradeSubresources", method: http.MethodPost, target: "/api/v1/namespaces/default/pods/p/portforward", headers: upgradeHeaders, want: ReasonSubresourceBlocked},
+	}
+
+	for _, tc := range tests {
+		for _, mode := range []Mode{ModeReadOnly, ModeReadOnlyWithDryRun, ModeReadWrite} {
+			t.Run(tc.name+"/"+string(mode), func(t *testing.T) {
+				req := httptest.NewRequest(tc.method, tc.target, nil)
+				for k, v := range tc.headers {
+					req.Header.Set(k, v)
+				}
+				info, err := factory.NewRequestInfo(req)
+				if err != nil {
+					t.Fatalf("NewRequestInfo(%q): %v", tc.target, err)
+				}
+				pol := Policy{
+					Mode:                     mode,
+					RedactSecrets:            true,
+					AllowUpgradeSubresources: true,
+					DenyStreaming:            true,
+				}
+				perr := pol.Evaluate(req, info)
+				var got RejectionReason
+				if perr != nil {
+					got = perr.RejectionReason
+					if perr.Code != http.StatusForbidden {
+						t.Errorf("code = %d, want 403", perr.Code)
+					}
+					if !strings.Contains(perr.Message, "permission boundary") {
+						t.Errorf("message %q lacks boundary notice", perr.Message)
+					}
+					if strings.Contains(perr.Message, "policy rule:") {
+						t.Errorf("streaming refusal carries read-only markers: %q", perr.Message)
+					}
+				}
+				if got != tc.want {
+					t.Errorf("got %q, want %q (err=%v)", got, tc.want, perr)
+				}
+			})
 		}
 	}
 }

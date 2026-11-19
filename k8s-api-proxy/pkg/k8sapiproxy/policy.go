@@ -69,6 +69,7 @@ const (
 	ReasonSubresourceBlocked       RejectionReason = "subresource_blocked"
 	ReasonDryRunRequired           RejectionReason = "dry_run_required"
 	ReasonVerbBlocked              RejectionReason = "verb_blocked"
+	ReasonStreamingBlocked         RejectionReason = "streaming_blocked"
 )
 
 // PolicyError is a refusal, carrying what the handler needs to write a metav1.Status.
@@ -101,6 +102,8 @@ const (
 
 	dryRunParam = "dryRun"
 	dryRunAll   = "All"
+	watchParam  = "watch"
+	followParam = "follow"
 )
 
 // Request verbs, as RequestInfoFactory names them.
@@ -211,6 +214,44 @@ func NewRequestInfoFactory() *request.RequestInfoFactory {
 	}
 }
 
+// IsValidClusterID reports whether id matches the allowed cluster identifier syntax.
+func IsValidClusterID(id string) bool {
+	return validClusterID.MatchString(id)
+}
+
+// IsDisallowedURLRune reports whether c is a backslash or ASCII control character.
+func IsDisallowedURLRune(c rune) bool {
+	return c == '\\' || c < ' ' || c == '\x7f'
+}
+
+// ValidateURLPath rejects percent-encoded path separators, encoded dots, NUL bytes, empty
+// segments, backslashes, control characters, and dot segments in path or rawPath.
+func ValidateURLPath(path, rawPath string) error {
+	for _, p := range []string{rawPath, path} {
+		if p == "" {
+			continue
+		}
+		lower := strings.ToLower(p)
+		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") || strings.Contains(lower, "%5c") || strings.Contains(lower, "%00") {
+			return fmt.Errorf("percent-encoded separators, dots and NUL are not permitted in the path")
+		}
+		if strings.Contains(p, "//") {
+			return fmt.Errorf("empty path segments ('//') are not permitted")
+		}
+		if strings.ContainsFunc(p, IsDisallowedURLRune) {
+			return fmt.Errorf("backslashes and control characters are not permitted in the path")
+		}
+	}
+	if path != "" {
+		for _, seg := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+			if seg == "." || seg == ".." {
+				return fmt.Errorf("dot segments ('.' or '..') are not permitted")
+			}
+		}
+	}
+	return nil
+}
+
 // SplitClusterPath validates u's path and splits off its /clusters/{id} prefix, returning
 // the target cluster and the API server path. A path without the prefix is refused, with
 // no default cluster to fall back to: every kubeconfig the sandbox builds names
@@ -221,28 +262,31 @@ func NewRequestInfoFactory() *request.RequestInfoFactory {
 // characters are refused rather than cleaned, so the path the policy classifies is the
 // path the API server receives.
 func SplitClusterPath(u *url.URL) (clusterID, apiPath string, err *PolicyError) {
-	if u == nil || !strings.HasPrefix(u.Path, "/") {
+	return SplitClusterPathWithDefault(u, "")
+}
+
+// SplitClusterPathWithDefault validates u's path like SplitClusterPath and uses
+// defaultClusterID when the path carries no /clusters/{id} prefix and defaultClusterID is
+// non-empty.
+func SplitClusterPathWithDefault(u *url.URL, defaultClusterID string) (clusterID, apiPath string, err *PolicyError) {
+	if defaultClusterID != "" && !validClusterID.MatchString(defaultClusterID) {
+		return "", "", invalidRoute(fmt.Sprintf("invalid default cluster ID %q", defaultClusterID))
+	}
+	if u == nil {
 		return "", "", invalidRoute("path must start with '/'")
 	}
-	for _, p := range []string{u.RawPath, u.Path} {
-		lower := strings.ToLower(p)
-		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") || strings.Contains(lower, "%5c") || strings.Contains(lower, "%00") {
-			return "", "", invalidRoute("percent-encoded separators, dots and NUL are not permitted in the path")
-		}
-		if strings.Contains(p, "//") {
-			return "", "", invalidRoute("empty path segments ('//') are not permitted")
-		}
-		if strings.ContainsFunc(p, func(c rune) bool { return c == '\\' || c < ' ' || c == '\x7f' }) {
-			return "", "", invalidRoute("backslashes and control characters are not permitted in the path")
-		}
+	path := u.Path
+	if path == "" && defaultClusterID != "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", "", invalidRoute("path must start with '/'")
+	}
+	if verr := ValidateURLPath(path, u.RawPath); verr != nil {
+		return "", "", invalidRoute(verr.Error())
 	}
 
-	segments := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
-	for _, seg := range segments {
-		if seg == "." || seg == ".." {
-			return "", "", invalidRoute("dot segments ('.' or '..') are not permitted")
-		}
-	}
+	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
 
 	if segments[0] == clustersSegment {
 		if len(segments) < 2 || segments[1] == "" {
@@ -252,6 +296,10 @@ func SplitClusterPath(u *url.URL) (clusterID, apiPath string, err *PolicyError) 
 			return "", "", invalidRoute(fmt.Sprintf("invalid cluster ID %q", segments[1]))
 		}
 		return segments[1], "/" + strings.Join(segments[2:], "/"), nil
+	}
+
+	if defaultClusterID != "" {
+		return defaultClusterID, path, nil
 	}
 
 	return "", "", invalidRoute("name a cluster: /clusters/<context>/... (this request's path has no /clusters/ prefix: either the server URL was configured without one, or the client dropped it, as kubectl before 1.34 does on `get --raw`)")
@@ -272,8 +320,10 @@ type Policy struct {
 	// not read request bodies, so it cannot refuse that create.
 	RedactSecrets bool
 	// AllowUpgradeSubresources permits exec, attach, portforward and proxy in ModeReadWrite.
-	// Ignored in the read-only modes.
+	// Policy ignores this field in the read-only modes and when DenyStreaming is true.
 	AllowUpgradeSubresources bool
+	// DenyStreaming refuses watch requests, pod log follow requests, and protocol upgrades.
+	DenyStreaming bool
 }
 
 // Evaluate returns nil when r may be forwarded, or the refusal. info must come from
@@ -345,28 +395,33 @@ func (p Policy) Evaluate(r *http.Request, info *request.RequestInfo) *PolicyErro
 		return upgradeBlocked()
 	}
 
-	if readVerbs.Has(info.Verb) {
-		return nil
-	}
-	switch p.Mode {
-	case ModeReadOnlyWithDryRun:
-		if dryRunVerbs.Has(info.Verb) {
-			if HasStrictDryRunAll(r) {
-				return nil
-			}
+	allowedByMode := false
+	switch {
+	case readVerbs.Has(info.Verb):
+		allowedByMode = true
+	case p.Mode == ModeReadOnlyWithDryRun && dryRunVerbs.Has(info.Verb):
+		if !HasStrictDryRunAll(r) {
 			return forbidden(ReasonDryRunRequired, p.refusal(fmt.Sprintf(
 				"%sverb %q on resource %q: this proxy enforces read-only cluster access (pass --dry-run=server for non-persisted validation).",
 				policyPrefix, info.Verb, info.Resource), info))
 		}
-	case ModeReadWrite:
-		if readWriteVerbs.Has(info.Verb) {
-			return nil
+		allowedByMode = true
+	case p.Mode == ModeReadWrite:
+		if !readWriteVerbs.Has(info.Verb) {
+			return forbidden(ReasonVerbBlocked, fmt.Sprintf(
+				"%sverb %q on resource %q: verb is not permitted.%s", policyPrefix, info.Verb, info.Resource, boundaryNotice))
 		}
-		return forbidden(ReasonVerbBlocked, fmt.Sprintf(
-			"%sverb %q on resource %q: verb is not permitted.%s", policyPrefix, info.Verb, info.Resource, boundaryNotice))
+		allowedByMode = true
 	}
-	return forbidden(ReasonVerbBlocked, p.refusal(fmt.Sprintf(
-		"%sverb %q on resource %q: this proxy enforces read-only cluster access.", policyPrefix, info.Verb, info.Resource), info))
+	if !allowedByMode {
+		return forbidden(ReasonVerbBlocked, p.refusal(fmt.Sprintf(
+			"%sverb %q on resource %q: this proxy enforces read-only cluster access.", policyPrefix, info.Verb, info.Resource), info))
+	}
+
+	if p.DenyStreaming {
+		return evaluateStreaming(r, info, sub)
+	}
+	return nil
 }
 
 func evaluateNonResource(r *http.Request, info *request.RequestInfo) *PolicyError {
@@ -388,8 +443,68 @@ func evaluateNonResource(r *http.Request, info *request.RequestInfo) *PolicyErro
 
 // permitsUpgrade reports whether info names a stream upgrade the policy admits.
 func (p Policy) permitsUpgrade(info *request.RequestInfo) bool {
-	return p.Mode == ModeReadWrite && p.AllowUpgradeSubresources && info.IsResourceRequest &&
+	return !p.DenyStreaming && p.Mode == ModeReadWrite && p.AllowUpgradeSubresources && info.IsResourceRequest &&
 		upgradeSubresources.Has(strings.ToLower(info.Subresource))
+}
+
+func evaluateStreaming(r *http.Request, info *request.RequestInfo, sub string) *PolicyError {
+	if info.Verb == verbWatch || hasStreamQueryParam(r, watchParam) {
+		return forbidden(ReasonStreamingBlocked, fmt.Sprintf(
+			"%swatch on resource %q: streaming watches are not permitted.%s",
+			policyPrefix, info.Resource, boundaryNotice))
+	}
+	if sub == subLog && hasStreamQueryParam(r, followParam) {
+		return forbidden(ReasonStreamingBlocked, fmt.Sprintf(
+			"%sfollow on subresource \"%s/%s\": streaming log follows are not permitted.%s",
+			policyPrefix, info.Resource, info.Subresource, boundaryNotice))
+	}
+	return nil
+}
+
+// hasStreamQueryParam reports whether r's query enables param ("watch" or "follow") under
+// Kubernetes Convert_Slice_string_To_bool rules. Any present value except "0" or ASCII
+// case-insensitive "false" (including an empty value) enables the option.
+func hasStreamQueryParam(r *http.Request, param string) bool {
+	if r == nil || r.URL == nil || r.URL.RawQuery == "" {
+		return false
+	}
+	for _, part := range strings.FieldsFunc(r.URL.RawQuery, func(c rune) bool { return c == '&' || c == ';' }) {
+		rawKey, rawVal, _ := strings.Cut(part, "=")
+		key, keyErr := url.QueryUnescape(rawKey)
+		if keyErr != nil {
+			key = rawKey
+		}
+		if !equalFoldASCII(key, param) {
+			continue
+		}
+		val, valErr := url.QueryUnescape(rawVal)
+		if valErr != nil {
+			return true
+		}
+		if val != "0" && !equalFoldASCII(val, "false") {
+			return true
+		}
+	}
+	return false
+}
+
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 // evaluateSubresource decides a subresource that neither mints credentials nor upgrades.
