@@ -70,12 +70,15 @@ BASELINES = Path(__file__).resolve().parents[1] / "baselines"
 
 VERSIONS = Versions(fleet=1, verifiers=1)
 
+# The legacy today key: the lines recorded before every install ran the A2A
+# stack carry it. NEXT_KEY below is the key every run writes now.
 KEY = VersionKey(
-    setup_id="gemini-3-1-pro-preview-kubeagents-mcp",
+    setup_id="setup-x",
     scoring_version="v1",
-    judge_model="gemini-3.1-pro-preview",
+    judge_model="model-x",
     fleet=1,
     verifiers=1,
+    mode=MODE_TODAY,
 )
 
 
@@ -166,10 +169,10 @@ def test_the_key_builds_from_a_real_captured_run(name):
     key = VersionKey.from_run(
         setup_id=rec.setup_id,
         scoring_version=rec.scoring_version,
-        judge_model="gemini-3.1-pro-preview",
+        judge_model="model-x",
         versions=VERSIONS,
     )
-    assert key == KEY
+    assert key == NEXT_KEY
 
 
 def test_the_key_is_none_when_the_run_does_not_carry_one():
@@ -226,7 +229,7 @@ NEXT_KEY = VersionKey(
 )
 
 
-def test_a_today_key_serialises_without_a_mode():
+def test_a_legacy_today_key_serialises_without_a_mode():
     """Byte-compatible with every line recorded before the mode existed."""
     assert KEY.mode == MODE_TODAY
     assert "mode" not in KEY.to_dict()
@@ -253,15 +256,15 @@ def test_an_unknown_mode_matches_neither_today_nor_next():
     assert other != KEY and other != NEXT_KEY
 
 
-def test_from_run_carries_the_mode():
+def test_from_run_carries_the_mode_and_defaults_to_next():
     kwargs = {"setup_id": KEY.setup_id, "scoring_version": "v1", "judge_model": KEY.judge_model, "versions": VERSIONS}
-    assert VersionKey.from_run(**kwargs) == KEY
-    assert VersionKey.from_run(**kwargs, mode=MODE_NEXT) == NEXT_KEY
+    assert VersionKey.from_run(**kwargs) == NEXT_KEY
+    assert VersionKey.from_run(**kwargs, mode=MODE_TODAY) == KEY
 
 
 def test_evidence_pools_within_one_mode_only(tmp_path):
-    """Today's lines, written before the mode existed, are today's window and
-    never next's; next's lines are next's window and never today's."""
+    """Today's lines, written before the mode existed, are the legacy today
+    window and never next's; next's lines are next's window and never today's."""
     store = BaselineStore.load(
         write_store(
             tmp_path,
@@ -489,7 +492,7 @@ def test_a_key_with_no_record_reports_stale_rather_than_comparing(tmp_path):
     admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
     assert admitted is False
     assert why.startswith("stale:")
-    assert "gemini-3.1-pro-preview" in why
+    assert "model-x" in why
 
 
 def test_a_run_with_no_key_is_not_admitted(tmp_path):
@@ -631,7 +634,7 @@ def test_evidence_ignores_lines_at_another_key(tmp_path):
     other = VersionKey(
         setup_id="some-other-setup",
         scoring_version="v1",
-        judge_model="gemini-3.1-pro-preview",
+        judge_model="model-x",
         fleet=1,
         verifiers=1,
     )

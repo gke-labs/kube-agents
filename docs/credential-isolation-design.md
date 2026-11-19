@@ -123,10 +123,13 @@ window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
 roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
 idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` step of the
-catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
-are rejected. One name goes to the shell Pod
+catch-up policy on the same jobs, the `POST_MERGE_READS_PER_TICK` cap on the post-merge check's reads,
+and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
-operator normalises to `true` or `false` before it reaches that Pod. The three
+operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
+kubectl cost table the shell's admission charges, which the operator passes only as a short
+lowercase word, before either reaches that Pod. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -250,11 +253,12 @@ audience-bound projected ServiceAccount token (one hour; the audience is per
 caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
-broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
+audit-report reader on every install and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
-consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
 with an `AgentProfile` bound, each profile tier's (bound to the audience
@@ -303,7 +307,7 @@ than in the Pod's status.
 
 | Data                             | Sandbox                                                    | Credential runtime          |
 | -------------------------------- | ---------------------------------------------------------- | --------------------------- |
-| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
+| `spec.deployment.env`            | Five names only, which the operator normalises (see above) | Yes                         |
 | Slack tokens                     | No                                                         | Yes, Secret-backed env      |
 | PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
 | Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
@@ -1057,7 +1061,10 @@ host, method and path against the code allowlist in
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
 unchanged under a response cap and a deadline (a route with a projection, the GKE
-cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
+cluster list and get, returns its 2xx body cut down to the fields it names). One read is a
+`POST`, Logging `entries:list`: its JSON body is read under a size cap, held to the
+table's body check (one `projects/<project>`, no other resource), and forwarded as the
+runtime's own serialisation. The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
@@ -1262,8 +1269,8 @@ needs the same treatment.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
-   normalised to `true` or `false`, and the three earned-autonomy switches,
-   normalised to a known value), secret volume, credential-state
+   normalised to `true` or `false`, `KUBEAGENTS_KUBECTL_COST_TIER`, a lowercase word, and the
+   three earned-autonomy switches, normalised to a known value), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

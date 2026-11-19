@@ -63,9 +63,11 @@ jobs:
   # in scripts/installer/min_versions.sh; tests/test_terraform_module_tests.py
   # holds the two equal. 1.6 is here as well as 1.5.0 because from 1.6
   # `terraform init` parses a root's tests/ directory; a suite moved back
-  # there from tftests/ fails this job rather than an install on 1.6.
+  # there from tftests/ fails this job rather than an install on 1.6. The job
+  # also plans full-install, because validate evaluates no validation and
+  # Terraform below 1.12 evaluates both operands of || and &&.
   terraform-floor:
-    name: Terraform ${{ matrix.terraform }} initialises and validates every root
+    name: Terraform ${{ matrix.terraform }} initialises and validates every root, and plans full-install
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -107,6 +109,31 @@ jobs:
               (cd "$dir" && terraform validate)
             fi
           done
+
+      # validate never evaluates a variable's validation or a precondition;
+      # plan does. Terraform below 1.12 evaluates both operands of || and &&,
+      # so a check whose right operand fails when its left one already
+      # decided passes on 1.15.8 and fails every plan on the floor. A plan of
+      # the composition at its defaults reaches every such check an install
+      # that sets nothing else reaches; a module off by default (for example
+      # Chat, drift Pub/Sub, backups, the minter) is not planned. The plan
+      # makes no network call, so it runs once: the placeholder token is never
+      # sent (with -refresh=false and the defaults, nothing it evaluates reads
+      # a Google API), and enable_cert_manager=false skips the one release
+      # whose chart it would fetch, from charts.jetstack.io; that release
+      # carries no check. tests/test_terraform_module_tests.py runs this step
+      # against a stub.
+      - name: Plan full-install at its defaults on the floor
+        working-directory: terraform/examples/full-install
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: plan-only-placeholder
+        run: >-
+          terraform plan -input=false -refresh=false -lock=false
+          -var=project_id=floor-plan-project
+          -var=cluster_name=floor-plan
+          -var=location=us-central1
+          -var=api_server_key=floor-plan
+          -var=enable_cert_manager=false
 
   validate:
     runs-on: ubuntu-latest
@@ -171,7 +198,7 @@ jobs:
         run: make shellcheck
 
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.2.3
 

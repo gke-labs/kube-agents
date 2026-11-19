@@ -106,8 +106,40 @@ describe("App", () => {
     const box = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
     await userEvent.type(box, "hello{Enter}");
 
-    expect(handleResult.send).toHaveBeenCalledWith("hello");
+    expect(handleResult.send).toHaveBeenCalledWith("hello", undefined);
     expect(box.value).toBe("");
+  });
+
+  it("drops an armed reply and its report's button on /new", async () => {
+    setLocation("?pass=secret");
+    render(<App />);
+    await waitFor(() => expect(captured).not.toBeNull());
+    const handleResult = await startBus.mock.results[0]!.value;
+    const [, , opts] = startBus.mock.calls[0]!;
+    const first = (opts as { conversation: string }).conversation;
+    act(() => captured!.dispatch({ type: "connection", state: "up" }));
+    act(() =>
+      captured!.dispatch({
+        type: "notice",
+        frame: { messageId: "n-1", text: "two pods pending", edit: false, kind: "notify", replyTo: "task-root" },
+        conversation: first,
+        at: 1,
+      }),
+    );
+    const box = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
+    await userEvent.click(screen.getByRole("button", { name: /^reply under: / }));
+    expect(screen.getByText(/replying under the report/)).toBeTruthy();
+
+    await userEvent.type(box, "/new{Enter}");
+    expect(screen.queryByText(/replying under the report/)).toBeNull();
+    // The old conversation's report stays in the transcript but takes no reply now.
+    expect(screen.getByText("two pods pending")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^reply under: / })).toBeNull();
+    // The pane is not remounted: the box the user was typing in is the same node and keeps focus.
+    expect(screen.getByRole("textbox")).toBe(box);
+    expect(document.activeElement).toBe(box);
+    await userEvent.type(box, "hello{Enter}");
+    expect(handleResult.send).toHaveBeenLastCalledWith("hello", undefined);
   });
 
   it("links a conversation /new changed while the bus was still connecting", async () => {

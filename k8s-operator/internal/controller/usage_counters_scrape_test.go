@@ -655,6 +655,12 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if _, asked := reading.Samples[usageCounterPositiveFeedback]; asked {
 		t.Fatalf("the chat listener was asked for the thumbs-ups it never serves: %v", reading.Samples)
 	}
+	// Nor for the post ratings, which only the A2A gateway counts.
+	for _, counter := range []string{usageCounterAutonomousNegativeFeedback, usageCounterAutonomousPositiveFeedback} {
+		if _, asked := reading.Samples[counter]; asked {
+			t.Fatalf("the chat listener was asked for %s, which it never serves: %v", counter, reading.Samples)
+		}
+	}
 	a2a := strings.Join([]string{
 		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
 		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
@@ -673,6 +679,12 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="down"} 2`,
 		`kubeagents_a2a_gateway_answer_feedback_total{platform="other",rating="down"} 1`,
 		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="other"} 3`,
+		"# TYPE kubeagents_a2a_gateway_post_feedback_total counter",
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="up",kind="alert"} 4`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="up",kind="report"} 1`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="down",kind="alert"} 7`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="googlechat",rating="down",kind="other"} 2`,
+		`kubeagents_a2a_gateway_post_feedback_total{platform="slack",rating="other",kind="alert"} 5`,
 		"",
 	}, "\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageMetricsPath, usageA2AChatCounters, nil)
@@ -693,6 +705,12 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	// platform; a rating outside the two counts into neither.
 	if reading.Samples[usageCounterNegativeFeedback] != 3 || reading.Samples[usageCounterPositiveFeedback] != 6 {
 		t.Fatalf("a2a samples = %v, want 3 thumbs-downs (2 + 1) and 6 thumbs-ups", reading.Samples)
+	}
+	// The post ratings are their own family: down and up into the autonomous
+	// pair, each over every platform and kind, and never into the answer
+	// counters above; a rating outside the two counts into neither.
+	if reading.Samples[usageCounterAutonomousNegativeFeedback] != 9 || reading.Samples[usageCounterAutonomousPositiveFeedback] != 5 {
+		t.Fatalf("a2a samples = %v, want 9 thumbs-downs on posts (7 + 2) and 5 thumbs-ups (4 + 1)", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
 		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)

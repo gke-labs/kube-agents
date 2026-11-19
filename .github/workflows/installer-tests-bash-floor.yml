@@ -54,6 +54,7 @@ on:
       - "tests/test_installer_ghes.py"
       - "tests/test_installer_gitlab.py"
       - "tests/test_installer_gitops_record.py"
+      - "tests/test_installer_report_files.py"
       - "tests/test_lifecycle_script.py"
       - "tests/test_repeat_under_load.py"
       - "tests/testing/**"
@@ -87,6 +88,7 @@ env:
     tests/test_installer_ghes.py
     tests/test_installer_gitlab.py
     tests/test_installer_gitops_record.py
+    tests/test_installer_report_files.py
     tests/test_lifecycle_script.py
     tests/test_repeat_under_load.py
 
@@ -110,7 +112,7 @@ jobs:
       # tests/test_upgrade_script.py has chart tests that are `skipUnless(helm)`;
       # the same version as the Linux unit-test job.
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.2.3
 

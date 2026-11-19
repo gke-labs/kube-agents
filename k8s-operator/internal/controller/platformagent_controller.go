@@ -547,6 +547,11 @@ type PlatformAgentReconciler struct {
 	// Cleared by an echo that carries the field, and when the CR is deleted;
 	// a restart of the operator after the CRD is applied clears it too.
 	prunedBusMigrationStatus sync.Map
+	// singleServerBusWarned holds, per CR, the UID of the one-server bus pod
+	// the A2ABusSingleServer Event last named (noteA2ABusSingleServer), so
+	// the Event is written once per pod, not on every pass. Cleared when the
+	// bus is not one server, and when the CR is deleted.
+	singleServerBusWarned sync.Map
 	// prunedObservedVersion records, per CR, when a status write was last
 	// seen to come back without status.observedVersion: an operator rolled
 	// ahead of the CRD that adds the field. While fresh, updateStatusReady
@@ -691,9 +696,20 @@ type PlatformAgentReconciler struct {
 	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
-	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
-	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
-	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+	// busConfigLoadTime stands in for reading a bus server's config_load_time
+	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (string, error)
+	// busVarz stands in for reading a bus server's /varz (a2aBusVarz), in
+	// tests; it wins over busConfigLoadTime, which answers a fixed start.
+	busVarz func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pod *corev1.Pod) (a2aBusVarz, error)
+	// busConfigWrittenAt stands in for reading when the live bus config
+	// Secret was written (a2aBusConfigWrittenAt), in tests: the fake client
+	// keeps no managedFields.
+	busConfigWrittenAt func(live *corev1.Secret) (time.Time, bool)
+	// busTLSWrittenAt stands in for reading when the bus's TLS Secret was
+	// last written (a2aBusWatched), in tests: the fake client keeps no
+	// managedFields.
+	busTLSWrittenAt func(tls *corev1.Secret) (time.Time, bool)
 	// busStreamState stands in for reading each bus stream's state from the
 	// monitoring endpoint (a2aBusStreamState), in tests.
 	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
@@ -773,8 +789,8 @@ type PlatformAgentReconciler struct {
 // The markers below are the operator's whole Kubernetes authority: controller-gen renders them
 // into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. A
 // marker without `namespace=` lands in the ClusterRole; one with it lands in the Role document
-// beside it, which both install paths bind in the install namespace and, under mode next, in the
-// profile namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
+// beside it, which both install paths bind in the install namespace and in the profile
+// namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
 // or the group it sits in:
 //
 //   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
@@ -845,8 +861,8 @@ type PlatformAgentReconciler struct {
 // exists, so a namespaced read would be a 403 wherever that RoleBinding is
 // absent (the API server authorises a namespaced list before it looks for
 // the namespace). The install creates the profile namespace and binds the
-// namespaced Role there in the same apply (the chart under mode next,
-// config/profiles under make deploy), which is what lets the namespaced
+// namespaced Role there in the same apply (the chart, or config/profiles
+// under make deploy), which is what lets the namespaced
 // writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
 // and 2026-10-31, #3655 PR 6, predates that binding).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list
@@ -1468,6 +1484,26 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// The A2A stack: NATS, the auth callout, the gateway, the capability
 	// verifier, the provisioning Job and the tiers. Every install renders it.
 	a2aState, err := r.reconcileA2A(ctx, renderAgent, homeRec)
+	// The A2A stack ran on the render copy and recorded what it resolved in
+	// that copy's status: the bus's server count, a migration's run record
+	// and its phases, the conditions it sets directly. The status writers
+	// below write instance, so all of it is carried back, with the version a
+	// write made on the copy (#6298). Only the copy's universe-domain pair
+	// stays behind: it was stamped on for the renders, and the Ready writer
+	// records the resolved pair itself.
+	//
+	// Not on a failed pass: a migration step changes its record before the
+	// work it records (a give-up marked before its cleanup, a terminal phase
+	// before its teardown) and leaves the change behind when the work fails,
+	// for the next pass to redo. The deferred writers would persist it, and
+	// the work would never be redone. instance takes the stored status
+	// instead, which holds what this pass did write, such as a new run's
+	// record.
+	if err == nil {
+		adoptRenderedStatus(instance, renderAgent)
+	} else {
+		r.adoptStoredStatus(ctx, instance)
+	}
 	// For the deferred write at 2d, failed pass or not: a step after
 	// the dispatcher's failing doesn't undo what it did to Job mode.
 	dispatcherJobMode = a2aState.dispatcherJobMode
@@ -4135,7 +4171,8 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicyWithFQDN(ctx context.Con
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
 	if skipFQDNReconcile {
-		// On a cold-start metadata timeout with no prior resolved universe, leave
+		// On a cold-start metadata timeout with no prior resolved universe, or
+		// with a prior value the validators refuse, leave
 		// any existing FQDNNetworkPolicy untouched rather than rendering default
 		// commercial domains or deleting a previously applied sovereign policy.
 		// Probe CRD presence via List (not Get, because isCRDNotInstalledError treats
@@ -4874,6 +4911,34 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
+}
+
+// adoptRenderedStatus carries the render copy's status and resourceVersion
+// back into instance, keeping instance's own universe-domain pair (see
+// adoptRenderedStatus's caller).
+func adoptRenderedStatus(instance, rendered *agentv1alpha1.PlatformAgent) {
+	domain, source := instance.Status.ResolvedUniverseDomain, instance.Status.UniverseDomainSource
+	instance.Status = *rendered.Status.DeepCopy()
+	instance.Status.ResolvedUniverseDomain, instance.Status.UniverseDomainSource = domain, source
+	instance.ResourceVersion = rendered.ResourceVersion
+}
+
+// adoptStoredStatus replaces instance's status and version with the stored
+// ones, read past the cache, after a failed pass (see its caller). A read
+// that fails leaves instance as it is: a deferred write against a version
+// this pass moved then conflicts and the pass is redone.
+func (r *PlatformAgentReconciler) adoptStoredStatus(ctx context.Context, instance *agentv1alpha1.PlatformAgent) {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(instance), live); err != nil {
+		logf.FromContext(ctx).Error(err, "could not read the stored PlatformAgent after a failed pass")
+		return
+	}
+	instance.Status = live.Status
+	instance.ResourceVersion = live.ResourceVersion
 }
 
 // busReplicasStatusCurrent reports whether status.busReplicas needs no write:
@@ -5643,6 +5708,7 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusMigrationStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.singleServerBusWarned.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
@@ -6125,7 +6191,8 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the A2A stack renders — one per reconcile while the exec tier is short
 // of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
 // pod per reconcile while a bus replica is not on the StatefulSet's update
-// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
+// revision (replaceStuckA2ANATSPod), and one Get of the bus pod per reconcile
+// on a one-server bus with no migration in flight (noteA2ABusSingleServer). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.

@@ -197,7 +197,7 @@ in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make
 probes the agent pods for both containers and reads the sandbox first.
 
 A profile worker runs in a pod with no PVC, so the store is also served over the
-network, to the credential broker and to nothing else (#5619; the broker's routes follow). `audit_report_store.py` listens on
+network, to the credential broker and to nothing else (#5619). `audit_report_store.py` listens on
 port 8700 in the gateway pod's `agent-api-auth` container, over the same root on the gateway's data
 volume. It is a process of its own rather than more routes on Session KV's 8699, so it serves the
 store routes and nothing else. Each request carries the broker's projected ServiceAccount token,
@@ -222,6 +222,8 @@ directory step is relative to an open directory and refuses a symlink (409), bec
 takes regular files of at most 1 MiB alone, and a write holds a lock on its store directory. A ring write prunes to 14, and
 `latest` must be a byte-identical copy of a ring entry. All of this renders with the A2A stack, on
 every install.
+
+The broker serves the same seven routes under `/v1/audit-reports` and relays each to the listener with its own token, read fresh from `AUDIT_REPORT_STORE_TOKEN_FILE` on every call; the listener's status and body come back, its 401 or 403 (the broker's own store credential refused, which the broker's log says) as a 502. The broker decides who may read and write, which the listener doesn't: a profile task whose profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` reads, and writes only its own builtin schedule's stream, to the repository `finish` publishes to (or `no_forge%2Flocal` when that rule yields none); the platform agent's shell reads every stream and writes that key or any repository `managed_repos` registers; the A2A gateway's relay, under the `a2a-reports` role its own `kubeagents-credential-proxy-a2a-reports` audience confers to the gateway's ServiceAccount alone, reads one finished report of any audit on that publish key alone, as `GET /v1/audit-reports/{audit_id}/publish/latest` or `.../publish/runs/{ts}`, and writes nothing (#5618): the gateway can't compute the publish key, so it sends the reserved word `publish`, which the broker replaces with the publish key before relaying and refuses any real key from it, and which no real key can equal, since each holds a `%2F`; the shell's or a profile's `publish` isn't resolved; the role may read any audit's report on the publish key, so the gateway's relay decides which conversation sees which report; every other caller is refused ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4). It caps a body at the listener's 1 MiB, answers 503 with no store configured, answers 504 when the listener doesn't answer whole within 15 seconds, and logs the method, path, caller and status of each request, never a token or a body. One known window: the broker reads `managed_repos` through its 30-second managed-repository cache and `gitops_repo` fresh, so for up to that long after a ConfigMap edit a write can be checked against a key neither the old nor the new state alone gives. The key is still one a state registers, or `no_forge%2Flocal`. The exec tier doesn't serve these routes.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it

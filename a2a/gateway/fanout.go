@@ -392,10 +392,9 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, kid.Addressee, kid.ID)
 	switch {
 	case err == nil && task.Final:
-		source := TerminalFromExecutor
-		if terminalSubject == lib.TaskSupervisorSubject(kid.Addressee, kid.ID) {
-			source = TerminalFromSupervisor
-		}
+		// Either supervisor form (#5301), read as the relay reads it, so a
+		// healed child's terminal and a relayed one are booked alike.
+		source := terminalSourceOf(terminalSubject)
 		g.log.Info("healing a fan-out child whose terminal the relay never delivered", "conversation", rec.Key, "taskId", kid.ID, "state", task.State)
 		// A canceled child writes nothing to the room (applyCanceledEvent).
 		if !kid.Canceled {

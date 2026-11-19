@@ -15,7 +15,7 @@
 id: observability-gmp-kube-state-metrics-oom
 name: "Managed Prometheus kube-state-metrics OOM-Killed in a Loop (collector OOM check)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit

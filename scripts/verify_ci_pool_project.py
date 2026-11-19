@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,25 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+# The seeded files' content, shared with hack/fleet-fixture-state.py through a
+# module of its own; this script's directory is not on sys.path when another
+# script loads this file by path.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from gitops_seed_files import (  # noqa: E402
+    GITOPS_INTENT_NOTE_CONTENT,
+    GITOPS_INTENT_NOTE_MESSAGE,
+    GITOPS_INTENT_NOTE_PATH,
+    GITOPS_SEEDED_FILES,
+    GITOPS_WORKLOAD_MANIFEST_CONTENT,
+    GITOPS_WORKLOAD_MANIFEST_MESSAGE,
+    GITOPS_WORKLOAD_MANIFEST_PATH,
+    gitops_seeded_blob_sha,
+    gitops_seeded_bytes,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _UPSTREAM_SLUG = "gke-labs/kube-agents"
@@ -83,9 +102,32 @@ GITHUB_PATH_FAILED = "failed"
 # The body came back but is not UTF-8. run_cmd decodes strictly, so this is
 # caught in the reader rather than ending the verifier in a traceback.
 GITHUB_PATH_UNDECODABLE = "undecodable"
+# gitops_seeded_file_state alone: no credential to read with at all (gh with
+# nothing to authenticate as, or no gh and no GITOPS_READ_TOKEN_ENV). Not a
+# read that failed but one never made, which the seeded-fleet scan leaves out
+# of a role's verdict rather than counting as unread: the hourly scan holds no
+# credential for the pool repositories by design.
+GITHUB_PATH_NO_CREDENTIAL = "no_credential"
 # The contents API's `type` for a symlink at the last component of a path. The
 # audit's walk follows none, so a prefix that is one names nothing to it.
 GITHUB_CONTENT_TYPE_SYMLINK = "symlink"
+# The same reads without `gh`, for the seeded-fleet scan on the presubmit's
+# image, which has no gh (gitops_seeded_file_state): the API host gh talks
+# to, the media type and the agent name it sends, and the statuses that mean
+# the read did not happen (no credential, a refusal, a rate limit, a 5xx),
+# which _UNREAD_PATTERNS and _DENIAL_PATTERNS read off gh's wording.
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_JSON_MEDIA_TYPE = "application/vnd.github+json"
+GITHUB_READ_USER_AGENT = "kube-agents-verify-ci-pool-project"
+GITHUB_UNREAD_STATUSES = frozenset({401, 403, 408, 429, 500, 502, 503, 504})
+HTTP_NOT_FOUND = 404
+# What a bearer credential this script puts in a header may look like: one
+# line of printable ASCII. A value with a line break or a control character
+# (a credential file with a second line, a header file cut another way)
+# would make http.client refuse the header with the whole value in its
+# message, and that message would land in a report; such a value is refused
+# before any request, and never echoed.
+BEARER_CREDENTIAL_LINE_RE = re.compile(r"[!-~]+")
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
 GITOPS_REPO_ORG = "gke-agentic"
 GITOPS_REPO_SUFFIX = "-infra"
@@ -292,9 +334,16 @@ FLEET_TIMEOUT_SECONDS = 600
 # fixtures are there but not in the shape the cases depend on. It prints one
 # summary line of its own, parsed the same way as the presence line above.
 _FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
+# The state script's WARNING for an assertion it had no credential to make
+# (its `unasserted` report list: the declared-intent note with no `gh` login),
+# carried into this check's advice rather than read as an unread role.
+FLEET_STATE_UNASSERTED_MARK = "was not asserted"
+# The fourth count: a role that is not yet ready is planted and in shape, and
+# its audit's age gate (the orphaned-snapshot roles' 91 days) has not passed;
+# it fails nothing here.
 _FLEET_STATE_SUMMARY = re.compile(
     r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
-    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked"
+    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked, (?P<not_ready>\d+) not yet ready"
 )
 # How long the state pass may wait for a fixture to converge before calling it
 # drifted. An operator usually runs this minutes after `tofu apply`, when the
@@ -535,51 +584,10 @@ DEFAULT_GITHUB_APP_ID = 4675512
 GITOPS_SEED_FILE = "README.md"
 GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
-# The declared-intent note provisioning seeds after the first commit
-# (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
-# declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
-# repository lacks it.
-GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
-# The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
-# verifier prints is the note provisioning seeds; a test pins the two copies
-# to each other. The body read back is judged by the audit's parser, not
-# compared to this text.
-GITOPS_INTENT_NOTE_CONTENT = """---
-type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
-declares:
-  - check: no-pdb
-    namespace: seeded-intent
-    object: Deployment/notification-relay
-  - check: netpol-missing
-    namespace: seeded-intent
-    object: Namespace/seeded-intent
-  - check: default-sa-automount
-    namespace: seeded-token
-    object: Deployment/token-reader
-  - check: no-notifications
-    namespace: ""
-    object: Cluster/seeded-c
-  - check: overrequest
-    namespace: seeded-headroom
-    object: Deployment/burst-ingest
-  - check: single-zone-nodepool
-    namespace: ""
-    object: NodePool/declared-zonal-pool
----
-
-`notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
-it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
-in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
-design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
-`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
-the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
-`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
-pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
-waste and capacity audits list the six postures under Declared intent rather than as findings."""
+# The declared-intent note and checkout-gateway's manifest, the two files
+# provisioning seeds into a pool repository, live in gitops_seed_files.py
+# beside this script (imported above): the verifier reads them back, the
+# seeded-fleet scan holds a pool repository's file to their blob sha.
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -596,6 +604,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "patch-declared-intent-no-finding",
     "cost-declared-intent-no-finding",
     "stockout-declared-intent-no-finding",
+    "compute-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -604,59 +613,29 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
     ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
+    ("gce-compute-fleet-audit", {"check": "orphaned-snapshots", "namespace": "", "object": "Snapshot/declared-orphan-snap-seeded"}),
 )
-# checkout-gateway's declaration, which provisioning seeds beside the note
-# (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
-# remediation cases propose a PodDisruptionBudget beside it; in a repository
-# without it the agent finds nothing to fix and refuses the pull request. The
-# path is the one the fleet audit's workload_declarations reads a cluster off
-# (clusters/<cluster>/...), the tie #2228's cases wait for. The script's
-# content, byte for byte, pinned by a test as the note is.
-GITOPS_WORKLOAD_MANIFEST_PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
-GITOPS_WORKLOAD_MANIFEST_MESSAGE = "Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
-GITOPS_WORKLOAD_MANIFEST_CONTENT = """apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: checkout-gateway
-  namespace: seeded-reliability
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: checkout-gateway
-  template:
-    metadata:
-      labels:
-        app: checkout-gateway
-    spec:
-      automountServiceAccountToken: false
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65534
-        seccompProfile:
-          type: RuntimeDefault
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: checkout-gateway
-      containers:
-        - name: gateway
-          image: registry.k8s.io/pause:3.9
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              memory: 32Mi"""
 # The key the audit's index (collect.py workload_declarations) must hold for
 # the seeded file: cluster off the path's second segment, then kind, namespace
 # and name. Presence alone is not the check: a file at the path that declares
 # another object leaves the finding manual and the cases red with a presence
 # check green, so the body is handed to that index and the key looked up.
 GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
+# The repair the scan names for a seeded file out of shape: one line that
+# prints the replace command (the seed command below, with the live file's
+# sha) for the operator to run. The command itself carries the whole
+# multi-line file inline, so the drift line names what prints it rather than
+# the command. Not the declaration check: that check judges the note by the
+# audit's parser and passes a note that differs from the seed by bytes alone,
+# which the scan still reads as drift.
+GITOPS_SEEDED_FILE_SEED_COMMANDS = {
+    GITOPS_INTENT_NOTE_PATH: "gitops_note_seed_command",
+    GITOPS_WORKLOAD_MANIFEST_PATH: "gitops_manifest_seed_command",
+}
+GITOPS_SEEDED_FILE_REPAIR = (
+    "replace it with the seeded file: python3 -c 'import sys; sys.path.insert(0, \"scripts\"); "
+    "import verify_ci_pool_project as v; print(v.{seed_command}(\"{repo}\", \"{sha}\"))' prints the command"
+)
 # The index refuses an object two files declare (`declaration_for` returns
 # None on more than one path), so every YAML under the seeded cluster's tree is
 # handed to it with the seeded file, read from the repository's tree listing.
@@ -694,15 +673,57 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
-# The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
-# installation also holds issues, pull_requests and contents write, for
-# hack/ci-eval-pr.sh's ledger reset and repository reset),
-# which is not the minter App above. hack/ci-eval-pr.sh mints an installation
-# token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
-# test pins these two to that script, so changing the App there cannot leave
-# this check attesting a credential CI no longer uses.
-LEDGER_APP_ID = 4739812
-LEDGER_INSTALLATION_ID = 157029058
+# The Apps the EVAL RUNNER grades ledger issues with (a mint pinned to reads;
+# each installation also holds issues, pull_requests and contents write, for
+# hack/ci-eval-pr.sh's ledger reset and repository reset), which are not the
+# minter App above. There are several since gke-labs/kube-agents#6240, one per
+# shard of the pool, so concurrent runs on different projects draw on
+# different hourly budgets: hack/eval/ledger-reader-apps.txt lists them in
+# shard order (App id, installation id, the build-cluster Secret holding its
+# key), LEDGER_READER_SHARD_SIZE projects per App in number order
+# (ledger_reader_for). hack/ci-eval-pr.sh mints from the same file by the
+# same rule into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
+# test holds this parse, that rule and the size to the script's, so changing
+# the Apps there cannot leave this check attesting a credential CI no longer
+# uses.
+_LEDGER_READER_APPS_FILE = _ROOT / "hack" / "eval" / "ledger-reader-apps.txt"
+# key_holder is the NAME of the build-cluster Secret holding the App's key,
+# never the key: the name says so (core_engineering.md, "Name identifiers for
+# what they hold").
+LedgerReader = NamedTuple("LedgerReader", [("app_id", int), ("installation_id", int), ("key_holder", str)])
+LEDGER_READER_ROW_FIELDS = 3
+LEDGER_READER_ROW_SHAPE = "<App id> <installation id> <Secret holding its key>"
+
+
+def _parse_ledger_readers(path: Path) -> Tuple[LedgerReader, ...]:
+    """The table's rows, with the line that breaks the shape named: this runs
+    at import, in the fixture scan as well as here, so a bad row has to say
+    where it is rather than raise an IndexError."""
+    rows = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        fields = raw.split("#", 1)[0].split()
+        if not fields:
+            continue
+        if len(fields) != LEDGER_READER_ROW_FIELDS or not (fields[0].isdigit() and fields[1].isdigit()):
+            raise ValueError(f"{path}:{number}: expected `{LEDGER_READER_ROW_SHAPE}`, got {raw!r}")
+        rows.append(LedgerReader(int(fields[0]), int(fields[1]), fields[2]))
+    return tuple(rows)
+
+
+LEDGER_READERS = _parse_ledger_readers(_LEDGER_READER_APPS_FILE)
+# The project's number as the shard rule reads it: the N of kube-agents-evals-N,
+# BARE_POOL_PROJECT_NUMBER for the bare kube-agents-evals, the pool's first.
+POOL_PROJECT_NUMBER_RE = re.compile(r"-(\d+)$")
+BARE_POOL_PROJECT_NUMBER = 1
+# Projects per App, in number order: numbers 1-10 on the first row, 11-20 on
+# the second. The same value as LEDGER_READER_SHARD_SIZE in hack/ci-eval-pr.sh
+# and scripts/provision_ci_pool_project.sh.
+LEDGER_READER_SHARD_SIZE = 10
+# Shard 0 is the App of before the split: the smoke test's step 0 mints from
+# it ahead of any lease (hack/ledger_token_mint.py's defaults; a test holds
+# them equal), and the messages about a failure that is pool-wide name it.
+LEDGER_APP_ID = LEDGER_READERS[0].app_id
+LEDGER_INSTALLATION_ID = LEDGER_READERS[0].installation_id
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
@@ -719,10 +740,10 @@ LEDGER_READ_PERMISSIONS = {
     "metadata": "read",
 }
 
-# Its private key, read from the cluster rather than the operator's disk: a
+# Shard 0's private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
 # cluster ALIAS the prowjob names, not a GKE cluster.
-LEDGER_KEY_SECRET = "kube-agents-evals-ledger-app-key"
+LEDGER_KEY_SECRET = LEDGER_READERS[0].key_holder
 LEDGER_KEY_SECRET_ENTRY = "key.pem"
 LEDGER_KEY_NAMESPACE = "test-pods"
 PROW_BUILD_CLUSTER = "kube-agents-prow"
@@ -1069,9 +1090,15 @@ FLEET_RECONCILER_ROLES = {
     # default pool's instance group (`drain_timeout`, defects-b.tf), and the create needs
     # compute.backendServices.*, compute.healthChecks.* and compute.instanceGroups.use.
     "roles/compute.loadBalancerAdmin",
-    # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
-    # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
+    # securityAdmin: the stack plants VPC firewall rules (`world_open` and
+    # `world_open_deny_remote`, main.tf), and the create needs compute.firewalls.* and
+    # compute.networks.updatePolicy.
     "roles/compute.securityAdmin",
+    # networkAdmin: the stack plants a VPC network and peers it with `default`
+    # (`mtu_peer_declared`, main.tf), and the create needs compute.networks.create,
+    # .delete, .addPeering, .removePeering and .updatePeering, which no other role
+    # here carries.
+    "roles/compute.networkAdmin",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
@@ -1283,6 +1310,9 @@ _DENIAL_PATTERNS = (
 # A failed command with no stderr: nothing to match, nothing that says absent.
 NO_OUTPUT_REASON = "the command failed without output (killed, or gone before it could say why)"
 
+# gh with no credential at all (exit 4) names the login command; the read
+# never left the machine, so no path it was asked for is absent.
+_GH_NO_CREDENTIAL = re.compile(r"gh auth login")
 _UNREAD_PATTERNS = (
     re.compile(r"timed out after \d+s", re.I),
     re.compile(r"invalid_grant", re.I),
@@ -1297,6 +1327,7 @@ _UNREAD_PATTERNS = (
     # A token the API rejected is a credential that expired mid-run, not an
     # absent resource: gcloud prints the gRPC status, or the HTTP 401 below.
     re.compile(r"\bUNAUTHENTICATED\b|Request had invalid authentication credentials"),
+    _GH_NO_CREDENTIAL,
     # A separator between the word and the code is required (`code=`, `status:
     # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
     # not a status.
@@ -2751,9 +2782,10 @@ def _fleet_state_result(
     converged = int(match.group("converged"))
     drifted = int(match.group("drifted"))
     unchecked = int(match.group("unchecked"))
+    not_ready = int(match.group("not_ready"))
     counts = (
         f"{converged} role(s) in their designed state, {drifted} drifted, "
-        f"{unchecked} whose state could not be read"
+        f"{unchecked} whose state could not be read, {not_ready} planted and not yet ready"
     )
     if drifted:
         return CheckResult(
@@ -2780,10 +2812,22 @@ def _fleet_state_result(
                 )),
             ],
         )
+    # An assertion the script had no credential to make (the declared-intent
+    # note, with no `gh` login) is outside every verdict, so it is advice
+    # here, not an unread: the roles were read, the note was not.
+    unasserted = [note for note in notes if FLEET_STATE_UNASSERTED_MARK in note]
     if presence.warnings:
+        presence.warnings = [*presence.warnings, *unasserted]
         return presence
+    if not_ready:
+        return CheckResult(
+            name,
+            True,
+            f"All {expected} fixture roles planted and reachable: {converged} in their designed state, "
+            f"{not_ready} planted and not yet ready (an age gate the clock clears)",
+        )
     return CheckResult(
-        name, True, f"All {expected} fixture roles planted, reachable and in their designed state"
+        name, True, f"All {expected} fixture roles planted, reachable and in their designed state", warnings=unasserted
     )
 
 
@@ -2947,6 +2991,25 @@ def _gitops_repo_slug(project_id: str) -> str:
     return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
 
 
+def pool_project_number(project_id: str) -> int:
+    """kube-agents-evals-N -> N; the bare kube-agents-evals, the pool's first project, is 1."""
+    found = POOL_PROJECT_NUMBER_RE.search(project_id)
+    # Never below the bare project's number: bash's integer division in
+    # hack/ci-eval-pr.sh truncates toward zero, and the two rules are held
+    # equal, so a number 0 (which no pool project has) lands on the first row.
+    return max(BARE_POOL_PROJECT_NUMBER, int(found.group(1))) if found else BARE_POOL_PROJECT_NUMBER
+
+
+def ledger_reader_for(project_id: str) -> Tuple[int, Optional[LedgerReader]]:
+    """The shard a pool project's repository sits in, and the App that reads it:
+    LEDGER_READER_SHARD_SIZE projects per App in number order, the rule
+    hack/ci-eval-pr.sh's ledger_reader_shard applies when it mints for the
+    project it leased. None for the App when the table has no row for the
+    shard yet: the project cannot be graded until that App is registered."""
+    shard = (pool_project_number(project_id) - 1) // LEDGER_READER_SHARD_SIZE
+    return shard, LEDGER_READERS[shard] if shard < len(LEDGER_READERS) else None
+
+
 def _load_audit_report():
     """The fleet-audit script as a module, proven able to run its note parser here.
 
@@ -3043,11 +3106,16 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
     audit's reader admits `#` in a prefix, which an unencoded URL would drop
     as a fragment and probe a different path than the audit checks.
     """
+    return _gh_api_state(f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}", raw=raw)
+
+
+def _gh_api_state(api_path: str, raw: bool = False) -> tuple[str, str]:
+    """One `gh api <api_path>` read, classified as _gitops_path_state says."""
     cmd = ["gh", "api"]
     if raw:
         cmd += ["-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}"]
     try:
-        rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}"])
+        rc, out, err = run_cmd(cmd + [api_path])
     except UnicodeDecodeError as exc:
         return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
     if rc == 0:
@@ -3060,6 +3128,102 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
     if _GH_NOT_FOUND_SPELLING.search(err or ""):
         return GITHUB_PATH_ABSENT, ""
     return GITHUB_PATH_FAILED, (err or "").strip()
+
+
+def _github_api_state_with_token(api_path: str, token: str) -> tuple[str, str]:
+    """The same read as _gh_api_state over urllib with a bearer token, for a
+    host without `gh`: the presubmit's image. Classified the same way: a
+    status in GITHUB_UNREAD_STATUSES, or no answer at all, is unread; 404 is
+    absent (of the path, or of the repository to this credential; the caller
+    tells them apart); anything else the API refused is a failure."""
+    request = urllib.request.Request(
+        f"{GITHUB_API_BASE}/{api_path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": GITHUB_JSON_MEDIA_TYPE, "User-Agent": GITHUB_READ_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_net_timeout(DEFAULT_TIMEOUT_SECONDS)) as response:
+            return GITHUB_PATH_PRESENT, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            return GITHUB_PATH_ABSENT, ""
+        if exc.code in GITHUB_UNREAD_STATUSES:
+            return GITHUB_PATH_UNREAD, f"HTTP {exc.code} from {api_path}"
+        return GITHUB_PATH_FAILED, f"HTTP {exc.code} from {api_path}"
+    except UnicodeDecodeError as exc:
+        return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
+    except ValueError:
+        # http.client refusing a header, or a response that was not HTTP: its
+        # message can quote a header value whole, so it is not repeated.
+        return GITHUB_PATH_UNREAD, f"the request to {api_path} could not be made: a header or the response was malformed"
+    except (urllib.error.URLError, OSError) as exc:
+        # URLError for a refused or unresolved connection, OSError (TimeoutError
+        # among them) for one that stalled: no answer, so nothing is known.
+        return GITHUB_PATH_UNREAD, f"no answer from {api_path}: {exc}"
+
+
+def gitops_seeded_file_repair(project_id: str, path: str, sha: str = "") -> str:
+    """The repair the scan names for a seeded file out of shape in `project_id`'s
+    repository: the one line that prints its replace command, naming the live
+    file's blob `sha` so the PUT replaces rather than conflicts (none for a
+    file that is missing)."""
+    return GITOPS_SEEDED_FILE_REPAIR.format(
+        seed_command=GITOPS_SEEDED_FILE_SEED_COMMANDS[path], repo=_gitops_repo_slug(project_id), sha=sha
+    )
+
+
+def gitops_seeded_file_state(project_id: str, path: str) -> tuple[str, str]:
+    """The blob a pool project's GitOps repository carries at a seeded path, for the seeded-fleet scan.
+
+    (GITHUB_PATH_PRESENT, <blob sha>) when the path is a file there;
+    (GITHUB_PATH_ABSENT, "") when the repository answered and the path is
+    not in it; (GITHUB_PATH_NO_CREDENTIAL, reason) when there was nothing to
+    read with, so no read was made; (GITHUB_PATH_UNREAD, reason) when a read
+    was made and nothing was learned: a refusal, a transient, or a 404 the
+    repository itself also answers, which is a private repository this
+    credential cannot see as often as a missing file; (GITHUB_PATH_FAILED,
+    reason) for a path that is a directory or an answer the API refused
+    outright. One contents read, plus one repository read on a 404. Through
+    `gh` where it is on PATH (its own credential store, or
+    GITOPS_READ_TOKEN_ENV, which gh honours); otherwise over urllib with the
+    token in GITOPS_READ_TOKEN_ENV, the presubmit's case.
+    """
+    repo_slug = _gitops_repo_slug(project_id)
+    token = os.environ.get(GITOPS_READ_TOKEN_ENV, "").strip()
+    if shutil.which("gh"):
+        read = _gh_api_state
+    elif token:
+        if not BEARER_CREDENTIAL_LINE_RE.fullmatch(token):
+            # Refused before any request, and never echoed: see BEARER_CREDENTIAL_LINE_RE.
+            return GITHUB_PATH_UNREAD, (
+                f"the credential in {GITOPS_READ_TOKEN_ENV} is not one line of printable characters "
+                "(a line break or a control character inside it), so nothing was read with it"
+            )
+
+        def read(api_path: str) -> tuple[str, str]:
+            return _github_api_state_with_token(api_path, token)
+    else:
+        return GITHUB_PATH_NO_CREDENTIAL, f"no GitHub credential: {GITOPS_READ_TOKEN_ENV} is unset and gh is not on PATH"
+    state, out = read(f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}")
+    if state == GITHUB_PATH_UNREAD and _GH_NO_CREDENTIAL.search(out):
+        return GITHUB_PATH_NO_CREDENTIAL, out
+    if state == GITHUB_PATH_PRESENT:
+        try:
+            payload = _load_json(out)
+        except Exception as exc:
+            return GITHUB_PATH_FAILED, f"the contents of {path} in {repo_slug} did not parse: {exc}"
+        sha = payload.get("sha") if isinstance(payload, dict) else None
+        if not sha:
+            return GITHUB_PATH_FAILED, f"{path} in {repo_slug} is not a file"
+        return GITHUB_PATH_PRESENT, str(sha)
+    if state == GITHUB_PATH_ABSENT:
+        visible, detail = read(GITOPS_REPO_API_PATH.format(repo=repo_slug))
+        if visible == GITHUB_PATH_PRESENT:
+            return GITHUB_PATH_ABSENT, ""
+        return GITHUB_PATH_UNREAD, (
+            f"{repo_slug} answers 404 for {path} and for the repository itself, so it is not visible to this "
+            f"credential (or does not exist); nothing is known about the file" + (f": {detail}" if detail else "")
+        )
+    return state, out
 
 
 def _names_nothing_to_the_audit(contents_json: str) -> bool:
@@ -4012,12 +4176,13 @@ def check_gitops_default_branch(project_id: str) -> CheckResult:
     return CheckResult(name, False, f"{repo_slug} does not default to {GITOPS_DEFAULT_BRANCH}", details=details, findings=findings)
 
 
-def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
-    """The ledger App's PEM, read out of the build cluster. Returns (pem, reason).
+def _read_ledger_app_key(timeout: int = 30, key_holder: str = LEDGER_KEY_SECRET) -> Tuple[Optional[str], str]:
+    """A ledger App's PEM, read out of the build cluster. Returns (pem, reason).
 
     A None pem always carries a reason. Read from the cluster rather than from a
     file the operator supplies: the question is whether the key CI mounts can see
-    the repository, and a local copy cannot answer it.
+    the repository, and a local copy cannot answer it. key_holder names the App's
+    Secret (hack/eval/ledger-reader-apps.txt); the first App's by default.
     """
     context = f"gke_{PROW_BUILD_CLUSTER_PROJECT}_{PROW_BUILD_CLUSTER_ZONE}_{PROW_BUILD_CLUSTER}"
     credentials = (
@@ -4031,7 +4196,7 @@ def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
         [
             "kubectl", "--context", context,
             "-n", LEDGER_KEY_NAMESPACE,
-            "get", "secret", LEDGER_KEY_SECRET,
+            "get", "secret", key_holder,
             "-o", f"jsonpath={{.data.{LEDGER_KEY_SECRET_ENTRY.replace('.', chr(92) + '.')}}}",
         ],
         timeout=timeout,
@@ -4047,7 +4212,7 @@ def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
         # The secret exists and the entry does not, which kubectl reports as an
         # empty jsonpath rather than an error.
         return None, (
-            f"secret {LEDGER_KEY_SECRET} in {LEDGER_KEY_NAMESPACE} has no "
+            f"secret {key_holder} in {LEDGER_KEY_NAMESPACE} has no "
             f"{LEDGER_KEY_SECRET_ENTRY} entry"
         )
     try:
@@ -4064,15 +4229,18 @@ def _net_timeout(default: float) -> float:
     return max(NET_TIMEOUT_FLOOR_SECONDS, min(default, _RUN_DEADLINE - time.monotonic()))
 
 
-def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str, str]:
-    """Trade the App key for an installation token. Returns (token, status, message).
+def _mint_ledger_token(
+    pem: str, timeout: int = 15, reader: LedgerReader = LEDGER_READERS[0]
+) -> Tuple[Optional[str], str, str]:
+    """Trade an App key for an installation token. Returns (token, status, message).
 
     status is one of {"ok", "failed", "unverified"}, and the token is only ever
     returned, never logged: it is a live credential for every repository in the
     installation.
 
     The token is narrowed to LEDGER_READ_PERMISSIONS, the four reads grading
-    pins, whatever the App is granted.
+    pins, whatever the App is granted. reader is the shard's App (ledger_reader_for);
+    shard 0's by default.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -4085,7 +4253,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             {
                 "iat": now - JWT_BACKDATE_SECONDS,
                 "exp": now + JWT_LIFETIME_SECONDS,
-                "iss": str(LEDGER_APP_ID),
+                "iss": str(reader.app_id),
             },
             separators=(",", ":"),
         ).encode()
@@ -4109,14 +4277,14 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             return None, "unverified", "openssl is not on PATH, so no JWT could be signed"
         if rc != 0:
             return None, "failed", (
-                f"the key in secret {LEDGER_KEY_SECRET} would not sign a JWT: {err.strip()[:200]}"
+                f"the key in secret {reader.key_holder} would not sign a JWT: {err.strip()[:200]}"
             )
         with open(sig_path, "rb") as fh:
             signature = fh.read()
 
     jwt = (signing_input + b"." + _b64(signature)).decode("ascii")
     request = urllib.request.Request(
-        GITHUB_INSTALLATION_TOKEN_URL.format(installation=LEDGER_INSTALLATION_ID),
+        GITHUB_INSTALLATION_TOKEN_URL.format(installation=reader.installation_id),
         method="POST",
         headers={
             "Authorization": f"Bearer {jwt}",
@@ -4132,13 +4300,13 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             return None, "failed", (
-                f"GitHub rejected a JWT signed by secret {LEDGER_KEY_SECRET} (401). The stored key "
-                f"is not App {LEDGER_APP_ID}'s, which breaks ledger grading on every pool project"
+                f"GitHub rejected a JWT signed by secret {reader.key_holder} (401). The stored key "
+                f"is not App {reader.app_id}'s, which breaks ledger grading on every pool project of its shard"
             )
         if exc.code == 404:
             return None, "failed", (
-                f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
-                "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
+                f"App {reader.app_id} has no installation {reader.installation_id} (404). It was "
+                "uninstalled from gke-agentic, or the id moved; ledger grading is broken on every pool project of its shard"
             )
         if exc.code == 422:
             # The body asked for a permission the installation does not hold.
@@ -4146,10 +4314,10 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             # on this answer, so every run on every pool project would stop.
             wanted = ", ".join(f"{k}: {v}" for k, v in LEDGER_READ_PERMISSIONS.items())
             return None, "failed", (
-                f"GitHub refused to mint {wanted} for App {LEDGER_APP_ID}'s installation "
-                f"{LEDGER_INSTALLATION_ID} (422): the installation no longer holds one of them. "
+                f"GitHub refused to mint {wanted} for App {reader.app_id}'s installation "
+                f"{reader.installation_id} (422): the installation no longer holds one of them. "
                 "hack/ci-eval-pr.sh's preflight mint asks for exactly these and stops the run on "
-                "this answer, so ledger grading is broken pool-wide until an organisation owner "
+                "this answer, so ledger grading is broken on every pool project of its shard until an organisation owner "
                 "restores the permission (or accepts a pending permission change) on the installation"
             )
         return None, "unverified", (
@@ -4172,9 +4340,9 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     # `all` fails: an absent key is GitHub changing its response, not a flip.
     if body.get("repository_selection") == "all":
         return None, "failed", (
-            f"App {LEDGER_APP_ID}'s installation {LEDGER_INSTALLATION_ID} is "
+            f"App {reader.app_id}'s installation {reader.installation_id} is "
             "repository_selection: all, so it reads every gke-agentic repository rather than the "
-            "pool's. Set it back to `selected` with the -infra repositories listed"
+            "pool's. Set it back to `selected` with its shard's -infra repositories listed"
         )
 
     token = body.get("token")
@@ -4209,21 +4377,41 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     """
     name = "Ledger Read Credential"
     repo_slug = _gitops_repo_slug(project_id)
+    # The App whose installation must hold this repository: the project's
+    # shard, which is where hack/ci-eval-pr.sh will mint from on a lease. A
+    # repository added to another shard's App reads as a 404 below.
+    shard, reader = ledger_reader_for(project_id)
+    # Messages count Apps from 1, as the App names and the table's rows do.
+    number = shard + 1
+    warnings: List[str] = []
+    if reader is None:
+        # No row for the shard yet: hack/ci-eval-pr.sh reads such a project
+        # through the first App with a warning, so that is what is checked,
+        # and the warning here says what the rollout still owes.
+        warnings.append(
+            f"{project_id} is on reader App {number} ({LEDGER_READER_SHARD_SIZE} projects per App, in "
+            f"number order) and hack/eval/ledger-reader-apps.txt has {len(LEDGER_READERS)} row(s), so the "
+            f"eval reads {repo_slug} through reader App 1 until the row exists. Register App {number} with "
+            "the same grants, install it on its ten repositories, mount its key, and append its row -- "
+            "see section 5.4 of docs/ci-pool-projects.md"
+        )
+        shard, reader = 0, LEDGER_READERS[0]
+    where = f"App {reader.app_id} (reader App {shard + 1} of {len(LEDGER_READERS)}, by the project's number)"
 
-    pem, reason = _read_ledger_app_key()
+    pem, reason = _read_ledger_app_key(key_holder=reader.key_holder)
     if pem is None:
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"Not checked: {reason}, so nothing here says whether the eval runner can read "
             f"{repo_slug}'s issues -- the read that failed on kube-agents-evals-6's first lease. "
-            f"The key is secret {LEDGER_KEY_SECRET} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
+            f"The key is secret {reader.key_holder} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
             f"{LEDGER_KEY_NAMESPACE} on cluster {PROW_BUILD_CLUSTER}"
         )])
 
-    token, status, message = _mint_ledger_token(pem, timeout=timeout)
+    token, status, message = _mint_ledger_token(pem, timeout=timeout, reader=reader)
     if status == "failed":
-        return CheckResult(name, False, "Ledger issues not readable", details=[message])
+        return CheckResult(name, False, "Ledger issues not readable", details=[message], warnings=warnings)
     if token is None:
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"{message}, so the eval runner's access to {repo_slug}'s issues is unknown"
         )])
 
@@ -4249,27 +4437,29 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
                 name,
                 True,
                 "Not checked",
-                warnings=[Unread(
+                warnings=[*warnings, Unread(
                     f"GitHub rate-limited the read of {repo_slug}'s issues, so the eval runner's "
                     "access to them was never established. Re-run when the limit resets"
                 )],
             )
         if exc.code == 403:
-            return CheckResult(name, False, "Ledger issues not readable", details=[
-                f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
+            return CheckResult(name, False, "Ledger issues not readable", warnings=warnings, details=[
+                f"{where} reaches {repo_slug} but is refused its issues "
                 f"(403 {exc.reason}). The token was just minted with `issues: read`, so this is "
                 "not a missing permission: the installation is suspended, or an organisation "
-                "IP allow list or SAML setting blocks App tokens from here. Pool-wide rather than "
+                "IP allow list or SAML setting blocks App tokens from here. App-wide rather than "
                 f"anything about {project_id}; clear it and re-run"
             ])
         if exc.code == 404:
             return CheckResult(name, False, "Ledger issues not readable", details=[
-                f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
-                "repository_selection: selected, so add this repository to it -- see section 5.4 "
-                "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                f"{where} cannot see {repo_slug} at all (404). Its installation "
+                f"{reader.installation_id} is repository_selection: selected, so add this repository "
+                "to it (and, until the Prow job mounts this App's key, keep it on reader App 1's "
+                "installation as well, which is where the eval reads it meanwhile); see section 5.4 of "
+                "docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
-            ])
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+            ], warnings=warnings)
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of allowing or refusing the "
             f"read of {repo_slug}'s issues, so the eval runner's access is unknown. Re-run when "
             "it clears"
@@ -4280,12 +4470,12 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             if "CERTIFICATE_VERIFY_FAILED" in str(exc)
             else "re-run from somewhere with egress to api.github.com"
         )
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"Could not reach api.github.com to read {repo_slug}'s issues "
             f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
         )])
 
-    return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
+    return CheckResult(name, True, f"{where} can read {repo_slug}'s issues", warnings=warnings)
 
 
 def check_gemini_api_key(project_id: str) -> CheckResult:

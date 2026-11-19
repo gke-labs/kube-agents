@@ -679,15 +679,18 @@ type Config struct {
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// default requests (150m/320Mi, SessionResources) ten concurrent sessions
-	// hold 1.5 CPU / 3.2Gi, which a small dev cluster absorbs without
+	// hold 1.5 CPU / about 3.1Gi, which a small dev cluster absorbs without
 	// preemption. Raising it buys more
 	// concurrent delegations at that per-pod price plus model-quota
 	// contention; lowering it turns busy-hour delegations into refusals
 	// sooner - a UX decision, not a safety one, because this cap is the
 	// usability half. The enforcement half is the namespace ResourceQuota
 	// the operator renders above this number (a compromised or buggy gateway
-	// ignores its own cap and cannot ignore that one), which is also what
-	// bounds the count-then-create race between concurrent conversations.
+	// ignores its own cap and cannot ignore that one). The gateway serializes
+	// the check and counts slots granted but not yet spawned, so concurrent
+	// conversations don't race past the cap (#6033); a replacing turn or a
+	// leader handover can still overshoot it briefly, which the quota's
+	// margin absorbs.
 	MaxSessions int
 
 	// SessionResources are the session pod's CPU and memory requests and

@@ -180,7 +180,7 @@ export default function App() {
   }, [probePending]);
 
   const handleSend = useCallback(
-    (text: string): boolean => {
+    (text: string, replyTo?: string): boolean => {
       const handle = busHandleRef.current;
       if (handle === null) {
         local(`not sent: not connected to the bus yet. "${text}"`);
@@ -195,7 +195,7 @@ export default function App() {
         local(linkDownSendNote(text));
         return false;
       }
-      handle.send(text);
+      handle.send(text, replyTo);
       return true;
     },
     [local],

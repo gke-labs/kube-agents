@@ -717,7 +717,7 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 	endpoint := u.Scheme + "://" + u.Host + brokerSnapshotPath
 	reqBody, err := json.Marshal(map[string]any{
 		"repository": repoID,
-		"paths":      []string{"knowledge", ".kube-agents"},
+		"paths":      []string{"knowledge"},
 	})
 	if err != nil {
 		return err
