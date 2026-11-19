@@ -21,13 +21,13 @@
 # repository from {{BENCH_GITOPS_REPO}} (the repository the lane's checks
 # grade): the skill writes only to the repository its task names.
 #
-# RED UNTIL #4457 AND #6168 LAND. On a gateway without #4457 the door drops
-# the unknown `intent` key and the task runs as a typed message, so no permit
-# is minted and the broker refuses `publish` and `proposal create` with
-# CALLER_PERMIT_REQUIRED. Without #6168 (pull request #6422) the cluster
-# persona has no version-control skill and declines to open pull requests.
-# Either way no pull request is linked and the first objective fails: that is
-# the case's red, not infrastructure. A door that refuses the confirm (400,
+# RED UNTIL #4457 LANDS, AND RED ON THE PERSONA BEFORE #6168. On a gateway
+# without #4457 the door drops the unknown `intent` key and the task runs as a
+# typed message, so no permit is minted and the broker refuses `publish` and
+# `proposal create` with CALLER_PERMIT_REQUIRED. On the cluster persona before
+# #6168 (which adds this case with its version-control skill), the persona
+# declines to open pull requests. Either way no pull request is linked and the
+# first objective fails: that is the case's red, not infrastructure. A door that refuses the confirm (400,
 # A2A_INJECT_CONFIRM unset on a #4457 gateway) is infrastructure: the agent
 # never saw the ask.
 #
