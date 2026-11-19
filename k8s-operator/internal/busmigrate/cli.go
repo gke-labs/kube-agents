@@ -327,11 +327,17 @@ func restoreAllDirected(ctx context.Context, nc *nats.Conn, streams []string, di
 				break
 			}
 			// Forward: the rendered limits, and a snapshot that does not fit
-			// them refused. Back: the stream as it was.
+			// them refused. Back: the stream as it was. Either way the
+			// stream is restored at one replica and raised after, as the
+			// operator's policy says (a2aStreamPolicies at one replica): a
+			// snapshot of a three-server bus, which a reshape takes,
+			// records three.
+			cfg := meta.Config
+			cfg.Replicas = 1
 			if forward {
-				err = RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, open, want.Data, policy)
+				err = RestoreVerified(ctx, nc, cfg, meta.State, meta.TakenAt, open, want.Data, policy)
 			} else {
-				err = RestoreAsItWas(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
+				err = RestoreAsItWas(ctx, nc, cfg, meta.State, open, want.Data, policy)
 			}
 			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || errors.Is(err, ErrOverRenderedLimits) || attempt == restoreRetries {
 				break
