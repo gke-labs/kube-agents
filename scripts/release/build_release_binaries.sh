@@ -37,7 +37,9 @@ readonly RELEASE_BINARY_SPECS=(
   "k8s-api-proxy|k8s-api-proxy|./cmd/k8s-api-proxy|k8s-api-proxy/README.md|${FAILURE_MODE_REQUIRED}|linux/amd64 linux/arm64 darwin/amd64 darwin/arm64"
   # The workstation MCP bridge, for wherever an MCP host runs. Neither its
   # command nor the a2a module has a README, so it carries the repository's.
-  "kube-agents-mcp|a2a|./cmd/kube-agents-mcp|README.md|${FAILURE_MODE_OPTIONAL}|darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64"
+  # No windows/amd64 until the bridge compiles there (#6565); the .exe and
+  # .zip handling below turns on when it is added back.
+  "kube-agents-mcp|a2a|./cmd/kube-agents-mcp|README.md|${FAILURE_MODE_OPTIONAL}|darwin/amd64 darwin/arm64 linux/amd64 linux/arm64"
 )
 # The same flags deploy/kube-proxy/Dockerfile builds the image's binary with,
 # plus -trimpath so the binary carries no runner path.

@@ -238,10 +238,10 @@ class PackageReleaseBundleTest(unittest.TestCase):
             proxy_archive = dist_dir / f"k8s-api-proxy_{MOCK_RELEASE_BUNDLE_VERSION}_linux_amd64.tar.gz"
             self.assertTrue(proxy_archive.exists(), f"{proxy_archive.name} missing from {dist_dir}")
             self.assertIn(proxy_archive.name, checksums_content)
-            # So are the kube-agents-mcp archives, the Windows one a zip.
+            # So are the kube-agents-mcp archives.
             for mcp_archive_name in (
                 f"kube-agents-mcp_{MOCK_RELEASE_BUNDLE_VERSION}_darwin_arm64.tar.gz",
-                f"kube-agents-mcp_{MOCK_RELEASE_BUNDLE_VERSION}_windows_amd64.zip",
+                f"kube-agents-mcp_{MOCK_RELEASE_BUNDLE_VERSION}_linux_amd64.tar.gz",
             ):
                 self.assertTrue((dist_dir / mcp_archive_name).exists(), f"{mcp_archive_name} missing from {dist_dir}")
                 self.assertIn(mcp_archive_name, checksums_content)
@@ -255,7 +255,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
 
             create_mock_helm_binary(bin_dir)
             create_mock_syft_binary(bin_dir)
-            create_mock_go_binary(bin_dir, fail_build_matching="windows/amd64*./cmd/kube-agents-mcp*")
+            create_mock_go_binary(bin_dir, fail_build_matching="linux/arm64*./cmd/kube-agents-mcp*")
 
             head_commit = subprocess.check_output(
                 ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True

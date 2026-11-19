@@ -6,6 +6,7 @@ and what each archive holds, without a Go toolchain.
 """
 
 import pathlib
+import re
 import subprocess
 import tarfile
 import unittest
@@ -24,7 +25,13 @@ _SCRIPT = _REPO_ROOT / "scripts" / "release" / "build_release_binaries.sh"
 _PLATFORMS = ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"]
 _README_AT_RELEASE = "k8s-api-proxy README at the release\n"
 _MCP = "kube-agents-mcp"
-_MCP_PLATFORMS = ["darwin/amd64", "darwin/arm64", "linux/amd64", "linux/arm64", "windows/amd64"]
+_MCP_PLATFORMS = ["darwin/amd64", "darwin/arm64", "linux/amd64", "linux/arm64"]
+# The bridge does not ship for Windows yet (#6565). The Windows tests run a copy
+# of the script with this platform added to its spec, so the .exe/.zip path
+# stays covered until it does.
+_WINDOWS = "windows/amd64"
+# The kube-agents-mcp spec line, up to and including its platform list.
+_MCP_SPEC_PLATFORMS = re.compile(r'("kube-agents-mcp\|[^"\n]*\|)([^"|\n]*)"')
 _ROOT_README = "kube-agents README at the release\n"
 
 
@@ -55,11 +62,11 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         # Only the tools the script needs, so the developer's own go stays out of reach.
         self.bin_dir = create_minimal_tools_bin(base)
 
-    def _run(self, args, env=None, with_go=True, fail_build=False, fail_build_matching=None):
+    def _run(self, args, env=None, with_go=True, fail_build=False, fail_build_matching=None, script=_SCRIPT):
         if with_go:
             create_mock_go_binary(self.bin_dir, fail_build=fail_build, fail_build_matching=fail_build_matching)
         return subprocess.run(
-            ["bash", str(_SCRIPT)] + args,
+            ["bash", str(script)] + args,
             capture_output=True,
             text=True,
             env=get_isolated_test_env(
@@ -94,6 +101,24 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         self.git("commit", "-m", "feat: add module")
         self.git("tag", "-a", MOCK_TARGET_RELEASE_TAG, "-m", "release")
         return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def _script_with_windows(self):
+        """A copy of the script whose kube-agents-mcp spec also lists windows/amd64.
+
+        It sits in a scripts/release/ of its own beside a link to the real
+        common.sh, and scripts/installer/ links to the real one, so common.sh
+        finds what it sources from the copy's root.
+        """
+        root = pathlib.Path(self.repo_dir).parent / "windows-script"
+        release_dir = root / "scripts" / "release"
+        release_dir.mkdir(parents=True)
+        (release_dir / "common.sh").symlink_to(_SCRIPT.parent / "common.sh")
+        (root / "scripts" / "installer").symlink_to(_REPO_ROOT / "scripts" / "installer")
+        text, count = _MCP_SPEC_PLATFORMS.subn(rf'\g<1>\g<2> {_WINDOWS}"', _SCRIPT.read_text())
+        self.assertEqual(count, 1, "the kube-agents-mcp spec line moved; update _MCP_SPEC_PLATFORMS")
+        script = release_dir / _SCRIPT.name
+        script.write_text(text)
+        return script
 
     def _go_log(self):
         return (self.bin_dir / "go.log").read_text()
@@ -214,8 +239,6 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         built = sorted(p.name for p in self.dist.iterdir())
         self.assertEqual(built, sorted(_proxy_archive_files() + _mcp_archive_files()))
         for platform in _MCP_PLATFORMS:
-            if platform.startswith("windows/"):
-                continue
             with self.subTest(platform=platform):
                 root = _archive_name(platform, _MCP)
                 with tarfile.open(self.dist / _mcp_archive_file(platform)) as archive:
@@ -225,12 +248,25 @@ class BuildReleaseBinariesTest(unittest.TestCase):
                     self.assertEqual(archive.extractfile(f"{root}/README.md").read().decode(), _ROOT_README)
                     self.assertEqual(archive.extractfile(f"{root}/LICENSE").read().decode(), "Apache License\n")
 
-    def test_kube_agents_mcp_for_windows_is_a_zip_holding_an_exe(self):
+    def test_kube_agents_mcp_ships_no_windows_archive_yet(self):
         self._commit_module_and_tag(with_mcp=True)
 
         proc = self._run([MOCK_TARGET_RELEASE_TAG])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        root = _archive_name("windows/amd64", _MCP)
+        self.assertNotIn("GOOS=windows", self._go_log())
+        self.assertEqual(list(self.dist.glob("*windows*")), [])
+
+    def test_kube_agents_mcp_for_windows_is_a_zip_holding_an_exe(self):
+        self._commit_module_and_tag(with_mcp=True)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], script=self._script_with_windows())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        built = sorted(p.name for p in self.dist.iterdir())
+        self.assertEqual(built, sorted(_proxy_archive_files() + _mcp_archive_files() + [_mcp_archive_file(_WINDOWS)]))
+        windows_build = [line for line in self._go_log().splitlines() if "GOOS=windows" in line]
+        self.assertEqual(len(windows_build), 1)
+        self.assertIn(f"/{_archive_name(_WINDOWS, _MCP)}/{_MCP}.exe ", windows_build[0])
+        root = _archive_name(_WINDOWS, _MCP)
         with zipfile.ZipFile(self.dist / f"{root}.zip") as archive:
             names = sorted(archive.namelist())
             self.assertEqual(names, sorted([f"{root}/", f"{root}/{_MCP}.exe", f"{root}/LICENSE", f"{root}/README.md"]))
@@ -253,8 +289,7 @@ class BuildReleaseBinariesTest(unittest.TestCase):
             self.assertIn(f"GOOS={goos} GOARCH={goarch} CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local", line)
             self.assertIn("-trimpath", line)
             self.assertIn(f"-ldflags=-s -w -X main.version={MOCK_TARGET_RELEASE_TAG}", line)
-            binary = f"{_MCP}.exe" if goos == "windows" else _MCP
-            self.assertIn(f"/{_archive_name(platform, _MCP)}/{binary} ", line)
+            self.assertIn(f"/{_archive_name(platform, _MCP)}/{_MCP} ", line)
 
     def test_builds_kube_agents_mcp_without_k8s_api_proxy(self):
         self._commit_module_and_tag(with_mcp=True, with_proxy=False)
@@ -282,16 +317,17 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         self._seed_dist()
 
         # The last platform fails, after the others have written their archives.
-        proc = self._run([MOCK_TARGET_RELEASE_TAG], fail_build_matching=f"windows/amd64*./cmd/{_MCP}*")
-        self._assert_kube_agents_mcp_left_out(proc, "windows/amd64")
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], fail_build_matching=f"linux/arm64*./cmd/{_MCP}*")
+        self._assert_kube_agents_mcp_left_out(proc, "linux/arm64")
 
     def test_a_failed_kube_agents_mcp_archive_leaves_the_release_without_it(self):
         self._commit_module_and_tag(with_mcp=True)
         self._seed_dist()
         (self.bin_dir / "zip").unlink(missing_ok=True)
 
-        proc = self._run([MOCK_TARGET_RELEASE_TAG])
-        self._assert_kube_agents_mcp_left_out(proc, "windows/amd64")
+        # Only the Windows archive needs zip, so the archive fails after the others are written.
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], script=self._script_with_windows())
+        self._assert_kube_agents_mcp_left_out(proc, _WINDOWS)
 
     def test_a_failed_k8s_api_proxy_build_still_fails_beside_kube_agents_mcp(self):
         self._commit_module_and_tag(with_mcp=True)
@@ -299,6 +335,43 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         proc = self._run([MOCK_TARGET_RELEASE_TAG], fail_build_matching="linux/arm64*./cmd/k8s-api-proxy*")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("go build failed for k8s-api-proxy on linux/arm64", proc.stderr)
+
+
+_RELEASE_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "release-publish.yml"
+_GO_VERSION_FILE = re.compile(r'^\s*go-version-file:\s*"?([^"\s]+)"?\s*$', re.MULTILINE)
+_GO_DIRECTIVE = re.compile(r"^go\s+(\S+)\s*$", re.MULTILINE)
+
+
+def _go_directive(go_mod):
+    match = _GO_DIRECTIVE.search((_REPO_ROOT / go_mod).read_text())
+    if match is None:
+        raise AssertionError(f"{go_mod} has no go directive")
+    return match.group(1)
+
+
+class ReleaseGoToolchainParityTest(unittest.TestCase):
+    """The bridge builds with the Go the release workflow installs for k8s-api-proxy.
+
+    build_release_binaries.sh runs with GOTOOLCHAIN=local, so an a2a/go.mod
+    asking for a newer Go than that fails the kube-agents-mcp build, which is
+    optional: the release would publish without the bridge and only warn.
+    """
+
+    def test_a2a_go_directive_matches_the_release_toolchain(self):
+        workflow = _RELEASE_WORKFLOW.read_text()
+        files = _GO_VERSION_FILE.findall(workflow)
+        self.assertEqual(files, ["k8s-api-proxy/go.mod"], f"go-version-file in {_RELEASE_WORKFLOW.relative_to(_REPO_ROOT)}")
+        line = next(n for n, text in enumerate(workflow.splitlines(), 1) if "go-version-file:" in text)
+        proxy, bridge = _go_directive("k8s-api-proxy/go.mod"), _go_directive("a2a/go.mod")
+        self.assertEqual(
+            bridge,
+            proxy,
+            f"a2a/go.mod says go {bridge} but k8s-api-proxy/go.mod says go {proxy}. "
+            f".github/workflows/release-publish.yml:{line} installs Go from k8s-api-proxy/go.mod "
+            "and the release binaries build with GOTOOLCHAIN=local, so a differing a2a directive "
+            "drops the kube-agents-mcp archives from the release with only a warning. "
+            "Move both directives together.",
+        )
 
 
 if __name__ == "__main__":
