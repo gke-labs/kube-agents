@@ -53,7 +53,7 @@ const (
 	// still after the park before the window opens: the parking pass writes
 	// its deferred conditions on the way out, and a pass that read the cache
 	// between them sends one more no-op write, which is settling, not the
-	// loop this test guards.
+	// loop this test guards. The window's baseline is read after this wait.
 	degradedLoopQuiesce = 5 * time.Second
 	// degradedLoopMeasureWindow is how long the counters run once the CR is
 	// parked. It covers one RequeueAfter tick (30s on this path), so the
@@ -231,10 +231,10 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 		}
 		return got
 	}
-	// Parked, and settled: the pass that parks also writes BusCredentialsReady
-	// on its way out (the deferred sync in Reconcile), so the window must not
-	// open between the two writes, or a pass reading a cache that has only the
-	// first would send the second again.
+	// Parked: the pass that parks also writes BusCredentialsReady and the
+	// conditions after it on its way out (the deferred syncs in Reconcile), at
+	// most one status write each. This only says that the park has begun to
+	// land; the window's baseline is read after those writes settle, below.
 	parked := func(pa *agentv1alpha1.PlatformAgent) bool {
 		cond := meta.FindStatusCondition(pa.Status.Conditions, "Ready")
 		return pa.Status.Phase == "Degraded" && cond != nil && cond.Reason == reasonShellSandboxKeysMissing &&
@@ -284,6 +284,10 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 	// of whether anything wrote it.
 	reconcilesBefore := platformAgentReconcileTotal(t)
 	writesBefore := counting.writes.Load()
+	// The baseline is read here, after the settle, and not taken from the read
+	// that first saw the park: that read can land between two of the parking
+	// pass's exit writes, and its resourceVersion is then one write old.
+	current = fetch()
 	rvBefore := current.ResourceVersion
 	time.Sleep(degradedLoopMeasureWindow)
 	reconciles := platformAgentReconcileTotal(t) - reconcilesBefore

@@ -37,10 +37,24 @@ import repo_ref  # noqa: E402 — needs the sys.path lines above
 import wif_credentials  # noqa: E402 — needs the sys.path lines above
 from credential_proxy_client import authorization_headers  # noqa: E402
 
+# A URL's userinfo, the part between "<scheme>://" and the last "@" before
+# the path, query or fragment, where a URL parser ends it: it can carry a
+# credential, so nothing this script logs keeps it. Greedy, so an "@" inside
+# the userinfo can't leave the rest of it behind.
+# No word-boundary anchor, so a scheme glued to the text before it is still
+# found, and a bounded scheme keeps the scan linear on long lines.
+_URL_USERINFO = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,30}://)[^\s/?#]*@")
+
+
+def redact_url(text: str) -> str:
+    """text with the userinfo of every URL in it replaced by [REDACTED]."""
+    return _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+
 
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
+    # Every line is redacted here, whatever its caller formatted into it.
+    print(f"[{timestamp}] [SRE-AUTH] {redact_url(msg)}", file=sys.stderr, flush=True)
 
 
 TOKEN_BROKER_URL = os.getenv(
@@ -362,13 +376,16 @@ def github_repo_from_remote(url: str) -> str | None:
     """
     ref = repo_ref.try_parse(url)
     if ref is None:
-        log(f"Ignoring git remote: '{url}' is not a repository URL.")
+        # A remote that was refused is never quoted: it came from outside the
+        # script and may carry a credential in a shape no redaction names.
+        # The operator reads it from .git/config.
+        log("Ignoring git remote: it is not a repository URL.")
         return None
     if not ref.host_stated:
-        log(f"Ignoring git remote: '{url}' names no host.")
+        log("Ignoring git remote: it names no host.")
         return None
     if not ref.is_github:
-        log(f"Ignoring git remote: host '{ref.host}' is not a GitHub host.")
+        log("Ignoring git remote: its host is not a GitHub host.")
         return None
     if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
         log(f"Ignoring git remote: path '{ref.path}' is not an owner/repo slug.")

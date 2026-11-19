@@ -108,7 +108,9 @@ Two more stacks add to the total:
 - **The A2A stack**, on every install: its standing pods, a container in the agent pod and a
   JetStream claim per NATS server. Each delegation adds a session pod, up to `maxSessions` at
   once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
-  gives the totals and each pod's requests and limits, generated from the chart.
+  gives the totals and each pod's requests and limits, generated from the chart. The totals
+  include the session pods at the cap, and say how much of each is theirs; `maxSessions`
+  scales that share, so a host or quota budget follows it.
 
   Each NATS server's metrics exporter is sized for up to about 2,000 JetStream consumers, which
   is about 1,000 clusters at two consumers per AgentProfile. Its memory and CPU grow with the

@@ -83,7 +83,7 @@ var (
 	// to), may be followed by a colon or by whitespace, none of which is the
 	// value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
-	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)[*_]*\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t*_]*([=:])[ \t]*)`) // a * or _ left as text may precede the separator (#6182)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
@@ -293,8 +293,13 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
-		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
-			a.trace.cardTitles[createdCardID] = short
+		// A card is recorded only from an id the create's result reports in a
+		// JSON field without error: free text or error text may name another
+		// task's card (#6430).
+		if kanbanCardIDFromJSON(d.Extra.Result) == createdCardID {
+			if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
+				a.trace.cardTitles[createdCardID] = short
+			}
 		}
 	}
 	if strings.HasPrefix(effectiveTool, "kanban_") && sessID != "" && sessID != a.sessionID {
@@ -1312,7 +1317,7 @@ var (
 	// secretReferenceKeyPattern is a key that names a Secret object, not a
 	// credential: existingSecret, imagePullSecret, tls_secret.
 	secretReferenceKeyPattern = regexp.MustCompile(`(?i)(?:existing|external|pull|tls|ref|reference|source|target|mountable|default)[_.-]?secret$`)
-	clearSecretNounPattern    = regexp.MustCompile(`(?i)\b(?:password|passwd|passphrase|token|api[ _-]?key)\b`)
+	clearSecretNounPattern    = regexp.MustCompile(`(?i)\b(?:password|passwd|passphrase|token|api[ _-]?key)_*\b`)
 )
 
 // keyClearlyNamesSecret says whether a key's last component is password,
@@ -1675,12 +1680,28 @@ func scrubYAMLSecretBlocks(s string) string {
 // (proseSecretPattern), as proseValueRedacted says, matched with the
 // markdown around the noun and the value normalised away ("the
 // **password** is `x`").
+// proseMarkedAssignmentPattern is a prose label that ends in a key, a mark
+// left against it, and "=": an assignment. Its group is the key.
+var proseMarkedAssignmentPattern = regexp.MustCompile(`([A-Za-z0-9_.-]+)[*_]+\s*=\s*$`)
+
+// keyValueOwnsProseLabel says whether the key/value rule takes a prose
+// label's value instead: an assignment whose key it classifies as a secret
+// key redacts whole there, while the prose value stops at punctuation
+// (#6201). Any other label keeps the prose redaction.
+func keyValueOwnsProseLabel(label string) bool {
+	m := proseMarkedAssignmentPattern.FindStringSubmatch(label)
+	return m != nil && inlineSecretKey(strings.TrimRight(m[1], "_"))
+}
+
 func scrubProseSecrets(s string, sink secretSink) string {
 	return scrubNormalized(s, sink, func(n string, code [][2]int, rec func(lo, hi int, named bool)) {
 		for _, m := range proseSecretPattern.FindAllStringSubmatchIndex(n, -1) {
 			lo, hi := m[4], m[5]
 			if end, ok := codeSpanEnd(code, lo); ok && n[lo:end] != redactedValue && proseValueRedacted(n[lo:end]) {
 				hi = end // a code-spanned value ends at its closing backtick
+			}
+			if keyValueOwnsProseLabel(n[m[2]:m[3]]) {
+				continue
 			}
 			if n[lo:hi] != redactedValue && proseValueRedacted(n[lo:hi]) {
 				rec(lo, hi, clearSecretNounPattern.MatchString(n[m[2]:m[3]]))
@@ -1713,7 +1734,7 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 		matchStart := pos + loc[0]
 		matchEnd := pos + loc[1]
 		openQuote := s[pos+loc[2] : pos+loc[3]]
-		key := s[pos+loc[4] : pos+loc[5]]
+		key := strings.TrimRight(s[pos+loc[4]:pos+loc[5]], "_")
 		closeQuote := s[pos+loc[6] : pos+loc[7]]
 		sep := s[pos+loc[10]]
 		// Only a blank counts here, not a mark the separator group allows.
@@ -2626,6 +2647,23 @@ func findUnescapedEscapedQuote(s string, q byte) int {
 // is the one thing read out of a tool result: an identifier with the card
 // token's shape, which the task's own subtask steps name again.
 func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
+	if id := kanbanCardIDFromJSON(rawResult); id != "" {
+		return id
+	}
+	if toolName == kanbanCreateTool {
+		if m := kanbanCardIDPattern.FindStringSubmatch(strings.TrimSpace(string(rawResult))); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// kanbanCardIDFromJSON is the card id a result names in a JSON field (id,
+// card_id or task_id, at the top level or in a JSON string holding an
+// object), or "" when the call named none or carried an error. Unlike
+// createdKanbanCardID it never reads an id out of free text, which can be an
+// error message naming some other card (#6430).
+func kanbanCardIDFromJSON(rawResult json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(rawResult))
 	if trimmed == "" || trimmed == "null" {
 		return ""
@@ -2648,15 +2686,18 @@ func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
 		}
 	}
 	if m, ok := decoded.(map[string]any); ok {
+		if errVal, hasErr := m["error"]; hasErr && errVal != nil && errVal != false && errVal != "" {
+			return ""
+		}
+		if okVal, hasOk := m["ok"]; hasOk {
+			if b, isBool := okVal.(bool); isBool && !b {
+				return ""
+			}
+		}
 		for _, k := range []string{"id", "card_id", "task_id"} {
 			if v, ok := m[k].(string); ok && isCardID(v) {
 				return strings.TrimSpace(v)
 			}
-		}
-	}
-	if toolName == kanbanCreateTool {
-		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
-			return m[1]
 		}
 	}
 	return ""

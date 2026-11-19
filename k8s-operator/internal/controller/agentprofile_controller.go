@@ -98,13 +98,17 @@ const (
 
 // Condition reasons.
 const (
-	reasonAgentProfileRendered        = "Rendered"
-	reasonAgentProfileNoAgent         = "NoPlatformAgent"
-	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
-	reasonAgentProfileRefused         = "ServiceAccountRefused"
-	reasonAgentProfileInvalid         = "InvalidProfile"
-	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
-	reasonAgentProfilePublished       = "Published"
+	reasonAgentProfileRendered   = "Rendered"
+	reasonAgentProfileNoAgent    = "NoPlatformAgent"
+	reasonAgentProfileManyAgents = "MultiplePlatformAgents"
+	reasonAgentProfileRefused    = "ServiceAccountRefused"
+	reasonAgentProfileInvalid    = "InvalidProfile"
+	reasonAgentProfileSANotFound = "ServiceAccountNotFound"
+	reasonAgentProfilePublished  = "Published"
+	// reasonAgentProfileDurableRecheck: the card is published and a
+	// durable that existed answered "not found"; the operator looks again
+	// a bus retry later before re-creating it (#6283).
+	reasonAgentProfileDurableRecheck  = "DurableRecheck"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
@@ -496,6 +500,12 @@ func (r *AgentProfileReconciler) publishCard(ctx context.Context, agent *agentv1
 			return reasonAgentProfileBusError, "the agent card is published, but its durables are not: " + err.Error(), err
 		}
 		if err := r.cards().SyncDurables(ctx, agent, p.Name, desiredProfileDurables(p), probe); err != nil {
+			if errors.Is(err, errDurableAwaitingRecheck) {
+				// Not the connection's fault: the bus answered. The bus
+				// retry comes back and re-creates the durable if it is
+				// still missing (#6283).
+				return reasonAgentProfileDurableRecheck, "the agent card is published; a durable is being re-checked before it is re-created: " + err.Error(), err
+			}
 			// Drop the connection: callout grants are fixed when it opens,
 			// and one opened before the callout served the map that grants
 			// the operator its durables would be refused forever. The retry
@@ -777,6 +787,19 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		Message:            idMsg,
 		ObservedGeneration: p.Generation,
 	})
+	// The durables' tiers: written only by a pass whose durable sync
+	// succeeded (the card reads Published with the dispatcher on), so a pass
+	// the bus refused, as during a bus migration's write freeze, leaves the
+	// record of durables that existed in place (#6283).
+	if verdict != nil && cardReason == reasonAgentProfilePublished && a2aDispatcherEnabled() {
+		p.Status.DurableTiers = durableTiersOf(*verdict)
+	}
+	// A withdrawn card (IdentityNotRendered, from withdrawCard) deleted the
+	// profile's durables, so none existed any more: when the profile
+	// recovers, its durables are made at once, not after a re-check.
+	if cardReason == reasonAgentProfileIdentityMissing && a2aDispatcherEnabled() {
+		p.Status.DurableTiers = nil
+	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               agentv1alpha1.AgentProfileConditionCardPublished,
 		Status:             conditionStatus(cardReason == reasonAgentProfilePublished),
@@ -825,7 +848,8 @@ func conditionStatus(ok bool) metav1.ConditionStatus {
 // times, which SetStatusCondition preserves when nothing else changed.
 func equalAgentProfileStatus(a, b *agentv1alpha1.AgentProfileStatus) bool {
 	if a.ObservedGeneration != b.ObservedGeneration || a.AgentRef != b.AgentRef || a.ServiceAccountName != b.ServiceAccountName ||
-		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || len(a.Conditions) != len(b.Conditions) {
+		!slices.Equal(a.RenderedTiers, b.RenderedTiers) || !slices.Equal(a.DurableTiers, b.DurableTiers) ||
+		len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
 	for _, c := range b.Conditions {

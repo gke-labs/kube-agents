@@ -175,6 +175,10 @@ readonly EVAL_TIMING_FILE="timing.json"
 # The delivered reply's shape beside results.json, where
 # bench/kube_agents_bench/scoring.py (_SHAPE_FILE) reads it. Reported, never scored.
 readonly EVAL_SHAPE_FILE="shape.json"
+# The invocation's eval run tag (<run>/<case>/<rep>) and run id beside
+# results.json (harness.py, KUBE_AGENTS_EVAL_RUN_FILE), so a retried
+# repetition's attempt is told apart from the first in the replay proxy's log.
+readonly EVAL_RUN_TAG_FILE="eval_run.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
 # Where each unit writes a repetition's log (run_one_unit) and grading reads it
@@ -4758,6 +4762,10 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # The full compliance audit with its ledger write (#1983), after a plant of
+    # four namespaces and at most one CRD on the host. Unmeasured: priced at
+    # the audit band.
+    security-serviceentry-host-collision) echo 900 ;;
     # Written to outrun the worker turn budget: about 150 trivial model calls,
     # twice (the dispatcher retries the timed-out card once), on the agent's
     # own cluster. 13-26 min a repetition at 90 turns on a dev install on
@@ -5685,6 +5693,23 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
       return 0
     fi
   fi
+  # A case graded by post_merge_outcome (bench/kube_agents_bench/post_merge.py)
+  # merges the agent's fix pull request itself, as no reconciler or reviewer
+  # does inside a run, and afterwards takes the merged pull request's audit
+  # labels off and puts its files back. The ledger App mints it a token
+  # narrowed to this repository with the reset's permissions (a merge, a
+  # label, a file); the agent never sees it. Without one the check errors, which grades the repetition MISSING.
+  unset EVAL_POST_MERGE_WRITE_TOKEN
+  # GitHub only: on GitLab forge_write_token hands back the agent's own token.
+  # Minted at launch and good for an hour, which covers the agent's turn plus
+  # the check's fifteen minutes of ticks; a unit that outlasts it errors its cleanup
+  # into the log rather than silently.
+  if [ "${EVAL_FORGE_KIND:-github}" = "github" ] && grep -q 'type: post_merge_outcome' "${BENCH_DIR}/${task#./}" 2>/dev/null && [ -n "${EVAL_LEDGER_REPO:-}" ]; then
+    local merge_token=""
+    merge_token="$(forge_write_token "${EVAL_LEDGER_REPO}" '{"pull_requests":"write","contents":"write","issues":"write"}')" ||
+      echo "WARNING: ${name} rep ${rep}: no merge token for ${EVAL_LEDGER_REPO}; post_merge_outcome will error" >&2
+    [ -n "${merge_token}" ] && export EVAL_POST_MERGE_WRITE_TOKEN="${merge_token}"
+  fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
     export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
@@ -5746,6 +5771,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The same for the delivered reply's shape (harness.py, KUBE_AGENTS_SHAPE_FILE).
   local shape="${STATE_DIR}/${name}.rep${rep}.${EVAL_SHAPE_FILE}"
   rm -f "${shape}"
+  # The same for the eval run tag (harness.py, KUBE_AGENTS_EVAL_RUN_FILE).
+  local eval_run="${STATE_DIR}/${name}.rep${rep}.${EVAL_RUN_TAG_FILE}"
+  rm -f "${eval_run}"
   # A stack that writes to the leased GitOps repository gets its own write
   # token, minted here, after the waits, as the grading token is above, and
   # renewed until devops-bench returns, which is after the stack's destroy
@@ -5770,7 +5798,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
   start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" KUBE_AGENTS_EVAL_RUN_FILE="${eval_run}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   stop_ledger_token_renewal "${token_file}"
   if [ -n "${gitops_writer}" ]; then
@@ -5789,6 +5817,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
   if [ -n "${dir}" ] && [ -f "${shape}" ]; then
     cp "${shape}" "${dir}/${EVAL_SHAPE_FILE}" 2>/dev/null || true
+  fi
+  if [ -n "${dir}" ] && [ -f "${eval_run}" ]; then
+    cp "${eval_run}" "${dir}/${EVAL_RUN_TAG_FILE}" 2>/dev/null || true
   fi
   # A gated judged score the judge failed to return is asked for once more
   # from the saved answer (kube_agents_bench/rejudge.py), before the .dir

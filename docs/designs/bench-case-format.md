@@ -440,7 +440,7 @@ the run started (or, with `since_state_file`, since the `fired_at` a case's stac
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
-`required_finding_phrases` entry, a finding in its `document` whose id contains it. `report_store_reply`, in its own module
+`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the

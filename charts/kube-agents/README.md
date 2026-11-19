@@ -1028,7 +1028,9 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
 `helm upgrade` on an install whose served `PlatformAgent` CRD predates
-`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. A value under
+`googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
+of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
 `GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
 renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
@@ -1046,7 +1048,9 @@ has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
-significant digits is refused at render as well: the chart compares quantities as
+significant digits is refused at render as well, and so is one with an exponent
+below -18 (`1e-19`), which the operator decodes only slowly and no resource
+needs: the chart compares quantities as
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
@@ -1109,6 +1113,13 @@ rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent
 wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
 says what is counted and what a held triage does.
+
+`platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
+LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
+agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
+proxy logs and does not forward. `false`, the default, renders nothing. A literal entry with the
+same name in `platformAgent.deployment.env` wins. A `valueFrom` entry with the key `true` fails the
+render, because the operator forwards only literal values and would drop it.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
@@ -1454,7 +1465,12 @@ or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.
 folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
 hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
 provisioning Job, so it overstates both.
-The session pods the install spawns on demand are not counted; the operator caps those with
+It counts the session pods the gateway spawns on demand at their cap:
+`platformAgent.harness.tuning.maxSessions` (10 by default) times one session pod, from
+`files/footprint.yaml`'s `operatorRenderedPerReplica.sessionPod` with each key
+`platformAgent.harness.tuning.sessionResources` sets laid over it, as the operator resolves
+them, and on GKE Autopilot at Autopilot's per-Pod minimums. The refusal says how much of
+what it requires is that share. The operator also caps the session pods with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
@@ -1573,9 +1589,10 @@ apply. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them, but not the preflight's quota gate: it sums
 on every render, a namespace with no ResourceQuota and `helm template` included, so the
-refusals the preflight section lists apply wherever the summary prints. It says what it
-leaves out: the session pods, which the
-[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+refusals the preflight section lists apply wherever the summary prints. Its figures
+and cost are the standing release; it prints the session pods' share at the cap on a line
+of its own, as the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) do.
 
 #### Upgrade notes: operator memory floor
 

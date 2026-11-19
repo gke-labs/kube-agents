@@ -46,9 +46,15 @@ const (
 	universeDomainSourceDiscovered = "Discovered"
 
 	// reasonUniverseDomainMismatch parks Ready False / Phase Degraded before
-	// rendering workloads when spec.harness.universeDomain disagrees with the
-	// host cluster's metadata server.
+	// rendering workloads when spec.harness.universeDomain is malformed, is
+	// under googleapis.com, or disagrees with the host cluster's metadata
+	// server.
 	reasonUniverseDomainMismatch = "UniverseDomainMismatch"
+	// universeDomainUnderCommercialMsgFmt answers a spec.harness.universeDomain
+	// under the commercial domain: the value, the commercial domain, and the
+	// commercial domain again as what to set.
+	universeDomainUnderCommercialMsgFmt = "spec.harness.universeDomain %q is under %q, which is the commercial Google Cloud universe and not another one. " +
+		"Set spec.harness.universeDomain to %q (or omit it to auto-detect from the host cluster)."
 	universeDomainMismatchMsgFmt = "spec.harness.universeDomain is %q, while the host cluster's GKE metadata server reports %q. " +
 		"One PlatformAgent spans a single Google Cloud universe domain and will not send tokens across universe boundaries. " +
 		"Set spec.harness.universeDomain to %q (or omit it to auto-detect from the host cluster)."
@@ -172,7 +178,8 @@ func (r *PlatformAgentReconciler) hostUniverseDomain(ctx context.Context) (strin
 
 // validateUniverseDomain checks that spec.harness.universeDomain, when
 // explicitly set, does not contradict the host cluster's GKE metadata server,
-// and is a well-formed DNS domain even when admission webhooks are off.
+// and is a well-formed DNS domain that is not under googleapis.com, even when
+// admission webhooks are off.
 // When the metadata probe fails transiently on GKE, transient=true asks the
 // caller to requeue rather than rendering cross-universe workloads unverified.
 func (r *PlatformAgentReconciler) validateUniverseDomain(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (reason, message string, transient bool) {
@@ -181,13 +188,17 @@ func (r *PlatformAgentReconciler) validateUniverseDomain(ctx context.Context, ag
 	}
 	specDomain := strings.TrimSpace(agent.Spec.Harness.UniverseDomain)
 	if specDomain == "" {
-		if harnessOnKind(agent.Spec.Harness) || strings.TrimSpace(agent.Status.ResolvedUniverseDomain) != "" {
+		if harnessOnKind(agent.Spec.Harness) || keptUniverseDomain(agent) != "" {
 			return "", "", false
 		}
 		if _, determined := r.hostUniverseDomain(ctx); !determined {
 			return "", "", true
 		}
 		return "", "", false
+	}
+	if agentv1alpha1.IsUnderCommercialUniverseDomain(specDomain) {
+		return reasonUniverseDomainMismatch, fmt.Sprintf(universeDomainUnderCommercialMsgFmt,
+			specDomain, agentv1alpha1.DefaultUniverseDomain, agentv1alpha1.DefaultUniverseDomain), false
 	}
 	if !agentv1alpha1.IsValidUniverseDomain(specDomain) {
 		return reasonUniverseDomainMismatch, fmt.Sprintf(
@@ -208,12 +219,29 @@ func (r *PlatformAgentReconciler) validateUniverseDomain(ctx context.Context, ag
 	return "", "", false
 }
 
+// keptUniverseDomain returns status.resolvedUniverseDomain when it is a value
+// the validators accept, and "" otherwise. The status can hold a value from
+// before the validators refused it (a name under googleapis.com), and every
+// reader that keeps or renders the status value goes through here, so such a
+// value is not used again.
+func keptUniverseDomain(agent *agentv1alpha1.PlatformAgent) string {
+	if agent == nil {
+		return ""
+	}
+	kept := strings.TrimSpace(agent.Status.ResolvedUniverseDomain)
+	if !agentv1alpha1.IsValidUniverseDomain(kept) {
+		return ""
+	}
+	return kept
+}
+
 // resolvedUniverseDomainPair returns the (domain, source) pair to record on
 // PlatformAgentStatus. Absent ("", "") when spec.harness.universeDomain is
 // unset and no metadata detector answered (for example on kind or in offline
 // unit tests). When the metadata server fails transiently on a live install
 // that already recorded a discovered universe domain, the prior status pair is
 // preserved so workloads are never rolled back onto commercial googleapis.com.
+// A prior value the validators refuse is not preserved (keptUniverseDomain).
 func (r *PlatformAgentReconciler) resolvedUniverseDomainPair(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (domain, source string) {
 	if agent != nil && agent.Spec.Harness != nil {
 		if specDomain := strings.TrimSpace(agent.Spec.Harness.UniverseDomain); specDomain != "" {
@@ -227,8 +255,8 @@ func (r *PlatformAgentReconciler) resolvedUniverseDomainPair(ctx context.Context
 	if detected != "" {
 		return detected, universeDomainSourceDiscovered
 	}
-	if !determined && agent != nil {
-		if existing := strings.TrimSpace(agent.Status.ResolvedUniverseDomain); existing != "" {
+	if !determined {
+		if existing := keptUniverseDomain(agent); existing != "" {
 			existingSource := strings.TrimSpace(agent.Status.UniverseDomainSource)
 			if existingSource == "" {
 				existingSource = universeDomainSourceDiscovered
@@ -242,8 +270,10 @@ func (r *PlatformAgentReconciler) resolvedUniverseDomainPair(ctx context.Context
 // guardrailAgentForUniverse returns a copy of agent safe for
 // reconcileAgentNetworkGuardrails on refusal and requeue branches before step
 // 10a, plus skipFQDN=true when no authoritative universe is known yet (a
-// cold-start metadata timeout with empty status.resolvedUniverseDomain).
-// When spec.harness.universeDomain was refused (mismatch or malformed syntax),
+// cold-start metadata timeout with empty status.resolvedUniverseDomain, or
+// with a status value the validators refuse).
+// When spec.harness.universeDomain was refused (mismatch, malformed syntax, or
+// a name under googleapis.com),
 // the rejected spec value is cleared so FQDNNetworkPolicy never renders rules
 // for a rejected or unparseable universe domain.
 func (r *PlatformAgentReconciler) guardrailAgentForUniverse(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, bool) {
@@ -256,7 +286,7 @@ func (r *PlatformAgentReconciler) guardrailAgentForUniverse(ctx context.Context,
 		if copyAgent.Spec.Harness != nil {
 			copyAgent.Spec.Harness.UniverseDomain = ""
 		}
-		if strings.TrimSpace(copyAgent.Status.ResolvedUniverseDomain) != "" {
+		if keptUniverseDomain(copyAgent) != "" {
 			return copyAgent, false
 		}
 		return copyAgent, true
@@ -276,7 +306,8 @@ func (r *PlatformAgentReconciler) guardrailAgentForUniverse(ctx context.Context,
 // effectiveUniverseDomain returns the Google Cloud API universe domain that
 // manifest builders render against: spec.harness.universeDomain when set, else
 // status.resolvedUniverseDomain (stamped on the in-memory copy during
-// Reconcile when discovered from the metadata server), else "googleapis.com".
+// Reconcile when discovered from the metadata server) when the validators
+// accept it (keptUniverseDomain), else "googleapis.com".
 func effectiveUniverseDomain(agent *agentv1alpha1.PlatformAgent) string {
 	if agent != nil {
 		if agent.Spec.Harness != nil {
@@ -284,7 +315,7 @@ func effectiveUniverseDomain(agent *agentv1alpha1.PlatformAgent) string {
 				return specDomain
 			}
 		}
-		if statusDomain := strings.TrimSpace(agent.Status.ResolvedUniverseDomain); statusDomain != "" {
+		if statusDomain := keptUniverseDomain(agent); statusDomain != "" {
 			return statusDomain
 		}
 	}

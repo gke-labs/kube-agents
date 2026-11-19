@@ -131,6 +131,7 @@ readonly GATEWAY_HOME_CHANNEL_SLACK_PLATFORM="Slack"
 # `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
 readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_SCHEMA_FILE="values.schema.json"
 readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
 readonly FOOTPRINT_PROBE_KEY="summary"
 readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
@@ -982,7 +983,8 @@ tfvars_scalar() {
 # Renders the chart's footprint summary for the install terraform.tfvars
 # describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
 # $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
-# the chart is not in the checkout, or the render refuses; the caller decides
+# the chart is not in the checkout, a step of the probe chart's build fails
+# (the probe directory is removed), or the render refuses; the caller decides
 # whether that is worth more than a warning.
 render_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
@@ -1000,14 +1002,15 @@ render_footprint_summary() {
   # only template beside the probe. values.schema.json comes too, so a value
   # the chart would refuse is refused here as well.
   cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
-  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  [ ! -f "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" ] || cp "${chart_dir}/${FOOTPRINT_SCHEMA_FILE}" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
   cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
-  mkdir -p "$probe_dir/templates"
-  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  mkdir -p "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE%/*}" || { rm -rf "$probe_dir"; return 1; }
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}" || { rm -rf "$probe_dir"; return 1; }
   # A ConfigMap, so the output is one YAML document helm's manifest sorter
   # reads; the block scalar keeps the summary's lines as they are.
   printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
-    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}" \
+    || { rm -rf "$probe_dir"; return 1; }
   local -a set_args=()
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue

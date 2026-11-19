@@ -1319,6 +1319,15 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# Which GitOps repositories the agent manages, read from the install's
+# configured registry via gitops_preflight.py (`agents/platform/SOUL.md` §1)
+# rather than discovered through kubectl, gcloud, forge APIs, clones, MCP
+# cluster/doc tools, or web search. deployer: noop, read-only, no seeded-fleet
+# fixture (depends only on each eval install's `<owner>/<PROJECT_ID>-infra`
+# repository); compatible with both the inject and api transports (excluded
+# from neither exclusion list; CI nightlies run over inject).
+./tasks/list-gitops-repos/task.yaml
+
 # The networking audit's firewall-world-open-ingress check over a standing
 # plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
 # the internet on one VM with an external IP. deployer: noop, read-only on the
@@ -1380,6 +1389,12 @@
 # repetitions alone, after every other unit, and restores the scope after them
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
+
+# #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
+# stack plants two namespaces exporting one host everywhere and two exporting
+# another to themselves only, on the host cluster, installing a minimal
+# ServiceEntry CRD when none is served; graded on the report store's finding ids.
+./tasks/security-serviceentry-host-collision/task.yaml
 
 # #5191: a /session turn that asks for a profile by name delegates to it,
 # graded by delegated_to (#5194 moved it to the cluster profile). Needs the

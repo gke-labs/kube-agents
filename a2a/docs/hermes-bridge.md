@@ -388,7 +388,7 @@ Hermes API server in the same pod (`BRIDGE_API_URL`, default
 `model-default`) with `Authorization: Bearer $API_SERVER_KEY` and three headers:
 `X-Hermes-Session-Key` and `X-Hermes-Session-Id`, both set to the session id below, and
 `Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice (a
-follow-up turn's key adds its envelope id; see **Steering** below). The
+follow-up turn's key adds its envelope id; see **Steering** below). On an inject-door conversation, whose key is `inject:<run>/<case>/<rep>`, it also sends `X-Kube-Agents-Eval-Run: <run>/<case>/<rep>`; the API server records it for the session while the install has `KUBEAGENTS_EVAL_RUN_TAGS` on and ignores it otherwise (`deploy/docker/patches/eval_run_tag.py`). The
 server loads the session's history from its own store before the turn and appends to it after,
 so the second task in a thread sees the first. The session id is `a2a-` plus the task's
 `contextId`, which the gateway mints once per backend conversation. A `contextId` that is not
@@ -427,25 +427,43 @@ be posted back. A Google Chat, Slack or console conversation is posted back. A c
 conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
-Before the same first turn the bridge also reads the store the other way: a reply typed under a
-report the system pushed (a relayed scheduled report, the triage card's report the notifier posts
-under an alert, a card's report it posted into a Slack or Google Chat conversation) arrives with
-no link to that report, and under `next`
-nothing else attaches it, since the Hermes gateway's `incident_context` hook runs on no turn of
-the `api` executor. So the bridge asks session-kv for the row the poster stored
-(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's
-recent-reports index or its Google Chat first-reply recovery): first by the thread the conversation key
-names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/threads/B` is
-`(spaces/A, the thread name)`), then by the Hermes session and the conversation key, which is how
-the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
-gateway conversation (a console
-conversation's row carries the filing turn's task in its key, which a later reply does not know,
-so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
-since every later message there shares it and would carry the first stored report for the row's
-life). A row found is spliced ahead of
+Before the same first turn the bridge also puts the report a reply is under ahead of it. Under
+`next` a reply typed under a report the system pushed (a relayed scheduled report, the triage
+card's report the notifier posts under an alert, a card's report posted into a conversation)
+arrives with no link to that report, and nothing else attaches it, since the Hermes gateway's
+`incident_context` hook runs on no turn of the `api` executor. Two sources, in order. First the
+gateway's relay: the A2A gateway keeps the text of each report its notify route posts into a
+console conversation (a card's report, marked `report` by the notifier and naming its task; a
+progress note, which shares the thread and the task, is not kept; a Slack or Google Chat
+thread's posts, a relayed scheduled report and an alert's triage report it does not keep, and the
+lookup still serves them; `docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it
+on a reply's submission as a `pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the
+reply names the task the report was on (a console or MCP client's `replyTo`, the chain's root even
+when a delegated child filed the card); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so
+what it kept is what the person read; it holds reports only, and when two reports share one root
+(two cards from one turn) the reply carries the newest. This is how a card filed in a delegated
+child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
+reply never reads, and the relay carries the report across. The relay rides a human turn on every
+route; this executor frames it on the platform route (the install's default), and a conversation
+on its own session pod (the a2a-worker) does not read it yet. Then, with no relayed part (the gateway restarted
+since the post, or the post was one it does not keep), the bridge asks session-kv for the row the poster stored
+(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's recent-reports
+index or its Google Chat first-reply recovery): first, when the submission carries a `replyTo`
+part, by the Hermes session and `<conversation key>#<task>`, which is how the notifier keys a
+card's report it posted into a console conversation (the report's frame names the filing turn's
+task as `replyTo`, and a console client, the MCP server's `send_message` with `reply_to`, echoes it
+with the reply; a reply while the turn is still running is steered into it and carries no
+`replyTo`, since the report is attached on an opening turn only); then by the thread the
+conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
+`gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
+conversation key, which is how the notifier keys a card's report it posted into a Slack or Google
+Chat gateway conversation. A console reply that names no task takes only the last,
+`(session, key)`, and finds no row, since the console row's key carries the task; a key naming a
+whole DM or space rather than a thread is not looked up at all, since every later message there
+shares it and would carry the first stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
-the hook by its test). No row, a store that errors, or a bridge with no route store leaves the
+the hook by its test). No relayed part and no row, a store that errors, or a bridge with no route store leaves the
 prompt as typed; a steer queued during the task is not looked up, since its session has read the
 report, and a later message on the conversation is a new task and is.
 

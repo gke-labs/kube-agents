@@ -141,11 +141,22 @@ SEGMENT_ROLL_CHECK_SECONDS = 1.0
 # remaining 15 with room for the interpreter to exit.
 SHUTDOWN_CLOSE_SECONDS = 10.0
 
-# Request headers not forwarded: hop-by-hop ones, and Accept-Encoding so the
-# upstream answers uncompressed and the usage block can be read.
+# The eval run tag headers the agent's eval_run_tag plugin adds
+# (deploy/docker/patches/eval_run_tag.py): logged on every request line as
+# eval_run and eval_agent, and never forwarded, so LiteLLM and the model
+# behind it see the request they saw before the tags existed. The key is the
+# body's alone (normalizer.py), so they cannot reach it either.
+EVAL_RUN_HEADER = "x-kube-agents-eval-run"
+EVAL_AGENT_HEADER = "x-kube-agents-eval-agent"
+EVAL_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}")
+EVAL_AGENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63};[a-z]{1,16}")
+
+# Request headers not forwarded: hop-by-hop ones, Accept-Encoding so the
+# upstream answers uncompressed and the usage block can be read, and the eval
+# run tag headers above.
 DROPPED_REQUEST_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer",
-    "upgrade", "proxy-connection", "accept-encoding",
+    "upgrade", "proxy-connection", "accept-encoding", EVAL_RUN_HEADER, EVAL_AGENT_HEADER,
 }
 DROPPED_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade"}
 MODEL_GROUP_HEADER = "x-litellm-model-group"
@@ -766,7 +777,12 @@ class ShadowProxy:
             self.metrics.add("analysis_dropped")
             self.log({F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
                       F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: F.ERROR_ANALYSIS_DROPPED,
-                      **self.served_fields(served)})
+                      **self.served_fields(served), **self.eval_fields(upstream)})
+
+    @staticmethod
+    def eval_fields(upstream: Dict[str, Any]) -> Dict[str, Any]:
+        """The eval run tag fields every request line carries, even one whose analysis was lost."""
+        return {F.EVAL_RUN: upstream.get(F.EVAL_RUN), F.EVAL_AGENT: upstream.get(F.EVAL_AGENT)}
 
     def served_fields(self, served: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """The mode and served fields every request line carries, even one whose analysis was lost."""
@@ -830,7 +846,7 @@ class ShadowProxy:
                     # The type name only: an exception's message can quote request text.
                     entry = {F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
                              F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__,
-                             **self.served_fields(served)}
+                             **self.served_fields(served), **self.eval_fields(upstream)}
                 self.log(entry)
             except Exception:  # a failed write to stdout loses this line, not the worker
                 self.metrics.add("analysis_errors")
@@ -1071,6 +1087,7 @@ class ShadowProxy:
             F.LITELLM_MODEL_GROUP: upstream["headers"].get(MODEL_GROUP_HEADER),
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
             **self.served_fields(served),
+            **self.eval_fields(upstream),
         }
         if served is None:
             entry[F.LITELLM_MODEL_NAME] = upstream["headers"].get(MODEL_NAME_HEADER)
@@ -1239,16 +1256,27 @@ class Handler(BaseHTTPRequestHandler):
                 answer, saved, fingerprint, via = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
+                upstream.update(self._eval_tags())
                 self.proxy.submit(body, received, upstream, len(raw), served=saved, keyed=keyed)
                 return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
         if body is None:
             return
         upstream["refused"] = refused
+        upstream.update(self._eval_tags())
         self.proxy.metrics.add("completions")
         self.proxy.submit(body, received, upstream, len(raw), keyed=keyed)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
+
+    def _eval_tags(self) -> Dict[str, Optional[str]]:
+        """The request's eval run tag headers, each None when absent or malformed."""
+
+        def read(name: str, pattern: "re.Pattern[str]") -> Optional[str]:
+            value = (self.headers.get(name) or "").strip()
+            return value if pattern.fullmatch(value) else None
+
+        return {F.EVAL_RUN: read(EVAL_RUN_HEADER, EVAL_RUN_RE), F.EVAL_AGENT: read(EVAL_AGENT_HEADER, EVAL_AGENT_RE)}
 
     def _forward(self, raw: bytes, observe: bool, streaming: bool) -> Dict[str, Any]:
         """Send the request upstream and copy the response back byte for byte."""

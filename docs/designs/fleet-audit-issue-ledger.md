@@ -551,7 +551,7 @@ the `repo`, `path` and `excerpt` of the declaration — validated for scope, a n
 identity, a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
 beside the roster; a fault check or a stream with no declared-intent step is rejected), and an
 `object` of a kind the check files where the check fixes one (`DECLARABLE_OBJECT_KINDS`: the cost
-checks' kinds and `NodePool/` for the stockout pool check), and never
+checks' kinds, `NodePool/` for the stockout pool check and `Snapshot/` for the compute snapshot check), and never
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.
@@ -1109,35 +1109,40 @@ headroom for the trailing marker and for anything a later section appends.
 - **Table caps.** The scope and skipped tables cap at 60 rows each, with a trailing "…and N more"
   row. Without the cap a body with _zero findings_ overflows: 1,200 clusters plus 1,200 skipped
   entries renders 148,627 characters of pure scope.
-- **Order of measurement.** Header, scope, and footer (the complete-list block excepted, see below) are rendered and measured first; whatever
+- **Order of measurement.** Header, scope, footer (the complete-list block excepted, see below), and the dropped check-evidence notice (when the run has check evidence) are rendered and measured first; whatever
   remains of the 60,000 is the findings budget. The collector-held section, when there is one, is
   measured after the findings and before the evidence appendix, degrading to identity lines and then
-  to a note rather than displacing a finding (collector design §3.3). It also carries the
+  to a note rather than displacing a finding or the dropped check-evidence notice (collector design §3.3). It also carries the
   _Not re-checked this run_ rows (§7.4). Findings are selected **severity-first**, so
-  truncation only ever eats the least-severe end and criticals are structurally safe — a fleet with
-  five criticals and three hundred minors publishes all five criticals no matter what. In a
+  omission only ever eats the least-severe end: full blocks past the first finding yield to one-line
+  rows across every band (critical included) before any finding is omitted, and a fleet with five
+  criticals and three hundred minors names every critical — in full while all names fit, or on one
+  line when they do not — before any minor is cut. In a
   severity band, selection takes one finding for each target in turn while the band has space: no
   target gets a second row before every target in the band has one. When the band has fewer slots
   than targets, the targets late in the alphabet lose their full rows first (see the next bullet
   for the one-line tier). The body still shows the
   selected findings in display order.
-- **A name outranks a full block, except a critical's.** When the full blocks do not all fit, the
+- **A name outranks a full block.** When the full blocks do not all fit, the
   findings left over are each listed on one line — severity, title, location, id, then any fix
   state and its pull request — under
-  `### Listed without detail (N)`; a 2.7 finding the shared-account shield made manual keeps the
-  shield's note on an indented line under its row. Bands are taken most severe first. A non-critical band shows as
-  many full blocks as still leave room to name the rest of it and every finding below it; the
-  critical band keeps room for its own names only, so a critical never loses its evidence to a less
-  severe finding's name. When naming everything below cannot fit even with no full blocks, a
-  non-critical band keeps only its floor of full blocks and spends the rest on names. Every band below the one where full blocks stop is names only,
-  as many as fit, then a count. A listed line is a
-  bullet, never a `####` heading, so the readers that recover a finding's detail from its heading
-  (`FINDING_MARKER_RE`, the Slack card) do not take it for one. Its id rides the delta marker like a
-  full row's, and `parse_finding_locations` reads its row with the full blocks, only between
+  `### Listed without detail (N)`; a new listed finding carries `<!-- finding-new -->` indented on
+  the line beneath its bullet, and a 2.7 finding the shared-account shield made manual keeps the
+  shield's note on an indented line under its row. Bands are taken most severe first, with the state
+  index charged against the full-row prefix actually shown rather than fifty rows up front. Once all
+  full blocks do not fit, every band — critical included — shows only as many full blocks from the
+  top down as still leave room to name every remaining finding below on one line. When naming
+  everything cannot fit even beside a single full block, the body keeps the first finding in full
+  and spends the rest of the budget listing remaining findings down the severity bands, then gives
+  the omitted count and per-severity breakdown for the tail. A listed line is a
+  bullet, never a `####` heading, so `FINDING_MARKER_RE` (which recovers a finding's detail from its
+  heading) does not take it for one. Its id rides the delta marker like a
+  full row's, and both `parse_finding_locations` and the chat card (`slack_audit_report.py`) read
+  its row with the full blocks, only between
   the renderer's `audit-listed:begin`/`end` comments, which model text cannot spell: the ledger names it,
-  so the delta, the collector hold, the clean close and the `carried` list `start` prints all treat
-  it as on the ledger. A listed finding that gains a full block when others resolve is not new, and
-  one that stops reproducing is resolved.
+  so the delta, the collector hold, the clean close, the chat card and the `carried` list `start`
+  prints all treat it as on the ledger. A listed finding that gains a full block when others resolve
+  is not new, and one that stops reproducing is resolved.
 - **Truncation is stated, counts are not.** When findings are omitted the body says so explicitly,
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
@@ -1177,7 +1182,8 @@ headroom for the trailing marker and for anything a later section appends.
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
 - **A finding new since the last run is marked where the run knows it.** A `<!-- finding-new -->`
-  line under a finding's heading says the last run did not file it although it ran the finding's
+  line under a finding's heading — or indented beneath its one-line row in `### Listed without detail`
+  — says the last run did not file it although it ran the finding's
   check on its cluster, so the Slack card can tag it. It is worked out before rendering, against
   everything the last run filed in its stored report rather than the hidden block alone: a finding
   the last body cut for space, or a posture it withheld, is not new, and nor is one whose check that
@@ -1318,7 +1324,8 @@ Four changes close it, and none of them pretend to verify anything:
   collapsed table of every entry, one row per check and command with every cluster that ran it
   named in the row, rendered against whatever body budget the findings left and
   dropped whole rather than half if it does not fit — with a notice pointing at the run's stored
-  report, which keeps every entry.
+  report, which keeps every entry (the notice's length is reserved before finding selection so a
+  dropped table always carries it).
 
 One residual risk is worth naming because the design cannot remove it: the harness runs as a
 subprocess of the agent, so it never observes the commands the agent issued — only the document
