@@ -638,6 +638,7 @@ var knownPlatformSkills = []string{
 	"gke-multitenancy",
 	"gke-cluster-creation",
 	"gke-batch-hpc",
+	"gke-kueue-troubleshooting",
 	"gke-inference",
 	"gke-tpu-dynamic-slices-monitoring",
 	"gke-tpu-metrics-monitoring",

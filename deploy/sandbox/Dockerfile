@@ -192,12 +192,13 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # In the agent container `python3` resolves through PATH into the Hermes venv,
 # so a shell command there gets these for free; here python3 is the bare base
-# image. No skill script imports a third-party module today — the ones that do
-# (credential_proxy.py, platform_mcp_server.py, session_kv_server.py,
-# profile_cron_tick.py, cluster_agent_profile.py) all run in the agent pod — but
-# that is an undeclared contract. Two packages rather than the venv's ~150: a
-# script written on the fly parses YAML or makes an HTTP call, and reaches for
-# the standard library for everything else.
+# image. Skill scripts that parse YAML (`gke-kueue-troubleshooting/scripts/`)
+# depend on `pyyaml` here, while the heavier helper scripts
+# (`credential_proxy.py`, `platform_mcp_server.py`, `session_kv_server.py`,
+# `profile_cron_tick.py`, `cluster_agent_profile.py`) run in the agent pod.
+# Two packages rather than the venv's ~150: skill scripts and scripts written
+# on the fly parse YAML or make an HTTP call, and reach for the standard library
+# for everything else.
 #
 # Not the google-cloud or kubernetes clients, which are the bulk of what is left
 # there. Both authenticate before they are useful and the sandbox holds no
