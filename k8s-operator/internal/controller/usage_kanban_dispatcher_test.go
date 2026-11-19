@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -81,20 +82,48 @@ func TestKanbanDispatcher_ConditionSetsAtTheThresholdAndClears(t *testing.T) {
 	}
 }
 
-// The True message names the board, the streak and the last error class, and
-// it is held while the status holds.
-func TestKanbanDispatcher_MessageNamesTheBoardAndIsHeld(t *testing.T) {
+// The True message names the board, the last error class and the rule, and no
+// tick count or age. A longer streak on the same board with the same error is
+// the same message, so a later poll writes nothing; a change of the error class
+// or of the board is a new message, and the poll that reads it writes it.
+func TestKanbanDispatcher_MessageNamesTheBoardAndFollowsIt(t *testing.T) {
 	h := dispatcherHarness(t)
 	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: kanbanDispatcherFailingTicks})
 	h.poll(5)
 	cond := dispatcherCondition(h)
-	if cond == nil || !strings.Contains(cond.Message, `failed 60 ticks in a row on board "default" (last error OperationalError)`) || !strings.Contains(cond.Message, kanbanDispatcherFailingHint) {
+	want := `The kanban dispatcher's ticks fail on board "default" (last error OperationalError): 60 or more in a row, or 3 or more in a streak at least 5m0s old.`
+	if cond == nil || !strings.HasPrefix(cond.Message, want+" ") || !strings.Contains(cond.Message, kanbanDispatcherFailingHint) {
 		t.Fatalf("True message = %+v", cond)
 	}
-	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "DatabaseError", Ticks: kanbanDispatcherFailingTicks * 2})
+	// A later poll: the streak is longer and has an age. Nothing in the message changes.
+	written, patches := cond.Message, h.patches
+	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: kanbanDispatcherFailingTicks * 2, Seconds: 600, HasAge: true})
 	h.poll(10)
-	if again := dispatcherCondition(h); again.Message != cond.Message {
-		t.Fatalf("a held True condition was rewritten: %q -> %q", cond.Message, again.Message)
+	if again := dispatcherCondition(h); again.Message != written || h.patches != patches {
+		t.Fatalf("a longer streak rewrote the condition: %q -> %q, %d -> %d patches", written, again.Message, patches, h.patches)
+	}
+	// The error class changes: the message on the CR names the new one.
+	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "DatabaseError", Ticks: kanbanDispatcherFailingTicks * 3, Seconds: 900, HasAge: true})
+	h.poll(15)
+	if again := dispatcherCondition(h); !strings.Contains(again.Message, `on board "default" (last error DatabaseError)`) || again.Reason != kanbanDispatcherReasonTicksFailing {
+		t.Fatalf("after the error class changed: condition %+v, want the new class in the message", again)
+	}
+	// Another board is the failing one now, under the same reason. An old
+	// transition time first, so that a write that moved it would show.
+	agent := h.agent()
+	transition := metav1.NewTime(usageClock(0).Add(-48 * time.Hour).Truncate(time.Second))
+	meta.FindStatusCondition(agent.Status.Conditions, kanbanDispatcherFailingCondition).LastTransitionTime = transition
+	if err := h.cl.Status().Update(context.Background(), agent); err != nil {
+		t.Fatalf("setting an old transition time: %v", err)
+	}
+	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "audits", Error: "DatabaseError", Ticks: kanbanDispatcherFailingTicks})
+	h.poll(20)
+	again := dispatcherCondition(h)
+	if !strings.Contains(again.Message, `on board "audits"`) || strings.Contains(again.Message, `"default"`) {
+		t.Fatalf("after another board began to fail: message %q, want it to name audits only", again.Message)
+	}
+	if !again.LastTransitionTime.Equal(&transition) {
+		t.Fatalf("a message change moved lastTransitionTime: %v -> %v", transition, again.LastTransitionTime)
 	}
 }
 
@@ -157,7 +186,7 @@ func TestKanbanDispatcher_ALockedBoardSetsItByTheStreaksAge(t *testing.T) {
 	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTicksFailing {
 		t.Fatalf("at 3 ticks over 375 s: condition %+v, want True", cond)
 	}
-	if !strings.Contains(cond.Message, `failed 3 ticks in a row over 6m15s on board "default"`) {
+	if !strings.Contains(cond.Message, `ticks fail on board "default"`) || strings.Contains(cond.Message, "6m15s") {
 		t.Fatalf("message = %q", cond.Message)
 	}
 	h.stub.setDispatcher(chatAddr())
@@ -244,6 +273,65 @@ func TestKanbanDispatcher_AStuckBoardIsNamedBeforeAStreak(t *testing.T) {
 	if cond == nil || cond.Reason != kanbanDispatcherReasonTickStuck || !strings.Contains(cond.Message, `tick on board "locked" waited on its database`) ||
 		!strings.Contains(cond.Message, "2 boards are failing") {
 		t.Fatalf("condition %+v, want the stuck board named under %s and two boards counted", cond, kanbanDispatcherReasonTickStuck)
+	}
+}
+
+// The stuck message follows what it names. A board that stays stuck is one
+// message however long it waits, so a later poll writes nothing. When another
+// board is the stuck one, or the count of failing boards changes, the reason is
+// the same and the message is not: the poll that reads it writes it.
+func TestKanbanDispatcher_TheStuckMessageFollowsTheBoardAndTheCount(t *testing.T) {
+	h := dispatcherHarness(t)
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "locked", Seconds: 400}})
+	h.poll(5)
+	first := dispatcherCondition(h)
+	if first == nil || first.Reason != kanbanDispatcherReasonTickStuck || !strings.Contains(first.Message, `tick on board "locked" waited`) {
+		t.Fatalf("condition %+v, want %s naming locked", first, kanbanDispatcherReasonTickStuck)
+	}
+	patches := h.patches
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "locked", Seconds: 4000}})
+	h.poll(10)
+	if again := dispatcherCondition(h); again.Message != first.Message || h.patches != patches {
+		t.Fatalf("a board that stayed stuck rewrote the condition: %q -> %q, %d -> %d patches", first.Message, again.Message, patches, h.patches)
+	}
+	// "locked" recovered and "queue" is stuck: the same reason, another board.
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "queue", Seconds: 320}})
+	h.poll(15)
+	moved := dispatcherCondition(h)
+	if moved.Reason != kanbanDispatcherReasonTickStuck || !strings.Contains(moved.Message, `tick on board "queue" waited`) || strings.Contains(moved.Message, `"locked"`) {
+		t.Fatalf("after another board got stuck: condition %+v, want it to name queue only", moved)
+	}
+	if moved.Status != first.Status {
+		t.Fatalf("the status changed with the board: %s -> %s", first.Status, moved.Status)
+	}
+	// A second board fails: the count joins the message.
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "queue", Seconds: 620}},
+		usageDispatcherFailure{Board: "default", Error: "OSError", Ticks: kanbanDispatcherFailingTicks})
+	h.poll(20)
+	if counted := dispatcherCondition(h); !strings.Contains(counted.Message, "2 boards are failing.") {
+		t.Fatalf("after a second board failed: message %q, want the count of 2", counted.Message)
+	}
+}
+
+// Two streaks that began in the same second, as on a full disk, are named by
+// board. Their tick counts differ by a tick from poll to poll; a name chosen by
+// the count would move between the boards and write the condition each time.
+func TestKanbanDispatcher_StreaksOfOneAgeAreNamedByBoard(t *testing.T) {
+	h := dispatcherHarness(t)
+	streak := func(board string, ticks int64) usageDispatcherFailure {
+		return usageDispatcherFailure{Board: board, Error: "OSError", Ticks: ticks, Seconds: 900, HasAge: true}
+	}
+	h.stub.setDispatcher(chatAddr(), streak("audits", 70), streak("default", 71))
+	h.poll(5)
+	first := dispatcherCondition(h)
+	if first == nil || !strings.Contains(first.Message, `on board "audits"`) {
+		t.Fatalf("condition %+v, want audits named: the first board by name", first)
+	}
+	patches := h.patches
+	h.stub.setDispatcher(chatAddr(), streak("audits", 131), streak("default", 130))
+	h.poll(10)
+	if again := dispatcherCondition(h); again.Message != first.Message || h.patches != patches {
+		t.Fatalf("a tick's difference between two boards rewrote the condition: %q -> %q, %d -> %d patches", first.Message, again.Message, patches, h.patches)
 	}
 }
 

@@ -1007,7 +1007,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						continue
 					}
 					if name == kanbanDispatcherFailingSecondsSeries {
-						// Bounded to what a time.Duration holds, for the condition's message.
+						// Bounded to what a time.Duration holds.
 						if len(dispatcherAges) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
 							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 						}
