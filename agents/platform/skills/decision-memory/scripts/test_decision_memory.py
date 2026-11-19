@@ -7,11 +7,13 @@ A live run against a real Hindsight is opt-in: set DECISION_MEMORY_LIVE_URL.
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -638,6 +640,43 @@ class IndexTests(unittest.TestCase):
 
     def tearDown(self):
         self.r.close()
+
+    def test_the_opener_takes_no_proxy_when_the_module_is_loaded_under_a_proxy_variable(self):
+        # The module builds its opener when it is imported. A process that has a proxy
+        # variable has it at that time, so the module is loaded in a new process. The
+        # probe prints the http proxy of the module's opener, then that of a default
+        # opener of the same process, which shows that the variable reached the process.
+        proxy = "http://egress.invalid:3128"
+        probe = (
+            "import urllib.request\n"
+            "import decision_memory\n"
+            "def http_proxies(opener):\n"
+            "    return [h.proxies.get('http') for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]\n"
+            "print(http_proxies(decision_memory._HINDSIGHT_OPENER), http_proxies(urllib.request.build_opener()))\n"
+        )
+        environment = {key: value for key, value in os.environ.items() if key.lower() not in ("no_proxy", "http_proxy")}
+        environment["http_proxy"] = proxy
+        done = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=os.path.dirname(os.path.abspath(__file__)), env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(f"[] [{proxy!r}]", done.stdout.strip())
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_hindsight(self):
+        # Hindsight is an in-cluster Service. With a proxy variable and no NO_PROXY
+        # entry for its host, urllib hands the decision records to the proxy.
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}), mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            dm.Hindsight(self.url)._req("PUT", "", {})
+        self.assertEqual([("PUT", "/v1/default/banks/" + dm.DEFAULT_BANK_ID, {})], FakeHindsight.calls)
 
     def test_index_upserts_then_deletes_removed_records(self):
         rc, out = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")

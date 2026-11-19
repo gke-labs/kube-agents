@@ -1321,6 +1321,11 @@ SESSION_KV_URL = "http://127.0.0.1:8699"
 #: slow server must cost the tick a moment, not the next delivery.
 INCIDENT_TIMEOUT_SECONDS = 2.0
 
+#: Session KV is on the pod's loopback address: a proxy from the environment
+#: must not get the report and its bearer token, and urllib does not leave
+#: out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 #: The report's ``What to do`` section, which is where the options live. Written
 #: to tolerate the heading depth drifting (``##`` in the template, but §7 only
 #: pins the words) while still requiring a heading rather than the phrase in
@@ -1414,7 +1419,7 @@ def _post_incident(chat_id: str, thread_id: str, report: str) -> None:
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=INCIDENT_TIMEOUT_SECONDS):
+    with _SESSION_KV_OPENER.open(request, timeout=INCIDENT_TIMEOUT_SECONDS):
         pass
 
 
