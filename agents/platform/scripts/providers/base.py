@@ -121,16 +121,19 @@ LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "exclude
 # against a URL on every forge. `snapshot` is git against a URL too.
 # `proposal-claim` is the broker's because the claim token it burns is the
 # broker's: no forge has one. `revision-contains` is git against a URL too.
+# `proposal-reviews` is a forge read, kept here rather than in
+# COLLABORATION_VERBS because only a library caller runs it.
 BROKER_VERBS: tuple[str, ...] = (
     "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
-    "proposal-claim", "revision-contains", "proposal-practice-label",
+    "proposal-claim", "revision-contains", "proposal-practice-label", "proposal-reviews",
 )
 # Served to library callers only (`vcs_client.snapshot`, the `pr_opened` hook's
-# claim, the post-merge check's ancestry read, the fleet audit's auto-merge
-# label), so `capabilities` does not advertise them: no `vcs.py` command runs
-# them, and an advertised verb sends the agent to a command that does not exist.
+# claim, the post-merge check's ancestry and change-request reads, the fleet
+# audit's auto-merge label), so `capabilities` does not advertise them: no
+# `vcs.py` command runs them, and an advertised verb sends the agent to a
+# command that does not exist.
 LIBRARY_VERBS: frozenset[str] = frozenset(
-    {"snapshot", "proposal-claim", "revision-contains", "proposal-practice-label"}
+    {"snapshot", "proposal-claim", "revision-contains", "proposal-practice-label", "proposal-reviews"}
 )
 
 

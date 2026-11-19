@@ -1296,6 +1296,21 @@ func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesThePostMergeReadCap(t *testing.T) {
+	// POST_MERGE_READS_PER_TICK bounds how many records one post-merge check
+	// step reads; it reaches the agent only through this allowlist, and only
+	// as a literal value.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "POST_MERGE_READS_PER_TICK", Value: "50"},
+		{Name: "POST_MERGE_READS_PER_TICK", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "cap"},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "POST_MERGE_READS_PER_TICK" || got[0].Value != "50" || got[0].ValueFrom != nil {
+		t.Fatalf("expected only the literal POST_MERGE_READS_PER_TICK=50 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
