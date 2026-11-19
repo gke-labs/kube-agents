@@ -1269,12 +1269,16 @@ def _manual_fallback_class(cc: dict) -> bool:
 
 
 def _class_pools(class_name: str, node_pools: list[dict]) -> list[dict]:
-    """The node pools a machine rule of the class can use: the ones that carry
-    the class label, or every pool for the cluster default class, which node
-    pools serve without the label."""
-    if class_name == CLUSTER_DEFAULT_CLASS:
-        return list(node_pools)
+    """The node pools that carry the class label."""
     return [pool for pool in node_pools if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == class_name]
+
+
+def _unjudged_default_class(cc: dict) -> bool:
+    """A class in §3.13's scope that the pool list cannot judge: node pools
+    serve the cluster default class without the class label, and which pools
+    those are depends on a cluster setting and on the other classes' labels,
+    neither of which this collector reads."""
+    return (cc.get("metadata") or {}).get("name") == CLUSTER_DEFAULT_CLASS and _manual_fallback_class(cc)
 
 
 def _pool_family(machine_type: str) -> str:
@@ -1290,8 +1294,9 @@ def _rule_has_manual_pool(rule: dict, class_name: str, node_pools: list[dict]) -
     neither pools nor a machine, so the pool list cannot answer.
 
     A `nodepools` rule is backed by a pool it names; one existing name is
-    enough. A `machineType` or `machineFamily` rule is backed by one of
-    `_class_pools` that has that type or family.
+    enough. A `machineType` or `machineFamily` rule is backed by a pool that
+    carries the class label and has that type or family; a pool without the
+    label is not the class's.
     """
     named = rule.get("nodepools") or []
     if named:
@@ -1319,13 +1324,15 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     on this cluster and a priority rule no node pool backs. GKE creates no
     pool for that rule, so the fallback the class lists does not exist.
 
-    A class with no node pool of its own here -- none a rule names, none of
-    `_class_pools` -- is not filed: nothing on this cluster falls back on it,
+    A class with no node pool of its own here -- none a rule names, none with
+    the class label -- is not filed: nothing on this cluster falls back on it,
     and `check_dangling_compute_class` names a workload that selects it. A
     rule `_rule_has_manual_pool` cannot judge is neither counted as backed nor
-    flagged; the excerpt names it.
+    flagged; the excerpt names it. The cluster default class is not judged
+    here (`_unjudged_default_class`); the caller files the check unevaluated
+    for it.
     """
-    if not _manual_fallback_class(cc):
+    if not _manual_fallback_class(cc) or _unjudged_default_class(cc):
         return None
     name = cc["metadata"]["name"]
     priorities = cc["spec"]["priorities"]
@@ -1342,7 +1349,7 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
         excerpt += f". Backed: {'; '.join(backed)}"
     else:
         pools = "; ".join(f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in own_pools)
-        excerpt += f". No rule is backed; the node pools of the class: {pools}"
+        excerpt += f". No rule is backed; the node pools with the class label: {pools}"
     if unjudged:
         excerpt += f". Not judged, the rule names neither pools nor a machine: {'; '.join(unjudged)}"
     return {"object": f"ComputeClass/{name}", "excerpt": excerpt, "needs_triage": MANUAL_POOL_TRIAGE}
@@ -2293,6 +2300,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     machine_unnamed: list[str] = []
     size_unknown: list[str] = []
     manual_fallback_unread: list[str] = []
+    default_class_unjudged: list[str] = []
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
@@ -2325,7 +2333,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         for hit in [check_ccc_hyperdisk_incompatible(cc, cc_meta["name"] in cc_referenced_by_hyperdisk)]:
             if hit:
                 candidates.append(_emit("ccc-hyperdisk-incompatible", hit))
-        if pools_readable:
+        if pools_readable and _unjudged_default_class(cc):
+            default_class_unjudged.append(f"ComputeClass/{cc_meta['name']}")
+        elif pools_readable:
             for hit in [check_ccc_unbacked_manual_fallback(cc, node_pools)]:
                 if hit:
                     # The two reads the verdict rests on: the classes and the pool list.
@@ -2382,7 +2392,19 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
-        commands[UNBACKED_MANUAL_FALLBACK] = dump_record
+        if default_class_unjudged:
+            # Said, not skipped in silence; the other classes' findings still
+            # file, each with its own command.
+            unevaluated[UNBACKED_MANUAL_FALLBACK] = (
+                f"{', '.join(default_class_unjudged)} is the cluster default class: node pools serve it "
+                f"without the class label, and the collector does not read which pools those are"
+            )
+            limitations.append(
+                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {', '.join(default_class_unjudged)}: "
+                f"node pools serve the cluster default class without the class label"
+            )
+        else:
+            commands[UNBACKED_MANUAL_FALLBACK] = dump_record
         # The live backlog, read only where the check runs: one more
         # server-filtered read per cluster, Pending pods only.
         unschedulable_pods, backlog_failure = read_unschedulable_pods(run=run, env=env)
