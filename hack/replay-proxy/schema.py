@@ -181,14 +181,6 @@ RECORD_ERROR_BUDGET = "budget_spent"
 # went on from that very answer (hack/replay-proxy/run_attribution.py).
 ANSWER_VARIANT = "answer_variant"
 PRIOR_ANSWER = "prior_answer"
-# In record mode: replay_cache.answer_exact of this request's answer as stored,
-# and of the request's last assistant message stored under the normalization of
-# the request it answered. A later line's PRIOR_EXACT equal to an earlier
-# line's ANSWER_EXACT says its conversation went on from exactly that answer;
-# the publisher's evidence for an answer with no card of its own is keyed on
-# these, never on the coarser ANSWER_VARIANT (run_attribution.py).
-ANSWER_EXACT = "answer_exact"
-PRIOR_EXACT = "prior_exact"
 # On a replay miss: the closest saved request and where this one differed.
 MISS = "miss"
 MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"

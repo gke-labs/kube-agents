@@ -13,6 +13,10 @@ SETTINGS = "s" * 64
 FRONT_PROMPT = "Which namespaces exist in the cluster?"
 
 
+def run_name(case, rep):
+    return f"devops-bench-{case}-{rep}"
+
+
 def blob_name(index):
     return f"{index:064x}"
 
@@ -40,7 +44,7 @@ class World:
         return self.blobs[key]
 
     def request(self, messages, fingerprint, stored=True, recorded=False, answer=None, prior=None, unstorable=(),
-                answer_hash=None, exact=None, prior_exact=None):
+                answer_hash=None, tag=None):
         request_id = f"{len(self.lines) + 1:032x}"
         if stored:
             with open(os.path.join(self.root, "store", "requests", request_id + ".json"), "w") as handle:
@@ -54,16 +58,24 @@ class World:
             entry["stored_answer_hash"] = answer_hash or answer
         if prior:
             entry["prior_answer"] = list(prior)
-        if exact:
-            entry["answer_exact"] = exact
-        if prior_exact:
-            entry["prior_exact"] = prior_exact
+        if tag is not None:
+            entry["eval_run"] = tag
         self.lines.append(entry)
         return entry
 
-    def run(self, case, rep, outcome, cards, results=True):
+    @staticmethod
+    def tag(case, rep, run_id=None):
+        """The eval run tag of `case` rep `rep`'s attempt `run_id` (the graded one by default)."""
+        return f"{run_id or run_name(case, rep)}/{case}/{rep}"
+
+    def run(self, case, rep, outcome, cards, results=True, run_id=None, eval_run=True):
         run_dir = os.path.join(self.root, "runs", f"{case}-{rep}")
         os.makedirs(run_dir)
+        if eval_run:
+            run_id = run_id or run_name(case, rep)
+            with open(os.path.join(run_dir, "eval_run.json"), "w") as handle:
+                json.dump({"eval_run": self.tag(case, rep, run_id), "run_id": run_id, "case_id": case,
+                           "repetition": str(rep)}, handle)
         if results:
             trajectory = [{"name": "inject.task", "args": {"taskId": "task-" + "0" * 15 + str(rep)}}]
             trajectory += [{"name": "terminal", "task": card} for card in cards]
@@ -171,118 +183,6 @@ class DecisionTest(unittest.TestCase):
         entry = self.world.request(worker("t_11111111"), "f1")
         self.assertEqual(self.world.decide(entry).decision, "unattributed")
 
-    def _rep(self, rep, outcome, answer, continued=True, opening_logged=True, recorded=False):
-        """One repetition's front door: the shared opening, answered `answer`, then its own card."""
-        card = f"t_{rep:08x}"
-        self.world.run("case-a", rep, outcome, [card])
-        opening = None
-        if opening_logged:
-            opening = self.world.request(front(), "opening", recorded=recorded, answer=answer)
-        if continued:
-            self.world.request(front({"role": "assistant", "content": answer}, *created(card)), f"next-{rep}",
-                               prior=("ctx-opening", answer))
-        return opening
-
-    def test_an_opening_is_published_when_a_passing_run_went_on_from_its_answer(self):
-        opening = self._rep(1, "pass", "A", recorded=True)
-        self._rep(2, "fail", "B")
-        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
-        self.assertEqual(self.world.decide(opening, final=False).decision, "pass", "positive evidence holds early")
-
-    def test_a_failing_runs_opening_is_not_published_when_the_passing_runs_line_was_lost(self):
-        # The review's case: the failing repetition recorded the opening; the
-        # passing one's opening line never reached a segment. Its continuation
-        # went on from another answer, so it is no evidence for this one.
-        opening = self._rep(1, "fail", "A", recorded=True)
-        self._rep(2, "pass", "B", opening_logged=False)
-        self.assertEqual(self.world.decide(opening).decision, "fail")
-        self.assertEqual(self.world.decide(opening, final=False).decision, "pending")
-
-    def test_the_same_answer_given_to_a_passing_run_publishes_it(self):
-        opening = self._rep(1, "fail", "A", recorded=True)
-        self._rep(2, "pass", "A")
-        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#2",)})
-
-    def test_an_opening_with_no_continuation_logged_is_never_published(self):
-        # Lost lines of every kind -- a spent budget, a replaced pod, a cut last
-        # pass -- leave the opening without evidence, never with false evidence.
-        opening = self._rep(1, "pass", "A", recorded=True, continued=False)
-        self._rep(2, "pass", "B", opening_logged=False, continued=False)
-        self.assertEqual(self.world.decide(opening, final=False).decision, "pending")
-        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
-        self.assertEqual(self.world.decide(opening, lost=5).decision, "ambiguous")
-
-    def _board_chain(self, outcome, log_middle=True):
-        """A front door that reads its board twice before it creates its card: R1, R2, R3 card-less, then R4."""
-        card = "t_00000001"
-        self.world.run("case-a", 1, outcome, [card])
-        listing = {"role": "tool", "tool_call_id": "c9", "content": "[]"}
-        r1 = self.world.request(front(), "r1", recorded=True, answer="A")
-        steps = [("r2", [{"role": "assistant", "content": "A"}, listing], ("ctx-r1", "A"), "B"),
-                 ("r3", [{"role": "assistant", "content": "A"}, listing, {"role": "assistant", "content": "B"}, listing],
-                  ("ctx-r2", "B"), "C")]
-        for fingerprint, more, prior, answer in steps:
-            if log_middle or fingerprint != "r2":
-                self.world.request(front(*more), fingerprint, prior=prior, answer=answer)
-        last = steps[-1][1] + [{"role": "assistant", "content": "C"}, *created(card)]
-        self.world.request(front(*last), "r4", prior=("ctx-r3", "C"))
-        return r1
-
-    def test_an_opening_is_proven_through_card_less_continuations(self):
-        opening = self._board_chain("pass")
-        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
-
-    def test_a_chain_proven_to_a_failing_run_stays_a_fail(self):
-        self.assertEqual(self.world.decide(self._board_chain("fail")).decision, "fail")
-
-    def test_a_chain_broken_by_a_lost_line_stays_unproven(self):
-        opening = self._board_chain("pass", log_middle=False)
-        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
-        self.assertEqual(self.world.decide(opening, final=False).decision, "pending")
-
-    def _shared_middle(self, outcomes):
-        """Repetitions that open and read their board alike, each then creating its own card."""
-        listing = {"role": "tool", "tool_call_id": "c9", "content": "[]"}
-        opening = self.world.request(front(), "r1", recorded=True, answer="A")
-        middle = [{"role": "assistant", "content": "A"}, listing]
-        for rep, outcome in enumerate(outcomes, start=1):
-            card = f"t_{rep:08x}"
-            self.world.run("case-a", rep, outcome, [card])
-            self.world.request(front(*middle), "r2", prior=("ctx-r1", "A"), answer="B")
-            self.world.request(front(*middle, {"role": "assistant", "content": "B"}, *created(card, f"x{rep}")),
-                               f"r3-{rep}", prior=("ctx-r2", "B"))
-        return opening
-
-    def test_repetitions_sharing_a_card_less_step_each_prove_the_opening(self):
-        # Every run that went on from the shared middle answer sent the middle
-        # request after the opening's answer, so each is proven for the opening.
-        opening = self._shared_middle(["fail", "pass", "pass"])
-        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#2", "case-a#3")})
-
-    def test_repetitions_sharing_a_card_less_step_that_all_failed_stay_a_fail(self):
-        self.assertEqual(self.world.decide(self._shared_middle(["fail", "fail"])).decision, "fail")
-
-    def test_a_line_without_an_answer_variant_is_never_published(self):
-        self.world.run("case-a", 1, "pass", ["t_00000001"])
-        opening = self.world.request(front(), "opening", recorded=True)
-        self.world.request(front(*created("t_00000001")), "next", prior=("ctx-opening", "A"))
-        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
-
-    def test_a_continuation_naming_two_runs_is_no_evidence(self):
-        self.world.run("case-a", 1, "pass", ["t_00000001"])
-        self.world.run("case-a", 2, "pass", ["t_00000002"])
-        opening = self.world.request(front(), "opening", recorded=True, answer="A")
-        self.world.request(front(*created("t_00000001", "c1"), *created("t_00000002", "c2")), "both",
-                           prior=("ctx-opening", "A"))
-        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
-
-    def test_the_same_answer_after_another_request_is_no_evidence(self):
-        self.world.run("case-a", 1, "pass", ["t_00000001"])
-        opening = self.world.request(front(), "opening", recorded=True, answer="A")
-        other = [system(), {"role": "user", "content": "another prompt"}, *created("t_00000001")]
-        self.world.request(other, "elsewhere", prior=("ctx-opening", "A"))
-        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
-
     def _first_writer(self, writer_card, answers, outcomes):
         """An answer saved by `writer_card`'s request, then the same request from runs' workers, unsaved."""
         for rep, (answer, outcome) in enumerate(zip(answers, outcomes), start=1):
@@ -332,17 +232,15 @@ class DecisionTest(unittest.TestCase):
         self.world.request(worker("t_00000002", *created("t_88888888")), "opening", answer="A")
         self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
 
-    def test_a_failing_run_hidden_behind_a_card_less_lines_pass_blocks_it(self):
-        # A card-less line that got the answer decides pass on its passing run
-        # and drops the failing one that went on from it too; the guard sees both.
+    def test_a_tagged_card_less_line_proves_a_saved_answer_and_a_failing_ones_blocks_it(self):
         saved = self.world.request(worker("t_99999999"), "r1", recorded=True, answer="A")
-        self.world.request(front(), "r1", answer="A")
-        for rep, outcome in ((1, "pass"), (2, "fail")):
-            card = f"t_{rep:08x}"
-            self.world.run("case-a", rep, outcome, [card])
-            self.world.request(front({"role": "assistant", "content": "A"}, *created(card, f"x{rep}")),
-                               f"r2-{rep}", prior=("ctx-r1", "A"))
-        self.assertEqual(self.world.attribution().decide_answer(RA.Line.from_entry(saved)).decision, "unattributed")
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.request(front(), "r1", answer="A", tag=World.tag("case-a", 1))
+        line = RA.Line.from_entry(saved)
+        self.assertEqual(self.world.attribution().decide_answer(line).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
+        self.world.request(front(), "r1", answer="A", tag=World.tag("case-a", 2))
+        self.assertEqual(self.world.attribution().decide_answer(line).decision, "unattributed")
 
     def test_a_passing_run_in_another_build_is_no_evidence(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
@@ -377,6 +275,98 @@ class DecisionTest(unittest.TestCase):
             handle.write('{"case": "half", "reps": [')
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.assertEqual([r.key for r in RA.load_runs(self.world.verdicts)], ["case-a#1"])
+
+
+class TagTest(unittest.TestCase):
+    """A request's eval run tag (`eval_run`) against each graded repetition's eval_run.json."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.world = World(root)
+
+    def decide(self, entry, final=True):
+        return self.world.decide(entry, final=final).decision
+
+    def test_a_card_less_line_belongs_to_the_run_its_tag_names(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.run("case-a", 2, "fail", ["t_00000002"])
+        passing = self.world.request(front(), "opening", recorded=True, answer="A", tag=World.tag("case-a", 1))
+        failing = self.world.request(front(), "opening", answer="B", tag=World.tag("case-a", 2))
+        self.assertEqual(self.world.decide(passing).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
+        self.assertEqual(self.decide(passing, final=False), "pass", "a graded run's tag decides early")
+        self.assertEqual(self.world.decide(failing).__dict__, {"decision": "fail", "runs": ("case-a#2",)})
+
+    def test_an_untagged_card_less_line_is_never_attributed(self):
+        # The exact chain's case: a passing run went on from exactly this
+        # answer. Without a tag nothing in the line says whose it was.
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        opening = self.world.request(front(), "opening", recorded=True, answer="A")
+        self.world.request(front({"role": "assistant", "content": "A"}, *created("t_00000001")), "next",
+                           prior=("ctx-opening", "A"), tag=World.tag("case-a", 1))
+        self.assertEqual(self.decide(opening), "untagged")
+        self.assertEqual(self.decide(opening, final=False), "untagged")
+
+    def test_a_retried_attempt_is_told_from_the_graded_one_by_its_run_id(self):
+        self.world.run("case-a", 1, "pass", ["t_00000002"], run_id="devops-bench-second")
+        first = self.world.request(front(), "opening", answer="A", tag=World.tag("case-a", 1, "devops-bench-first"))
+        graded = self.world.request(front(), "opening", answer="B", tag=World.tag("case-a", 1, "devops-bench-second"))
+        self.assertEqual(self.decide(first), "unattributed")
+        self.assertEqual(self.decide(first, final=False), "unattributed", "its repetition is graded: nothing to wait for")
+        self.assertEqual(self.decide(graded), "pass")
+
+    def test_a_tag_and_a_card_naming_different_runs_disagree(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.run("case-a", 2, "pass", ["t_00000002"])
+        other_run = self.world.request(worker("t_00000001"), "w", answer="A", tag=World.tag("case-a", 2))
+        other_attempt = self.world.request(worker("t_00000001"), "w", answer="A",
+                                           tag=World.tag("case-a", 1, "devops-bench-retried"))
+        ungraded = self.world.request(worker("t_00000001"), "w", answer="A", tag=World.tag("case-b", 1))
+        agreeing = self.world.request(worker("t_00000001"), "w", answer="A", tag=World.tag("case-a", 1))
+        for entry in (other_run, other_attempt, ungraded):
+            self.assertEqual(self.decide(entry), "disagree", entry["eval_run"])
+        self.assertEqual(self.decide(agreeing), "pass")
+        self.assertEqual(self.world.attribution().disagreements(), 3)
+
+    def test_a_tag_whose_repetition_is_not_graded_waits(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        entry = self.world.request(front(), "opening", answer="A", tag=World.tag("case-b", 1))
+        self.assertEqual(self.decide(entry, final=False), "pending")
+        self.assertEqual(self.decide(entry), "unattributed")
+
+    def test_a_malformed_tag_is_ignored(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.run("case-a", 2, "pass", ["t_00000002"])
+        good = World.tag("case-a", 2)
+        for bad in ("", "a/b", good + "/2", good.replace("/", " ", 1), good + "\n", "/case-a/2",
+                    good[:-1] + "x", 7, ["x"]):
+            with self.subTest(tag=bad):
+                card_less = self.world.request(front(), "opening", answer="A", tag=bad)
+                carded = self.world.request(worker("t_00000001"), "w", answer="A", tag=bad)
+                self.assertEqual(self.decide(card_less), "untagged")
+                self.assertEqual(self.decide(carded), "pass", "decided by its card, with no tag to disagree")
+
+    def test_a_repetition_without_an_eval_run_file_checks_no_tag(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"], eval_run=False)
+        card_less = self.world.request(front(), "opening", answer="A", tag=World.tag("case-a", 1))
+        carded = self.world.request(worker("t_00000001"), "w", answer="A", tag=World.tag("case-a", 1))
+        self.assertEqual(self.decide(card_less), "untagged")
+        self.assertEqual(self.decide(carded), "pass")
+
+    def test_an_eval_run_file_that_names_another_repetition_gives_no_tag(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        path = os.path.join(self.world.root, "runs", "case-a-1", "eval_run.json")
+        for record in ({"eval_run": "r/case-a/2", "run_id": "r", "case_id": "case-a", "repetition": "2"},
+                       {"eval_run": "r/case-b/1", "run_id": "r", "case_id": "case-b", "repetition": "1"},
+                       {"eval_run": "r/case-a/1", "run_id": "s", "case_id": "case-a", "repetition": "1"},
+                       {"eval_run": "r a/case-a/1", "run_id": "r a", "case_id": "case-a", "repetition": "1"}):
+            with self.subTest(record=record):
+                with open(path, "w") as handle:
+                    json.dump(record, handle)
+                self.assertEqual(RA.load_runs(self.world.verdicts)[0].tag, "")
+        with open(path, "w") as handle:
+            json.dump({"eval_run": "r/case-a/1", "run_id": "r", "case_id": "case-a", "repetition": "1"}, handle)
+        self.assertEqual(RA.load_runs(self.world.verdicts)[0].tag, "r/case-a/1")
 
 
 if __name__ == "__main__":

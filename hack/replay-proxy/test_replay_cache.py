@@ -86,37 +86,6 @@ class NormalizeRestoreTest(unittest.TestCase):
         self.assertEqual(missing, ["⟦TASK_1⟧", "⟦TASK_1⟧"])
 
 
-class AnswerExactTest(unittest.TestCase):
-    """answer_exact absorbs what a client's re-sending changes, and nothing else."""
-
-    @staticmethod
-    def call(arguments, call_id="call_1"):
-        return {"id": call_id, "type": "function", "function": {"name": "kanban_show", "arguments": arguments}}
-
-    def test_a_null_text_and_reordered_argument_keys_match(self):
-        sent = {"role": "assistant", "content": None,
-                "tool_calls": [self.call('{"task_id": "⟦TASK_1⟧", "opts": {"b": 1, "a": [2, 3]}}')],
-                "provider_specific_fields": {"thought_signature": "c2ln"}}
-        resent = {"role": "assistant", "content": "",
-                  "tool_calls": [self.call('{"opts":{"a":[2,3],"b":1},"task_id":"⟦TASK_1⟧"}', call_id="other")]}
-        self.assertEqual(replay_cache.answer_exact(sent), replay_cache.answer_exact(resent))
-        self.assertEqual(replay_cache.answer_exact({"role": "assistant"}),
-                         replay_cache.answer_exact({"role": "assistant", "content": ""}))
-
-    def test_different_argument_values_or_text_do_not_match(self):
-        base = replay_cache.answer_exact({"content": "", "tool_calls": [self.call('{"id": 12}')]})
-        for other in ({"content": "", "tool_calls": [self.call('{"id": 13}')]},
-                      {"content": "", "tool_calls": [self.call('{"id": "12"}')]},
-                      {"content": "Looking.", "tool_calls": [self.call('{"id": 12}')]},
-                      {"content": "", "tool_calls": [self.call('{"id": 12}'), self.call('{"id": 12}')]}):
-            with self.subTest(other=other):
-                self.assertNotEqual(replay_cache.answer_exact(other), base)
-
-    def test_arguments_that_are_not_json_compare_as_text(self):
-        self.assertNotEqual(replay_cache.answer_exact({"tool_calls": [self.call("not json")]}),
-                            replay_cache.answer_exact({"tool_calls": [self.call("not  json")]}))
-
-
 class AnswerCacheTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

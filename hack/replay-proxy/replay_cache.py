@@ -94,9 +94,7 @@ TEXT_KEY = "text"
 FUNCTION_KEY = "function"
 NAME_KEY = "name"
 ARGUMENTS_KEY = "arguments"
-# answer_exact's tags for tool-call arguments that parsed as JSON and that did not.
-EXACT_PARSED = "json"
-EXACT_TEXT = "text"
+
 
 # Fields of a saved entry.
 ENTRY_FINGERPRINT = "fingerprint"
@@ -176,37 +174,6 @@ def stored_hash(stored: Dict[str, Any]) -> str:
     answer, are left out, so identical answers from different runs share one.
     """
     return normalizer.stable_hash(_without_opaque(stored))
-
-
-def answer_exact(stored: Dict[str, Any]) -> str:
-    """Which answer a stored answer is, in the form a client sends it back in a later request's history.
-
-    Exact-chain attribution matches a later request's last assistant message
-    to the answer a recorded request got (run_attribution.py), so this keeps
-    only what survives that round trip: the text, and each tool call's name and
-    arguments. Hermes re-sends a null text as "" and re-serialises arguments
-    with their keys in another order, so a missing, null or empty text is ""
-    and arguments that parse as JSON are compared as parsed (keys sorted at
-    every depth by stable_hash); ids and signatures are left out. Values are
-    compared as they are: two calls that differ in any argument value differ.
-    Unlike normalizer.answer_variant it renames nothing the request did not
-    bind (stored_answer's swap only), so an age, a pid or a keyed number
-    still tells two answers apart. Kept here, not in normalizer.py, so no
-    fingerprint changes.
-    """
-    content = stored.get(CONTENT_KEY)
-    calls = []
-    for call in stored.get(TOOL_CALLS_KEY) or []:
-        function = call.get(FUNCTION_KEY) if isinstance(call, dict) else None
-        function = function if isinstance(function, dict) else {}
-        arguments: Any = function.get(ARGUMENTS_KEY)
-        if isinstance(arguments, str):
-            try:
-                arguments = {EXACT_PARSED: json.loads(arguments)}
-            except (ValueError, RecursionError):
-                arguments = {EXACT_TEXT: arguments}
-        calls.append({NAME_KEY: function.get(NAME_KEY), ARGUMENTS_KEY: arguments})
-    return normalizer.stable_hash({CONTENT_KEY: content or "", TOOL_CALLS_KEY: calls})
 
 
 def answer_texts(message: Dict[str, Any]) -> List[str]:

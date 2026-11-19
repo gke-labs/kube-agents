@@ -281,10 +281,10 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(report["decisions"], {"pass": 1, "fail": 1})
         self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [y]}})
 
-    def test_a_failing_cardless_answer_does_not_borrow_a_passing_continuation_of_a_lookalike(self):
-        # Two reps' front doors sent one request and answered differently in
-        # stored bytes but alike in answer_variant (an age, a pid); the
-        # continuations can't say which answer each followed.
+    def test_an_untagged_cardless_answer_is_not_published_even_after_a_passing_continuation(self):
+        # Two reps' front doors sent one request and answered in different
+        # stored bytes; each went on to its own card, and nothing tags the
+        # openings. Neither answer can be tied to a run, so neither goes up.
         x, y = "1" * 64, "2" * 64
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
@@ -297,101 +297,100 @@ class PublishTest(unittest.TestCase):
         self.alternate(1, x)
         self.alternate(1, y)
         self.write_logs()
-        self.publisher.publish(final=True)
-        objects = self.bucket.objects()
-        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", objects, "only a failing rep gave x")
-        self.assertNotIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{y}.json", objects,
-                         "nor can y be told apart: both stay unpublished")
+        report = self.publisher.publish(final=True)
+        self.assertFalse(self.published(x))
+        self.assertFalse(self.published(y))
+        self.assertEqual(report["decisions"], {"untagged": 2})
 
-    def test_a_cardless_answer_two_reps_gave_identically_still_goes_up(self):
-        # The same stored answer from a failing and a passing front door: the
-        # continuations' evidence is unambiguous, so the passing one counts.
-        x = "1" * 64
-        self.world.run("case-a", 1, "fail", ["t_11111111"])
-        self.world.run("case-a", 2, "pass", ["t_22222222"])
-        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=x)
-        self.world.request(front(), fp(1), recorded=False, answer="V", answer_hash=x)
-        self.world.request(front({"role": "assistant", "content": "X"}, *created("t_11111111")), fp(2),
-                           prior=(f"ctx-{fp(1)}", "V"))
-        self.world.request(front({"role": "assistant", "content": "X"}, *created("t_22222222")), fp(3),
-                           prior=(f"ctx-{fp(1)}", "V"))
-        self.alternate(1, x)
-        self.write_logs()
-        self.publisher.publish(final=True)
-        self.assertIn(f"replay-cache/{VERSION}/alts/{fp(1)}-{x}.json", self.bucket.objects())
+    # Two front doors sent one request with no card of their own; the failing
+    # rep answered X, the passing rep a look-alike Y (same answer_variant "V",
+    # an age or a number apart). Each line carries its rep's tag.
+    X, Y = "1" * 64, "2" * 64
 
-    # Exact-chain evidence: two front doors sent one request; the failing rep
-    # answered x, the passing rep a look-alike y (same answer_variant "V", so
-    # an age or a number apart), each with its own answer_exact.
-    X, Y, EX, EY = "1" * 64, "2" * 64, "e1" * 32, "e2" * 32
-
-    def lookalike_openings(self, exact=True):
-        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.X, exact=exact and self.EX)
-        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.Y, exact=exact and self.EY)
+    def tagged_openings(self, x_answer=None):
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.X, tag=World.tag("case-a", 1))
+        self.world.request(front(), fp(1), recorded=x_answer is None, answer="V", answer_hash=x_answer or self.Y,
+                           tag=World.tag("case-a", 2))
         self.alternate(1, self.X)
-        self.alternate(1, self.Y)
-
-    def continuation(self, card, answer, fingerprint, exact=True, stored=True):
-        self.world.request(front({"role": "assistant", "content": "went on"}, *created(card)), fingerprint,
-                           stored=stored, prior=(f"ctx-{fp(1)}", "V"), prior_exact=exact and answer)
+        if x_answer is None:
+            self.alternate(1, self.Y)
 
     def published(self, answer):
         return f"replay-cache/{VERSION}/alts/{fp(1)}-{answer}.json" in self.bucket.objects()
 
-    def test_a_failing_reps_cardless_lookalike_with_no_continuation_is_not_published(self):
+    def test_a_failing_reps_tagged_cardless_answer_is_not_published_and_a_passing_reps_is(self):
+        # No card, no continuation logged: the tag alone decides each.
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
-        self.lookalike_openings()
-        self.continuation("t_22222222", self.EY, fp(3))  # only the passing rep went on, from exactly y
+        self.tagged_openings()
         self.write_logs()
-        self.publisher.publish(final=True)
-        self.assertFalse(self.published(self.X), "no continuation carries x")
-        self.assertTrue(self.published(self.Y))
-
-    def test_a_failing_reps_continuation_whose_text_is_missing_proves_nothing(self):
-        self.world.run("case-a", 1, "fail", ["t_11111111"])
-        self.world.run("case-a", 2, "pass", ["t_22222222"])
-        self.lookalike_openings()
-        self.continuation("t_11111111", self.EX, fp(2), stored=False)
-        self.continuation("t_22222222", self.EY, fp(3))
-        self.write_logs()
-        self.publisher.publish(final=True)
+        report = self.publisher.publish(final=True)
         self.assertFalse(self.published(self.X))
         self.assertTrue(self.published(self.Y))
+        self.assertEqual(report["decisions"], {"fail": 1, "pass": 1})
 
     def test_an_interval_pass_with_the_failing_rep_ungraded_publishes_only_the_passing_answer(self):
         self.world.run("case-a", 2, "pass", ["t_22222222"])  # rep 1 still running
-        self.lookalike_openings()
-        self.continuation("t_11111111", self.EX, fp(2))
-        self.continuation("t_22222222", self.EY, fp(3))
+        self.tagged_openings()
         self.write_logs()
         report = self.publisher.publish(final=False)
         self.assertFalse(self.published(self.X))
         self.assertTrue(self.published(self.Y))
         self.assertEqual(report["decisions"], {"pending": 1, "pass": 1})
+        self.world.run("case-a", 1, "fail", ["t_11111111"])
+        self.publisher.publish(final=True)
+        self.assertFalse(self.published(self.X), "graded later, a fail")
 
-    def test_a_cardless_answer_a_failing_and_a_passing_rep_gave_identically_goes_up_on_the_exact_chain(self):
+    def test_a_cardless_answer_a_failing_and_a_passing_rep_gave_identically_goes_up(self):
         self.world.run("case-a", 1, "fail", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
-        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.X, exact=self.EX)
-        self.world.request(front(), fp(1), answer="V", answer_hash=self.X, exact=self.EX)
-        self.alternate(1, self.X)
-        self.continuation("t_11111111", self.EX, fp(2))
-        self.continuation("t_22222222", self.EX, fp(3))
+        self.tagged_openings(x_answer=self.X)
         self.write_logs()
         self.publisher.publish(final=True)
         self.assertTrue(self.published(self.X))
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {self.X: 1}}})
 
-    def test_lines_without_exact_fields_refuse_a_cardless_lookalike_group(self):
-        self.world.run("case-a", 1, "fail", ["t_11111111"])
+    def test_a_retried_attempts_cardless_answer_is_not_published(self):
+        # Rep 2's first attempt answered Y and was retried; the graded attempt
+        # (another run id) passed without asking again.
+        self.world.run("case-a", 2, "pass", ["t_22222222"], run_id="devops-bench-retry")
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=self.Y,
+                           tag=World.tag("case-a", 2, "devops-bench-first"))
+        self.alternate(1, self.Y)
+        self.write_logs()
+        report = self.publisher.publish(final=False)
+        self.assertFalse(self.published(self.Y))
+        self.assertEqual(report["decisions"], {"unattributed": 1})
+
+    def test_a_tag_and_card_that_disagree_refuse_the_answer_and_are_counted(self):
+        a = "a" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.world.run("case-a", 2, "pass", ["t_22222222"])
-        self.lookalike_openings(exact=False)
-        self.continuation("t_22222222", None, fp(3), exact=False)
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a, tag=World.tag("case-a", 1))
+        self.world.request(worker("t_11111111"), fp(1), answer=a, tag=World.tag("case-a", 2))
+        self.alternate(1, a)
         self.write_logs()
         report = self.publisher.publish(final=True)
-        self.assertFalse(self.published(self.X), "the coarse evidence can't say which answer rep 2 followed")
-        self.assertFalse(self.published(self.Y))
-        self.assertEqual(report["decisions"], {"ambiguous": 2})
+        self.assertFalse(self.published(a), "one producer agrees and passed, but the other's attribution is broken")
+        self.assertEqual(report["decisions"], {"disagree": 1})
+        self.assertEqual(report["tag_card_disagreements"], 1)
+        self.assertEqual(self._records()[-1]["tag_card_disagreements"], 1)
+
+    def test_a_record_counts_tagged_cardless_producers_like_carded_ones(self):
+        a = "a" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.run("case-a", 3, "fail", ["t_33333333"])
+        self.world.request(front(), fp(1), recorded=True, answer="V", answer_hash=a, tag=World.tag("case-a", 1))
+        self.world.request(front(), fp(1), answer="V", answer_hash=a, tag=World.tag("case-a", 1))
+        self.world.request(worker("t_22222222"), fp(1), answer="V", answer_hash=a)
+        self.world.request(front(), fp(1), answer="V", answer_hash=a, tag=World.tag("case-a", 3))
+        self.world.request(front(), fp(1), answer="V", answer_hash=a)
+        self.alternate(1, a)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 3}}},
+                         "rep 1 twice by tag, rep 2 by card; the failing and the untagged lines count nothing")
 
     def test_the_same_answer_from_failing_reps_only_stays(self):
         a = "a" * 64
@@ -528,17 +527,13 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
         self.assertEqual(self.publisher.publish()["uploaded"], {}, "never uploaded twice")
 
-    def test_an_opening_goes_up_once_a_passing_run_went_on_from_its_answer(self):
-        self.world.run("case-a", 1, "pass", ["t_00000001"])
-        self.world.request(front(), fp(1), recorded=True, answer="A")
+    def test_a_tagged_opening_waits_for_its_case_then_goes_up(self):
+        self.world.request(front(), fp(1), recorded=True, answer="A", tag=World.tag("case-a", 1))
         self.answer(1)
         self.write_logs()
         self.assertEqual(self.publisher.publish()["decisions"], {"pending": 1})
-        self.world.request(front({"role": "assistant", "content": "A"}, *created("t_00000001")), fp(2),
-                           recorded=True, prior=(f"ctx-{fp(1)}", "A"))
-        self.answer(2)
-        self.write_logs()
-        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 2})
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
 
     def test_records_name_the_recording_job(self):
         self.publisher.job = P.job_identity("ci-kube-agents-eval-nightly", "", "ab" * 20)

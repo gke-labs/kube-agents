@@ -19,10 +19,11 @@ What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
   storable line whose `stored_answer_hash` is that name,
   recorded or not, is attributed to runs that passed
   (run_attribution.Attribution.decide_alternate): runs that give the same
-  answer save it once, and the run that saved it may have failed. A line with
-  no card of its own counts only through a later request that went on from
-  exactly its answer (`prior_exact` equal to its `answer_exact`). An answer
-  only failing runs gave stays here. The key already holds the normalizer
+  answer save it once, and the run that saved it may have failed. A line is
+  attributed by its card, or with no card of its own by its eval run tag
+  (`eval_run`) alone, and never when the two name different runs; an
+  untagged line with no card is no evidence. An answer only failing runs gave
+  stays here. The key already holds the normalizer
   version, the LiteLLM config checksum and image, so answers no other run
   could hit cost space only; the version prefix lets a reader fetch only its
   own.
@@ -40,7 +41,7 @@ What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
   snippets are drawn from.
 And gs://<bucket>/replay-cache/builds/<build>/publish-<ms>.json, one per call
 that changed anything: the graded runs and their outcomes, what was decided,
-and the objects this call confirmed are in the bucket (uploaded now, or there
+how many requests' tags and cards named different runs, and the objects this call confirmed are in the bucket (uploaded now, or there
 already from an earlier night), each with its size in this night's copy and,
 for a slot, the fingerprint of the answer it points at; under `produced`,
 per fingerprint, the answers (alternates) this call confirmed and so this
@@ -110,6 +111,10 @@ RECORD_FINAL = "final"
 RECORD_RUNS = "runs"
 RECORD_DECISIONS = "decisions"
 RECORD_LOST_LINES = "lost_lines"
+# How many of the build's logged requests carry a tag and a card naming
+# different runs (run_attribution.Attribution.disagreements); each refuses the
+# answer it gave. Not zero means the tags or the cards are wrong somewhere.
+RECORD_TAG_CARD_DISAGREEMENTS = "tag_card_disagreements"
 RECORD_OBJECTS = "objects"
 # Per normalizer version, per fingerprint, the identities of the answers this
 # night's passing runs gave (the alternates this record confirms): what the
@@ -282,6 +287,7 @@ class Selection:
     decisions: Dict[str, int] = field(default_factory=dict)
     runs: List[RA.Run] = field(default_factory=list)
     lost_lines: int = 0
+    disagreements: int = 0
     # version -> fingerprint -> answer -> passing producer count (RECORD_PRODUCED_COUNTS),
     # for every alternate already in the bucket or decided PASS by this call.
     counts: Dict[str, Dict[str, Dict[str, int]]] = field(default_factory=dict)
@@ -329,6 +335,7 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
     logs = state.reader.load(p for _, _, segments in pods for p in segments)
     selection.lost_lines = logs.lost
     attribution = RA.Attribution(logs, state.store, selection.runs, final)
+    selection.disagreements = attribution.disagreements()
     # Every line of the build that gave an answer, by (fingerprint, stored_answer_hash),
     # the hash of the answer as stored and so the alternate's name: its
     # producers, recorded or not, from any pod (decide_alternate). A line counts
@@ -458,6 +465,7 @@ class Publisher:
                     RECORD_BUILD: self.build, RECORD_FINAL: final, RECORD_JOB: self.job,
                     RECORD_RUNS: [{RUN_CASE: r.case, RUN_REP: r.rep, RUN_OUTCOME: r.outcome} for r in selection.runs],
                     RECORD_DECISIONS: selection.decisions, RECORD_LOST_LINES: selection.lost_lines,
+                    RECORD_TAG_CARD_DISAGREEMENTS: selection.disagreements,
                     RECORD_OBJECTS: {version: [objects[n] for n in sorted(objects)]
                                      for version, objects in confirmed.items()},
                     RECORD_PRODUCED: {version: produced(objects) for version, objects in confirmed.items()},
@@ -513,7 +521,7 @@ class Publisher:
         report: Dict[str, object] = {
             "event": "publish", "final": final, "runs": len(selection.runs),
             "decisions": selection.decisions, "uploaded": uploaded_now, "total_uploaded": dict(self.totals),
-            "lost_lines": selection.lost_lines,
+            "lost_lines": selection.lost_lines, RECORD_TAG_CARD_DISAGREEMENTS: selection.disagreements,
         }
         self.emit(report)
         return report

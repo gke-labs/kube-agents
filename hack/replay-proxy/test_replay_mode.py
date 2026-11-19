@@ -229,27 +229,6 @@ class SeveralAnswersTest(SlotCacheCase):
         self.assertEqual(self.recorded(self.BODY, again)["stored_answer_hash"], first["stored_answer_hash"],
                          "a signature is opaque: the same answer delivered again shares the name")
 
-    def test_a_continuation_names_exactly_the_answer_its_history_holds(self):
-        # Hermes re-sends a null text as "" and re-serialises the arguments with
-        # their keys in another order and a new id: the continuation's
-        # prior_exact still equals the producer's answer_exact.
-        at = time.time()
-        sent = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {
-            "name": "kanban_show", "arguments": json.dumps({"task_id": "t_bbbbbbbb", "verbose": True})}}]}
-        producer = self.recorded(self.BODY, sent, at=at)
-        resent = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_x", "type": "function", "function": {
-            "name": "kanban_show", "arguments": '{"verbose":true,"task_id":"t_bbbbbbbb"}'}}]}
-        body = dict(self.BODY, messages=self.BODY["messages"] + [
-            resent, {"role": "tool", "tool_call_id": "call_x", "content": "card t_bbbbbbbb is open"}])
-        continuation = self.recorded(body, self.LOOKING, at=at + 1)
-        self.assertTrue(producer["answer_exact"])
-        self.assertEqual(continuation["prior_exact"], producer["answer_exact"])
-        other = dict(resent, tool_calls=[dict(resent["tool_calls"][0], function={
-            "name": "kanban_show", "arguments": '{"verbose":false,"task_id":"t_bbbbbbbb"}'})])
-        forked = self.recorded(dict(body, messages=self.BODY["messages"] + [other, body["messages"][-1]]),
-                               self.LOOKING, at=at + 2)
-        self.assertNotEqual(forked["prior_exact"], producer["answer_exact"], "another argument value is another answer")
-
     def test_replay_hands_the_answers_out_in_turn_and_wraps(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
         self.recorded(self.BODY, self.ON_IT)

@@ -853,18 +853,13 @@ class ShadowProxy:
 
     def history_variants(
         self, body: Dict[str, Any], messages: List[Any], digests: List[str], prefix_seen: List[float], received: float,
-        last_only: bool = False, with_exact: bool = False,
+        last_only: bool = False,
     ):
         """(context, answer) of each assistant message, as record mode noted the answer to the request before it.
 
         `prefix_seen` is prefix_first_seen's. Memoized by the digests of the
         prefix, so each answer is normalized once per process. With
-        `last_only`, only the last assistant message's. With `with_exact`,
-        each item is ((context, answer), exact): exact is
-        replay_cache.answer_exact of the message stored under that prefix's
-        normalization, which equals the `answer_exact` record mode logged for
-        the request that got this answer (exact-chain attribution,
-        run_attribution.py).
+        `last_only`, only the last assistant message's.
         """
         chain = self.settings_chain(body)
         indices = [i for i, m in enumerate(messages)
@@ -874,20 +869,17 @@ class ShadowProxy:
             if index in wanted:
                 memo_key = normalizer.stable_hash([chain, digests[index]])
                 with self._variant_lock:
-                    memo = self._variants.get(memo_key)
-                if memo is None:
+                    variant = self._variants.get(memo_key)
+                if variant is None:
                     asked = dict(body)
                     asked[request_store.MESSAGES_KEY] = messages[:index]
                     now = prefix_seen[index] if index else received
-                    normalized = normalizer.normalize_request(asked, now)
-                    variant = normalizer.answer_variant(normalized, message, self.key_context)
-                    exact = replay_cache.answer_exact(replay_cache.stored_answer(message, normalized.mapping))
-                    memo = (variant, exact)
+                    variant = normalizer.answer_variant(normalizer.normalize_request(asked, now), message, self.key_context)
                     with self._variant_lock:
-                        self._variants[memo_key] = memo
+                        self._variants[memo_key] = variant
                         while len(self._variants) > VARIANT_MEMO_CAPACITY:
                             self._variants.popitem(last=False)
-                yield memo if with_exact else memo[0]
+                yield variant
             chain = normalizer.stable_hash([chain, digests[index]])
 
     def submit(
@@ -1288,16 +1280,13 @@ class ShadowProxy:
                 entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
             digests, _ = self.diagnosis.first_seen_with_digests(raw_messages, received)
             prefix_seen = self.prefix_first_seen(body, digests, received)
-            prior = list(self.history_variants(body, raw_messages, digests, prefix_seen, received, last_only=True,
-                                               with_exact=True))
+            prior = list(self.history_variants(body, raw_messages, digests, prefix_seen, received, last_only=True))
             if prior:
-                entry[F.PRIOR_ANSWER] = list(prior[0][0])
-                entry[F.PRIOR_EXACT] = prior[0][1]
+                entry[F.PRIOR_ANSWER] = list(prior[0])
             # Before recording, which names the saved file by it; logged on every
             # line, saved or not, so the publisher can tie each run to the file.
             if stored:
                 entry[F.STORED_ANSWER_HASH] = replay_cache.stored_hash(stored)
-                entry[F.ANSWER_EXACT] = replay_cache.answer_exact(stored)
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))

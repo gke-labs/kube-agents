@@ -729,12 +729,12 @@ its `kanban_create` calls returned). Each run's `results.json` lists the cards i
 and whether it passed. So the copy job can match each saved answer to its card, the card to its
 run, and the run to pass or fail, and copy only the passing ones. A front door's first request
 names no card at all, only the case's prompt, and the board reads before its first card name none
-either. Each is matched through the requests that came after it: an answer is copied when a chain
-of requests, each going on from exactly the answer before it, reaches a request naming a passing
-run's card. "Exactly" is the answer as stored, compared the way the agent sends it back (an empty
-text and a missing one are the same, and so are tool-call arguments with their keys in another
-order), so an answer that differs from a passing run's only in an age or a number is never vouched
-for by that run's requests.
+either. Those are matched by the run tag instead: on an eval install the agent stamps every model
+request with its run, case and repetition (`X-Kube-Agents-Eval-Run`), the proxy logs it, and the
+harness writes the same tag beside each run's `results.json`. The run part is new on every
+attempt, so a retried attempt's requests never count for the attempt that was graded. A request
+with a card must also agree with its tag; when they name different runs, its answer isn't copied.
+A request with neither a card nor a tag isn't copied at all.
 
 **Every passing answer is kept, and handed out in turn.** Each case runs three times, and the runs
 often answer the same request differently. If the cache kept only the first answer to each request,
@@ -751,9 +751,8 @@ order, rather than every other time. Identical answers share one file, so withou
 answer would be served as often as the common one. Once a run is served one answer, its next request holds that answer, so it only matches what
 followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
 once can take turns in either order, so this spreads runs across recordings rather than giving each
-run its own. Giving each run exactly one recording needs the proxy to know the run while it's
-happening: the harness would tell the proxy which case and run each front-door task ID is, and every
-card after that was created by an answer the proxy already saw. That comes later.
+run its own. Giving each run exactly one recording would mean serving by the run tag above, which
+the proxy logs but does not serve by yet.
 
 The lane loads only answers that a passing run of a night inside its 30-hour window produced. A
 night's record lists the answers its passing runs gave, so an older object that a later night only
