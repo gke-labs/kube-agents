@@ -3297,6 +3297,17 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
                 self.assertEqual(1, len(broker.requests))
                 self.assertEqual([], self.sleeps)
 
+    def test_a_signal_death_with_a_cut_payload_is_still_the_status_of_a_cut_payload(self):
+        """A cut stdout is not the command's answer, whatever ended the command. A cut that fell
+        on stderr alone keeps the command's own status, here the signal's."""
+        cut_stdout = {"stdout": "{", "exitCode": -9, "truncated": True, "bytesWritten": 1, "limit": 4096}
+        code, _, _ = self.run_shim(self.broker([(200, {}, cut_stdout)]))
+        self.assertEqual(credential_proxy_client.EXIT_OUTPUT_TRUNCATED, code)
+        cut_stderr = {"stdout": "{}", "stderr": "I0101 ...", "exitCode": -9, "truncated": True, "stdoutTruncated": False}
+        code, out, _ = self.run_shim(self.broker([(200, {}, cut_stderr)]))
+        self.assertEqual(137, code)
+        self.assertEqual("{}", out)
+
     def test_an_exit_code_that_no_command_can_have_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
         """Above 255 no status exists, and `sys.exit` would wrap it: 256 would read as success.
         Below -127 no signal exists. The line names the field and the range, never the value."""

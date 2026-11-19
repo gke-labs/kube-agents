@@ -7799,12 +7799,18 @@ class CurrentContextTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertIsNone(read_current_context(document))
 
-    def test_returns_none_for_text_that_the_yaml_reader_refuses_with_a_value_error(self):
-        # PyYAML builds some scalars with int() and datetime, which raise a plain
-        # ValueError and not a yaml.YAMLError.
+    def test_returns_none_for_text_that_the_yaml_reader_refuses_with_a_plain_exception(self):
+        # PyYAML builds a tagged or dated scalar with int(), datetime, a lookup
+        # table and a pattern match. For text that does not fit, those raise a
+        # ValueError, a KeyError, an IndexError or an AttributeError, and not a
+        # yaml.YAMLError.
         for label, document in (
-            ("a date that does not exist", "current-context: gke_p_l_c\na: 2001-13-45\n"),
-            ("an int tag on text", "current-context: gke_p_l_c\na: !!int x\n"),
+            ("a date that does not exist (ValueError)", "current-context: gke_p_l_c\na: 2001-13-45\n"),
+            ("an int tag on text (ValueError)", "current-context: gke_p_l_c\na: !!int x\n"),
+            ("a bool tag on text (KeyError)", "current-context: gke_p_l_c\na: !!bool x\n"),
+            ("an int tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!int ''\n"),
+            ("a float tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!float ''\n"),
+            ("a timestamp tag on text (AttributeError)", "current-context: gke_p_l_c\na: !!timestamp x\n"),
         ):
             with self.subTest(label):
                 self.assertIsNone(read_current_context(document))

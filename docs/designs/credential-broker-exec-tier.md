@@ -642,9 +642,10 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   `exitCode`, so a command that a signal ended arrives as the signal's negative number: the shim
   writes its output and exits with 128 plus the number, as a shell does. A value above 255 or
   below -127 is no command's result, and the exit would wrap it. The shim has no guard for a
-  `stdout`, `stderr` or
+  `stdout` or
   `kubeconfig` string with a lone surrogate, which would end its write in a `UnicodeEncodeError`:
-  the broker decodes a command's output as UTF-8 with replacement, so its answer holds none.
+  the broker decodes a command's output as UTF-8 with replacement and encodes its answer the same
+  way, so the answer holds none.
   `CREDENTIAL_PROXY_BUSY` is
   raised only at admission, before the command starts, so a retry never runs a command twice.
 - The retry skips a refusal at the session cap, which uses the same code so that the model
