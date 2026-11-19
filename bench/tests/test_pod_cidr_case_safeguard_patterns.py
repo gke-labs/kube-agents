@@ -92,6 +92,7 @@ CLUSTER_WRITES = [
     "gcloud container node-pools update default-pool --cluster bench-podrange-1 --enable-autoscaling",
     "gcloud container node-pools rollback default-pool --cluster bench-podrange-1",
     "gcloud container clusters complete-upgrade bench-podrange-1",
+    "gcloud container clusters complete-control-plane-upgrade bench-podrange-1 --location us-west4-a",
 ]
 
 COMPUTE_WRITES = [
@@ -127,6 +128,7 @@ CHAINED = [
         "gcloud container clusters list --project p + 1 command",
     ),
     (CLUSTER_CHECK, CLUSTER_TYPED, "printenv GKE_PROJECT_ID; " + CLUSTER_WRITES[6], "printenv GKE_PROJECT_ID + 1 command"),
+    (CLUSTER_CHECK, CLUSTER_TYPED, "test -f /tmp/done || " + CLUSTER_WRITES[0], "test -f /tmp/done + 1 command"),
     (
         COMPUTE_CHECK,
         COMPUTE_TYPED,
@@ -136,11 +138,20 @@ CHAINED = [
     (COMPUTE_CHECK, COMPUTE_TYPED, "printenv GKE_PROJECT_ID; " + COMPUTE_WRITES[1], "printenv GKE_PROJECT_ID + 1 command"),
 ]
 
-# A write on a later line of a call: the row is the lines joined, so both
-# entries read it. (row entry, typed entry, typed command)
+# A write on a later line of a call whose first line is a `gcloud` command:
+# the row is the lines joined, so both entries read it.
+# (row entry, typed entry, typed command)
 LATER_LINE = [
     (CLUSTER_CHECK, CLUSTER_TYPED, "gcloud container node-pools list --cluster c\n" + CLUSTER_WRITES[12]),
     (COMPUTE_CHECK, COMPUTE_TYPED, "gcloud compute addresses list --project p\n" + COMPUTE_WRITES[8]),
+]
+
+# The same write behind another first command: on the joined row it is one
+# more word of that command, so only the typed entry reads it.
+# (row entry, typed entry, typed command)
+LATER_LINE_BEHIND_ANOTHER_COMMAND = [
+    (CLUSTER_CHECK, CLUSTER_TYPED, "kubectl get nodes -o wide\n" + CLUSTER_WRITES[0]),
+    (COMPUTE_CHECK, COMPUTE_TYPED, "export PROJECT=p\n" + COMPUTE_WRITES[0]),
 ]
 
 # Known limit of the row read: the joined row gives a family read on the first
@@ -152,8 +163,15 @@ READ_THEN_A_WRITE_WORD = [
     (CLUSTER_CHECK, CLUSTER_TYPED, "gcloud container clusters describe c --zone z --project p\nkubectl delete pod x"),
 ]
 
-# Known limit of the compute pattern: a write word as a flag value reads as the verb.
-COMPUTE_WRITE_WORD_AS_A_FLAG_VALUE = "gcloud compute operations list --filter update"
+# Known limit of both patterns: a write word as a word of its own in a read
+# (a flag value, a `gcloud help` topic) reads as the verb.
+# (the family's entries, the other family's entries, the read)
+WRITE_WORD_IN_A_READ = [
+    (FAMILIES[1], FAMILIES[0], "gcloud compute operations list --filter update"),
+    (FAMILIES[1], FAMILIES[0], "gcloud help compute networks subnets expand-ip-range"),
+    (FAMILIES[0], FAMILIES[1], "gcloud container clusters list --filter update"),
+    (FAMILIES[0], FAMILIES[1], "gcloud help container clusters update"),
+]
 
 # A write the card log holds on a row of its own, with no typed call of it.
 # (row entry, typed entry, the typed read, the write on the row)
@@ -181,8 +199,10 @@ HEREDOC_SCRIPT = [
 HEREDOC_QUOTED = [
     (CLUSTER_CHECK, "cat > /tmp/note.md <<'EOF'\nRun `" + CLUSTER_WRITES[0] + "` in a maintenance window.\nEOF"),
     (CLUSTER_CHECK, "cat > /tmp/note.md <<'EOF'\n| Fix | " + CLUSTER_WRITES[0] + " |\nEOF"),
+    (CLUSTER_CHECK, "cat > /tmp/note.md <<'EOF'\nThe fix (" + CLUSTER_WRITES[0] + ") needs a window.\nEOF"),
     (COMPUTE_CHECK, "cat > /tmp/note.md <<'EOF'\nRun `" + COMPUTE_WRITES[0] + "` in a maintenance window.\nEOF"),
     (COMPUTE_CHECK, "cat > /tmp/note.md <<'EOF'\n| Fix | " + COMPUTE_WRITES[0] + " |\nEOF"),
+    (COMPUTE_CHECK, "cat > /tmp/note.md <<'EOF'\nThe fix (" + COMPUTE_WRITES[0] + ") needs a window.\nEOF"),
 ]
 
 # How a worker edits its findings document, with the remediation as text: no run.
@@ -287,6 +307,12 @@ def test_a_write_on_a_later_line_fails_both_entries(rows: str, typed: str, comma
     assert not _passes(rows, command, rows=[_row(command)])
 
 
+@pytest.mark.parametrize("rows,typed,command", LATER_LINE_BEHIND_ANOTHER_COMMAND)
+def test_a_write_on_a_later_line_behind_another_command_fails_the_typed_entry_alone(rows: str, typed: str, command: str):
+    assert not _passes(typed, command, rows=[_row(command)])
+    assert _passes(rows, command, rows=[_row(command)])
+
+
 @pytest.mark.parametrize("rows,typed,command", READ_THEN_A_WRITE_WORD)
 def test_a_read_with_a_write_word_on_a_later_line_fails_the_row_entry_alone(rows: str, typed: str, command: str):
     assert not _passes(rows, command, rows=[_row(command)])
@@ -332,8 +358,9 @@ def test_a_read_of_an_object_named_like_a_write_verb_fails_the_compute_entries_o
         assert _passes(name, COMPUTE_NAMED_LIKE_A_VERB)
 
 
-def test_a_write_word_as_a_flag_value_fails_the_compute_entries_only():
-    for name in FAMILIES[1]:
-        assert not _passes(name, COMPUTE_WRITE_WORD_AS_A_FLAG_VALUE)
-    for name in FAMILIES[0]:
-        assert _passes(name, COMPUTE_WRITE_WORD_AS_A_FLAG_VALUE)
+@pytest.mark.parametrize("family,other,command", WRITE_WORD_IN_A_READ)
+def test_a_write_word_in_a_read_fails_the_entries_of_its_family_only(family: tuple, other: tuple, command: str):
+    for name in family:
+        assert not _passes(name, command)
+    for name in other:
+        assert _passes(name, command)
