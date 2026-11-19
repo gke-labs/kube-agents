@@ -99,10 +99,14 @@ const (
 	// the cap unwritten before the next attempt, the status.usage cadence.
 	sessionCapPrunedReprobe = usageStatusReprobeInterval
 
-	// sessionCapRemedy is what lifts the fit: a wider TASKS. Nothing widens
-	// it in place today; the planned opt-in reshape is how it will be.
-	sessionCapRemedy = "the cap stays fitted until TASKS is widened, and the planned opt-in TASKS reshape " +
-		"(gke-labs/kube-agents#6466) is how it will be lifted"
+	// sessionCapRemedy is what lifts the fit: a wider TASKS. A live stream's
+	// max_consumers can't change in place. On a one-server bus, moving to
+	// busReplicas: 3 restores TASKS at the larger of its width and the
+	// rendered one, history kept (gke-labs/kube-agents#6462); on any bus the
+	// planned opt-in reshape will.
+	sessionCapRemedy = "the cap stays fitted until TASKS is widened: on a one-server bus, setting " +
+		"spec.harness.tuning.busReplicas to 3 widens it and keeps its history, and the planned opt-in TASKS " +
+		"reshape (gke-labs/kube-agents#6466) will widen it on any bus"
 	sessionCapClusterViewMessage = "the operator's " + a2aSessionClusterViewEnvVar + " is on, so the session pods' temporary cluster view is still rendered " +
 		"and the session default is not engaged: plain conversations stay with platform, whatever spec.harness.tuning.defaultRoute says, " +
 		"so the default never widens what a plain turn reaches; the view's retirement is tracked in gke-labs/kube-agents#6483"

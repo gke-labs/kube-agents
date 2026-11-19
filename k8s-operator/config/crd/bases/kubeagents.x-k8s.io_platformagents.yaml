@@ -10175,8 +10175,9 @@ spec:
                             (status.effectiveSessionCap, with the SessionCapFitted condition while
                             the fit is below maxSessions). A stream with no room for one session
                             sends plain conversations to `platform` instead. The cap stays fitted
-                            until TASKS is widened; the planned opt-in TASKS reshape is how it
-                            will be lifted. On an existing install, until the operator has read
+                            until TASKS is widened: on a one-server bus, busReplicas 3 widens it
+                            and keeps its history, and a planned opt-in TASKS reshape will on any
+                            bus. On an existing install, until the operator has read
                             the bus's width once, an unset field keeps routing to `platform` and
                             the provision Job waits. On `platform` no fit applies. While the
                             operator's A2A_SESSION_CLUSTER_VIEW is on, every install routes to
