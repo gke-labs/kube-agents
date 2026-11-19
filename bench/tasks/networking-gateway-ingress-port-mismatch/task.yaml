@@ -21,7 +21,7 @@
 id: networking-gateway-ingress-port-mismatch
 name: "Gateway Route to a Service Port Nothing Serves (route and port mismatch check)"
 domain: fleet-audits
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit

@@ -35,8 +35,9 @@ package controller
 //     system:service-account-issuer-discovery binding lets every
 //     ServiceAccount read the JWKS;
 //   - on the broker, a projected token bound to auditReportStoreAudience,
-//     which it presents to the listener, and the listener's address. The
-//     broker reads neither yet; its routes are the next change;
+//     which it presents to the listener, the listener's address, and the
+//     profiles whose tasks may use the store (auditReportProfilesEnv). The
+//     broker's /v1/audit-reports routes read all three;
 //   - the Service <agent>-report-store;
 //   - in <agent>-gateway-netpol, one more ingress rule: the broker's pods to
 //     the port (auditReportStoreIngressRule). A rule in the gateway policy
@@ -100,6 +101,14 @@ const (
 	// On the broker: where the listener is, and the token it presents.
 	auditReportStoreURLEnv       = "AUDIT_REPORT_STORE_URL"
 	auditReportStoreTokenFileEnv = "AUDIT_REPORT_STORE_TOKEN_FILE" // #nosec G101 -- Environment variable name, not a credential
+	// And the AgentProfiles whose tasks may use the store through the broker
+	// (credential_proxy.REPORT_PROFILES_ENV): a task's profile must be named
+	// here to read, and to write with its schedule's trigger. Unset means no
+	// profile task reaches the store.
+	auditReportProfilesEnv = "CREDENTIAL_PROXY_REPORT_PROFILES"
+	// The fleet-audit profile the builtin audits run on, and the platform
+	// specialist (docs/designs/scheduling-on-profiles.md §1 item 4).
+	auditReportProfiles = "fleet-audit,platform"
 )
 
 // auditReportStoreEnvNames are reserved in mergeCredentialProxyEnv: a CR
@@ -116,6 +125,7 @@ var auditReportStoreEnvNames = []string{
 	auditReportStoreAllowedPodPrefixEnv,
 	auditReportStoreURLEnv,
 	auditReportStoreTokenFileEnv,
+	auditReportProfilesEnv,
 	"FLEET_AUDIT_REPORTS_DIR",
 	"AUDIT_REPORT_STORE_API_SERVER",
 	"AUDIT_REPORT_STORE_SA_DIR",
@@ -173,6 +183,7 @@ func auditReportStoreBrokerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvV
 	return []corev1.EnvVar{
 		{Name: auditReportStoreURLEnv, Value: auditReportStoreURL(agent)},
 		{Name: auditReportStoreTokenFileEnv, Value: auditReportStoreTokenMountPath + "/token"},
+		{Name: auditReportProfilesEnv, Value: auditReportProfiles},
 	}
 }
 

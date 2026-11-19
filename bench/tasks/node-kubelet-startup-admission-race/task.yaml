@@ -23,8 +23,8 @@
 id: node-kubelet-startup-admission-race
 name: "Kubelet startup admission race (declared gap; planted as an init DaemonSet on a pool with no startup taint when its check lands)"
 domain: fleet-audits
-suite: certification
-certification_part: 2
+suite: validated-capabilities
+suite_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
@@ -35,7 +35,7 @@ prompt: >-
 expected_output: >-
   Planted as an init DaemonSet and a worker on a pool with no startup taint,
   once its check lands. Customer failure: pods admitted before the DaemonSet
-  is ready on a new node. Certified means: the ledger issue carries a finding
+  is ready on a new node. Validated means: the ledger issue carries a finding
   that names DaemonSet `node-init-agent` or pool `default-pool` as that
   shape. The closing response is the SOP's one line with the ledger URL.
 infrastructure:

@@ -14,7 +14,8 @@ copy of their arithmetic:
 - the session quota from the ``ResourceQuota`` the operator's golden renders, which
   counts the operator's default chart pods; a profile whose chart runs more pods moves
   it by the difference the chart stamps;
-- the session pod from ``a2a/gateway/spawn.go``'s constants.
+- the session pod from ``files/footprint.yaml``'s ``operatorRenderedPerReplica.sessionPod``,
+  which the generator reads from the session env the operator renders on the A2A gateway.
 
 Standard library only, like ``generate_docs.py``, which imports this. The one tool it
 calls is ``helm``.
@@ -31,7 +32,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from generate_chart_footprint import parse_bytes, parse_cpu_millis
 
 REPO = Path(__file__).resolve().parent.parent
 CHART_DIR = REPO / "charts/kube-agents"
@@ -62,7 +62,6 @@ PROBE = """\
 SETTLED_GOLDEN = REPO / "k8s-operator/internal/testing/testdata/platform/expected/platformagent-settled.yaml"
 SESSION_QUOTA_NAME = "platformagent-a2a-session-quota"
 A2A_MANIFESTS_GO = REPO / "k8s-operator/internal/controller/platformagent_a2a_manifests.go"
-SPAWN_GO = REPO / "a2a/gateway/spawn.go"
 MIB = 1024**2
 GIB = 1024**3
 NONE_CELL = "—"
@@ -183,13 +182,6 @@ def _go_int_constant(source: str, name: str, path: Path) -> int:
     return int(match.group(1))
 
 
-def _go_string_constant(source: str, name: str, path: Path) -> str:
-    match = re.search(rf'^\s*{name}\s*=\s*"([^"]+)"', source, re.M)
-    if match is None:
-        raise SystemExit(f"{path.relative_to(REPO)}: no string constant {name}")
-    return match.group(1)
-
-
 @functools.lru_cache(maxsize=1)
 def golden_session_quota() -> int:
     """The pods the operator's golden puts in the session quota."""
@@ -304,23 +296,13 @@ def _per_pod(entry: dict) -> dict:
 
 
 def _session_pod() -> dict:
-    source = SPAWN_GO.read_text(encoding="utf-8")
-
-    def quantity(name: str) -> str:
-        return _go_string_constant(source, name, SPAWN_GO)
-
-    # The chart footprint generator's parsers, which read every quantity form the
-    # chart's template does, so the two footprint scripts cannot disagree.
-    ephemeral = parse_bytes(quantity("workerEphemeralStorageRequest"))
-    return {
-        "cpuMillisRequest": parse_cpu_millis(quantity("workerCPURequest")),
-        "memoryBytesRequest": parse_bytes(quantity("workerMemoryRequest")),
-        "cpuMillisLimit": parse_cpu_millis(quantity("workerCPULimit")),
-        "memoryBytesLimit": parse_bytes(quantity("workerMemoryLimit")),
-        # spawn.go limits ephemeral storage at its request.
-        "ephemeralStorageBytesRequest": ephemeral,
-        "ephemeralStorageBytesLimit": ephemeral,
-    }
+    """One session pod, from footprint.yaml: the generator reads it from the session env
+    the operator renders on the A2A gateway, the figures the gateway sizes the pods by."""
+    default = next(p for p in PROFILES if p.key == "standard")
+    entry = (run_probe(default)["footprint"].get("operatorRenderedPerReplica") or {}).get("sessionPod")
+    if not entry:
+        raise SystemExit("charts/kube-agents/files/footprint.yaml has no operatorRenderedPerReplica.sessionPod; run make chart-sync")
+    return entry
 
 
 def workloads_rows() -> list[str]:
@@ -392,21 +374,41 @@ def workloads_rows() -> list[str]:
     return rows
 
 
+def _session_share_sentence() -> str:
+    """The session pods at the default cap, from the same render as the totals."""
+    default = next(p for p in PROFILES if p.key == "standard")
+    r = run_probe(default)["requirements"]
+    a = run_probe(next(p for p in PROFILES if p.autopilot))["requirements"]
+    return (
+        f"Of those totals, the session pods at the default cap of {r['maxSessions']} are {r['sessionPods']} pods,"
+        f" {cpu(r['sessionRequestsCpu'])} CPU and {memory(r['sessionRequestsMemory'])} memory requested,"
+        f" {cpu(r['sessionLimitsCpu'])} CPU and {memory(r['sessionLimitsMemory'])} memory in limits, and"
+        f" {memory(r['sessionRequestsEphemeral'])} of ephemeral storage: one `a2a-worker` row below per"
+        " session. `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting,"
+        " Autopilot admits each pod at its per-Pod minimums where those exceed the request, with"
+        f" limits equal to requests: {cpu(a['sessionRequestsCpu'])} CPU and"
+        f" {memory(a['sessionRequestsMemory'])} memory at the same cap, the figures the quota preflight"
+        " uses on Autopilot (the Autopilot profile's row above carries them)."
+    )
+
+
 def render_tables() -> str:
     """The page's footprint block: totals by profile, the session quota, the workloads."""
     constants = quota_constants()
     lines = [
         "Totals by install profile, as the chart's quota preflight sums them (the operator's"
-        " pods included, the session pods not):",
+        " pods included, and the session pods at the default cap of `maxSessions`):",
         "",
         *TOTALS_HEADER,
         *(_totals_row(p) for p in PROFILES if p.label),
+        "",
+        _session_share_sentence(),
         "",
         f"The session quota is `spec.harness.tuning.maxSessions` ({constants['maxSessions']} by default)"
         " plus the pods the operator runs for the agent, the chart's pods in the namespace with"
         f" their rollout surges ({constants['defaultChartPods']} when the operator cannot read the"
         f" chart's count), and a margin of {constants['margin']} for the operator's rollout surges,"
-        " its Jobs and the gateway's count-then-create overshoot.",
+        " its Jobs and the gateway's transient overshoot at the cap.",
         "",
         "The A2A stack, per pod:",
         "",

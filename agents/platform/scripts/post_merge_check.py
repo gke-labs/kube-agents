@@ -2,7 +2,8 @@
 
 Step 2, notice the merge: :func:`notice_merges` reads each waiting record's
 pull request from the forge, one read per record per tick and at most
-:data:`READS_PER_TICK` records, and writes what it found back to the row:
+:func:`reads_per_tick` records (:data:`READS_PER_TICK` unless the install sets
+:data:`READS_PER_TICK_ENV`), and writes what it found back to the row:
 
 - merged: ``merged_at`` (the forge's close time, else now) and ``merge_commit``,
   the commit the merge became (the forge's ``mergeCommit``). The later steps
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -44,8 +46,16 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger("post_merge_check")
 
 RECORDS_TABLE = "post_merge_records"
-#: The most records one tick reads from the forge.
+#: The most records one tick reads, per step, unless :data:`READS_PER_TICK_ENV`
+#: says otherwise.
 READS_PER_TICK = 20
+#: The agent container's variable (``spec.deployment.env``) that sets the per-step
+#: limit: a whole number from 1 to :data:`READS_PER_TICK_MAX`; anything else is the default.
+READS_PER_TICK_ENV = "POST_MERGE_READS_PER_TICK"
+#: The ceiling fits a run inside the five-minute tick the step is scheduled at: 25
+#: forge reads at :data:`VIEW_TIMEOUT_SECONDS` each is under 4.5 minutes even when
+#: every read times out.
+READS_PER_TICK_MAX = 25
 #: The forge read's ceiling, per record, on the agent pod's hop to the sandbox
 #: (``forge.call``); a run with no sandbox reaches the broker without one.
 VIEW_TIMEOUT_SECONDS = 10.0
@@ -513,31 +523,52 @@ SESSION_KV_DB_DEFAULT = "/var/lib/kube-agents/session/session_kv.db"
 SWITCH = "POST_MERGE_CHECK"
 
 
+def reads_per_tick() -> int:
+    """:data:`READS_PER_TICK_ENV` as a whole number from 1 to :data:`READS_PER_TICK_MAX`, else :data:`READS_PER_TICK`."""
+    raw = os.environ.get(READS_PER_TICK_ENV, "").strip()
+    if not raw:
+        return READS_PER_TICK
+    # At most four digits before int(): Python refuses a digit string past
+    # 4300 characters with a ValueError, and no valid value needs more than three.
+    value = int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 4 else 0
+    if not 1 <= value <= READS_PER_TICK_MAX:
+        logger.warning("post-merge check: %s=%r is not a whole number from 1 to %d; using %d",
+                       READS_PER_TICK_ENV, raw, READS_PER_TICK_MAX, READS_PER_TICK)
+        return READS_PER_TICK
+    return value
+
+
 def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None) -> int:
     """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply step;
     prints what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
+
+    ``report`` is one tick of the report step (``post_merge_report``), in the switch's mode.
     """
-    import os
     import sys
     from contextlib import closing
 
     argv = sys.argv[1:] if argv is None else argv
-    if argv not in (["notice"], ["health"]):
-        print("usage: post_merge_check.py notice|health", file=sys.stderr)
+    if argv not in (["notice"], ["health"], ["report"]):
+        print("usage: post_merge_check.py notice|health|report", file=sys.stderr)
         return 2
     import kubeagents_switches
 
-    if kubeagents_switches.switch(SWITCH) == kubeagents_switches.OFF:
+    mode = kubeagents_switches.switch(SWITCH)
+    if mode == kubeagents_switches.OFF:
         print(json.dumps({"switch": kubeagents_switches.OFF}))
         return 0
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
         if argv == ["notice"]:
-            print(json.dumps(notice_merges(conn, view)))
+            print(json.dumps(notice_merges(conn, view, limit=reads_per_tick())))
+        elif argv == ["report"]:
+            import post_merge_report
+
+            print(json.dumps(post_merge_report.report_outcomes(conn, mode, limit=reads_per_tick())))
         else:
-            print(json.dumps(watch_health(conn, kubectl_json)))
+            print(json.dumps(watch_health(conn, kubectl_json, limit=reads_per_tick())))
     return 0
 
 

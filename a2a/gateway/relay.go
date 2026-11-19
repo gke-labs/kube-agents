@@ -100,6 +100,9 @@ var reasonSentences = map[string]string{
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
 	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
+	// A confirmed change runs only in a one-pod Job of its own (#4458); the
+	// detail names the profile and tier, which are for an operator.
+	"change-needs-job": "this change has to run in a job of its own, which this agent can't start for this kind of request, so nothing was changed",
 	// The dispatcher's re-check of a profile task's child (#5686). The
 	// gateway refuses the same at mint, so these reach the room only from a
 	// child an older gateway sent, or one that broke a rule anyway.
@@ -450,6 +453,8 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l := g.lockSession(sessionKey)
 	l.Lock()
 	defer l.Unlock()
+	// A wake that took a cap slot ends it here, as a turn does (#6033).
+	defer g.releaseCapHold(sessionKey)
 
 	// A stopping gateway renders nothing new: its run context is done, so
 	// every read would fail, and the batch's deliveries are left for the

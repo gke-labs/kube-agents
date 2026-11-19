@@ -354,11 +354,11 @@ const (
 	// AgentProfileConditionCardPublished is True when the profile's agent card
 	// is on the directory.
 	AgentProfileConditionCardPublished = "CardPublished"
-	// AgentProfileConditionJobResourcesFit is False when the profile allows
-	// the unattended tier and its resource requests break GKE Autopilot's
-	// cpu-to-memory ratio: Autopilot raises them on the profile's Jobs, which
-	// then no longer equal their template, so the Job admission policy refuses
-	// them there.
+	// AgentProfileConditionJobResourcesFit is False when the profile's
+	// resource requests break GKE Autopilot's cpu-to-memory ratio: Autopilot
+	// raises them on the profile's Jobs (its unattended tasks', and at any tier
+	// its permit-carrying ones'), which then no longer equal their template,
+	// so the Job admission policy refuses them there.
 	AgentProfileConditionJobResourcesFit = "JobResourcesFit"
 	// AgentProfileConditionTiersRendered is False when allowedTiers lists a
 	// name with no tier (reason TierUnknown) or a second unattended-mode tier
@@ -399,6 +399,22 @@ type AgentProfileStatus struct {
 	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
 	// +optional
 	RenderedTiers []string `json:"renderedTiers,omitempty"`
+
+	// DurableTiers are the tiers whose PROFILE_SUBMITS durables the operator
+	// last made or found, written only after a durable sync succeeds and
+	// left as it was by any other pass (#6283). The operator reads it to
+	// tell a durable that existed, which it re-creates only once it is
+	// still missing a pass later, from one it never made, which it makes at
+	// once. A hint like renderedTiers: absent, every durable counts as new.
+	// It holds at most 32: the rendered tiers first, then the draining ones
+	// by name. A draining tier left out counts as new, re-created on its
+	// first miss as before #6283.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]+$`
+	// +optional
+	DurableTiers []string `json:"durableTiers,omitempty"`
 
 	// Conditions represent the latest available observations of the profile.
 	// +listType=map

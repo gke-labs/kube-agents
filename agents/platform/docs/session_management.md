@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). The hermes-bridge also records a session's origin (`PUT /v1/sessions/{id}/origin`). The work-origin callers are the rest ([below](#work-origin-tables)): the board's insert-time stamp (`deploy/docker/patches/kanban_origin.py`) reads a turn's origin (`GET /v1/sessions/{id}/origin`) and redeems stamp tickets; the bootstrap hand-off and the GitHub scan gate mint those tickets through it; the cron scheduler's origin patch (`deploy/docker/patches/cron_job_template.py`) reads and records a job's origin; the `pr_opened` plugin writes the proposals ledger and, with `KUBEAGENTS_POST_MERGE_CHECK` not `off`, the post-merge records; and the `chat_metrics` plugin reads its counts. The `session_store` plugin writes the `origin` keys of `session_metadata` straight into the database, not through a route, and `post_merge_check.py notice` and `health` update `post_merge_records` the same way. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). The hermes-bridge also records a session's origin (`PUT /v1/sessions/{id}/origin`). The work-origin callers are the rest ([below](#work-origin-tables)): the board's insert-time stamp (`deploy/docker/patches/kanban_origin.py`) reads a turn's origin (`GET /v1/sessions/{id}/origin`) and redeems stamp tickets; the bootstrap hand-off and the GitHub scan gate mint those tickets through it; the cron scheduler's origin patch (`deploy/docker/patches/cron_job_template.py`) reads and records a job's origin; the `pr_opened` plugin writes the proposals ledger and, with `KUBEAGENTS_POST_MERGE_CHECK` not `off`, the post-merge records; and the `chat_metrics` plugin reads its counts. The `session_store` plugin writes the `origin` keys of `session_metadata` straight into the database, not through a route, and `post_merge_check.py notice`, `health` and `report`, `post_merge_edited.py fill`, `post_merge_environment.py fill` and `post_merge_followups.py` update `post_merge_records` the same way. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -423,10 +423,16 @@ whose `cluster_identity` names that cluster (all three parts must match for the 
 `<project>/<location>/<name>`), empty when none names it or the profiles that do disagree. The finding itself is
 still the opener's word, so the check verifies the fix rather than trusting the row. `repo` is read
 off the pull request url, and the thread is the one the opening card reports to: empty outside a
-kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it
-(the plugin does not). The merge step is `post_merge_check.py notice`,
+kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it,
+and is `NULL` otherwise (the plugin does not send it). `post_merge_environment.py fill` fills it for a `verified_fixed` or
+`still_broken` record: the cluster's resource labels, read with `gcloud` in the shell sandbox and
+resolved by `automation_rules.cluster_environment`, or `""` when there is no such label. It runs under
+the same switch, reads at most `READS_PER_TICK` clusters a run, and is likewise unscheduled. A cluster
+it cannot read is retried for a day after the outcome, then given `""`. The merge step is `post_merge_check.py notice`,
 one run of which reads at most `READS_PER_TICK` (20) waiting records' pull requests, least recently
-read first, and reads nothing while the switch is `off`; no job schedules it yet. A merge fills
+read first, and reads nothing while the switch is `off`. `POST_MERGE_READS_PER_TICK` in
+`spec.deployment.env` (a whole number from 1 to 25, so a run of forge reads fits a five-minute tick) sets that cap for every step; no job
+schedules the step yet. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
@@ -439,9 +445,32 @@ object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload)
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
 (`health_baseline`) for the health window, a later step. A workload that is gone or cannot be judged
 fails with the reason in `health_result` and `health_detail`; any other read failure is kept and
-retried. The edit, revert and outcome
-columns are left for the later steps. `cleanup_old_records` leaves the table: each row
+retried. `post_merge_edited.py fill`, under the same switch and per-run cap and likewise unscheduled,
+fills `human_edited` for each merged record without one: `1` when anyone but the install, a person or
+another automation such as a dependency bot, committed to the pull request or requested changes on it
+(the pull-request sweep's rule, read through `proposal-commits` and `proposal-reviews`), `0` when
+neither happened, and `NULL` when what was read shows neither but cannot be read in full. It asks again next run, until a day after the
+check noticed the merge (`merge_checked_at`), so a merge noticed late is still asked. The revert and outcome columns are left for the later steps (the follow-ups below write `reverted_at`). `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
+
+The report step is `post_merge_check.py report` (`post_merge_report.py`), under the same switch and
+likewise unscheduled. It takes each record with an `outcome` and no `reported_at`. At `silent` it
+stamps every such record's `reported_at` and posts nothing, so turning `report` on later does not post old
+outcomes. At `report` it reads at most `READS_PER_TICK` pull requests a run and comments once on each, from a fixed text per outcome (never
+the outcome's detail, which can carry cluster output) ending in a hidden marker; it looks for the
+marker first, so a restart between the comment and the stamp never posts twice. A pull request whose
+comments do not fit in one read is not commented, and a comment the forge refuses is retried for a
+day. No step writes `outcome` yet, so it reports nothing.
+
+The follow-ups (`post_merge_followups.py`, likewise unscheduled) act once on a `still_broken` or
+`verified_fixed` record with an `environment`, within a day of the outcome. `still_broken` runs
+`post_merge_stepdown.py` in the shell sandbox; `verified_fixed` reads `clean_merges.ready_in` here and
+runs `post_merge_offer.py` only when it says ready. The script's answer goes in `followup_state` and
+`followup_detail`. A `retry` is run again, `FOLLOWUP_ATTEMPTS` (5) times in all or until the outcome
+is a day old, and then `followup_state` is `failed`; a step-down that ends that way comments once on
+the fix, behind the step-down's marker, saying what did and did not open. A record waits until
+`post_merge_environment.py fill` gives it an `environment`. `reverted_at` is stamped once the revert a step-down opened merges, watched for
+eight days.
 
 `GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
 fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its

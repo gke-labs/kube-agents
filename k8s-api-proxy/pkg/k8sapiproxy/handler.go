@@ -264,7 +264,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	// The authenticator's error goes to the audit event, not to the caller, as the transport's
 	// does: it can describe the proxy's own authentication setup.
 	caller, err := h.authenticator.AuthenticateRequest(r)
-	if errors.Is(err, errAuthenticationUnavailable) {
+	if errors.Is(err, ErrAuthenticationUnavailable) {
 		// The cause can name the host API server; it is not the caller's to read.
 		ev.Outcome, ev.Err = OutcomeAuthUnavailable, err
 		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, authUnavailableMessage)

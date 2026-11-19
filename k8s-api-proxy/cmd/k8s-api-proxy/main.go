@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/tokenreview"
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/upstream"
 )
 
@@ -235,7 +236,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
+	authn, err := tokenreview.NewAuthenticator(tokenreview.Config{
 		Kubernetes:      inCluster,
 		Audience:        *audience,
 		AllowedCallers:  callers,

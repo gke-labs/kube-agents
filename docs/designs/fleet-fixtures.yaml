@@ -357,8 +357,9 @@ fixtures:
     namespace: seeded-compute-class
     defect: >-
       A Deployment naming ComputeClass general-ccc only in a required
-      nodeAffinity term and never in nodeSelector, which is the one field the
-      pre-filter reads.
+      nodeAffinity term and never in nodeSelector. A required nodeAffinity on
+      the class key also requests the class, so this is the targeted control
+      beside the untargeted workload and no check flags it.
 
   - role: compute-class-toleration-workload
     slot: c
@@ -372,6 +373,19 @@ fixtures:
       toleration for the class taint that names key, value and effect and no
       operator. The pool it targets carries no taint, so the pod runs; the
       toleration's shape is the fixture.
+
+  - role: no-ephemeral-limit-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/batch-worker-a
+    namespace: seeded-compute-class
+    defect: >-
+      The same batch-worker-a Deployment, read for a second defect: its
+      container sets no ephemeral-storage request or limit, so its writable
+      layer and logs can fill the node's boot disk until the kubelet evicts
+      pods under DiskPressure. GKE Standard admission adds none, where
+      Autopilot writes a 1Gi request and limit onto every container.
 
   - role: untainted-compute-class-pool
     slot: c

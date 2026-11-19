@@ -462,7 +462,7 @@ You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces 
 
 What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which hold the task and a string derived from the rater's Slack member ID or Google Chat address. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
 
-The counts are on the gateway's metrics and in the `PlatformAgent`'s `status.usage` as `negativeFeedbackTotal` and `positiveFeedbackTotal` ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
+The counts are on the gateway's metrics and in the `PlatformAgent`'s `status.usage` as `negativeFeedbackTotal` and `positiveFeedbackTotal`; ratings on the alerts and reports the agent posts on its own count apart, as `autonomousNegativeFeedbackTotal` and `autonomousPositiveFeedbackTotal` ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
 
 ```bash
 kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
@@ -531,7 +531,7 @@ Only a member on the [allowed users](#allowed-users-1) list sees the dashboard; 
 
 With `KUBEAGENTS_DIAL=on` (off by default), the **Autonomy dial** panel sits above the Home channel panel. It shows what the agent may change on its own: Explain (finds and explains, changes nothing), Propose fixes (opens a pull request, your team merges) or Auto-merge proven fixes (your pipeline merges proven fixes).
 
-Under the level, each kind of fix shows one repository's clean merges toward the auto-merge offer, for example `org/infra · 3 of 5 clean merges · off`, with a picker when the kind has fixes in more than one repository. The state is `off`, `Pending: rules PR #N` while the pull request that turns it on is open, or `auto-merges`. A note under the row says why the last change did nothing, when it did nothing.
+Under the level, each kind of fix shows one repository's clean merges toward the auto-merge offer, for example `org/infra · 3 of 5 clean merges · off`, with a picker when the kind has fixes in more than one repository. The state is `off`, `Pending: rules PR #N` while the pull request that turns it on is open, or `auto-merges`. A note under the row says why the last change did nothing, when it did nothing. Until the post-merge check records outcomes, which nothing schedules yet, every count stays at 0.
 
 A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser on every change, and its one-line answer appears under the panel for the person who pressed.
 

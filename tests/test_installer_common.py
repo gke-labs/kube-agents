@@ -6,8 +6,10 @@ unparseable or unreadable state fails safe), the comma-or-space splitting
 behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 """
 
+import base64
 import datetime
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -2400,6 +2402,88 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("Could not probe cluster", proc.stderr)
 
+    _API_DISABLED_IN = (
+        'echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, '
+        "message=Kubernetes Engine API has not been used in project {project} before or it is disabled. "
+        'Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project={project} then retry." >&2; exit 1'
+    )
+
+    def test_tfvars_reads_a_disabled_gke_api_in_the_target_project_as_absence(self):
+        # A fresh project's first install: the Kubernetes Engine API is off, so
+        # no cluster can exist there, and the apply enables the API before it
+        # creates one. The generator must not refuse this as an unreadable
+        # cluster (the pool's new projects and a fresh standalone project both
+        # stopped here on 2026-11-13 and 2026-11-16).
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="test-project"),
+        )
+        # The harness stubs print_info, so the absence line is not readable
+        # here; the exit code and the missing refusal are the assertion.
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_project_number_as_absence(self):
+        # gcloud names the project by number in the ErrorInfo consumer line.
+        stub = (
+            'echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; '
+            'echo "  consumer: projects/123456789" >&2; exit 1'
+        )
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_a_disabled_gke_api_that_names_no_project(self):
+        # A bare SERVICE_DISABLED with no project named (a quota-project
+        # refusal without its consumer line) says nothing about the target.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub='echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; exit 1',
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_number_in_the_message_as_absence(self):
+        # The message line itself can carry the number rather than the id.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=self._API_DISABLED_IN.format(project="123456789"),
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_resolves_the_project_number_when_the_front_door_did_not_export_it(self):
+        # upgrade.sh, uninstall.sh and the menu reach the generator before
+        # PROJECT_NUMBER is exported; a refusal by number is then resolved
+        # with one `projects describe`, and only for a refusal of that shape.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="123456789"),
+            gcloud_extra_cases='  *"projects describe test-project"*) printf "123456789\\n"; exit 0 ;;\n',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_when_the_disabled_gke_api_is_another_projects(self):
+        # The refusal names the caller's quota project, not the target: it says
+        # nothing about whether the target holds a cluster, so the generator
+        # keeps refusing to guess.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="someone-elses-quota-project"),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
     def test_tfvars_generation_recovers_credentials_from_live_secret(self):
         # PERSIST_SECRETS_ON_DISK=false leaves install.env without the keys; the
         # live Secret is their home, so the generator reads them back from it.
@@ -2407,11 +2491,12 @@ class InstallerCommonTest(unittest.TestCase):
         kubectl_stub = (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
-            # Recovery is gated on the current context being this install's
-            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name
-            # and asserts that secret reads explicitly pass --context.
+            # Recovery runs when the cluster exists, and the stub asserts that
+            # the Secret read names this install's context explicitly.
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*) printf "%s" "{recovered_b64}" ;;\n'
+            # One read of the whole Secret (-o json), on this install's context.
+            f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"API_SERVER_KEY\": \"{recovered_b64}\", \"SESSION_KV_SALT\": \"{recovered_b64}\", \"SESSION_KV_API_KEY\": \"{recovered_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -2420,6 +2505,8 @@ class InstallerCommonTest(unittest.TestCase):
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 kubectl_script=kubectl_stub,
+                describe_stub=self._CLUSTER_EXISTS,
+                gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n",
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
@@ -2427,6 +2514,188 @@ class InstallerCommonTest(unittest.TestCase):
             # SESSION_KV_* recover too: an adoption re-install must keep the
             # live salt or every chat identity re-pseudonymises.
             self.assertIn('session_kv_salt    = "recovered-key"', content)
+
+    # ── #6126: a Secret read that fails is not an absent key ────────────────
+
+    _CTX = "gke_test-project_us-central1_test-cluster"
+    _ALL_SECRET_KEYS = ("API_SERVER_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                        "OPENAI_COMPATIBLE_API_KEY", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+                        "SESSION_KV_API_KEY", "SESSION_KV_SALT")
+
+    def _secret_read_stub(self, read_arm, log=None, current_ctx=None):
+        """kubectl on this install's context; the whole-Secret read runs read_arm."""
+        rec = f'echo "$*" >> "{log}"; ' if log else ""
+        return (
+            "#!/usr/bin/env bash\n"
+            f"{rec}"
+            'case "$*" in\n'
+            f'  *"config current-context"*) printf "{current_ctx or self._CTX}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"-o json"*) {read_arm} ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+
+    # The cluster probe finds the cluster: recovery runs only then.
+    _CLUSTER_EXISTS = "printf 'False\\n'; exit 0"
+
+    def _recover(self, read_arm, env=None, log=None, current_ctx=None, **run_kwargs):
+        run_kwargs.setdefault("describe_stub", self._CLUSTER_EXISTS)
+        run_kwargs.setdefault("gcloud_extra_cases", "  *get-credentials*) exit 0 ;;\n")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; print_error() { echo "ERROR: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"KUBE_AGENTS_REQUIRE_SECRET_ANSWER": "true", "SLACK_BOT_TOKEN": "", **(env or {})},
+                kubectl_script=self._secret_read_stub(read_arm, log, current_ctx),
+                **run_kwargs,
+            )
+            return proc, (dest.read_text() if dest.exists() else None)
+
+    def test_a_timed_out_secret_read_stops_an_applying_run_rather_than_blank_keys(self):
+        # The ka-today-1 failure: the read failed and SLACK_BOT_TOKEN went out
+        # empty. An applying caller now stops, names what it couldn't recover,
+        # and writes no tfvars for the apply to take.
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded)" >&2; exit 1')
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not read the live 'platform-agent-secrets' Secret", proc.stderr)
+        self.assertIn("SLACK_BOT_TOKEN", proc.stderr)
+        self.assertIn("Client.Timeout exceeded", proc.stderr)
+        self.assertIsNone(tfvars, "tfvars were written after a failed Secret read")
+
+    def test_an_rbac_denied_secret_read_stops_an_applying_run(self):
+        proc, tfvars = self._recover(
+            "echo 'Error from server (Forbidden): secrets \"platform-agent-secrets\" is forbidden: User \"u\" cannot get resource \"secrets\"' >&2; exit 1")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("(Forbidden)", proc.stderr)
+        self.assertIsNone(tfvars)
+
+    def test_a_key_absent_from_a_secret_that_was_read_is_absent(self):
+        # A read that succeeded and lacks the key is a real absence: the run
+        # goes on with it empty, and the keys the Secret holds are recovered.
+        api = base64.b64encode(b"live-api-key").decode()
+        proc, tfvars = self._recover(f"printf '%s' '{{\"data\": {{\"API_SERVER_KEY\": \"{api}\"}}}}'")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn('api_server_key    = "live-api-key"', tfvars)
+        self.assertNotIn("xoxb", tfvars)
+
+    def test_a_secret_that_does_not_exist_has_nothing_to_recover(self):
+        # A first install onto an existing cluster: NotFound is a real answer.
+        proc, tfvars = self._recover(
+            "echo 'Error from server (NotFound): secrets \"platform-agent-secrets\" not found' >&2; exit 1",
+            env={"API_SERVER_KEY": "k"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIsNotNone(tfvars)
+
+    def test_a_caller_that_does_not_apply_warns_and_goes_on(self):
+        # uninstall.sh doesn't opt in: a destroy has no use for the keys.
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1',
+            env={"KUBE_AGENTS_REQUIRE_SECRET_ANSWER": "", "API_SERVER_KEY": "k"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not read the live 'platform-agent-secrets' Secret", proc.stderr)
+
+    def test_no_secret_read_when_the_environment_holds_every_key(self):
+        # An operator whose RBAC can't read Secrets runs by exporting them.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "kubectl.log"
+            log.touch()
+            env = {k: "v" for k in self._ALL_SECRET_KEYS}
+            proc, _ = self._recover('echo "Unable to connect" >&2; exit 1', env=env, log=log)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("get secret", log.read_text())
+
+    def test_allow_empty_secret_keys_lets_named_keys_go_out_empty(self):
+        # The one way to accept writing keys empty on purpose: every key the
+        # failed read left unknown is named.
+        missing = [k for k in self._ALL_SECRET_KEYS if k != "API_SERVER_KEY"]
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1',
+            env={"API_SERVER_KEY": "k", "ALLOW_EMPTY_SECRET_KEYS": ",".join(missing)})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIsNotNone(tfvars)
+        # Naming all but one still stops, and names the one left.
+        proc, _ = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1',
+            env={"API_SERVER_KEY": "k", "ALLOW_EMPTY_SECRET_KEYS": ",".join(m for m in missing if m != "SESSION_KV_SALT")})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SESSION_KV_SALT", proc.stderr)
+
+    def test_an_existing_cluster_is_read_by_name_when_current_context_is_elsewhere(self):
+        # The adoption get-credentials is best-effort, and a shared kubeconfig
+        # can be switched underneath. Skipping recovery on a context mismatch
+        # would write the keys empty, so an existing cluster is read through
+        # its own context by name whatever current-context says.
+        exists = dict(
+            gcloud_extra_cases="  *get-credentials*) exit 1 ;;\n",
+            current_ctx="gke_other-project_us-east1_other-cluster",
+        )
+        proc, tfvars = self._recover(
+            'echo "Unable to connect to the server: i/o timeout" >&2; exit 1', **exists)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SLACK_BOT_TOKEN", proc.stderr)
+        self.assertIsNone(tfvars)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "kubectl.log"
+            log.touch()
+            api = base64.b64encode(b"live-api-key").decode()
+            proc, tfvars = self._recover(
+                f"printf '%s' '{{\"data\": {{\"API_SERVER_KEY\": \"{api}\"}}}}'", log=log, **exists)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('api_server_key    = "live-api-key"', tfvars)
+            self.assertIn(f"--context {self._CTX}", log.read_text())
+
+    def test_a_cluster_the_probe_found_absent_is_not_read_whatever_the_context(self):
+        # After an uninstall the context stays current, pointing at an endpoint
+        # that is gone. A fresh install with the same names must not read it,
+        # fail, and stop: a confirmed-absent cluster has no Secret.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "kubectl.log"
+            log.touch()
+            proc, tfvars = self._recover(
+                'echo "Unable to connect to the server: dial tcp: lookup gone: no such host" >&2; exit 1',
+                env={"API_SERVER_KEY": "k"}, log=log,
+                describe_stub='echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND" >&2; exit 1')
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIsNotNone(tfvars)
+            self.assertNotIn("get secret", log.read_text())
+
+    def test_a_404_that_is_not_this_secrets_own_is_not_an_absence(self):
+        # kubectl prints (NotFound) for any 404, a proxy's included; only the
+        # Secret's own "not found" means there is nothing to recover.
+        proc, tfvars = self._recover(
+            "echo 'Error from server (NotFound): the server could not find the requested resource' >&2; exit 1",
+            env={"API_SERVER_KEY": "k"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIsNone(tfvars)
+
+    def test_the_guard_refuses_to_render_a_live_key_empty(self):
+        # Checked against the values as rendered, so a change between the
+        # recovery and the render can't blank a key the live Secret held.
+        for value, allow, want in (("", "", "rc=1"), ("", "SLACK_BOT_TOKEN", "rc=0"), ("xoxb-1", "", "rc=0")):
+            with self.subTest(value=value, allow=allow):
+                proc = self._run(
+                    'print_error() { echo "ERROR: $*" >&2; }; '
+                    'LIVE_SECRET_NONEMPTY_KEYS=" API_SERVER_KEY SLACK_BOT_TOKEN"; '
+                    'rc=0; refuse_blanking_live_secret_keys || rc=$?; echo "rc=$rc"',
+                    env={"API_SERVER_KEY": "k", "SLACK_BOT_TOKEN": value, "ALLOW_EMPTY_SECRET_KEYS": allow})
+                self.assertIn(want, proc.stdout, proc.stderr)
+                if want == "rc=1":
+                    self.assertIn("SLACK_BOT_TOKEN is set in the live", proc.stderr)
+
+    def test_allow_empty_secret_keys_unset_under_set_u(self):
+        # bash 4+ rejects ${unset//,/ } under set -u; the read must not abort.
+        proc, _ = self._recover('echo "Unable to connect" >&2; exit 1',
+                                env={"API_SERVER_KEY": "k"})
+        self.assertNotIn("unbound variable", proc.stderr)
+
+    def test_a_value_that_is_not_base64_stops_an_applying_run(self):
+        proc, tfvars = self._recover("printf '%s' '{\"data\": {\"SLACK_BOT_TOKEN\": \"not*base64\"}}'",
+                                     env={"API_SERVER_KEY": "k"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not decode", proc.stderr)
+        self.assertIsNone(tfvars)
 
     # ── the adoption fetch: which control-plane endpoint it writes ───────────
 
@@ -2660,14 +2929,17 @@ class InstallerCommonTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.OPENAI_COMPATIBLE_API_KEY}}"*) printf "%s" "{recovered_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"-o json"*) '
+            f"printf '%s' '{{\"data\": {{\"OPENAI_COMPATIBLE_API_KEY\": \"{recovered_b64}\"}}}}' ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
         env = dict(self._OPENAI_COMPATIBLE_ENV, OPENAI_COMPATIBLE_API_KEY="")
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub)
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub,
+                             describe_stub=self._CLUSTER_EXISTS,
+                             gcloud_extra_cases="  *get-credentials*) exit 0 ;;\n")
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('openai_compatible_api_key = "recovered-key"', dest.read_text())
 
@@ -6456,6 +6728,89 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("values don't meet the specifications", proc.stderr)
         self.assertNotIn("Release footprint", proc.stdout)
 
+    def _failed_step(self, break_step, function="render_footprint_summary"):
+        """Run the render on a copy of the chart with one step of the probe build made to fail.
+
+        `break_step` is shell that runs after the copy exists at $CHECKOUT and before the
+        call. $TMPDIR is a directory of the run's own, listed after the call, so a probe
+        directory that stays behind shows on the `left:` line.
+        """
+        chart = _REPO_ROOT / "charts" / "kube-agents"
+        script = (
+            # C messages: the tests read cp's own error text.
+            'export LC_ALL=C\n'
+            'work="$(mktemp -d)"; CHECKOUT="$work/checkout"; export TMPDIR="$work/tmp"\n'
+            'mkdir -p "$CHECKOUT/charts/kube-agents/templates" "$TMPDIR"\n'
+            f'cp "{chart}/Chart.yaml" "{chart}/values.yaml" "{chart}/values.schema.json" "$CHECKOUT/charts/kube-agents/"\n'
+            f'cp -R "{chart}/files" "$CHECKOUT/charts/kube-agents/files"\n'
+            f'cp "{chart}/templates/_helpers.tpl" "$CHECKOUT/charts/kube-agents/templates/"\n'
+            f"{break_step}\n"
+            f'{function} "$CHECKOUT" "$TFVARS"; echo "rc=$?"\n'
+            'echo "left: $(ls -A "$TMPDIR" | tr "\\n" " ")"\n'
+            'chmod -R u+rwx "$work"; rm -rf "$work"\n'
+        )
+        return self._run(script, helm_script=_ECHO_HELM)
+
+    # The four steps of the probe build that had no handler: each must end the render
+    # with a non-zero status, with the step's own error and no helm call after it, and
+    # leave no probe directory behind.
+    _UNREADABLE_SCHEMA = 'chmod 000 "$CHECKOUT/charts/kube-agents/values.schema.json"'
+    _UNREADABLE_HELPERS = 'chmod 000 "$CHECKOUT/charts/kube-agents/templates/_helpers.tpl"'
+    _FAILING_MKDIR = 'mkdir() { case "$*" in */templates) echo "mkdir: cannot create the templates directory" >&2; return 1 ;; *) command mkdir "$@" ;; esac; }'
+    _FAILING_PROBE_WRITE = (
+        'printf() { case "$1" in "apiVersion: v1"*) echo "printf: write error" >&2; return 1 ;; *) builtin printf "$@" ;; esac; }'
+    )
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_schema(self):
+        proc = self._failed_step(self._UNREADABLE_SCHEMA)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("values.schema.json", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        # The render did not go on without the schema: helm was not called.
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_helpers_template(self):
+        proc = self._failed_step(self._UNREADABLE_HELPERS)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("_helpers.tpl", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_templates_directory_cannot_be_made(self):
+        proc = self._failed_step(self._FAILING_MKDIR)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        # The step's own error and nothing after it: without the handler the next copy
+        # fails into the directory that is not there, and its handler ends the render.
+        self.assertEqual(proc.stderr, "mkdir: cannot create the templates directory\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_probe_template_cannot_be_written(self):
+        proc = self._failed_step(self._FAILING_PROBE_WRITE)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertEqual(proc.stderr, "printf: write error\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_print_names_the_failed_step_and_nothing_after_it(self):
+        # The warning carries the step's error alone: no summary rendered without the
+        # schema, and no helm error for a template the copy never delivered.
+        for break_step, name in ((self._UNREADABLE_SCHEMA, "values.schema.json"), (self._UNREADABLE_HELPERS, "_helpers.tpl")):
+            with self.subTest(name=name):
+                proc = self._failed_step(break_step, function="print_footprint_summary")
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                warning = next((line for line in proc.stdout.splitlines() if line.startswith("WARN: ")), "")
+                self.assertIn("Could not render the release footprint summary: ", warning)
+                self.assertIn(name, warning)
+                self.assertTrue(warning.rstrip().endswith("Permission denied"), warning)
+                self.assertNotIn("args: ", proc.stdout)
+                self.assertIn("left: \n", proc.stdout)
+
     def test_print_warns_and_goes_on_without_helm(self):
         proc = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', without_helm=True
@@ -6484,7 +6839,7 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_real_render_prints_the_notes_block_for_the_tfvars(self):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn("      Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
         # which `make docs-generate` renders from the same chart template with these
@@ -6509,9 +6864,11 @@ class FootprintSummaryTest(unittest.TestCase):
                 self.assertIn("rc=0", output.stdout, output.stderr)
             r = profile["requirements"]
             gib = 1024**3
-            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
-            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
-            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            # The summary prints the standing release; the session pods' share, which the
+            # totals carry, is on its own line.
+            self.assertIn(f"CPU requests:        {(r['requestsCpu'] - r['sessionRequestsCpu']) / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {(r['requestsMemory'] - r['sessionRequestsMemory']) / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods'] - r['sessionPods']}\n", output.stdout, key)
             self.assertIn(
                 f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
                 output.stdout, key,
@@ -6522,7 +6879,7 @@ class FootprintSummaryTest(unittest.TestCase):
             profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the session pods", proc.stdout)
+        self.assertIn("Not in these figures or the cost: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

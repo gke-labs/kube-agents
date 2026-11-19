@@ -5,11 +5,16 @@ wrappers and routes; these call the module's public API directly with the
 redactor loaded by path, as the bench's in-pod script loads it.
 """
 
+import ast
 import importlib.util
 import json
+import os
 import shlex
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -47,6 +52,17 @@ class TestScrubStepText(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(worker_transcript.scrub_step_text(None, kind, "x", WITHHELD), WITHHELD)
 
+    # The search for the JSON parser's depth limit tries no document deeper than this: 4 million levels, 8 MB.
+    DEEPEST_DOCUMENT_TRIED = 1 << 22
+
+    @staticmethod
+    def _parses(text):
+        try:
+            json.loads(text)
+        except RecursionError:
+            return False
+        return True
+
     def test_withheld_when_the_walk_exceeds_the_recursion_limit(self):
         class _TooDeep:
             @staticmethod
@@ -56,8 +72,24 @@ class TestScrubStepText(unittest.TestCase):
         for kind in ("tool_call", "tool_result", "reply"):
             with self.subTest(kind=kind):
                 self.assertEqual(worker_transcript.scrub_step_text(_TooDeep, kind, "x", WITHHELD), WITHHELD)
+        # A document that parses and is too deep to walk is withheld.
+        depth = 2 * sys.getrecursionlimit()
+        nested = "[" * depth + "]" * depth
+        with self.subTest(levels=depth):
+            if not self._parses(nested):
+                self.skipTest("the JSON parser refuses %d levels here, so no document of this depth parses" % depth)
+            self.assertEqual(_scrub("tool_result", nested), WITHHELD)
         # A document too deep to parse is scrubbed as text rather than dropped.
-        deep = "[" * 100000 + "]" * 100000
+        # The parser's depth limit is the interpreter's: some thousands of
+        # levels on Python 3.12 and 3.13, and on 3.14 as many as the stack
+        # holds (more than 100,000 with a 16 MB stack). So the test finds a
+        # depth above it and holds no fixed one.
+        deep = nested
+        while self._parses(deep):
+            if 2 * depth > self.DEEPEST_DOCUMENT_TRIED:
+                self.skipTest("the JSON parser of this Python parses %d levels; the search stops there" % depth)
+            depth *= 2
+            deep = "[" * depth + "]" * depth
         self.assertEqual(_scrub("tool_result", deep), deep)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
@@ -691,6 +723,35 @@ class TestScrubStepText(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
                 self.assertNotIn("S3cretValue9", out)
 
+    def test_key_headers_with_no_end_line_scrub_in_linear_time(self):
+        # 170 KB of private key headers with no END line. The redactor's
+        # pattern read to the end of the text from each header, in the
+        # redactor and again here, so the scrub took 6 s of CPU time
+        # (#6072); with the redactor's one-pass mask it takes 0.04 s. The
+        # coverage job in CI runs about 5 times slower than a developer's
+        # machine, which leaves the 1 s bound a margin of about 5.
+        import time
+
+        header = "-----BEGIN PRIVATE KEY-----\n"
+        start = time.process_time()
+        out = _scrub("tool_result", header * 6000)
+        self.assertLess(time.process_time() - start, 1.0)
+        # Only the last header is masked: it is a key that the text cuts short.
+        self.assertEqual(out, header * 5999 + worker_transcript.REDACTED_PRIVATE_KEY_MARKER)
+
+    def test_a_key_block_that_only_the_transcript_rules_decode_is_masked(self):
+        # A JSON string inside a JSON string, with each dash and line end of
+        # the key block written as a `\\u` escape: the redactor's own pass
+        # does not decode it, so the mask in `supplement_redact` is the one
+        # that masks the block.
+        dashes, line_end = "\\u002d" * 5, "\\u000a"
+        inner = '{"pem": "' + dashes + "BEGIN PRIVATE KEY" + dashes + line_end + "MIIE" + line_end + dashes + "END PRIVATE KEY" + dashes + '"}'
+        self.assertEqual(json.loads(inner), {"pem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"})
+        want = json.dumps({"output": json.dumps({"pem": worker_transcript.REDACTED_PRIVATE_KEY_MARKER})})
+        for kind in ("tool_call", "tool_result", "reply", "thinking"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, json.dumps({"output": inner})), want)
+
     def test_a_value_that_holds_the_next_flag_word_does_not_hide_the_next_value(self):
         # The first value is `abc\ -p` (or `abc\ -u`): its place overlaps
         # the place of the second value, and one marker stands for both. The
@@ -986,6 +1047,42 @@ class TestScrubStepText(unittest.TestCase):
         self.assertTrue(worker_transcript.named_value_is_sensitive(REDACTOR, "client-key-data"))
 
 
+def _deepest_python_call(function, *args):
+    """How many Python frames `function` runs at its deepest, itself counted
+    as 1. `sys.setprofile` sees each call and each return of a Python
+    function, also one that a pattern's `sub` calls back; a C function
+    counts for nothing. The number does not depend on the recursion limit
+    of the run, while the function stays below that limit. The garbage
+    collector is off for the call: a finalizer that it ran in the middle
+    would count as a call of the function's. So would a Python signal
+    handler; no test in this file sets one."""
+    import gc
+
+    depth = deepest = 0
+
+    def note(frame, event, arg):
+        nonlocal depth, deepest
+        if event == "call":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif event == "return":
+            depth -= 1
+
+    collects = gc.isenabled()
+    gc.disable()
+    try:
+        before = sys.getprofile()
+        sys.setprofile(note)
+        try:
+            function(*args)
+        finally:
+            sys.setprofile(before)
+    finally:
+        if collects:
+            gc.enable()
+    return deepest
+
+
 class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
     """Three patterns were quadratic on a long run (#5901). Their linear forms
     must give the same output as the old forms: the same key, scheme and
@@ -1123,6 +1220,21 @@ class TestLinearPatternsKeepTheirMatches(unittest.TestCase):
         ):
             with self.subTest(cmd=cmd):
                 self.assertEqual(_scrub("tool_call", cmd), want)
+
+    def test_blank_quoted_spans_keeps_its_depth_in_python_frames(self):
+        # The callback runs one Python frame below the rule and calls no
+        # Python function, also for the single quotes inside an open double
+        # quote. A callback of its own for those (a second `re.sub`) gives
+        # the same output one frame deeper, so the rule reaches the
+        # recursion limit one frame sooner in a deeply nested step. No other
+        # test in this file sees that.
+        #
+        # First, the count does see a function that a pattern's `sub` calls
+        # back: the second lambda runs one frame below the first.
+        self.assertEqual(_deepest_python_call(lambda: worker_transcript.SHELL_QUOTED_SPAN_RE.sub(lambda match: "", "'a'")), 2)
+        for text in ("echo plain", "echo 'a b'", 'echo "c d"', 'echo "c d', "x 'a' 'b' \"c 'd' 'e' f"):
+            with self.subTest(text=text):
+                self.assertEqual(_deepest_python_call(worker_transcript.blank_quoted_spans, text), 2)
 
     def test_a_long_run_scrubs_in_linear_time(self):
         # The whole scrub. Each command took seconds on the old forms (1.6 s
@@ -1315,6 +1427,26 @@ class TestJsonBlockRuleKeepsItsOutput(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(worker_transcript.scrub_secret_blocks(REDACTOR, text), want)
+
+    def test_the_block_rule_keeps_its_depth_in_python_frames(self):
+        # The block callback runs one Python frame below
+        # `scrub_secret_blocks`, and the pair function one frame below the
+        # callback, for a pair only. A call of the pair function for a
+        # string that opens no pair gives the same output one frame deeper
+        # on such a block, so the rule reaches the recursion limit one frame
+        # sooner. No other test in this file sees that. The callback's other
+        # paths have a text each: a block that is not masked, and a marker
+        # of an earlier document that the callback steps over.
+        for text, deepest in (
+            ('"stringData":{"a","b"}', 2),
+            ('{"kind":"Secret",\n"data":{"a","b"}}', 2),
+            ('{"level":"info","data":{"a","b"}}', 2),
+            ('x "kind": 1\n{"apiVersion":"v1","data":{"a","b"}}', 2),
+            ('"stringData":{"a":"b"}', 3),
+            ('{"kind":"Secret",\n"data":{"a":"b","c":"d"}}', 3),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_deepest_python_call(worker_transcript.scrub_secret_blocks, REDACTOR, text), deepest)
 
     def test_many_blocks_scrub_in_linear_time(self):
         # The whole scrub. Each text took seconds on the old forms (1.3 s to
@@ -2520,6 +2652,129 @@ class TestSecretReadDetector(unittest.TestCase):
         self.assertTrue(worker_transcript.is_secret_read_tool_call(cmd))
         self.assertFalse(worker_transcript.is_secret_read_tool_call({"path": cmd}))
         self.assertFalse(worker_transcript.is_secret_read_tool_call(None))
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODULE_SOURCE = "agents/platform/scripts/worker_transcript.py"
+MODULE_FOLDER_SOURCE = "agents/platform/scripts"
+READER_SOURCE = "bench/kube_agents_bench/shell_words.py"
+READER_FILENAME = "shell_words.py"
+# The build stages that ship the module today, as (Dockerfile, stage name). The scan must find these.
+SHIPPING_STAGES = (
+    ("deploy/docker/Dockerfile", "platform"),
+    ("deploy/docker/Dockerfile", "credential-proxy"),
+    ("hack/replay-proxy/Dockerfile", ""),
+)
+
+
+def _load_module_copy(folder):
+    spec = importlib.util.spec_from_file_location("worker_transcript_copy", Path(folder) / "worker_transcript.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _copy_instructions(dockerfile):
+    """Each COPY of a Dockerfile as (stage, sources, destination), with line continuations joined.
+
+    The stage is the name of the last FROM line above the COPY (`FROM x AS name`, or "" with no
+    name): two stages of one file are two images.
+    """
+    lines = [line for line in dockerfile.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#")]
+    copies = []
+    stage = ""
+    for line in "\n".join(lines).replace("\\\n", " ").splitlines():
+        words = line.split()
+        if words and words[0] == "FROM":
+            stage = words[-1] if len(words) > 2 and words[-2].upper() == "AS" else ""
+        if words and words[0] == "COPY":
+            paths = [word for word in words[1:] if not word.startswith("--")]
+            copies.append((stage, paths[:-1], paths[-1]))
+    return copies
+
+
+def _destination_folder(destination):
+    return destination if destination.endswith("/") else os.path.dirname(destination) + "/"
+
+
+class TestShellReader(unittest.TestCase):
+    """The module loads the bench's shell reader, and each image holds that reader beside it."""
+
+    def test_a_checkout_loads_the_reader_of_the_bench(self):
+        self.assertEqual(Path(worker_transcript.SHELL_READER_PATH).resolve(), REPO_ROOT / READER_SOURCE)
+        self.assertEqual(
+            worker_transcript.SHELL_READER._shell_argvs("echo 'a; b' | wc -l; ls $(pwd)"),
+            [["echo", "a; b"], ["wc", "-l"], ["ls", "$(pwd)"], ["pwd"]],
+        )
+
+    def _image_folder(self):
+        # As deep as the image's /opt/defaults/scripts, so the repository's place of the reader is
+        # inside the temporary folder too, and is empty.
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        folder = Path(root.name).resolve() / "opt" / "defaults" / "scripts"
+        folder.mkdir(parents=True)
+        shutil.copy(REPO_ROOT / MODULE_SOURCE, folder)
+        return folder
+
+    def test_the_reader_beside_the_module_is_the_one_it_loads(self):
+        folder = self._image_folder()
+        shutil.copy(REPO_ROOT / READER_SOURCE, folder)
+        # A file at the repository's place too: the folder of the module is the first place to look.
+        second = folder.parents[2] / READER_SOURCE
+        second.parent.mkdir(parents=True)
+        second.write_text("raise RuntimeError('the second place was loaded')\n", encoding="utf-8")
+        copy = _load_module_copy(folder)
+        self.assertEqual(Path(copy.SHELL_READER_PATH), folder / READER_FILENAME)
+        self.assertEqual(copy.SHELL_READER._shell_argvs("a; b"), [["a"], ["b"]])
+
+    def test_a_module_with_no_reader_fails_at_import(self):
+        folder = self._image_folder()
+        with self.assertRaises(ImportError) as raised:
+            _load_module_copy(folder)
+        self.assertIn(str(folder / READER_FILENAME), str(raised.exception))
+
+    def test_the_reader_imports_only_the_standard_library(self):
+        # The images copy this one file, with no package around it and nothing installed for it.
+        tree = ast.parse((REPO_ROOT / READER_SOURCE).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "a relative import at line %d" % node.lineno)
+                names = [node.module]
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            else:
+                continue
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name.split(".")[0], sys.stdlib_module_names)
+
+    def test_each_dockerfile_that_ships_the_module_ships_the_reader_beside_it(self):
+        # Tracked files only: a checkout can hold other checkouts in folders that git ignores.
+        listed = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+        shipping = []
+        for relative in listed.stdout.splitlines():
+            if not os.path.basename(relative).startswith("Dockerfile"):
+                continue
+            copies = _copy_instructions(REPO_ROOT / relative)
+            for stage, sources, destination in copies:
+                plain = [source.rstrip("/") for source in sources]
+                if MODULE_SOURCE not in plain and MODULE_FOLDER_SOURCE not in plain:
+                    continue
+                shipping.append((relative, stage))
+                with self.subTest(dockerfile=relative, stage=stage):
+                    target = _destination_folder(destination) + READER_FILENAME
+                    reader_targets = [
+                        to if not to.endswith("/") else to + READER_FILENAME
+                        for other_stage, froms, to in copies
+                        if other_stage == stage and READER_SOURCE in froms
+                    ]
+                    self.assertIn(target, reader_targets)
+                    # A file of this name in a folder of the same COPY would take the reader's place.
+                    for source in sources:
+                        self.assertFalse((REPO_ROOT / source / READER_FILENAME).exists(), source)
+        for site in SHIPPING_STAGES:
+            self.assertIn(site, shipping)
 
 
 class TestCardToSession(unittest.TestCase):

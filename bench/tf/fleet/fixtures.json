@@ -1475,7 +1475,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/app-worker-b", "computeclass/general-ccc"],
-      "fixture": "app-worker-b Deployment, one replica, naming ComputeClass general-ccc only in a required nodeAffinity term and never in nodeSelector, which the Cluster Autoscaler's ComputeClass pre-filter reads alone",
+      "fixture": "app-worker-b Deployment, one replica, naming ComputeClass general-ccc only in a required nodeAffinity term and never in nodeSelector; a required nodeAffinity on the class key also requests the class, so this is the targeted control beside app-worker-a and no check flags it",
       "state": [
         {
           "subject": "deployment/app-worker-b",
@@ -1488,7 +1488,7 @@
           "subject": "deployment/app-worker-b",
           "path": "spec.template.spec.nodeSelector",
           "op": "absent",
-          "why": "the defect is the class named in affinity instead of the selector; a selector added heals it"
+          "why": "the control is the class named in affinity and not in the selector; a selector added makes it the plain selector form"
         }
       ]
     },
@@ -1517,6 +1517,33 @@
           "path": "spec.template.spec.tolerations[?(@.key=='cloud.google.com/compute-class')].operator",
           "op": "absent",
           "why": "the defect is the toleration without an operator; the API server stores it as written, and anyone adding `operator: Equal` heals the shape the check reads"
+        }
+      ]
+    },
+    "no-ephemeral-limit-workload": {
+      "cluster_slot": "c",
+      "namespace": "seeded-compute-class",
+      "probes": ["deployment/batch-worker-a"],
+      "fixture": "the same batch-worker-a Deployment, read for a second defect: its container sets no ephemeral-storage request or limit, as every planted workload in the fleet does (GKE Standard admission adds none, where Autopilot writes a 1Gi request and limit onto every container), so its writable layer and logs can fill the node's boot disk until the kubelet evicts pods under DiskPressure",
+      "state": [
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the pod runs; slot c must stay a cluster with no failing workload"
+        },
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "spec.template.spec.containers[?(@.name=='worker')].resources.limits.ephemeral-storage",
+          "op": "absent",
+          "why": "the defect is the missing limit; the remediation the case forbids is adding it"
+        },
+        {
+          "subject": "deployment/batch-worker-a",
+          "path": "spec.template.spec.containers[?(@.name=='worker')].resources.requests.ephemeral-storage",
+          "op": "absent",
+          "why": "the other half of the fix a check would compose; a request added by hand or by a LimitRange heals half the shape"
         }
       ]
     },
