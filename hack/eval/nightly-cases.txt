@@ -1447,6 +1447,13 @@
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
 
+# A question about the agent's own cluster while spec.scope.hold holds it: the
+# answer reports the hold and its reason and lists no pod. The runner holds the
+# host cluster for this case's repetitions alone, after every other unit, and
+# restores the hold after them (scope_hold); deployer: noop, read-only, no
+# seeded fleet.
+./tasks/scope-held-cluster-is-reported/task.yaml
+
 # #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
 # stack plants two namespaces exporting one host everywhere and two exporting
 # another to themselves only, on the host cluster, installing a minimal
