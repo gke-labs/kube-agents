@@ -64,6 +64,8 @@ OPEN_COLUMNS = ("url", "repo", "number", "kind", "project", "location", "cluster
 #: workload's own reading was still not settled ``HEALTH_SETTLE_LIMIT`` past the window.
 #: The same limit reached on a read that failed (``READ_FAILED``) judges nothing.
 CANNOT_JUDGE = "cannot judge: "
+#: The ``sync_state`` ``watch_health`` writes for a record the declared scope refused, which it stamps unread.
+SCOPE_STAMPS = (f"{SCOPE_UNKNOWN}: ", f"{SCOPE}: ")
 NEVER_SETTLED = "not healthy "
 READ_FAILED = "; this read failed:"
 #: Merged records with no outcome. A pull request closed without a merge never
@@ -108,6 +110,9 @@ def _not_live(record: dict) -> str:
 def _read_since(record: dict, moment: datetime | None) -> bool:
     """Whether the apply step last read the record at or after ``moment``: a deadline ends a record
     only on a reading taken after it, never on a stale one (a pod outage, a cron gap, a backlog)."""
+    if str(record.get("sync_state") or "").startswith(SCOPE_STAMPS):
+        # The stamp of a record the scope refused: nothing was read.
+        return False
     read = _parse_time(record.get("health_checked_at"))
     return moment is not None and read is not None and read >= moment
 
@@ -153,6 +158,9 @@ def decide(record: dict, now: datetime, recheck: post_merge_scope.Recheck,
     window = HEALTH_WINDOW.get(record["kind"] or "", max(HEALTH_WINDOW.values()))
     stalled = (_since(record["applied_at"], now) or timedelta(0)) > window + CHECK_DEADLINE
     if record["health_result"] is None:
+        if str(record["health_detail"] or "").startswith(post_merge_check.SAMPLED):
+            # The last reading was healthy (a first sample after a gap in the runs): the window goes on.
+            return None
         applied = _parse_time(record["applied_at"])
         if stalled and _read_since(record, applied and applied + window + CHECK_DEADLINE):
             return APPLIED_NOT_RECHECKED, (f"{UNREADABLE}: the workload could not be read after the apply: "

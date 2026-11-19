@@ -597,9 +597,20 @@ def _healthy_samples(detail: object) -> int:
 HEALTHY, UNSETTLED, RED = "healthy", "unsettled", "red"
 
 
+#: ``health_baseline`` keys with this prefix hold the restart counts of a pod that was not Ready at the
+#: apply: its restarts from before the apply are not counted, but it is not a known pod, so it may still
+#: be starting (NotReady) without failing the window.
+STARTING_PREFIX = "~"
+
+
 def _known_pods(baseline: dict[str, int]) -> set[str]:
-    """The pods the baseline holds: there at the apply, or seen Ready on a later reading."""
-    return {key.split("/", 1)[0] for key in baseline}
+    """The pods the baseline holds as Ready: there at the apply, or seen Ready on a later reading."""
+    return {key.split("/", 1)[0] for key in baseline if not key.startswith(STARTING_PREFIX)}
+
+
+def _restarts_before(baseline: dict[str, int], key: str) -> int:
+    """A container's restart count at the apply (or when it joined), whether its pod was Ready then or not."""
+    return max(baseline.get(key, 0), baseline.get(STARTING_PREFIX + key, 0))
 
 
 def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: datetime) -> tuple[str, str]:
@@ -621,7 +632,7 @@ def assess_health(workload: dict, pods: dict, baseline: dict[str, int], since: d
             return RED, f"pod {name} is not Ready"
         for container in _container_statuses(pod):
             key = f"{meta.get('uid') or name}/{container.get('name')}"
-            if int(container.get("restartCount") or 0) > baseline.get(key, 0):
+            if int(container.get("restartCount") or 0) > _restarts_before(baseline, key):
                 return RED, f"container {container.get('name')} in pod {name} restarted"
             for current, state in ((False, container.get("lastState") or {}), (True, container.get("state") or {})):
                 ended = state.get("terminated") or {}
@@ -868,10 +879,15 @@ def watch_health(
                 updates["sync_state"] = f"{state}: {detail}"[:500]
                 if applied:
                     updates["applied_at"] = stamp
-                    # Ready pods only, as _join_baseline adds later ones: a pod still starting at the apply
-                    # (a scale-up, a drain) is waited for rather than judged NotReady on the next reading.
-                    ready = [pod for pod in _owned_pods(workload, pods) if _is_ready(pod)]
-                    updates["health_baseline"] = json.dumps(restart_baseline({"items": ready}), sort_keys=True)
+                    # Ready pods as known pods, as _join_baseline adds later ones: a pod still starting at the
+                    # apply (a scale-up, a drain) is waited for rather than judged NotReady on the next reading.
+                    # Its restart counts are kept too, under STARTING_PREFIX, so a restart from before the
+                    # apply never reads as one after it.
+                    owned = _owned_pods(workload, pods)
+                    baseline = restart_baseline({"items": [pod for pod in owned if _is_ready(pod)]})
+                    starting = restart_baseline({"items": [pod for pod in owned if not _is_ready(pod)]})
+                    baseline.update({STARTING_PREFIX + key: count for key, count in starting.items()})
+                    updates["health_baseline"] = json.dumps(baseline, sort_keys=True)
                     bucket = "applied"
                 else:
                     bucket = "waiting"
@@ -980,10 +996,10 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
          **tick_overrides) -> int:
     """With no arguments, the ``post-merge-check`` cron job: one ``post_merge_outcome.tick``, printing
     nothing to stdout. The summary goes to ``logs/post_merge_check.log``. A run in which any record or
-    step errored exits 1 with one line naming them on stderr, kept in the run's saved output, and the
-    scheduler posts its failure line to chat; a failure already reported in the last day
-    (``post_merge_outcome.failures_to_report``) does not exit 1 again. A clean run exits 0 and the
-    scheduler relays nothing. ``notice``, ``health`` and ``report``
+    step errored prints one line on stdout naming them, which chat posts, and still exits 0, since the
+    scheduler's own line for a non-zero exit says the check did not run; a failure already reported in
+    the last day (``post_merge_outcome.failures_to_report``) is not said again. A clean run prints
+    nothing and the scheduler relays nothing. A run that cannot start (an unreadable database) raises. ``notice``, ``health`` and ``report``
     run one step by hand (``report`` in the switch's mode, through ``post_merge_report``) and print
     what it saw as JSON.
 
@@ -1037,9 +1053,11 @@ def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: K
             failures = post_merge_outcome.failures_to_report(post_merge_outcome.errored(seen),
                                                              datetime.now(timezone.utc))
             if failures:
-                print(f"post-merge check ({mode}): {len(failures)} failed: {', '.join(failures)[:1500]}; "
-                      f"the run's summary is in logs/{LOG_FILE}", file=sys.stderr)
-                return 1
+                # One line on stdout, which chat posts, and exit 0: a non-zero exit makes the scheduler post
+                # that the check "didn't run" and will retry, where it did run and did the other records.
+                print(f"The post-merge check ran, but {len(failures)} record(s) or step(s) failed: "
+                      f"{', '.join(failures)[:1500]}. Details are in logs/{LOG_FILE} on the agent; "
+                      "each is said once a day while it keeps failing.")
     return 0
 
 

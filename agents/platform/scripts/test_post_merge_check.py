@@ -271,6 +271,24 @@ class WatchHealthTest(unittest.TestCase):
         self.assertIsNone(row["applied_at"])
         self.assertTrue(row["sync_state"].startswith("pending"), row["sync_state"])
 
+    def test_a_restart_from_before_the_apply_on_a_pod_still_starting_is_not_a_restart(self):
+        # checkout-2 has one old restart and is not Ready at the apply reading; later all three are Ready
+        # and no count has moved: the window passes, it does not fail on the old restart.
+        self.cluster.apps = [argo_app()]
+        starting = pods(restarts=(0, 0, 1))
+        starting["items"][2]["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+        self.cluster.pod_list = starting
+        self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
+        baseline = json.loads(self.row()["health_baseline"])
+        self.assertEqual(baseline, {"u0/web": 0, "u1/web": 0, "~u2/web": 1})
+        self.cluster.pod_list = pods(restarts=(0, 0, 1))
+        self.tick(4)
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+        # A restart after the apply on that pod still fails it.
+        self.conn.execute("UPDATE post_merge_records SET health_result = NULL, health_detail = NULL")
+        self.cluster.pod_list = pods(restarts=(0, 0, 2))
+        self.assertEqual(self.tick(8)["failed"], [f"{REPO}/pull/1"])
+
     def test_applied_records_the_baseline_then_passes_after_the_window(self):
         self.cluster.apps = [argo_app()]
         self.cluster.pod_list = pods(restarts=(2, 0, 0))

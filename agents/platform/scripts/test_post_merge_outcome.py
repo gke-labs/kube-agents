@@ -67,6 +67,22 @@ class DecideTest(unittest.TestCase):
         applied["health_checked_at"] = (NOW + timedelta(minutes=66)).isoformat()
         self.assertEqual(self.decide(200, applied)[0], post_merge_outcome.APPLIED_NOT_RECHECKED)
 
+    def test_a_healthy_first_sample_after_a_gap_is_never_called_unread(self):
+        late = (NOW + timedelta(minutes=70)).isoformat()
+        sampled = record(applied_at=NOW.isoformat(), health_checked_at=late,
+                         health_detail=f"{post_merge_check.SAMPLED}1, last {late}")
+        self.assertIsNone(self.decide(70, sampled))
+        unread = dict(sampled, health_detail="unreadable: connection refused")
+        self.assertEqual(self.decide(70, unread)[0], post_merge_outcome.APPLIED_NOT_RECHECKED)
+
+    def test_a_scope_stamp_is_not_a_reading(self):
+        stamped = (NOW + timedelta(minutes=90)).isoformat()
+        for state in ("scope unknown: p could not be read", "out of scope: p/l/prod is excluded"):
+            with self.subTest(state=state):
+                self.assertIsNone(self.decide(90, record(sync_state=state, health_checked_at=stamped)))
+        read = record(sync_state="pending: OutOfSync", health_checked_at=stamped)
+        self.assertEqual(self.decide(90, read)[0], post_merge_outcome.NOT_APPLIED)
+
     def test_a_merge_with_no_merge_commit_ends_unreadable_not_unapplied(self):
         self.assertIsNone(self.decide(30, record(merge_commit=None)))
         outcome, detail = self.decide(61, record(merge_commit=None))
@@ -390,13 +406,15 @@ class CronRunTest(unittest.TestCase):
         self.assertEqual((code, out, err), (0, "", ""))
         self.assertIn("post-merge check (silent)", log.call_args[0][1][0])
 
-    def test_a_run_with_errors_exits_one_with_a_line_for_chat(self):
+    def test_a_run_with_errors_says_so_in_one_chat_line_and_exits_zero(self):
         with mock.patch.object(post_merge_scope, "install_scope", side_effect=RuntimeError("render unreadable")), \
                 self.assertLogs("post_merge_check", level="WARNING"):
             code, out, err, _ = self.run_main("report")
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn("failed", err)
-        self.assertIn("logs/post_merge_check.log", err)
+        # Exit 0: a non-zero exit makes the scheduler say the check "didn't run", and it did.
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
+        self.assertTrue(out.startswith("The post-merge check ran, but 1 record(s) or step(s) failed"), out)
+        self.assertIn("logs/post_merge_check.log", out)
 
 
 class FailuresToReportTest(unittest.TestCase):
