@@ -107,6 +107,16 @@ The record is an annotation the operator writes before the delete, with its own 
 StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
 its one restart stays named in the condition, for a person.
 
+**Amended 11/18 (#6273): a fresh bus that agrees no meta leader at all is restarted whole, once.**
+Once in a nightly, one server campaigned alone and its peers' votes never reached it, so no leader was
+ever agreed, and there was no single stray to restart. After the same 3 minutes, every server is
+restarted once, under the same guards: the bus hasn't been provisioned, no server holds a stream or
+consumer, every server's meta node has started, and the record names none of them yet. The record is
+written first, with every server, so a pass that dies part-way, or an operator restarted mid-way,
+never tries again: a partial restart counts as the one attempt. An `A2ABusMetaGroupRestarted`
+Warning names the servers. A bus still without a leader after that keeps the condition, which says
+every server was restarted once and leaves it for a person.
+
 If a server isn't running while the others are (its pod absent, being deleted, or not Running,
 as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
 is restarted on that account. If a running server's view can't be read, or no server is
