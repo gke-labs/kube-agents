@@ -951,14 +951,16 @@ func TestPlatformAgentReconciler_Reconcile_GchatHomeChannelRecordDrivesTheProjec
 	}
 }
 
-// The values the Google Chat learn keeps in step by hand across four places
-// that cannot import one another: the bound on a recorded space name (gateway
-// and operator) and the projected file's key (gateway, operator, and the
-// agent's two readers). Each file is read as text for its one declaration.
+// The values the Google Chat learn keeps in step by hand across places that
+// cannot import one another: the bound on a recorded space name (gateway and
+// operator) and the projected file's key (gateway, operator, and the agent's
+// chat_notify.py). Each file is read as text for its one declaration. The
+// agent's second reader, the kanban patch, is held to chat_notify.py by its own
+// test (deploy/docker/patches/test_kanban_chat_notify.py), so it is not read
+// here.
 const (
 	gatewayGchatHomeSource  = "../../../a2a/gateway/gchat_home_channel.go"
 	agentChatNotifySource   = "../../../agents/platform/scripts/chat_notify.py"
-	kanbanChatNotifySource  = "../../../deploy/docker/patches/kanban_chat_notify.py"
 	gatewaySpaceMaxPattern  = `(?m)^\tgchatHomeSpaceMax\s+=\s+(\d+)$`
 	gatewayGchatKeyPattern  = `(?m)^\tgchatHomeFileKey\s+=\s+"([^"]+)"$`
 	gatewaySlackKeyPattern  = `(?m)^\thomeFileKey\s+=\s+"([^"]+)"$`
@@ -991,8 +993,6 @@ func TestGchatHomeChannelValuesMatchTheGatewayAndTheAgent(t *testing.T) {
 		{gatewayHomeChannelSource, gatewaySlackKeyPattern, homeChannelProjectionKey},
 		{agentChatNotifySource, pythonGchatKeyPattern, homeChannelProjectionGchatKey},
 		{agentChatNotifySource, pythonSlackKeyPattern, homeChannelProjectionKey},
-		{kanbanChatNotifySource, pythonGchatKeyPattern, homeChannelProjectionGchatKey},
-		{kanbanChatNotifySource, pythonSlackKeyPattern, homeChannelProjectionKey},
 	} {
 		if got := declared(tc.path, tc.pattern); got != tc.want {
 			t.Errorf("%s reads the projected file %q, the operator writes %q", tc.path, got, tc.want)

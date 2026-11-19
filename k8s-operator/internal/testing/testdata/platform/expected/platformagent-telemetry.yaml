@@ -5665,6 +5665,7 @@ metadata:
 ---
 apiVersion: v1
 data:
+  gchat_home: ""
   slack_home: ""
 kind: ConfigMap
 metadata:
