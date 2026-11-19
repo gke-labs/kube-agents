@@ -409,16 +409,19 @@ memory:
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
 # to audit this privileged specialist's tool calls. pr_opened claims each pull
-# request record line through the broker, strips its claim token, counts the
-# claimed pull request in the proposals ledger by origin, and links
-# `docs(knowledge):` proposals to Curator via `curator emit` when `NATS_URL` is
-# set; in a kanban worker it also records the pull request on the card, which is
-# what posts the thread's PR message. The Cluster Agent and TSE profiles enable
-# it too. It also refuses submit_suggestion.py from a worker whose run on its
-# card has ended (plugins/pr_opened/__init__.py).
+# request record line through the broker, strips its claim token and counts the
+# claimed pull request in the proposals ledger by origin; in a kanban worker it
+# also records the pull request on the card, which is what posts the thread's PR
+# message. The Cluster Agent and TSE profiles enable it too. It also refuses
+# submit_suggestion.py from a worker whose run on its card has ended
+# (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
     - pr_opened
+    # Off unless KUBEAGENTS_EVAL_RUN_TAGS is on (eval installs only): then it adds
+    # the eval run, case and repetition to each model request's headers for the
+    # replay proxy's log (plugins/eval_run_tag/__init__.py). Off, it registers nothing.
+    - eval_run_tag

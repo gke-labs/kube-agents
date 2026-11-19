@@ -320,8 +320,8 @@ Every request is classified as either a **resource request** (`info.IsResourceRe
 **Dry-run query enforcement**:
 When `Mode == ModeReadOnlyWithDryRun` and `info.Verb` is `create`, `update`, or `patch`:
 
-- The proxy checks `req.URL.Query()["dryRun"]`.
-- It admits the request only if `len(values) == 1 && values[0] == "All"`, and it explicitly sets `q.Set("dryRun", "All")` on the outbound query string so no duplicate parameter can override it.
+- The proxy parses the raw query with `url.ParseQuery` (`HasStrictDryRunAll`) and refuses a query that does not parse or that contains `;`.
+- It admits the request only when `dryRun` has exactly one value and that value is `All`. It does not rewrite the outbound query: the query that passed the check is the query that `kube-apiserver` receives.
 
 **Native Kubernetes refusal responses**:
 When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body:
@@ -364,7 +364,7 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
 - `Connection` and `Upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled and `Upgrade` is non-empty, in which case `Connection: Upgrade` is set)
 
-It also appends `kproxy/<caller-username>` to the outbound `User-Agent` header so `kube-apiserver` audit logs record the originating sandbox identity alongside `kubectl`'s own `User-Agent`.
+Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
 
 For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering.
 
@@ -402,7 +402,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - Validates `<project>`, `<location>`, and `<cluster>` against `^[a-z0-9][a-z0-9-]*\z`.
    - Calls `GET https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}` using the proxy pod's `GCPTokenSource` (Workload Identity Federation via `CREDENTIAL_PROXY_WIF_AUDIENCE`, `CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT`, and `CREDENTIAL_PROXY_WIF_TOKEN_FILE`, or the GCE metadata server).
    - Dials `https://<endpoint>` verified against the cluster's `masterAuth.clusterCaCertificate` root CA.
-   - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 5-minute TTL and automatic invalidation on connection failure.
+   - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 10-minute TTL and automatic invalidation on connection failure.
    - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request and refuses `3xx` upstream redirects (`502 Bad Gateway`) so the bearer token is never followed to a redirect target.
    - When `spec.security.scopedServiceAccountPool.enabled` (`CREDENTIAL_PROXY_SCOPED_SA_POOL=1`) is armed, `kube-proxy` loads `/etc/credential-proxy/scoped-sa-pool.json`, constructs a per-project `upstream.Transport` that exchanges the base credential for that project's scoped service account token via `iamcredentials.googleapis.com`, and refuses any cluster whose project has no entry in the pool without falling back to the ambient credential.
 
@@ -427,7 +427,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - For every Kubernetes API request, `kube-proxy` extracts incoming W3C `traceparent`/`tracestate` headers before header sanitization, starts a server span (`k8s.api.proxy <verb> <resource>`), records structured attributes (`k8s.cluster.id`, `k8s.verb`, `k8s.resource`, `k8s.subresource`, `k8s.namespace`, `k8s.dry_run`, `kube_proxy.mode`, `kube_proxy.outcome`, `kube_proxy.rejection_reason`, `kube_proxy.secret_redacted`, `http.response.status_code`), and wraps the upstream round trip in a child client span (`k8s.api.upstream`).
 3. **Pluggable audit sink and structured JSON audit logging (`pkg/k8sapiproxy/audit.go`)**:
    - `pkg/k8sapiproxy` defines the `AuditSink` interface (`Record(ctx context.Context, event AuditEvent)`), `AuditSinkFunc`, and `NewSlogAuditSink(logger)` so OSS deployments and hosted services can route typed `AuditEvent` records to different backends.
-   - By default (`NewSlogAuditSink(logger)`), `kube-proxy` emits a structured audit record (`msg: "k8s-api-proxy audit"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `outcome`, `cluster_id`, `caller`, `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `reason`, `status_code`, `duration`, `user_agent`, `err`, and `cache` (the response cache's result when it handled the request; `hit` and `coalesced` never reached the cluster).
+   - By default (`NewSlogAuditSink(logger)`), `kube-proxy` emits a structured audit record (`msg: "k8s-api-proxy request"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `outcome`, `cluster`, `caller_username` (with `caller_uid` and `caller_groups`), `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `rejection_reason`, `status_code`, `duration_ms`, `user_agent`, `error`, and `cache` (the response cache's result when it handled the request; `hit` and `coalesced` never reached the cluster).
    - Request and response bodies and authentication credentials are never written to the audit log.
 
 ### 11. Deployment topology in `kube-agents`

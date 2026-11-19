@@ -1507,6 +1507,10 @@ spec:
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
+              value: kubeagents-credential-proxy-a2a-reports
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1971,6 +1975,8 @@ spec:
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -2335,6 +2341,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -2610,6 +2618,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: NATS_URL
@@ -3853,7 +3863,7 @@ spec:
             - name: A2A_RESERVED_PRINCIPALS
               value: callout,gateway,bridge,seed,web,console,console-mcp,sys
             - name: A2A_RESERVED_ADDRESSEES
-              value: platform
+              value: platform,session
             - name: A2A_TASK_SIGNING_PUBLIC_KEYS
               value: <GENERATED_FOR_TESTS>
             - name: A2A_ISSUER_SEED

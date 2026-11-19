@@ -30,10 +30,7 @@ knows (``target``, set by the fleet audit for a one-workload ``no-pdb`` fix) is 
 ``POST /v1/post-merge/records`` with the thread its card reports to
 (:func:`write_post_merge_record`). The gateway's notifier claims the event kind and, with
 ``KAGE_SLACK_UX`` on, posts the PR as its own message in the thread the card
-reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``). When ``NATS_URL``
-is set and a claimed proposal records an OKF decision or lesson (``docs(knowledge): ... DEC-...``
-or ``LES-...``), it also notifies Curator on a bounded best-effort call so the proposal URL links
-immediately without waiting for the next watcher sweep.
+reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``).
 
 At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are claimed,
 and none once :data:`CLAIMS_BUDGET_SECONDS` have passed since the hook began on
@@ -84,25 +81,11 @@ import json
 import logging
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 import urllib.request
 
 logger = logging.getLogger(__name__)
-
-#: OKF knowledge-record proposal title pattern (`docs(knowledge): ... DEC-...` / `LES-...`).
-#: Scoped to knowledge-record proposals so ordinary workload PRs citing `per DEC-...` in
-#: their title never overwrite an active record's `evidence.pull_request`.
-KNOWLEDGE_PR_TITLE_RE = re.compile(
-    r"^\s*docs\([a-z0-9_-]*knowledge[a-z0-9_-]*\)\s*:.*?((?:DEC|LES)-\d{4}-\d{3,})\b",
-    re.IGNORECASE,
-)
-DEFAULT_CURATOR_BIN = "/usr/local/bin/curator"
-CURATOR_LINK_TIMEOUT_SECONDS = 1.0
-CURATOR_MIN_BUDGET_SECONDS = 0.1
-CURATOR_RESERVE_BUFFER_SECONDS = 2.5
 
 #: ``vcs_client.PROPOSAL_OPENED_KEY`` / ``_EVENT`` / ``_FIELDS``, held here because a
 #: plugin is loaded by file path and the sandbox's client is not on its import
@@ -557,46 +540,6 @@ def record(task_id, proposal):
         kb._append_event(conn, task_id, PR_OPENED_KIND, proposal, run_id=kb._current_run_id(conn, task_id))
 
 
-def _notify_curator_pr_opened(confirmed, repo=None, deadline=None):
-    """Best-effort: when a claimed knowledge-record PR names an OKF ID, attach its PR URL in Curator."""
-    if not os.environ.get("NATS_URL", "").strip():
-        return
-    title = str(confirmed.get("title") or "")
-    match = KNOWLEDGE_PR_TITLE_RE.search(title)
-    if match is None:
-        return
-    timeout_s = CURATOR_LINK_TIMEOUT_SECONDS
-    if deadline is not None:
-        timeout_s = min(timeout_s, deadline - time.monotonic())
-        if timeout_s <= CURATOR_MIN_BUDGET_SECONDS:
-            return
-    rec_id = match.group(1).upper()
-    curator_bin = os.environ.get("CURATOR_BIN", "").strip()
-    if not curator_bin:
-        if os.path.isfile(DEFAULT_CURATOR_BIN) and os.access(DEFAULT_CURATOR_BIN, os.X_OK):
-            curator_bin = DEFAULT_CURATOR_BIN
-        else:
-            curator_bin = shutil.which("curator") or ""
-    if not curator_bin:
-        return
-    url = str(confirmed.get("url") or "")
-    pr_ref = f"{url} (#{confirmed.get('number')})" if confirmed.get("number") else url
-    cmd = [curator_bin, "emit", "--kind", "proposed", "--id", rec_id, "--pr", pr_ref]
-    resolved_repo = str(repo or confirmed.get("repo") or "").strip()
-    if resolved_repo and REPO_ARGV_SAFE.match(resolved_repo):
-        cmd.extend(["--repo", resolved_repo])
-    try:
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except Exception as exc:  # noqa: BLE001 — best-effort link; sweep_memory_proposals reconciles missed links
-        logger.debug("pr_opened: curator link for %s failed: %s", rec_id, exc)
-
-
 def _recorded(task_id, proposal):
     """Record the claimed ``proposal`` on card ``task_id``; True when written, False (logged) when not."""
     try:
@@ -667,11 +610,6 @@ def _claim_output(output):
                     write_post_merge_record(confirmed, proposal.get("target"), origin, task_id)
                 elif proposal.get("target"):
                     logger.warning("pr_opened: no time left to record %s for the post-merge check", confirmed["url"])
-                _notify_curator_pr_opened(
-                    confirmed,
-                    repo=claim_repository(proposal),
-                    deadline=began + HOOK_CALLBACK_SECONDS - CURATOR_RESERVE_BUFFER_SECONDS,
-                )
                 if task_id and _recorded(task_id, confirmed):
                     removed.add(proposal["url"])
                     changed = True

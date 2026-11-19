@@ -53,10 +53,10 @@ from kube_agents_bench.evidence_store import _key_segments
 from test_evidence_store import FakeGcloud
 
 BASELINES = Path(__file__).resolve().parents[1] / "baselines"
-JUDGE = "gemini-3.1-pro-preview"
+JUDGE = "model-x"
 
 KEY = {
-    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "setup_id": "setup-x",
     "scoring_version": "v1",
     "judge_model": JUDGE,
     "fleet": 1,

@@ -359,6 +359,24 @@ one), this server for a watcher session on its first inject (`drift` or `event`)
 session with no `origin` resolves as `other`. `GET /v1/sessions/{id}/origin` follows compression
 parents, so a rotated session id keeps its parent's origin.
 
+#### `session_eval_runs`
+
+```sql
+CREATE TABLE session_eval_runs(     -- PUT/GET /v1/sessions/{id}/eval-run
+  session_id TEXT PRIMARY KEY,
+  eval_run TEXT NOT NULL,           -- <run>/<case>/<rep>
+  recorded_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The eval run, case and repetition an API turn's session belongs to, as the harness sent it in
+`X-Kube-Agents-Eval-Run`. The API server writes it only while the install has
+`KUBEAGENTS_EVAL_RUN_TAGS` on (`deploy/docker/patches/eval_run_tag.py`). The first write wins:
+`PUT` answers the tag the session keeps. `GET` follows compression parents, as the origin route
+does, and answers 404 when the session has none. The table is created on the first write and
+`session_metadata` is not touched. The tag of each card is in `kanban.db`, in the side table
+`kanban_task_eval_runs` beside `kanban_task_origins`.
+
 #### Work-origin tables
 
 Three tables hold the origin of work that is not a session. `cleanup_old_records` leaves the first
@@ -409,7 +427,7 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   health_at TEXT, health_checked_at TEXT,
   human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT,
   outcome_detail TEXT, reported_at TEXT, followup_state TEXT, followup_attempts INTEGER,
-  followup_detail TEXT
+  followup_detail TEXT, changed_paths TEXT
 );
 ```
 
@@ -437,9 +455,17 @@ schedules the step yet. A merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
 `post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
-recently read first by `health_checked_at`. For a merged record with a `merge_commit` and a cluster it
+recently read first by `health_checked_at`. A record whose cluster the install's declared scope leaves out, by the fleet audit's own rule
+(`post_merge_scope.py`), or whose scope cannot be judged, is not read: `sync_state` says why
+(`out of scope: ...` or `scope unknown: ...`), and it takes no place in the per-run cap. A scope
+that cannot be read at all stops the run before any cluster is read, with a non-zero exit. For a merged record with a `merge_commit` and a cluster it
 can name, it reads the Argo CD Applications, Flux Kustomizations and Config Sync RepoSyncs on that
-cluster that deliver the repository into the record's namespace, asking the broker
+cluster that deliver the repository into the record's namespace, and the git-sourced RootSyncs of the repository
+whose `spec.git.dir` holds a file the pull request changed that names the record's workload, so a
+RootSync delivering another file of the same pull request never counts (read from its diff only when a RootSync
+or more than one namespace match could change the answer, and kept in `changed_paths` once read; a
+path narrows the namespace matches and never empties them, and a diff it cannot read whole, or one with
+no file naming the workload, is said as `the workload's files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
@@ -623,7 +649,7 @@ their record. `TRIAGE_QUEUED`, `TRIAGE_DEQUEUED` and
 `TRIAGE_STARTED` log lines mark the other steps. A restart loses the queued starts, and their rows
 stay `pending`.
 
-For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db`, `kanban.db`, and the Hermes session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`) with `?mode=ro`, scrubbing worker step text through `AuditRedactor` and the shared supplement rules in `agents/platform/scripts/worker_transcript.py` (the same module the bench's trajectory read loads in the pod) before returning it. A `tool_result` whose call read a secret is withheld rather than scrubbed, and the detector fails closed: it reads each simple command of the line on its own and each quoted script (`sh -c '…'`) as a line of its own, serves a `kubectl get` whose resources are other kinds by name, serves one of secrets only when the command is provably the bare list (names, types and ages; no output flag in any spelling, no variable, no substitution), withholds one whose resource it cannot tell (from a file, stdin or a variable), and serves a secret store's command only when its subcommand is one of the store's named lists, so an output form nobody enumerated withholds the result. It also withholds a command that prints the caller's own token (a `gcloud auth` subcommand other than the ones named as printing none, and `gcloud config config-helper`) or the environment (`env` with no command behind it, a bare `printenv`, `export`, `declare` or `set`, a `printenv` or `declare -p` of a credential-shaped name, a read of `/proc/<pid>/environ`), another tool's token printer (`gh auth token`, `az account get-access-token`, `aws sts get-session-token`, `kubectl create token`, `oc create token`), or the whole environment from inline code of another language (`python3 -c '…os.environ…'`, `node -e '…process.env…'`). Such a word counts where it is the command: on its own, behind a prefix word (`sudo`, `timeout`), as a shell's `-c` script, in a substitution, or as the command a `kubectl exec`, `docker run` or `ssh` runs. The same word as an argument of another command (`kubectl get pods -n env`), or in a one-line quoted argument that no word on the command runs as a script (`git commit -m "…"`), is served.
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db`, `kanban.db`, and the Hermes session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`) with `?mode=ro`, scrubbing worker step text through `AuditRedactor` and the shared supplement rules in `agents/platform/scripts/worker_transcript.py` (the same module the bench's trajectory read loads in the pod) before returning it. A `tool_result` whose call read a secret is withheld rather than scrubbed, and the detector fails closed: it reads each simple command of the line on its own and each quoted script (`sh -c '…'`) as a line of its own, serves a `kubectl get` whose resources are other kinds by name, serves one of secrets only when the command is provably the bare list (names, types and ages; no output flag in any spelling, no variable, no substitution), withholds one whose resource it cannot tell (from a file, stdin or a variable), and serves a secret store's command only when its subcommand is one of the store's named lists, so an output form nobody enumerated withholds the result. It also withholds a command that prints the caller's own token (a `gcloud auth` subcommand other than the ones named as printing none, and `gcloud config config-helper`) or the environment (`env` with no command behind it, a bare `printenv`, `export`, `declare` or `set`, a `printenv` or `declare -p` of a credential-shaped name, a read of `/proc/<pid>/environ`), another tool's token printer (`gh auth token`, `az account get-access-token`, `aws sts get-session-token`, `kubectl create token`, `oc create token`), or the whole environment from inline code of another language (`python3 -c '…os.environ…'`, `node -e '…process.env…'`). Such a word counts where it is the command: on its own, behind a prefix word (`sudo`, `timeout`), as a shell's `-c` script, in a substitution, or as the command a `kubectl exec`, `docker run` or `ssh` runs. A command word beside a substitution counts too, because the substitution can print nothing (`env$(true)`). The line is read two times, by the rule's own marks and by the bench's shell reader (`bench/kube_agents_bench/shell_words.py`, which the image carries beside the module), and the result is withheld when either read finds such a command. The same word as an argument of another command (`kubectl get pods -n env`), or in a one-line quoted argument that no word on the command runs as a script (`git commit -m "…"`), is served.
 
 Two routes write to `kanban.db`, and the drift backlog writes one more table there directly: when it files a card, it stamps the card's origin as `drift` in `kanban_task_origins` (`_stamp_board_task_origin`), and the first stamp wins. The first route also signals processes: `POST /v1/sessions/{session_id}/cards/stop`. The hermes-bridge calls it when a gateway conversation's `stop` reaches its cards, with the conversation's context id. The route refuses any session but the `a2a-*` one that context id names; that is a consistency check on what the bridge sends, not an authorization. It archives every open card in the conversation through Hermes' own `archive_task`: the cards filed under the session or its compression continuations (not its branches or delegates), every card those cards fanned out, to any depth and whatever session the child carries, and a session-less card subscribed to that session and thread. It kills each running card's worker, and the processes in the worker's group that carry its `HERMES_KANBAN_TASK`, and no others; a command an ssh client already sent to the shell sandbox runs on. Stop doesn't touch cards from other conversations, crons or alerts that depend on this thread's cards: a `task_links` child filed under another session is left alone even though Hermes copies our thread's subscription onto it, and it is promoted once our card is archived, as it would have been when our card finished. The answer names what was stopped, and what it could not finish in time, within 24 seconds (`CARD_STOP_WORST_CASE_S`: a 20-second deadline plus one 3-second busy wait plus a second of slack); an archive still running at the deadline is reported `pending` and finishes on its own. Every holder of `SESSION_KV_API_KEY` can call it for any `a2a-*` session, so anything in the pod that can record a conversation's route can also stop that conversation's cards; the agent itself could already archive cards.
 
