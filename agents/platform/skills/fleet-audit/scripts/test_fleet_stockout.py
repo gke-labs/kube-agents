@@ -828,6 +828,17 @@ class DanglingComputeClassTest(unittest.TestCase):
         self.assertIsNone(fs.check_compute_class_status(compute_class("cc1", [{"machineFamily": "n4"}])))
         self.assertIsNone(fs.check_compute_class_status({**compute_class("cc1", []), "status": {"conditions": ["junk", None]}}))
 
+    def test_the_class_captured_from_the_fleet_is_a_hit_marked_for_triage(self):
+        """The stored capture is the live read of the fleet's class: the shape
+        the predicate is written against, not a shape typed from memory."""
+        capture = Path(__file__).resolve().parent / "testdata" / "computeclass_taint_missing.json"
+        hit = fs.check_compute_class_status(json.loads(capture.read_text(encoding="utf-8")))
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertIn("status condition NodepoolMisconfigured is True (TaintMissing)", hit["excerpt"])
+        self.assertIn("status condition Health is False (Health)", hit["excerpt"])
+        self.assertEqual(hit["needs_triage"], fs.CLASS_STATUS_TRIAGE)
+        self.assertIn(fs.CLASS_STATUS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
     def test_a_long_condition_message_is_clipped(self):
         long_message = ("NodepoolMisconfigured", "True", "TaintMissing", "x" * 1000)
         excerpt = fs.check_compute_class_status(self.class_with_status(long_message))["excerpt"]
@@ -842,6 +853,7 @@ class DanglingComputeClassTest(unittest.TestCase):
                 self.assertEqual([c["object"] for c in hits], ["ComputeClass/general-ccc"])
                 self.assertEqual(hits[0]["severity"], "critical")
                 self.assertIn("kubectl get", hits[0]["command"])
+                self.assertEqual(hits[0]["needs_triage"], fs.CLASS_STATUS_TRIAGE)
 
     def test_the_collector_tells_the_check_the_cluster_mode(self):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "Balanced"})

@@ -148,6 +148,11 @@ AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
 # string has to match the one that file names, and the two files carry it
 # separately because neither imports the other.
 NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
+# The `needs_triage` marker on a §3.12(b) finding. Its fix changes a node pool or a
+# class (for `TaintMissing`, a `NoSchedule` taint on a pool), and the collector reads
+# nothing about the other Pods on that pool, so the automatic sweep leaves it to
+# `/remediate`. The string matches `TRIAGE_REASONS` in audit_report.py.
+CLASS_STATUS_TRIAGE = "class-status"
 
 # §3.1: the zone span credited to an Autopilot cluster, which has no node
 # pools to read and places nodes across its region's zones. Any value above
@@ -1269,7 +1274,11 @@ def check_compute_class_status(cc: dict) -> dict | None:
             reported.append(CCC_CONDITION_EXCERPT.format(type=kind, state=state, reason=condition.get("reason") or "", message=message))
     if not reported:
         return None
-    return {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": CCC_CONDITION_JOINER.join(reported)}
+    return {
+        "object": f"ComputeClass/{cc['metadata']['name']}",
+        "excerpt": CCC_CONDITION_JOINER.join(reported),
+        "needs_triage": CLASS_STATUS_TRIAGE,
+    }
 
 
 def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[str, dict], node_pool_labels: set[str] | None, *, autopilot: bool = False) -> dict | None:

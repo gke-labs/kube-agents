@@ -7,6 +7,7 @@ would leave the case red on a product that still files the finding. This test
 joins the two.
 """
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -17,22 +18,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CASE_FILE = REPO_ROOT / "bench" / "tasks" / "ccc-untainted-node-pool-absorption" / "task.yaml"
 EVIDENCE_CHECK = "the-finding-carries-the-collectors-evidence"
 CLASS_CHECK = "ledger-files-the-misconfigured-class"
-# The fleet's class as GKE reports it: a node pool with the class label and no class taint.
-PLANTED_CLASS = {
-    "kind": "ComputeClass",
-    "metadata": {"name": "general-ccc"},
-    "status": {
-        "conditions": [
-            {
-                "type": "NodepoolMisconfigured",
-                "status": "True",
-                "reason": "TaintMissing",
-                "message": "Crd taint is missing for the nodepool default-pool.",
-            },
-            {"type": "Health", "status": "False", "reason": "Health", "message": "Crd is not healthy."},
-        ]
-    },
-}
+# The fleet's class as GKE reports it, captured live: a node pool with the class label
+# and no class taint.
+CAPTURE_FILE = (
+    REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "testdata" / "computeclass_taint_missing.json"
+)
+PLANTED_CLASS = json.loads(CAPTURE_FILE.read_text(encoding="utf-8"))
 
 sys.path.insert(0, str(REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts"))
 

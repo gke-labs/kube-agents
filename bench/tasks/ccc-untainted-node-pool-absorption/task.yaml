@@ -67,7 +67,9 @@ verification_spec:
       required_phrases: ["ComputeClass/general-ccc"]
   # The finding must come from the collector, not from a step a worker may
   # skip. `finish` takes a collector candidate's evidence from the manifest,
-  # so the ledger body carries the collector's excerpt word for word; a
+  # so the ledger body carries the collector's excerpt word for word while
+  # the finding renders in full (a row under "Listed without detail", on a
+  # ledger over its size budget, carries no evidence); a
   # finding a worker writes by hand from the same status quotes the YAML and
   # does not carry this sentence. A body phrase, because the finding scope
   # reads the object alone.
