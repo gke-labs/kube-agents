@@ -140,6 +140,9 @@ readonly SIZING_FLEET_STORAGE_SIZE_RECOMMENDATION="100Gi"
 readonly SIZING_FLEET_STORAGE_RECOMMENDATION_MI=102400
 readonly SIZING_AGENT_BASE_STORAGE_MI=8192
 readonly SIZING_AGENT_PER_PROFILE_MI=400
+readonly SIZING_SCAN_GCLOUD_CLUSTER_COLUMNS=3
+readonly SIZING_SCAN_LOC_REGEX='^[a-z]+-[a-z0-9-]+$'
+readonly SIZING_SCAN_ASSET_NAME_REGEX='^//container\.googleapis\.com/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/]+)$'
 # A GSA account id is 6-30 characters. A cluster name too long for
 # "<cluster>-minter" keeps this many of its characters, plus this many hex
 # characters of its hash (minter_derived_names).
@@ -4463,6 +4466,9 @@ has_cr_json = sys.argv[4] == "true"
 probe_ok = sys.argv[5] == "1"
 host_project_id, host_project_number = sys.argv[6], sys.argv[7]
 excl_projects_raw, excl_clusters_raw = sys.argv[8], sys.argv[9]
+gcloud_cluster_col_count = int(sys.argv[10])
+loc_re = re.compile(sys.argv[11])
+asset_re = re.compile(sys.argv[12])
 
 def csv_tokens(raw):
     return [t for t in re.split(r"[\s,]+", raw.strip()) if t]
@@ -4480,12 +4486,10 @@ def is_excluded(proj, loc, name):
         return True
     return f"{proj}/{loc}/{name}" in excl_clusters
 
-GCLOUD_CLUSTER_COLUMN_COUNT = 3
 clusters = set()
-loc_re = re.compile(r"^[a-z]+-[a-z0-9-]+$")
 for line in pathlib.Path(proj_file).read_text(encoding="utf-8").splitlines():
     parts = line.split("\t")
-    if len(parts) != GCLOUD_CLUSTER_COLUMN_COUNT:
+    if len(parts) != gcloud_cluster_col_count:
         continue
     proj, loc, name = (p.strip() for p in parts)
     if not (proj and name and loc_re.match(loc)):
@@ -4494,7 +4498,6 @@ for line in pathlib.Path(proj_file).read_text(encoding="utf-8").splitlines():
     if not is_excluded(proj, loc, name):
         clusters.add((proj, loc, name))
 
-asset_re = re.compile(r"^//container\.googleapis\.com/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/]+)$")
 for line in pathlib.Path(asset_file).read_text(encoding="utf-8").splitlines():
     m = asset_re.match(line.strip())
     if not m:
@@ -4550,7 +4553,7 @@ elif live_cr_count:
     best = live_cr_count
 
 print(f"{best}|{gcloud_count}|{live_cr_count}|{cr_sizing}|{cr_tier}|{cr_storage}|{cr_expected}|{cr_present}")
-' "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file" "$has_cr_json" "$probe_ok" "$project_id" "${PROJECT_NUMBER:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>/dev/null)" || parsed=""
+' "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file" "$has_cr_json" "$probe_ok" "$project_id" "${PROJECT_NUMBER:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "$SIZING_SCAN_GCLOUD_CLUSTER_COLUMNS" "$SIZING_SCAN_LOC_REGEX" "$SIZING_SCAN_ASSET_NAME_REGEX" 2>/dev/null)" || parsed=""
 
   rm -f "$gcloud_proj_file" "$gcloud_asset_file" "$cr_json_file"
   [ -n "$parsed" ] || return 0

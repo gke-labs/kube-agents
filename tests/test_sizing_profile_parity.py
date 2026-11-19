@@ -234,6 +234,32 @@ class InstallerAndTerraformSizingParity(unittest.TestCase):
         per_str = re.search(r'^\s*perClusterProfileStorage\s*=\s*"(\d+(?:Gi|Mi))"$', go_manifests, re.MULTILINE).group(1)
         self.assertIn(f"{base_str} + N x {per_str}", sh_text)
 
+    def test_installer_and_release_presets_and_threshold_match(self) -> None:
+        go_text = OPERATOR.read_text(encoding="utf-8")
+        fleet_go = re.search(r"^\s*sizingFleetClusterThreshold\s+int64\s*=\s*([0-9]+)$", go_text, re.MULTILINE)
+        self.assertIsNotNone(fleet_go)
+        install_sh = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+        upgrade_sh = (REPO_ROOT / "upgrade.sh").read_text(encoding="utf-8")
+        common_sh = (REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text(encoding="utf-8")
+        provision_sh = (REPO_ROOT / "scripts" / "release" / "provision_environment.sh").read_text(encoding="utf-8")
+        fleet_install = re.search(r"^readonly\s+INSTALL_DEFAULT_SIZING_FLEET_CLUSTER_THRESHOLD=([0-9]+)$", install_sh, re.MULTILINE)
+        self.assertIsNotNone(fleet_install)
+        self.assertEqual(fleet_install.group(1), fleet_go.group(1))
+        schema = json.loads((CHART / "values.schema.json").read_text(encoding="utf-8"))
+        want_presets = " ".join(
+            v for v in schema["properties"]["platformAgent"]["properties"]["deployment"]["properties"]["sizingProfile"]["enum"]
+            if isinstance(v, str) and v
+        )
+        for rel_path, text, var_name in (
+            ("scripts/installer/installer_common.sh", common_sh, "PLATFORM_AGENT_SIZING_PROFILE_VALUES"),
+            ("install.sh", install_sh, "INSTALL_SIZING_PROFILE_VALUES"),
+            ("upgrade.sh", upgrade_sh, "UPGRADE_SIZING_PROFILE_VALUES"),
+            ("scripts/release/provision_environment.sh", provision_sh, "PLATFORM_AGENT_SIZING_PROFILE_VALUES"),
+        ):
+            m = re.search(rf'^readonly\s+{var_name}="([^"]+)"$', text, re.MULTILINE)
+            self.assertIsNotNone(m, f"{var_name} missing in {rel_path}")
+            self.assertEqual(m.group(1), want_presets, f"{var_name} in {rel_path}")
+
 
 if __name__ == "__main__":
     unittest.main()

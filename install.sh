@@ -9145,6 +9145,14 @@ main() {
      [ -z "${TF_VAR_sizing_profile:-}" ] && \
      ! install_env_records_key "${INSTALL_ENV_FILE:-}" TF_VAR_sizing_profile && \
      [ -z "${TF_VAR_standard_machine_type:-}" ]; then
+    if [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ] && [ ! -w "$INSTALL_ENV_FILE" ]; then
+      if [ -n "${tfvars_file:-}" ]; then
+        rm -f "$tfvars_file"
+      fi
+      print_error "${INSTALL_ENV_FILE} assigns no TF_VAR_sizing_profile, which this run would record there, and it is not writable."
+      print_info "Make it writable, or add TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} to it yourself, and re-run."
+      exit 1
+    fi
     local fleet_nodes_chosen="false"
     if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "$PARAM_DRY_RUN" = "true" ] || ! has_controlling_tty; then
       fleet_nodes_chosen="true"
@@ -9165,11 +9173,6 @@ main() {
       esac
     fi
     if [ "$fleet_nodes_chosen" = "true" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
-      if [ ! -w "$INSTALL_ENV_FILE" ]; then
-        print_error "${INSTALL_ENV_FILE} assigns no TF_VAR_sizing_profile, which this run would record there, and it is not writable."
-        print_info "Make it writable, or add TF_VAR_sizing_profile=${INSTALL_GKE_SIZING_PROFILE_FLEET} to it yourself, and re-run."
-        exit 1
-      fi
       case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
         *" TF_VAR_sizing_profile "*) ;;
         *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD:+${INSTALL_ENV_KEYS_TO_RECORD} }TF_VAR_sizing_profile" ;;

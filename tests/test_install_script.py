@@ -6963,11 +6963,14 @@ class PlatformAgentSizingProfilePersistsThroughInstallEnvTest(unittest.TestCase)
                 try:
                     for dry_run, want_rc in (("false", 1), ("true", 0)):
                         with self.subTest(read_only_dry_run=dry_run):
+                            tfvars_stub = pathlib.Path(tmp) / f"ro-{dry_run}.tfvars"
+                            tfvars_stub.write_text("# stale tfvars\n")
                             proc_ro = _run_installer_bash(
                                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                                 'source scripts/installer/installer_common.sh\n'
                                 'resolve_shared_defaults\n'
                                 f'INSTALL_ENV_FILE="{ro_env}"\n'
+                                f'tfvars_file="{tfvars_stub}"\n'
                                 'project_id="p"; cluster_name="c"; region="us-central1"; cluster_mode="standard"\n'
                                 'PROJECT_ID="p"; CLUSTER_NAME="c"; REGION="us-central1"; CLUSTER_MODE="standard"\n'
                                 f'PARAM_NON_INTERACTIVE="true"; PARAM_DRY_RUN="{dry_run}"; PARAM_MEMORY="file"\n'
@@ -6982,8 +6985,10 @@ class PlatformAgentSizingProfilePersistsThroughInstallEnvTest(unittest.TestCase)
                             self.assertEqual(proc_ro.returncode, want_rc, proc_ro.stdout + proc_ro.stderr)
                             if want_rc == 1:
                                 self.assertIn("not writable", proc_ro.stdout + proc_ro.stderr)
+                                self.assertFalse(tfvars_stub.exists())
                             else:
                                 self.assertIn("KEYS=[]", proc_ro.stdout)
+                                self.assertTrue(tfvars_stub.exists())
                 finally:
                     ro_env.chmod(0o600)
 

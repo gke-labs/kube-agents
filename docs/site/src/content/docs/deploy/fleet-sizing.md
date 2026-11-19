@@ -31,7 +31,7 @@ need the raises below.
 | Pods in the largest single cluster                                  | under 2,500             | 2,500 to 7,499   | 7,500 or more               |
 | Objects in the host cluster                                         | under 15,000            | 15,000 to 49,999 | 50,000 or more              |
 
-(`charts/kube-agents/values.yaml` defaults an omitted `sizingProfile` to `small`; `install.sh` and `upgrade.sh` default `PLATFORM_AGENT_SIZING_PROFILE`, and Terraform defaults `platform_agent_sizing_profile`, to `auto`, which begins at `small` below 10 clusters and steps up automatically at the thresholds above.)
+(`charts/kube-agents/values.yaml` defaults an omitted `sizingProfile` to `small`; `install.sh` and `upgrade.sh` default `PLATFORM_AGENT_SIZING_PROFILE`, and Terraform defaults `platform_agent_sizing_profile`, to `auto`, which begins at `small` below 10 clusters and steps up automatically at the 10- and 25-cluster thresholds above.)
 
 The host-cluster row is the one that sizes the operator. The manager caches every Deployment,
 StatefulSet, Service and PersistentVolumeClaim in the cluster it runs in, so a shared host
