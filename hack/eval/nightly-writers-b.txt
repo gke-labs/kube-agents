@@ -33,3 +33,6 @@ stop-on-permission-refusal
 vcs-review-feedback-read-back
 scale-request-proposes-pr
 provisioning-cluster-request-never-creates
+# cluster-profile-confirmed-pdb-pull-request (#6380): listed here when it
+# joined the writers part, to keep the three counts within one.
+cluster-profile-confirmed-pdb-pull-request
