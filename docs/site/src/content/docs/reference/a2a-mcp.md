@@ -21,7 +21,7 @@ Its pod adds one to the namespace's session pod quota, and the chart's quota che
 
 ## Connecting a client
 
-To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents over MCP](/kube-agents/install/mcp/). A client that talks to the server directly connects as below.
+To connect Claude Code, Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents over MCP](/kube-agents/install/mcp/). A client that talks to the server directly connects as below.
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 

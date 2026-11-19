@@ -26,7 +26,7 @@ TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'
 
 The setting applies to every `PlatformAgent` the operator manages. If the line already sets other values, add `mcpServer={enabled=true}` inside its `operator` object, since there is one such line. On a bare Helm install, pass `--set operator.mcpServer.enabled=true` or set it in your values file. An install that turned the server on with an `A2A_MCP_DOOR` entry in `operator.extraEnv` keeps working, and that entry wins over the value.
 
-Once the operator has restarted and reconciled, the install's namespace holds four objects named after the `PlatformAgent` (`platform-agent` on a default install): the server's Deployment and Service, its token Secret, and a NetworkPolicy that limits who can reach it:
+Once the operator has restarted and reconciled, the install's namespace holds five objects named after the `PlatformAgent` (`platform-agent` on a default install). They are the server's Deployment, Service and ServiceAccount, its token Secret, and a NetworkPolicy that denies it all in-cluster ingress; a port-forward is not affected:
 
 ```bash
 kubectl -n kubeagents-system get deployment,service platform-agent-a2a-mcp
@@ -40,12 +40,12 @@ If they do not appear, read the `A2AMCPServer` condition on the `PlatformAgent` 
 
 The bridge acts with your kubeconfig credentials. Each person who connects needs these permissions on the install's cluster:
 
-| Permission                                                                              | Where                  | Why                                                        |
-| --------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------- |
-| `list` on `platformagents.kubeagents.x-k8s.io`                                          | Cluster-wide           | Finding the install; the bridge lists across namespaces.   |
-| `list` on `agentprofiles.kubeagents.x-k8s.io`                                           | Cluster-wide, optional | Showing the install's profiles; without it they are blank. |
-| `get` on the Secret `<name>-a2a-mcp-token`                                              | The install namespace  | Reading the bearer token.                                  |
-| `get` on the Service `<name>-a2a-mcp`, `list` on `pods`, `create` on `pods/portforward` | The install namespace  | Opening the port-forward to the server's pod.              |
+| Permission                                                                                                | Where                  | Why                                                        |
+| --------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------- |
+| `list` on `platformagents.kubeagents.x-k8s.io`                                                            | Cluster-wide           | Finding the install; the bridge lists across namespaces.   |
+| `list` on `agentprofiles.kubeagents.x-k8s.io`                                                             | Cluster-wide, optional | Showing the install's profiles; without it they are blank. |
+| `get` on the Secret `<name>-a2a-mcp-token`                                                                | The install namespace  | Reading the bearer token.                                  |
+| `list` on `pods`, `create` on `pods/portforward`, and (recommended) `get` on the Service `<name>-a2a-mcp` | The install namespace  | Opening the port-forward to the server's pod.              |
 
 Reading the token Secret and opening the port-forward are the access gate to the server: anyone with both can send the install messages as a console user. A Role and ClusterRole for a default install look like this; bind them to your users or group:
 
@@ -99,15 +99,15 @@ When all three work, skip to [Build the bridge](#build-the-bridge).
 
 A cluster whose control plane has no public endpoint needs a path to its API server first. Pick one of these, get a context through it, and run the three checks above against that context. The bridge needs nothing more: it uses the context as `kubectl` does.
 
-Some paths carry ordinary API calls but not port-forwards. Before you configure the bridge, check that the path carries one: this should print `Forwarding from 127.0.0.1:18089`, and you stop it with Ctrl-C.
+Some paths carry ordinary API calls but not port-forwards. Before you configure the bridge, check that the path carries one. The bridge's port-forward uses SPDY, while recent `kubectl` tries WebSockets first, so the check turns that off to test the same protocol. It should print `Forwarding from 127.0.0.1:18089`; stop it with Ctrl-C.
 
 ```bash
-kubectl --context <context> -n kubeagents-system port-forward service/platform-agent-a2a-mcp 18089:8089
+KUBECTL_PORT_FORWARD_WEBSOCKETS=false kubectl --context <context> -n kubeagents-system port-forward service/platform-agent-a2a-mcp 18089:8089
 ```
 
 - **DNS-based endpoint (GKE).** A cluster with the control plane's DNS-based endpoint turned on, and external traffic allowed on it, is reached by name, with access decided by IAM rather than by network. Get a context for it with `gcloud container clusters get-credentials <cluster> --location <location> --dns-endpoint`, then run the checks.
 - **Connect gateway (GKE fleets).** A cluster registered to a fleet is reached through Google's connect gateway. Get a context with `gcloud container fleet memberships get-credentials <membership> --location <location>`, then run the checks, the port-forward one included.
-- **A bastion or an IAP tunnel.** With neither of the above, run a forward proxy on a host inside the cluster's network and reach it through a tunnel, for example `gcloud compute ssh <bastion> --tunnel-through-iap --zone <zone> -- -L 8888:localhost:8888 -N`. Then point the context at the proxy with `proxy-url: http://localhost:8888` under its `cluster` entry in the kubeconfig, and run the checks while the tunnel is open.
+- **A bastion or an IAP tunnel.** With neither of the above, get a context whose server is the control plane's private address (`gcloud container clusters get-credentials <cluster> --location <location> --internal-ip`), run a forward proxy on a host inside the cluster's network, and reach that proxy through a tunnel, for example `gcloud compute ssh <bastion> --tunnel-through-iap --zone <zone> -- -L 8888:localhost:8888 -N`. Then point the context at the proxy with `proxy-url: http://localhost:8888` under its `cluster` entry in the kubeconfig, and run the checks while the tunnel is open.
 
 The bridge reads the same kubeconfig settings as `kubectl`, a `proxy-url` included, so a context that passes the checks works for the bridge too. Keep any tunnel open while your host runs the bridge.
 
@@ -190,7 +190,7 @@ agy --print "Call the kube-agents connection_status tool." \
 ```
 
 :::caution
-With `agy` 1.5.12, `connection_status` returns, but `send_message`, `task_control` and `poll_events` calls do not return their results to `agy`, although the install completes the turn. Until that is fixed, read a turn's answer from another host, such as Claude Code, with `task_control` and the task the call reported.
+The Antigravity CLI asks the bridge for step-by-step results, and with `agy` 1.5.12 a `send_message` call then never returns its answer, although the install completes the turn. Until that is fixed, ask for the plain result: have the agent pass `stream_steps: false` to `send_message`, for example "Use the kube-agents send_message tool with stream_steps false to ask: …". The call then returns the turn's answer as in other hosts.
 :::
 
 ### Antigravity editor
@@ -222,13 +222,13 @@ Replace both paths with your own. The entry carries no token: the bridge reads i
 
 Three optional settings go in `env` or `args`:
 
-| Setting                                                  | What it does                                                                                                                                               |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KUBECONFIG`                                             | The kubeconfig the bridge reads, as for `kubectl`. Point it at a file holding only the contexts you want scanned.                                          |
-| `KUBE_AGENTS_MCP_CONFIG`, or `--config <path>` in `args` | The bridge's state file, `~/.config/kube-agents/mcp-config.json` by default. A separate file per workspace keeps each workspace's saved installs apart.    |
-| `GH_TOKEN` or `GITHUB_TOKEN`                             | The GitHub token the bridge's `inspect_pr` tool uses to fetch a pull request; without one it falls back to the `github.com` entry in `~/.git-credentials`. |
+| Setting                                                  | What it does                                                                                                                                                                                      |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KUBECONFIG`                                             | The kubeconfig the bridge reads, as for `kubectl`. Point it at a file holding only the contexts you want scanned.                                                                                 |
+| `KUBE_AGENTS_MCP_CONFIG`, or `--config <path>` in `args` | The bridge's state file, `~/.config/kube-agents/mcp-config.json` by default. A separate file per workspace keeps each workspace's saved installs apart.                                           |
+| `GH_TOKEN` or `GITHUB_TOKEN`                             | The GitHub token the bridge's `inspect_pr` tool uses to fetch a pull request; without one it falls back to the `github.com` entry in `~/.git-credentials`, or to the `gh` CLI if it is on `PATH`. |
 
-Save the file, then reload it: type `/mcp` in the agent panel, or refresh the list under **Manage MCP Servers**. The `kube-agents` server should list eight tools.
+Save the file, then reload it: type `/mcp` in the agent panel, or refresh the list under **Manage MCP Servers**. The `kube-agents` server should list nine tools.
 
 ## What the bridge does for you
 
@@ -282,7 +282,7 @@ Without the `sleep`, a call against a real cluster fails with `context canceled`
 
 `not connected to a kube-agents deployment: could not scan any kubeconfig context: <context>: <cause>` means no context could be scanned. A cause of `listing PlatformAgents: ...` is usually missing cluster-wide `list` on `platformagents`, or a credential plugin missing from `PATH`. `no kubeconfig file found (looked for ...)` means the bridge found no kubeconfig at all; set `KUBECONFIG` in the entry's `env`.
 
-`no deployments configured or discovered` means every context was scanned and none holds a `PlatformAgent`.
+`no deployments configured or discovered` means every context was scanned and none holds a `PlatformAgent`. When some contexts could not be scanned and the rest hold none, the error is `no kube-agents deployment found in the kubeconfig contexts that were scanned; could not scan <context>: <cause>`.
 
 ### Connected to the install, but the server is missing
 
