@@ -216,18 +216,20 @@ func (g *Gateway) healStoppedTasks(ctx context.Context, rec *SessionRecord) bool
 		}
 		addressee := rec.AddresseeFor(ref.ID)
 		task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, ref.ID)
+		// The source each end is booked under, the same way the relay and
+		// healBatchChild read it (terminalSourceOf), so one terminal is
+		// attributed alike on every path.
+		var source TerminalSource
 		switch {
 		case err == nil && task.Final:
-			source := TerminalFromExecutor
-			if terminalSubject == lib.TaskSupervisorSubject(addressee, ref.ID) {
-				source = TerminalFromSupervisor
-			}
+			source = terminalSourceOf(terminalSubject)
 			g.log.Info("healing a stopped task whose terminal the relay never delivered", "conversation", rec.Key, "taskId", ref.ID, "state", task.State)
 			g.logTaskTerminal(rec, addressee, ref.ID, task.State, source, finalMessageText(task))
 		case noFirstEventPastGrace(&ActiveTask{SubmittedAt: ref.StartedAt}, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
+			source = TerminalNeverStarted
 			g.log.Info("a stopped task never started; ending it", "conversation", rec.Key, "taskId", ref.ID,
 				"addressee", addressee, "grace", g.cfg.FirstEventGrace)
-			g.logTaskTerminal(rec, addressee, ref.ID, lib.StateCanceled, TerminalNeverStarted, "")
+			g.logTaskTerminal(rec, addressee, ref.ID, lib.StateCanceled, source, "")
 		default:
 			continue
 		}
@@ -241,7 +243,7 @@ func (g *Gateway) healStoppedTasks(ctx context.Context, rec *SessionRecord) bool
 			if err == nil && task.Final {
 				state = task.State
 			}
-			g.batchChildEnded(ctx, rec, fresh, BatchEnd{State: state, Text: reasonStopped, Source: TerminalFromGateway}, stoppedEndReason)
+			g.batchChildEnded(ctx, rec, fresh, BatchEnd{State: state, Text: reasonStopped, Source: source}, stoppedEndReason)
 		}
 	}
 	return changed

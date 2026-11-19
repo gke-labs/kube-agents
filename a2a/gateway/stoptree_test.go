@@ -348,3 +348,25 @@ func TestTheHistoryCapKeepsAStoppedTaskStillRunning(t *testing.T) {
 		}
 	}
 }
+
+// TestAStoppedTasksSteerFromASilentExecutorLogsNoShortfall: a steer sent to
+// an addressee never seen to speak steer notices counts no missed steer when
+// the task is stopped, as postSteerShortfall counts none on an uncanceled
+// end, so no false "steer shortfall" drop is logged.
+func TestAStoppedTasksSteerFromASilentExecutorLogsNoShortfall(t *testing.T) {
+	t.Parallel()
+	r, _, _ := startObservedRig(t, nil)
+	conv := "discord:g1/t-stop-silent-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "q-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "q-2", Text: "only prod"}
+	waitFor(t, "steer published", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "q-3", Text: "stop"}
+	waitFor(t, "stopped", func() bool { return refOf(t, r, conv, origin.TaskID).Canceled })
+	publishFinal(t, r, origin, "platform", lib.StateCanceled, "reason: canceled-by-request")
+	waitFor(t, "the terminal relayed", loggedContaining(r, "task terminal", origin.TaskID))
+	if loggedContaining(r, "dropped a canceled task's write", origin.TaskID, `what="steer shortfall"`)() {
+		t.Fatalf("a steer shortfall was logged for an executor that speaks no steer notices:\n%s", r.logs.String())
+	}
+}

@@ -323,6 +323,12 @@ func TestAStoppedFanOutReleasesTheConversation(t *testing.T) {
 	if end, _ := obs.terminalFor(f.origin.TaskID); end.state != lib.StateCanceled {
 		t.Fatalf("root terminal = %+v, want canceled", end)
 	}
+	// The last child to end is the one the heal ended as never started,
+	// and the chain's end carries that source, not "gateway", which names a
+	// task that never reached the bus.
+	if end, _ := obs.terminalFor(f.origin.TaskID); end.source != TerminalNeverStarted {
+		t.Fatalf("root terminal source = %q, want %q", end.source, TerminalNeverStarted)
+	}
 	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "next"))
 	next := awaitSubmission(t, r, targetPlatform, 3)
 	waitFor(t, "the next child on the record", func() bool {

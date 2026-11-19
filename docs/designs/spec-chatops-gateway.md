@@ -188,7 +188,10 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   Stop control at the first drop, edited to "🛑 cancel sent — the task ends when the
   executor confirms", and is closed by the terminal's edit, which reads stopped
   ("🛑 canceled") whatever the task ended with; nor does its executor's terminal mark
-  draw. The stop's own reply is the only output. A program's observer hears the
+  draw. The stop's own reply is the only output, with one exception: a task started
+  with no rolling line at all (`TaskRef.Lineless`: its backend shows task status
+  itself, so a delegated child has none) has no line to close, so its terminal posts
+  its one "🛑 canceled", unless the stop answered for itself. A program's observer hears the
   chain end canceled and is handed no deliverable, and a console's terminal frame says
   canceled with no answer text.
 
@@ -532,7 +535,7 @@ not what runs at once: children queue at the dispatcher, held to each profile's 
 of one cluster task. A stop during a fan-out cancels the delegating turn and every child still
 running or queued (Stop, above). The batch ends, and the conversation's next delegation can
 mint, once every child has ended: each stopped child's terminal counts it ended, stopped, and
-posts nothing, and when the last has ended no wake runs and the chain ends once, canceled. A
+posts nothing (a child with no line of its own posts its one "🛑 canceled", as above), and when the last has ended no wake runs and the chain ends once, canceled. A
 stopped batch caught partway through minting mints no more, so only the children on the record
 count. A stopped child whose terminal never comes is ended by the next turn's heal once its
 terminal is on the stream or it has produced nothing within `A2A_FIRST_EVENT_GRACE`: its end

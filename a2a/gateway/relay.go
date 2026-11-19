@@ -671,7 +671,8 @@ const (
 // (spec-chatops-gateway.md, "Stop"). A status note, a question, a steer
 // notice, a progress line, a turn's answer and a notice are each dropped and
 // logged (dropCanceledWrite); its terminal still ends it (relayTerminal,
-// which posts nothing for it either, and closes its line); and what the
+// which closes its line and posts nothing, except one "🛑 canceled" for a
+// task with no line to close: Lineless); and what the
 // gateway keeps as state rather than renders (the result, a handoff, a
 // delegate request, which the stopped-turn guard ignores) is applied as
 // for any task.
@@ -726,7 +727,10 @@ func (g *Gateway) dropCanceledNotices(rec *SessionRecord, rs *relayState, taskID
 	g.mu.Lock()
 	notices := len(rs.notices)
 	rs.notices = nil
-	shortfall := rs.steersSent > len(rs.answered) || len(rs.ended)+max(0, len(rs.queued)-rs.turnsStarted) > 0
+	// The same test postSteerShortfall posts on: a missed steer counts only
+	// for an addressee seen to speak steer notices.
+	speaks := g.steerNoticesFrom[rec.AddresseeFor(taskID)]
+	shortfall := (speaks && rs.steersSent > len(rs.answered)) || len(rs.ended)+max(0, len(rs.queued)-rs.turnsStarted) > 0
 	g.mu.Unlock()
 	if notices > 0 {
 		g.logCanceledDrop(rec, taskID, droppedGatewayNote)
@@ -939,7 +943,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	ref, _ := rec.TaskRefFor(taskID)
 	// A task the gateway canceled posts nothing at its end: no turn answer,
 	// result, notice or steer shortfall (applyCanceledEvent). Its line is
-	// still closed below, once, and its end logged and observed.
+	// still closed below, once, and its end logged and observed. A task with
+	// no line to close (Lineless) posts its one "🛑 canceled" instead.
 	muted := ref.Canceled
 	// endState is how the task's end reads to the room's line, its marks and
 	// its observers: a canceled task ends canceled whatever its executor
