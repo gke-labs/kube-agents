@@ -631,6 +631,9 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
 			t.Fatalf("precondition: the fence was not there to delete: %v", err)
 		}
+		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayEgressKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
+			t.Fatalf("precondition: the egress policy was not there to delete: %v", err)
+		}
 		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
@@ -647,6 +650,9 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		}
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 			t.Errorf("no gateway exists and the fences rendered %s anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+		if err := cl.Get(ctx, a2aGatewayEgressKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("no gateway exists and the fences rendered %s anyway (err=%v)", a2aGatewayEgressKey(agent).Name, err)
 		}
 	})
 }
