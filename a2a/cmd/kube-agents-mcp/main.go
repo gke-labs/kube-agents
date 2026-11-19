@@ -15,8 +15,24 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/mcpbridge/kube"
 )
 
+const (
+	binaryName = "kube-agents-mcp"
+	// devVersion is what a build without the release's -ldflags reports.
+	devVersion = "dev"
+)
+
+// version is the release (X.Y.Z) a release archive was built for, stamped by
+// scripts/release/build_release_binaries.sh with -ldflags "-X main.version=...".
+var version = devVersion
+
+// versionString is what --version prints.
+func versionString() string {
+	return binaryName + " " + version
+}
+
 func main() {
-	if err := mcpbridge.RunCLI(os.Args[1:], kube.New()); err != nil {
+	opts := mcpbridge.ServerOptions{Cluster: kube.New(), VersionText: versionString()}
+	if err := mcpbridge.RunCLIWithOptions(os.Args[1:], opts); err != nil {
 		fmt.Fprintf(os.Stderr, "kube-agents-mcp: %v\n", err)
 		os.Exit(1)
 	}
