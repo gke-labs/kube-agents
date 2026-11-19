@@ -110,6 +110,8 @@ MIN_GKE_VERSIONS = {
 MIN_GKE_VERSION_CVM_TDX = "1.28.6-gke.1317000"
 MIN_GKE_VERSION_DYNAMIC_RWO = "1.35.3-gke.1290000"
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+)(?:-gke\.(\d+))?)?$")
+VERSION_MAJOR_MINOR_LEN = 2
+VERSION_MAJOR_MINOR_PATCH_LEN = 3
 
 PD_DISK_PREFIX = "pd-"
 HYPERDISK_PREFIX = "hyperdisk-"
@@ -190,7 +192,9 @@ FIELD_ENABLE_CVM_SNAKE = "enable_confidential_compute"
 FIELD_ENABLED = "enabled"
 FIELD_MASTER_VERSION = "currentMasterVersion"
 FIELD_MASTER_VERSION_ALT = "masterVersion"
+FIELD_MASTER_VERSION_ALT_SNAKE = "master_version"
 FIELD_MIN_MASTER_VERSION = "minMasterVersion"
+FIELD_MIN_MASTER_VERSION_SNAKE = "min_master_version"
 FIELD_MASTER_VERSION_SNAKE = "current_master_version"
 FIELD_VERSION = "version"
 FIELD_NODE_VERSION = "currentNodeVersion"
@@ -360,10 +364,13 @@ def parse_version(text: str | None) -> tuple[int, int, int, int] | None:
 def _version_below_floor(version_text: str, floor_text: str) -> bool:
     """Return True when `version_text` is unparseable or below `floor_text`.
 
-    When `version_text` omits `-gke.BUILD` (e.g. `1.29.2`), compare `(major,
-    minor, patch)` against the floor's `(major, minor, patch)` so a bare
-    Kubernetes release at the floor patch is not rejected for lacking a GKE
-    build number; when `-gke.BUILD` is present, compare the full 4-tuple.
+    When `version_text` is a two-component `MAJOR.MINOR` string (e.g. `1.29`),
+    compare `(major, minor)` against the floor's `(major, minor)` because a
+    minor-only version in Config Connector or Terraform resolves to a current
+    patch of that minor. When `version_text` omits `-gke.BUILD` (e.g. `1.29.2`),
+    compare `(major, minor, patch)` against the floor's `(major, minor, patch)`
+    so a bare Kubernetes release at the floor patch is not rejected for lacking
+    a GKE build number; when `-gke.BUILD` is present, compare the full 4-tuple.
     """
     parsed = parse_version(version_text)
     floor = parse_version(floor_text)
@@ -371,8 +378,19 @@ def _version_below_floor(version_text: str, floor_text: str) -> bool:
         return False
     if parsed is None:
         return True
-    if GKE_BUILD_MARKER not in version_text.strip():
-        return parsed[:3] < floor[:3]
+    match = VERSION_RE.match(version_text.strip())
+    if match is not None:
+        _, _, patch_group, build_group = match.groups()
+        if patch_group is None:
+            return (
+                parsed[:VERSION_MAJOR_MINOR_LEN]
+                < floor[:VERSION_MAJOR_MINOR_LEN]
+            )
+        if build_group is None:
+            return (
+                parsed[:VERSION_MAJOR_MINOR_PATCH_LEN]
+                < floor[:VERSION_MAJOR_MINOR_PATCH_LEN]
+            )
     return parsed < floor
 
 
@@ -478,9 +496,87 @@ def _as_dict(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _extract_cluster_version(cluster: dict[str, Any] | None) -> str:
+    """Extract the GKE control-plane version from GKE, KCC (`spec`), or Terraform cluster dicts."""
+    if not isinstance(cluster, dict):
+        return ""
+    version_keys = (
+        FIELD_MASTER_VERSION,
+        FIELD_MASTER_VERSION_ALT,
+        FIELD_MIN_MASTER_VERSION,
+        FIELD_MASTER_VERSION_SNAKE,
+        FIELD_MIN_MASTER_VERSION_SNAKE,
+        FIELD_MASTER_VERSION_ALT_SNAKE,
+        FIELD_VERSION,
+    )
+    raw = _first_present(cluster, *version_keys)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    spec = _as_dict(cluster.get(FIELD_SPEC))
+    if isinstance(spec, dict):
+        spec_ver = _first_present(spec, *version_keys)
+        if isinstance(spec_ver, str) and spec_ver.strip():
+            return spec_ver.strip()
+    return ""
+
+
+def _normalize_cluster_doc(cluster: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize a GKE, Config Connector (`ContainerCluster`), or Terraform cluster dict.
+
+    Merges `spec` fields into a top-level working copy (preserving `spec` so
+    schema detection still sees Config Connector objects), resolves the cluster
+    name from `spec.resourceID` or `metadata.name` when top-level `name` is
+    absent, and maps Terraform `min_master_version` / `master_version` onto
+    `minMasterVersion`.
+    """
+    if not isinstance(cluster, dict):
+        return None
+    normalized = dict(cluster)
+    spec = _as_dict(cluster.get(FIELD_SPEC))
+    if isinstance(spec, dict):
+        for key, value in spec.items():
+            if key not in normalized or normalized[key] is None:
+                normalized[key] = value
+    raw_name = normalized.get(FIELD_NAME)
+    if not (isinstance(raw_name, str) and raw_name.strip()):
+        resolved_name = ""
+        if isinstance(spec, dict):
+            res_id = spec.get(FIELD_RESOURCE_ID)
+            if isinstance(res_id, str) and res_id.strip():
+                resolved_name = res_id.strip()
+        if not resolved_name:
+            metadata = _as_dict(cluster.get(FIELD_METADATA))
+            if isinstance(metadata, dict):
+                meta_name = metadata.get(FIELD_NAME)
+                if isinstance(meta_name, str) and meta_name.strip():
+                    resolved_name = meta_name.strip()
+        if resolved_name:
+            normalized[FIELD_NAME] = resolved_name
+    extracted_version = _extract_cluster_version(normalized)
+    if (
+        extracted_version
+        and _first_present(
+            normalized,
+            FIELD_MASTER_VERSION,
+            FIELD_MASTER_VERSION_ALT,
+            FIELD_MIN_MASTER_VERSION,
+            FIELD_MASTER_VERSION_SNAKE,
+            FIELD_VERSION,
+        )
+        is None
+    ):
+        normalized[FIELD_MIN_MASTER_VERSION] = extracted_version
+    return normalized
+
+
 def _is_cluster_wrapper(doc: dict[str, Any]) -> bool:
     """Return True when `doc` is a cluster wrapper carrying `nodePools` / `node_pools`."""
-    return FIELD_NODE_POOLS in doc or FIELD_NODE_POOLS_SNAKE in doc
+    if FIELD_NODE_POOLS in doc or FIELD_NODE_POOLS_SNAKE in doc:
+        return True
+    spec = _as_dict(doc.get(FIELD_SPEC))
+    return isinstance(spec, dict) and (
+        FIELD_NODE_POOLS in spec or FIELD_NODE_POOLS_SNAKE in spec
+    )
 
 
 def _extract_source_machine_type(config: dict[str, Any]) -> str:
@@ -597,6 +693,12 @@ def _node_config_of(node_pool: dict[str, Any]) -> dict[str, Any]:
     return node_pool
 
 
+def _storage_config_of(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the ComputeClass `storage` dict from `config`, or `{}` when absent."""
+    storage = _as_dict(config.get(FIELD_STORAGE))
+    return storage if isinstance(storage, dict) else {}
+
+
 def _extract_boot_disk_type(config: dict[str, Any]) -> str:
     """Extract the lowercase boot disk type from a node config dict, or `""`."""
     direct = _first_present(
@@ -617,8 +719,8 @@ def _extract_boot_disk_type(config: dict[str, Any]) -> str:
         )
         if isinstance(nested, str) and nested.strip():
             return nested.strip().lower()
-    storage = _as_dict(config.get(FIELD_STORAGE))
-    if isinstance(storage, dict):
+    storage = _storage_config_of(config)
+    if storage:
         nested_storage = _first_present(
             storage,
             FIELD_BOOT_DISK_TYPE,
@@ -651,6 +753,7 @@ def _extract_cvm_state(
     technology string against `KNOWN_CVM_TYPES` so only a constant literal from
     `KNOWN_CVM_TYPES` is returned.
     """
+    cluster = _normalize_cluster_doc(cluster)
     pool_sources: list[tuple[str, Any]] = [
         (
             f"config.{FIELD_CVM_NODES}",
@@ -723,13 +826,25 @@ def _extract_local_ssd_configs(
     details: list[str] = []
     has_legacy_count = False
 
-    raw_legacy = _first_present(
-        config,
-        FIELD_LOCAL_SSD_COUNT,
-        FIELD_LOCAL_SSD_COUNT_SNAKE,
-        FIELD_LOCAL_SSD_COUNT_CC,
+    legacy_count = _safe_positive_int(
+        _first_present(
+            config,
+            FIELD_LOCAL_SSD_COUNT,
+            FIELD_LOCAL_SSD_COUNT_SNAKE,
+            FIELD_LOCAL_SSD_COUNT_CC,
+        )
     )
-    legacy_count = _safe_positive_int(raw_legacy)
+    if legacy_count == 0:
+        storage = _storage_config_of(config)
+        if storage:
+            legacy_count = _safe_positive_int(
+                _first_present(
+                    storage,
+                    FIELD_LOCAL_SSD_COUNT_CC,
+                    FIELD_LOCAL_SSD_COUNT,
+                    FIELD_LOCAL_SSD_COUNT_SNAKE,
+                )
+            )
     if legacy_count > 0:
         details.append(f"{FIELD_LOCAL_SSD_COUNT}={legacy_count}")
         has_legacy_count = True
@@ -810,6 +925,7 @@ def _evaluate_security(
 ) -> list[Finding]:
     """Check Shielded VM, Secure Boot, vTPM, integrity monitoring, and Confidential VM."""
     blockers: list[Finding] = []
+    cluster = _normalize_cluster_doc(cluster)
 
     if target_family in SHIELDED_ONLY_FAMILIES:
         if isinstance(cluster, dict):
@@ -1330,19 +1446,9 @@ def _evaluate_versions_and_os_image(
     """Check GKE control-plane and node version floors and OS image compatibility."""
     blockers: list[Finding] = []
     warnings: list[Finding] = []
+    cluster = _normalize_cluster_doc(cluster)
 
-    control_plane_version = cluster_version_override.strip()
-    if not control_plane_version and isinstance(cluster, dict):
-        raw_master = _first_present(
-            cluster,
-            FIELD_MASTER_VERSION,
-            FIELD_MASTER_VERSION_ALT,
-            FIELD_MIN_MASTER_VERSION,
-            FIELD_MASTER_VERSION_SNAKE,
-            FIELD_VERSION,
-        )
-        if isinstance(raw_master, str):
-            control_plane_version = raw_master.strip()
+    control_plane_version = cluster_version_override.strip() or _extract_cluster_version(cluster)
 
     node_version = _extract_pool_version(node_pool)
 
@@ -1600,6 +1706,7 @@ def evaluate_node_pool_transition(
             )
 
     config = _node_config_of(node_pool)
+    cluster = _normalize_cluster_doc(cluster)
     pool_name = _extract_pool_name(node_pool) or UNNAMED_POOL
     source_machine_type = _extract_source_machine_type(config)
     if not source_machine_type:
@@ -1900,16 +2007,24 @@ def run_preflight(
     cluster_doc: dict[str, Any] | None = None
     pools_to_check: list[dict[str, Any]] = []
 
-    if cluster_version_override and cluster_version_override.strip():
+    if cluster_version_override:
         if parse_version(cluster_version_override.strip()) is None:
             raise ValueError(
                 f"--cluster-version {cluster_version_override!r} must be a numeric GKE "
                 "version (MAJOR.MINOR or MAJOR.MINOR.PATCH[-gke.BUILD])"
             )
 
+    requested_names: list[str] = []
+    for raw_pool_name in node_pool_names or []:
+        cleaned_pool_name = (raw_pool_name or "").strip()
+        if not cleaned_pool_name:
+            raise ValueError("empty --node-pool name")
+        if cleaned_pool_name not in requested_names:
+            requested_names.append(cleaned_pool_name)
+
     explicit_shape = ""
     explicit_shape_family = ""
-    if target_machine_type and target_machine_type.strip():
+    if target_machine_type:
         explicit_shape_family, explicit_shape = parse_target_spec(target_machine_type)
         if not explicit_shape:
             raise ValueError(
@@ -1962,6 +2077,7 @@ def run_preflight(
                 normalized_targets.append((parsed_family, shape))
         else:
             normalized_targets.extend(parsed_entries)
+    normalized_targets = list(dict.fromkeys(normalized_targets))
 
     if cluster_json_source:
         loaded_cluster, err = _load_json_input(cluster_json_source, "--cluster-json")
@@ -1975,7 +2091,7 @@ def run_preflight(
                 }
             )
         else:
-            cluster_doc = loaded_cluster
+            cluster_doc = _normalize_cluster_doc(loaded_cluster)
 
     has_explicit_cluster_source = bool(
         cluster_json_source or cluster_name or location
@@ -2001,9 +2117,9 @@ def run_preflight(
                         }
                     )
                     continue
-                cluster_doc = loaded_pool
+                cluster_doc = _normalize_cluster_doc(loaded_pool)
                 raw_wrapper_pools = _first_present(
-                    loaded_pool,
+                    cluster_doc or loaded_pool,
                     FIELD_NODE_POOLS,
                     FIELD_NODE_POOLS_SNAKE,
                 )
@@ -2047,12 +2163,13 @@ def run_preflight(
     if not cluster_json_source:
         if cluster_name and location:
             if cluster_doc is None:
-                cluster_doc, err = _describe_cluster_live(
+                raw_live_cluster, err = _describe_cluster_live(
                     resolved_project,
                     location,
                     cluster_name,
                     runner,
                 )
+                cluster_doc = _normalize_cluster_doc(raw_live_cluster)
                 if err:
                     errors.append({"target": f"cluster/{cluster_name}", "message": err})
         elif cluster_name or location:
@@ -2088,7 +2205,6 @@ def run_preflight(
             if isinstance(raw_cluster_pools, list)
             else []
         )
-        requested_names = [n.strip() for n in (node_pool_names or []) if n.strip()]
         if requested_names:
             by_name = {
                 _extract_pool_name(p): p
@@ -2127,26 +2243,24 @@ def run_preflight(
                     )
         else:
             pools_to_check.extend(cluster_pools)
-    elif pools_to_check and node_pool_names:
-        requested_names = [n.strip() for n in node_pool_names if n.strip()]
-        if requested_names:
-            by_name = {
-                _extract_pool_name(p): p
-                for p in pools_to_check
-                if _extract_pool_name(p)
-            }
-            filtered: list[dict[str, Any]] = []
-            for req_name in requested_names:
-                if req_name in by_name:
-                    filtered.append(by_name[req_name])
-                else:
-                    errors.append(
-                        {
-                            "target": f"node-pool/{req_name}",
-                            "message": f"node pool {req_name!r} was not found in provided node-pool JSON",
-                        }
-                    )
-            pools_to_check = filtered
+    elif pools_to_check and requested_names:
+        by_name = {
+            _extract_pool_name(p): p
+            for p in pools_to_check
+            if _extract_pool_name(p)
+        }
+        filtered: list[dict[str, Any]] = []
+        for req_name in requested_names:
+            if req_name in by_name:
+                filtered.append(by_name[req_name])
+            else:
+                errors.append(
+                    {
+                        "target": f"node-pool/{req_name}",
+                        "message": f"node pool {req_name!r} was not found in provided node-pool JSON",
+                    }
+                )
+        pools_to_check = filtered
 
     if not errors and not pools_to_check:
         errors.append(
@@ -2186,18 +2300,9 @@ def run_preflight(
                     )
                 )
 
-    control_plane_version = cluster_version_override.strip()
-    if not control_plane_version and isinstance(cluster_doc, dict):
-        raw_master = _first_present(
-            cluster_doc,
-            FIELD_MASTER_VERSION,
-            FIELD_MASTER_VERSION_ALT,
-            FIELD_MIN_MASTER_VERSION,
-            FIELD_MASTER_VERSION_SNAKE,
-            FIELD_VERSION,
-        )
-        if isinstance(raw_master, str):
-            control_plane_version = raw_master.strip()
+    control_plane_version = cluster_version_override.strip() or _extract_cluster_version(
+        cluster_doc
+    )
 
     effective_cluster_name = (
         cluster_name
@@ -2233,7 +2338,7 @@ def run_preflight(
         "location": effective_location,
         "cluster": effective_cluster_name,
         "control_plane_version": control_plane_version,
-        "target_families": [fam for fam, _ in normalized_targets],
+        "target_families": list(dict.fromkeys(fam for fam, _ in normalized_targets)),
         "results": [t.to_dict() for t in transitions],
         "errors": errors,
     }
