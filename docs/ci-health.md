@@ -545,9 +545,10 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
-not a pool job but the validated-capabilities lane's weekly slice, watched here because
-its record is its logs bucket and nothing else reads a failed build of it. A fifth,
+daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
+not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
+their record is their logs bucket and nothing else reads a failed build of them. The first slice is
+also watched as `ci-kube-agents-certification-1`, the name its job has until `oss-test-infra` renames it. Another,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
 `ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
@@ -556,7 +557,7 @@ its messages are built from, so adding the next periodic is one entry. The 15-mi
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
 identities cannot write the Prow archive), or from the nightlies' bucket
-`gs://kube-agents-evals-nightly-logs` for the validated-capabilities slice and the replay lane, which are
+`gs://kube-agents-evals-nightly-logs` for the validated-capabilities slices and the replay lane, which are
 decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
@@ -596,7 +597,7 @@ recovery needs a build that passed, or for the postsubmit reconcile a later
 daily run that reached its projects (below): a failed check under the
 threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile and the daily replay lane, eight days for the weekly validated-capabilities slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile and the daily replay lane, eight days for the weekly validated-capabilities slices; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading

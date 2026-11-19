@@ -887,6 +887,65 @@ class RecentWorkTest(unittest.TestCase):
         self.assertEqual(norm(raw), '{"output": "x\\n\\nrest"')
 
 
+def runtime_environment(kernel, cwd="/opt/data/kanban/workspaces/t_defda7c5"):
+    """The end of a Hermes system prompt on the ssh backend, as recorded on Nov 18 (agent/prompt_builder.py `_format_backend_probe`)."""
+    return ("Conversation started: Wednesday, November 18, 2026 (UTC, UTC+00:00)\nModel: model-default\n\n"
+            "# Hermes runtime environment\n\nTerminal backend: ssh. Your `terminal` tools all operate inside this ssh "
+            "environment. Only the following backend state matters:\n"
+            f"  OS: Linux {kernel}\n  User: agent\n  Home: /home/agent\n  Working directory: {cwd}\n\n"
+            "<!-- End Hermes runtime environment -->")
+
+
+def system_request(system, *users):
+    return {"model": "model-default", "messages": [{"role": "system", "content": system}]
+            + [{"role": "user", "content": u} for u in users]}
+
+
+class RuntimeKernelTest(unittest.TestCase):
+    # Two nodes of the same pool on the Nov 18 recording night.
+    KERNELS = ("6.12.105+", "6.12.110+")
+
+    def test_the_system_prompts_kernel_does_not_change_the_key(self):
+        a, b = (system_request(runtime_environment(k), "work the card") for k in self.KERNELS)
+        self.assertEqual(fp(a), fp(b))
+        walked = [normalizer.normalize_request(r, NOW).messages[0]["content"] for r in (a, b)]
+        self.assertEqual(walked[0], walked[1])
+        self.assertIn("  OS: Linux ⟦KERNEL⟧\n  User: agent\n", walked[0])
+
+    def test_a_system_prompt_as_text_parts(self):
+        a, b = (system_request([{"type": "text", "text": runtime_environment(k)}]) for k in self.KERNELS)
+        self.assertEqual(fp(a), fp(b))
+
+    def test_the_rest_of_the_block_still_counts(self):
+        self.assertNotEqual(fp(system_request(runtime_environment(self.KERNELS[0]))),
+                            fp(system_request(runtime_environment(self.KERNELS[0], cwd="/home/agent"))))
+        self.assertNotEqual(fp(system_request(runtime_environment(self.KERNELS[0]))),
+                            fp(system_request(runtime_environment(self.KERNELS[0]).replace("Linux", "Darwin"))))
+
+    def test_prose_quoting_the_heading_before_the_block_is_left_alone(self):
+        quoted = "Notes: # Hermes runtime environment\n  OS: Linux 5.15.0-1\nmore notes\n\n"
+        walked = normalizer.normalize_request(system_request(quoted + runtime_environment(self.KERNELS[0])), NOW)
+        content = walked.messages[0]["content"]
+        self.assertIn("  OS: Linux 5.15.0-1\n", content)
+        self.assertIn("  OS: Linux ⟦KERNEL⟧\n  User: agent\n", content)
+
+    def test_a_kernel_anywhere_else_stays_literal(self):
+        # What the agent reads about a node it is debugging: `uname -r`, a KERNEL-VERSION column, a pasted block.
+        for kernel in self.KERNELS:
+            elsewhere = (f"  OS: Linux {kernel}",
+                         f"Kernel Version:             {kernel}",
+                         runtime_environment(kernel))
+            for text in elsewhere:
+                with self.subTest(kernel=kernel, text=text[:30]):
+                    walked = normalizer.normalize_request(system_request("system", text), NOW).messages[1]["content"]
+                    self.assertIn(kernel, walked)
+                    conversation = tool_conversation("terminal", text)
+                    self.assertIn(kernel, normalizer.normalize_request(conversation, NOW).messages[-1]["content"])
+            # Outside the block, a system prompt's line keeps its kernel too.
+            self.assertIn(kernel, normalizer.normalize_request(system_request(f"  OS: Linux {kernel}"), NOW).messages[0]["content"])
+        self.assertNotEqual(fp(system_request("s", "uname -r: 6.12.105+")), fp(system_request("s", "uname -r: 6.12.110+")))
+
+
 class EvalPoolProjectTest(unittest.TestCase):
     def test_the_project_is_an_identifier_wherever_the_pool_writes_it(self):
         cases = (
