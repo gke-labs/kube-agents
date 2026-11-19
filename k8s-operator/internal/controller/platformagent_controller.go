@@ -624,6 +624,13 @@ type PlatformAgentReconciler struct {
 	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
 
+	// sessionCapWarned records, per CR, the SessionCapFitted Warning last
+	// recorded (resolveA2ASessionCap), so a cap fitted to the same width
+	// warns once rather than on every pass. Keyed by ObjectKey, value the
+	// event message; cleared when the CR is deleted and when the cap is no
+	// longer fitted.
+	sessionCapWarned sync.Map
+
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
 	// rather than on every requeue. Keyed by ObjectKey, value int64; cleared
@@ -1448,6 +1455,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if _, err := r.ensureA2ACredsSecret(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
 	}
+	// The session cap, fitted to the TASKS stream's live width
+	// (platformagent_a2a_session_cap.go), before the workload: the platform
+	// agent container's A2A_DEFAULT_ADDRESSEE reads it, as the gateway's
+	// does in the A2A stack below, so both render from the one reading.
+	r.resolveA2ASessionCap(ctx, renderAgent, instance)
 	if err := r.reconcileWorkload(ctx, renderAgent, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1889,6 +1901,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
+		r.sessionCapWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
 		r.forgetA2AGatewayLease(agent)

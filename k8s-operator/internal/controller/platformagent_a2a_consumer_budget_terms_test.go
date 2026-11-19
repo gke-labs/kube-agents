@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -228,9 +229,9 @@ func TestBridgeConcurrencyMaxMatchesTheBridgeQueue(t *testing.T) {
 // operator's setting (unpinned it runs 10 workers and the row is 80).
 func TestProvisionRefusalMovesWithTheReserve(t *testing.T) {
 	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
-	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	agent := platformRouteAgent()
 	sessions := 100
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Harness.Tuning.MaxSessions = &sessions
 	script := a2aProvisionScript(agent)
 	for _, want := range []string{
 		"required_consumers=332",
@@ -347,7 +348,7 @@ func TestBridgeConcurrencyReadsTheSidecarLikeTheBridgeDoes(t *testing.T) {
 			sidecar("hermes-bridge", lit("99999999999999999999"))}}, 2, 32},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+			agent := platformRouteAgent()
 			agent.Spec.Deployment = tc.deployment
 			if got := a2aBridgeConcurrency(agent); got != tc.want {
 				t.Errorf("a2aBridgeConcurrency = %d, want %d", got, tc.want)
@@ -389,8 +390,8 @@ func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
 	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
 	first := 0
 	for m := 1; m <= a2aTasksMaxConsumersFloor; m++ {
-		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
-		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &m}}
+		agent := platformRouteAgent()
+		agent.Spec.Harness.Tuning.MaxSessions = &m
 		if a2aTasksMaxConsumers(agent) > a2aTasksMaxConsumersFloor {
 			first = m
 			break
@@ -399,7 +400,7 @@ func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
 	if first != 11 {
 		t.Errorf("the first maxSessions rendering above the floor is %d, the comment above a2aTasksReservedConsumers says 11", first)
 	}
-	def := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	def := platformRouteAgent()
 	if got := a2aTasksConsumerBudget(def); got != 62 {
 		t.Errorf("default budget = %d, the comment says 62", got)
 	}
@@ -410,8 +411,8 @@ func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
 	t.Run("the rendered bridge's default is above the floor from one session", func(t *testing.T) {
 		t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "")
 		one := 1
-		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
-		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &one}}
+		agent := platformRouteAgent()
+		agent.Spec.Harness.Tuning.MaxSessions = &one
 		if got := a2aTasksMaxConsumers(agent); got != 83 {
 			t.Errorf("maxSessions=1 renders max_consumers=%d, want 83: 3 plus the 80 the rendered bridge's 10 workers reserve", got)
 		}
@@ -634,6 +635,16 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		// from the first provision, so TASKS is created at the floor while
 		// the budget fits, and wider (the lane's Degraded gate) when not.
 		t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(tc.workers))
+		// The script sets no defaultRoute, so its CR is on the session
+		// route, where a session counts 7 and the first provision creates
+		// TASKS at that budget, wider than the floor. That provision still
+		// fits the stream it creates, which is what #2077 needs.
+		if got, want := a2aTasksMaxConsumers(agent), max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); got != want {
+			t.Errorf("at %d workers on the default route the render creates TASKS at %d, not the %d its own budget needs", tc.workers, got, want)
+		}
+		// The script's arithmetic copies the platform route's 3 a session
+		// (A2A_SESSION_CONSUMERS), and holds on that route.
+		agent.Spec.Harness.Tuning.DefaultRoute = ptr.To(agentv1alpha1.DefaultRoutePlatform)
 		budget := a2aTasksConsumerBudget(agent)
 		if fits := budget <= a2aTasksMaxConsumersFloor; fits != tc.fits {
 			t.Errorf("at %d workers with maxSessions=%d the budget is %d against a %d-wide TASKS; fits=%v, want %v", tc.workers, n, budget, a2aTasksMaxConsumersFloor, fits, tc.fits)
@@ -641,5 +652,21 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		if got := a2aTasksMaxConsumers(agent); tc.fits && got != a2aTasksMaxConsumersFloor {
 			t.Errorf("at %d workers the render creates TASKS at %d consumers, not the floor %d", tc.workers, got, a2aTasksMaxConsumersFloor)
 		}
+	}
+}
+
+// platformRouteAgent is the bare test agent on the platform route
+// (spec.harness.tuning.defaultRoute: platform). The budget tests in this
+// file and platformagent_a2a_consumer_budget_test.go hold the reserve table
+// and the refusal's arithmetic, which were written against the platform
+// route's 3 consumers a session; sessions are now the default route, whose
+// share (7) platformagent_a2a_default_route_test.go and
+// platformagent_a2a_session_cap_test.go hold.
+func platformRouteAgent() *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{
+			DefaultRoute: ptr.To(agentv1alpha1.DefaultRoutePlatform),
+		}}},
 	}
 }

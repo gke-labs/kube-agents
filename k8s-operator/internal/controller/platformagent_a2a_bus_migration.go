@@ -1732,16 +1732,23 @@ func (r *PlatformAgentReconciler) recordClearReport(ctx context.Context, agent *
 const reasonA2ABusMigrationStreamsOverCap = "A2ABusMigrationStreamsOverCap"
 
 // a2aBusJszStreamsPath is the monitoring endpoint's JetStream report, with
-// each stream's state (the meta group check reads the summary alone,
-// a2aBusJszPath).
-const a2aBusJszStreamsPath = "/jsz?streams=true"
+// each stream's state and config (the meta group check reads the summary
+// alone, a2aBusJszPath). config=true adds each stream's configuration
+// beside its state, a few hundred bytes a stream across the dozen streams
+// and buckets the bus holds; it lists no consumers (consumers=true would),
+// so the answer stays the size of the stream list. The session cap reads
+// TASKS' max_consumers from it (resolveA2ASessionCap).
+const a2aBusJszStreamsPath = "/jsz?streams=true&config=true"
 
 // a2aBusStream is one stream's state as the bus's /jsz reports it: what
-// the restore's rendered-limit check reads from the snapshot.
+// the restore's rendered-limit check reads from the snapshot, and the
+// stream's configured max_consumers, which the session cap is fitted to.
+// MaxConsumers is nil when the report carried no config for the stream.
 type a2aBusStream struct {
-	Bytes     int64
-	Msgs      int64
-	FirstTime time.Time
+	Bytes        int64
+	Msgs         int64
+	FirstTime    time.Time
+	MaxConsumers *int
 }
 
 // busMigrationStreamsOverCap says why a one to three migration can't start,
@@ -1790,6 +1797,9 @@ func (r *PlatformAgentReconciler) a2aBusStreamState(ctx context.Context, agent *
 	if r.busStreamState != nil {
 		return r.busStreamState(ctx, agent)
 	}
+	if a2aBusStreamStateDefault != nil {
+		return a2aBusStreamStateDefault(ctx, agent)
+	}
 	ctx, cancel := context.WithTimeout(ctx, a2aBusVarzTimeout)
 	defer cancel()
 	url := fmt.Sprintf("http://%s.%s.svc:%d%s", a2aNATSName(agent), agent.Namespace, a2aNATSMonitorPort, a2aBusJszStreamsPath)
@@ -1820,6 +1830,9 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 					Msgs      int64     `json:"messages"`
 					FirstTime time.Time `json:"first_ts"`
 				} `json:"state"`
+				Config *struct {
+					MaxConsumers *int `json:"max_consumers"`
+				} `json:"config"`
 			} `json:"stream_detail"`
 		} `json:"account_details"`
 	}
@@ -1829,7 +1842,11 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 	streams := map[string]a2aBusStream{}
 	for _, account := range jsz.AccountDetails {
 		for _, stream := range account.Streams {
-			streams[stream.Name] = a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime}
+			st := a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime}
+			if stream.Config != nil {
+				st.MaxConsumers = stream.Config.MaxConsumers
+			}
+			streams[stream.Name] = st
 		}
 	}
 	return streams, nil
