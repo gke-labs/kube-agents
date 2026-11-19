@@ -2161,7 +2161,7 @@ class CollectClusterTest(unittest.TestCase):
         declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
         # `spot-scarcity-risk` rides along because this fixture's cluster asks
         # for no Spot capacity at all, which is its own declared non-applicability.
-        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk"})
+        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk", fs.UNBACKED_MANUAL_FALLBACK})
         self.assertIn("Autopilot", declared["single-zone-nodepool"])
 
     def test_autopilot_never_issues_the_node_pools_read(self):
@@ -4313,6 +4313,138 @@ class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
         text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
         self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
         self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+
+
+def manual_pool(name, machine_type, compute_class_label=None):
+    labels = {fs.COMPUTE_CLASS_LABEL: compute_class_label} if compute_class_label else {}
+    return {"name": name, "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": machine_type, "labels": labels}}
+
+
+# The seeded fleet's shape: one `nodepools` rule on the labelled pool, then two
+# machine-family rules no pool backs, node pool auto-creation off.
+FLEET_CLASS_RULES = [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}, {"machineFamily": "c3"}]
+FLEET_POOL = manual_pool("default-pool", "e2-medium", "general-ccc")
+
+
+class CccUnbackedManualFallbackTest(unittest.TestCase):
+    def check(self, priorities, pools, **spec):
+        cc = compute_class("general-ccc", priorities, node_pool_auto_creation=False)
+        cc["spec"].update(spec)
+        return fs.check_ccc_unbacked_manual_fallback(cc, pools)
+
+    def test_the_fleet_s_class_is_flagged_for_its_two_unbacked_rules(self):
+        hit = self.check(FLEET_CLASS_RULES, [FLEET_POOL])
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertIn("2 of 3 priority rules have no manual node pool", hit["excerpt"])
+        self.assertIn("rule 2 (machineFamily n4); rule 3 (machineFamily c3)", hit["excerpt"])
+        self.assertIn("Backed: rule 1 (nodepools default-pool)", hit["excerpt"])
+
+    def test_a_class_with_a_pool_behind_every_rule_passes(self):
+        pools = [FLEET_POOL, manual_pool("n4-pool", "n4-standard-4", "general-ccc"), manual_pool("c3-pool", "c3-standard-8", "general-ccc")]
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, pools))
+
+    def test_a_pool_of_the_family_without_the_class_label_backs_no_rule(self):
+        pools = [FLEET_POOL, manual_pool("n4-pool", "n4-standard-4"), manual_pool("c3-pool", "c3-standard-8", "another-class")]
+        self.assertIn("2 of 3", self.check(FLEET_CLASS_RULES, pools)["excerpt"])
+
+    def test_a_machine_type_rule_needs_that_type_not_only_its_family(self):
+        rules = [{"nodepools": ["default-pool"]}, {"machineType": "n4-standard-8"}]
+        self.assertIn("rule 2 (machineType n4-standard-8)", self.check(rules, [FLEET_POOL, manual_pool("n4-pool", "n4-standard-4", "general-ccc")])["excerpt"])
+        self.assertIsNone(self.check(rules, [FLEET_POOL, manual_pool("n4-pool", "n4-standard-8", "general-ccc")]))
+
+    def test_a_nodepools_rule_that_names_no_existing_pool_is_unbacked(self):
+        rules = [{"nodepools": ["gone-pool"]}, {"nodepools": ["default-pool"]}]
+        hit = self.check(rules, [FLEET_POOL])
+        self.assertIn("1 of 2", hit["excerpt"])
+        self.assertIn("rule 1 (nodepools gone-pool)", hit["excerpt"])
+
+    def test_a_class_with_no_pool_at_all_says_no_rule_is_backed(self):
+        self.assertIn("No rule is backed", self.check(FLEET_CLASS_RULES, [])["excerpt"])
+
+    def test_auto_creation_on_is_out_of_scope(self):
+        cc = compute_class("general-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=True)
+        self.assertIsNone(fs.check_ccc_unbacked_manual_fallback(cc, [FLEET_POOL]))
+
+    def test_an_omitted_auto_creation_field_reads_as_off(self):
+        """The CRD defaults the field to off, so leaving it out is the usual
+        way to have it off."""
+        cc = compute_class("general-ccc", FLEET_CLASS_RULES)
+        del cc["spec"]["nodePoolAutoCreation"]
+        self.assertIsNotNone(fs.check_ccc_unbacked_manual_fallback(cc, [FLEET_POOL]))
+
+    def test_a_single_rule_has_no_fallback_to_back(self):
+        self.assertIsNone(self.check([{"machineFamily": "n4"}], []))
+
+    def test_an_autopilot_mode_class_is_out_of_scope(self):
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, [FLEET_POOL], autopilot={"enabled": True}))
+
+    def test_a_rule_that_names_no_pool_and_no_machine_is_not_judged(self):
+        accelerator_only = {"gpu": {"type": "nvidia-l4", "count": 1}}
+        self.assertIsNone(self.check([{"nodepools": ["default-pool"]}, accelerator_only], [FLEET_POOL]))
+        hit = self.check([*FLEET_CLASS_RULES, accelerator_only], [FLEET_POOL])
+        self.assertIn("2 of 4", hit["excerpt"])
+        self.assertIn("Not judged, the rule names neither pools nor a machine: rule 4", hit["excerpt"])
+
+
+class UnbackedManualFallbackCollectTest(unittest.TestCase):
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    SLUG = fs.UNBACKED_MANUAL_FALLBACK
+
+    def fleet_class(self):
+        return compute_class("general-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=False)
+
+    def test_the_collector_files_the_fleet_s_class_as_major_with_both_reads(self):
+        entry = self.run_with(dump_items=[self.fleet_class()], pools=[FLEET_POOL])
+        [filed] = [c for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual((filed["object"], filed["severity"], filed["namespace"]), ("ComputeClass/general-ccc", "major", ""))
+        self.assertIn("kubectl get computeclasses -A -o json; gcloud container node-pools list", filed["command"])
+        self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_a_cluster_with_no_class_in_scope_records_the_check_as_run(self):
+        for pools_rc in (0, 1):
+            entry = self.run_with(dump_items=[compute_class("auto", FLEET_CLASS_RULES)], pools=[FLEET_POOL], pools_rc=pools_rc)
+            self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+            self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+            self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+
+    def test_unread_pools_leave_a_class_in_scope_unevaluated_not_flagged(self):
+        entry = self.run_with(dump_items=[self.fleet_class()], pools_rc=1)
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+        [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == self.SLUG]
+        self.assertIn("ComputeClass/general-ccc", reason)
+        self.assertIn("node-pools list", reason)
+        self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc", entry["limitations"])
+
+    def test_autopilot_declares_the_check_not_applicable(self):
+        entry = self.run_with(dump_items=[self.fleet_class()], cluster={**self.CLUSTER, "autopilot": True})
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == self.SLUG], [])
+        [reason] = [e["reason"] for e in entry["checks_not_applicable"] if e["check"] == self.SLUG]
+        self.assertIn("Autopilot", reason)
+
+    def test_the_finding_s_command_stays_under_the_published_command_cap(self):
+        """The class read and the discovery listing as one line, at the longest
+        kubeconfig path the platform profile makes."""
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        class_read = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}"
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, "[]")
+
+        fs.enumerate_clusters(LONGEST_PROJECT, run=run)
+        listing = issued[0]
+        self.assertEqual(listing[:4], ["gcloud", "container", "clusters", "list"])
+        for pools_read in (
+            shlex.join(listing),
+            shlex.join(["gcloud", "container", "node-pools", "list", "--cluster", LONGEST_CLUSTER, "--location", LONGEST_LOCATION, "--project", LONGEST_PROJECT, "--format", "json"]),
+        ):
+            text = f"{class_read}; {pools_read}"
+            self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", self.SLUG))
 
 
 if __name__ == "__main__":

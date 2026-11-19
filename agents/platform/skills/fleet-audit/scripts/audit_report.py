@@ -402,6 +402,7 @@ AUDITS: dict[str, AuditSpec] = {
             "reservation-mismatch-risk",
             "autoscaler-out-of-resources",
             "dangling-compute-class",
+            "ccc-unbacked-manual-fallback",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
         # project-scoped checks. `reservation-mismatch-risk` sits under both
@@ -422,6 +423,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "reservation-mismatch-risk",
                     "autoscaler-out-of-resources",
                     "dangling-compute-class",
+                    "ccc-unbacked-manual-fallback",
                 ),
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
@@ -1321,6 +1323,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
+    "ccc-unbacked-manual-fallback": "{object} compute class lists fallbacks it has no node pool for",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",

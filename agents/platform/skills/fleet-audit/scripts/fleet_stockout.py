@@ -15,6 +15,7 @@ other collectors already read with confidence — a `ComputeClass`/`Deployment`/
 --format=json(quotas)`: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
 `ccc-mixed-disk-generations`, `ccc-hyperdisk-incompatible`,
+`ccc-unbacked-manual-fallback`,
 `quota-exhaustion-risk`, `single-zone-nodepool`, `reservation-mismatch-risk`,
 `dangling-compute-class`.
 
@@ -223,6 +224,9 @@ RESERVATION_IDLE_RATIO = 0.5
 RESERVATION_IDLE_MIN_INSTANCES = 4
 # "Alternative family fallbacks" (§3.3, §3.8) means at least a second family.
 MIN_FALLBACK_FAMILIES = 2
+# §3.13: with fewer rules than this a class has no later rule to fall back to.
+MIN_RULES_WITH_A_FALLBACK = 2
+UNBACKED_MANUAL_FALLBACK = "ccc-unbacked-manual-fallback"
 ERROR_EXCERPT_CHARS = 300
 STDERR_EXCERPT_CHARS = 200
 # `2026-09-30T14:43:39`: an RFC 3339 log timestamp cut to whole seconds.
@@ -475,6 +479,7 @@ IMPACT = {
     "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
+    UNBACKED_MANUAL_FALLBACK: "Node pool auto-creation is off, so GKE scales existing node pools only: a priority rule with no manual node pool is a fallback that does not exist, and pods stay Pending when the backed rule's pool cannot grow.",
     "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
     # Both arms of §3.9 set their own `impact` on the hit -- and a pool
     # matching both gets both sentences -- so this entry is the fallback
@@ -495,6 +500,7 @@ SEVERITY = {
     "ccc-priority-starvation": "critical",
     "ccc-mixed-disk-generations": "critical",
     "ccc-hyperdisk-incompatible": "critical",
+    UNBACKED_MANUAL_FALLBACK: "major",
     "quota-exhaustion-risk": "critical",
     "single-zone-nodepool": "major",
     "reservation-mismatch-risk": "major",  # overridden to critical for a broken/bypassed binding
@@ -1232,6 +1238,79 @@ def check_ccc_hyperdisk_incompatible(cc: dict, uses_hyperdisk: bool) -> dict | N
     if incompatible:
         return {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"fallback includes Hyperdisk-incompatible families {sorted(incompatible)}"}
     return None
+
+
+def _manual_fallback_class(cc: dict) -> bool:
+    """§3.13's scope: node pool auto-creation is not on and the class lists a
+    rule to fall back to.
+
+    `is not True`, as `check_dangling_compute_class` reads the field: the CRD
+    defaults it to off. A class in Autopilot mode (`spec.autopilot.enabled`)
+    is out of scope: GKE creates its nodes, so it has no manual pool to lack.
+    """
+    spec = cc.get("spec") or {}
+    if (spec.get("nodePoolAutoCreation") or {}).get("enabled") is True or (spec.get("autopilot") or {}).get("enabled") is True:
+        return False
+    return len(spec.get("priorities") or []) >= MIN_RULES_WITH_A_FALLBACK
+
+
+def _rule_has_manual_pool(rule: dict, class_name: str, node_pools: list[dict]) -> bool | None:
+    """Whether a node pool backs one priority rule, or None when the rule names
+    neither pools nor a machine, so the pool list cannot answer.
+
+    A `nodepools` rule is backed by a pool it names. A `machineType` or
+    `machineFamily` rule is backed by a pool that carries the class label and
+    has that type or family; a pool without the label is not the class's.
+    """
+    named = rule.get("nodepools") or []
+    if named:
+        return any(pool.get("name") in named for pool in node_pools)
+    if _priority_names_no_machine(rule):
+        return None
+    class_machine_types = [
+        (pool.get("config") or {}).get("machineType") or ""
+        for pool in node_pools
+        if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == class_name
+    ]
+    if rule.get("machineType"):
+        return rule["machineType"] in class_machine_types
+    return any(_priority_family({"machineType": machine_type}) == rule["machineFamily"] for machine_type in class_machine_types)
+
+
+def _rule_label(position: int, rule: dict) -> str:
+    """A priority rule as the excerpt names it: its place in the chain and the
+    field that says what it needs."""
+    for field in ("nodepools", "machineType", "machineFamily"):
+        if rule.get(field):
+            value = rule[field]
+            return f"rule {position} ({field} {', '.join(value) if isinstance(value, list) else value})"
+    return f"rule {position}"
+
+
+def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict | None:
+    """§3.13: a class in `_manual_fallback_class`'s scope with a priority rule
+    no node pool backs. GKE creates no pool for that rule, so the fallback the
+    class lists does not exist.
+
+    A rule `_rule_has_manual_pool` cannot judge is neither counted as backed
+    nor flagged; the excerpt names it.
+    """
+    if not _manual_fallback_class(cc):
+        return None
+    name = cc["metadata"]["name"]
+    priorities = cc["spec"]["priorities"]
+    verdicts = [_rule_has_manual_pool(rule, name, node_pools) for rule in priorities]
+    labels = [_rule_label(position, rule) for position, rule in enumerate(priorities, 1)]
+    unbacked = [label for label, backed in zip(labels, verdicts) if backed is False]
+    if not unbacked:
+        return None
+    backed = [label for label, verdict in zip(labels, verdicts) if verdict is True]
+    unjudged = [label for label, verdict in zip(labels, verdicts) if verdict is None]
+    excerpt = f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: {'; '.join(unbacked)}"
+    excerpt += f". Backed: {'; '.join(backed)}" if backed else ". No rule is backed"
+    if unjudged:
+        excerpt += f". Not judged, the rule names neither pools nor a machine: {'; '.join(unjudged)}"
+    return {"object": f"ComputeClass/{name}", "excerpt": excerpt}
 
 
 def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict]) -> bool:
@@ -2015,8 +2094,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
     # One record for the five kinds, as the one dump was: the two reads' command
     # lines, and a digest over both outputs.
+    class_read_command = f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}"
     dump_record = _record(
-        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {paged_command_text(PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}",
+        f"{class_read_command}; {paged_command_text(PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}",
         Run(result.argv, 0, cc_result.stdout + "\n" + result.stdout, "", cc_result.duration_s + result.duration_s),
     )
 
@@ -2177,6 +2257,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     span_decides: list[str] = []
     machine_unnamed: list[str] = []
     size_unknown: list[str] = []
+    manual_fallback_unread: list[str] = []
     for cc in compute_classes:
         cc_meta = cc.get("metadata") or {}
         # §3.2 and §3.10 do not flag non-production.
@@ -2209,6 +2290,13 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         for hit in [check_ccc_hyperdisk_incompatible(cc, cc_meta["name"] in cc_referenced_by_hyperdisk)]:
             if hit:
                 candidates.append(_emit("ccc-hyperdisk-incompatible", hit))
+        if pools_readable:
+            for hit in [check_ccc_unbacked_manual_fallback(cc, node_pools)]:
+                if hit:
+                    # The two reads the verdict rests on: the classes and the pool list.
+                    candidates.append(_emit(UNBACKED_MANUAL_FALLBACK, {**hit, "command": f"{class_read_command}; {pools_record['command']}"}))
+        elif not autopilot and _manual_fallback_class(cc):
+            manual_fallback_unread.append(f"ComputeClass/{cc_meta['name']}")
         if not non_production:
             for hit in [check_reservation_affinity(cc)]:
                 if hit:
@@ -2244,12 +2332,22 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 ),
             }
         )
+        not_applicable.append(
+            {
+                "check": UNBACKED_MANUAL_FALLBACK,
+                "reason": (
+                    "GKE Autopilot: Google creates the nodes for every ComputeClass, "
+                    "so no priority rule waits on a manual node pool."
+                ),
+            }
+        )
     elif pools_readable:
         # Recorded even when the cluster holds no pools. Zero pools is a real
         # answer to "is any pool single-zone" -- no -- and dropping the check
         # for it makes an empty Standard cluster indistinguishable from one
         # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
+        commands[UNBACKED_MANUAL_FALLBACK] = dump_record
         # The live backlog, read only where the check runs: one more
         # server-filtered read per cluster, Pending pods only.
         unschedulable_pods, backlog_failure = read_unschedulable_pods(run=run, env=env)
@@ -2307,6 +2405,19 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"without node pool labels, so its nodePoolAutoCreation arm did not "
             f"run either, and spot-scarcity-risk read no Spot node pool"
         )
+        if manual_fallback_unread:
+            # No class in scope is an answer the dump alone gives; a class in
+            # scope needs the pools this read would have listed.
+            unevaluated[UNBACKED_MANUAL_FALLBACK] = (
+                f"{', '.join(manual_fallback_unread)} leave node pool auto-creation off and list a fallback rule, "
+                f"and the node pools those rules need were not read: {pools_failure}"
+            )
+            limitations.append(
+                f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {', '.join(manual_fallback_unread)}: "
+                f"the node pools were not read ({pools_failure})"
+            )
+        else:
+            commands[UNBACKED_MANUAL_FALLBACK] = dump_record
 
     if span_decides:
         # §3.1 with the zone span unread: these classes vary too few
