@@ -741,10 +741,13 @@ substitutes its placeholders first, so a field whose whole value is a placeholde
 refused here and load in a run. No case in the tree has one.
 
 Without the package the rule does not run, and the target's last line, on stderr, says so.
-The same holds when the installed package is another checkout's: the line then says that the
-package is installed, but behind the tree. The rule knows the check types and the fields of
-the installed package, so after a pull that changes `bench/pyproject.toml` (a new check
-type, a new devops-bench pin), run `make test-bench-deps` again.
+The same holds when the installed package is another checkout's, or a copy that an install
+made: the line then says that the package is installed, but behind the tree. Only an editable
+install of this checkout counts. The rule knows the check types and the fields of the
+installed package and of the installed devops-bench, so after a pull that changes
+`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
+points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
+because pip can keep the old commit when the version did not change.
 The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
 the rule in the job that does, over every case in the tree.
 

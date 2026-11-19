@@ -652,7 +652,7 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
     def _installed(self, package_dir):
         """Stand-in modules for a bench package that is installed with its files in `package_dir`."""
         bench = types.ModuleType("kube_agents_bench")
-        bench.__file__ = str(package_dir / "__init__.py")
+        bench.__file__ = str(package_dir / "__init__.py") if package_dir else None
         loader = types.ModuleType("devops_bench.tasks.loader")
         loader.safe_parse_yaml = yaml.safe_load
         spec = types.ModuleType("devops_bench.verification.spec")
@@ -676,6 +676,20 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
                 validator.unloadable_entries(self.path),
                 [f"check 'names-the-thing': {validator.UNLOADABLE_ENTRY}: {self.REFUSED}"],
             )
+
+    def test_a_checkout_that_is_installed_through_a_link_is_this_checkout(self):
+        link = pathlib.Path(self.tmp.name) / "link-to-bench"
+        link.symlink_to(validator.BENCH_DIR, target_is_directory=True)
+        with self._installed(link / "kube_agents_bench"):
+            self.assertNotIsInstance(validator.spec_parser(), str)
+
+    def test_a_copy_of_the_package_gives_the_note_wherever_it_is(self):
+        """A copy that an install made is as old as that install, also under this checkout's
+        `bench/`; and a module with no file has no place that can be compared."""
+        copy = validator.BENCH_DIR / ".venv" / "lib" / "python3.12" / "site-packages" / "kube_agents_bench"
+        for package_dir, shown in ((copy, str(copy.resolve())), (None, "a package with no file")):
+            with self.subTest(package=shown), self._installed(package_dir):
+                self.assertEqual(validator.spec_parser(), validator.FIELD_CHECK_STALE.format(path=shown))
 
     def test_a_bench_package_of_another_checkout_gives_a_note_and_no_verdict(self):
         """An older checkout's package does not know a check type or a field that this tree added,

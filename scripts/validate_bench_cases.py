@@ -94,9 +94,11 @@ FIELD_CHECK_SKIPPED = (
     "does not have passes. Install the package with `make test-bench-deps` and run this again."
 )
 # The rule's verdict comes from the bench package that the interpreter resolves. One from another
-# checkout does not know a check type or a field that this tree added, and would refuse entries
-# that a run loads.
+# checkout, or a copy that an install made, does not know a check type or a field that this tree
+# added since, and would refuse entries that a run loads. Only the package that resolves to this
+# checkout's own source folder counts, which is what an editable install gives.
 BENCH_DIR = REPO_ROOT / "bench"
+BENCH_PACKAGE_DIR = BENCH_DIR / "kube_agents_bench"
 FIELD_CHECK_STALE = (
     "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
     "tree: this interpreter resolves it to {path}, not to this checkout's bench/. Install this "
@@ -793,15 +795,15 @@ def spec_parser() -> tuple[Any, Any] | str:
         from devops_bench.verification.spec import parse_entries  # noqa: PLC0415
     except ImportError:
         return FIELD_CHECK_SKIPPED
-    package = pathlib.Path(kube_agents_bench.__file__).resolve().parent
-    if not package.is_relative_to(BENCH_DIR.resolve()):
-        return FIELD_CHECK_STALE.format(path=package)
+    origin = getattr(kube_agents_bench, "__file__", None)
+    if not origin or pathlib.Path(origin).resolve().parent != BENCH_PACKAGE_DIR.resolve():
+        return FIELD_CHECK_STALE.format(path=pathlib.Path(origin).resolve().parent if origin else "a package with no file")
     return safe_parse_yaml, parse_entries
 
 
 def unloadable_entries(path: pathlib.Path) -> list[str]:
-    """One problem for each entry of the case that the harness does not load; none where the bench
-    package is not installed.
+    """One problem for each entry of the case that the harness does not load; none where the rule
+    cannot run (`spec_parser`).
 
     The entries are read with the harness's own reader, not with PyYAML: the two read `no`, `on`
     and `22:30` as different types (YAML 1.1 and 1.2), and the parser has to see what a run sees.
