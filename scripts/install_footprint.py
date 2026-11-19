@@ -408,7 +408,7 @@ def render_tables() -> str:
         " plus the pods the operator runs for the agent, the chart's pods in the namespace with"
         f" their rollout surges ({constants['defaultChartPods']} when the operator cannot read the"
         f" chart's count), and a margin of {constants['margin']} for the operator's rollout surges,"
-        " its Jobs and the gateway's count-then-create overshoot.",
+        " its Jobs and the gateway's transient overshoot at the cap.",
         "",
         "The A2A stack, per pod:",
         "",

@@ -106,6 +106,19 @@ ORIGIN_COMPRESSION_WALK_MAX = 32
 # sessions are in that profile's `state.db`, not in this server's own.
 GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 ORIGIN_DB_TIMEOUT_SECONDS = 5.0
+# The eval run tag of a session (deploy/docker/patches/eval_run_tag.py): which
+# eval run, case and repetition an API turn belongs to, as the harness sent it
+# in X-Kube-Agents-Eval-Run. Written only while the install has
+# KUBEAGENTS_EVAL_RUN_TAGS on, once per session (the first write wins), in a
+# table of its own so no session_metadata blob is rewritten for it. Read back
+# through compression, as the origin record is.
+SESSION_EVAL_RUNS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS session_eval_runs ("
+    " session_id TEXT PRIMARY KEY, eval_run TEXT NOT NULL, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+)
+SESSION_EVAL_RUN_KEY = "eval_run"
+# `<run>/<case>/<rep>`, the pattern eval_run_tag.TAG_RE and the replay proxy hold.
+SESSION_EVAL_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}")
 # The board's origin stamp (`_stamp_board_task_origin`, the drift backlog's
 # writer), a side table in the kanban database that the first stamp wins.
 KANBAN_TASK_ORIGINS_SCHEMA = """
@@ -1957,10 +1970,20 @@ def init_db() -> None:
                     reported_at     TEXT,
                     followup_state  TEXT,
                     followup_attempts INTEGER,
-                    followup_detail TEXT
+                    followup_detail TEXT,
+                    changed_paths   TEXT
                 )
                 """
             )
+            # `changed_paths` arrived after the table did: the files a merged fix
+            # changed, read from its diff once by `post_merge_check.py health`
+            # and kept, since a merged pull request's files never change.
+            if "changed_paths" not in {row[1] for row in conn.execute("PRAGMA table_info(post_merge_records)")}:
+                try:
+                    conn.execute("ALTER TABLE post_merge_records ADD COLUMN changed_paths TEXT")
+                except sqlite3.OperationalError as exc:
+                    if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
+                        raise
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
@@ -8409,6 +8432,41 @@ def get_session_origin(session_id: str) -> Dict[str, str]:
     if origin == ORIGIN_OTHER and not platform:
         raise HTTPException(status_code=404, detail="the session has no origin record")
     return {"origin": origin, "platform": platform}
+
+
+def _session_eval_run_row(session_id: str) -> str:
+    """The eval run tag recorded for exactly `session_id`, or ""."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        try:
+            row = conn.execute("SELECT eval_run FROM session_eval_runs WHERE session_id = ?", (session_id,)).fetchone()
+        except sqlite3.OperationalError:  # no tag was ever recorded on this volume
+            return ""
+    return str(row[0]) if row and row[0] else ""
+
+
+@app.put("/v1/sessions/{session_id}/eval-run", dependencies=[Depends(verify_api_key)])
+def put_session_eval_run(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record a session's eval run tag unless it has one; answers the tag the session keeps."""
+    tag = request_data.get(SESSION_EVAL_RUN_KEY)
+    if not isinstance(tag, str) or not SESSION_EVAL_RUN_RE.fullmatch(tag.strip()):
+        raise HTTPException(status_code=400, detail="eval_run must be <run>/<case>/<repetition>")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        conn.execute(SESSION_EVAL_RUNS_SCHEMA)
+        conn.execute(
+            "INSERT OR IGNORE INTO session_eval_runs (session_id, eval_run) VALUES (?, ?)", (session_id, tag.strip())
+        )
+        conn.commit()
+    return {SESSION_EVAL_RUN_KEY: _session_eval_run_row(session_id)}
+
+
+@app.get("/v1/sessions/{session_id}/eval-run", dependencies=[Depends(verify_api_key)])
+def get_session_eval_run(session_id: str) -> Dict[str, str]:
+    """The session's eval run tag, inherited through compression; 404 when none."""
+    for candidate in (session_id, *_session_compression_ancestors(session_id)):
+        tag = _session_eval_run_row(candidate)
+        if tag:
+            return {SESSION_EVAL_RUN_KEY: tag}
+    raise HTTPException(status_code=404, detail="the session has no eval run tag")
 
 
 def _cron_job_origin(job_id: str) -> Optional[tuple[str, str]]:

@@ -1,0 +1,3 @@
+# Synthetic checkout for scripts/test_eval_dashboard_collect.py: the one
+# field the collector reads from a task file.
+domain: reliability

@@ -175,6 +175,10 @@ readonly EVAL_TIMING_FILE="timing.json"
 # The delivered reply's shape beside results.json, where
 # bench/kube_agents_bench/scoring.py (_SHAPE_FILE) reads it. Reported, never scored.
 readonly EVAL_SHAPE_FILE="shape.json"
+# The invocation's eval run tag (<run>/<case>/<rep>) and run id beside
+# results.json (harness.py, KUBE_AGENTS_EVAL_RUN_FILE), so a retried
+# repetition's attempt is told apart from the first in the replay proxy's log.
+readonly EVAL_RUN_TAG_FILE="eval_run.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
 # Where each unit writes a repetition's log (run_one_unit) and grading reads it
@@ -5767,6 +5771,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The same for the delivered reply's shape (harness.py, KUBE_AGENTS_SHAPE_FILE).
   local shape="${STATE_DIR}/${name}.rep${rep}.${EVAL_SHAPE_FILE}"
   rm -f "${shape}"
+  # The same for the eval run tag (harness.py, KUBE_AGENTS_EVAL_RUN_FILE).
+  local eval_run="${STATE_DIR}/${name}.rep${rep}.${EVAL_RUN_TAG_FILE}"
+  rm -f "${eval_run}"
   # A stack that writes to the leased GitOps repository gets its own write
   # token, minted here, after the waits, as the grading token is above, and
   # renewed until devops-bench returns, which is after the stack's destroy
@@ -5791,7 +5798,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
   start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" KUBE_AGENTS_EVAL_RUN_FILE="${eval_run}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   stop_ledger_token_renewal "${token_file}"
   if [ -n "${gitops_writer}" ]; then
@@ -5810,6 +5817,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
   if [ -n "${dir}" ] && [ -f "${shape}" ]; then
     cp "${shape}" "${dir}/${EVAL_SHAPE_FILE}" 2>/dev/null || true
+  fi
+  if [ -n "${dir}" ] && [ -f "${eval_run}" ]; then
+    cp "${eval_run}" "${dir}/${EVAL_RUN_TAG_FILE}" 2>/dev/null || true
   fi
   # A gated judged score the judge failed to return is asked for once more
   # from the saved answer (kube_agents_bench/rejudge.py), before the .dir
