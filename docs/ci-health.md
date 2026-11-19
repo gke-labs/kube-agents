@@ -1876,11 +1876,15 @@ python3 scripts/eval_dashboard/health.py --replay --data data.json --step 30m \
 walks a `data.json` as if the job had run every 30 minutes and prints the state
 timeline. `scripts/test_eval_dashboard_health.py` asserts that timeline for
 2026-09-01 → 2026-09-08 against the incidents filed that week (#1171, #1189,
-#1214, #1269, #1278). The roster history matters: `compliance-rbac-overgrant`
-and `rca-remediation-pr` were admitted when they collapsed and were demoted
-afterwards, so a replay with today's roster would not see the 09-02 outage.
-A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`, is the day
-the build cluster lost five nodes (#1478); the same test file asserts it reads
+#1214, #1269, #1278). The roster history matters: the two cases the fixture
+calls `case-09` and `case-23` were admitted when they collapsed and were
+demoted afterwards, so a replay with today's roster would not see the 09-02
+outage. The fixtures are synthetic cuts of the real weeks (case ids, pull
+request and build numbers and reasons invented; timeline kept: `SCHEMA.md`,
+"Fixtures"), so a replay of a real `data.json` pairs with the real roster, not
+this file. A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`,
+is the day the build cluster lost five nodes (#1478); the same test file
+asserts it reads
 as `lost_pods` with 12 runs on 12 pull requests, and that the setup-death rule
 no longer claims them. A third, `testdata_health/slow-gate-2026-09-14.json.gz`,
 is the week ending 2026-09-14 18:20Z (#1586), the seven days the slow-gate

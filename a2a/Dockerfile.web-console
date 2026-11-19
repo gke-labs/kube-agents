@@ -8,7 +8,7 @@
 # enabled (`GET /api/release`). It is reachable through `kubectl port-forward`
 # by default — the chart renders it behind a ClusterIP Service and a deny-all
 # ingress NetworkPolicy. See
-# docs/site/src/content/docs/deploy/web-console.md.
+# docs/site/src/content/docs/deploy/web-console.mdx.
 #
 # Build from the a2a/ module root:
 #   docker build -f Dockerfile.web-console -t <registry>/web-console:<tag> .

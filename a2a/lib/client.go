@@ -59,8 +59,10 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 const TaskProfileSupervisorToken = "p"
 
 // ProfileSupervisorSubject is a profile task's supervisor subject in its
-// profile form. Nothing publishes it yet: readers accept it beside
-// TaskSupervisorSubject until the dispatcher moves to it (#5301).
+// profile form (#5301). Readers accept it beside TaskSupervisorSubject; the
+// dispatcher publishes a terminal here when its dispatch config's
+// ProfileSupervisorForm is ProfileSupervisorFormProfile
+// (DispatchConfig.SupervisorSubjectFor).
 func ProfileSupervisorSubject(profile, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s", TaskProfileSupervisorToken, profile, taskID, TaskClassSupervisor)
 }

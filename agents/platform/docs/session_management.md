@@ -359,6 +359,24 @@ one), this server for a watcher session on its first inject (`drift` or `event`)
 session with no `origin` resolves as `other`. `GET /v1/sessions/{id}/origin` follows compression
 parents, so a rotated session id keeps its parent's origin.
 
+#### `session_eval_runs`
+
+```sql
+CREATE TABLE session_eval_runs(     -- PUT/GET /v1/sessions/{id}/eval-run
+  session_id TEXT PRIMARY KEY,
+  eval_run TEXT NOT NULL,           -- <run>/<case>/<rep>
+  recorded_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The eval run, case and repetition an API turn's session belongs to, as the harness sent it in
+`X-Kube-Agents-Eval-Run`. The API server writes it only while the install has
+`KUBEAGENTS_EVAL_RUN_TAGS` on (`deploy/docker/patches/eval_run_tag.py`). The first write wins:
+`PUT` answers the tag the session keeps. `GET` follows compression parents, as the origin route
+does, and answers 404 when the session has none. The table is created on the first write and
+`session_metadata` is not touched. The tag of each card is in `kanban.db`, in the side table
+`kanban_task_eval_runs` beside `kanban_task_origins`.
+
 #### Work-origin tables
 
 Three tables hold the origin of work that is not a session. `cleanup_old_records` leaves the first
@@ -409,7 +427,7 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   health_at TEXT, health_checked_at TEXT,
   human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT,
   outcome_detail TEXT, reported_at TEXT, followup_state TEXT, followup_attempts INTEGER,
-  followup_detail TEXT
+  followup_detail TEXT, changed_paths TEXT
 );
 ```
 
@@ -437,9 +455,17 @@ schedules the step yet. A merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
 `post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
-recently read first by `health_checked_at`. For a merged record with a `merge_commit` and a cluster it
+recently read first by `health_checked_at`. A record whose cluster the install's declared scope leaves out, by the fleet audit's own rule
+(`post_merge_scope.py`), or whose scope cannot be judged, is not read: `sync_state` says why
+(`out of scope: ...` or `scope unknown: ...`), and it takes no place in the per-run cap. A scope
+that cannot be read at all stops the run before any cluster is read, with a non-zero exit. For a merged record with a `merge_commit` and a cluster it
 can name, it reads the Argo CD Applications, Flux Kustomizations and Config Sync RepoSyncs on that
-cluster that deliver the repository into the record's namespace, asking the broker
+cluster that deliver the repository into the record's namespace, and the git-sourced RootSyncs of the repository
+whose `spec.git.dir` holds a file the pull request changed that names the record's workload, so a
+RootSync delivering another file of the same pull request never counts (read from its diff only when a RootSync
+or more than one namespace match could change the answer, and kept in `changed_paths` once read; a
+path narrows the namespace matches and never empties them, and a diff it cannot read whole, or one with
+no file naming the workload, is said as `the workload's files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts

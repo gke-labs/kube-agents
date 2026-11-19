@@ -481,6 +481,10 @@ plugins:
     # DefaultBuiltInPlugins (platformagent_manifests.go) is only the roster an
     # AgentPlugin may not shadow; keep the two in step.
     - agent_roster
+    # Off unless KUBEAGENTS_EVAL_RUN_TAGS is on (eval installs only): then it adds
+    # the eval run, case and repetition to each model request's headers for the
+    # replay proxy's log (plugins/eval_run_tag/__init__.py). Off, it registers nothing.
+    - eval_run_tag
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt. Without it Hermes falls back to 20,000 whenever the model window is

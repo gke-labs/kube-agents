@@ -747,6 +747,68 @@ class LocalEndpointTest(ProxyTestCase):
         self.assertEqual(FakeLiteLLM.calls, [])
 
 
+TAG = "devops-bench-0123456789ab/some-case/2"
+AGENT = "platform;card"
+
+
+class EvalRunTagTest(ProxyTestCase):
+    """X-Kube-Agents-Eval-Run and -Agent: logged on every line, never forwarded, never keyed."""
+
+    def tagged(self, body, run=TAG, agent=AGENT):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+        headers = {"Content-Type": "application/json"}
+        if run is not None:
+            headers["X-Kube-Agents-Eval-Run"] = run
+        if agent is not None:
+            headers["X-Kube-Agents-Eval-Agent"] = agent
+        conn.request("POST", "/v1/chat/completions", body=json.dumps(body).encode(), headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def test_the_tags_are_logged_and_never_forwarded(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                FakeLiteLLM.calls = []
+                self.assertEqual(self.tagged(chat("t_11111111", stream=stream)), 200)
+                forwarded = {k.lower() for k in FakeLiteLLM.calls[0]["headers"]}
+                self.assertNotIn("x-kube-agents-eval-run", forwarded)
+                self.assertNotIn("x-kube-agents-eval-agent", forwarded)
+        lines = self.lines(2)
+        self.assertEqual({(l["eval_run"], l["eval_agent"]) for l in lines}, {(TAG, AGENT)})
+
+    def test_the_fingerprint_is_the_same_with_and_without_the_tags(self):
+        body = chat("t_11111111", stream=False)
+        self.tagged(body, run=None, agent=None)
+        self.tagged(body)
+        untagged, tagged = self.lines(2)
+        self.assertIsNone(untagged["eval_run"])
+        self.assertIsNone(untagged["eval_agent"])
+        self.assertEqual(tagged["eval_run"], TAG)
+        for field in ("fingerprint", "settings_hash", "message_hashes", "diag_message_hashes", "diag_settings_hash"):
+            self.assertEqual(untagged[field], tagged[field], field)
+        self.assertEqual(FakeLiteLLM.calls[0]["body"], FakeLiteLLM.calls[1]["body"])
+        self.assertEqual({k: v for k, v in FakeLiteLLM.calls[0]["headers"].items() if k.lower() != "host"},
+                         {k: v for k, v in FakeLiteLLM.calls[1]["headers"].items() if k.lower() != "host"})
+
+    def test_a_malformed_tag_logs_as_null_and_is_still_dropped(self):
+        self.tagged(chat("t_11111111", stream=False), run="not-a-tag", agent="no separator")
+        line = self.lines(1)[0]
+        self.assertIsNone(line["eval_run"])
+        self.assertIsNone(line["eval_agent"])
+        self.assertNotIn("x-kube-agents-eval-run", {k.lower() for k in FakeLiteLLM.calls[0]["headers"]})
+
+    def test_an_errored_analysis_line_keeps_the_tags(self):
+        def explode(*_args):
+            raise RuntimeError("bug")
+
+        self.proxy.analyze = explode
+        self.tagged(chat("t_11111111", stream=False))
+        line = self.lines(1)[0]
+        self.assertEqual((line["error"], line["eval_run"], line["eval_agent"]), ("RuntimeError", TAG, AGENT))
+
+
 class LogLineTest(ProxyTestCase):
     def test_non_streaming_line(self):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))

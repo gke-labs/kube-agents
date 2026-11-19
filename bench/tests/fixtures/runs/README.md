@@ -1,6 +1,6 @@
 # Captured run fixtures
 
-Six real devops-bench run directories, kept as captured but for one redaction
+Six real devops-bench run directories, kept as captured but for two redactions
 (below). #899 asks for exactly this — "capture a handful of real `results.json`
 records now and treat them as fixtures" — because the record's shape is not
 documented anywhere and guessing at it is how a scorer ends up keying on a
@@ -51,11 +51,16 @@ install from a cloudtop runner, at `b35543c`, with devops-bench pinned at
 `4670d76`; the inject record's provenance is in its own paragraph below the
 table.
 
-**One field is redacted.** `kanban_red_1`'s `output` was a 2,252-character
+**Two fields are redacted.** `kanban_red_1`'s `output` was a 2,252-character
 agent report that had delegated to the platform agent and pasted back a fleet
 inventory — project name, cluster names, node counts, control-plane version,
-console links. It is replaced by a short placeholder. Nothing else in any of
-the six is altered.
+console links. It is replaced by a short placeholder. The second is the model:
+`setupId` and `model` in each `manifest.json` and `rows.json` read `setup-x` and
+`model-x`, because a committed file names no run's model
+(`.agents/rules/public_surfaces.md`). That one is read: `load_run` builds the
+version key from `setupId`, so the admission fixtures and the store-unset
+goldens carry the same two strings (the stale admission record's older judge
+is `model-y`) and the key stays consistent across all of them. Nothing else in any of the six is altered.
 
 The redaction is safe because no rung reads `kanban_red_1`'s `output`: the
 ladder reads `scores`, `status`, `error`, `errors`, `trajectory`, `tokens`,
