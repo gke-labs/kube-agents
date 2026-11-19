@@ -3004,8 +3004,11 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place).
-	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	// freeze) or ThreeToOne (in place). Reshape is reserved for a later
+	// release's leg; nothing in this one starts it, and a run of a leg this
+	// operator does not run is held (A2ABusMigrationLegUnknown) until the
+	// operator that started it carries it on or a person abandons it.
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 
 	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
