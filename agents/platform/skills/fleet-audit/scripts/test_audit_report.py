@@ -264,6 +264,7 @@ NUMBER_WORDS = {
             "twenty-three",
             "twenty-four",
             "twenty-five",
+            "twenty-six",
         )
     )
 }
@@ -35798,6 +35799,23 @@ class TestPlainChatLines(unittest.TestCase):
     def test_a_row_names_the_object_the_check_judged(self):
         finding = make_finding(check="privileged-container", cluster="proj/us-central1-a/seeded-a", obj="Deployment/payments-api")
         self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a/payments: payments-api runs a privileged container")
+
+    def test_ingress_gateway_healthcheck_mismatch_is_rostered_and_phrased(self):
+        self.assertIn(
+            "ingress-gateway-healthcheck-mismatch",
+            audit_report.AUDITS["obtainability-audit"].checks,
+        )
+        finding = make_finding(
+            check="ingress-gateway-healthcheck-mismatch",
+            severity="major",
+            cluster="proj/us-central1/host",
+            namespace="seeded-networking",
+            obj="Service/backend-api-svc",
+        )
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` host/seeded-networking: backend-api-svc routes or health-checks a port no pod exposes",
+        )
 
     def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
         finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")
