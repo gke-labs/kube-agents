@@ -12425,6 +12425,14 @@ spec:
                         RunID names this migration's own Jobs, pods, ServiceAccounts and bus
                         principals.
                       type: string
+                    settleTime:
+                      description: |-
+                        SettleTime is how long the one to three restore waited, from raising
+                        the last restored stream to three replicas, for every stream's replicas
+                        to be current and every restored durable consumer to answer from its
+                        leader, as a Go duration ("1.2s"). Set when a restore that succeeded
+                        reports it.
+                      type: string
                     startedAt:
                       description: StartedAt is when the migration began.
                       format: date-time

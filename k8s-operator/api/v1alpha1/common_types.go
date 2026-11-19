@@ -3096,6 +3096,14 @@ type BusMigrationStatus struct {
 	// +optional
 	Message string `json:"message,omitempty"`
 
+	// SettleTime is how long the one to three restore waited, from raising
+	// the last restored stream to three replicas, for every stream's replicas
+	// to be current and every restored durable consumer to answer from its
+	// leader, as a Go duration ("1.2s"). Set when a restore that succeeded
+	// reports it.
+	// +optional
+	SettleTime string `json:"settleTime,omitempty"`
+
 	// Cause is why the run turned back: the phase that failed, and whether
 	// it was still running at Deadline. Set at the first failure and kept
 	// until a retry, which moves it into Retries.

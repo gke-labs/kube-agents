@@ -18,8 +18,8 @@ spec's layout wins and this doc binds to its subjects and topic classes.
 ## What we deploy
 
 NATS 2.10 or later (auth callout requires it), JetStream enabled, file storage on a PV.
-The operator renders the whole deployment from the mode switch: `mode: next` gets a NATS
-cluster, the default gets nothing. Dark until promoted.
+The operator renders the whole deployment for every `PlatformAgent`; the `spec.mode` switch
+that once held it dark is gone, and the field is deprecated and ignored.
 
 Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run a single
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
@@ -69,12 +69,13 @@ another `busReplicas` change while one runs.
   and web logins drop, and the gateway and bridge cannot publish), the operator's pods
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
   snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
-  stream, checked against the operator's policy for it before and after, and raises it to
-  three replicas. Each stream comes back at the rendered `max_bytes` and `max_age`, and its
-  `max_consumers` is widened to the render's but never narrowed: JetStream fixes it when a
-  stream is created, so the restore is the one moment it can grow, and a wider stream's
-  consumers must still fit (amended 11/18). The way back restores each stream as the snapshot
-  recorded it, its width included.
+  stream, checked against the operator's policy for it before and after, raises it to
+  three replicas, and waits (up to 5 minutes for all streams) until every replica is
+  current and every restored durable consumer answers from its leader. Each stream comes back
+  at the rendered `max_bytes` and `max_age`, and its `max_consumers` is widened to the render's
+  but never narrowed: JetStream fixes it when a stream is created, so the restore is the one
+  moment it can grow, and a wider stream's consumers must still fit (amended 11/18). The way
+  back restores each stream as the snapshot recorded it, its width included.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
   restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
@@ -829,7 +830,7 @@ Layout:
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
 
-- **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
+- **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
   publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
@@ -1070,9 +1071,8 @@ no current-template replica serving, and a gateway let through beside a `False` 
 has a serving replica to mint against. The stale-true paragraph above no longer applies
 to the gate: it reads the Deployment from the informer rather than a condition written a
 pass earlier, and the `Generation` check is what keeps a stale informer copy from
-standing in for a stale condition; the live read for "already there" is unchanged. The
-delay also stopped being invisible. Under
-`mode: next` the A2A gateway is one of the workloads `Ready` is computed from
+standing in for a stale condition; the live read for "already there" is unchanged. The delay also stopped being invisible. The A2A
+gateway is one of the workloads `Ready` is computed from
 (`readSplitWorkloads`), so an install held at the gate reads `Provisioning` with a
 message naming the Deployment - rather than a `Ready: True` sitting above an absent
 dispatcher.
@@ -1175,16 +1175,13 @@ route, leaves the cheap ones, and names the class while doing it.
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:
 `extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
-against the reserved names. The render strip is gated on the A2A surface, so it runs
-under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
-recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
-on that function). On the mounts it goes further than admission does: besides the
+against the reserved names. The render strip runs on every CR, since every install renders the A2A stack. On the mounts it goes further than admission does: besides the
 reserved names it drops any mount naming a volume it has just dropped by source, because
 a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
 layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
 at all; that is deliberate, because it is the supported route for a CR-declared Hermes
 bridge sidecar, which is meant to hold `bridge-password`. The bridge the operator renders
-under `next` gets the same key as a `secretKeyRef` the operator writes itself.
+gets the same key as a `secretKeyRef` the operator writes itself.
 
 Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
 pod-scoped and the callout cannot see which container presented one, so this is a guard
@@ -1320,7 +1317,7 @@ already published, stays, and a removed profile keeps its deny while it drains, 
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
-`PlatformAgent` and removed with the stack on a flip to `today`:
+`PlatformAgent`:
 
 | Object                                             | Holds                                                  |
 | -------------------------------------------------- | ------------------------------------------------------ |

@@ -1,0 +1,42 @@
+# The sized test fleet (docs/designs/sized-test-fleet.md). Size M is declared here;
+# S and L multiply every count by their factor, rounded up. The shape is the same
+# at every size, so only the number of clusters, nodes and workloads changes.
+# bench/tf/sized-fleet/ reads this file for the clusters and their node pools, and
+# bench/kube_agents_bench/scale/sized_fleet.py for the workloads.
+default_size: M
+
+# Counts at size M, across the whole fleet.
+base:
+  clusters: 8
+  nodes: 250
+  # Long-running HTTP servers, each behind a Service.
+  deployments: 1500
+  # Short-lived clients: each run starts one Pod that sends a few requests and exits.
+  cronjobs: 500
+  # Pods that fail on purpose (an image that does not exist, a command that exits 1),
+  # so the audits and the stall watch have findings.
+  failing_pods: 5
+
+factors:
+  S: 0.5
+  M: 1
+  L: 2
+
+shape:
+  machine_type: n1-standard-1
+  disk_size_gb: 30
+  disk_type: pd-standard
+  # Each node gets a /26 Pod range: 32 Pods a node is twice what the workloads place.
+  max_pods_per_node: 32
+  namespaces_per_cluster: 10
+  deployment_replicas: 2
+  cronjob_period_minutes: 5
+  cronjob_pod_seconds_min: 60
+  cronjob_pod_seconds_max: 180
+  client_requests: 5
+  cpu_request: 10m
+  memory_request: 16Mi
+  memory_limit: 32Mi
+  image: registry.k8s.io/e2e-test-images/busybox:1.36.1-1
+  # One registry path that does not exist, for the failing Pods.
+  missing_image: registry.k8s.io/e2e-test-images/sized-fleet-no-such-image:0

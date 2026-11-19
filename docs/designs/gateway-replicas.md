@@ -268,8 +268,7 @@ ingress gap above.
 
 ## Operator changes
 
-- **Replicas from the CR** (`spec.deployment.availability.a2aGateway.replicas`), default two on
-  `next` installs, one allowed. More replicas add
+- **Replicas from the CR** (`spec.deployment.availability.a2aGateway.replicas`), default two, one allowed. More replicas add
   standbys and nothing else in phase one.
 - **A readiness probe** that holds the pod not Ready until it has a NATS connection and has read
   the Lease, and again whenever the connection is down, the leader's included once its relay has
@@ -288,8 +287,7 @@ ingress gap above.
   `A2A_GATEWAY_IMAGE` pin, a tag taken from `PLATFORM_AGENT_IMAGE`, or the first roll of any image
   when no gateway has been elected yet), and moves to two once a pod on that image holds the
   Lease. The condition describes the gateway that's running, not one that once ran: the operator
-  clears it whenever the gateway Deployment rolls to an image outside the operator's own release, and when
-  the mode goes back to today, as `BusProvisioned` is. So a pin to a pre-election image clears it,
+  clears it whenever the gateway Deployment rolls to an image outside the operator's own release. So a pin to a pre-election image clears it,
   and removing the pin rolls once at one replica again. A deleted Lease or its held-back recreate
   doesn't change the running image, so it leaves the condition, and the two replicas, in place. A status condition doesn't
   survive most restores, so a restored install starts at one replica until a
@@ -366,7 +364,7 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    (`false` turns it off), the replicas, the strategy and
    their guard, the readiness probe, the PDB and the spread.
 5. **The cards-pending mark on the record** (planned separately).
-6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
+6. **Live runs** on a live install: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.
 
 ## Later: active-active
