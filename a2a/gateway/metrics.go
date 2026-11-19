@@ -52,8 +52,15 @@ const (
 	taskTerminalsName       = "task_terminals_total"
 	gchatEventsReceivedName = "gchat_events_received_total"
 	gchatPullsName          = "gchat_pulls_total"
-	chatMessagesName        = "chat_messages_total"
-	notifyMarksDroppedName  = "notify_marks_dropped_total"
+	// gchatAPIDurationName times each Chat API call the Google Chat adapter
+	// makes through the credential proxy's relay, by method and outcome, and
+	// gchatRateLimitedName counts the ones answered 429. The event pull and
+	// its ack are relay routes, not Chat API calls, and are not timed; the
+	// pull is a long poll gchatPullsName already counts.
+	gchatAPIDurationName   = "gchat_api_request_duration_seconds"
+	gchatRateLimitedName   = "gchat_api_rate_limited_total"
+	chatMessagesName       = "chat_messages_total"
+	notifyMarksDroppedName = "notify_marks_dropped_total"
 	// messagesInboundName counts the chat messages the gateway accepted as
 	// turns, by platform: the next-mode half of status.usage's
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
@@ -133,6 +140,13 @@ const (
 	slackAPIOK          = "ok"
 	slackAPIRateLimited = "rate_limited"
 	slackAPIError       = "error"
+	// The Chat API outcomes, under the Slack ones' names: ok (the relay
+	// answered 200 with the API's response), rate_limited (the Chat API's 429,
+	// as the relay carries it) and error (any other status, the relay's own
+	// 429 included, or no response at all).
+	gchatCallOK          = "ok"
+	gchatCallRateLimited = "rate_limited"
+	gchatCallError       = "error"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -248,11 +262,22 @@ var (
 		"auth.test", "apps.connections.open", "assistant.threads.setSuggestedPrompts",
 		slackSessionsSetStatusMethod, slackSessionsRenameMethod,
 	}
+	// metricsGchatAPIMethods are the Chat API methods the method label names,
+	// each its resource path and method joined by dots as the Chat API
+	// reference writes it; a call to any other (a method added later) is
+	// counted as other.
+	metricsGchatAPIMethods = []string{
+		"spaces.messages.create", "spaces.messages.patch", "spaces.messages.get",
+		"spaces.members.list", "spaces.findDirectMessage", "spaces.setup",
+	}
 	// metricsSlackIngressBuckets reach from a Socket Mode delivery that is
 	// near instant to one a minute late; metricsSlackAPIBuckets from a fast
 	// Web API call to the client's 30-second bound (slackAPITimeout).
 	metricsSlackIngressBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
 	metricsSlackAPIBuckets     = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+	// metricsGchatAPIBuckets are the Slack API buckets, reaching on to the
+	// relay client's 45-second bound (gchatRelayTimeout).
+	metricsGchatAPIBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 45}
 )
 
 // Metrics is the gateway's counters and the private registry that serves
@@ -266,6 +291,8 @@ type Metrics struct {
 	taskTerminals       *prometheus.CounterVec
 	gchatEventsReceived prometheus.Counter
 	gchatPulls          *prometheus.CounterVec
+	gchatAPIDuration    *prometheus.HistogramVec
+	gchatRateLimited    *prometheus.CounterVec
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
@@ -383,6 +410,19 @@ func NewMetrics() *Metrics {
 			Name:      gchatPullsName,
 			Help:      "Pulls of the Google Chat relay, by outcome: events (one arrived), empty (none did), failed (the relay refused or did not answer, or the pull was never made or could not be read).",
 		}, []string{labelOutcome}),
+		gchatAPIDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      gchatAPIDurationName,
+			Help:      "Seconds each Google Chat API call the Google Chat adapter made through the credential broker's relay took, by method (spaces.messages.create, spaces.messages.patch, spaces.members.list, ..., other) and outcome (ok, the relay returned the API's response; rate_limited, a 429 from the Chat API; error, any other status or no response).",
+			Buckets:   metricsGchatAPIBuckets,
+		}, []string{labelMethod, labelOutcome}),
+		gchatRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      gchatRateLimitedName,
+			Help:      "Google Chat API calls answered 429 (rate limited), by the Chat API as the relay carries its status, by method (spaces.messages.create, spaces.messages.patch, spaces.members.list, ..., other).",
+		}, []string{labelMethod}),
 		chatMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -463,7 +503,7 @@ func NewMetrics() *Metrics {
 		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.gchatAPIDuration, m.gchatRateLimited, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}

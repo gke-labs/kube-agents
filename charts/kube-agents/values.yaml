@@ -1228,7 +1228,9 @@ platformAgent:
     # metadata server on operator-rendered workloads; set explicitly when
     # chart-rendered litellm (vertex_ai) or githubMinter run in a custom
     # universe so Helm templates render GOOGLE_CLOUD_UNIVERSE_DOMAIN and the
-    # cluster's OIDC issuer host at install time.
+    # cluster's OIDC issuer host at install time. A value under googleapis.com,
+    # such as mtls.googleapis.com, is refused: it names hosts of standard
+    # Google Cloud. Use googleapis.com or leave this empty.
     universeDomain: ""
     # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
     # own default applies — dashboardEnabled therefore lands `true` unless an

@@ -10247,7 +10247,9 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
-                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining"},
+                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
+                     # Refused before the route ran anything (#6247).
+                     credential_proxy.BUSY_BEFORE_ADMISSION_KEY: True},
                     captured["payload"],
                 )
                 handler.metrics.record_refusal.assert_called_once_with(
@@ -12372,7 +12374,8 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-claim", "issue-list", "issue-view", "branch-view", "revision-contains"},
+             "proposal-commits", "proposal-reviews", "proposal-claim", "issue-list", "issue-view", "branch-view",
+             "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -14920,7 +14923,12 @@ class MCPRouteAdmissionTest(unittest.TestCase):
         self.assertTrue(permitted)
         self.assertEqual([], replies)
         self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP, credential_proxy.CALLER_ROLE_PROFILE),
+            (
+                credential_proxy.CALLER_ROLE_SHELL,
+                credential_proxy.CALLER_ROLE_MCP,
+                credential_proxy.CALLER_ROLE_PROFILE,
+                credential_proxy.CALLER_ROLE_CURATOR,
+            ),
             credential_proxy.required_roles("/v1/vcs/proposal-view"),
         )
 
@@ -15068,6 +15076,32 @@ class MCPVcsVerbGateTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
         route.assert_not_called()
+
+    def test_curator_reaches_snapshot_only_on_a_managed_repository(self):
+        route = mock.Mock(return_value={"archiveBase64": ""})
+        handler = self._handler("snapshot", credential_proxy.CALLER_ROLE_CURATOR, {"repository": "acme/infra", "paths": ["knowledge"]})
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"snapshot": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            handler._handle_vcs_post()
+        self.assertEqual(HTTPStatus.OK, handler.replies[0][0])
+        route.assert_called_once()
+
+        unmanaged = self._handler("snapshot", credential_proxy.CALLER_ROLE_CURATOR, {"repository": "acme/infra", "paths": ["knowledge"]})
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"snapshot": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=False), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            unmanaged._handle_vcs_post()
+        self.assertEqual(HTTPStatus.FORBIDDEN, unmanaged.replies[0][0])
+        self.assertEqual("REPOSITORY_NOT_MANAGED", unmanaged.replies[0][1]["code"])
+
+        for verb in ("publish", "proposal-create", "proposal-view", "clone"):
+            refused = self._handler(verb, credential_proxy.CALLER_ROLE_CURATOR)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                refused._handle_vcs_post()
+            self.assertEqual(HTTPStatus.FORBIDDEN, refused.replies[0][0])
+            self.assertEqual("CALLER_VERB_FORBIDDEN", refused.replies[0][1]["code"])
 
     def test_the_shell_and_the_roleless_principal_still_reach_every_verb(self):
         for role in (credential_proxy.CALLER_ROLE_SHELL, ""):

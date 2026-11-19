@@ -21,7 +21,12 @@ object on stdout.
 - **Reading a dependency or an upstream project** named in an issue, a design
   doc, or a user's question.
 - **Reading the GitOps repository or a context repository** when you are not
-  editing it.
+  editing it. If the checkout contains `knowledge/` (`knowledge/decision/`,
+  `knowledge/lesson/`, `knowledge/decisions/`, or `knowledge/lessons/`) and you
+  are answering why a manifest or field is configured a certain way, check the
+  recorded `DEC-YYYY-NNN` and `LES-YYYY-NNN` files under `knowledge/` (or run
+  `python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> why <path>`
+  on a full `vcs.py clone`) and cite those record IDs in your answer.
 - **Tracing a diagnosis into a repository you do not write.** The chart a
   `HelmRelease` installs, the module a Terraform root calls, a context
   repository on the preflight's `CONTEXT:` line: read it here to name the

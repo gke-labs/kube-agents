@@ -782,6 +782,13 @@ spec:
     metadata:
       labels:
         {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 8 }}
+      {{- if eq $replayShadowMode "replay" }}
+      # A replay pod's seeded cache is in its emptyDir and a replacement starts
+      # empty: the collector seeds it only at its turn in a later pass, minutes
+      # in which every request misses. Scale-down must not remove one.
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      {{- end }}
     spec:
       {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replayShadow.replicaCount "selectorLabels" (include "kube-agents.replayShadowSelectorLabels" .))) }}
       {{- . | nindent 6 }}

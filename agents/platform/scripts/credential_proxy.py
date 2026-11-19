@@ -483,6 +483,12 @@ RETRY_AFTER_MIN_SECONDS = 5
 RETRY_AFTER_MAX_SECONDS = 30
 RETRY_AFTER_HEADER = "Retry-After"
 RESOURCE_PRESSURE_CODE = "CREDENTIAL_PROXY_RESOURCE_PRESSURE"
+# Set, true, on a busy answer given before the request was admitted -- before
+# its body was read and before anything it asked for ran (#6247). A caller may
+# send such a request again knowing nothing ran twice; a busy answer without it
+# may come from inside a route (a credential refresh's wait, after a forge call)
+# and is not sent again by `vcs_call`.
+BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 # What the tick's relief step calls: the C allocator's trim, where libc has it.
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
@@ -1490,6 +1496,11 @@ RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
 # A profile caller's proposal-update that edits labels (#3993): refused whoever
 # owns the proposal (vcs_broker.ProfileLabelsRefused).
 RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
+# A profile caller's issue-list whose `query` carries a search qualifier
+# (#6247): GitHub composes `query` ahead of its own `repo:` qualifier, so a
+# `repo:` or `org:` in it would widen the search past the managed repository.
+RULE_CALLER_VCS_QUERY = "caller.vcs-query"
+PROFILE_QUERY_QUALIFIER_CODE = "PROFILE_QUERY_QUALIFIER"
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
 DIAL_PATH = "/v1/dial"
@@ -1515,7 +1526,7 @@ def probe_gce_universe_domain_status(
 ) -> tuple[str, bool]:
     """Probe the GCE/GKE metadata server, returning `(domain, determined)`.
 
-    Only HTTP 200 (with a valid DNS domain) and HTTP 404 (authoritative non-GCE
+    Only HTTP 200 (with a valid universe domain) and HTTP 404 (authoritative non-GCE
     or older emulator) return `determined=True`; timeouts, connection errors,
     and 5xx responses return `(googleapis.com, False)` so callers never cache a
     transient metadata blip as commercial Google Cloud.
@@ -2299,6 +2310,9 @@ DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE = "kubeagents-credential-proxy-scope"
 SCOPE_AUDIENCE_ENV = "CREDENTIAL_PROXY_SCOPE_AUDIENCE"
 SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
+DEFAULT_CREDENTIAL_PROXY_CURATOR_AUDIENCE = "kubeagents-credential-proxy-curator"
+CURATOR_AUDIENCE_ENV = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"
+CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
 # The A2A gateway's ServiceAccount, the one caller the a2a-chat audience is for
 # (#6090). The operator renders it beside CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE,
 # only while Google Chat is armed on the A2A stack.
@@ -2348,6 +2362,10 @@ CALLER_ROLE_PROFILE = "profile"
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
+# The OKF memory curator pod. Version-control snapshot route only, on a
+# managed repository only, so the curator can verify active and superseded
+# records from Git without holding a forge credential of its own.
+CALLER_ROLE_CURATOR = "curator"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -2374,6 +2392,7 @@ CALLER_ROLES = (
     CALLER_ROLE_MCP,
     CALLER_ROLE_PROFILE,
     CALLER_ROLE_SCOPE,
+    CALLER_ROLE_CURATOR,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -2475,7 +2494,10 @@ def executable_refusal_message(role: str, executable: str) -> str:
 #   * the reads a change needs: clone (the working copy publish builds on),
 #     proposal-view, proposal-list, proposal-commits, branch-view, identity
 #     (the forge login a submission checks it is not proposing as), issue-list
-#     and issue-view. Each is held to the managed list like every other verb.
+#     and issue-view. Each is held to the managed list like every other verb,
+#     and an issue-list's search fields may start no qualifier of their own:
+#     plain words in `query`, no quote or backslash in a label name
+#     (profile_issue_query_refusal, rule caller.vcs-query).
 #   * publish, proposal-create and proposal-update, the writes that put a
 #     change up for review, each further gated in `_dispatch_vcs_post` on the
 #     task credential's permit (PROFILE_PERMIT_GATED_VCS_VERBS).
@@ -2487,6 +2509,7 @@ def executable_refusal_message(role: str, executable: str) -> str:
 # does not stretch to the rest.
 ROLE_VCS_VERBS: dict[str, frozenset[str]] = {
     CALLER_ROLE_MCP: frozenset({"proposal-view"}),
+    CALLER_ROLE_CURATOR: frozenset({"snapshot"}),
     CALLER_ROLE_PROFILE: frozenset(
         {
             "clone",
@@ -2561,6 +2584,65 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
     return None
 
 
+# What a profile caller's issue-list `query` may not hold, because each can
+# change what a forge's search grammar reads after it (#6247): a colon starts a
+# qualifier; a quote, a backslash or a parenthesis can open a phrase or a group
+# that swallows the `repo:` qualifier GitHub appends; and OR, AND and NOT,
+# GitHub's boolean operators, can join the caller's words to that qualifier as
+# an alternative rather than a narrowing.
+PROFILE_QUERY_REFUSED_CHARACTERS = frozenset(':"\\()')
+PROFILE_QUERY_REFUSED_WORDS = frozenset({"OR", "AND", "NOT"})
+# And it is printable and short: a control character or a query past a
+# forge's length limit could cut the composed search before the qualifier
+# appended after it.
+PROFILE_QUERY_MAX_LENGTH = 256
+
+
+def profile_issue_query_refusal(payload: dict[str, Any]) -> str | None:
+    """Why a profile caller's ``issue-list`` search fields are refused, or None.
+
+    A forge may compose these into its own search grammar, where a caller's
+    byte could start a qualifier of its own. GitHub puts ``query`` ahead of
+    the ``repo:<managed repository>`` qualifier it adds, so a ``repo:``,
+    ``org:`` or ``user:`` in it widens the search to whatever the forge
+    credential can read; every qualifier needs a colon, so a ``query`` holding
+    one is refused, as ``LOGIN_RE`` refuses one in ``author``. Nor may ``query``
+    reach that qualifier without one: an unclosed quote or parenthesis would
+    swallow it, and ``OR`` would make it one alternative of two. So ``query`` is
+    held to plain words, with none of PROFILE_QUERY_REFUSED_CHARACTERS, none
+    of PROFILE_QUERY_REFUSED_WORDS as a word of its own, nothing unprintable,
+    and no more than PROFILE_QUERY_MAX_LENGTH characters. This is an allowlist
+    by design, not a parser of any forge's grammar: a bypass found later is
+    answered by narrowing it further (dropping free-text `query` for the role
+    and keeping labels), not by modelling more syntax. It quotes each
+    ``labels`` and ``excludeLabels`` entry as ``label:"<name>"``, so a ``"``
+    in a name closes the quote and what follows is a qualifier; a name holding
+    ``"`` or ``\\`` is refused. A colon inside a label name stays, since the
+    quotes hold it. Fields of the wrong type are left to the adapter, which
+    refuses them.
+    """
+    query = payload.get("query")
+    if isinstance(query, str) and (
+        PROFILE_QUERY_REFUSED_CHARACTERS.intersection(query)
+        or PROFILE_QUERY_REFUSED_WORDS.intersection(query.split())
+        or not query.isprintable()
+        or len(query) > PROFILE_QUERY_MAX_LENGTH
+    ):
+        return (
+            "a profile caller's issue-list query may hold plain words only: printable, at most "
+            f"{PROFILE_QUERY_MAX_LENGTH} characters, no ':', quote, backslash or parenthesis, and "
+            "no OR, AND or NOT, any of which can change what a forge's search reads after it"
+        )
+    for field in ("labels", "excludeLabels"):
+        names = payload.get(field)
+        if isinstance(names, list) and any(isinstance(n, str) and ('"' in n or "\\" in n) for n in names):
+            return (
+                f"a profile caller's issue-list {field} may not contain a quote or a backslash, "
+                "which would end the label's quoting in a forge's search"
+            )
+    return None
+
+
 def _validate_role_vcs_verbs(
     table: dict[str, frozenset[str]],
     gated: frozenset[str] = PROFILE_PERMIT_GATED_VCS_VERBS,
@@ -2588,11 +2670,12 @@ def _validate_role_vcs_verbs(
             raise ValueError(
                 f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unknown))} is not a vcs verb"
             )
-    writes = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.WRITE_VERBS
-    if writes:
-        raise ValueError(
-            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(writes))} writes to the forge"
-        )
+    for read_only_role in (CALLER_ROLE_MCP, CALLER_ROLE_CURATOR):
+        writes = table.get(read_only_role, frozenset()) & vcs_broker.WRITE_VERBS
+        if writes:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{read_only_role!r}]: {', '.join(sorted(writes))} writes to the forge"
+            )
     # The profile role's writes are claim-gated: every write in its set must be
     # one `_dispatch_vcs_post` checks the permit for, so a write added to the
     # set without the gate is a red import rather than an ungated write.
@@ -2844,11 +2927,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # subscription sets, and the prefix is what this table keys the role on.
     (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
-    # The MCP pod reaches this family and no other; the profile role reaches
-    # it beside the exec route. Which verbs within it is ROLE_VCS_VERBS's to
-    # say, and for a profile caller the task credential's, checked in
+    # The MCP and curator pods reach this family and no other; the profile role
+    # reaches it beside the exec route. Which verbs within it is ROLE_VCS_VERBS's
+    # to say, and for a profile caller the task credential's, checked in
     # _dispatch_vcs_post.
-    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),
+    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE, CALLER_ROLE_CURATOR)),
     # The autonomy dial's level (vcs_broker.dial_level), reported from the agent
     # pod after an install admin's pick. The chat role alone: the agent pod holds
     # that token and the sandbox the model drives does not, so no command the
@@ -5312,6 +5395,7 @@ class ServiceAccountAuthenticator:
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
         scope_callers: frozenset[str] = frozenset(),
+        curator_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
         a2a_chat_callers: frozenset[str] = frozenset(),
     ) -> None:
@@ -5326,6 +5410,7 @@ class ServiceAccountAuthenticator:
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
         self.scope_callers = scope_callers
+        self.curator_callers = curator_callers
         self.a2a_chat_callers = a2a_chat_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
@@ -5470,6 +5555,10 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a scope caller may present only the scope audience")
         if role == CALLER_ROLE_SCOPE and username not in self.scope_callers:
             raise AuthenticationError("the scope audience is only for scope callers")
+        if username in self.curator_callers and role != CALLER_ROLE_CURATOR:
+            raise AuthenticationError("a curator caller may present only the curator audience")
+        if role == CALLER_ROLE_CURATOR and username not in self.curator_callers:
+            raise AuthenticationError("the curator audience is only for curator callers")
         # The a2a-chat binding, as the session one: empty leaves the audience
         # deciding, for an operator that renders no a2a-chat callers.
         if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:
@@ -5696,6 +5785,11 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(SCOPE_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    curator_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(CURATOR_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     a2a_chat_callers = frozenset(
         caller.strip()
         for caller in os.getenv(A2A_CHAT_CALLERS_ENV, "").split(",")
@@ -5791,6 +5885,21 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; the scope role is bound to the callers named there, so every "
                     "caller presenting the scope audience is refused"
                 )
+        curator_audience = os.getenv(CURATOR_AUDIENCE_ENV, "").strip()
+        if curator_audience and curator_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_CURATOR_AUDIENCE equals the %s audience; the curator "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[curator_audience] or CALLER_ROLE_SHELL,
+            )
+        elif curator_audience:
+            audience_roles[curator_audience] = CALLER_ROLE_CURATOR
+            if not curator_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_CURATOR_AUDIENCE is set but CREDENTIAL_PROXY_CURATOR_CALLERS "
+                    "is not; the curator role is bound to the callers named there, so every "
+                    "caller presenting the curator audience is refused"
+                )
         # The profile workers' audience (#3889), read raw for the same reason,
         # and refused on a collision for the mcp one's. Its callers come from
         # the identity map rather than a list of their own: one rendering
@@ -5866,6 +5975,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         session_callers=session_callers,
         mcp_callers=mcp_callers,
         scope_callers=scope_callers,
+        curator_callers=curator_callers,
         a2a_chat_callers=a2a_chat_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
@@ -8185,12 +8295,16 @@ VCS_SCRATCH_DIR = "vcs"
 # `archive` and `ls-tree` are on it for one caller: `snapshot` lists one
 # revision's tree to size the tar, then writes the tree as a tar, to a file in
 # its scratch directory (`--output`), from a bare clone.
+#
+# `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
+# against the policy base's merge-base before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
         "bundle",
         "checkout",
         "clone",
+        "diff-tree",
         "fetch",
         "init",
         "ls-remote",
@@ -8208,9 +8322,9 @@ VCS_GIT_SUBCOMMANDS = frozenset(
 # The broker's own git subcommands that no caller's argv may name. `archive`
 # takes `--output=<path>` and `--remote=<url>`, and only `snapshot` issues it,
 # with a path and a revision the broker chose, so it stays off the `/v1/exec`
-# argument gate below. `ls-tree` is there for the same caller, and stays off
-# the gate because no caller of `/v1/exec` needed it before.
-VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "ls-tree"})
+# argument gate below. `ls-tree` and `diff-tree` stay off `/v1/exec` too so
+# `ALLOWED_GIT_SUBCOMMANDS` does not widen for sandbox callers.
+VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "diff-tree", "ls-tree"})
 
 
 def _allowed_git_subcommands() -> frozenset[str]:
@@ -16905,6 +17019,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # principal with no role is the socket posture and keeps every verb.
         principal = getattr(self, "principal", None)
         role = principal.role if principal is not None else ""
+        # Every answer below up to the body read is given with the body still
+        # unsent or unread, so each drains it first: closing on unread bytes
+        # resets the connection, and a caller still sending a large body (a
+        # publish bundle) reads a broken pipe in place of the refusal, which
+        # vcs_client reports as a broker fault (#6247).
+        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         if not vcs_verb_permitted(role, verb):
             LOGGER.warning(
                 "vcs verb refused for role role=%s verb=%s rule=%s",
@@ -16912,6 +17032,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(verb),
                 RULE_CALLER_VCS_VERB,
             )
+            self._drain_vcs_body(body_limit)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -16946,6 +17067,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 }
                 if detail := vcs_broker.write_mode_detail(raw):
                     refusal["detail"] = detail
+                self._drain_vcs_body(body_limit)
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return TOOL_STATUS_BLOCKED
         if role == CALLER_ROLE_PROFILE:
@@ -16958,6 +17080,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     RULE_CALLER_VCS_PERMIT,
                     refusal,
                 )
+                self._drain_vcs_body(body_limit)
                 self._json(
                     HTTPStatus.FORBIDDEN,
                     {
@@ -16969,6 +17092,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return TOOL_STATUS_BLOCKED
         if self.vcs is None:
+            self._drain_vcs_body(body_limit)
             self._json(
                 HTTPStatus.NOT_FOUND,
                 {
@@ -16979,9 +17103,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return TOOL_STATUS_ERROR
         route = vcs_broker.route_table(self.vcs).get(verb)
         if route is None:
+            self._drain_vcs_body(body_limit)
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return TOOL_STATUS_BLOCKED
-        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
             # One slot for the whole request: the body, which may carry a
             # bundle of tens of MiB and is not read until the request is
@@ -16993,10 +17117,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # publish must not spend the interactive reserve the shell and the
             # session pods keep. Every other role keeps the interactive slot
             # it had.
+            # Whether the request got past admission: a busy refusal before
+            # it ran nothing and read no body; one after it may have come from
+            # inside the route, past a forge call.
+            admitted = False
             vcs_session_slot = (
                 self._session_slot(role) if role == CALLER_ROLE_PROFILE else contextlib.nullcontext()
             )
             with vcs_session_slot, self._request_slot(admission_class(role)):
+                admitted = True
                 # Read under one deadline for the whole body: the slot is held
                 # from here on, and a caller that stalls or trickles mid-send
                 # would otherwise keep it with nothing running in it. A stalled
@@ -17019,6 +17148,23 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "request body not received verb=%s type=%s", verb, type(exc).__name__
                     )
                     return TOOL_STATUS_ERROR
+                if role == CALLER_ROLE_PROFILE and verb == "issue-list":
+                    query_refusal = profile_issue_query_refusal(payload)
+                    if query_refusal is not None:
+                        LOGGER.warning(
+                            "vcs issue-list query refused for a profile caller rule=%s",
+                            RULE_CALLER_VCS_QUERY,
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": query_refusal,
+                                "code": PROFILE_QUERY_QUALIFIER_CODE,
+                                "rule": RULE_CALLER_VCS_QUERY,
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
                 # The managed-repository control: the broker holds the forge credential, so "is this a repository we act
                 # on" can only be answered here. Nothing downstream answers it
                 # -- a forge is handed a repository and spends the token on it
@@ -17053,10 +17199,21 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         )
                         return TOOL_STATUS_BLOCKED
                     payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
-                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
+                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS and role != CALLER_ROLE_CURATOR
                 named, outside = payload.get("repository"), None
                 if role_selected:
                     named, outside = self.vcs.snapshot_source(named)
+                elif verb == "snapshot" and role == CALLER_ROLE_CURATOR:
+                    named, outside = self.vcs.snapshot_source(named)
+                    if outside is not None:
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "the curator caller may snapshot only managed repositories",
+                                "code": "REPOSITORY_NOT_MANAGED",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
                 resolves = verb not in vcs_broker.UNGATED_VERBS and outside is None
                 if resolves:
                     try:
@@ -17157,13 +17314,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return TOOL_STATUS_ERROR
         except CommandSlotUnavailable as exc:
-            # Raised before the body was read, so nothing is left half-done --
-            # and the body is drained before the answer, or a caller still
-            # sending a large one would see the connection reset in place of
-            # the 503.
+            # Raised by admission, before the body was read, so nothing is
+            # left half-done -- and the body is drained before the answer, or
+            # a caller still sending a large one would see the connection
+            # reset in place of the 503. Raised past admission instead (a
+            # forge credential refresh's wait inside the route), the body is
+            # read already and the route may have reached the forge, so the
+            # answer does not say it came before admission.
             LOGGER.warning("command %s verb=%s: %s", _busy_phrase(exc), verb, exc)
-            drain_request_body(self, body_limit)
-            self._busy(exc)
+            if not admitted:
+                self._drain_vcs_body(body_limit)
+            self._busy(exc, before_admission=not admitted)
             return TOOL_STATUS_BUSY
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
@@ -17171,6 +17332,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
             return TOOL_STATUS_ERROR
+
+    def _drain_vcs_body(self, body_limit: int) -> None:
+        """Drain a vcs request's unread body ahead of an answer (`drain_request_body`).
+
+        A handler the route tests build by hand has no connection and nothing
+        to drain, as the body read in `_dispatch_vcs_post` allows for.
+        """
+        if getattr(self, "connection", None) is not None:
+            drain_request_body(self, body_limit)
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -17506,7 +17676,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         elif method == "PUT":
             # An audit-report write (#5619), under its own cap.
             drain_request_body(self, AUDIT_REPORT_MAX_BYTES)
-        self._busy(CommandSlotUnavailable(SHUTDOWN_DRAINING_ERROR, bound=ADMISSION_BOUND_DRAINING))
+        self._busy(
+            CommandSlotUnavailable(SHUTDOWN_DRAINING_ERROR, bound=ADMISSION_BOUND_DRAINING), before_admission=True
+        )
         return True
 
     def _handle_teams_post(self) -> None:
@@ -17740,7 +17912,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             },
         )
 
-    def _busy(self, exc: CommandSlotUnavailable) -> None:
+    def _busy(self, exc: CommandSlotUnavailable, before_admission: bool = False) -> None:
         """Answer a broker at its concurrency cap or child memory budget, or
         refusing under resource pressure, on whichever route asked.
 
@@ -17757,7 +17929,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         Counted here, once per route that answers it, under the bound the
         exception carries; the 503 names it to the caller too, so the shim can
         tell a bound another exec replica may not hold from one it will.
+        `before_admission` adds BUSY_BEFORE_ADMISSION_KEY, for a refusal given
+        before the request was admitted, when nothing it asked for has run.
         """
+        flag = {BUSY_BEFORE_ADMISSION_KEY: True} if before_admission else {}
         bound = getattr(exc, "bound", ADMISSION_BOUND_OTHER)
         if bound not in ADMISSION_BOUNDS:
             bound = ADMISSION_BOUND_OTHER
@@ -17770,6 +17945,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "code": RESOURCE_PRESSURE_CODE,
                     "error": str(exc),
                     "retry_after": exc.retry_after,
+                    **flag,
                 },
                 headers={RETRY_AFTER_HEADER: str(exc.retry_after)},
             )
@@ -17778,7 +17954,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # stopping broker (`draining`) from one at a cap.
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
-            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound},
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound, **flag},
         )
 
 

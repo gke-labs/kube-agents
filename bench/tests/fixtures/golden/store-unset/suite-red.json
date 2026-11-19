@@ -104,7 +104,8 @@
         "scoring_version": "v1",
         "judge_model": "gemini-3.1-pro-preview",
         "fleet": 1,
-        "verifiers": 1
+        "verifiers": 1,
+        "mode": "next"
       },
       "baseline_judged": null,
       "baseline_runs": 0,
@@ -206,7 +207,8 @@
         "scoring_version": "v1",
         "judge_model": "gemini-3.1-pro-preview",
         "fleet": 1,
-        "verifiers": 1
+        "verifiers": 1,
+        "mode": "next"
       },
       "baseline_judged": null,
       "baseline_runs": 0,

@@ -185,20 +185,16 @@ meaning of the field - the capability switch above, and the reserved volume name
 webhook refuses. `POD_NAMESPACE` is the other name the render writes, but it goes in as a
 default a CR beats, so it overrides nothing.
 
-**Flipping to `mode: today` with a declared bridge still set takes the agent down.** A
-rendered bridge leaves the pod with the mode: the flip renders none, so it needs no CR edit
-first. A declared one does not leave. The operator copies `spec.deployment.sidecars` into
-the pod without consulting the mode, so the flip removes the NATS Service and leaves the
-bridge dialling a host that no longer resolves. Confirmed live 2026-09-05: the sidecar
-crash-loops, and because it shares the agent's pod the pod never reaches Ready - the whole
-agent is down, not merely carrying an A2A trace. On an install that declares its own
-bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any flip runbook
-for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
-follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
-that look like bus clients, flipped, and the saved list declared again once `next` is back;
-a CR with none, the lane's own, is only flipped. Asked to end under `today`
-(`ROLLBACK_END_MODE=today`, the today lane's run), it refuses a CR with declared sidecars before
-changing anything, since the last flip would leave them unset.
+**A declared bridge outlives the bus it dials.** The operator copies `spec.deployment.sidecars`
+into the pod as declared, so a declared bridge stays in the pod whatever happens to the NATS
+Service; a rendered one is the operator's and goes with the stack it renders. Confirmed live
+2026-09-05, when a flip to `spec.mode: today` still removed the bus: the sidecar crash-looped
+dialling a host that no longer resolved, and because it shared the agent's pod the pod never
+reached Ready - the whole agent was down, not merely carrying an A2A trace. The flip is gone (the
+webhook rewrites `today` to `next`, and `hack/rollback-roundtrip.sh`, which exercised it and
+refused a CR with declared sidecars, is deleted), but the shape remains: on an install that
+declares its own bridge, unset `spec.deployment.sidecars` _before_ removing the bus it dials. In
+any such runbook that step is a blocker, not tidiness.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -214,12 +210,13 @@ workflow publishes it as `hermes-bridge` beside the other first-party images, `F
 platform-agent image the same run pushed under the same commit tag, and `images.json`
 carries it with `A2A_BRIDGE_IMAGE` as its operator override, which the operator reads when
 it renders the bridge. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own in its
-`a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+`a2a-bridge` step on every build `hack/ci-deploy.sh` makes (the release-candidate path builds
+nothing), `FROM` the
 platform-agent image that same build produced, by the tag it just pushed and never from a
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
 `A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
 eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
-"The CI flag"). Either way the sidecar and the agent
+"The inject door on every lane"). Either way the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the
@@ -430,25 +427,43 @@ be posted back. A Google Chat, Slack or console conversation is posted back. A c
 conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
-Before the same first turn the bridge also reads the store the other way: a reply typed under a
-report the system pushed (a relayed scheduled report, the triage card's report the notifier posts
-under an alert, a card's report it posted into a Slack or Google Chat conversation) arrives with
-no link to that report, and under `next`
-nothing else attaches it, since the Hermes gateway's `incident_context` hook runs on no turn of
-the `api` executor. So the bridge asks session-kv for the row the poster stored
-(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's
-recent-reports index or its Google Chat first-reply recovery): first by the thread the conversation key
-names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/threads/B` is
-`(spaces/A, the thread name)`), then by the Hermes session and the conversation key, which is how
-the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
-gateway conversation (a console
-conversation's row carries the filing turn's task in its key, which a later reply does not know,
-so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
-since every later message there shares it and would carry the first stored report for the row's
-life). A row found is spliced ahead of
+Before the same first turn the bridge also puts the report a reply is under ahead of it. Under
+`next` a reply typed under a report the system pushed (a relayed scheduled report, the triage
+card's report the notifier posts under an alert, a card's report posted into a conversation)
+arrives with no link to that report, and nothing else attaches it, since the Hermes gateway's
+`incident_context` hook runs on no turn of the `api` executor. Two sources, in order. First the
+gateway's relay: the A2A gateway keeps the text of each report its notify route posts into a
+console conversation (a card's report, marked `report` by the notifier and naming its task; a
+progress note, which shares the thread and the task, is not kept; a Slack or Google Chat
+thread's posts, a relayed scheduled report and an alert's triage report it does not keep, and the
+lookup still serves them; `docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it
+on a reply's submission as a `pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the
+reply names the task the report was on (a console or MCP client's `replyTo`, the chain's root even
+when a delegated child filed the card); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so
+what it kept is what the person read; it holds reports only, and when two reports share one root
+(two cards from one turn) the reply carries the newest. This is how a card filed in a delegated
+child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
+reply never reads, and the relay carries the report across. The relay rides a human turn on every
+route; this executor frames it on the platform route (the install's default), and a conversation
+on its own session pod (the a2a-worker) does not read it yet. Then, with no relayed part (the gateway restarted
+since the post, or the post was one it does not keep), the bridge asks session-kv for the row the poster stored
+(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's recent-reports
+index or its Google Chat first-reply recovery): first, when the submission carries a `replyTo`
+part, by the Hermes session and `<conversation key>#<task>`, which is how the notifier keys a
+card's report it posted into a console conversation (the report's frame names the filing turn's
+task as `replyTo`, and a console client, the MCP server's `send_message` with `reply_to`, echoes it
+with the reply; a reply while the turn is still running is steered into it and carries no
+`replyTo`, since the report is attached on an opening turn only); then by the thread the
+conversation key names (`slack:<channel>/<ts>` is the row `(channel, ts)`;
+`gchat:spaces/A/threads/B` is `(spaces/A, the thread name)`); then by the Hermes session and the
+conversation key, which is how the notifier keys a card's report it posted into a Slack or Google
+Chat gateway conversation. A console reply that names no task takes only the last,
+`(session, key)`, and finds no row, since the console row's key carries the task; a key naming a
+whole DM or space rather than a thread is not looked up at all, since every later message there
+shares it and would carry the first stored report for the row's life. A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
-the hook by its test). No row, a store that errors, or a bridge with no route store leaves the
+the hook by its test). No relayed part and no row, a store that errors, or a bridge with no route store leaves the
 prompt as typed; a steer queued during the task is not looked up, since its session has read the
 report, and a later message on the conversation is a new task and is.
 
@@ -877,8 +892,8 @@ and a submission past it is finalized `failed` with `reason: bridge-queue-overfl
 infrastructure in the harness's classification. Size the parallelism against both: concurrency
 at or above the parallelism, and the number of submissions a run can have outstanding at once,
 the units in flight plus anything abandoned and not yet cancelled, well under the queue
-capacity. `hack/ci-deploy.sh` under `EVAL_MODE_NEXT=1` sets the operator's
-`A2A_BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`, and the operator renders that
+capacity. `hack/ci-deploy.sh` sets the operator's `A2A_BRIDGE_CONCURRENCY` to the run's
+`EVAL_TASK_PARALLELISM` on every eval install, and the operator renders that
 into the bridge. It sizes the TASKS consumer reserve from the same value, so a concurrency the
 stream cannot hold is a refused provision and a `Degraded` CR, not a silent shortfall. That
 read, the render in [Where it runs](#where-it-runs), the two env names it writes on every
