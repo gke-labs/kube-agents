@@ -47,6 +47,10 @@ import clean_merges
 import kubeagents_switches
 
 logger = logging.getLogger(__name__)
+# The credential broker is an in-cluster Service: a proxy from the environment
+# must not get the level report and its bearer token, and urllib does not leave
+# out a cluster host by itself.
+_BROKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 STATE_NAME = "kube-agents/dial.json"
 #: The managed .env key (``KUBEAGENTS_DIAL_ADMINS``), which the operator pins.
@@ -314,7 +318,7 @@ def report_level(level: str) -> bool:
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=BROKER_TIMEOUT_SECONDS) as response:
+        with _BROKER_OPENER.open(request, timeout=BROKER_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read() or b"{}")
     except Exception as exc:  # noqa: BLE001 — reported again on the next pick
         logger.warning("dial: could not report the level %s to the broker: %s", level, exc)
