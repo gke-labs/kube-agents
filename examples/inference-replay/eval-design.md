@@ -732,8 +732,10 @@ of the request's fingerprint and a hash of the answer exactly as it is stored an
 once like every other object; only those a passing run gave are published, decided answer by
 answer, so two runs that gave the same answer share one file and two that differed in any served
 word or action never do. The replay proxy hands a request's
-answers out in turn, so the first run to ask gets the first answer, the second run the second, and
-so on. Once a run is served one answer, its next request holds that answer, so it only matches what
+answers out in turn, each as often as passing runs gave it: a request whose passing runs answered
+one way nine times and another way once is served the second answer one time in ten, in a fixed
+order, rather than every other time. Identical answers share one file, so without the count a rare
+answer would be served as often as the common one. Once a run is served one answer, its next request holds that answer, so it only matches what
 followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
 once can take turns in either order, so this spreads runs across recordings rather than giving each
 run its own. Giving each run exactly one recording needs the proxy to know the run while it's
@@ -742,7 +744,8 @@ card after that was created by an answer the proxy already saw. That comes later
 
 The lane loads only answers that a passing run of a night inside its 30-hour window produced. A
 night's record lists the answers its passing runs gave, so an older object that a later night only
-found already in the bucket never comes in on that night's record.
+found already in the bucket never comes in on that night's record. The record also counts how many
+requests from passing runs got each answer, and the lane adds the counts of the nights in its window.
 
 ### Prompts change often
 

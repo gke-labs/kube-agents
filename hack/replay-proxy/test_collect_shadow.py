@@ -785,6 +785,14 @@ class ReplayModeTest(CollectorTestCase):
         self.collector.collect_pass()
         self.assertEqual(self.seeds(), 1, "a seeded pod is not seeded again")
 
+    def test_a_weights_file_is_seeded_with_the_answers(self):
+        path = os.path.join(self.seed_dir, "weights", f"{fp(1)}.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as handle:
+            handle.write('{"%s": 9}' % fp(2))
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, "weights", f"{fp(1)}.json")))
+
     def test_a_pod_that_replaced_one_is_seeded_too(self):
         self.collector.collect_pass()
         other = self.cluster.add_pod("proxy-b")

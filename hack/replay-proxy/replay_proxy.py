@@ -55,6 +55,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -87,6 +88,11 @@ VARIANT_MEMO_CAPACITY = 100_000
 # Keys whose turn among their saved answers replay keeps (ShadowProxy.next_turn),
 # least recently looked up dropped first. A seeded cache holds fewer keys than this.
 TURN_MEMO_CAPACITY = 1_000_000
+# Distinct weightings whose turn order (weighted_cycle) is kept built. A cycle
+# is as long as its weights' sum (each weight at most
+# replay_cache.MAX_ANSWER_WEIGHT, and reduced by their common divisor), and
+# most keys with several answers weigh a few turns in all.
+CYCLE_MEMO_CAPACITY = 1024
 # A rough prompt-token estimate for a line whose response carried no usage.
 BYTES_PER_TOKEN = 4
 DEFAULT_BIND_HOST = "0.0.0.0"
@@ -570,8 +576,51 @@ Keyed = Tuple[normalizer.NormalizedRequest, str]
 # A servable replay hit: the restored answer, its saved entry, the fingerprint
 # it is saved under, how it matched (VIA_EXACT or VIA_ANSWER_SLOTS), which of
 # the key's answers it is (its identity; replay_cache.LEGACY_ANSWER for the
-# older layout's), and how many answers the key has.
-Hit = Tuple[Dict[str, Any], Dict[str, Any], str, str, str, int]
+# older layout's), how many answers the key has, the served answer's weight
+# and the key's total weight (weighted_cycle).
+Hit = Tuple[Dict[str, Any], Dict[str, Any], str, str, str, int, int, int]
+
+
+@lru_cache(maxsize=CYCLE_MEMO_CAPACITY)
+def weighted_cycle(weights: Tuple[int, ...]) -> Tuple[int, ...]:
+    """One full turn order over answers weighing `weights`: sum(weights) turns, answer i taking weights[i] of them.
+
+    Smooth weighted round-robin: each turn every answer gains its weight, the
+    one with the most (the first on a tie) is taken and loses the total. The
+    order depends on the weights alone, so it is the same on every pod and
+    every run, and spreads each answer's turns evenly: 9:1 gives the rarer
+    answer one turn in ten, 2:1 gives A, B, A, and equal weights give plain
+    rotation, 0, 1, 2, ...
+    """
+    total = sum(weights)
+    current = [0] * len(weights)
+    order = []
+    for _ in range(total):
+        for i, w in enumerate(weights):
+            current[i] += w
+        chosen = max(range(len(weights)), key=lambda i: (current[i], -i))
+        current[chosen] -= total
+        order.append(chosen)
+    return tuple(order)
+
+
+def weighted_order(weights: Tuple[int, ...], turn: int) -> List[int]:
+    """The answers a lookup at `turn` tries, in order: the cycle's from that turn on, each once.
+
+    The first is the one the weighted rotation serves; a refused answer passes
+    to the next distinct one the cycle reaches, so every answer is tried
+    before the request goes live.
+    """
+    divisor = math.gcd(*weights)
+    cycle = weighted_cycle(tuple(w // divisor for w in weights))
+    order: List[int] = []
+    for step in range(len(cycle)):
+        index = cycle[(turn + step) % len(cycle)]
+        if index not in order:
+            order.append(index)
+            if len(order) == len(weights):
+                break
+    return order
 
 # Tells the analysis worker to stop.
 _STOP = object()
@@ -652,10 +701,12 @@ class ShadowProxy:
 
         On a miss, (None, None), or (None, refusal) when a key matched saved
         answers that guards refused: the key and the guard, for the miss block.
-        A key with several saved answers hands them out in turn (next_turn):
-        each lookup starts at the next one, and a refused answer passes to the
-        one after it, so a request is served whichever of them its guards allow
-        and goes live only when they refuse every one. `keyed` is the
+        A key with several saved answers hands them out in turn (next_turn),
+        each in proportion to how often passing runs produced it (its weight,
+        replay_cache.AnswerCache.weights; 1 when the cache gives none) by
+        weighted_order: a refused answer passes to the next one in that order,
+        so a request is served whichever of them its guards allow and goes
+        live only when they refuse every one. `keyed` is the
         request's normalization and fingerprint (keyed()), when the caller has
         them already.
         """
@@ -681,13 +732,14 @@ class ShadowProxy:
                 return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
         if not saved:
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
-        start = self.next_turn(fingerprint)
+        found = self.cache.weights(fingerprint) if len(saved) > 1 else {}
+        weights = tuple(found.get(name, 1) for name, _ in saved)
         first_guard = None
-        for offset in range(len(saved)):
-            name, entry = saved[(start + offset) % len(saved)]
+        for index in weighted_order(weights, self.next_turn(fingerprint)):
+            name, entry = saved[index]
             answer, guard = self._servable(name, entry, fingerprint, via, normalized)
             if answer is not None:
-                return (answer, entry, fingerprint, via, name, len(saved)), None
+                return (answer, entry, fingerprint, via, name, len(saved), weights[index], sum(weights)), None
             first_guard = first_guard or guard
         refused = refusal(via, first_guard or F.GUARD_UNREADABLE_ENTRY)
         if len(saved) > 1:
@@ -697,9 +749,9 @@ class ShadowProxy:
     def next_turn(self, fingerprint: str) -> int:
         """The turn this lookup of a key takes: 0 for its first, then 1, 2, ..., one counter per key.
 
-        A lookup takes the saved answer at its turn modulo how many there are,
-        so the repetitions of a case are served different recordings in turn
-        rather than all one. The counter is this process's: each proxy pod
+        A lookup takes the saved answer at its turn in the key's weighted
+        order (weighted_order), so the repetitions of a case are served
+        different recordings in turn rather than all one. The counter is this process's: each proxy pod
         turns its own.
         """
         with self._turn_lock:
@@ -1163,6 +1215,8 @@ class ShadowProxy:
             entry[F.SERVED_VIA] = upstream.get("served_via")
             entry[F.SERVED_ALTERNATE] = upstream.get("served_alternate")
             entry[F.ALTERNATES] = upstream.get("alternates")
+            entry[F.SERVED_WEIGHT] = upstream.get("served_weight")
+            entry[F.ALTERNATES_WEIGHT] = upstream.get("alternates_weight")
         entry.update(usage_tokens(upstream["usage"]))
         if served is not None:
             # The recording's reasoning and cache writes, billed when it was recorded, not now.
@@ -1322,11 +1376,13 @@ class Handler(BaseHTTPRequestHandler):
             if hit is not None:
                 self.proxy.metrics.add("completions")
                 self.proxy.metrics.add("served")
-                answer, saved, fingerprint, via, alternate, alternates = hit
+                answer, saved, fingerprint, via, alternate, alternates, weight, total = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
                 upstream["served_alternate"] = alternate
                 upstream["alternates"] = alternates
+                upstream["served_weight"] = weight
+                upstream["alternates_weight"] = total
                 self.proxy.submit(body, received, upstream, len(raw), served=saved, keyed=keyed)
                 return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))

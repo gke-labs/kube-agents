@@ -614,20 +614,36 @@ class Attribution:
         gave never passes. With no PASS, a producer still pending keeps it
         pending; otherwise the first producer's decision stands.
         """
-        decisions = []
-        for line in producers:
-            if not line.storable:
-                continue
-            found = self.decide(line)
-            if found.decision == PASS and self._look_alike(line):
-                found = Decision(AMBIGUOUS, found.runs)
-            decisions.append(found)
+        decisions = [found for _, found in self._producer_decisions(producers)]
         passed = sorted({run for found in decisions if found.decision == PASS for run in found.runs})
         if any(found.decision == PASS for found in decisions):
             return Decision(PASS, tuple(passed))
         if any(found.decision == PENDING for found in decisions):
             return Decision(PENDING)
         return decisions[0] if decisions else Decision(UNATTRIBUTED if self.final else PENDING)
+
+    def _producer_decisions(self, producers: List[Line]) -> List[Tuple[Line, Decision]]:
+        """Each storable producer's own decision, a card-less look-alike's PASS refused (decide_alternate)."""
+        out = []
+        for line in producers:
+            if not line.storable:
+                continue
+            found = self.decide(line)
+            if found.decision == PASS and self._look_alike(line):
+                found = Decision(AMBIGUOUS, found.runs)
+            out.append((line, found))
+        return out
+
+    def passing_count(self, producers: List[Line]) -> int:
+        """How many times passing runs produced an alternate: its producers decided PASS, one per request.
+
+        The same per-line decision decide_alternate publishes on, counted
+        rather than or-ed: each is one request a passing run sent and the
+        model answered with exactly this stored answer, so the counts of a
+        key's alternates are how often passing runs got each. A request is
+        counted once however many times its line was read.
+        """
+        return len({line.request_id for line, found in self._producer_decisions(producers) if found.decision == PASS})
 
     def _look_alike(self, line: Line) -> bool:
         """Whether a card-less line's evidence could belong to a different stored answer.

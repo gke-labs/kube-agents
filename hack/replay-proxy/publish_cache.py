@@ -42,10 +42,14 @@ And gs://<bucket>/replay-cache/builds/<build>/publish-<ms>.json, one per call
 that changed anything: the graded runs and their outcomes, what was decided,
 and the objects this call confirmed are in the bucket (uploaded now, or there
 already from an earlier night), each with its size in this night's copy and,
-for a slot, the fingerprint of the answer it points at; and, under `produced`,
-per fingerprint, the answers (alternates) this night's passing runs gave. The
+for a slot, the fingerprint of the answer it points at; under `produced`,
+per fingerprint, the answers (alternates) this call confirmed and so this
+night's passing runs gave; and under `produced_counts`, for every alternate
+the build has confirmed so far, how many of its producing requests were
+attributed to passing runs (run_attribution.Attribution.passing_count). The
 replay lane reads these to fetch exactly the answers recent nightlies
-produced (fetch_cache.py) and to compare verdicts (lane_report.py).
+produced and to weigh them (fetch_cache.py), and to compare verdicts
+(lane_report.py).
 
 Every object is written once (`gcloud storage cp --no-clobber`, and the
 recorder's grant cannot overwrite). An alternate's name is the hash of its
@@ -112,6 +116,13 @@ RECORD_OBJECTS = "objects"
 # lane may load (fetch_cache.py), so a served answer is never older than the
 # night that produced it.
 RECORD_PRODUCED = "produced"
+# Per normalizer version, per fingerprint, per answer: how many times this
+# build's passing runs produced each alternate it has confirmed so far, in this
+# call or an earlier one (run_attribution.Attribution.passing_count), counted
+# again on every call, so a build's newest record holds its fullest count. The
+# lane serves a key's answers in proportion to these (fetch_cache.py); a record
+# written before it has none, and each answer it produced counts once.
+RECORD_PRODUCED_COUNTS = "produced_counts"
 # The recording job: its Prow job name, the install mode it graded (next or
 # today), its forge (github when EVAL_FORGE is unset) and the commit its
 # checkout was at (empty when git could not say; records written before it
@@ -270,6 +281,9 @@ class Selection:
     decisions: Dict[str, int] = field(default_factory=dict)
     runs: List[RA.Run] = field(default_factory=list)
     lost_lines: int = 0
+    # version -> fingerprint -> answer -> passing producer count (RECORD_PRODUCED_COUNTS),
+    # for every alternate already in the bucket or decided PASS by this call.
+    counts: Dict[str, Dict[str, Dict[str, int]]] = field(default_factory=dict)
 
     def add(self, version: str, sub: str, name: str, path: str) -> None:
         self.objects.setdefault(version, {}).setdefault(sub, {}).setdefault(name, path)
@@ -279,6 +293,9 @@ class Selection:
 
     def count(self, decision: str) -> None:
         self.decisions[decision] = self.decisions.get(decision, 0) + 1
+
+    def set_count(self, version: str, parts: Tuple[str, str], count: int) -> None:
+        self.counts.setdefault(version, {}).setdefault(parts[0], {})[parts[1]] = count
 
 
 @dataclass
@@ -333,9 +350,11 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 recorded.setdefault(line.fingerprint, line)
         for sub in (ANSWERS, ALTS):
             for name, path in pod_files(pod_dir, sub):
-                if (version, name) in state.done:
-                    continue
                 parts = alternate_parts(name)
+                if (version, name) in state.done:
+                    if parts is not None and producers.get(parts):
+                        selection.set_count(version, parts, attribution.passing_count(producers[parts]))
+                    continue
                 fingerprint = parts[0] if parts is not None else name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
                 line = recorded.get(fingerprint) if parts is None else None
                 if (not producers.get(parts)) if parts is not None else line is None:
@@ -355,6 +374,8 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 selection.count(decision)
                 if decision == RA.PASS:
                     selection.add(version, sub, name, path)
+                    if parts is not None:
+                        selection.set_count(version, parts, attribution.passing_count(producers[parts]))
         for sub in (VARIANTS, MESSAGES):
             for name, path in pod_files(pod_dir, sub):
                 if (version, name) not in state.done:
@@ -439,6 +460,7 @@ class Publisher:
                     RECORD_OBJECTS: {version: [objects[n] for n in sorted(objects)]
                                      for version, objects in confirmed.items()},
                     RECORD_PRODUCED: {version: produced(objects) for version, objects in confirmed.items()},
+                    RECORD_PRODUCED_COUNTS: self._produced_counts(selection),
                 }, handle, sort_keys=True)
             dest = f"gs://{self.bucket}/{CACHE_ROOT}/{BUILDS_DIR}/{self.build}/{name}"
             if self.run("publish_record", ["gcloud", "storage", "cp", "--no-clobber", path, dest],
@@ -450,6 +472,17 @@ class Publisher:
                     self.unrecorded.setdefault(version, {}).update(objects)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
+
+    def _produced_counts(self, selection: Selection) -> Dict[str, Dict[str, Dict[str, int]]]:
+        """RECORD_PRODUCED_COUNTS: this call's count of every alternate this build has confirmed in the bucket."""
+        out: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for version, keys in sorted(selection.counts.items()):
+            for fingerprint, answers in sorted(keys.items()):
+                for answer, count in sorted(answers.items()):
+                    name = f"{ALTS}/{fingerprint}{VARIANT_SEPARATOR}{answer}{JSON_SUFFIX}"
+                    if (version, name) in self.state.done:
+                        out.setdefault(version, {}).setdefault(fingerprint, {})[answer] = count
+        return out
 
     def publish(self, final: bool = False) -> Dict[str, object]:
         selection = select(self.keep_dir, self.verdicts_dir, final, self.state)

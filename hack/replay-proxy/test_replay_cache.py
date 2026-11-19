@@ -39,6 +39,32 @@ class LayoutTest(unittest.TestCase):
                 self.assertIsNone(replay_cache.CACHE_REL_RE.match(rel + "\n"))
 
 
+class WeightsTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.cache = replay_cache.AnswerCache(self.root)
+
+    def test_a_weights_file_is_in_the_directory_layout_but_not_among_the_buckets_objects(self):
+        import publish_cache
+        rel = f"weights/{'a' * 64}.json"
+        self.assertTrue(replay_cache.CACHE_REL_RE.match(rel), "the lane seeds it")
+        self.assertIsNone(replay_cache.CACHE_REL_RE.match(rel + "\n"))
+        self.assertIsNone(publish_cache.OBJECT_NAME_RE.match(rel), "no record may name one")
+
+    def test_weights_keep_positive_integers_and_cap_them(self):
+        a, b, c, d, e = ("%x" % n * 64 for n in range(10, 15))
+        self.assertTrue(self.cache.save_weights("f" * 64, {a: 3, b: 0, c: True, d: "2", e: 10 ** 9}))
+        self.assertEqual(self.cache.weights("f" * 64), {a: 3, e: replay_cache.MAX_ANSWER_WEIGHT})
+
+    def test_no_file_or_a_file_that_is_not_a_map_gives_no_weights(self):
+        self.assertEqual(self.cache.weights("f" * 64), {})
+        path = Path(self.root, "weights", "e" * 64 + ".json")
+        path.parent.mkdir()
+        path.write_text("[1, 2]")
+        self.assertEqual(self.cache.weights("e" * 64), {})
+
+
 class NormalizeRestoreTest(unittest.TestCase):
     def test_round_trip_puts_the_current_values_in(self):
         saved = replay_cache.normalize_answer(ANSWER, mapping_for("task t_11111111 pod web-7d4b9c8f6d-x2k9p"))

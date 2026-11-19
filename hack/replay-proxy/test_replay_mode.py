@@ -325,6 +325,68 @@ class SeveralAnswersTest(SlotCacheCase):
             hit, _ = replay.lookup(self.BODY, time.time())
             self.assertEqual(hit[0]["content"], self.LOOKING["content"])
 
+    DONE = {"role": "assistant", "content": "Done already."}
+
+    def weigh(self, fingerprint, *weights):
+        """Write the key's weights file, giving its answers (in their saved order) these weights."""
+        names = [name for name, _ in self.saved(fingerprint)]
+        replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, dict(zip(names, weights)))
+        return names
+
+    def test_answers_are_served_in_proportion_to_their_weights_in_a_fixed_order(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        names = self.weigh(fingerprint, 9, 1)
+        runs = []
+        for _ in range(2):  # a second pod turns the same way
+            replay = self.proxy()
+            runs.append([replay.lookup(self.BODY, time.time())[0] for _ in range(20)])
+        served = [hit[4] for hit in runs[0]]
+        self.assertEqual(served, [hit[4] for hit in runs[1]], "the order is reproducible")
+        for cycle in (served[:10], served[10:]):
+            self.assertEqual((cycle.count(names[0]), cycle.count(names[1])), (9, 1), "9 of every 10 turns")
+        self.assertEqual({(hit[4], hit[6], hit[7]) for hit in runs[0]}, {(names[0], 9, 10), (names[1], 1, 10)})
+
+    def test_weights_two_to_one_interleave(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        names = self.weigh(fingerprint, 2, 1)
+        replay = self.proxy()
+        self.assertEqual([replay.lookup(self.BODY, time.time())[0][4] for _ in range(6)],
+                         [names[0], names[1], names[0]] * 2, "the rarer answer is spread, not bunched")
+
+    def test_an_answer_the_weights_do_not_name_weighs_one(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        names = [name for name, _ in self.saved(fingerprint)]
+        replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, {names[0]: 3})
+        replay = self.proxy()
+        served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(4)]
+        self.assertEqual((served.count(names[0]), served.count(names[1])), (3, 1))
+
+    def test_a_refused_answer_passes_to_the_next_in_weighted_order(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        self.recorded(self.BODY, self.DONE)
+        names = [name for name, _ in self.saved(fingerprint)]
+        weights = {names[0]: 1, names[1]: 1, names[2]: 8}
+        replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, weights)
+        # The cycle for 1, 1, 8 is 2 2 2 0 2 2 1 2 2 2; with the heavy answer
+        # refused, each turn takes the next distinct answer the cycle reaches.
+        heavy = dict(self.saved(fingerprint))[names[2]]["answer"]["content"]
+        self.break_answer(fingerprint, heavy)
+        replay = self.proxy()
+        served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(10)]
+        self.assertEqual(served, [names[i] for i in (0, 0, 0, 0, 1, 1, 1, 0, 0, 0)])
+
+    def test_the_older_layout_weighs_one(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        (_, entry), = self.saved(fingerprint)
+        shutil.rmtree(Path(self.cache_dir, replay_cache.ALTS_DIR))
+        replay_cache.AnswerCache(self.cache_dir).save(fingerprint, entry)
+        hit, _ = self.proxy().lookup(self.BODY, time.time())
+        self.assertEqual((hit[4], hit[5], hit[6], hit[7]), (replay_cache.LEGACY_ANSWER, 1, 1, 1))
+
     def test_a_slot_hands_its_keys_answers_out_in_turn(self):
         body = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"},
                                            {"role": "assistant", "content": "Yes."},
@@ -1308,6 +1370,8 @@ class ReplayTest(ProxyTestCase):
         lines = self.lines(3, out)
         self.assertEqual([line["served_alternate"] for line in lines], [names[0], names[1], names[0]])
         self.assertEqual({line["alternates"] for line in lines}, {2})
+        self.assertEqual({(line["served_weight"], line["alternates_weight"]) for line in lines}, {(1, 2)},
+                         "no weights file: each answer weighs 1")
 
     def test_a_replay_request_is_normalized_and_fingerprinted_once(self):
         self.record(chat("t_11111111", stream=False))

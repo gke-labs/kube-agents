@@ -455,6 +455,53 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self._records()[-1]["produced"], {VERSION: {fp(1): [b]}},
                          "tonight's passing run produced that answer, whichever night wrote the object")
 
+    def test_a_record_counts_how_often_passing_runs_produced_each_answer(self):
+        # Rep 1 asked twice and got a both times; rep 2 got a once and b once;
+        # rep 3 failed with a, which counts for nothing.
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.run("case-a", 3, "fail", ["t_33333333"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_11111111"), fp(1), answer=a)
+        self.world.request(worker("t_22222222"), fp(1), answer=a)
+        self.world.request(worker("t_22222222"), fp(1), recorded=True, answer=b)
+        self.world.request(worker("t_33333333"), fp(1), answer=a)
+        self.alternate(1, a)
+        self.alternate(1, b)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        record = self._records()[-1]
+        self.assertEqual(record["produced"], {VERSION: {fp(1): [a, b]}})
+        self.assertEqual(record["produced_counts"], {VERSION: {fp(1): {a: 3, b: 1}}})
+
+    def test_a_later_call_counts_again_an_answer_an_earlier_call_put_up(self):
+        a = "a" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])  # rep 2 still running
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), answer=a)
+        self.alternate(1, a)
+        self.write_logs()
+        self.publisher.publish(final=False)
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 1}}})
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.publisher.publish(final=True)
+        last = self._records()[-1]
+        self.assertEqual(last["produced"], {}, "already up: this call confirmed nothing new")
+        self.assertEqual(last["produced_counts"], {VERSION: {fp(1): {a: 2}}}, "but it counted it again")
+
+    def test_an_answer_not_put_up_is_not_counted(self):
+        a, b = "a" * 64, "b" * 64
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "fail", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True, answer=a)
+        self.world.request(worker("t_22222222"), fp(1), recorded=True, answer=b)
+        self.alternate(1, a)
+        self.alternate(1, b)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertEqual(self._records()[-1]["produced_counts"], {VERSION: {fp(1): {a: 1}}})
+
     def test_the_first_night_to_record_a_key_keeps_it(self):
         earlier = self.bucket.path(f"gs://{BUCKET}/replay-cache/{VERSION}/answers/{fp(1)}.json")
         os.makedirs(os.path.dirname(earlier))

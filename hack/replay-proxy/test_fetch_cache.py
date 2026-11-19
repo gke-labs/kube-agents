@@ -84,7 +84,7 @@ class FetchTest(unittest.TestCase):
 
     NEXT_GITHUB = {"name": "ci-kube-agents-eval-nightly", "mode": "next", "forge": "github"}
 
-    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB, produced=None):
+    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB, produced=None, counts=None):
         """A publish record; `objects` maps a version to names, or to (name, bytes, target) entries."""
         described = {}
         for version, names in objects.items():
@@ -99,7 +99,8 @@ class FetchTest(unittest.TestCase):
         self.bucket.put(f"replay-cache/builds/{build}/publish-{ms}.json",
                         json.dumps({"build": build, "objects": described, "runs": list(runs),
                                     **({"job": job} if job is not None else {}),
-                                    **({"produced": produced} if produced is not None else {})}), created)
+                                    **({"produced": produced} if produced is not None else {}),
+                                    **({"produced_counts": counts} if counts is not None else {})}), created)
 
     def objects(self, version, *names, content=None):
         for name in names:
@@ -143,6 +144,57 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(result.by_kind, {"alts": 1, "slots": 1}, "the slot's key has an answer")
         self.assertEqual([name for name, _ in replay_cache.AnswerCache(self.dest).answers(fp(1))], [fp(8)])
         self.assertTrue(FC.answers_arrived(self.dest))
+
+    def weights(self, fingerprint):
+        import replay_cache
+        return replay_cache.AnswerCache(self.dest).weights(fingerprint)
+
+    def test_counts_sum_across_builds_and_a_builds_newest_record_holds_its_count(self):
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        produced = {VERSION: {fp(1): [fp(7), fp(8)]}}
+        # Build 100 counted again on its second call: 4 and 1, not 2+4 and 1+1.
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced=produced,
+                    counts={VERSION: {fp(1): {fp(7): 2, fp(8): 1}}})
+        self.record("100", 2, {VERSION: []}, created=NOW - 9 * HOUR, produced={VERSION: {}},
+                    counts={VERSION: {fp(1): {fp(7): 4, fp(8): 1}}})
+        # Build 101, another night's runs: 5 more of the first.
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 5}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 9, fp(8): 1})
+        self.assertEqual(result.by_kind, {"alts": 2, "weights": 1})
+
+    def test_a_build_whose_records_give_no_count_adds_one_per_answer(self):
+        a, b = f"alts/{fp(1)}-{fp(7)}.json", f"alts/{fp(1)}-{fp(8)}.json"
+        self.objects(VERSION, a, b)
+        self.record("100", 1, {VERSION: [a, b]}, created=NOW - 10 * HOUR, produced={VERSION: {fp(1): [fp(7), fp(8)]}})
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 3}}})
+        self.fetcher().fetch(self.dest)
+        self.assertEqual(self.weights(fp(1)), {fp(7): 1 + 3, fp(8): 1})
+
+    def test_a_key_with_one_answer_gets_no_weights_file(self):
+        a = f"alts/{fp(1)}-{fp(7)}.json"
+        self.objects(VERSION, a)
+        self.record("101", 1, {VERSION: [a]}, produced={VERSION: {fp(1): [fp(7)]}},
+                    counts={VERSION: {fp(1): {fp(7): 3}}})
+        result = self.fetcher().fetch(self.dest)
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "weights")))
+        self.assertEqual(result.by_kind, {"alts": 1})
+
+    def test_produced_counts_outside_their_shape_refuse_the_whole_download(self):
+        message = f"messages/{'b' * 16}.json"
+        for counts in ([1], {VERSION: [1]}, {VERSION: {"../x": {fp(7): 1}}}, {VERSION: {fp(1): [fp(7)]}},
+                       {VERSION: {fp(1): {"../y": 1}}}, {VERSION: {fp(1): {fp(7): -1}}},
+                       {VERSION: {fp(1): {fp(7): True}}}, {VERSION: {fp(1): {fp(7): "2"}}}):
+            with self.subTest(counts=counts):
+                shutil.rmtree(self.bucket.root, ignore_errors=True)
+                self.bucket.created.clear()
+                self.objects(VERSION, message)
+                self.record("101", 1, {VERSION: [message]}, counts=counts)
+                with self.assertRaises(FC.Refused):
+                    self.fetcher().fetch(self.dest)
 
     def test_a_slot_whose_keys_alternates_were_all_left_out_is_removed(self):
         alt, slot = f"alts/{fp(1)}-{fp(7)}.json", f"slots/{fp(2)}.json"

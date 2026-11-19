@@ -16,7 +16,10 @@ Replay mode reads the directory: a hit restores one of the key's answers with
 the current request's values (a placeholder the request does not bind makes it
 a miss) and serves it in the shape an OpenAI-compatible client expects. The
 older layout, one `answers/<fingerprint>.json` per key, is still read: a key
-with no alternates serves that file as its one answer.
+with no alternates serves that file as its one answer. The replay lane's
+download may write `weights/<fingerprint>.json` beside a key's alternates,
+how often passing runs produced each (AnswerCache.weights), which replay
+serves them in proportion to.
 """
 
 from __future__ import annotations
@@ -57,7 +60,20 @@ CACHE_LAYOUT_PATTERN = (
     rf"|(?:{re.escape(VARIANTS_DIR)}|{re.escape(ALTS_DIR)})/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})\Z"
 )
 DISK_VARIANT_JOINER = "/"
-CACHE_REL_RE = re.compile(CACHE_LAYOUT_PATTERN.replace(VARIANT_JOINER, re.escape(DISK_VARIANT_JOINER)))
+# How often passing runs produced each of a key's alternates,
+# weights/<fingerprint>.json holding {answer identity: count}: written only by
+# the replay lane's download (fetch_cache.py), never by record mode or the
+# publisher, so it is in the directory's layout (CACHE_REL_RE, what the lane
+# seeds) but not among the bucket's objects (CACHE_LAYOUT_PATTERN).
+WEIGHTS_DIR = "weights"
+WEIGHTS_PATTERN = rf"{re.escape(WEIGHTS_DIR)}/{CACHE_HEX}{re.escape(JSON_SUFFIX)}"
+CACHE_REL_RE = re.compile(
+    rf"(?:{CACHE_LAYOUT_PATTERN.replace(VARIANT_JOINER, re.escape(DISK_VARIANT_JOINER))}|^{WEIGHTS_PATTERN}\Z)")
+# The most one answer weighs (AnswerCache.weights): a larger count is read as
+# this, so a key's weighted turn order stays short enough to build per lookup.
+# The busiest keys of the 2026-11-17 and -18 nightlies gave about a hundred
+# producing requests a build.
+MAX_ANSWER_WEIGHT = 1000
 # A fingerprint or an answer identity as one path segment.
 CACHE_HEX_RE = re.compile(rf"^{CACHE_HEX}\Z")
 # The identity AnswerCache.answers gives the older layout's single answer,
@@ -294,6 +310,25 @@ class AnswerCache:
         if os.path.exists(self._path(ANSWERS_DIR, fingerprint)):
             return [(LEGACY_ANSWER, self.load(fingerprint))]
         return []
+
+    def weights(self, fingerprint: str) -> Dict[str, int]:
+        """How often passing runs produced each alternate of a fingerprint (weights/), by identity.
+
+        Empty when there is no file or it is not a map; an entry that is not
+        a positive integer is left out, and one above MAX_ANSWER_WEIGHT is
+        read as it. An alternate with no entry weighs 1 (the caller's rule).
+        """
+        if not CACHE_HEX_RE.match(fingerprint):
+            return {}
+        found = self._load_entry(self._path(WEIGHTS_DIR, fingerprint))
+        return {name: min(count, MAX_ANSWER_WEIGHT) for name, count in (found or {}).items()
+                if isinstance(name, str) and isinstance(count, int) and not isinstance(count, bool) and count > 0}
+
+    def save_weights(self, fingerprint: str, weights: Dict[str, int]) -> bool:
+        """Write a fingerprint's weights file once (the lane's download); True when this call wrote it."""
+        if not CACHE_HEX_RE.match(fingerprint):
+            raise ValueError("a weights file is named by a hex digest")
+        return self._write_once(self._path(WEIGHTS_DIR, fingerprint), json.dumps(weights, sort_keys=True))
 
     def has_answer(self, fingerprint: str) -> bool:
         """Whether a readable answer to the fingerprint is saved, in either layout."""

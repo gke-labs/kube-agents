@@ -22,6 +22,17 @@ served is older than the window. An older-layout answer (`answers/`, one per
 key, from records written before alternates) is still taken as before, and
 can be as old as the bucket's lifecycle.
 
+For each key two or more alternates arrived for, it writes
+`weights/<fingerprint>.json` (replay_cache.WEIGHTS_DIR): per answer, how many
+requests from passing runs got it, which the proxy serves the key's answers in
+proportion to. A build's records count every answer it put up again on each
+call (`produced_counts`), so a build's count is its newest in-window record's,
+never a sum of its records; builds are different runs, so their counts add.
+Only builds whose in-window records list the answer under `produced` count, so
+the weight covers the same window as the answers. A build with no count for an
+answer it produced (a record written before counts) adds 1. A weights file
+past `--max-bytes` is left out and counted; its key's answers then weigh 1.
+
 What fits under `--max-bytes` is chosen before anything downloads, in this
 order, newest record first within each kind: answers in the older layout;
 alternates; slots whose key has a chosen answer; variants; messages. An object
@@ -89,6 +100,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 import collect_shadow
 import normalizer
 import publish_cache as P
+import replay_cache
 
 CACHE_ROOT = P.CACHE_ROOT
 BUILDS_DIR = P.BUILDS_DIR
@@ -140,6 +152,8 @@ PRIORITY = (P.ANSWERS, P.ALTS, P.SLOTS, P.VARIANTS, P.MESSAGES)
 NESTED_KINDS = (P.VARIANTS, P.ALTS)
 # An alternate a recent record confirms but does not say its night produced.
 NOT_PRODUCED = "not_produced"
+# The weights files written beside the alternates (replay_cache.WEIGHTS_DIR), by name in the summary.
+WEIGHTS = replay_cache.WEIGHTS_DIR
 
 Run = Callable[..., Optional[subprocess.CompletedProcess]]
 
@@ -315,6 +329,32 @@ class Fetcher:
                     out.update((fingerprint, answer) for answer in answers)
         return out
 
+    def _produced_counts(self, record: Dict[str, object]) -> Dict[Tuple[str, str], int]:
+        """(fingerprint, answer) -> count of every alternate a record counts (RECORD_PRODUCED_COUNTS), at this version.
+
+        Empty for a record written before the field. Refused when it is there
+        but not in its shape, as _produced is.
+        """
+        counts = record.get(P.RECORD_PRODUCED_COUNTS)
+        if counts is None:
+            return {}
+        if not isinstance(counts, dict):
+            raise Refused("a record's produced counts are not a map")
+        out: Dict[Tuple[str, str], int] = {}
+        for version, keys in counts.items():
+            if not isinstance(keys, dict):
+                raise Refused("a record's produced counts are not a map")
+            for fingerprint, answers in keys.items():
+                if not SAFE_HEX.match(str(fingerprint)) or not isinstance(answers, dict):
+                    raise Refused("a record counts an answer outside the cache layout")
+                for answer, count in answers.items():
+                    if not (isinstance(answer, str) and SAFE_HEX.match(answer)) or not isinstance(count, int) \
+                            or isinstance(count, bool) or count < 0:
+                        raise Refused("a record counts an answer outside the cache layout")
+                    if version == self.version:
+                        out[(fingerprint, answer)] = count
+        return out
+
     def _same_job(self, record: Dict[str, object]) -> bool:
         """Whether a record's job graded the lane's own mode on its forge; a record naming no job doesn't."""
         job = record.get(P.RECORD_JOB)
@@ -361,6 +401,7 @@ class Fetcher:
         for version in (objects if isinstance(objects, dict) else {}):
             self._confirmed(record, version)
         self._produced(record)
+        self._produced_counts(record)
         return self._commit(record)
 
     def night_commit(self) -> NightCommit:
@@ -457,6 +498,27 @@ class Fetcher:
                 chosen[kind].append((name, size, target))
         return chosen
 
+    def _write_weights(self, dest: str, produced_by: Dict[str, Set[Tuple[str, str]]],
+                       counted: Dict[str, Dict[Tuple[str, str], int]], answers_of: Dict[str, List[str]],
+                       used: int, result: Fetched) -> None:
+        """A weights file (replay_cache.WEIGHTS_DIR) for every key two or more alternates arrived for, within the bound.
+
+        A key with one answer has nothing to weigh. A file past the bound is
+        left out and counted: its key's answers then each weigh 1.
+        """
+        cache = replay_cache.AnswerCache(dest)
+        for fingerprint, names in sorted(answers_of.items()):
+            if len(names) < 2:
+                continue
+            weights = {name: weight((fingerprint, name), produced_by, counted) for name in sorted(names)}
+            cost = disk_cost(len(json.dumps(weights, sort_keys=True)))
+            if used + cost > self.max_bytes:
+                result.count(result.left_out, WEIGHTS)
+                continue
+            if cache.save_weights(fingerprint, weights):
+                used += cost
+                result.count(result.by_kind, WEIGHTS)
+
     def fetch(self, dest: str, runs_out: Optional[str] = None) -> Fetched:
         result = Fetched()
         listed = self.listed()
@@ -487,6 +549,10 @@ class Fetcher:
                     result.verdict_records += 1
                     result.runs[build] = [r for r in runs if isinstance(r, dict)]
             confirmed: Dict[str, Tuple[str, int, str]] = {}
+            # Per build, the alternates its in-window records say it produced,
+            # and its newest record's count of each (weight()).
+            produced_by: Dict[str, Set[Tuple[str, str]]] = {}
+            counted: Dict[str, Dict[Tuple[str, str], int]] = {}
             # Newest first, so what the bound leaves out is the oldest.
             for key in reversed(keys):
                 build = RECORD_KEY_RE.match(key).group(1)  # type: ignore[union-attr]
@@ -503,9 +569,13 @@ class Fetcher:
                 # outside the layout means the writer is not this code.
                 items = self._confirmed(record)
                 produced = self._produced(record)
+                counts = self._produced_counts(record)
                 if not self._same_job(record):
                     result.other_job_records += 1
                     continue
+                produced_by.setdefault(build, set()).update(produced)
+                for pair, count in counts.items():
+                    counted.setdefault(build, {}).setdefault(pair, count)  # newest record first
                 for item in items:
                     parts = P.alternate_parts(item[0])
                     if parts is not None and parts not in produced:
@@ -520,6 +590,8 @@ class Fetcher:
             used = 0
             contexts: Set[str] = set()
             answers: Set[str] = set()
+            # Each key's alternates that arrived, for its weights file.
+            answers_of: Dict[str, List[str]] = {}
             for kind in PRIORITY:
                 if not chosen[kind]:
                     continue
@@ -549,15 +621,33 @@ class Fetcher:
                     key = P.answered_key(name)
                     if key is not None:
                         answers.add(key)
+                    parts = P.alternate_parts(name)
+                    if parts is not None:
+                        answers_of.setdefault(parts[0], []).append(parts[1])
                     result.downloaded += 1
                     result.bytes += size
                     result.count(result.by_kind, kind)
+            self._write_weights(dest, produced_by, counted, answers_of, used, result)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         if runs_out:
             with open(runs_out, "w", encoding=TEXT_ENCODING) as handle:
                 json.dump(result.runs, handle, sort_keys=True)
         return result
+
+
+def weight(pair: Tuple[str, str], produced_by: Dict[str, Set[Tuple[str, str]]],
+           counted: Dict[str, Dict[Tuple[str, str], int]]) -> int:
+    """How often the window's passing runs produced one alternate: summed over the builds that produced it.
+
+    A build's records count again on every call (publish_cache.RECORD_PRODUCED_COUNTS),
+    so its newest record's count is the build's and its records are not
+    summed; different builds are different runs, so they are. A build whose
+    records give no count (written before them), or a count below 1, adds 1:
+    it published the answer, so it produced it at least once.
+    """
+    return sum(max(counted.get(build, {}).get(pair, 1), 1)
+               for build, pairs in sorted(produced_by.items()) if pair in pairs)
 
 
 def answers_arrived(dest: str) -> bool:

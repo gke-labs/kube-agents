@@ -151,9 +151,15 @@ VIA_ANSWER_SLOTS = "answer_slots"
 # On a served line: which of the key's saved answers was served (the
 # alternate's name, the STORED_ANSWER_HASH of the line that saved it; empty for the
 # older layout's single answer), and how
-# many answers the key had. Replay hands a key's answers out in turn.
+# many answers the key had. Replay hands a key's answers out in turn, by weight.
 SERVED_ALTERNATE = "served_alternate"
 ALTERNATES = "alternates"
+# On a served line: the served answer's weight, how often passing runs
+# produced it (1 when the replay cache gave no count), and the sum over the
+# key's answers. Replay serves each answer in proportion to its weight, so over
+# a key's lookups an answer's share is about SERVED_WEIGHT / ALTERNATES_WEIGHT.
+SERVED_WEIGHT = "served_weight"
+ALTERNATES_WEIGHT = "alternates_weight"
 # In record mode: whether this request's answer was saved (false when the same
 # answer to the key was already saved, or the answer was unstorable).
 RECORDED = "recorded"
