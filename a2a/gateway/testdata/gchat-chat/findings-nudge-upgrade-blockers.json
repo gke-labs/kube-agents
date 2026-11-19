@@ -1,0 +1,60 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*2 critical issues will block cluster upgrades* · 4 open across 2 clusters\n\n- `critical` *kube-system/istiod* on `prod-central` — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica) · Allow at least 1 pod disruption or run at least 2 replicas.\n- `critical` *gke-prod-pool-8f2a* on `prod-central` — Orphan Node objects: has no backing GCE instance · Delete the orphan Node object.\n\n2 more issues are queued (1 critical, 1 lower priority).\n\n*Queue breakdown (2 more queued)*\n```\nCluster      | Critical | Major | Lower | Next queued issue\n-------------+----------+-------+-------+------------------------------------------------------------------\nprod-central | 1        | 0     | 0     | billing/invoice-worker: mounts a static GCP key\nprod-europe  | 0        | 1     | 0     | authz-webhook: Fail-closed webhook: blocks API calls during drain\n```",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "Fix first issue",
+              "type": "FILLED"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "See all 4 items"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "See all 4 items"
+            },
+            {
+              "onClick": {
+                "openLink": {
+                  "url": "https://github.com/acme/gitops/issues/42"
+                }
+              },
+              "text": "Open backlog"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

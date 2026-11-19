@@ -12,7 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import chat_cases
 import findings_nudge as nudge
+import findings_nudge_card as nudge_card
 import findings_queue as fq
 
 UTC = timezone.utc
@@ -60,94 +62,285 @@ class ComposeTests(unittest.TestCase):
         # A critical waiting for tomorrow's budget is not something to say.
         self.assertEqual(nudge.compose(plan_for([finding()], added={"critical": 2}), 1, daily=False), "")
 
-    def test_a_message_opens_with_the_heading_and_ends_with_the_count(self):
-        message = nudge.compose(plan_for([finding(id="a"), finding(id="b", check_slug="x", severity="minor")]), 2, False)
-        self.assertTrue(message.startswith(f"{nudge.HEADING}\n\n"))
-        self.assertTrue(message.endswith("2 findings are open on the queue. Ask for the full list."))
+    def test_a_message_opens_with_plain_answer_headline_and_never_asks_for_the_full_list(self):
+        rows = [finding(id="a"), finding(id="b", check_slug="x", severity="minor")]
+        message = nudge.compose(plan_for(rows), 2, False, rows=rows)
+        self.assertTrue(message.startswith("1 new critical issue needs attention · 2 open across 1 cluster\n\n"))
+        self.assertIn("1 more issue is queued.", message)
+        self.assertNotIn("Findings queue", message)
+        self.assertNotIn("Ask for the full list", message)
 
-    def test_new_criticals_are_numbered_with_score_location_action_and_id(self):
-        message = nudge.compose(plan_for([finding(id="a", title="first"), finding(id="b", check_slug="x", title="second")]), 2, False)
-        self.assertIn("New: 2 critical findings.", message)
-        self.assertIn("1. [288] first\n   prod/payments/api\n   add a readinessProbe\n   id: a", message)
-        self.assertIn("2. [288] second", message)
+    def test_new_criticals_show_readable_location_and_fix_without_scores_or_ids(self):
+        rows = [
+            finding(id="a", title="first"),
+            finding(id="b", check_slug="x", title="second"),
+        ]
+        message = nudge.compose(plan_for(rows), 2, False, rows=rows)
+        self.assertIn("2 new critical issues need attention", message)
+        self.assertIn("- critical · payments/api on prod — first. add a readinessProbe.", message)
+        self.assertIn("- critical · payments/api on prod — second. add a readinessProbe.", message)
+        self.assertNotIn("[288]", message)
+        self.assertNotIn("id:", message)
 
     def test_one_critical_reads_as_singular(self):
-        self.assertIn("New: 1 critical finding.", nudge.compose(plan_for([finding()]), 1, False))
+        self.assertIn("1 new critical issue needs attention", nudge.compose(plan_for([finding()]), 1, False))
 
-    def test_new_noncriticals_say_so(self):
+    def test_new_noncriticals_use_plain_review_headline(self):
         message = nudge.compose(plan_for([finding(severity="major")], now=at(6, 16)), 1, False)
-        self.assertIn("New: 1 finding, none of them critical.", message)
+        self.assertIn("1 new issue needs review", message)
 
-    def test_a_gathered_line_lists_its_other_objects_and_counts_its_ids(self):
+    def test_a_gathered_line_summarises_extra_objects_cleanly_and_hides_ids_in_metadata(self):
         rows = [finding(id=f"p{i}", object=f"d{i}") for i in range(8)]
-        message = nudge.compose(plan_for(rows), 8, False)
-        self.assertIn("New: 1 critical finding.", message)
-        self.assertIn("also payments/d1, payments/d2, payments/d3, payments/d4, payments/d5 and 2 more", message)
-        self.assertIn("id: p0 (a decision on it covers all 8 objects in this item)", message)
+        bundle = nudge.build_nudge(plan_for(rows), 1, False, rows=rows)
+        self.assertIn("payments/d0 (+7 more) on prod", bundle.text)
+        self.assertNotIn("id:", bundle.text)
+        self.assertIn("id=p0", bundle.card["thread_context"])
+        self.assertIn("covers=8 unreported=0", bundle.card["thread_context"])
 
-    def test_the_covered_count_is_every_row_a_decision_reaches(self):
-        # Added with 16 members; a later sweep stopped reporting 13 of them.
-        # They are no longer pending, but a decision on p0 still decides them.
+    def test_the_covered_count_and_unreported_rows_stay_in_hidden_thread_context(self):
         rows = [shown(at(5, 16), id=f"p{i}", object=f"d{i}", severity="major") for i in range(3)]
         rows += [
             shown(at(5, 16), id=f"p{i}", object=f"d{i}", severity="major", absent_since="2026-10-05 20:00:00")
             for i in range(3, 16)
         ]
-        message = nudge.compose(plan_for(rows), 1, daily=True)
-        self.assertIn("also payments/d1, payments/d2\n", message)
-        self.assertIn("id: p0 (a decision on it covers all 16 objects in this item, 13 of them not listed because "
-                      "the last complete sweep did not report them)", message)
-
-    def test_a_lone_row_names_no_count(self):
-        message = nudge.compose(plan_for([finding(id="solo")]), 1, False)
-        self.assertIn("id: solo\n", message)
-        self.assertNotIn("covers", message)
+        bundle = nudge.build_nudge(plan_for(rows), 1, daily=True, rows=rows)
+        self.assertIn("payments/d0 (+2 more) on prod", bundle.text)
+        self.assertNotIn("id:", bundle.text)
+        self.assertNotIn("unreported", bundle.text)
+        self.assertIn("covers=16 unreported=13", bundle.card["thread_context"])
 
     def test_reminders_appear_only_in_the_daily_part(self):
         plan = plan_for([shown(at(5, 12), id="old")])
         self.assertEqual(nudge.compose(plan, 1, daily=False), "")
-        self.assertIn("Still open: 1 critical finding, undecided.", nudge.compose(plan, 1, daily=True))
+        self.assertIn("1 critical issue needs attention", nudge.compose(plan, 1, daily=True))
 
-    def test_the_stop_add_notice_names_what_blocks_and_how_to_release_it(self):
-        plan = plan_for([shown(at(5, 16), id="m0", severity="major", title="no limits"), finding(id="c0", check_slug="x")])
-        message = nudge.compose(plan, 2, daily=True)
-        self.assertIn("New findings are on hold until this one is dismissed, snoozed or accepted. 1 critical finding is waiting.", message)
-        self.assertIn("no limits", message)
-        self.assertIn("id: m0", message)
-        self.assertIn("dismiss (won't fix), snooze until a date, or accept (being worked on)", message)
+    def test_the_stop_add_notice_explains_the_pause_without_exposing_ids(self):
+        rows = [shown(at(5, 16), id="m0", severity="major", title="no limits"), finding(id="c0", check_slug="x")]
+        plan = plan_for(rows)
+        bundle = nudge.build_nudge(plan, 2, daily=True, rows=rows)
+        self.assertIn("1 open issue is pausing new findings", bundle.text)
         self.assertIn(
-            "A decision on an id covers the objects counted beside it; "
-            "a finding added to the line later stays open until a message names it.",
-            message,
+            "New findings are paused until you resolve, snooze, or dismiss this open item (1 critical issue waiting behind it).",
+            bundle.text,
         )
-        self.assertNotIn("New: ", message)
+        self.assertIn("no limits", bundle.text)
+        self.assertNotIn("id: m0", bundle.text)
+        self.assertIn("id=m0", bundle.card["thread_context"])
 
     def test_the_waiting_count_says_how_many_are_critical(self):
         rows = [shown(at(5, 16), id="m0", severity="major"), finding(id="c0", check_slug="x")]
         rows += [finding(id=f"n{i}", check_slug=f"n{i}", severity="minor") for i in range(2)]
-        message = nudge.compose(plan_for(rows), 4, daily=True)
-        self.assertIn("1 critical finding and 2 other findings are waiting.", message)
+        message = nudge.compose(plan_for(rows), 4, daily=True, rows=rows)
+        self.assertIn("1 critical issue and 2 other issues waiting behind it", message)
         rows = [shown(at(5, 16), id="m0", severity="major"), finding(id="n0", check_slug="n0", severity="minor")]
-        self.assertIn("1 finding is waiting.", nudge.compose(plan_for(rows), 2, daily=True))
+        self.assertIn("1 issue waiting behind it", nudge.compose(plan_for(rows), 2, daily=True, rows=rows))
 
     def test_a_cluster_scoped_finding_names_its_cluster_once(self):
         message = nudge.compose(plan_for([finding(namespace="", object="prod", title="WI disabled")]), 1, False)
-        self.assertIn("\n   prod\n", message)
+        self.assertIn("prod — WI disabled", message)
         self.assertNotIn("prod/prod", message)
+        self.assertNotIn("prod on prod", message)
 
-    def test_a_finding_with_a_project_leads_with_it(self):
-        message = nudge.compose(plan_for([finding(project="acme-prod")]), 1, False)
-        self.assertIn("acme-prod/prod/payments/api", message)
+    def test_project_path_is_hidden_unless_two_projects_share_a_cluster_name(self):
+        single = [finding(project="kube-agents-gkedemos", cluster="prod-central")]
+        single_msg = nudge.compose(plan_for(single), 1, False, rows=single)
+        self.assertIn("payments/api on prod-central", single_msg)
+        self.assertNotIn("kube-agents-gkedemos", single_msg)
 
-    def test_a_finding_with_no_recommended_action_prints_without_a_blank_line(self):
+        colliding = [
+            finding(id="a", project="proj-a", cluster="prod"),
+            finding(id="b", check_slug="x", project="proj-b", cluster="prod"),
+        ]
+        colliding_msg = nudge.compose(plan_for(colliding), 2, False, rows=colliding)
+        self.assertIn("prod (proj-a)", colliding_msg)
+        self.assertIn("prod (proj-b)", colliding_msg)
+
+    def test_a_finding_with_no_recommended_action_prints_cleanly(self):
         message = nudge.compose(plan_for([finding(recommendation={})]), 1, False)
-        self.assertNotIn("\n   \n", message)
+        self.assertIn("- critical · payments/api on prod — no readinessProbe on api", message)
+        self.assertNotIn("  \n", message)
 
     def test_provider_managed_observations_are_counted_never_named(self):
-        rows = [finding(id="obs", check_slug="x", provider_managed=True, actionable=False, title="kube-system thing"), finding(id="c0")]
-        message = nudge.compose(plan_for(rows), 2, False)
+        rows = [
+            finding(id="obs", check_slug="x", provider_managed=True, actionable=False, title="kube-system thing"),
+            finding(id="c0"),
+        ]
+        message = nudge.compose(plan_for(rows), 2, False, rows=rows)
         self.assertNotIn("kube-system thing", message)
-        self.assertIn("1 of them is provider-managed, with no next step you can take", message)
+        self.assertIn("1 provider-managed finding requires no action from you and is hidden.", message)
+
+
+class CardAndChatUxTests(unittest.TestCase):
+    """Issue #6256 regressions, Option C fold.table layout, and chat UX lint checks."""
+
+    def test_issue_6256_upgrade_blockers_render_cleanly_with_zero_plumbing(self):
+        pdb = shown(
+            at(5, 12),
+            id="urr-pdb-blocks-drain.kube-agents-gkedemos.prod-central.kube-system.istiod",
+            check_slug="upgrade-drain-blocking-budget",
+            project="kube-agents-gkedemos",
+            cluster="prod-central",
+            namespace="kube-system",
+            object="istiod",
+            rank_score=150,
+            title="1. PodDisruptionBudget blocks drain: kube-system/istiod (minAvailable: 1 (>= 1 expected pods)) (1 replicas)",
+            recommendation={"action": "Allow at least 1 pod disruption or run at least 2 replicas."},
+        )
+        orphan_a = shown(
+            at(5, 12),
+            id="urr-orphan-node.kube-agents-gkedemos.prod-central..gke-prod-pool-8f2a",
+            check_slug="upgrade-orphan_node_objects",
+            project="kube-agents-gkedemos",
+            cluster="prod-central",
+            namespace="",
+            object="gke-prod-pool-8f2a",
+            rank_score=150,
+            title="22. Orphan Node objects: gke-prod-pool-8f2a has no backing GCE instance",
+            recommendation={"action": "Delete the orphan Node object (kubectl delete node gke-prod-pool-8f2a)."},
+        )
+        orphan_b = shown(
+            at(5, 12),
+            id="urr-orphan-node.kube-agents-gkedemos.prod-central..gke-prod-pool-9b1c",
+            check_slug="upgrade-orphan_node_objects",
+            project="kube-agents-gkedemos",
+            cluster="prod-central",
+            namespace="",
+            object="gke-prod-pool-9b1c",
+            rank_score=150,
+            title="22. Orphan Node objects: gke-prod-pool-9b1c has no backing GCE instance",
+            recommendation={"action": "Delete the orphan Node object (kubectl delete node gke-prod-pool-9b1c)."},
+        )
+        queued_extra = [
+            finding(
+                id="q1",
+                check_slug="static-sa-key",
+                project="kube-agents-gkedemos",
+                cluster="prod-central",
+                namespace="billing",
+                object="invoice-worker",
+                severity="critical",
+                title="invoice-worker mounts a static GCP key",
+            ),
+            finding(
+                id="q2",
+                check_slug="upgrade-fail-closed-webhook",
+                project="kube-agents-gkedemos",
+                cluster="prod-europe",
+                namespace="",
+                object="authz-webhook",
+                severity="major",
+                title="4. Fail-closed webhook: authz-webhook blocks API calls during drain",
+            ),
+            finding(
+                id="q3",
+                check_slug="no-resourcequota",
+                project="kube-agents-gkedemos",
+                cluster="staging-east",
+                namespace="ledger",
+                object="ledger",
+                severity="minor",
+                title="Namespace ledger has no ResourceQuota",
+            ),
+        ]
+        all_rows = [pdb, orphan_a, orphan_b, *queued_extra]
+        # Advance added={"critical": 2} so only the two reminded upgrade blockers surface, leaving 3 queued.
+        plan = plan_for(all_rows, now=at(6, 12), added={"critical": 2, "noncritical": 0})
+        bundle = nudge.build_nudge(
+            plan,
+            open_count=5,
+            daily=True,
+            rows=all_rows,
+            backlog_url="https://github.com/acme/gitops/issues/42",
+        )
+
+        chat, fallback = nudge_card.chat_from_card(bundle.card)
+        blocks, _ = nudge_card.blocks_from_card(bundle.card)
+        chat_cases.check_chat(chat, "nudge")
+        self.assertEqual(chat_cases.lint(chat), [])
+
+        self.assertEqual(chat["headline"], "2 critical issues will block cluster upgrades")
+        self.assertEqual(chat["note"], "· 5 open across 3 clusters")
+        self.assertEqual(chat["tone"], "critical")
+        self.assertEqual(len(chat["rows"]), 2)
+        self.assertIn("**kube-system/istiod** on `prod-central`", chat["rows"][0]["text"])
+        self.assertIn("(minAvailable: 1, expects at least 1 pod)", chat["rows"][0]["text"])
+        self.assertIn("(1 replica)", chat["rows"][0]["text"])
+        self.assertEqual(
+            chat["rows"][1]["detail"],
+            "Delete the orphan Node object.",
+        )
+
+        # Forbidden plumbing never appears in fallback text, chat JSON, or Block Kit JSON.
+        visible_serialized = fallback + "\n" + json.dumps(chat) + "\n" + json.dumps(blocks)
+        for forbidden in (
+            "[150]",
+            "1. [",
+            "22.",
+            "id:",
+            "urr-pdb-blocks-drain",
+            "urr-orphan-node",
+            "kube-agents-gkedemos/",
+            "kubectl",
+            ">= 1 expected pods",
+            "1 replicas",
+            "Findings queue",
+            "undecided",
+            "Ask for the full list",
+        ):
+            self.assertNotIn(forbidden, visible_serialized)
+
+        # Option C collapsible queue breakdown table.
+        self.assertEqual(chat["fold"]["title"], "Queue breakdown (3 more queued)")
+        self.assertEqual(
+            chat["fold"]["table"]["columns"],
+            ["Cluster", "Critical", "Major", "Lower", "Next queued issue"],
+        )
+        self.assertEqual(
+            chat["fold"]["table"]["rows"],
+            [
+                ["prod-central", "1", "0", "0", "billing/invoice-worker: mounts a static GCP key"],
+                ["prod-europe", "0", "1", "0", "authz-webhook: Fail-closed webhook: blocks API calls during drain"],
+                ["staging-east", "0", "0", "1", "ledger/ledger: Namespace ledger has no ResourceQuota"],
+            ],
+        )
+
+        # Buttons + backlog link.
+        self.assertEqual(
+            [c["text"] for c in chat["choices"]],
+            ["Fix first issue", "See all 5 items"],
+        )
+        self.assertTrue(chat["choices"][0]["primary"])
+        self.assertEqual(chat["links"], [{"text": "Open backlog", "url": "https://github.com/acme/gitops/issues/42"}])
+
+        # Hidden thread context retains exact IDs and covers count.
+        hidden = bundle.card["thread_context"]
+        self.assertIn("urr-pdb-blocks-drain.kube-agents-gkedemos.prod-central.kube-system.istiod", hidden)
+        self.assertIn("urr-orphan-node.kube-agents-gkedemos.prod-central..gke-prod-pool-8f2a", hidden)
+        self.assertIn("covers=2", hidden)
+
+    def test_clean_action_strips_bare_and_inline_cli_commands(self):
+        self.assertEqual(
+            nudge.clean_action("Run `kubectl rollout restart deployment/api` to reload certificates."),
+            "Reload certificates.",
+        )
+        self.assertEqual(
+            nudge.clean_action("kubectl delete node gke-orphan-1"),
+            "Remove the node gke-orphan-1.",
+        )
+        self.assertEqual(
+            nudge.clean_action("gcloud container clusters update prod --enable-shielded-nodes"),
+            nudge.FALLBACK_ACTION,
+        )
+
+    def test_noncritical_card_uses_attention_tone_and_omits_fold_when_nothing_remains(self):
+        rows = [finding(id="m0", severity="major", title="missing PDB")]
+        bundle = nudge.build_nudge(plan_for(rows, now=at(6, 16)), open_count=1, daily=False, rows=rows)
+        chat, _ = nudge_card.chat_from_card(bundle.card)
+        chat_cases.check_chat(chat, "noncritical")
+        self.assertEqual(chat_cases.lint(chat), [])
+        self.assertEqual(chat["tone"], "attention")
+        self.assertNotIn("fold", chat)
+        self.assertEqual([c["text"] for c in chat["choices"]], ["Fix issue"])
 
 
 class NudgeHarness(unittest.TestCase):
@@ -169,7 +362,7 @@ class NudgeHarness(unittest.TestCase):
         for name in fq.PACING_ENV.values():
             os.environ.pop(name, None)
 
-    def run_at(self, now, ranked, added=None, fail=None, surfaced_error=None, failing_marks=()):
+    def run_at(self, now, ranked, added=None, fail=None, surfaced_error=None, failing_marks=(), backlog_url=None):
         """Drive `main` at `now` against a stubbed queue, recording every request."""
         self.out.seek(0)
         self.out.truncate()
@@ -186,6 +379,10 @@ class NudgeHarness(unittest.TestCase):
             if path.startswith("/v1/findings/additions?day="):
                 self.day_asked = path.split("=", 1)[1]
                 return {"day": self.day_asked, **(added or {"critical": 0, "noncritical": 0})}
+            if path == "/v1/findings/publication/backlog":
+                if backlog_url is None:
+                    raise urllib.error.HTTPError(path, 404, "not found", None, io.BytesIO(b"not found"))
+                return {"target_ref": backlog_url}
             if path.endswith("/surfaced"):
                 if surfaced_error:
                     raise surfaced_error
@@ -204,11 +401,12 @@ class NudgeHarness(unittest.TestCase):
 
 
 class MainTests(NudgeHarness):
-    def test_noon_adds_the_top_two_criticals_and_marks_them_as_additions(self):
+    def test_noon_adds_the_top_two_criticals_marks_them_and_writes_sidecar_card(self):
         rows = [finding(id=f"c{i}", check_slug=f"c{i}", rank_score=300 - i) for i in range(6)]
-        code = self.run_at(at(6, 12), rows)
+        code = self.run_at(at(6, 12), rows, backlog_url="https://github.com/acme/ops/issues/9")
         self.assertEqual(code, 0)
-        self.assertIn("New: 2 critical findings.", self.out.getvalue())
+        output = self.out.getvalue()
+        self.assertIn("2 new critical issues need attention", output)
         self.assertEqual(self.day_asked, "2026-10-06")
         self.assertEqual(
             self.marks,
@@ -217,16 +415,29 @@ class MainTests(NudgeHarness):
                 ("c1", {"publisher": "nudge", "added_class": "critical", "run": "2026-10-06T12:00:00Z"}),
             ],
         )
-        self.assertEqual(self.calls[:3], ["/v1/findings/expire-snoozes", "/v1/findings/ranked", "/v1/findings/additions?day=2026-10-06"])
+        self.assertEqual(
+            self.calls[:4],
+            [
+                "/v1/findings/expire-snoozes",
+                "/v1/findings/ranked",
+                "/v1/findings/additions?day=2026-10-06",
+                "/v1/findings/publication/backlog",
+            ],
+        )
         self.assertEqual(self.state()[nudge.DAILY_KEY], "2026-10-06")
+        loaded = nudge_card.load(self.home, output)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["links"], [["Open backlog", "https://github.com/acme/ops/issues/9"]])
 
-    def test_an_hour_with_nothing_to_say_prints_nothing(self):
+    def test_an_hour_with_nothing_to_say_prints_nothing_and_removes_stale_card(self):
         rows = [shown(at(6, 12), id="c0"), shown(at(6, 12), id="c1", check_slug="x"), finding(id="c2", check_slug="y")]
-        self.run_at(at(6, 12), [])
+        self.run_at(at(6, 12), [finding(id="seed")])
+        self.assertTrue(nudge_card.card_path(self.home).exists())
         code = self.run_at(at(6, 13), rows, added={"critical": 2, "noncritical": 0})
         self.assertEqual(code, 0)
         self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
+        self.assertFalse(nudge_card.card_path(self.home).exists())
 
     def test_a_morning_hour_adds_nothing(self):
         code = self.run_at(at(6, 11), [finding()])
@@ -237,29 +448,30 @@ class MainTests(NudgeHarness):
     def test_reminders_go_out_once_a_day(self):
         rows = [shown(at(5, 12), id="old")]
         self.run_at(at(6, 12), rows)
-        self.assertIn("Still open: 1 critical finding", self.out.getvalue())
+        self.assertIn("1 critical issue needs attention", self.out.getvalue())
         self.assertEqual(self.marks, [("old", {"publisher": "nudge"})])
 
         self.run_at(at(6, 13), rows)
         self.assertEqual(self.out.getvalue(), "")
 
         self.run_at(at(7, 12), rows)
-        self.assertIn("Still open: 1 critical finding", self.out.getvalue())
+        self.assertIn("1 critical issue needs attention", self.out.getvalue())
 
     def test_the_daily_part_waits_for_the_first_run_after_noon(self):
         rows = [shown(at(5, 12), id="old")]
         self.run_at(at(6, 9), rows)
         self.assertEqual(self.out.getvalue(), "")
-        # The noon run was missed (a restart, say); the next one carries it.
         self.run_at(at(6, 14), rows)
-        self.assertIn("Still open", self.out.getvalue())
+        self.assertIn("1 critical issue needs attention", self.out.getvalue())
 
     def test_stop_add_posts_a_notice_once_a_day_and_adds_nothing(self):
         rows = [shown(at(5, 16), id="m0", severity="major"), finding(id="c0", check_slug="x")]
         self.run_at(at(6, 12), rows)
         message = self.out.getvalue()
-        self.assertIn("New findings are on hold until this one is dismissed, snoozed or accepted.", message)
-        self.assertIn("id: m0", message)
+        self.assertIn("1 open issue is pausing new findings", message)
+        self.assertNotIn("id: m0", message)
+        loaded = nudge_card.load(self.home, message)
+        self.assertIn("id=m0", loaded["thread_context"])
         self.assertEqual(self.marks, [("m0", {"publisher": "nudge"})])
 
         for hour in (13, 16, 23):
@@ -267,31 +479,31 @@ class MainTests(NudgeHarness):
             self.assertEqual(self.out.getvalue(), "", hour)
 
         self.run_at(at(7, 12), rows)
-        self.assertIn("New findings are on hold", self.out.getvalue())
+        self.assertIn("1 open issue is pausing new findings", self.out.getvalue())
 
     def test_noncriticals_are_added_from_the_afternoon_hour(self):
         rows = [finding(id=f"m{i}", check_slug=f"m{i}", severity="major") for i in range(4)]
         self.run_at(at(6, 15), rows)
         self.assertEqual(self.out.getvalue(), "")
         self.run_at(at(6, 16), rows)
-        self.assertIn("New: 3 findings, none of them critical.", self.out.getvalue())
+        self.assertIn("3 new issues need review", self.out.getvalue())
         self.assertEqual([body["added_class"] for _, body in self.marks], ["noncritical"] * 3)
 
     def test_the_hour_is_configurable(self):
         rows = [finding(severity="major")]
         with unittest.mock.patch.dict(os.environ, {"FINDINGS_NONCRITICAL_AFTER_HOUR": "13"}):
             self.run_at(at(6, 13), rows)
-        self.assertIn("none of them critical", self.out.getvalue())
+        self.assertIn("1 new issue needs review", self.out.getvalue())
 
     def test_the_daily_limit_is_configurable_and_a_bad_value_is_reported(self):
         rows = [finding(id=f"c{i}", check_slug=f"c{i}") for i in range(3)]
         with unittest.mock.patch.dict(os.environ, {"FINDINGS_DAILY_CRITICALS": "1"}):
             self.run_at(at(6, 12), rows)
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
 
         with unittest.mock.patch.dict(os.environ, {"FINDINGS_DAILY_CRITICALS": "lots"}):
             self.run_at(at(7, 12), rows)
-        self.assertIn("New: 2 critical findings.", self.out.getvalue())
+        self.assertIn("2 new critical issues need attention", self.out.getvalue())
         self.assertIn("FINDINGS_DAILY_CRITICALS='lots'", self.err.getvalue())
 
     def test_a_member_joining_a_reminded_line_is_marked_shown_with_it(self):
@@ -309,33 +521,30 @@ class MainTests(NudgeHarness):
         rows = [finding(id="a")]
         refused = urllib.error.URLError("refused")
         self.run_at(at(6, 12), rows, surfaced_error=refused)
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
         for hour in (13, 18):
             self.run_at(at(6, hour), rows, surfaced_error=refused)
             self.assertEqual(self.out.getvalue(), "", hour)
         self.run_at(at(7, 12), rows)
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
 
     def test_an_announced_critical_whose_mark_failed_still_spends_the_day_budget(self):
         a = finding(id="a", check_slug="a", rank_score=300)
         b = finding(id="b", check_slug="b", rank_score=290)
         c = finding(id="c", check_slug="c", rank_score=400)
         self.run_at(at(6, 12), [a, b], surfaced_error=urllib.error.URLError("refused"))
-        self.assertIn("New: 2 critical findings.", self.out.getvalue())
-        # c outranks both, but today's two were already announced.
+        self.assertIn("2 new critical issues need attention", self.out.getvalue())
         self.run_at(at(6, 13), [c, a, b])
         self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
         self.run_at(at(7, 12), [c, a, b])
-        self.assertIn("New: 2 critical findings.", self.out.getvalue())
+        self.assertIn("2 new critical issues need attention", self.out.getvalue())
         self.assertEqual([fid for fid, _ in self.marks], ["c", "a"])
 
     def test_an_announced_noncritical_whose_mark_failed_holds_back_a_higher_ranked_one(self):
-        # Through stop-add: an unrecorded non-critical stops every addition,
-        # as a pending one does, so the day's budget is never reached.
         rows = [finding(id=f"m{i}", check_slug=f"m{i}", severity="major", rank_score=90 - i) for i in range(3)]
         self.run_at(at(6, 16), rows, surfaced_error=urllib.error.URLError("refused"))
-        self.assertIn("New: 3 findings, none of them critical.", self.out.getvalue())
+        self.assertIn("3 new issues need review", self.out.getvalue())
         self.run_at(at(6, 17), [finding(id="m9", check_slug="m9", severity="major", rank_score=95)] + rows)
         self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
@@ -344,45 +553,42 @@ class MainTests(NudgeHarness):
         critical = finding(id="a", check_slug="a")
         self.run_at(at(6, 12), [critical], surfaced_error=urllib.error.URLError("refused"))
         self.run_at(at(6, 16), [critical, finding(id="m0", check_slug="m0", severity="major")])
-        self.assertNotIn("none of them critical", self.out.getvalue())
+        self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
 
     def test_an_announced_noncritical_whose_mark_failed_still_stops_every_addition(self):
         major = finding(id="m0", check_slug="m0", severity="major")
         self.run_at(at(6, 16), [major], surfaced_error=urllib.error.URLError("refused"))
         self.run_at(at(6, 17), [finding(id="c", check_slug="c"), major])
-        self.assertNotIn("New:", self.out.getvalue())
+        self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
 
     def test_a_row_left_open_on_an_announced_line_does_not_stop_the_days_additions(self):
-        # #4262: the nudge adds K (m0); a sweep adds m1 to K, still queued; the
-        # user decides m0, and the decision leaves m1 open. The next run adds
-        # another item and names m1, which no message has named.
         m0 = finding(id="m0", check_slug="K", severity="major", object="api")
         self.run_at(at(6, 16), [m0])
-        self.assertIn("none of them critical", self.out.getvalue())
+        self.assertIn("1 new issue needs review", self.out.getvalue())
         self.assertEqual(self.state()[nudge.ANNOUNCED_KEY]["ids"], ["m0"])
-        decided = finding(id="m0", check_slug="K", severity="major", object="api", state="dismissed", first_shown_at="2026-10-06 16:00:00")
+        decided = finding(
+            id="m0", check_slug="K", severity="major", object="api", state="dismissed", first_shown_at="2026-10-06 16:00:00"
+        )
         m1 = finding(id="m1", check_slug="K", severity="major", object="web")
         n0 = finding(id="n0", check_slug="N", severity="major", rank_score=80)
         self.run_at(at(6, 17), [decided, m1, n0], added={"critical": 0, "noncritical": 1})
-        self.assertIn("m1", self.out.getvalue())
+        loaded = nudge_card.load(self.home, self.out.getvalue())
+        self.assertIn("id=m1", loaded["thread_context"])
         self.assertEqual(sorted(fid for fid, _ in self.marks), ["m1", "n0"])
         self.assertEqual(self.state()[nudge.ANNOUNCED_KEY]["ids"], ["m0", "m1", "n0"])
 
     def test_a_line_whose_marks_partly_failed_does_not_stop_the_days_additions(self):
-        # #5329: the nudge adds K (m0, m1); the mark of m1 fails, so the queue
-        # holds K's addition and m1 is still new. The user decides m0, which
-        # leaves m1 open. The next run adds another item and does not name K.
         m0 = finding(id="m0", check_slug="K", severity="major", object="api")
         m1 = finding(id="m1", check_slug="K", severity="major", object="web")
         self.run_at(at(6, 16), [m0, m1], failing_marks={"m1"})
-        self.assertIn("New: 1 finding, none of them critical.", self.out.getvalue())
+        self.assertIn("1 new issue needs review", self.out.getvalue())
         self.assertEqual([fid for fid, _ in self.marks], ["m0"])
         n0 = finding(id="n0", check_slug="N", severity="major", rank_score=80, title="no memory limit on orders")
         added = {"critical": 0, "noncritical": 1, "lines": [list(fq.item_key(m0))]}
         self.run_at(at(6, 17), [m1, n0], added=added)
-        self.assertIn("New: 1 finding, none of them critical.", self.out.getvalue())
+        self.assertIn("1 new issue needs review", self.out.getvalue())
         self.assertIn("no memory limit on orders", self.out.getvalue())
         self.assertEqual([fid for fid, _ in self.marks], ["n0"])
 
@@ -394,7 +600,6 @@ class MainTests(NudgeHarness):
         self.run_at(at(6, 17), [m1, n0], added={"critical": 0, "noncritical": 1})
         self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
-        # The next day starts a record with ids, and m1 is added.
         self.run_at(at(7, 16), [m1, n0])
         self.assertEqual(sorted(fid for fid, _ in self.marks), ["m1", "n0"])
         self.assertEqual(sorted(self.state()[nudge.ANNOUNCED_KEY]["ids"]), ["m1", "n0"])
@@ -402,7 +607,9 @@ class MainTests(NudgeHarness):
     def test_additions_under_an_older_record_keep_it_without_ids(self):
         critical = finding(id="c", check_slug="c")
         m1 = finding(id="m1", check_slug="K", severity="major", object="web")
-        (self.home / nudge.STATE_FILE).write_text(json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": [["x", "acme", "prod"]]}}))
+        (self.home / nudge.STATE_FILE).write_text(
+            json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": [["x", "acme", "prod"]]}})
+        )
         self.run_at(at(6, 12), [critical, m1])
         self.assertEqual([fid for fid, _ in self.marks], ["c"])
         record = self.state()[nudge.ANNOUNCED_KEY]
@@ -411,7 +618,9 @@ class MainTests(NudgeHarness):
 
     def test_malformed_announced_keys_are_ignored_not_fatal(self):
         for keys in ("x", [1]):
-            (self.home / nudge.STATE_FILE).write_text(json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": keys}}))
+            (self.home / nudge.STATE_FILE).write_text(
+                json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": keys}})
+            )
             self.assertEqual(self.run_at(at(6, 12), [finding(id="c", check_slug="c")]), 0, keys)
             self.assertEqual([fid for fid, _ in self.marks], ["c"], keys)
 
@@ -422,23 +631,33 @@ class MainTests(NudgeHarness):
         self.assertEqual(self.err.getvalue().count("could not mark"), 2)
         self.assertEqual(self.state()[nudge.DAILY_KEY], "2026-10-06")
 
-    def test_the_open_count_counts_items(self):
-        rows = [finding(id=f"p{i}", object=f"d{i}") for i in range(3)] + [finding(id="x", check_slug="x")]
+    def test_the_open_count_counts_items_not_individual_members(self):
+        rows = (
+            [finding(id=f"p{i}", object=f"d{i}") for i in range(3)]
+            + [finding(id="x", check_slug="x")]
+            + [finding(id="y", check_slug="y")]
+        )
         self.run_at(at(6, 12), rows)
-        self.assertIn("2 findings are open on the queue.", self.out.getvalue())
+        output = self.out.getvalue()
+        self.assertIn("· 3 open across 1 cluster", output)
+        self.assertIn("1 more issue is queued", output)
 
     def test_the_open_count_counts_provider_managed_observations_by_item(self):
-        # Two lines of nameable rows, and ten observations of one check on
-        # one cluster: three findings, one of them provider-managed.
         rows = [finding(id=f"p{i}", object=f"d{i}") for i in range(3)] + [finding(id="x", check_slug="x")]
         rows += [
-            finding(id=f"obs{i}", check_slug="dns", namespace="kube-system", object=f"pod{i}",
-                    provider_managed=True, actionable=False)
+            finding(
+                id=f"obs{i}",
+                check_slug="dns",
+                namespace="kube-system",
+                object=f"pod{i}",
+                provider_managed=True,
+                actionable=False,
+            )
             for i in range(10)
         ]
         self.run_at(at(6, 12), rows)
         self.assertIn(
-            "3 findings are open on the queue. Ask for the full list. 1 of them is provider-managed,",
+            "1 provider-managed finding requires no action from you and is hidden.",
             self.out.getvalue(),
         )
 
@@ -471,7 +690,6 @@ class FirstReportTests(NudgeHarness):
         self.run_at(at(6, 12), [finding()])
         self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.marks, [])
-        # A held run says so, so a stuck onboarding is not a silent one.
         err = self.err.getvalue()
         self.assertIn("adding nothing until the first inventory report is out (its delivery claimed", err)
         self.assertIn("or until 2026-10-07 09:00 UTC", err)
@@ -487,7 +705,7 @@ class FirstReportTests(NudgeHarness):
     def test_no_longer_held_25_hours_after_the_scan_was_filed(self):
         self.file_scan(at(5, 11))
         self.run_at(at(6, 12), [finding()])
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
         err = self.err.getvalue()
         self.assertIn("still undelivered more than 24 hours after its sweep was filed", err)
         self.assertIn("filed 2026-10-05 11:00 UTC by its filed_at= line", err)
@@ -499,34 +717,30 @@ class FirstReportTests(NudgeHarness):
                 marker = self.file_scan(at(6, 12), text)
                 for filed, held in ((at(5, 13), True), (at(5, 11), False)):
                     os.utime(marker, (filed.timestamp(), filed.timestamp()))
-                    # Each case starts from a fresh day: no addition announced yet.
                     (self.home / nudge.STATE_FILE).unlink(missing_ok=True)
                     self.err.seek(0)
                     self.err.truncate()
                     self.assertEqual(nudge.first_report_hold(self.gateway, at(6, 12))[0], held)
                     self.run_at(at(6, 12), [finding()])
                     self.assertIn("by its mtime", self.err.getvalue())
-                    self.assertEqual("New: 1 critical finding." in self.out.getvalue(), not held)
+                    self.assertEqual("1 new critical issue needs attention" in self.out.getvalue(), not held)
 
     def test_a_marker_removed_while_it_is_read_is_not_held(self):
-        # The re-arm runbook deletes it; a run that saw it a moment before
-        # must not fail on the read that follows.
         self.assertIsNone(nudge._filed_at(self.gateway / nudge.SCAN_FILED_MARKER))
         self.file_scan(at(6, 9))
         with unittest.mock.patch.object(nudge, "_filed_at", return_value=None):
             self.assertEqual(nudge.first_report_hold(self.gateway, at(6, 12)), (False, ""))
             self.run_at(at(6, 12), [finding()])
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
 
     def test_additions_start_once_it_was_delivered(self):
         self.file_scan(at(6, 9))
         (self.gateway / nudge.DELIVERED_MARKER).write_text("")
         self.run_at(at(6, 12), [finding()])
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
         self.assertEqual(self.err.getvalue(), "")
 
     def test_a_conversation_claim_holds_until_its_outcome_is_recorded(self):
-        # Under spec.mode next a claim can be released and retried, so it is not the delivery.
         self.file_scan(at(6, 9))
         (self.gateway / nudge.DELIVERED_MARKER).write_text("")
         (self.gateway / "onboarding_conversation.json").write_text("{}")
@@ -537,7 +751,7 @@ class FirstReportTests(NudgeHarness):
     def test_an_install_that_never_ran_onboarding_is_not_held(self):
         self.assertEqual(nudge.first_report_hold(self.gateway, at(6, 12)), (False, ""))
         self.run_at(at(6, 12), [finding()])
-        self.assertIn("New: 1 critical finding.", self.out.getvalue())
+        self.assertIn("1 new critical issue needs attention", self.out.getvalue())
         self.assertEqual(self.err.getvalue(), "")
 
     def test_the_gateway_home_is_found_from_a_shell_in_the_container(self):
@@ -575,7 +789,7 @@ class FailureTests(NudgeHarness):
     def test_a_failure_does_not_spend_the_daily_part(self):
         self.run_at(at(6, 12), [], fail=urllib.error.URLError("refused"))
         self.run_at(at(6, 13), [shown(at(5, 12), id="old")])
-        self.assertIn("Still open", self.out.getvalue())
+        self.assertIn("1 critical issue needs attention", self.out.getvalue())
 
 
 class RosterTests(unittest.TestCase):
@@ -591,19 +805,14 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(job["script"], "findings_nudge.py")
         self.assertTrue(job["no_agent"])
         self.assertTrue(job["enabled"])
-        # Anything but an audible target writes the run to `last_output` and
-        # delivers nowhere, so a broken nudge would read as a quiet hour.
         self.assertIn(job["deliver"], ("chat", "all"))
         self.assertEqual(job["schedule"]["expr"], job["schedule"]["display"])
-        # Hourly, so the afternoon hour is a setting rather than a schedule.
         self.assertEqual(job["schedule"]["expr"].split()[1:], ["*", "*", "*", "*"])
 
         def minute_of_day(job_id):
             minute, hour_field = jobs[job_id]["schedule"]["expr"].split()[:2]
             return int(hour_field) * 60 + int(minute)
 
-        # The daily audits are themselves a source of findings; adding before
-        # they ran would publish a list a day behind its own inputs.
         latest_daily = max(
             minute_of_day(job_id)
             for job_id, other in jobs.items()

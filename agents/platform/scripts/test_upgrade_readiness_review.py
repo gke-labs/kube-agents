@@ -130,6 +130,9 @@ class TheMapping(unittest.TestCase):
         self.assertEqual(single["check"], "upgrade-drain-blocking-budget")
         self.assertEqual((single["namespace"], single["object"]), ("seeded-upgrade", "pinned-batch-runner"))
         self.assertIn("maxUnavailable to 1", single["recommendation"]["action"])
+        self.assertIn("(1 replica)", single["detail"])
+        self.assertNotIn("(1 replicas)", single["detail"])
+        self.assertIn("(3 replicas)", spread["detail"])
 
     def test_skew_blocks_is_critical_and_the_ceiling_is_major(self):
         ceiling = review.skew_findings(seeded_b())

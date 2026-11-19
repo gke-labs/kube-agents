@@ -1,0 +1,195 @@
+{
+  "name": "findings-nudge-upgrade-blockers",
+  "source": "agents/platform/scripts/test_findings_nudge.py::CardAndChatUxTests.test_issue_6256_upgrade_blockers_render_cleanly_with_zero_plumbing",
+  "notes": "findings_nudge_card.chat_from_card: daily upgrade-blocking nudge with clean rows, collapsible cluster breakdown table, and queue buttons.",
+  "input": {
+    "findings_nudge": {
+      "now": "2026-10-06T12:00:00Z",
+      "added": {
+        "critical": 2,
+        "noncritical": 0
+      },
+      "open_count": 4,
+      "daily": true,
+      "backlog_url": "https://github.com/acme/gitops/issues/42",
+      "rows": [
+        {
+          "id": "urr-pdb-blocks-drain.kube-agents-gkedemos.prod-central.kube-system.istiod",
+          "check_slug": "upgrade-drain-blocking-budget",
+          "severity": "critical",
+          "rank_score": 150,
+          "rubric": {
+            "B": 8,
+            "L": 6,
+            "detect": 3,
+            "recover": 3,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-central",
+          "namespace": "kube-system",
+          "object": "istiod",
+          "title": "1. PodDisruptionBudget blocks drain: kube-system/istiod (minAvailable: 1 (>= 1 expected pods)) (1 replicas)",
+          "recommendation": {
+            "action": "Allow at least 1 pod disruption or run at least 2 replicas.",
+            "rationale": "drain",
+            "risk": "upgrade stalled"
+          },
+          "state": "surfaced",
+          "first_shown_at": "2026-10-05 12:00:00",
+          "provider_managed": false,
+          "actionable": true
+        },
+        {
+          "id": "urr-orphan-node.kube-agents-gkedemos.prod-central..gke-prod-pool-8f2a",
+          "check_slug": "upgrade-orphan_node_objects",
+          "severity": "critical",
+          "rank_score": 150,
+          "rubric": {
+            "B": 8,
+            "L": 6,
+            "detect": 3,
+            "recover": 3,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-central",
+          "namespace": "",
+          "object": "gke-prod-pool-8f2a",
+          "title": "22. Orphan Node objects: gke-prod-pool-8f2a has no backing GCE instance",
+          "recommendation": {
+            "action": "Delete the orphan Node object (kubectl delete node gke-prod-pool-8f2a).",
+            "rationale": "precheck",
+            "risk": "upgrade blocked"
+          },
+          "state": "surfaced",
+          "first_shown_at": "2026-10-05 12:00:00",
+          "provider_managed": false,
+          "actionable": true
+        },
+        {
+          "id": "q1",
+          "check_slug": "static-sa-key",
+          "severity": "critical",
+          "rank_score": 140,
+          "rubric": {
+            "B": 8,
+            "L": 6,
+            "detect": 3,
+            "recover": 3,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-central",
+          "namespace": "billing",
+          "object": "invoice-worker",
+          "title": "invoice-worker mounts a static GCP key",
+          "recommendation": {
+            "action": "Move to Workload Identity.",
+            "rationale": "iam",
+            "risk": "editor key"
+          },
+          "state": "queued",
+          "first_shown_at": null,
+          "provider_managed": false,
+          "actionable": true
+        },
+        {
+          "id": "q2",
+          "check_slug": "upgrade-fail-closed-webhook",
+          "severity": "major",
+          "rank_score": 110,
+          "rubric": {
+            "B": 6,
+            "L": 5,
+            "detect": 2,
+            "recover": 2,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-europe",
+          "namespace": "",
+          "object": "authz-webhook",
+          "title": "4. Fail-closed webhook: authz-webhook blocks API calls during drain",
+          "recommendation": {
+            "action": "Run 2 webhook replicas.",
+            "rationale": "api",
+            "risk": "outage"
+          },
+          "state": "queued",
+          "first_shown_at": null,
+          "provider_managed": false,
+          "actionable": true
+        }
+      ]
+    }
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "2 critical issues will block cluster upgrades",
+        "note": "\u00b7 4 open across 2 clusters",
+        "tone": "critical",
+        "rows": [
+          {
+            "text": "**kube-system/istiod** on `prod-central` \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)",
+            "severity": "critical",
+            "detail": "Allow at least 1 pod disruption or run at least 2 replicas."
+          },
+          {
+            "text": "**gke-prod-pool-8f2a** on `prod-central` \u2014 Orphan Node objects: has no backing GCE instance",
+            "severity": "critical",
+            "detail": "Delete the orphan Node object."
+          }
+        ],
+        "after": ["2 more issues are queued (1 critical, 1 lower priority)."],
+        "fold": {
+          "title": "Queue breakdown (2 more queued)",
+          "table": {
+            "columns": [
+              "Cluster",
+              "Critical",
+              "Major",
+              "Lower",
+              "Next queued issue"
+            ],
+            "rows": [
+              [
+                "prod-central",
+                "1",
+                "0",
+                "0",
+                "billing/invoice-worker: mounts a static GCP key"
+              ],
+              [
+                "prod-europe",
+                "0",
+                "1",
+                "0",
+                "authz-webhook: Fail-closed webhook: blocks API calls during drain"
+              ]
+            ]
+          }
+        },
+        "choices": [
+          {
+            "text": "Fix first issue",
+            "reply": "Fix first issue: kube-system/istiod on prod-central \u2014 PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)",
+            "primary": true
+          },
+          {
+            "text": "See all 4 items"
+          }
+        ],
+        "links": [
+          {
+            "text": "Open backlog",
+            "url": "https://github.com/acme/gitops/issues/42"
+          }
+        ]
+      }
+    }
+  ]
+}

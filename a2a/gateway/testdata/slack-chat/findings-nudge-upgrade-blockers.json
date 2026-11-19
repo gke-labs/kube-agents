@@ -1,0 +1,272 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "2 critical issues will block cluster upgrades",
+                "type": "text"
+              },
+              {
+                "text": " · 4 open across 2 clusters",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "kube-system/istiod",
+                "type": "text"
+              },
+              {
+                "text": " on ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "prod-central",
+                "type": "text"
+              },
+              {
+                "text": " — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "Allow at least 1 pod disruption or run at least 2 replicas.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "gke-prod-pool-8f2a",
+                "type": "text"
+              },
+              {
+                "text": " on ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "prod-central",
+                "type": "text"
+              },
+              {
+                "text": " — Orphan Node objects: has no backing GCE instance",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "Delete the orphan Node object.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "2 more issues are queued (1 critical, 1 lower priority).",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "rows": [
+              [
+                {
+                  "text": "Cluster",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Critical",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Major",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Lower",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Next queued issue",
+                  "type": "raw_text"
+                }
+              ],
+              [
+                {
+                  "text": "prod-central",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "1",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "billing/invoice-worker: mounts a static GCP key",
+                  "type": "raw_text"
+                }
+              ],
+              [
+                {
+                  "text": "prod-europe",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "1",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "authz-webhook: Fail-closed webhook: blocks API calls during drain",
+                  "type": "raw_text"
+                }
+              ]
+            ],
+            "type": "table"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "Queue breakdown (2 more queued)",
+          "type": "plain_text"
+        },
+        "type": "container"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "action_id": "kage.choice.0",
+                "style": "primary",
+                "text": {
+                  "emoji": true,
+                  "text": "Fix first issue",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain (minAvailable: 1, expects at least 1 pod) (1 replica)"
+              },
+              {
+                "action_id": "kage.choice.1",
+                "text": {
+                  "emoji": true,
+                  "text": "See all 4 items",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "See all 4 items"
+              },
+              {
+                "action_id": "kage.link.0",
+                "text": {
+                  "emoji": true,
+                  "text": "Open backlog",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "url": "https://github.com/acme/gitops/issues/42"
+              }
+            ],
+            "type": "actions"
+          }
+        ],
+        "color": "#E01E5A",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

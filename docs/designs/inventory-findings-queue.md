@@ -922,9 +922,11 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
   `FINDINGS_DAILY_CRITICALS` pending critical items not first shown that day are named again.
   They are not additions and count against nothing. A pending critical below that top is named
   only on the day it was added.
-- **The stop-add notice:** the same once-a-day part names every pending non-critical item, its
-  id, and the three decisions that release it (dismiss, snooze, accept), so stop-add is never
-  silent for more than a day. A pending critical holding non-criticals back gets no such notice.
+- **The stop-add notice:** the same once-a-day part names every pending non-critical item with a
+  pause notice naming the decisions that release it (resolve, snooze, dismiss), while finding ids
+  and covered-object counts ride in hidden thread context rather than visible chat text, so
+  stop-add is never silent for more than a day. A pending critical holding non-criticals back gets
+  no such notice.
 
 The day's limits count additions from `findings_additions` (§3.1, `GET /v1/findings/additions`),
 one row per item added, with the class the item had when it was added, so neither dismissing,

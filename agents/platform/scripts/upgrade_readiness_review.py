@@ -168,6 +168,7 @@ ROW_MEMBERS_KEY = "members"
 SKEW_VERDICT_BLOCKS = "blocks"
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
+REPLICA_NOUN = ("replica", "replicas")
 WORKLOADS_KEY = "workloads"
 NAME_KEY = "name"
 PDB_KEY = "pdb"
@@ -619,7 +620,11 @@ def budget_findings(member: dict) -> list[dict]:
         # the report names no workload at all.
         running = [w for w in workloads if (w.get(WORKLOAD_REPLICAS_KEY) or 0) > 0]
         singleton = any((w.get(WORKLOAD_REPLICAS_KEY) or 0) <= 1 for w in running) or not running
-        owners = ", ".join(f"{w.get(KIND_KEY)} {w.get(NAMESPACE_KEY)}/{w.get(NAME_KEY)} ({w.get(WORKLOAD_REPLICAS_KEY)} replicas)" for w in workloads)
+        owners = ", ".join(
+            f"{w.get(KIND_KEY)} {w.get(NAMESPACE_KEY)}/{w.get(NAME_KEY)} "
+            f"({w.get(WORKLOAD_REPLICAS_KEY)} {REPLICA_NOUN[w.get(WORKLOAD_REPLICAS_KEY) != 1]})"
+            for w in workloads
+        )
         name = str(budget.get(NAME_KEY) or budget.get(PDB_KEY) or "")
         namespace = str(budget.get(NAMESPACE_KEY) or "")
         field = budget.get(FIELD_KEY)
