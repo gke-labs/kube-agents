@@ -5,6 +5,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -19,8 +20,9 @@ const vcsSkill = "version-control"
 
 // profileQueryMaxLength, profileQueryRefusedCharacters and
 // profileQueryRefusedWords are the broker's plain-words rule for a profile
-// caller's issue-list query (credential_proxy.PROFILE_QUERY_*), which an
-// example in the skill must pass, or the model learns a refused search.
+// caller's issue-list query (credential_proxy.PROFILE_QUERY_*, pinned to
+// them by TestThePlainWordsRuleIsTheBrokers), which an example in the skill
+// must pass, or the model learns a refused search.
 const (
 	profileQueryMaxLength         = 256
 	profileQueryRefusedCharacters = ":\"\\()"
@@ -287,6 +289,48 @@ func plainWordsRefusal(q string) string {
 		}
 	}
 	return ""
+}
+
+// The Go copy of the plain-words rule is the broker's own: the refused
+// characters, the refused words and the length cap read from
+// credential_proxy.py (#6324). A broker that changes its rule fails this
+// until the copy, and so the skill's examples, follow it.
+func TestThePlainWordsRuleIsTheBrokers(t *testing.T) {
+	b, err := os.ReadFile(credentialProxySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	m := regexp.MustCompile(`(?m)^PROFILE_QUERY_REFUSED_CHARACTERS = frozenset\('((?:[^'\\]|\\.)*)'\)`).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatal("credential_proxy.py has no PROFILE_QUERY_REFUSED_CHARACTERS = frozenset('...')")
+	}
+	chars := regexp.MustCompile(`\\(.)`).ReplaceAllString(m[1], "$1")
+	sorted := func(s string) string { r := []rune(s); slices.Sort(r); return string(r) }
+	if sorted(chars) != sorted(profileQueryRefusedCharacters) {
+		t.Errorf("the broker refuses the characters %q; the skill's check refuses %q", chars, profileQueryRefusedCharacters)
+	}
+	m = regexp.MustCompile(`(?m)^PROFILE_QUERY_REFUSED_WORDS = frozenset\(\{([^}]*)\}\)`).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatal("credential_proxy.py has no PROFILE_QUERY_REFUSED_WORDS = frozenset({...})")
+	}
+	var words []string
+	for _, w := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(m[1], -1) {
+		words = append(words, w[1])
+	}
+	want := slices.Clone(profileQueryRefusedWords)
+	slices.Sort(words)
+	slices.Sort(want)
+	if !slices.Equal(words, want) {
+		t.Errorf("the broker refuses the words %v; the skill's check refuses %v", words, want)
+	}
+	m = regexp.MustCompile(`(?m)^PROFILE_QUERY_MAX_LENGTH = (\d+)`).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatal("credential_proxy.py has no PROFILE_QUERY_MAX_LENGTH")
+	}
+	if m[1] != strconv.Itoa(profileQueryMaxLength) {
+		t.Errorf("the broker caps a query at %s characters; the skill's check at %d", m[1], profileQueryMaxLength)
+	}
 }
 
 // The plain-words check itself refuses what the broker refuses and passes
