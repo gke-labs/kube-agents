@@ -78,13 +78,14 @@ A one-server bus starts its server with a `stale-cluster-meta` init step. A serv
 3. **The clear.** With the snapshot pinned, the operator's pod deletes the streams from the single server, so it joins the cluster with nothing on disk; the conversion would have dropped them anyway.
 4. **The conversion.** The bus renders three servers. On a cluster that provisions nodes on demand, such as Autopilot, that includes the nodes for servers 1 and 2. The conversion has 15 minutes of its own (`status.busMigration.phaseDeadline`) to get all three Ready, so a cluster that cannot schedule servers 1 and 2 turns the run back then, not at the run's two-hour deadline.
 5. **The restore.** The operator's restore pod restores each stream, with its consumers, and raises it to three replicas. Before it restores a stream, it checks the snapshot against the operator's digests and against the operator's policy for that stream: its subjects, limits and retention. The stream comes back with the limits the install renders now. A snapshot that does not fit them is refused, which turns the run back: more bytes than the rendered `max_bytes`, or an oldest message older than the rendered `max_age`. After, it checks the restored stream against the same policy and deletes one that fails.
-6. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
+6. **The settle.** Once every stream is raised, the restore pod waits, up to 5 minutes for all of them together, until each stream's replicas are current and each restored durable consumer answers from its leader. A stream that doesn't settle in that time turns the run back, like any failed restore.
+7. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
 
-The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (15Gi today), so the default StorageClass must support that access mode.
+The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes; the restore's settle wait adds up to 5 of them. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (15Gi today), so the default StorageClass must support that access mode.
 
 Before a one to three run starts, the operator reads each stream's size from the bus's monitoring endpoint. If a stream holds more than the cap the restore puts on it, keeps a message older than its max age (a stream an earlier install kept longer), or the sizes can't be read, no run starts and nothing freezes. The bus keeps its one server, and an `A2ABusMigrationStreamsOverCap` Warning Event names each stream and the limit it is over. The operator checks again on later passes and starts the run once every stream is under its cap.
 
-A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event.
+A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event. How long the streams took to settle is in `status.busMigration.settleTime`, and in a `BusMigrationSettled` Normal Event.
 
 #### When a migration fails
 
@@ -570,9 +571,21 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, the gateway's
+`defaultRoute`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
+`maxSessions` renders `10`, `defaultRoute` renders `platform`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
+
+`defaultRoute` is where the A2A gateway sends a plain conversation's first message: `platform` to the
+Platform Agent, `session` to a session pod of the conversation's own. The operator renders it as
+`A2A_DEFAULT_ADDRESSEE` on the gateway and on the Platform Agent container, which the hermes-bridge
+sidecar copies. Changing it rolls the gateway and the Platform Agent pod. On either route the Platform
+Agent stays reachable by handle and `delegate:` opens a session pod. A later release flips the unset
+default to `session`.
+
+`session` also widens the `TASKS` consumer budget, because each session counts the replays of its
+task too. On an install whose stream is narrower, the provision Job refuses until `maxSessions` is
+lowered or `TASKS` is recreated. Its message names both.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short

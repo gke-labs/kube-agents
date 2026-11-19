@@ -23,7 +23,7 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
 metadata:
   # A dot-free DNS-1123 label: it is the addressee on the bus. The name plus its
-  # longest listed tier is at most 54 characters. `platform` is reserved.
+  # longest listed tier is at most 54 characters. `platform` and `session` are reserved.
   name: auditor
   namespace: kubeagents-system
 spec:

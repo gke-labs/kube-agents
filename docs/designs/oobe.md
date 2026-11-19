@@ -93,6 +93,21 @@ waits, five tries in all; no repository, several, an unreadable mount or a body 
 may be is recorded in the path's own attempts file and waits for the retire. A report retired that way leaves its items unmarked in the findings queue, so the nudge
 announces them later: nobody saw them.
 
+Whichever way it ended, the report is readable on demand afterwards. The `platform_control` tool
+`get_first_run_report` (`agents/platform/scripts/platform_mcp_server.py`) reads the ranked report
+(`INVENTORY.delivered.md`, else a pending `INVENTORY.md`) or the sweep's complete findings
+(`INVENTORY.raw.md`) from where onboarding left them, and the markers on the agent pod, and names
+the state: `delivered` with the path that took it (`origin`, the chat the onboarding job was linked
+to, or `conversation`, the conversation recorded under the gateway: both the chat the first person
+wrote in), `filed` with the issue's repository, number, link and time, `retired`,
+`pending` (written, not yet delivered) or `absent` (no report yet). The `first-run-report` skill is
+the route a chat question takes ("what did onboarding find?", "show me the full inventory", "was
+the first-run report delivered, and where did it go?"), and its red line is the tool: no terminal
+read of the files, no new sweep. The file names, markers and claim tags have one home for
+delivery, the scan gate and the on-demand read, `agents/platform/scripts/first_run_report.py`;
+the onboarding plugin, `board_snapshot.py` and `findings_nudge.py` keep their own copies, pinned
+equal by tests.
+
 ## 4. First-run audits
 
 ### 4.1 Trigger

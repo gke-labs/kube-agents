@@ -35,11 +35,11 @@ func TestTheDirectionDecidesTheRestoreNotTheServerCount(t *testing.T) {
 	over := policyOf(meta.Config)
 	over.MaxBytes = int64(meta.State.Bytes) - 1
 	dir, run := stageTasks(t, meta, data, over)
-	if _, err := restoreAllDirected(ctx, open(t), []string{"TASKS"}, dir, run, 1, true); !errors.Is(err, ErrOverRenderedLimits) {
+	if _, _, err := restoreAllDirected(ctx, open(t), []string{"TASKS"}, dir, run, 1, true); !errors.Is(err, ErrOverRenderedLimits) {
 		t.Errorf("forward into one server over the cap: %v, want ErrOverRenderedLimits", err)
 	}
 	// Back into one server: the same snapshot goes back as it was.
-	if _, err := restoreAllDirected(ctx, open(t), []string{"TASKS"}, dir, run, 1, false); err != nil {
+	if _, _, err := restoreAllDirected(ctx, open(t), []string{"TASKS"}, dir, run, 1, false); err != nil {
 		t.Errorf("back into one server: %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestTheDirectionDecidesTheRestoreNotTheServerCount(t *testing.T) {
 		policy.MaxConsumers = 150
 		dir, run := stageTasks(t, meta, data, policy)
 		nc := open(t)
-		if _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 1, c.forward); err != nil {
+		if _, _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 1, c.forward); err != nil {
 			t.Fatalf("forward %v: %v", c.forward, err)
 		}
 		info, err := streamInfo(ctx, nc, "TASKS")
@@ -117,7 +117,7 @@ func TestAThreeReplicaSnapshotRestoresIntoThreeServersBothWays(t *testing.T) {
 		policy := policyOf(meta.Config)
 		policy.Replicas = 1 // the operator's policy, at one replica
 		dir, run := stageTasks(t, meta, buf.Bytes(), policy)
-		if _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 3, forward); err != nil {
+		if _, _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 3, forward); err != nil {
 			t.Fatalf("forward %v: %v", forward, err)
 		}
 		info, err := streamInfo(ctx, nc, "TASKS")
@@ -128,7 +128,7 @@ func TestAThreeReplicaSnapshotRestoresIntoThreeServersBothWays(t *testing.T) {
 			t.Errorf("forward %v: %d replicas, msgs %d last %d; want 3, %d and %d", forward, info.Config.Replicas, info.State.Msgs, info.State.LastSeq, meta.State.Msgs, meta.State.LastSeq)
 		}
 		// A pod run again finds it already restored and raised.
-		if _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 3, forward); err != nil {
+		if _, _, err := restoreAllDirected(ctx, nc, []string{"TASKS"}, dir, run, 3, forward); err != nil {
 			t.Errorf("forward %v, run again: %v", forward, err)
 		}
 		nc.Close()

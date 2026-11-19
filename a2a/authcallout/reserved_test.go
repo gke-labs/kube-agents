@@ -313,9 +313,15 @@ func TestTheRefusalNamesTheIdentityMapUser(t *testing.T) {
 				t.Fatalf("a narrowed pod named %q was authorized; it would hold %s's inbox", name, name)
 			}
 			reason := "the name of an identity-map user"
-			if name == "gateway" {
+			switch {
+			case name == "gateway":
 				// Static too, and that check runs first.
 				reason = "the name of a static principal"
+			case slices.Contains(renderedFixtureAddressees(t), name):
+				// A reserved addressee too (the narrowed entry's own
+				// user, `session`, is the gateway's session route), and
+				// the addressee check runs before the map's.
+				reason = "the name of an addressee"
 			}
 			if !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), `"`+name+`"`) {
 				t.Errorf("refused for the wrong reason: %v", err)

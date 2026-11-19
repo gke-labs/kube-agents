@@ -3265,8 +3265,9 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 //
 // The capability envelope's two subjects are on the allowed side, one each way,
 // and both are single subjects. The bridge is the default install's executor --
-// the operator renders no A2A_DEFAULT_ADDRESSEE, so an unqualified task arrives
-// here -- which is why it needs to ask at all. What it still may not do is
+// the operator renders A2A_DEFAULT_ADDRESSEE as `platform` unless defaultRoute
+// says `session`, so an unqualified task arrives here -- which is why it needs
+// to ask at all. What it still may not do is
 // read the answer's source: no `$KV.cap` entry is in either list.
 //
 // The blackboard streams are on the forbidden side here, and that is the half
