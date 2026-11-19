@@ -785,14 +785,33 @@ class ChainWatchTest(unittest.TestCase):
 
     def test_a_second_stop_still_waits_for_a_pass_the_first_outwaited(self):
         # The fan-out's stop times out; the EXIT trap's stop, with no pid file left, waits on.
-        calls = self.run_watch(1, 'echo started >> "$LOG"; sleep 5; echo landed >> "$LOG"', [
-            "sleep 2",
-            "stop_chain_audits_watch 2>/dev/null",
+        # The pass ends on a gate file, not on a clock. The first stop cannot see the pass
+        # land, because the gate is shut. The gate opens 1s into the second stop, whose
+        # bound is 5s. A fixed 5s pass against sleep 2 and two 2s bounds had both sides
+        # land on the same sixth second (#6435).
+        gate = '"${STATE_DIR}/gate"'
+        # 100 polls of 0.2s: a pass whose gate never comes ends by itself after 20s, so a
+        # run that is cut leaves no watch that polls for ever.
+        pass_stub = (
+            f'echo started >> "$LOG"; n=0; until [ -e {gate} ] || [ "$n" -ge 100 ]; do sleep 0.2; n=$((n + 1)); done;'
+            ' echo landed >> "$LOG"'
+        )
+        calls = self.run_watch(1, pass_stub, [
+            # A step that fails opens the gate on the way out, so the pass ends at once
+            # and the failure is the step's, not a timeout.
+            "trap ': > \"{tmp}/gate\"' EXIT",
+            # The pass is under way before the first stop.
+            'n=0; until grep -qx started "$LOG" 2>/dev/null || [ "$n" -ge 100 ]; do sleep 0.2; n=$((n + 1)); done',
+            'grep -qx started "$LOG"',
+            'stop_chain_audits_watch 2> "{tmp}/first-stop.err"',
+            # The first stop gave up at its bound, and the pass had not landed.
+            'grep -q "still running after 5s" "{tmp}/first-stop.err"',
             'tail -1 "$LOG" | grep -qx started',
             '[ ! -e "{tmp}/watch.pid" ]',
+            '( sleep 1; : > "{tmp}/gate" ) &',
             "stop_chain_audits_watch",
             'tail -1 "$LOG" | grep -qx landed || { echo "the second stop did not wait" >&2; exit 9; }',
-        ], stop_wait=2)
+        ], stop_wait=5)
         self.assertEqual(calls, ["started", "landed"])
 
     def test_a_stop_waits_for_a_pass_under_way(self):
