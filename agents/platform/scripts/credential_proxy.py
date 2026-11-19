@@ -5343,7 +5343,9 @@ class ProfileTaskWrites:
 
         Allowed when the task already holds a confirmed claim on the branch, or
         when nobody holds it and it is absent from the remote (``on_remote``,
-        asked outside the lock; an error there counts as present). A fresh claim
+        asked outside the lock). A lookup that raises releases the pending claim
+        and raises on, so the caller answers the forge's own failure rather than
+        an ownership refusal; nothing is written either way. A fresh claim
         is taken, pending, before the remote is asked, so a second request racing
         the same new name finds it held -- refused whoever sent it, the claiming
         task included, until the lookup confirms the name is free. At the cap a
@@ -5365,7 +5367,8 @@ class ProfileTaskWrites:
         try:
             present = on_remote()
         except Exception:
-            present = True
+            self.release_branch(task, repository, branch)
+            raise
         with self._lock:
             # Only this call's own claim: if it expired and was replaced while
             # the remote was asked, the replacement is not this lookup's to judge.
@@ -17070,7 +17073,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
         record = self.profile_task_writes
         if verb == "publish":
-            branch = str(payload.get("branch") or "")
+            branch = str(payload.get("branch") or "").strip()
             allowed, fresh = record.claim_branch(
                 task_id, expires_at, repository, branch, lambda: self._remote_branch_exists(payload, branch)
             )
@@ -17081,7 +17084,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 ), None
             return None, (task_id, repository, branch) if fresh else None
         if verb == PROPOSAL_CREATE_VERB:
-            source = str(payload.get("source") or "")
+            source = str(payload.get("source") or "").strip()
             if not record.owns_branch(task_id, repository, source):
                 return (
                     f"{source} is not a branch this task published, so this task does not open a "

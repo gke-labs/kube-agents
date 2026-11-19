@@ -1033,7 +1033,7 @@ under the same name does not build on it and its publish is refused as
 (one name per workload, so a repeat alert finds the earlier pull request) meets
 this on its second run. `branch-view` answers whether the remote holds the
 branch and at what revision; `branch-delete` removes a spent one. A profile task has
-neither the delete nor a way to publish to a branch already on the remote (#6400), so a
+neither the delete nor a way to publish to a branch another task left on the remote (#6400), so a
 profile flow that derives its branch name meets the refusal, `PROPOSAL_NOT_THIS_TASKS`,
 not the reuse (#6423). Both are broker
 verbs — the question is `ls-remote` and the delete is a push, identical on every

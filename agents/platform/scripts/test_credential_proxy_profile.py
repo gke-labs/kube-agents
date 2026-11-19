@@ -1609,6 +1609,16 @@ class ProfileTaskWritesTest(unittest.TestCase):
         self.assertEqual([(False, False), False], seen)
         self.assertFalse(record.owns_branch("t1", "r", "platform-agent/x"))
 
+    def test_a_lookup_that_raises_releases_the_claim_and_raises(self):
+        record = credential_proxy.ProfileTaskWrites()
+
+        def broken():
+            raise OSError("forge down")
+
+        with self.assertRaises(OSError):
+            record.claim_branch("t", FAR, "r", "b", broken)
+        self.assertEqual((True, True), record.claim_branch("t2", FAR, "r", "b", lambda: False))
+
     def test_a_lookup_never_confirms_a_claim_that_replaced_its_own(self):
         # The first claim expires while its remote lookup is in flight, and the
         # same task claims the name afresh (and has it confirmed). The first
@@ -1805,6 +1815,14 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 status, body = self.post_with("proposal-create", source=source)
                 self.assert_not_this_tasks("proposal-create", status, body)
 
+    def test_the_key_holds_the_host_and_the_path(self):
+        github, enterprise = mock.Mock(), mock.Mock()
+        github.name = enterprise.name = "github"
+        github.hosts, enterprise.hosts = ("github.com",), ("github.example.com",)
+        key = credential_proxy.task_repository_key
+        # The same provider and path on two hosts, and two paths on one host, are four records.
+        self.assertEqual(4, len({key(f, p) for f in (github, enterprise) for p in ("acme/infra", "acme/other")}))
+
     def test_the_same_path_on_another_forge_is_another_record(self):
         # The task opened #7 on github.com's acme/infra; GitLab's acme/infra #7,
         # also the install's, is not this task's.
@@ -1841,9 +1859,18 @@ class ProfileVcsRouteTest(unittest.TestCase):
         status, body = self.post_with("publish", branch="platform-agent/theirs")
         self.assert_not_this_tasks("publish", status, body)
 
-    def test_a_remote_lookup_that_fails_counts_as_present(self):
+    def test_a_remote_lookup_that_fails_is_the_forges_answer(self):
+        # Not "another task published it first": the forge's own status, nothing written.
         self.routes["branch-view"].side_effect = credential_proxy.providers.WorkspaceError("forge down", status=502)
         status, body = self.post_with("publish", branch="platform-agent/fresh")
+        self.assertEqual(502, status, body)
+        self.assertNotEqual(credential_proxy.PROPOSAL_NOT_THIS_TASKS_CODE, body.get("code"))
+        self.routes["publish"].assert_not_called()
+        self.assertFalse(self.record.owns_branch(TASK_ID, self.key, "platform-agent/fresh"))
+
+    def test_a_branch_name_with_white_space_is_the_same_branch(self):
+        self.own_branch("platform-agent/theirs", task="task-2")
+        status, body = self.post_with("publish", branch="platform-agent/theirs ")
         self.assert_not_this_tasks("publish", status, body)
 
     def test_a_failed_publish_releases_its_new_claim(self):

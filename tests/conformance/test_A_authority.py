@@ -592,7 +592,10 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         record.record_proposal("task-2", 4_000_000_000, key, 8)
 
         def update(number: int) -> list:
-            body = json.dumps({"repository": f"https://github.com/{repo}", "number": number, "title": "t"}).encode()
+            return write("proposal-update", {"number": number, "title": "t"})
+
+        def write(verb: str, fields: dict) -> list:
+            body = json.dumps({"repository": f"https://github.com/{repo}", **fields}).encode()
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
             handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
             handler.headers = email.message.Message()
@@ -604,7 +607,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             handler._repository_is_permitted = lambda repository, forge: True
             replies: list = []
             handler._json = lambda status, payload: replies.append((int(status), payload))
-            handler._dispatch_vcs_post("proposal-update")
+            handler._dispatch_vcs_post(verb)
             return replies
 
         self.assertEqual(200, update(7)[0][0], "the task's own proposal must stay updatable")
@@ -612,6 +615,14 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         self.assertEqual(403, replies[0][0], replies)
         self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
         self.assertEqual([7], [payload["number"] for payload in ran], "another task's proposal reached the forge")
+        # And the other two writes: a publish to, and a proposal from, another task's branch.
+        allowed, _ = record.claim_branch("task-2", 4_000_000_000, key, "platform-agent/theirs", lambda: False)
+        self.assertTrue(allowed)
+        for verb, field in (("publish", "branch"), ("proposal-create", "source")):
+            with self.subTest(verb=verb):
+                replies = write(verb, {field: "platform-agent/theirs", "title": "t", "target": "main"})
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
 
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
         # A report credential (#5619) is the one task credential with no
