@@ -2789,7 +2789,7 @@ unidentified caller gets an undifferentiated `401` rather than a reason. `CREDEN
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
 the same listener, on every install the A2A gateway's, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2841,8 +2841,8 @@ deletes are refused, and no other role's `publish` is resolved. It
 is bound both ways: `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names the gateway's ServiceAccount, no
 other caller may present the audience, and that account may present only this audience or the
 `a2a-chat` one, whose token the same pod holds ([fleet-audit-report-store.md](fleet-audit-report-store.md)
-§3). Under
-`mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
+§3). With
+an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
 allowlist. `/v1/vcs/` admits it too, and every verb there needs a valid task credential:
@@ -2872,7 +2872,7 @@ credential's cluster and project. Profile calls together hold at most
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
-The scope publisher Job under `mode: next` has a role of its own, `scope`:
+The scope publisher Job has a role of its own, `scope`:
 its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
 `CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
 `ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token

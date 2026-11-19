@@ -244,7 +244,7 @@ A gate nobody can read is ignored within a week, whatever its statistics say. Fo
 
 Every lane above (presubmit, the release-candidate eval, the nightly, the validated-capabilities lane) reaches the agent through the gateway's inject door; the harness's `api` transport ([`bench/README.md`](../../bench/README.md#transports), §4.2) is a developer's run against an install, not a CI lane. An injected turn becomes the same agent turn a Slack or Google Chat message does, so these lanes grade the agent over a transport that adds no variance of its own, and their records compare run to run. What the inject door leaves out is the channel: the connection, the layout, the clicks, the time the platform adds, and the paths only a chat message takes, such as a session keyed by its thread and the allowed-user filters. Those get a thin layer of their own, sized to what can break there, not a second copy of the suite.
 
-That layer, for the A2A gateway that carries chat under `next`:
+That layer, for the A2A gateway that carries chat:
 
 - Layout. The renderers' golden tests (`a2a/gateway/slack_chat_golden_test.go`, `gchat_chat_golden_test.go`) lay out the shared chat cases under `tests/conformance/chat/` and compare each with its checked-in output, and `a2a/lib/chatmsg` validates the same cases and lints them against the chat UX rules code can check ([`chat_ux.md`](../../.agents/rules/chat_ux.md)). A layout change shows as a golden diff, and a broken rule the lint knows fails a unit test.
 - Clicks. `a2a/gateway/slack_clicks_test.go` and `gchat_clicks_test.go` replay each platform's interactive payloads through the gateway, and assert the turn or the rating they become.
