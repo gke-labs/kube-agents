@@ -234,6 +234,9 @@ type Gateway struct {
 	// first use (triggerLimiter).
 	triggerLimiterOnce sync.Once
 	triggerLimits      *triggerRateLimiter
+	// triggerEventLimits is the same for event sources' kinds (#6572).
+	triggerEventLimiterOnce sync.Once
+	triggerEventLimits      *triggerRateLimiter
 	// reports keeps the notify route's posts into conversations for the
 	// replies under them (reports.go).
 	reports pushedReports

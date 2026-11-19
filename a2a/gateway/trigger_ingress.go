@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,11 @@ import (
 // the trigger's own conversation, publishes the submission on the profile's
 // unattended intake, and answers with the task's id or a refusal.
 //
+// An event source (#6572) submits the same way, with a trigger named
+// <source>/<kind> and no schedule, and only for a kind the install admits
+// (TriggerEventKinds, empty by default). Each run has its own conversation,
+// trigger:<key>, and each kind its own rate bucket.
+//
 // It ships dark: until the callout grants a source publish on the subject
 // (#5617's second pull request), nothing can reach it.
 
@@ -52,6 +58,12 @@ const (
 	// none: twelve an hour, so a schedule every five minutes runs every
 	// time (#5635).
 	DefaultTriggerRatePerHour = 12
+	// DefaultTriggerEventRatePerHour is each admitted event kind's cap when
+	// the config sets none (#6572): above the largest daily alert quota the
+	// session store applies to one kind before it asks for a triage, so one
+	// day's alerts pass in a burst and a runaway source is held to the cap
+	// on each kind the install admits.
+	DefaultTriggerEventRatePerHour = 30
 	// triggerLimiterMax bounds the limiter's map: past it, a full bucket
 	// (one that would admit at once anyway) is dropped first.
 	triggerLimiterMax = 4096
@@ -129,10 +141,22 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	// built-in schedule lives in the install's own namespace (one
 	// PlatformAgent per cluster, which owns them), so a schedule anywhere
 	// else is refused, and two namespaces never share a trigger.
-	if g.cfg.Namespace == "" || s.Schedule.Namespace != g.cfg.Namespace {
+	event := source != lib.TriggerSourceSchedule
+	switch {
+	case event && !slices.Contains(g.cfg.TriggerEventKinds, s.Trigger.Name):
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "event trigger "+s.Trigger.Name+" is not one this install admits")
+	case !event && (g.cfg.Namespace == "" || s.Schedule.Namespace != g.cfg.Namespace):
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "schedule "+s.Schedule.Namespace+"/"+s.Schedule.Name+" is not in the install's namespace")
 	}
 	key := triggerConversationKey(source, s.Schedule)
+	bucket := key
+	if event {
+		// An event run is its own conversation, so its delivery and
+		// active task are its own and its key is answered for as long as
+		// the record lives; its kind is its rate bucket.
+		key = triggerConversationPrefix + s.IdempotencyKey
+		bucket = triggerConversationPrefix + s.Trigger.Name
+	}
 	// One submission at a time per trigger, and the relay's batches for its
 	// tasks wait on the same lock (relayBatch): the record read here is the
 	// one written back, and a fast executor's terminal finds its TaskRef.
@@ -175,7 +199,7 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.publishTriggerRun(ctx, rec, s, route, *run)
 	}
 
-	if !g.triggerLimiter().allow(key, time.Now()) {
+	if !g.triggerLimiterFor(event).allow(bucket, time.Now()) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedRateLimited, "the trigger is over its rate cap")
 	}
 	// The cap bucket's writes are create-only, so a key a failed attempt
@@ -428,6 +452,22 @@ func (g *Gateway) triggerLimiter() *triggerRateLimiter {
 		g.triggerLimits = newTriggerRateLimiter(rate)
 	})
 	return g.triggerLimits
+}
+
+// triggerLimiterFor is the schedules' limiter, or for an event source the
+// event kinds', made on first use.
+func (g *Gateway) triggerLimiterFor(event bool) *triggerRateLimiter {
+	if !event {
+		return g.triggerLimiter()
+	}
+	g.triggerEventLimiterOnce.Do(func() {
+		rate := g.cfg.TriggerEventRatePerHour
+		if rate <= 0 {
+			rate = DefaultTriggerEventRatePerHour
+		}
+		g.triggerEventLimits = newTriggerRateLimiter(rate)
+	})
+	return g.triggerEventLimits
 }
 
 // triggerRateLimiter is a token bucket per trigger name: perHour tokens,

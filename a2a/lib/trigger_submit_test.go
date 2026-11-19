@@ -121,3 +121,61 @@ func TestATriggerReplyIsOnlyInItsSourcesNamespace(t *testing.T) {
 		}
 	}
 }
+
+// goodEventTriggerSubmit is an event source's submission: a trigger named
+// <source>/<kind>, no schedule, and a key <source>/<kind>/<token>.
+func goodEventTriggerSubmit() TriggerSubmit {
+	return TriggerSubmit{
+		Trigger:        TriggerClaim{Name: "event-watcher/k8s-event", Origin: TriggerOriginBuiltin},
+		IdempotencyKey: "event-watcher/k8s-event/k8s-evt-1a2b3c4d",
+		Profile:        "cluster",
+		Prompt:         "Triage the event.",
+		Parameters:     map[string]string{"project": "acme-prod", "location": "us-central1", "cluster": "web"},
+		Delivery:       ScheduleDelivery{Mode: ScheduleDeliveryChat, JobKey: "k8s-event"},
+	}
+}
+
+func TestAWellFormedEventTriggerSubmitPasses(t *testing.T) {
+	if err := ValidateTriggerSubmit("event-watcher", goodEventTriggerSubmit()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAMalformedEventTriggerSubmitIsRefused(t *testing.T) {
+	for name, mutate := range map[string]func(*TriggerSubmit){
+		"another source's trigger": func(s *TriggerSubmit) { s.Trigger.Name = "drift-detector/k8s-event" },
+		"a bare source as name":    func(s *TriggerSubmit) { s.Trigger.Name = "event-watcher" },
+		"a dotted kind":            func(s *TriggerSubmit) { s.Trigger.Name = "event-watcher/k8s.event" },
+		"a user origin":            func(s *TriggerSubmit) { s.Trigger.Origin = "user" },
+		"a stream":                 func(s *TriggerSubmit) { s.Trigger.Stream = "k8s-event" },
+		"a script":                 func(s *TriggerSubmit) { s.Trigger.Script = "k8s-event" },
+		"a schedule":               func(s *TriggerSubmit) { s.Schedule = ScheduleRef{Namespace: "kubeagents-system", Name: "k8s-event"} },
+		"a key for another kind":   func(s *TriggerSubmit) { s.IdempotencyKey = "event-watcher/gitops-drift/k8s-evt-1a2b3c4d" },
+		"a key for another source": func(s *TriggerSubmit) { s.IdempotencyKey = "drift-detector/k8s-event/k8s-evt-1a2b3c4d" },
+		"a schedule-shaped key":    func(s *TriggerSubmit) { s.IdempotencyKey = "schedule/kubeagents-system/k8s-event/1" },
+		"a key with no token":      func(s *TriggerSubmit) { s.IdempotencyKey = "event-watcher/k8s-event/" },
+		"a key with a space":       func(s *TriggerSubmit) { s.IdempotencyKey = "event-watcher/k8s-event/a b" },
+		"a key with a slash":       func(s *TriggerSubmit) { s.IdempotencyKey = "event-watcher/k8s-event/a/b" },
+		"a key with a colon":       func(s *TriggerSubmit) { s.IdempotencyKey = "event-watcher/k8s-event/a:b" },
+		"a key too long": func(s *TriggerSubmit) {
+			s.IdempotencyKey = "event-watcher/k8s-event/" + strings.Repeat("9", 600)
+		},
+		"an empty prompt": func(s *TriggerSubmit) { s.Prompt = "" },
+		"a bad delivery":  func(s *TriggerSubmit) { s.Delivery.Mode = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := goodEventTriggerSubmit()
+			mutate(&s)
+			if err := ValidateTriggerSubmit("event-watcher", s); err == nil {
+				t.Error("accepted")
+			}
+		})
+	}
+	// The schedule source keeps its own shape: an event-shaped submission
+	// from it is refused.
+	s := goodEventTriggerSubmit()
+	s.Trigger.Name, s.IdempotencyKey = "schedule/k8s-event", "schedule/k8s-event/x"
+	if err := ValidateTriggerSubmit(TriggerSourceSchedule, s); err == nil {
+		t.Error("the schedule source submitted without a schedule")
+	}
+}
