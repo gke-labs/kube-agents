@@ -234,8 +234,8 @@ type spawner interface {
 	// gone is not reusable and not an error.
 	Reusable(ctx context.Context, podName string) (bool, error)
 	// SessionPods lists the session pods that are live and not being
-	// deleted, with the conversation each belongs to: the cap eviction's
-	// candidates.
+	// deleted, with the conversation each belongs to: the session cap's
+	// count, and its eviction's candidates.
 	SessionPods(ctx context.Context) ([]sessionPod, error)
 	// PodStarted is the pod's status.startTime, when the kubelet took it
 	// (before the image pull), which is where activeDeadlineSeconds counts
@@ -763,6 +763,17 @@ func podReusable(p *corev1.Pod, transport string, taskDeadline time.Duration, no
 	return true
 }
 
+// SessionPods reads the k8s API rather than the gateway's own registry: the
+// API is authoritative, survives a gateway restart, and sees orphans the
+// registry has forgotten. Terminal pods are sweep's inventory, not load, so
+// they're not listed, which matches what a `pods` ResourceQuota counts, the
+// layer that backstops the cap.
+//
+// A pod being deleted isn't listed either, though the quota still counts it
+// until it's gone: its slot is already freeing, and the cap's eviction
+// can't choose it, so counting it would evict some other conversation's
+// live pod for a slot nobody needs. The overlap while it terminates is the
+// one a successful eviction already leaves, which the quota headroom absorbs.
 func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
 	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
@@ -823,7 +834,7 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 // margin. So the check is serialized (capCheck), and a slot granted here counts
 // as live until ensureSessionPod's spawn returns (capHolds), or for at most
 // sessionCapHoldTTL. Only the leader replica takes turns, so one process's
-// lock is enough. The namespace ResourceQuota stays the hard bound against a
+// check is enough. The namespace ResourceQuota stays the hard bound against a
 // gateway that has stopped honoring its own cap.
 func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, replacing bool) bool {
 	// SessionRouted persists in the KV record; the spawner is a setting. A

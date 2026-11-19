@@ -28,10 +28,6 @@ func (s *fakeSpawner) setLiveErr(err error) {
 	s.liveErr = err
 }
 
-// SessionPods (gateway_test.go) pads its list with keyless pods up to live,
-// so a test that sets only a count still drives the cap, whose count is the
-// list's length. A keyless pod is never an eviction candidate.
-
 // TestDelegateRefusedAtSessionCap: "Delegate:" makes pod creation
 // user-triggerable and threads are free, so the cap is the gateway's
 // usability bound. At the cap the delegation is refused with a reply naming
@@ -170,12 +166,19 @@ func TestPodSpawnerSessionPodsListsOnlyThisNamespacesLiveSessionPods(t *testing.
 			Status:     corev1.PodStatus{Phase: phase},
 		}
 	}
+	// Part of kube-agents but not a session pod: the selector needs both
+	// labels, so a pod with only one of them is not counted.
+	halfLabelled := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "half-labelled", Namespace: "test-ns", Labels: map[string]string{labelPartOf: partOfValue}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 	cs := k8sfake.NewSimpleClientset(
 		mk("running", "test-ns", corev1.PodRunning, true),
 		mk("pending", "test-ns", corev1.PodPending, true),
 		mk("done", "test-ns", corev1.PodSucceeded, true),
 		mk("dead", "test-ns", corev1.PodFailed, true),
 		mk("bystander", "test-ns", corev1.PodRunning, false),
+		halfLabelled,
 		mk("elsewhere", "other-ns", corev1.PodRunning, true),
 	)
 	s := &podSpawner{cfg: &Config{Namespace: "test-ns"}, client: cs, log: slog.Default()}
