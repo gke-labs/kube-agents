@@ -790,6 +790,59 @@ class DanglingComputeClassTest(unittest.TestCase):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "balanced"})
         self.assertIsNotNone(fs.check_dangling_compute_class(d, {}, None, autopilot=True))
 
+    @staticmethod
+    def class_with_status(*conditions):
+        """`general-ccc` as GKE reports it; the conditions are the live read of
+        a class whose node pool carries the class label and no class taint."""
+        cc = compute_class("general-ccc", [{"nodepools": ["default-pool"]}], node_pool_auto_creation=False)
+        cc["status"] = {"conditions": [
+            {"type": kind, "status": state, "reason": reason, "message": message}
+            for kind, state, reason, message in conditions
+        ]}
+        return cc
+
+    TAINT_MISSING = ("NodepoolMisconfigured", "True", "TaintMissing", "Crd taint is missing for the nodepool default-pool.")
+    NOT_HEALTHY = ("Health", "False", "Health", "Crd is not healthy.")
+
+    def test_a_class_gke_reports_misconfigured_is_a_hit_that_quotes_the_condition(self):
+        hit = fs.check_compute_class_status(self.class_with_status(self.TAINT_MISSING, self.NOT_HEALTHY))
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertEqual(
+            hit["excerpt"],
+            "status condition NodepoolMisconfigured is True (TaintMissing): Crd taint is missing for the nodepool "
+            "default-pool.; status condition Health is False (Health): Crd is not healthy.",
+        )
+
+    def test_either_condition_alone_is_a_hit(self):
+        autoscaling_off = ("CrdMisconfigured", "True", "", "Nodepool default-pool specified by name has autoscaling disabled")
+        for condition in (self.TAINT_MISSING, self.NOT_HEALTHY, autoscaling_off):
+            with self.subTest(condition=condition[0]):
+                self.assertIsNotNone(fs.check_compute_class_status(self.class_with_status(condition)))
+
+    def test_a_healthy_class_or_one_with_no_status_is_not_judged(self):
+        healthy = self.class_with_status(
+            ("NodepoolMisconfigured", "False", "", ""), ("Health", "True", "Health", "Crd is healthy."),
+            ("SomeOtherCondition", "True", "", ""),
+        )
+        self.assertIsNone(fs.check_compute_class_status(healthy))
+        self.assertIsNone(fs.check_compute_class_status(compute_class("cc1", [{"machineFamily": "n4"}])))
+        self.assertIsNone(fs.check_compute_class_status({**compute_class("cc1", []), "status": {"conditions": ["junk", None]}}))
+
+    def test_a_long_condition_message_is_clipped(self):
+        long_message = ("NodepoolMisconfigured", "True", "TaintMissing", "x" * 1000)
+        excerpt = fs.check_compute_class_status(self.class_with_status(long_message))["excerpt"]
+        self.assertLess(len(excerpt), 300)
+
+    def test_the_collector_files_the_class_and_stamps_the_read(self):
+        cc = self.class_with_status(self.TAINT_MISSING, self.NOT_HEALTHY)
+        for pools_rc in (0, 1):
+            with self.subTest(pools_rc=pools_rc):
+                entry = CollectClusterTest().run_with(dump_items=[cc], pools_rc=pools_rc)
+                hits = [c for c in entry["candidates"] if c["check"] == "dangling-compute-class"]
+                self.assertEqual([c["object"] for c in hits], ["ComputeClass/general-ccc"])
+                self.assertEqual(hits[0]["severity"], "critical")
+                self.assertIn("kubectl get", hits[0]["command"])
+
     def test_the_collector_tells_the_check_the_cluster_mode(self):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "Balanced"})
         for autopilot in (True, False):
