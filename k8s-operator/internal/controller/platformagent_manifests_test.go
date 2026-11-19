@@ -1296,6 +1296,34 @@ func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheEvalRunTagSwitchAsALiteralOnly(t *testing.T) {
+	// The chart renders KUBEAGENTS_EVAL_RUN_TAGS from
+	// platformAgent.deployment.evalRunTags on eval installs; the agent's API
+	// server, board and plugin read it only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "KUBEAGENTS_EVAL_RUN_TAGS", Value: "1"},
+		{Name: "KUBEAGENTS_EVAL_RUN_TAGS", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_EVAL_RUN_TAGS" || got[0].Value != "1" {
+		t.Fatalf("expected only the literal KUBEAGENTS_EVAL_RUN_TAGS to survive the allowlist, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesThePostMergeReadCap(t *testing.T) {
+	// POST_MERGE_READS_PER_TICK bounds how many records one post-merge check
+	// step reads; it reaches the agent only through this allowlist, and only
+	// as a literal value.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "POST_MERGE_READS_PER_TICK", Value: "50"},
+		{Name: "POST_MERGE_READS_PER_TICK", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "cap"},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "POST_MERGE_READS_PER_TICK" || got[0].Value != "50" || got[0].ValueFrom != nil {
+		t.Fatalf("expected only the literal POST_MERGE_READS_PER_TICK=50 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
@@ -1427,6 +1455,42 @@ func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
 	got := safeSandboxEnvOverrides(custom)
 	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "false" || got[0].ValueFrom != nil {
 		t.Errorf("expected only the literal KAGE_SLACK_UX=false to pass, got %#v", got)
+	}
+}
+
+// The dial's admin list reaches the agent through the managed .env only, on
+// every render: unpinned, a line in the PVC .env (which Hermes applies over the
+// container env, and save_env_value can write) would name who may move the dial.
+func TestManagedEnvPinsTheDialAdmins(t *testing.T) {
+	pinned := func(agent *agentv1alpha1.PlatformAgent) []string {
+		var got []string
+		for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+			if value, ok := strings.CutPrefix(line, dialAdminsEnvKey+"="); ok {
+				got = append(got, value)
+			}
+		}
+		return got
+	}
+	agent := newTestPlatformAgent()
+	if got := pinned(agent); !slices.Equal(got, []string{""}) {
+		t.Errorf("dial admins with none set = %q, want one empty pin", got)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: dialAdminsEnvKey, Value: " U0123ABCD , not-an-id,W0456EFGH\nKUBEAGENTS_DIAL=on,u0lower"},
+		{Name: dialAdminsEnvKey, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	}}
+	if got := pinned(agent); !slices.Equal(got, []string{"U0123ABCD"}) {
+		t.Errorf("dial admins = %q, want [U0123ABCD]", got)
+	}
+	// A list with no member id names nobody, rather than falling back to every
+	// workspace admin.
+	agent.Spec.Deployment.Env = []corev1.EnvVar{{Name: dialAdminsEnvKey, Value: "alice@corp.com, u0lower"}}
+	if got := pinned(agent); !slices.Equal(got, []string{dialAdminsNone}) {
+		t.Errorf("dial admins with no valid entry = %q, want [%s]", got, dialAdminsNone)
+	}
+	// One delivery path: the container env does not carry it.
+	if got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: dialAdminsEnvKey, Value: "U0123ABCD"}}); len(got) != 0 {
+		t.Errorf("%s passed the agent container's env allowlist, got %#v; the managed .env is its only path", dialAdminsEnvKey, got)
 	}
 }
 
@@ -4047,10 +4111,11 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// fourteen unconditional pins, none of which is about chat: the loopback bearer (see
+	// fifteen unconditional pins, none of which is about chat: the loopback bearer (see
 	// the next test), the PVC's directory mode, the mode pin (always next), the three
 	// earned-autonomy switches, the scope path, the resolved scope's path, the empty
-	// management-project override, the stall watch's three knobs, empty, the
+	// management-project override, the dial's admin list, empty, the stall watch's three
+	// knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
@@ -4062,6 +4127,7 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
 		resolvedScopeFileEnvKey + "=" + resolvedScopeDir + "/" + scopeResolvedDataKey + "\n" +
 		reconcileProjectEnvKey + "=\n" +
+		dialAdminsEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +
 		stallWatchKindsEnvKey + "=\n" +
@@ -4142,8 +4208,9 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
 	// would be a second answer to a question that must have exactly one. The stall
-	// watch's knobs take the same single path to stall_watch.py, and the
-	// earned-autonomy switches theirs to kubeagents_switches.py.
+	// watch's knobs take the same single path to stall_watch.py, the
+	// earned-autonomy switches theirs to kubeagents_switches.py, and the dial's
+	// admin list its own to session-kv's dial actions.
 	pinnedOnly := map[string]bool{
 		"GATEWAY_ALLOWED_USERS":           true,
 		"GATEWAY_ALLOW_ALL_USERS":         true,
@@ -4151,6 +4218,7 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 		stallWatchExcludeNamespacesEnvKey: true,
 		stallWatchMinAgeEnvKey:            true,
 		stallWatchKindsEnvKey:             true,
+		dialAdminsEnvKey:                  true,
 		envPostMergeCheck:                 true,
 		envAutomerge:                      true,
 		envDial:                           true,
@@ -8222,5 +8290,94 @@ func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) 
 	}
 	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
 		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
+	}
+}
+
+// A plugin mounted inside the data PVC (a default-profile plugin, at
+// <home>/plugins/<name>) has its parent folder made by an earlier init container
+// that mounts the PVC and runs as the pod's user, the agent's. Without it the container
+// runtime makes <home>/plugins as root when it creates the agent container, and
+// on a new volume the entrypoint cannot copy the image's plugins into it.
+func TestAPluginMountedUnderTheHomeHasItsParentMadeFirst(t *testing.T) {
+	const dataVolume = "platform-agent-data-vol"
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "plugin-agent", Namespace: "test-ns"}}
+	untargeted := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "myplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "gcr.io/my-plugin:v1"},
+	}
+	targeted := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "profileplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "gcr.io/profile-plugin:v1", TargetProfile: "platform"},
+	}
+	// dataMount is where a container mounts the PVC's root, or "".
+	dataMount := func(c corev1.Container) string {
+		for _, m := range c.VolumeMounts {
+			if m.Name == dataVolume && m.SubPath == "" {
+				return m.MountPath
+			}
+		}
+		return ""
+	}
+	// makesDir reports whether an init container makes dir, a path on the PVC:
+	// a line of its script is `mkdir -p <path>`, alone or before `||`. It must
+	// run as the pod's user, with no user of its own.
+	makesDir := func(c corev1.Container, dir string) bool {
+		root := dataMount(c)
+		if root == "" || len(c.Args) != 1 || (c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil) {
+			return false
+		}
+		want := "mkdir -p " + path.Join(root, dir)
+		for _, line := range strings.Split(c.Args[0], "\n") {
+			if line == want || strings.HasPrefix(line, want+" ||") {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, imageVolumes := range []bool{true, false} {
+		dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4",
+			[]*agentv1alpha1.AgentPlugin{untargeted, targeted}, renderOptions{imageVolumeSupported: imageVolumes})
+		spec := dep.Spec.Template.Spec
+		if spec.SecurityContext == nil || spec.SecurityContext.RunAsUser == nil || *spec.SecurityContext.RunAsUser != sandboxUID {
+			t.Fatalf("imageVolumeSupported=%v: the pod does not run as the agent's user: %+v", imageVolumes, spec.SecurityContext)
+		}
+		// Every container in start order: the init containers, then the rest.
+		inOrder := append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+		checked := 0
+		for i, c := range inOrder {
+			root := dataMount(c)
+			if root == "" {
+				continue
+			}
+			for _, m := range c.VolumeMounts {
+				if !strings.HasPrefix(m.Name, "plugin-") || !strings.HasPrefix(m.MountPath, root+"/") {
+					continue
+				}
+				checked++
+				parent := strings.TrimPrefix(path.Dir(m.MountPath), root+"/")
+				made := false
+				for _, earlier := range spec.InitContainers[:min(i, len(spec.InitContainers))] {
+					made = made || makesDir(earlier, parent)
+				}
+				if !made {
+					t.Errorf("imageVolumeSupported=%v: %s mounts %s inside the data PVC, and no earlier init container makes %s on it",
+						imageVolumes, c.Name, m.MountPath, parent)
+				}
+			}
+		}
+		if checked == 0 {
+			t.Errorf("imageVolumeSupported=%v: no plugin mount inside the data PVC was found, so nothing was checked", imageVolumes)
+		}
+	}
+
+	// With no plugin under the home, the cleanup container is as it was: an
+	// install without a default-profile plugin keeps its pod template.
+	for name, plugins := range map[string][]*agentv1alpha1.AgentPlugin{"no plugin": nil, "a targeted plugin only": {targeted}} {
+		dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins, renderOptions{imageVolumeSupported: true})
+		cleanup := containerByName(t, dep.Spec.Template.Spec.InitContainers, "sandbox-credential-cleanup")
+		if len(cleanup.Args) != 1 || strings.Contains(cleanup.Args[0], "mkdir") {
+			t.Errorf("%s: the cleanup container makes a folder: %q", name, cleanup.Args)
+		}
 	}
 }

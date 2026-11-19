@@ -18,9 +18,8 @@
 # ServiceAccount with automountServiceAccountToken on, the pattern the
 # compliance audit's default-sa-automount check (SOP 2.7) names; the
 # namespace's default account is left as the controller creates it, with the
-# field unset. The collector lists the workload; the case carries
-# expected_fail: true because the ledger body drops every major and minor
-# finding once the critical findings fill its budget.
+# field unset. The collector lists the workload and the ledger body names the
+# finding in full or under Listed without detail.
 #
 # Isolation class: namespace-scoped, in its own namespace so another case's
 # namespace left Terminating on the same host cluster cannot stop this plant.

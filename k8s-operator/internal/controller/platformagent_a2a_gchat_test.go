@@ -237,14 +237,16 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			if scopePublisherRendered(tc.agent) {
 				want = append(want, a2aResolvedScopeConfigMapEnvVar)
 			}
+			// The report reader's pair, on every install (a2a_report_reader.go).
+			want = append(want, a2aReportStoreURLEnvVar, a2aReportStoreTokenFileEnvVar)
 			// The tiers file (#3659), appended after the gateway is built.
 			want = append(want, a2aTiersFileEnvVar)
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}
-			if len(c.VolumeMounts) != 4 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
-				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName || c.VolumeMounts[3].Name != a2aTiersVolume {
-				t.Errorf("unarmed mounts %v, want the principal map, the bus CA, the scope file and the tiers file alone", c.VolumeMounts)
+			if len(c.VolumeMounts) != 5 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName ||
+				c.VolumeMounts[2].Name != a2aGatewayScopeVolumeName || c.VolumeMounts[3].Name != a2aReportsTokenVolume || c.VolumeMounts[4].Name != a2aTiersVolume {
+				t.Errorf("unarmed mounts %v, want the principal map, the bus CA, the scope file, the report reader's token and the tiers file alone", c.VolumeMounts)
 			}
 		})
 	}
@@ -263,6 +265,7 @@ func TestTheBrokerArmsTheA2ARelay(t *testing.T) {
 		"GOOGLE_CHAT_PROJECT_ID":             "chat-project",
 		a2aGoogleChatSubscriptionEnvVar:      "projects/chat-project/subscriptions/platform-agent-chat-events-sub",
 		credentialProxyA2AChatAudienceEnvVar: credentialProxyA2AChatAudience,
+		credentialProxyA2AChatCallersEnvVar:  "system:serviceaccount:test-ns:test-agent-a2a-gateway",
 	}
 	for name, expected := range want {
 		if value, found := brokerEnvValue(env, name); !found || value != expected {
@@ -275,6 +278,49 @@ func TestTheBrokerArmsTheA2ARelay(t *testing.T) {
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
 	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
 		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
+	}
+}
+
+// TestTheA2AChatBindingGoesWithItsAudience: the broker's a2a-chat callers
+// (#6090) are rendered exactly when the a2a-chat audience is, naming the A2A
+// gateway's ServiceAccount alone. Turning Chat off drops both, so no binding
+// is left behind for a role nothing confers, and a CR's env can't set the
+// callers either way: it would choose who holds the role.
+func TestTheA2AChatBindingGoesWithItsAudience(t *testing.T) {
+	gateway := "system:serviceaccount:test-ns:test-agent-a2a-gateway"
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		armed bool
+	}{
+		{"chat on", gchatTestAgent("next", true), true},
+		{"chat off", gchatTestAgent("next", false), false},
+		{"no chat at all", a2aTestAgent(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.agent.Spec.Deployment == nil {
+				tc.agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+			}
+			tc.agent.Spec.Deployment.Env = append(tc.agent.Spec.Deployment.Env,
+				corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: "system:serviceaccount:test-ns:chosen-by-the-cr"})
+			env := buildCredentialProxyDeployment(tc.agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
+			_, audience := brokerEnvValue(env, credentialProxyA2AChatAudienceEnvVar)
+			var callers []string
+			for _, e := range env {
+				if e.Name == credentialProxyA2AChatCallersEnvVar {
+					callers = append(callers, e.Value)
+				}
+			}
+			if tc.armed {
+				if !audience || len(callers) != 1 || callers[0] != gateway {
+					t.Errorf("armed: audience present=%v, callers %q; want the audience and exactly %q", audience, callers, gateway)
+				}
+				return
+			}
+			if audience || len(callers) != 0 {
+				t.Errorf("unarmed: audience present=%v, callers %q; want neither", audience, callers)
+			}
+		})
 	}
 }
 
@@ -357,9 +403,11 @@ func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 	if !found {
 		t.Error("the A2A gateway pod is not a peer; its relay pulls would be refused before TokenReview")
 	}
+	// Unarmed, the A2A gateway is still a peer: its report reader calls the
+	// store routes on every install (a2a_report_reader.go).
 	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("next", false), a2aTestAgent()} {
-		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
-			t.Errorf("unarmed: %d peers, want the two main renders", got)
+		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 3 {
+			t.Errorf("unarmed: %d peers, want the two main renders and the A2A gateway", got)
 		}
 	}
 }

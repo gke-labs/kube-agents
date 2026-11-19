@@ -38,6 +38,7 @@ import board_health_card
 import board_snapshot
 import chat_notify
 import clean_merges
+import dial_state
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -60,8 +61,8 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS")
-# The home channel a today-era `/sethome` or first chat mirrored into that
-# `.env` (Hermes' persist_home_channel). Under `next` with the operator's
+# The home channel a `/sethome` or first chat on an earlier release's Hermes Slack
+# platform mirrored into that `.env` (Hermes' persist_home_channel). With the operator's
 # projection mounted, the projected file is the channel the gateway posts
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
@@ -105,6 +106,19 @@ ORIGIN_COMPRESSION_WALK_MAX = 32
 # sessions are in that profile's `state.db`, not in this server's own.
 GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 ORIGIN_DB_TIMEOUT_SECONDS = 5.0
+# The eval run tag of a session (deploy/docker/patches/eval_run_tag.py): which
+# eval run, case and repetition an API turn belongs to, as the harness sent it
+# in X-Kube-Agents-Eval-Run. Written only while the install has
+# KUBEAGENTS_EVAL_RUN_TAGS on, once per session (the first write wins), in a
+# table of its own so no session_metadata blob is rewritten for it. Read back
+# through compression, as the origin record is.
+SESSION_EVAL_RUNS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS session_eval_runs ("
+    " session_id TEXT PRIMARY KEY, eval_run TEXT NOT NULL, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+)
+SESSION_EVAL_RUN_KEY = "eval_run"
+# `<run>/<case>/<rep>`, the pattern eval_run_tag.TAG_RE and the replay proxy hold.
+SESSION_EVAL_RUN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[0-9]{1,6}")
 # The board's origin stamp (`_stamp_board_task_origin`, the drift backlog's
 # writer), a side table in the kanban database that the first stamp wins.
 KANBAN_TASK_ORIGINS_SCHEMA = """
@@ -164,6 +178,9 @@ async def _lifespan(_app: FastAPI):
     # The data volume check runs on its own thread for the life of the server;
     # see check_data_volume.
     threading.Thread(target=_data_volume_monitor, name="data-volume-monitor", daemon=True).start()
+    # The autonomy dial's level, reported to the broker every minute while
+    # KUBEAGENTS_DIAL is on; the thread reads the switch each minute.
+    dial_state.start_reporter()
     yield
 
 
@@ -1323,7 +1340,7 @@ DRIFT_UNKNOWN_FIELD = "unknown"
 # gateway/slack_ux_incident.py reads it; Slack's rename refuses `·`, so " in ".
 SLACK_PLATFORM = "slack"
 # The platforms a cron report's card goes to: Slack, and Google Chat where the gateway
-# routes it (spec.mode: next) and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
+# routes it and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
 CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM)
 CRASHLOOP_REASON = "CrashLoopBackOff"
 BACKOFF_REASON = "BackOff"
@@ -1953,10 +1970,20 @@ def init_db() -> None:
                     reported_at     TEXT,
                     followup_state  TEXT,
                     followup_attempts INTEGER,
-                    followup_detail TEXT
+                    followup_detail TEXT,
+                    changed_paths   TEXT
                 )
                 """
             )
+            # `changed_paths` arrived after the table did: the files a merged fix
+            # changed, read from its diff once by `post_merge_check.py health`
+            # and kept, since a merged pull request's files never change.
+            if "changed_paths" not in {row[1] for row in conn.execute("PRAGMA table_info(post_merge_records)")}:
+                try:
+                    conn.execute("ALTER TABLE post_merge_records ADD COLUMN changed_paths TEXT")
+                except sqlite3.OperationalError as exc:
+                    if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
+                        raise
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
@@ -2825,9 +2852,9 @@ CHAT_PLATFORMS = ("google_chat", "slack")
 # this container exactly when the matching `spec.integration.<p>.enabled` is
 # true and this pod is the platform's consumer (platformagent_manifests.go, the
 # GoogleChat/Slack blocks in buildPodTemplateSpec and renderManagedEnv), so it
-# answers the question rather than approximating it. Under `mode: next` Google
-# Chat moves to the A2A gateway and the variable is absent here, which reads as
-# Chat not being this pod's to post to.
+# answers the question rather than approximating it. Google Chat is the A2A
+# gateway's, so the variable is absent here, which reads as Chat not being this
+# pod's to post to.
 #
 # SLACK_BOT_TOKEN is kept, and is inert on a deployed pod: a token is a
 # credential, so it lives in the credential-proxy container and never reaches
@@ -2927,12 +2954,13 @@ def _slack_home_channel() -> str:
 
     Environment first, so an install whose CR sets the channel resolves exactly
     as it did before; the files are consulted only when it is absent, which is
-    the case that was broken. Under `spec.mode: next` a channel the gateway
-    learned is never rendered into the pod: the operator projects it into a
-    file the kubelet refreshes in place (chat_notify.home_file). A mounted file
-    decides, empty or not, so this answer is the channel the gateway posts
-    into; the config files `/sethome` writes in today mode count only where no
-    file is mounted, since the data volume keeps them across a mode switch.
+    the case that was broken. A channel the gateway learned is never rendered
+    into the pod: the operator projects it into a file the kubelet refreshes in
+    place (chat_notify.home_file). A mounted file decides, empty or not, so
+    this answer is the channel the gateway posts into; the config files
+    a `/sethome` on an earlier release's Hermes Slack platform wrote count only
+    where no file is mounted, since the data volume keeps them from before the gateway
+    held Slack.
     """
     env = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
     if env:
@@ -3025,7 +3053,7 @@ def enabled_chat_platforms() -> list[str]:
 def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
     """Return `(resolved_platforms, explicit_config_choices)` across all sources.
 
-    Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
+    Checks `chat_notify.routes(name)` first so installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
     while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM`, the
     projected home-channel file, or with neither, the `A2A_NOTIFY_CONVERSATIONS`
@@ -3038,7 +3066,7 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
     resolved: list[str] = []
     explicit: Dict[str, bool] = {}
     for name in CHAT_PLATFORMS:
-        # Under next the managed scope says the Hermes platform is off, because
+        # The managed scope says the Hermes platform is off where
         # the A2A gateway holds the backend; posts to it go through the
         # gateway's chat.notify route instead (chat_notify.py), so it is
         # still a platform this install posts to.
@@ -3131,7 +3159,7 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 
 
 #: Returned by :func:`_post_initial_alert` when the send (`hermes send`, or
-#: `a2a notify` under next) reported success but no message id could be read
+#: `a2a notify` for a platform the gateway holds) reported success but no message id could be read
 #: out of its JSON stdout, or when `a2a notify` reported that the gateway took
 #: the request and did not answer in time. Distinct from
 #: `None`, which means the send itself failed. The caller must not try the next
@@ -3178,7 +3206,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
-    gateway holds under next (chat_notify.py). Four outcomes, not two: a thread
+    gateway holds (chat_notify.py). Four outcomes, not two: a thread
     id, `None` when the send failed, :data:`ALERT_SENT_WITHOUT_THREAD` when
     it succeeded (or may have) and the id could not be read, and
     :data:`ALERT_KEPT_FOR_DIGEST` when the gateway kept it for want of a home
@@ -5139,7 +5167,7 @@ def trigger_agent_troubleshooter(
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
-    Chat under ``spec.mode: next``, with ``alert_kind`` beside it.
+    Chat through the gateway, with ``alert_kind`` beside it.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
@@ -5235,7 +5263,7 @@ def _trigger_agent_troubleshooter(
             notice = _TriageNotice(active_platform, thread_id, "")
             if (alert_title or alert_kind) and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
                 # The title heads the plan the cards draw: on Slack, and on the
-                # platform the gateway lays the plan out for under spec.mode: next.
+                # platform the gateway lays the plan out for.
                 _record_alert_title(session_id, alert_title, alert_kind)
             # Armed here, before the gateway is contacted: an alert whose turn
             # never starts (session creation refused, the turn's POST failing)
@@ -5681,8 +5709,8 @@ class AuditHeadline(NamedTuple):
 
 def _card_platform(platform: str, chat_id: str) -> bool:
     """Whether a cron report's card goes to ``platform``: with ``KAGE_SLACK_UX`` on, Slack
-    (Block Kit through the relay, or a chat message through the gateway under
-    ``spec.mode: next``), or Google Chat when the gateway routes it, where the gateway
+    (Block Kit through the relay, or a chat message through the gateway when
+    it holds Slack), or Google Chat when the gateway routes it, where the gateway
     lays the chat message out; and a destination, the thread's chat or the home
     channel, which the gateway holds itself for the platform it routes."""
     routed = chat_notify.routes(platform)
@@ -5695,7 +5723,7 @@ def _slack_audit_headline(
     platform: str, message: str, chat_id: str, profile: str, job_id: str, deadline: float
 ) -> AuditHeadline | None:
     """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with on a
-    card platform: Slack, or Google Chat under ``spec.mode: next``.
+    card platform: Slack, or Google Chat through the gateway.
 
     None, and the leg posts `message` as it always has, unless every condition
     holds: the flag is on, the leg is a card platform with a channel known
@@ -5856,7 +5884,7 @@ def _post_audit_blocks(
 ) -> AuditPost | None:
     """Post the audit report as Block Kit (headline, findings, choice and link
     buttons, or the clean card); where it landed, or None to post text instead.
-    Under ``spec.mode: next`` the same card goes to the gateway as a chat
+    Where the gateway holds Slack the same card goes to it as a chat
     message instead (:func:`_post_audit_chat_via_gateway`).
 
     None, before anything is posted, when there are no blocks to build (no
@@ -5889,8 +5917,8 @@ def _post_summary_card(
     """Post the card of a fleet-audit report with no ledger issue (:func:`slack_audit_report.summary_card`).
 
     The no-ledger half of :func:`_post_audit_blocks`, with its outcomes: Block
-    Kit through the Slack relay, or under ``spec.mode: next`` a chat message
-    through the gateway; None, and the caller posts text, when neither is
+    Kit through the Slack relay, or a chat message through the gateway where
+    it holds Slack; None, and the caller posts text, when neither is
     there, the card cannot be built, or the post did not land.
     """
     routed = chat_notify.routes(platform)
@@ -5913,7 +5941,7 @@ def _post_audit_card(
     thread_id: str,
     deadline: float,
 ) -> AuditPost | None:
-    """Post a built audit card, ``(blocks, text)`` or under next ``(chat, text)``; where it landed, or None.
+    """Post a built audit card, ``(blocks, text)`` or ``(chat, text)`` through the gateway; where it landed, or None.
 
     The posting half of :func:`_post_audit_blocks`, whose docstring gives the
     outcomes.
@@ -5960,8 +5988,8 @@ def _post_audit_chat_via_gateway(
 ) -> AuditPost | None:
     """Post the audit report's card through the gateway's chat.notify route for ``platform``.
 
-    The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
-    the broker's Slack relay is gone and the gateway holds the chat platform,
+    The gateway half of :func:`_post_audit_blocks`: where the gateway holds
+    Slack the broker's Slack relay is gone and the gateway holds the chat platform,
     Slack or Google Chat, so the card goes as a ``kube-agents.chat/v1`` message
     (``a2a notify --chat-file``, chat_notify.py) into the home channel, and the
     gateway lays it out, its buttons included. ``text`` is the message's fallback, which the gateway
@@ -6015,10 +6043,10 @@ def _post_audit_chat_via_gateway(
 def _post_failed_audit_via_gateway(
     platform: str, profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
-    """Under ``spec.mode: next``, post a failed fleet-audit report as its one line with the report folded under it.
+    """Through the gateway, post a failed fleet-audit report as its one line with the report folded under it.
 
     A reply in the thread reaches the gateway there, which cannot replay the
-    report as ``incident_context`` does under today, so the report rides in
+    report as ``incident_context`` did on the Hermes Slack platform, so the report rides in
     the message's fold (:func:`slack_audit_report.failed_chat`). None, and the
     caller posts the line as text, when the message cannot be built, too
     little of `deadline` is left, or the gateway did not post it.
@@ -6073,8 +6101,8 @@ def _post_board_health_card(
 ) -> AuditPost | None:
     """Post the board-health card; where it landed, or None to post the report as text.
 
-    Block Kit through the Slack relay, or under ``spec.mode: next`` a chat
-    message through the gateway, with the outcomes of :func:`_post_audit_card`.
+    Block Kit through the Slack relay, or a chat message through the gateway
+    where it holds Slack, with the outcomes of :func:`_post_audit_card`.
     """
     routed = chat_notify.routes(platform)
     if not (routed or slack_blocks_post.configured()):
@@ -6092,7 +6120,7 @@ def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, j
     section (:func:`slack_audit_report.failed_line`), and the job runs the
     fleet-audit skill. The line is that section's first sentence, the agent's
     own words for what failed; the incident row the caller stores keeps the
-    whole report for a reply in the thread, and under ``spec.mode: next`` the
+    whole report for a reply in the thread, and through the gateway the
     report folds under the line instead (:func:`_post_failed_audit_via_gateway`).
     """
     if not _card_platform(platform, chat_id):
@@ -8400,6 +8428,41 @@ def get_session_origin(session_id: str) -> Dict[str, str]:
     return {"origin": origin, "platform": platform}
 
 
+def _session_eval_run_row(session_id: str) -> str:
+    """The eval run tag recorded for exactly `session_id`, or ""."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        try:
+            row = conn.execute("SELECT eval_run FROM session_eval_runs WHERE session_id = ?", (session_id,)).fetchone()
+        except sqlite3.OperationalError:  # no tag was ever recorded on this volume
+            return ""
+    return str(row[0]) if row and row[0] else ""
+
+
+@app.put("/v1/sessions/{session_id}/eval-run", dependencies=[Depends(verify_api_key)])
+def put_session_eval_run(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record a session's eval run tag unless it has one; answers the tag the session keeps."""
+    tag = request_data.get(SESSION_EVAL_RUN_KEY)
+    if not isinstance(tag, str) or not SESSION_EVAL_RUN_RE.fullmatch(tag.strip()):
+        raise HTTPException(status_code=400, detail="eval_run must be <run>/<case>/<repetition>")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        conn.execute(SESSION_EVAL_RUNS_SCHEMA)
+        conn.execute(
+            "INSERT OR IGNORE INTO session_eval_runs (session_id, eval_run) VALUES (?, ?)", (session_id, tag.strip())
+        )
+        conn.commit()
+    return {SESSION_EVAL_RUN_KEY: _session_eval_run_row(session_id)}
+
+
+@app.get("/v1/sessions/{session_id}/eval-run", dependencies=[Depends(verify_api_key)])
+def get_session_eval_run(session_id: str) -> Dict[str, str]:
+    """The session's eval run tag, inherited through compression; 404 when none."""
+    for candidate in (session_id, *_session_compression_ancestors(session_id)):
+        tag = _session_eval_run_row(candidate)
+        if tag:
+            return {SESSION_EVAL_RUN_KEY: tag}
+    raise HTTPException(status_code=404, detail="the session has no eval run tag")
+
+
 def _cron_job_origin(job_id: str) -> Optional[tuple[str, str]]:
     """The `(origin, platform)` recorded for a cron job id, or None."""
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
@@ -8555,7 +8618,9 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
         cluster,
         _bounded_text(request_data, "namespace"),
         workload,
-        _bounded_text(request_data, "environment"),
+        # NULL when not sent, so post_merge_environment.py can tell "not read
+        # yet" from a cluster read and found unlabelled, which it stores as "".
+        _bounded_text(request_data, "environment") or None,
         origin,
         platform,
         opened_at,
@@ -11035,8 +11100,9 @@ def _stop_session_cards_now(session_id: str, conversation: str, deadline: Option
 # Retry and Drop on the board-health card (kanban_board_health.py,
 # board_health_card.py). Each row of the stuck-task card carries the ids of
 # the cards it stands for, and a tap on either button reaches here: from the
-# Slack adapter's click handler under today (slack_ux_clicks.py), and from the
-# gateway through the hermes-bridge's board route under next
+# Hermes Slack UX's click handler (slack_ux_clicks.py), which the image still
+# carries, and from the
+# gateway through the hermes-bridge's board route
 # (a2a/hermes-bridge/board.go). Who may press is decided before this call, by
 # whichever of the two the click came through; this route checks the card.
 #
@@ -11094,6 +11160,10 @@ def _board_action_one(kanban_db, conn: sqlite3.Connection, action: str, task_id:
 def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """Retry or Drop the stuck cards one row of the board-health card names; see the section comment.
 
+    An ``action`` of ``dial.level``, ``dial.request`` or ``dial.stop`` is the
+    autonomy dial's instead (``dial_state.handle``), answered ``{action, ok,
+    message}``.
+
     Body: ``action`` (``retry`` or ``drop``), ``tasks`` (the row's card ids)
     and ``by`` (who pressed, logged). Answers each card's ``outcome``:
     ``done``, ``moved`` (no longer blocked: someone or something got there
@@ -11102,6 +11172,10 @@ def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
     card ``gone``.
     """
     action = str(request_data.get("action") or "").strip().lower()
+    if action in dial_state.ACTIONS:
+        # The autonomy dial's taps (dial_state.handle): the switch, the admin
+        # check, the record, the broker and the sandbox are all its own.
+        return dial_state.handle(action, request_data)
     tasks = request_data.get("tasks")
     by = str(request_data.get("by") or "").strip()[:BOARD_ACTION_BY_MAX_CHARS]
     if action not in BOARD_ACTIONS:

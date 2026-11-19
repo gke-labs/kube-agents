@@ -362,9 +362,12 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and,
-  with a task credential, the MCP relay for Developer Knowledge's two document reads alone
-  (`mcp_policy.PROFILE_SERVER_TOOLS`).
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist; with a
+  task credential, the MCP relay for Developer Knowledge's two document reads alone
+  (`mcp_policy.PROFILE_SERVER_TOOLS`); the version-control routes under the permit rule
+  below; and the audit-report store's `/v1/audit-reports` routes under the reports allowlist
+  and the builtin-schedule write rule (#5619,
+  [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
@@ -391,6 +394,45 @@ What the operator renders per profile, as built (amended 10/6):
     without a credential, so `get-credentials <cluster> --help` is a help read.
     `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
     broker's own account and default project.
+  - Version control (#3993). `/v1/vcs/` admits the profile role, and every verb there needs a
+    valid task credential: one with no credential is refused before the body is read, not
+    run local-only. The reads (`clone`, `proposal-view`, `proposal-list`, `proposal-commits`,
+    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more, except that an
+    `issue-list` whose `query` is not plain words (a `:`, quote, backslash or parenthesis,
+    or `OR`, `AND` or `NOT` as a word), or whose label names hold a quote or a backslash, is
+    refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
+    fields into a search ahead of its own `repo:` qualifier, and any of them could add a
+    qualifier, swallow that one, or make it an alternative, reaching past the managed
+    repository. `publish`,
+    `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
+    `vcs:proposal-create`, which the dispatcher mints only when the submission's
+    `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
+    claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
+    unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
+    token, in both verifiers. The permit names no repository; the managed list bounds where
+    every verb lands, a permitted write included. Under the permit the writes are still held
+    to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
+    `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
+    calls the install's (opened by the credential's login, from a branch under
+    `platform-agent/`, in this repository rather than a fork); `publish` only to a branch
+    under `platform-agent/`, and, `advance` or not, onto a branch carrying open proposals only
+    when every one passes that same test (a full or truncated list is refused, and `advance`
+    still needs one open proposal); `proposal-create` only from a bare `platform-agent/` branch
+    of this repository, with no field beyond `repository`, `title`, `body`, `source`, `target`
+    and `draft`, so `owner:branch` and any source-repository field are refused. A
+    `proposal-update` carries only `repository`, `number`, `title` and `body`: a label edit
+    (`labelsAdd`, `labelsRemove`, or any key naming labels) is refused even on the install's
+    own proposal, with code `PROFILE_LABELS_FORBIDDEN` under rule `caller.vcs-labels`, since a
+    hold or an approval label is a person's call. A `branch` or `source` must be the bare
+    name: `refs/heads/...` and `heads/...` are refused, because `publish` pushes the name as
+    given. A credential that cannot name its login is refused where a login is compared: on
+    `proposal-update`, and on a `publish` onto a branch that carries open proposals.
+    The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
+    `capabilities`, which skip the managed list, and every other write, `branch-delete`
+    among them. The shim sends the credential on these calls as it does on an exec. Known
+    limits: a task that names no cluster gets no `proxyToken`, so it reaches no
+    version-control verb at all; and `submit-suggestion` deletes a spent branch with
+    `branch-delete`, so on a profile worker that one path is refused.
   - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
     `/v1/exec` and the MCP relay before any of this runs.
   - With a credential, every call is held to its target (`task_confinement.py`). Every

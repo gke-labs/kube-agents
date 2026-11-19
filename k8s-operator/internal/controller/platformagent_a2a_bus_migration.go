@@ -763,6 +763,20 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	}}
 }
 
+// a2aBusMigrationStreams is a2aProvisionedStreams in the order the bus
+// migration's pods walk them: PROFILE_SUBMITS last, after both streams that
+// index it (KV_PROFILE_LEASES, the claimed submits; DISPATCH_STOPS, the
+// stopped ones). The clear deletes last to first and the restore goes
+// first to last, so one that stops partway leaves an index without the
+// submits, never the submits without an index: a give-up recreates the
+// missing streams empty, and an empty index next to full submits would
+// admit claimed or stopped submits again (#6287). A separate list, so the
+// rendered bus config, which follows a2aProvisionedStreams, is unchanged.
+func a2aBusMigrationStreams() []string {
+	streams := slices.DeleteFunc(slices.Clone(a2aProvisionedStreams), func(s string) bool { return s == a2aProfileSubmitStream })
+	return append(streams, a2aProfileSubmitStream)
+}
+
 // busMigrationPrincipal is a migration step's bus user, which is also its
 // inbox prefix.
 func busMigrationPrincipal(step, runID string) string {
@@ -833,7 +847,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(step, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams", strings.Join(a2aProvisionedStreams, ","),
+		"--streams", strings.Join(a2aBusMigrationStreams(), ","),
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
@@ -865,7 +879,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 // mounted read-only, writing the digests to its termination message for the
 // operator to read. It holds no bus credential at all.
 func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.Pod {
-	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aProvisionedStreams, ",")}
+	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aBusMigrationStreams(), ",")}
 	volumes := []corev1.Volume{{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
 		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: true},
 	}}}
@@ -926,7 +940,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(busMigrationStreamIdentity, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams", strings.Join(a2aProvisionedStreams, ","),
+		"--streams", strings.Join(a2aBusMigrationStreams(), ","),
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
@@ -1100,29 +1114,32 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 // implies the KV fields (its subjects, rollup, deny delete, direct, discard
 // new), which TestTheStreamPoliciesMatchAFreshInstall holds to a fresh
 // install. The restore pod reads it from the operator's run Secret.
-func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
+// TASKS's max_consumers is agent's (a2aTasksMaxConsumers), so a one to three
+// restore can widen a TASKS created narrower than this CR renders.
+func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmigrate.StreamPolicy {
 	const day = 24 * time.Hour
-	stream := func(name string, subjects []string, maxAge time.Duration, maxBytes, perSubject int64) busmigrate.StreamPolicy {
+	stream := func(name string, subjects []string, maxAge time.Duration, maxBytes, perSubject int64, maxConsumers int) busmigrate.StreamPolicy {
 		return busmigrate.StreamPolicy{Name: name, Subjects: subjects, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
-			MaxBytes: maxBytes, MaxAge: maxAge, Discard: nats.DiscardOld, MaxMsgsPerSubject: perSubject, AllowDirect: true, Replicas: replicas}
+			MaxBytes: maxBytes, MaxAge: maxAge, Discard: nats.DiscardOld, MaxMsgsPerSubject: perSubject, AllowDirect: true, Replicas: replicas,
+			MaxConsumers: maxConsumers}
 	}
 	kv := func(bucket string, maxBytes int64, ttl time.Duration) busmigrate.StreamPolicy {
 		return busmigrate.StreamPolicy{Name: "KV_" + bucket, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
 			MaxBytes: maxBytes, MaxAge: ttl, Discard: nats.DiscardNew, MaxMsgsPerSubject: 1, AllowRollup: true, DenyDelete: true, AllowDirect: true, Replicas: replicas}
 	}
 	return []busmigrate.StreamPolicy{
-		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, a2aTasksMaxBytes, 4096),
-		stream("DIRECTORY", []string{"a2a.agents.>"}, 0, 1073741824, 1),
-		stream(a2aTopicsStateStream, []string{"a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"}, 0, 1073741824, 8),
-		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, a2aTopicsJournalMaxBytes, -1),
+		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, a2aTasksMaxBytes, 4096, a2aTasksMaxConsumers(agent)),
+		stream("DIRECTORY", []string{"a2a.agents.>"}, 0, 1073741824, 1, 64),
+		stream(a2aTopicsStateStream, []string{"a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"}, 0, 1073741824, 8, 64),
+		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, a2aTopicsJournalMaxBytes, -1, 64),
 		kv("runtime-state", 268435456, 0),
 		kv("session-state", 268435456, 0),
 		kv("cap", 268435456, 0),
 		kv("feedback", 67108864, 30*day),
 		kv("people", 33554432, 30*day),
 		kv("PROFILE_LEASES", 67108864, 0),
-		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1),
-		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1),
+		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1, a2aProfileDurablesAllowed),
+		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1, 1),
 	}
 }
 
@@ -1158,7 +1175,7 @@ func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent 
 	if refused != "" {
 		return refused, nil
 	}
-	body, err := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(1)})
+	body, err := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(agent, 1)})
 	if err != nil {
 		return "", err
 	}
@@ -1247,9 +1264,9 @@ const busMigrationStageHeadroom = 1.1
 // stream full to its max_bytes cap, with headroom, in whole GiB. A snapshot
 // is at most its stream's size, so the stage never runs out before the bus
 // it copies would.
-func busMigrationStageSize() resource.Quantity {
+func busMigrationStageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
 	var total int64
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(agent, 1) {
 		total += p.MaxBytes
 	}
 	const gib = 1 << 30
@@ -1277,7 +1294,7 @@ func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bus
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
 			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceStorage: busMigrationStageSize()},
+				Requests: corev1.ResourceList{corev1.ResourceStorage: busMigrationStageSize(agent)},
 			},
 		},
 	}
@@ -1748,7 +1765,7 @@ func (r *PlatformAgentReconciler) busMigrationStreamsOverCap(ctx context.Context
 	now := time.Now()
 	var over []string
 	listed := 0
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(agent, 1) {
 		st, ok := live[p.Name]
 		if !ok {
 			continue

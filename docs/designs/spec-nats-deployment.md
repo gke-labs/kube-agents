@@ -70,7 +70,11 @@ another `busReplicas` change while one runs.
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
   snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
   stream, checked against the operator's policy for it before and after, and raises it to
-  three replicas.
+  three replicas. Each stream comes back at the rendered `max_bytes` and `max_age`, and its
+  `max_consumers` is widened to the render's but never narrowed: JetStream fixes it when a
+  stream is created, so the restore is the one moment it can grow, and a wider stream's
+  consumers must still fit (amended 11/18). The way back restores each stream as the snapshot
+  recorded it, its width included.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
   restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
@@ -110,6 +114,18 @@ running at all, the verdict is unknown: nothing is held or restarted, and the co
 the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
 digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
 has been provisioned. It doesn't repair a server that drops out of a running bus.
+
+**Amended 11/17 (#6147): a one-server bus says it is not highly available.** On `busReplicas: 1` the operator
+writes a Normal `A2ABusSingleServer` Event once per episode: each bus pod first seen Running under a new UID,
+and once per operator start (an in-memory record per agent, so a restart or leader failover repeats it once,
+which is accepted). The Event names the outage a drain or upgrade causes, typically about two minutes and longer after
+a node scale-down, and links the conversion
+to three servers. Ready and Degraded are untouched, and none is written mid-migration. The lone pod gets no
+PodDisruptionBudget and no `safe-to-evict: "false"`. #6040 found that on GKE Autopilot that annotation holds
+scale-down and node auto-upgrade for at least seven days, per GKE's extended-duration Pods page, and the
+operator can't tell Autopilot from Standard.
+After a node scale-down, GCE can keep the released disk attached to the node being deleted for tens of
+minutes, so the replacement waits in `FailedAttachVolume`; on three servers the bus serves on two meanwhile.
 
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
@@ -398,6 +414,9 @@ and the draining profiles' names. A connection that sends the bucket `<b>/32` as
 CONNECT password beside the token gets the per-profile grants, draining profiles' included,
 of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
 from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+entry also lists, as `held`, the bound profiles the profile hold keeps out of the dispatcher
+until every bus server has loaded their config; their entries stay in the map, and a bucket's
+grants skip them until the hold lifts (#5935). The
 password picks a slice of what the token already allows; it is not a credential. A bucket the
 callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
 names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
@@ -447,9 +466,9 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest. On a single server the gateway's per-profile
-deny is left out of that hash, since a reload applies it; on a cluster it is in, so a
-profile change rolls the servers (below).
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash on every server count, since a reload applies it and is confirmed server by
+server (below).
 
 Layout:
 
@@ -926,7 +945,9 @@ bridge's grants name. The operator renders the list into the callout's
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
 labels. Session addressees need no entry, since each is the name of the pod that is that
-addressee. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
+addressee. The callout also refuses the pod name `p`, the marker of a profile task's six-token
+supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`, #5301), as defence in depth:
+no session grant reaches a six-token subject today, and gateway-minted names carry hyphens. Two kinds are not on the list. One is the name a `BRIDGE_PROFILE` override
 sets, which leaves the bridge unable to publish its own events because its grants still
 name `platform`. The other is `AgentProfile` addressees, which come and go with their CRs:
 a narrowed pod named after a profile would be handed that profile's task subjects, so
@@ -1219,17 +1240,45 @@ writes a new `nats.conf` into the pod, the reloader sends nats-server the reload
 and the server applies the new users and permissions to the connections it already holds.
 It also runs the auth callout again for each connection the callout authenticated; on
 2.10.29 those connections dropped at the reload and reconnected within a second.
-The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
-added, removed or done draining changes the config Secret and not the template: the bus is
-reloaded, not rolled. Every other config change still rolls it. The operator records the
-reload it asked for on the Secret, with the `config_load_time` it read just before writing,
-and confirms the reload when that value moves. A config written while a reload is still
+The pod template's config hash leaves out the per-profile gateway deny, on one server and
+on a cluster alike, so an AgentProfile added, removed or done draining changes the config
+Secret and not the template: every server is reloaded, and none is restarted or rolled.
+Every other config change still rolls the bus. The operator records the reload it asked for
+on the Secret, with each server's pod UID, `start` and `config_load_time` read from its
+`/varz` just before writing, by pod IP (a Service answers from whichever server it picks,
+and the per-pod names under the routes Service don't resolve), and only from a server whose
+`server_name` is its pod's. A server on the same pod and start confirms when its load time
+has moved. A server restarted in place (a new `start`) reloads whatever file the kubelet last
+synced, which can be the old one, so it confirms only when a load time later than its start
+arrives, or when it started more than the kubelet's sync window (90 seconds: the sync period
+plus the Secret cache's lag) after the write. A new pod confirms when the API server created
+it after the write, by the operator's own managedFields entry on the live Secret (another manager's later edit doesn't move it). A change to the bus's TLS Secret while a reload is pending (a renewed certificate, which the reloader also acts on) folds every server, so the move that follows re-arms the wait. A reload sent by hand can't be told apart, and is left to whoever sends it. nats-server 2.10 serves no
+config digest to compare instead. A server it can't read, or can't show holds the newest
+write, hasn't loaded the config: the reload stays pending, and so does the profile hold
+below, until every server is confirmed. A pod at an ordinal past what the StatefulSet asks
+for (a scale-down under way), or under a server's name but not the StatefulSet's (a Warning
+names it), keeps it pending too. The single-server path an earlier operator shipped took any
+moved load time as the reload, a restart included; this closes that on one server as on
+three. For a rolled-back operator, the key it reads keeps its old shape: pod -0's load time
+alone. A config written while a reload is still
 pending can't be confirmed by that move, which may be the earlier write landing, so the move
 restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
 kubelet write, so a restarted wait usually sees no further move, and nothing the server
 reports says whether the newest write was in the one it saw. If the value hasn't moved
-within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
-the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+within three minutes, or can't be read, the operator deletes that server's pod so it restarts
+onto the new config: one server per pass, only once every other server has been Ready for
+30 seconds, so a cluster keeps quorum, and none while a scale-down is under way. When exactly
+one server isn't Ready and hasn't confirmed, it goes first, since restarting it costs no
+quorum. A server that can never start (unschedulable, or crash-looping) is deleted once per bound
+while it stays unconfirmed, with a Warning each time, and the profile stays held throughout.
+An upgrade that lands in the middle of a reload: on three servers there is nothing in flight
+to carry over, since the earlier operator rolled the bus rather than reloading it and kept no
+reload record. On one server, a reload the earlier operator left pending can't be confirmed in
+place, because its record carries no pod UID or start time, so the server is restarted at that
+operator's original bound, with a `BusConfigReloadFailed` Warning, and the new pod confirms by
+its creation after the write. The fresh pod mounts the current Secret, so its creation after the write confirms
+it, and the pending record stays until it is read. A pod created after the write is given a
+full three minutes from its own creation to come up before it can be restarted. That is a `BusConfigReloadFailed` Warning, or a Normal
 `BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
 restart is kept even then: confirming by the absence of a move would admit a profile whose
 deny the server might not hold. The kubelet takes up to about a minute to write
@@ -1241,11 +1290,13 @@ door, serves the same certificate from the same files (below).
 **A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
 grant and the agent card take a newly bound AgentProfile only once every bus server has
 loaded the config carrying its deny; until then the profile's `CardPublished` condition is
-`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
-servers, the pod template records the profile list, and the operator reads the revision
-each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
-them). On one server the config Secret records the previous list while a reload is pending
-or the pod restarts, and the profile counts as loaded once the server is on the new config.
+`False` with reason `BusConfigPending`. The config Secret records the previous list while a
+reload is pending on any server or a server restarts, and the profile counts as loaded once
+every server is on the new config. An earlier operator rolled a cluster onto each profile
+change instead and recorded the list on the pod template; while any server still runs, or
+the StatefulSet's update revision is, a revision carrying that list (an upgrade's roll
+unfinished), the loaded set is also narrowed to what every such revision lists, read from
+the StatefulSet's ControllerRevisions (the operator's one `get` on them).
 Only the way in waits: a profile the dispatch config already lists live, or whose card is
 already published, stays, and a removed profile keeps its deny while it drains, as before.
 

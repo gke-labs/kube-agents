@@ -146,6 +146,13 @@ SERVED = "served"
 SERVED_FROM = "served_from"
 # How a served answer matched: the exact key, or the answer-slot key.
 SERVED_VIA = "served_via"
+# On every request line: the eval run, case and repetition the request serves
+# (`<run>/<case>/<rep>`, from X-Kube-Agents-Eval-Run) and the agent that sent
+# it (`<profile>;<source>`, from X-Kube-Agents-Eval-Agent), as the agent's
+# eval_run_tag plugin set them; null when the request carried none or a
+# malformed one. Neither is forwarded upstream or read by the key.
+EVAL_RUN = "eval_run"
+EVAL_AGENT = "eval_agent"
 VIA_EXACT = "exact"
 VIA_ANSWER_SLOTS = "answer_slots"
 # On a served line: which of the key's saved answers was served (the

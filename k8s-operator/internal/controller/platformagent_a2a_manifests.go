@@ -734,6 +734,10 @@ const (
 	// The broker's side of the same backend.
 	a2aGoogleChatSubscriptionEnvVar      = "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME"
 	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
+	// credentialProxyA2AChatCallersEnvVar binds the a2a-chat role to the A2A
+	// gateway's ServiceAccount in the broker (#6090), rendered beside the
+	// audience above and only with it.
+	credentialProxyA2AChatCallersEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS" // #nosec G101 -- Environment variable name, not a credential
 
 	// The A2AGateway condition. Older operators published it while a next
 	// install's gateway ran nothing for want of a chat backend: withheld
@@ -2894,21 +2898,14 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // served until the pod restarts. A renewal rolls the bus once a year; the
 // bus pod's reloader would also apply it in place, but the hash still rolls.
 //
-// On a single server the gateway's per-profile deny is left out
-// (renderA2ANATSConf with no profiles): the config Secret carries it, the
-// reloader applies it, and planA2ABusReload confirms it, so a profile change
-// doesn't restart the bus. A cluster digests it too, so a profile change rolls
-// the servers one at a time onto it, each in lame duck while the others serve:
-// the reload's confirmation reads one config_load_time through the Service,
-// which can't tell whether every server reloaded, and its fallback restarts
-// one pod.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
-	if a2aNATSReplicas(agent) <= 1 {
-		profiles = nil
-	}
+// The gateway's per-profile deny is left out (renderA2ANATSConf with no
+// profiles) on every server count: the config Secret carries it, each
+// server's reloader applies it, and planA2ABusReload confirms it server by
+// server, so a profile change restarts no server and rolls no cluster.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys, profiles)
+	}, keys, nil)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -4232,13 +4229,15 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
   echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
   echo "     24h TTL will." >&2
-  echo "  3. once TASKS is back, restart the clients holding a durable consumer on it:" >&2
+  echo "  3. once TASKS is back, the operator restarts the clients holding a durable consumer" >&2
+  echo "     on it, if it saw the stream missing on three five-minute polls in a row. After a" >&2
+  echo "     quicker fix (deleted and recreated inside 15 minutes), restart them yourself:" >&2
   echo "       kubectl rollout restart deployment/` + a2aGatewayName(agent) + ` -n ` + agent.Namespace + `" >&2
   echo "     and, where a Hermes bridge sidecar runs, the agent workload ` + agent.Name + `-gateway" >&2
   echo "     (a Deployment or a StatefulSet, depending on the spec) with it." >&2
   echo "     Deleting a stream deletes every consumer on it, and neither client re-creates" >&2
   echo "     one: the consume underneath them carries no error handler, so a deleted consumer" >&2
-  echo "     ends the subscription with nothing logged. Skip this and the gateway goes on" >&2
+  echo "     ends the subscription with nothing logged. Without a restart the gateway goes on" >&2
   echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
   echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
   echo "     recover by themselves, which hides it rather than helping." >&2
@@ -4590,11 +4589,22 @@ func (r *PlatformAgentReconciler) recordProfileSubmitMaxAge(ctx context.Context,
 	if (have == nil && live == nil) || (have != nil && live != nil && *have == *live) {
 		return
 	}
-	patch := client.MergeFrom(agent.DeepCopy())
-	agent.Status.ProfileSubmitMaxAgeSeconds = live
-	if err := r.Status().Patch(ctx, agent, patch); err != nil {
+	// The patch goes through a copy: its answer, the stored status, would
+	// otherwise replace this pass's in-memory status, everything resolved
+	// and not yet written (the bus's count, a migration's progress). Only
+	// the field and the version the write made are carried back, and only
+	// from a write against the version this pass read: carried from a write
+	// over a status someone changed since (a poller), the version would let
+	// the pass's final full write go over that change instead of conflicting.
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	written := agent.DeepCopy()
+	written.Status.ProfileSubmitMaxAgeSeconds = live
+	if err := r.Status().Patch(ctx, written, patch); err != nil {
 		logf.FromContext(ctx).Error(err, "could not record PROFILE_SUBMITS' live max age; the provision Job's next run reports it again")
+		return
 	}
+	agent.Status.ProfileSubmitMaxAgeSeconds = written.Status.ProfileSubmitMaxAgeSeconds
+	agent.ResourceVersion = written.ResourceVersion
 }
 
 // a2aProvisionReport is the shape of the script's termination message: an
@@ -4861,7 +4871,9 @@ const (
 	// reconcile, each surge-first; the chart's own surges are in its count),
 	// one provisioning Job pod (at install, on any spec change and about daily
 	// after its TTL), the scope publisher's Job pods, and three for the
-	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// gateway's transient overshoot at the cap: a replacing turn's slot while
+	// its old pod is still going, and a gateway older than #6033, whose
+	// count-then-create race could pass a burst together (a2a/gateway/spawn.go,
 	// refuseAtSessionCap).
 	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
 	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
@@ -5290,11 +5302,11 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			if refusal := r.busMigrationStreamsOverCap(ctx, agent); refusal != "" {
 				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationStreamsOverCap,
 					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but no migration starts: %s; the bus keeps %d", want, running, refusal, running))
-			} else {
-				startBusMigration(agent, running, want, metav1.Now())
+			} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
+				return err
 			}
-		} else {
-			startBusMigration(agent, running, want, metav1.Now())
+		} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
+			return err
 		}
 	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
@@ -5358,6 +5370,48 @@ func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, no
 		Deadline:           metav1.NewTime(now.Add(busMigrationRunDeadline)),
 		ObservedGeneration: agent.Generation,
 	}
+}
+
+// startBusMigrationPersisted starts a run (startBusMigration) and writes its
+// record to the API server before the pass goes on, so nothing renders with
+// a run ID that isn't persisted (#6298). The rest of the pass renders the
+// run's work from its ID straight away: the callout's freeze template and
+// identity map, the bus's pins. A record kept only in memory until the
+// pass's final status write was lost whenever that write conflicted, and the
+// next pass, finding no run, started another with a new ID and rolled the
+// callout again, every pass, the callout never becoming ready.
+//
+// The write is a status patch of the record alone, against the
+// resourceVersion this pass read, so it fails on any change since the read.
+// A failed write takes the run back out of the pass and returns the error: a
+// conflict requeues the pass, which re-reads, and finds the run if the write
+// did land after all, or starts it again. Nothing was rendered with the
+// discarded ID, and an ID is minted only while no run is persisted. An echo
+// without the record is the served CRD pruning it: the run is taken back,
+// and noteBusMigrationEcho records the prune, so the next pass refuses to
+// start one, with its Warning Event.
+func (r *PlatformAgentReconciler) startBusMigrationPersisted(ctx context.Context, agent *agentv1alpha1.PlatformAgent, running, want int) error {
+	before := agent.Status.BusMigration
+	startBusMigration(agent, running, want, metav1.Now())
+	if agent.Status.BusMigration == before {
+		return nil // nothing started
+	}
+	base := agent.DeepCopy()
+	base.Status.BusMigration = before
+	written := agent.DeepCopy()
+	if err := r.Status().Patch(ctx, written, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		agent.Status.BusMigration = before
+		return err
+	}
+	// The pass's final status write goes against the version this write
+	// made; the rest of the in-memory status, changed this pass and not yet
+	// written, stays as it is.
+	agent.ResourceVersion = written.ResourceVersion
+	r.noteBusMigrationEcho(written, true)
+	if written.Status.BusMigration == nil {
+		agent.Status.BusMigration = before
+	}
+	return nil
 }
 
 // busMigrationWouldStart reports whether startBusMigration would start a run
@@ -6081,7 +6135,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, the operator restarts the clients that held a durable consumer on it, provided it saw the stream missing on three five-minute polls in a row; after a quicker fix (inside 15 minutes), restart them yourself: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so without a restart there is a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
@@ -7013,6 +7067,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	// The report reader's token and the broker's address, on every install
+	// (a2a_report_reader.go).
+	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
+	env = append(env, reportEnv...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))
@@ -7093,10 +7151,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), append(injectMounts, reportMounts...)...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), append(injectVolumes, reportVolumes...)...),
 				},
 			},
 		},
@@ -7383,6 +7441,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
+	r.noteA2ABusSingleServer(ctx, agent)
 	// A count change (a migration's phase moving the bus between one server
 	// and three) leaves streams that are not there until the migration puts
 	// them back, so the provisioned-once record no longer describes the
@@ -7544,13 +7603,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
 	// ones and the ones still draining, the same names as the dispatcher's
 	// grant. A profile the controller refuses gets neither. The list is in
-	// the config, and on a single server not the pod template's hash, so a
-	// profile admitted, removed or done draining reaches a single-server bus
-	// by a reload (planA2ABusReload) rather than a restart. A cluster rolls
-	// onto it (a2aConfigRolloutHash).
+	// the config and not the pod template's hash, so a profile admitted,
+	// removed or done draining reaches every bus server by a reload
+	// (planA2ABusReload) rather than a restart or a roll.
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
-	annotateA2ABusProfiles(agent, sts, profileNames)
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -7565,7 +7622,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+		if err := r.actOnA2ABusReload(ctx, agent, reload); err != nil {
 			return state, err
 		}
 		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {

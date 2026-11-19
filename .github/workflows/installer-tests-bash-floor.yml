@@ -54,6 +54,7 @@ on:
       - "tests/test_installer_ghes.py"
       - "tests/test_installer_gitlab.py"
       - "tests/test_installer_gitops_record.py"
+      - "tests/test_installer_report_files.py"
       - "tests/test_lifecycle_script.py"
       - "tests/test_repeat_under_load.py"
       - "tests/testing/**"
@@ -87,6 +88,7 @@ env:
     tests/test_installer_ghes.py
     tests/test_installer_gitlab.py
     tests/test_installer_gitops_record.py
+    tests/test_installer_report_files.py
     tests/test_lifecycle_script.py
     tests/test_repeat_under_load.py
 

@@ -130,3 +130,34 @@ func TestSessionResourceDefaultsMatchTheOperators(t *testing.T) {
 		}
 	}
 }
+
+// FromEnv reads the four variables into the Config the spawner uses, so a
+// gateway that ignored them fails here rather than only in the helper's test.
+func TestFromEnvReadsTheSessionPodsResources(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_SESSION_CPU_REQUEST", "200m")
+	t.Setenv("A2A_SESSION_MEMORY_REQUEST", "384Mi")
+	t.Setenv("A2A_SESSION_CPU_LIMIT", "1")
+	t.Setenv("A2A_SESSION_MEMORY_LIMIT", "1Gi")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		v    resource.Quantity
+		want string
+	}{
+		{cfg.SessionResources.Requests[corev1.ResourceCPU], "200m"},
+		{cfg.SessionResources.Requests[corev1.ResourceMemory], "384Mi"},
+		{cfg.SessionResources.Limits[corev1.ResourceCPU], "1"},
+		{cfg.SessionResources.Limits[corev1.ResourceMemory], "1Gi"},
+	} {
+		if c.v.Cmp(resource.MustParse(c.want)) != 0 {
+			t.Errorf("FromEnv: %s, want %s", c.v.String(), c.want)
+		}
+	}
+	t.Setenv("A2A_SESSION_MEMORY_REQUEST", "3Gi")
+	if _, err := FromEnv(); err == nil {
+		t.Error("FromEnv accepted a memory request over its limit")
+	}
+}

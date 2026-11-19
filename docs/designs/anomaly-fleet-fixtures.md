@@ -110,7 +110,9 @@ plants.
 ### Tier 3 — project-level, no cluster needed
 
 The fleet already carries a pair of these (`orphan_pd`, two unattached disks, catalogued as
-`orphan-disks`), so the pattern exists.
+`orphan-disks`), so the pattern exists, and for the snapshot row the closer precedent is the
+pair of age-gated orphaned snapshots `orphan_snapshot.py` plants (`declared-orphan-snapshot`
+and `orphan-snapshot` in the catalogue).
 
 | Check                             | Fixture                                                    |
 | --------------------------------- | ---------------------------------------------------------- |
@@ -139,7 +141,7 @@ Stated so nobody plans a fixture that cannot exist:
 ### Day-N gates
 
 The catalogue's age rules apply to the new fixtures too
-([`bench-fleet-catalog.md`](bench-fleet-catalog.md), "Day 0, 1, 7, 30"). The Tier 1 workloads are
+([`bench-fleet-catalog.md`](bench-fleet-catalog.md), "Day 0, 1, 7, 30, 91"). The Tier 1 workloads are
 assertable on apply day. The expiry fixtures in Tier 3 are assertable only once their own age
 window passes, and the key-age one has no obvious answer: the catalogue says plainly that backdating is impossible and
 not to try, so this fixture either waits out its own window after a replant or is dropped. Each new role states its day-N gate in the catalogue, and a case that asserts before the

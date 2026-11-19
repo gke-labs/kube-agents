@@ -339,7 +339,7 @@ starting it.
 | `a2a.tasks.{addressee}.{taskId}.in`           | `message` (follow-up input, and the submission itself for a chat session or the platform agent) and `cancel`, requester to executor. The executor's own consumer takes everything after the submission (follow-ups, steers, cancels). A profile's new tasks move to `…submit` below once the dispatcher lands (#3655); a profile executor still reading its submission here then sees only follow-ups.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `a2a.tasks.{addressee}.{taskId}.events`       | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `a2a.tasks.{addressee}.{taskId}.supervisor`   | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `a2a.tasks.p.{profile}.{taskId}.supervisor`   | Added 11/11 (#5301). A profile task's supervisor subject in its profile form: six tokens, so the gateway's five-token grant can never match it, and on TASKS beside the task's `events`. Readers accept it beside the five-token form; nothing writes it until the dispatcher moves to it in a later change, after which it is the dispatcher's alone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `a2a.tasks.p.{profile}.{taskId}.supervisor`   | Added 11/11 (#5301). A profile task's supervisor subject in its profile form: six tokens, so the gateway's five-token grant can never match it, and on TASKS beside the task's `events`. Readers accept it beside the five-token form. The dispatcher writes a profile task's terminal here when its dispatch config's `profileSupervisorForm` is `profile`, and on the five-token form otherwise; the operator sets it once every reader watches both. It is the dispatcher's alone, and the auth callout refuses a session pod named `p`.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `a2a.submit.{profile}.{tier}.{kind}.{taskId}` | Added 10/22 (#3660) as `a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit`, moved to its own prefix and stream (`PROFILE_SUBMITS`) 10/28 (#4121). A new task for a profile, `message` only, written by the gateway. `{tier}` is the requester's tier and `{kind}` is `top` for a task a client asked for or `child` for one another task started; both exist only to route the submission to the operator's durable for that (profile, tier, kind), whose dispatcher holds the task until it ends. Nothing on TASKS matches a submission, and a follow-up on `…in` never reaches the durable. The task's follow-ups and cancels go on `…in`, its events on `…events` and `…supervisor`. Envelope agreement: `taskId` and `to` match the tokens, and the writer is the submitter: `from.session` is the one a consumer names (the gateway), or, where it names none, neither `from.session` nor `from.profile` is the profile. |
 | `a2a.cap.verify.{caller}`                     | Added 9/9 with the capability envelope. An executor's request to resolve a capability reference, executor to the verifier. `{caller}` is the asking principal's name and the verifier reads its identity off that token rather than off the payload, which is sound only because each principal's grant is exactly one subject: a `a2a.cap.verify.*` grant would turn the identity check into a self-assertion. The `cap` KV bucket behind it is readable by the verifier alone.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `a2a.cap.reply.{caller}.{inbox}`              | Added 9/9. The verifier's answer, verifier to the one executor that asked. Scoped under `{caller}` so a principal's reply grant cannot reach another's - a subscribe permission on a reply space is interception and not observation, because any subscriber may join a queue group on it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -759,7 +759,7 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 
 Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
 delegation to profiles onward. The gateway carries a `delegate` request's `parameters` into the
-child's submission once their names pass the target profile's declared ones. Both are `data` parts, and only the gateway
+child's submission once their names pass the target profile's declared ones. These are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
 `taskParameters` parts.
 
@@ -770,6 +770,15 @@ from what the client or the parent task asked. They never ride the authority blo
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
 to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
+
+The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
+request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
+and only for a turn that arrived as a structured confirm action, never from free text or a
+delegation's arguments. A child task carries its parent's value from the gateway's own record and
+cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
+the field and every profile write is refused. Absent means false, so a
+submission that asks for no change is byte-identical to one written before the field existed. The
+dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
@@ -825,6 +834,31 @@ listed, and a turn with none reads as `platform` only.
   single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
+
+**Reply to.** A turn that answers a card's report carries `{"replyTo": {"taskId": "<task>"}}`: the
+gateway task whose turn filed the card, which the report's console frame named as `replyTo` (the
+root of its chain when a delegated child filed it, so that card's row, keyed by the child's task, is
+not reached; the pushed report below carries it; `a2a/docs/hermes-bridge.md`) and the client echoed with its reply (the console frame's `replyTo`; the MCP server's `send_message`
+`reply_to`). The hermes-bridge reads the report the kanban notifier stored for that turn when the
+turn carries no pushed report (below) (`a2a/docs/hermes-bridge.md`, the reply under a pushed
+report) and puts it ahead of the words. A
+chat backend's turn never carries one: a Slack or Google Chat reply is in the report's thread. The
+task id is a subject token; the gateway drops one that is not and sends the turn without it, and
+a reader that finds a part breaking that, or two parts, ignores them (`lib.ReplyToOf`) and looks the
+report up by the conversation alone.
+
+**Pushed report.** A turn under a report the gateway's notify route posted into the conversation
+carries `{"pushedReport": {"taskId"?, "text"}}`: the report's text, kept by the gateway from the
+report it posted (a post the kanban notifier marks as a card's report, `report`, naming its task
+with `reply_to`; `spec-chatops-gateway.md`, "Proactive posts"), and the root of the task it reported on. The gateway
+attaches it to a human turn, on any route, that names the task (`replyTo`, read as its chain's
+root): a console or MCP turn, since only console posts name their task today; a chat thread reply
+keeps the executor's lookup. The hermes-bridge (the platform route, the install's default) frames
+the text as it frames a report it looked up, untrusted and ahead of the words, and skips the lookup
+(`a2a/docs/hermes-bridge.md`). `text` is at most 64 KiB (`lib.PushedReportTextCap`), cut by the
+gateway with a note; a part with no text, text past the cap, a task id that is not a subject
+token, or a second part is ignored (`lib.PushedReportOf`) and the executor looks the report up
+instead. Only the gateway writes it; it is the gateway's own relay, not the sender's text.
 
 ### Card work after the task ends
 

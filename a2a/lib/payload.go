@@ -288,6 +288,16 @@ func validateDelegateText(text string) error {
 // these message fields authoritative. They never ride the authority block.
 type TaskParameters struct {
 	Parameters map[string]string `json:"parameters"`
+	// ChangeRequested says the requester asked for a change (a pull
+	// request) rather than an answer, and so whether the dispatcher grants
+	// the worker the permit to open one. Only the gateway sets it, and only
+	// true for a turn that arrived as a structured confirm action, never
+	// from free text or from a delegation's arguments, which are the
+	// model's; a child carries its parent's value from the gateway's own
+	// record. Both rules are the gateway's to keep (#4457): the dispatcher
+	// can't tell a parent's value from a raised one. Until the gateway sets
+	// it, nothing does. Absent means false.
+	ChangeRequested bool `json:"changeRequested,omitempty"`
 }
 
 // The bounds ValidateTaskParameters holds a parameter set to. A name is a
@@ -530,6 +540,125 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 	}
 	if found == nil {
 		return DelegateTargets{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// ReplyTo is the replyTo data part: the task whose stored report this turn
+// answers (spec-a2a-payloads.md, "Task parameters and child results");
+// written by the gateway only.
+type ReplyTo struct {
+	TaskID string `json:"taskId"`
+}
+
+const replyToKey = "replyTo"
+
+// ReplyToPart is r as a data part, refused when its task id is not a
+// subject token.
+func ReplyToPart(r ReplyTo) (Part, error) {
+	if !ValidSubjectToken(r.TaskID) {
+		return Part{}, fmt.Errorf("reply to: %q is not a task id", r.TaskID)
+	}
+	data, err := json.Marshal(map[string]ReplyTo{replyToKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ReplyToOf finds the replyTo part among parts. A part whose task id is not
+// a subject token, or a second one, is an error, and the reader goes on as
+// though the turn named no report.
+func ReplyToOf(parts []Part) (ReplyTo, bool, error) {
+	var found *ReplyTo
+	for _, p := range parts {
+		raw, ok := wrappedData(p, replyToKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return ReplyTo{}, true, errors.New("reply to: more than one replyTo part")
+		}
+		var r ReplyTo
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return ReplyTo{}, true, fmt.Errorf("reply to: %w", err)
+		}
+		if !ValidSubjectToken(r.TaskID) {
+			return ReplyTo{}, true, fmt.Errorf("reply to: %q is not a task id", r.TaskID)
+		}
+		found = &r
+	}
+	if found == nil {
+		return ReplyTo{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// PushedReport is the pushedReport data part: a report the gateway's notify
+// route posted into the conversation, put ahead of a reply under it, with
+// the task the report was on when its sender named one; written by the
+// gateway only (spec-a2a-payloads.md, "Task parameters and child results").
+type PushedReport struct {
+	TaskID string `json:"taskId,omitempty"`
+	Text   string `json:"text"`
+}
+
+// PushedReportTextCap bounds PushedReport.Text in bytes; the gateway cuts a
+// longer report and says so (ChildResultTextCap's value).
+const PushedReportTextCap = 64 * 1024
+
+const pushedReportKey = "pushedReport"
+
+// PushedReportPart is r as a data part, refused with no text, text past
+// PushedReportTextCap, or a task id that is not a subject token.
+func PushedReportPart(r PushedReport) (Part, error) {
+	if err := validatePushedReport(r); err != nil {
+		return Part{}, err
+	}
+	data, err := json.Marshal(map[string]PushedReport{pushedReportKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+func validatePushedReport(r PushedReport) error {
+	if r.Text == "" {
+		return errors.New("pushed report: no text")
+	}
+	if len(r.Text) > PushedReportTextCap {
+		return fmt.Errorf("pushed report: %d bytes of text, at most %d", len(r.Text), PushedReportTextCap)
+	}
+	if r.TaskID != "" && !ValidSubjectToken(r.TaskID) {
+		return fmt.Errorf("pushed report: %q is not a task id", r.TaskID)
+	}
+	return nil
+}
+
+// PushedReportOf finds the pushedReport part among parts. A part breaking
+// the bounds, or a second one, is an error, and the reader goes on as
+// though the turn carried none.
+func PushedReportOf(parts []Part) (PushedReport, bool, error) {
+	var found *PushedReport
+	for _, p := range parts {
+		raw, ok := wrappedData(p, pushedReportKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return PushedReport{}, true, errors.New("pushed report: more than one pushedReport part")
+		}
+		var r PushedReport
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return PushedReport{}, true, fmt.Errorf("pushed report: %w", err)
+		}
+		if err := validatePushedReport(r); err != nil {
+			return PushedReport{}, true, err
+		}
+		found = &r
+	}
+	if found == nil {
+		return PushedReport{}, false, nil
 	}
 	return *found, true, nil
 }

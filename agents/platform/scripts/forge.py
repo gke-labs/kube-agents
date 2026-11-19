@@ -378,7 +378,7 @@ def normalise_login(login: str) -> str:
     return text
 
 
-def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
+def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str, *, hostless: bool = False) -> bool:
     """Did the agent open this pull request, from a branch it wrote, here?
 
     All three conditions, because each one alone is something a stranger can
@@ -406,13 +406,18 @@ def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
     the fork a proposal came from has been deleted: the branch is then nobody's
     that anyone can name, and the agent's own is something it must be able to
     name before it pushes to it.
+
+    ``hostless`` says ``repo`` is already the forge's own path (the broker's
+    bound repository), so it is compared as given. Running repository_path on
+    it would take a dotted top-level group (``my.org/sub/project``) for a host
+    and strip it, and no proposal would then match.
     """
     if not viewer or not pr.head_repo:
         return False
     return (
         normalise_login(pr.author) == normalise_login(viewer)
         and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
-        and pr.head_repo.lower() == repository_path(repo).lower()
+        and pr.head_repo.lower() == (repo if hostless else repository_path(repo)).lower()
     )
 
 

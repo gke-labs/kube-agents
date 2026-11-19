@@ -255,10 +255,14 @@ not been set.
 
 **Image pins.** `images.json` is the source of truth for every image an install pulls, but a bump
 starts there and rarely ends there. Several images keep a second copy that the file is the source
-for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator, the chart's
+template default for the A2A bus's four (`kube-agents.a2aBusImageDefaults` in
+`charts/kube-agents/templates/_helpers.tpl`) — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
-default and a mirrored install, and what each off-by-default toggle it renders adds to each (the
-GitHub token minter, the web console, the cluster profile, Hindsight); the build-time
+default and a mirrored install, what each off-by-default toggle it renders adds to each (the
+GitHub token minter, the web console, the cluster profile, Hindsight), and the four bus env vars of
+a `helm upgrade --reuse-values` render from before `a2aBus` (no `a2aBus` key), unmirrored and
+mirrored; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
@@ -512,11 +516,12 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   eleven of the eighteen rounds on #2360 were on merges of `main`.
 - **Resolving.** Reply to a declined or deferred bot finding with the reason, and the follow-up
   issue when there is one, record it in **Self-Review**, and then resolve the thread, with a user in
-  the loop or without. An open thread makes the pull request the author's on the reviewers'
-  dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)), so the summoned
-  reviewer would never see a pull request that kept one open. The reply stays on the resolved
-  thread. A reviewer who disagrees replies in it (one with write access may also unresolve it); a
-  reply does not reopen it, so on one that asks for the fix, unresolve it, and it is your move again
+  the loop or without. An open thread keeps the pull request on its author's list as well as the
+  reviewer's and blocks the merge ([who owns an open pull request](#who-owns-an-open-pull-request)),
+  so the summoned reviewer sees an unanswered finding as the author's outstanding work. The reply
+  stays on the resolved thread. A reviewer who disagrees replies in it (one with write access may
+  also unresolve it); a reply does not reopen it, so on one that asks for the fix, unresolve it, and
+  it is your move again
   (**who counts**, next;
   [resolving conversations](#resolving-conversations)).
 - **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
@@ -553,9 +558,10 @@ Reply first — `AGENTS.md` says why — naming what changed and the commit that
 `kube-agents-bot` finding you decline or defer, the reason and the follow-up issue, if any, which
 **Self-Review** gives too. Then resolve what a commit fixed, what you showed wrong, and the bot
 findings you declined or deferred; the description thread waits for the body edit described below,
-or for your reply declining an ask the bot repeated. An open thread makes the pull request its
-author's on the reviewers' dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)),
-so a declined bot thread left open hides the pull request from the reviewer who has to rule on it.
+or for your reply declining an ask the bot repeated. An open thread keeps the pull request on its
+author's list as well as the reviewer's ([who owns an open pull request](#who-owns-an-open-pull-request)),
+so a declined bot thread left open reads as the author's unfinished work to the reviewer who has to
+rule on it.
 A reviewer who disagrees replies in the thread; only the author or a user with write access can
 unresolve it. A reply does not reopen a resolved thread, so on a reply that asks for the fix,
 unresolve it (`unresolveReviewThread`, below): it owes the fix and stays open until the fix lands
@@ -835,9 +841,8 @@ request. The sweep puts it back once after the first such removal since the last
 one keeps it out until a push. If `Smoke gate` is pending, a `/test` or a push is how you get a
 fresh green. `/retest` is fine: it reruns only failed contexts.
 
-No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
-changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository
-variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
+No verdict carries across a change to what the job grades. When a change to the stack the blocking job
+grades lands in `oss-test-infra`, set the repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
 timeout (a run in flight at the change reports afterwards). `Smoke gate` then stays pending on a
 green whose build first reported before that time, until a run from after it replaces it, and its
 pending text asks for a push. Check the value before you set it: an unparsable one exits
@@ -962,17 +967,25 @@ that no test cites any more.
 
 ## Who owns an open pull request
 
-Every open pull request has exactly one party whose move it is, and the commonest way one sits for
-a fortnight is that both sides believe it is the other's. The rule:
+Every open pull request has at least one party whose move it is, and the commonest way one sits
+for a fortnight is that each side believes it is the other's. The rule:
 
 **The author owns it while it is blocked on them** — a draft, a failing or cancelled required check,
 a pull request the sweep left out of the merge queue, merge conflicts, unresolved review threads,
 changes requested, or no human reviewer requested yet. An open thread is always the author's move,
-the reviewers' dashboard counts it that way, and a declined or deferred `kube-agents-bot` finding is
+the reviewers' dashboard counts it against the author (and the reviewers too, below), and a declined
+or deferred `kube-agents-bot` finding is
 resolved with its reply rather than left open for the reviewer
 ([resolving conversations](#resolving-conversations)).
-**Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
-is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
+**The requested reviewers own it** when one of them still owes a review — alone when nothing blocks
+the author, and together with the author when the blocker is a failing check, a merge conflict, open
+threads or a changes-requested verdict. None of those stops a review: the diff is readable as it
+stands, so the pull request is on the author for the fix and on the reviewers for the review at the
+same time, and the triage sweep counts it against both. Only a draft keeps a blocked pull request
+off the reviewers' lists. A reviewer who finds the blocker matters says so in a changes-requested
+review; submitting a review takes them off the requested list until review is requested of them
+again. A past reviewer does not own it: an approval already given is not an outstanding obligation.
+`kube-agents-bot` and other bot reviewers never count either way.
 
 A draft is owned by its author and waited on by nobody, so it is not a backlog item — it is work in
 progress, and chasing it is noise.
@@ -982,7 +995,9 @@ Four states that look like somebody else's problem and are not:
 - **`CHANGES_REQUESTED` does not clear itself.** It stays set until a reviewer submits a _new_
   review. Pushing the fix does not clear it, resolving every thread does not clear it, and GitHub
   will report `CHANGES_REQUESTED` and "review requested from X" in the same breath. Re-requesting
-  review is the explicit hand-back — do that rather than assuming the push spoke for itself.
+  review is the explicit hand-back — do that rather than assuming the push spoke for itself. Until
+  review is re-requested, the reviewer who gave the verdict is off the requested list, so if a
+  second reviewer was requested the pull request is on that reviewer as well as on the author.
 - **Nobody is requested at all.** A human is assigned once the `AI Review` check goes green, or
   once the bot has reviewed three commits whatever the colour (`AGENTS.md`, "Automated Review After
   Opening a Pull Request"); before either, an author with outstanding bot findings has no reviewer
@@ -1021,8 +1036,10 @@ skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
 naming the reason. A periodic
-triage sweep applies the wider rule and messages whoever owns each pull request; it runs outside
-this repository, so the rule above is all this page can state about it.
+triage sweep applies the wider rule and messages whoever owns each pull request, both parties on
+one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
+with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
+is all this page can state about it.
 
 ```bash
 # Whose move is it: draft, conflicts, verdict, and who is on the hook now.
