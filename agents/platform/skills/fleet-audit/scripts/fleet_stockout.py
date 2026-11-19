@@ -237,8 +237,9 @@ MANUAL_POOL_TRIAGE = "manual-pool-fallback"
 RULE_LABEL_FIELDS = ("nodepools", "machineType", "machineFamily")
 # The name GKE gives the cluster-level default ComputeClass.
 CLUSTER_DEFAULT_CLASS = "default"
-# What `_priority_family` returns for an N1 custom machine type, and the family it is.
-UNPREFIXED_CUSTOM_TYPE = "custom"
+# What `_priority_family` returns for the N1 machine types whose names do not
+# lead with the family (`custom-4-8192`, `f1-micro`, `g1-small`), and the family they are.
+N1_TYPE_PREFIXES = frozenset({"custom", "f1", "g1"})
 N1_FAMILY = "n1"
 ERROR_EXCERPT_CHARS = 300
 STDERR_EXCERPT_CHARS = 200
@@ -492,7 +493,7 @@ IMPACT = {
     "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
-    UNBACKED_MANUAL_FALLBACK: "Node pool auto-creation is off, so GKE scales existing node pools only: a priority rule with no manual node pool is a fallback that does not exist, and pods stay Pending when the backed rule's pool cannot grow.",
+    UNBACKED_MANUAL_FALLBACK: "Node pool auto-creation is off, so GKE scales existing node pools only: a priority rule with no manual node pool is a fallback that does not exist, and pods stay Pending when the class's existing node pools cannot grow.",
     "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
     # Both arms of §3.9 set their own `impact` on the hit -- and a pool
     # matching both gets both sentences -- so this entry is the fallback
@@ -1260,28 +1261,28 @@ def _manual_fallback_class(cc: dict) -> bool:
     `is not True`, as `check_dangling_compute_class` reads the field: the CRD
     defaults it to off. A class in Autopilot mode (`spec.autopilot.enabled`)
     is out of scope: GKE creates its nodes, so it has no manual pool to lack.
-    So is the cluster default class: node pools serve it without the class
-    label, so the pool list does not say which pools are its own.
     """
     spec = cc.get("spec") or {}
-    if (cc.get("metadata") or {}).get("name") == CLUSTER_DEFAULT_CLASS:
-        return False
     if (spec.get("nodePoolAutoCreation") or {}).get("enabled") is True or (spec.get("autopilot") or {}).get("enabled") is True:
         return False
     return len(spec.get("priorities") or []) >= MIN_RULES_WITH_A_FALLBACK
 
 
 def _class_pools(class_name: str, node_pools: list[dict]) -> list[dict]:
-    """The node pools that carry the class label."""
+    """The node pools a machine rule of the class can use: the ones that carry
+    the class label, or every pool for the cluster default class, which node
+    pools serve without the label."""
+    if class_name == CLUSTER_DEFAULT_CLASS:
+        return list(node_pools)
     return [pool for pool in node_pools if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == class_name]
 
 
 def _pool_family(machine_type: str) -> str:
     """A pool's machine family. Compute Engine names an N1 custom type with no
-    family prefix (`custom-4-8192`); every other family leads its custom types
-    (`n2-custom-4-8192`)."""
+    family prefix (`custom-4-8192`) and the N1 shared-core types `f1-micro`
+    and `g1-small`; every other family leads its types (`n2-custom-4-8192`)."""
     family = _priority_family({"machineType": machine_type})
-    return N1_FAMILY if family == UNPREFIXED_CUSTOM_TYPE else family
+    return N1_FAMILY if family in N1_TYPE_PREFIXES else family
 
 
 def _rule_has_manual_pool(rule: dict, class_name: str, node_pools: list[dict]) -> bool | None:
@@ -1289,9 +1290,8 @@ def _rule_has_manual_pool(rule: dict, class_name: str, node_pools: list[dict]) -
     neither pools nor a machine, so the pool list cannot answer.
 
     A `nodepools` rule is backed by a pool it names; one existing name is
-    enough. A `machineType` or `machineFamily` rule is backed by a pool that
-    carries the class label and has that type or family; a pool without the
-    label is not the class's.
+    enough. A `machineType` or `machineFamily` rule is backed by one of
+    `_class_pools` that has that type or family.
     """
     named = rule.get("nodepools") or []
     if named:
@@ -1319,8 +1319,8 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     on this cluster and a priority rule no node pool backs. GKE creates no
     pool for that rule, so the fallback the class lists does not exist.
 
-    A class with no node pool of its own here -- none a rule names, none with
-    the class label -- is not filed: nothing on this cluster falls back on it,
+    A class with no node pool of its own here -- none a rule names, none of
+    `_class_pools` -- is not filed: nothing on this cluster falls back on it,
     and `check_dangling_compute_class` names a workload that selects it. A
     rule `_rule_has_manual_pool` cannot judge is neither counted as backed nor
     flagged; the excerpt names it.
@@ -1333,16 +1333,16 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     labels = [_rule_label(position, rule) for position, rule in enumerate(priorities, 1)]
     unbacked = [label for label, verdict in zip(labels, verdicts) if verdict is False]
     backed = [label for label, verdict in zip(labels, verdicts) if verdict is True]
-    labelled = _class_pools(name, node_pools)
-    if not unbacked or not (backed or labelled):
+    own_pools = _class_pools(name, node_pools)
+    if not unbacked or not (backed or own_pools):
         return None
     unjudged = [label for label, verdict in zip(labels, verdicts) if verdict is None]
     excerpt = f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: {'; '.join(unbacked)}"
     if backed:
         excerpt += f". Backed: {'; '.join(backed)}"
     else:
-        pools = "; ".join(f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in labelled)
-        excerpt += f". No rule is backed; the node pools with the class label: {pools}"
+        pools = "; ".join(f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in own_pools)
+        excerpt += f". No rule is backed; the node pools of the class: {pools}"
     if unjudged:
         excerpt += f". Not judged, the rule names neither pools nor a machine: {'; '.join(unjudged)}"
     return {"object": f"ComputeClass/{name}", "excerpt": excerpt, "needs_triage": MANUAL_POOL_TRIAGE}
