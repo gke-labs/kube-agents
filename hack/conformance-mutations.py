@@ -2617,10 +2617,85 @@ Mutation(
     Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
-         "\tif backend == consoleBackend {"),
+        ("\tif backend == consoleBackend || backend == a2aEntraBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend || backend == a2aEntraBackend {"),
         "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
         "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
+        "A3-a2a-entra-alg-unpinned",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif header.Alg != a2aEntraAlgorithm {", "\tif false {"),
+        "test_A3_an_entra_token_is_checked_against_the_tenants_keys_with_the_algorithm_pinned",
+        "let the token name its own algorithm, so a forger who writes alg none "
+        "or an HMAC alg keyed with the public key is checked the way they ask",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-tenant",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !issued || claims.Tid != v.tenantID {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token from any tenant whose key happens to be in the set, so "
+        "an account outside the install's directory signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-application",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !audience {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token the tenant issued for some other application, so a "
+        "token a person granted another app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-entra-any-bearer-parsed",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !entraTokenShaped(token) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys",
+        "decode every non-static bearer as a JWT, so junk bearers and a "
+        "mistyped door token cost a parse and a key lookup each",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || objectID == "" {', '\tif objectID == "" {'),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "resolve an id that did not come through the door's Entra check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-entra-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aEntraAllowed[strings.ToLower(objectID)] {", "\tif false {"),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "admit every Entra-verified object id, so anyone in the tenant who can "
+        "mint a token for the install's application signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif err == nil && !d.entraAllowed[strings.ToLower(id.objectID)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_entra_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any account of the tenant "
+        "creates door conversations and submissions that evict a listed "
+        "person's",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-spellable",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\ta2aEntraCallerPrefix = ":entra:"', '\ta2aEntraCallerPrefix = "entra:"'),
+        "test_A3_no_eval_caller_can_spell_an_entra_caller",
+        "drop the leading colon, so an eval caller \"entra\" naming the context "
+        "\"<oid>:<ctx>\" spells a person's conversation key with the static token",
+    ),
+    Mutation(
+        "A3-a2a-entra-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aEntraBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend || backend == a2aGoogleBackend {"),
+        "test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Entra class's roster through principalMapFor, whose default "
         "is the chat map, so a door caller's id resolves as a chat identity",
     ),
     Mutation(
