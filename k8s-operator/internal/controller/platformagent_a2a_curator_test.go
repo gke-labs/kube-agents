@@ -119,24 +119,6 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 		t.Errorf("collector Ingress Ports = %+v, want TCP %d alone", collectorRule.Ports, a2aCuratorStatusPort)
 	}
 
-	applied := a2aCuratorNetworkPolicyWithOperatorPeer(agent, []string{"10.96.0.10"}, "kubeagents-system")
-	if len(applied.Spec.Ingress) != 2 {
-		t.Fatalf("applied Ingress rules = %d, want 2 (GMP collector + operator peer)", len(applied.Spec.Ingress))
-	}
-	opRule := applied.Spec.Ingress[1]
-	if len(opRule.From) != 1 || opRule.From[0].IPBlock != nil ||
-		opRule.From[0].NamespaceSelector == nil || opRule.From[0].NamespaceSelector.MatchLabels[labelMetadataName] != "kubeagents-system" ||
-		opRule.From[0].PodSelector == nil || opRule.From[0].PodSelector.MatchLabels[operatorPodNameLabel] != operatorPodNameValue {
-		t.Errorf("operator Ingress From = %+v, want operator pod in kubeagents-system", opRule.From)
-	}
-	if len(opRule.Ports) != 1 || opRule.Ports[0].Port == nil || opRule.Ports[0].Port.IntVal != a2aCuratorStatusPort {
-		t.Errorf("operator Ingress Ports = %+v, want TCP %d", opRule.Ports, a2aCuratorStatusPort)
-	}
-
-	bare := a2aCuratorNetworkPolicyWithOperatorPeer(agent, []string{"10.96.0.10"}, "")
-	if len(bare.Spec.Ingress) != 1 {
-		t.Errorf("bare Ingress rules = %d, want 1 when operatorNamespace is unset", len(bare.Spec.Ingress))
-	}
 	wantTypes := []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
 	if !slices.Equal(np.Spec.PolicyTypes, wantTypes) {
 		t.Errorf("PolicyTypes = %v, want %v", np.Spec.PolicyTypes, wantTypes)

@@ -888,9 +888,11 @@ class VcsBroker:
         cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
         automerge_switch: Callable[[], str] | None = None,
         on_decision_memory_check: Callable[[str], None] | None = None,
+        allowed_commit_emails: Callable[[str, str], frozenset[str]] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.on_decision_memory_check = on_decision_memory_check
+        self._allowed_commit_emails = allowed_commit_emails
         # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
         # or kubectl read the broker runs on its own behalf, through the same
         # executor and cluster selection a caller's read takes. Only
@@ -1889,6 +1891,10 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            if self._allowed_commit_emails is not None:
+                self._require_install_commit_identities(
+                    git, root, bound, remote_target, existing_head
+                )
             policy_branch = (
                 self._pinned_base(bound.forge, bound.repo)
                 or self._default_branch_of_remote(git, root, self._tls_refusal)
@@ -1936,6 +1942,63 @@ class VcsBroker:
         if dm_markdown:
             result["decisionMemoryMarkdown"] = dm_markdown
         return bound.stamp(result)
+
+    def _require_install_commit_identities(
+        self,
+        git: Callable,
+        root: Path,
+        bound: Binding,
+        remote_target: str,
+        existing_head: str,
+    ) -> None:
+        """Refuse any newly pushed commit whose author or committer email is not the install's."""
+        bases = [remote_target] + ([existing_head] if existing_head else [])
+        commits_res = git(
+            root,
+            "log",
+            "--format=%ae%x00%ce",
+            _INCOMING,
+            "--not",
+            *bases,
+            check=False,
+        )
+        if commits_res.returncode != 0:
+            detail = (commits_res.stderr or commits_res.stdout or "git log failed").strip()
+            raise WorkspaceError(
+                f"could not verify commit identities before pushing: {detail}",
+                status=403,
+                code="FORBIDDEN_COMMIT_IDENTITY",
+            )
+        try:
+            viewer = self._viewer(bound)
+        except Exception:  # noqa: BLE001 — best-effort viewer lookup for app noreply address
+            viewer = ""
+        host = bound.forge.hosts[0] if bound.forge.hosts else ""
+        allowed = {
+            str(addr).strip().casefold()
+            for addr in self._allowed_commit_emails(host, viewer)
+            if str(addr).strip()
+        }
+        for line in (commits_res.stdout or "").splitlines():
+            if "\x00" not in line:
+                continue
+            ae, ce = line.split("\x00", 1)
+            author_email = ae.strip().casefold()
+            committer_email = ce.strip().casefold()
+            if (
+                not author_email
+                or author_email not in allowed
+                or not committer_email
+                or committer_email not in allowed
+            ):
+                bad = sorted(
+                    {addr or "<empty>" for addr in (author_email, committer_email) if not addr or addr not in allowed}
+                )
+                raise WorkspaceError(
+                    f"bundle contains commit identity {', '.join(bad)} outside install commit addresses",
+                    status=403,
+                    code="FORBIDDEN_COMMIT_IDENTITY",
+                )
 
     @staticmethod
     def _extract_revision_paths_to_dir(
@@ -3082,6 +3145,11 @@ class VcsBroker:
         # `vcs.py` command runs it.
         return self._forge_verb("proposal-reviews", payload)
 
+    def proposal_closer(self, payload):
+        # Who closed an unmerged proposal, for the Decision Memory sweep's
+        # closer authority check. A library verb: no `vcs.py` command runs it.
+        return self._forge_verb("proposal-closer", payload)
+
     def proposal_acknowledge(self, payload):
         return self._forge_verb("proposal-acknowledge", payload)
 
@@ -3644,6 +3712,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
         "proposal-reviews": broker.proposal_reviews,
+        "proposal-closer": broker.proposal_closer,
         "proposal-acknowledge": broker.proposal_acknowledge,
         "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,

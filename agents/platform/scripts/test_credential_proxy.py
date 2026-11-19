@@ -12372,8 +12372,8 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-reviews", "proposal-claim", "issue-list", "issue-view", "branch-view",
-             "revision-contains"},
+             "proposal-commits", "proposal-reviews", "proposal-closer", "proposal-claim",
+             "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -22726,14 +22726,15 @@ class DecisionMemoryChecksMetricTest(unittest.TestCase):
         self._git(self.seed, "commit", "--quiet", "-m", "initial commit")
         self._git(self.seed, "push", "--quiet", "origin", "main")
 
-    def _git(self, cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    def _git(self, cwd: Path, *args: str, env_override: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env = {**self.git_env, **(env_override or {})}
         return subprocess.run(
             ["git", *args],
             cwd=str(cwd),
             capture_output=True,
             text=True,
             check=True,
-            env=self.git_env,
+            env=env,
         )
 
     def _make_broker(self, metrics: credential_proxy.ProxyMetrics, *, pinned_bases=None):
@@ -22775,7 +22776,7 @@ class DecisionMemoryChecksMetricTest(unittest.TestCase):
         broker.registry.hosts["local.test"] = _LocalForge(self.base / "remotes")
         return broker
 
-    def _bundle_change(self, broker, name: str, branch: str, files: dict[str, str]):
+    def _bundle_change(self, broker, name: str, branch: str, files: dict[str, str], *, commit_email: str = "kube-agents@users.noreply.invalid"):
         cloned = broker.clone({"repository": self.REPOSITORY})
         work = self.base / name
         bundle_in = self.base / f"{name}-in.bundle"
@@ -22787,7 +22788,14 @@ class DecisionMemoryChecksMetricTest(unittest.TestCase):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
         self._git(work, "add", "-A")
-        self._git(work, "commit", "--quiet", "-m", f"change {name}")
+        self._git(
+            work,
+            "commit",
+            "--quiet",
+            "-m",
+            f"change {name}",
+            env_override={"GIT_AUTHOR_EMAIL": commit_email, "GIT_COMMITTER_EMAIL": commit_email},
+        )
         out_bundle = self.base / f"{name}-out.bundle"
         self._git(work, "bundle", "create", str(out_bundle), f"{cloned['revision']}..refs/heads/{branch}")
         return {
@@ -22919,6 +22927,21 @@ class DecisionMemoryChecksMetricTest(unittest.TestCase):
                 f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{verdict="{verdict}"}} 1',
                 rendered,
             )
+
+    def test_build_vcs_broker_refuses_spoofed_commit_email_over_http(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+        spoofed = self._bundle_change(
+            broker,
+            "spoof",
+            "platform-agent/spoof",
+            {"notes.txt": "spoofed\n"},
+            commit_email="reviewer@company.com",
+        )
+        status, body = self._post_publish(broker, metrics, spoofed)
+        self.assertEqual(status, HTTPStatus.FORBIDDEN, body)
+        self.assertEqual(body.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
+        self.assertIn("reviewer@company.com", body.get("error", ""))
 
 
 if __name__ == "__main__":

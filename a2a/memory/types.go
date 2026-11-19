@@ -225,10 +225,9 @@ type RecordMeta struct {
 
 // Record is a parsed OKF decision or lesson file.
 type Record struct {
-	Path    string     `json:"path"`
-	Meta    RecordMeta `json:"meta"`
-	Body    string     `json:"body"`
-	repoDir string
+	Path string     `json:"path"`
+	Meta RecordMeta `json:"meta"`
+	Body string     `json:"body"`
 }
 
 // BlueprintCounts summarizes record counts by status.
@@ -729,7 +728,6 @@ func LoadRecords(repoDir string) ([]Record, error) {
 			if err != nil {
 				continue
 			}
-			rec.repoDir = filepath.Clean(repoDir)
 			out = append(out, rec)
 		}
 	}
@@ -1267,7 +1265,6 @@ func SaveRecord(repoDir string, rec *Record) error {
 	if err := repoRoot.WriteFile(filepath.FromSlash(rec.Path), []byte(rendered), recordFilePerm); err != nil {
 		return err
 	}
-	rec.repoDir = filepath.Clean(repoDir)
 	for _, old := range existingRecords {
 		if old.Meta.ID == rec.Meta.ID && old.Path != "" && old.Path != rec.Path {
 			_ = repoRoot.Remove(filepath.FromSlash(old.Path))

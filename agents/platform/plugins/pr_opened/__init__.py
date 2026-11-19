@@ -96,8 +96,7 @@ logger = logging.getLogger(__name__)
 #: Scoped to knowledge-record proposals so ordinary workload PRs citing `per DEC-...` in
 #: their title never overwrite an active record's `evidence.pull_request`.
 KNOWLEDGE_PR_TITLE_RE = re.compile(
-    r"^\s*docs\([a-z0-9_-]*knowledge[a-z0-9_-]*\)\s*:\s*[^\r\n]*?"
-    r"\b((?:DEC|LES)-(?:\d{8}-\d{2,4}-[a-z0-9-]+|\d{4}-\d{3,5}))\b",
+    r"^\s*docs\([a-z0-9_-]*knowledge[a-z0-9_-]*\)\s*:.*?((?:DEC|LES)-\d{4}-\d{3,})\b",
     re.IGNORECASE,
 )
 DEFAULT_CURATOR_BIN = "/usr/local/bin/curator"
@@ -571,8 +570,7 @@ def _notify_curator_pr_opened(confirmed, repo=None, deadline=None):
         timeout_s = min(timeout_s, deadline - time.monotonic())
         if timeout_s <= CURATOR_MIN_BUDGET_SECONDS:
             return
-    prefix, _, rest = match.group(1).partition("-")
-    rec_id = f"{prefix.upper()}-{rest.lower()}" if rest else prefix.upper()
+    rec_id = match.group(1).upper()
     curator_bin = os.environ.get("CURATOR_BIN", "").strip()
     if not curator_bin:
         if os.path.isfile(DEFAULT_CURATOR_BIN) and os.access(DEFAULT_CURATOR_BIN, os.X_OK):

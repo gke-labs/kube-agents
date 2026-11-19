@@ -8236,7 +8236,8 @@ VCS_SCRATCH_DIR = "vcs"
 # its scratch directory (`--output`), from a bare clone.
 #
 # `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
-# against the policy base's merge-base before pushing.
+# against the policy base's merge-base before pushing. `log` is on it so `publish`
+# inspects incoming commit author and committer addresses before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
@@ -8246,6 +8247,7 @@ VCS_GIT_SUBCOMMANDS = frozenset(
         "diff-tree",
         "fetch",
         "init",
+        "log",
         "ls-remote",
         "ls-tree",
         "merge-base",
@@ -12921,6 +12923,11 @@ def build_vcs_broker(
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
         on_decision_memory_check=(
             metrics.record_decision_memory_check if metrics is not None else None
+        ),
+        allowed_commit_emails=lambda host, viewer_login: vcs_readings.install_commit_emails(
+            host,
+            viewer_login,
+            os.environ.get(vcs_readings.GITHUB_APP_ID_ENV, "").strip() or None,
         ),
     )
     LOGGER.info(

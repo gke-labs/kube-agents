@@ -1011,12 +1011,11 @@ class RealBoardTest(unittest.TestCase):
 class CuratorLinkTest(unittest.TestCase):
     """Best-effort Curator PR link notification on claimed OKF proposals."""
 
-    def test_links_short_and_dated_okf_ids_ignores_workload_prs_and_respects_deadline(self):
+    def test_links_short_okf_ids_ignores_dated_and_workload_prs_and_respects_deadline(self):
         for title, expected_id in (
             ("docs(knowledge): record DEC-2026-010 (Require ttl)", "DEC-2026-010"),
             ("docs(knowledge): record dec-2026-010 (Require ttl)", "DEC-2026-010"),
-            ("docs(knowledge): record LES-20260401-02-checkout-oom", "LES-20260401-02-checkout-oom"),
-            ("docs(knowledge): record les-20260401-02-Checkout-Oom", "LES-20260401-02-checkout-oom"),
+            ("docs(knowledge): record les-2026-0123 (checkout OOM)", "LES-2026-0123"),
         ):
             calls = []
             with mock.patch.dict(
@@ -1039,8 +1038,11 @@ class CuratorLinkTest(unittest.TestCase):
             self.assertIn("acme/infra", cmd)
             self.assertLessEqual(kw["timeout"], plugin.CURATOR_LINK_TIMEOUT_SECONDS)
 
-        # Ordinary workload PRs citing `per DEC-...` or containing `record ...` must NOT trigger `curator emit`.
-        for workload_title in (
+        # Dated IDs and ordinary workload PRs citing `per DEC-...` must NOT trigger `curator emit`.
+        for ignored_title in (
+            "docs(knowledge): record DEC-20260401-01-slug (Require ttl)",
+            "docs(knowledge): record LES-20260401-02-checkout-oom",
+            "docs(knowledge): record les-20260401-02-Checkout-Oom",
             "fix(checkout): set ttl-hours per DEC-2026-010",
             "fix(telemetry): record request latency per DEC-2026-004",
         ):
@@ -1052,7 +1054,7 @@ class CuratorLinkTest(unittest.TestCase):
                     {
                         "url": "https://github.com/acme/infra/pull/43",
                         "number": 43,
-                        "title": workload_title,
+                        "title": ignored_title,
                     },
                     repo="acme/infra",
                     deadline=plugin.time.monotonic() + 5.0,

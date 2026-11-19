@@ -354,17 +354,6 @@ func buildA2ACuratorNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	}
 }
 
-// a2aCuratorNetworkPolicyWithOperatorPeer returns buildA2ACuratorNetworkPolicy
-// with the operator metrics ingress rule appended on a2aCuratorStatusPort when
-// operatorNamespace is a valid DNS-1123 namespace label.
-func a2aCuratorNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string, operatorNamespace string) *networkingv1.NetworkPolicy {
-	np := buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs)
-	if rule, ok := operatorMetricsIngressRule(operatorNamespace, a2aCuratorStatusPort); ok {
-		np.Spec.Ingress = append(np.Spec.Ingress, rule)
-	}
-	return np
-}
-
 // reconcileA2ACurator applies the curator ServiceAccount and Deployment when
 // A2A_CURATOR is enabled, or removes them when the flag is off.
 func (r *PlatformAgentReconciler) reconcileA2ACurator(ctx context.Context, agent *agentv1alpha1.PlatformAgent, busHeld bool) error {
