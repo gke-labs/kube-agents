@@ -15,7 +15,7 @@
 # ci-deploy.sh created) plus a CRD delete, since the chart leaves CRDs behind
 # by Helm's own design, plus an unconditional label sweep of every
 # cluster-scoped and namespaced kind the chart or the operator can create
-# *with the part-of label*
+# *with either part-of label*
 # — because a run killed mid-install leaves objects with no Helm release record
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
 # project's next lease (#1006). Step 5 names the kinds the label cannot reach,
@@ -75,8 +75,9 @@ readonly CRD_DELETE_TIMEOUT="5m"
 # their finalizers with this patch, deletes them, and deletes the CRDs again.
 # The release skips the operator's own deletion cleanup, which Steps 4 to 6
 # sweep by label and name (the A2A callout ClusterRoleBinding under its own
-# label, below); it runs only after the timed-out delete gave a live operator
-# its chance. The columns read each CR's namespace and name;
+# label, below), bar the profile namespace's objects, which go with that
+# chart-owned namespace on the uninstall path; it runs only after the
+# timed-out delete gave a live operator its chance. The columns read each CR's namespace and name;
 # every chart CRD is Namespaced (tests/test_ci_teardown_release_record.py
 # pins it, so a cluster-scoped one fails there and not here).
 readonly CR_FINALIZERS_RELEASE_PATCH='{"metadata":{"finalizers":null}}'
@@ -109,8 +110,10 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 readonly NATS_CLAIM_NAME_RE='^persistentvolumeclaim/data-platform-agent-a2a-nats-[0-9]+$'
 # Step 4's second selector: the A2A stack's objects carry part-of=a2a-next
 # (a2aLabels in platformagent_a2a_manifests.go), not the part-of the first
-# sweep selects. Its namespaced objects go with the PlatformAgent through
-# owner GC and Step 6; the one cluster-scoped object the operator builds under
+# sweep selects. Its namespaced objects in the agent's namespace go with the
+# PlatformAgent through owner GC and Step 6, and the ones in the profile
+# namespace with that chart-owned namespace; the one cluster-scoped object
+# the operator builds under
 # that label, the auth callout's ClusterRoleBinding
 # (kubeagents:a2a-callout-tokenreview:<namespace>:<name>, a grant of
 # tokenreviews/create and subjectaccessreviews/create to a ServiceAccount name),
@@ -370,7 +373,7 @@ CRD_STEP_RESULT="deleted"
 # summary. A release is traced by its WARNING line and the step's result
 # text, not by the count: the CRDs are gone and the next lease installs, and
 # a ✗ would read as a teardown that left them. What the operator's own
-# deletion handler would have reaped, Step 4 sweeps.
+# deletion handler would have reaped, Steps 4 and 6 sweep.
 CRD_STEP_STATUS=0
 PROBE_ERROR_LOG="$(mktemp)"
 if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
@@ -484,7 +487,8 @@ sweep_kinds() { # <label> <namespace-or-""> <selector> <kind...>
 sweep_kinds "Cluster-scoped sweep" "" "${SWEEP_SELECTOR}" "${SWEEP_KINDS[@]}"
 # The same sweep under the A2A stack's label, for the callout
 # ClusterRoleBinding (A2A_SWEEP_SELECTOR above); its own step line, so the
-# first sweep's count still reads as the #1006 audit.
+# first sweep's count still reads as the #1006 audit, and its own clock.
+STEP_START=$SECONDS
 sweep_kinds "Cluster-scoped A2A sweep" "" "${A2A_SWEEP_SELECTOR}" "${A2A_SWEEP_KINDS[@]}"
 
 STEP_START=$SECONDS
@@ -495,7 +499,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Sweeping namespaced kube-ag
 # reaped by owner-reference GC, which stops resolving owners as soon as Step 3
 # removes the PlatformAgent CRD.
 #
-# Same selector as Step 4: every object the operator creates is stamped with
+# Same selector as Step 4's first sweep: every object the operator creates is stamped with
 # app.kubernetes.io/part-of=kube-agents — through applyManaged, or, on the two
 # paths that bypass it, through withCommonLabels on the PVC and commonLabels
 # handed to ReconcileServiceAccount. Helm's release records are Secrets
