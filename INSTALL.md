@@ -87,7 +87,7 @@ on freshly created clusters (no Terraform field exists) and the GitHub App priva
 one place; see
 [Shared defaults live in `installer_common.sh`](scripts/installer/README.md#shared-defaults-live-in-installer_commonsh).
 
-Four behaviours worth knowing before the first run:
+Five behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the release version (in release checkouts and bundles) or the checkout's `HEAD` commit SHA (on `main`)**, and must be a SemVer release tag or a full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so the scripts and the container image stay on one revision; pass `--allow-unverified-source` to override that while iterating on the installer itself. Do not install from a `main` checkout when targeting an official release: manifests and CRD schemas on `main` diverge from older releases, and `verify_local_source_ref` blocks mismatched revisions to prevent broken installations.
 - **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
@@ -121,6 +121,21 @@ Four behaviours worth knowing before the first run:
   names its own three (`TF_VAR_drift_pubsub_topic`, `_subscription`, `_sink`) or `lifecycle.sh`
   refuses its apply; see
   [the composition's README](terraform/examples/full-install/README.md).
+- **A real run changes the project of your active `gcloud` configuration.** `install.sh` runs
+  `gcloud config set project` for the target project and does not set it back, so every terminal
+  and process that uses that configuration points at the new project from then on. `--dry-run`
+  leaves it unchanged. To keep your default as it is, give the run a configuration of its own:
+
+  ```bash
+  gcloud config configurations create kube-agents-install --no-activate
+  gcloud config set account "$(gcloud config get-value account)" --configuration=kube-agents-install
+  CLOUDSDK_ACTIVE_CONFIG_NAME=kube-agents-install ./install.sh --gcp-project-id=<PROJECT_ID>
+  ```
+
+  `gcloud` reads `CLOUDSDK_ACTIVE_CONFIG_NAME` only in the process that has it, so the installer's
+  `gcloud` calls use and change `kube-agents-install`, and other terminals keep their project. Set
+  the same variable when you run `upgrade.sh`, `uninstall.sh` or your own `gcloud` commands for
+  this install, so that they use the same project.
 
 ### Generate-Only Mode (Recommended for Existing Infrastructure)
 
@@ -1556,7 +1571,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
   - On the gateway, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
-  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`; the gateway's manifest is on the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page.
+  - For the complete manifest and its event subscriptions, see the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page, or run `./scripts/installer/print_instructions_slack.sh`. The manifest there is short enough to paste into Slack's **Create New App → From a manifest** dialog.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). The A2A gateway answers an unlisted user once with a notice naming their member ID. An empty allowlist admits all members in the workspace. The A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list, unless the list names that member as `T…:U…` (their workspace ID, a colon, their member ID). See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace:** The A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens, Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or Slack is turned off. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
 
