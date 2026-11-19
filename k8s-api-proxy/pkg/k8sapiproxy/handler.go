@@ -304,13 +304,15 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	ev.ClusterID, ev.Path = clusterID, apiPath
 	// Before anything reads the request or a cached answer: an excluded cluster's API is
 	// never reached, whatever the request asks of it.
+	// On a discovery path the refusal is plain text (refuseScope), which kubectl's
+	// discovery client shows; it can't decode a Status there.
 	if perr := h.exclusions.check(clusterID); perr != nil {
-		refuse(w, ev, perr)
+		refuseScope(w, ev, perr, apiPath)
 		return
 	}
 	// A held cluster likewise: an operator paused the agents' access to it.
 	if perr := h.holds.check(clusterID); perr != nil {
-		refuse(w, ev, perr)
+		refuseScope(w, ev, perr, apiPath)
 		return
 	}
 
