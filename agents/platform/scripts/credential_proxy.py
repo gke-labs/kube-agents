@@ -2310,6 +2310,17 @@ DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE = "kubeagents-credential-proxy-scope"
 SCOPE_AUDIENCE_ENV = "CREDENTIAL_PROXY_SCOPE_AUDIENCE"
 SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
+# The A2A gateway's report reader (#5618): the relay reads one finished audit
+# report through the store routes, and nothing else. An audience of its own
+# rather than the a2a-chat one, which is projected only with Google Chat on and
+# reaches the Chat relay: this one renders on every install and reaches the
+# two store reads alone. Bound to its callers both ways, and conferred to
+# nobody when none are named, as the mcp audience is; unlike the mcp binding,
+# a named caller may also present the a2a-chat audience, since the same
+# gateway ServiceAccount holds both tokens.
+DEFAULT_CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE = "kubeagents-credential-proxy-a2a-reports"
+A2A_REPORTS_AUDIENCE_ENV = "CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE"
+A2A_REPORTS_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_REPORTS_CALLERS"
 DEFAULT_CREDENTIAL_PROXY_CURATOR_AUDIENCE = "kubeagents-credential-proxy-curator"
 CURATOR_AUDIENCE_ENV = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"
 CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
@@ -2362,6 +2373,9 @@ CALLER_ROLE_PROFILE = "profile"
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
+# The A2A gateway's report reader (#5618): GET one finished audit report
+# (latest, or one run) on the install's publish key, and no other route.
+CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # The OKF memory curator pod. Version-control snapshot route only, on a
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
@@ -2392,6 +2406,7 @@ CALLER_ROLES = (
     CALLER_ROLE_MCP,
     CALLER_ROLE_PROFILE,
     CALLER_ROLE_SCOPE,
+    CALLER_ROLE_A2A_REPORTS,
     CALLER_ROLE_CURATOR,
 )
 
@@ -2912,10 +2927,14 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # as it writes today's file store directly; a profile worker reads with a
     # profile on the reports allowlist and writes only the stream its builtin
     # schedule's trigger binds, to the publish key (report_read_permitted,
-    # report_write_permitted). No trailing slash: the stream list is the prefix
+    # report_write_permitted). The A2A gateway's report reader (#5618, the
+    # a2a-reports role) reads one finished report, latest or one run, on the
+    # publish key alone, which it names as REPORT_A2A_PUBLISH_KEY and the
+    # handler resolves, and writes nothing (report_a2a_reports_read_permitted);
+    # this is the one route it reaches. No trailing slash: the stream list is the prefix
     # itself, matched whole or with "/" after it (_route_matches), and the
     # handler answers 404 to anything REPORT_CREDENTIAL_ROUTES does not match.
-    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),
+    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_A2A_REPORTS)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -3149,7 +3168,7 @@ def report_credential_permits(method: str, path: str) -> bool:
 
 # -- Who may read and write the store (#5619) --------------------------------
 #
-# docs/designs/scheduling-on-profiles.md §1 item 4. Two roles reach these
+# docs/designs/scheduling-on-profiles.md §1 item 4. Three roles reach these
 # routes (ROUTE_ROLES), and each is decided here, default deny: a role this
 # does not name, a claim it cannot read, or a stand-in of the wrong type is
 # refused, never defaulted.
@@ -3157,7 +3176,9 @@ def report_credential_permits(method: str, path: str) -> bool:
 # Where the role comes from: ServiceAccountAuthenticator.authenticate reads it
 # off the one audience the TokenReview validated (``audience_roles``, built by
 # build_authenticator: the shell audience confers CALLER_ROLE_SHELL, the
-# profile audience CALLER_ROLE_PROFILE). A profile worker's ServiceAccount is
+# profile audience CALLER_ROLE_PROFILE, and A2A_REPORTS_AUDIENCE_ENV alone
+# CALLER_ROLE_A2A_REPORTS, never when it repeats another audience, and only to
+# a caller named in A2A_REPORTS_CALLERS_ENV). A profile worker's ServiceAccount is
 # a key of ``profile_identities``, and a caller named there may present only
 # the profile audience ("a profile caller may present only the profile
 # audience"), so no profile worker holds the shell role; and nothing a caller
@@ -3202,6 +3223,33 @@ RULE_REPORT_NO_TRIGGER = "audit-report.no-trigger"
 RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
 RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
 RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
+# The A2A gateway's report reader (#5618): a write, a route other than one
+# report, and a key segment other than REPORT_A2A_PUBLISH_KEY are each their
+# own refusal.
+RULE_REPORT_A2A_REPORTS_WRITE = "audit-report.a2a-reports-write"
+RULE_REPORT_A2A_REPORTS_ROUTE = "audit-report.a2a-reports-route"
+RULE_REPORT_A2A_REPORTS_KEY = "audit-report.a2a-reports-key"
+# The one key segment the A2A gateway's report reader sends: the gateway cannot
+# compute the install's publish key, so the broker resolves this word to it
+# (report_publish_store_key, or REPORT_NO_FORGE_STORE_KEY when that yields
+# none) before relaying. Only for the a2a-reports role: the shell and a profile
+# worker sending it get it as any other key. It never names a real stream: a
+# store key from report_store_key always holds an escaped `/` (%2F), and this
+# holds none.
+REPORT_A2A_PUBLISH_KEY = "publish"
+
+# What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
+# the stream list, one stream's latest, its run index, or one run.
+REPORT_ROUTE_LIST = "list"
+REPORT_ROUTE_LATEST = "latest"
+REPORT_ROUTE_RUNS = "runs"
+REPORT_ROUTE_RUN = "run"
+# The reads the A2A gateway's report reader makes: one finished report, never an index.
+REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN})
+# The segment counts of a split store path ("", "v1", "audit-reports", ...).
+_REPORT_LIST_SEGMENTS = 3
+_REPORT_STREAM_ROUTE_SEGMENTS = 6
+_REPORT_RUN_SEGMENTS = 7
 
 
 def report_store_key(repo: str) -> str | None:
@@ -3238,23 +3286,70 @@ def _report_profile_permitted(profile: Any, allowlist: frozenset[str]) -> bool:
     return isinstance(profile, str) and bool(profile) and profile in allowlist
 
 
-def report_read_permitted(role: Any, profile: Any, allowlist: frozenset[str]) -> str | None:
+def report_route_kind(path: str) -> str | None:
+    """Which store route ``path`` is (REPORT_ROUTE_*), or None for any other shape.
+
+    Only the shape: report_credential_permits has already matched the path
+    whole against REPORT_CREDENTIAL_ROUTES before anything asks this.
+    """
+    segments = path.split("/")
+    if len(segments) == _REPORT_LIST_SEGMENTS:
+        return REPORT_ROUTE_LIST
+    if len(segments) == _REPORT_STREAM_ROUTE_SEGMENTS and segments[5] == "latest":
+        return REPORT_ROUTE_LATEST
+    if len(segments) == _REPORT_STREAM_ROUTE_SEGMENTS and segments[5] == "runs":
+        return REPORT_ROUTE_RUNS
+    if len(segments) == _REPORT_RUN_SEGMENTS and segments[5] == "runs":
+        return REPORT_ROUTE_RUN
+    return None
+
+
+def report_a2a_reports_read_permitted(route: Any, key: Any) -> str | None:
+    """The rule an a2a-reports read breaks, or None when the reader may read (#5618).
+
+    The A2A gateway's report reader reads one finished report: ``route`` must be
+    REPORT_ROUTE_LATEST or REPORT_ROUTE_RUN, never the stream list or a run
+    index. ``key`` is the request's raw store-key segment, and must be
+    REPORT_A2A_PUBLISH_KEY, which the handler then resolves to the install's
+    publish key. Every real store key is refused, the publish key's own
+    spelling included, so the reader never names a repository. Any audit id is
+    read.
+    """
+    if route not in REPORT_A2A_READ_ROUTES:
+        return RULE_REPORT_A2A_REPORTS_ROUTE
+    if key != REPORT_A2A_PUBLISH_KEY:
+        return RULE_REPORT_A2A_REPORTS_KEY
+    return None
+
+
+def report_read_permitted(
+    role: Any,
+    profile: Any,
+    allowlist: frozenset[str],
+    route: Any = None,
+    key: Any = None,
+) -> str | None:
     """The rule a read of the store breaks, or None when the caller may read.
 
-    The shell reads every stream: it reads today's file store directly. A
-    profile caller reads with a task credential whose profile is in
-    ``allowlist`` (REPORT_PROFILES_ENV); ``profile`` is that credential's, None
-    when the caller presented none. Every other role is refused.
+    - The shell reads every stream: it reads today's file store directly.
+    - A profile caller reads with a task credential whose profile is in
+      ``allowlist`` (REPORT_PROFILES_ENV); ``profile`` is that credential's,
+      None when the caller presented none.
+    - The a2a-reports role reads what report_a2a_reports_read_permitted allows
+      of ``route`` and ``key``; left at their defaults, nothing.
+    - Every other role is refused.
     """
     if role == CALLER_ROLE_SHELL:
         return None
-    if role != CALLER_ROLE_PROFILE:
-        return RULE_REPORT_ROLE
-    if profile is None:
-        return RULE_REPORT_NO_TASK
-    if not _report_profile_permitted(profile, allowlist):
-        return RULE_REPORT_PROFILE
-    return None
+    if role == CALLER_ROLE_PROFILE:
+        if profile is None:
+            return RULE_REPORT_NO_TASK
+        if not _report_profile_permitted(profile, allowlist):
+            return RULE_REPORT_PROFILE
+        return None
+    if role == CALLER_ROLE_A2A_REPORTS:
+        return report_a2a_reports_read_permitted(route, key)
+    return RULE_REPORT_ROLE
 
 
 def report_write_permitted(
@@ -3282,8 +3377,11 @@ def report_write_permitted(
       ``allowlist``; a trigger of origin builtin, named ``schedule/<stream>``,
       whose stream is ``audit_id`` (so only that schedule's grant writes that
       audit's baseline); and the install's key.
+    - The a2a-reports role (the A2A gateway's report reader, #5618) writes nothing.
     - Every other role is refused.
     """
+    if role == CALLER_ROLE_A2A_REPORTS:
+        return RULE_REPORT_A2A_REPORTS_WRITE
     if role == CALLER_ROLE_SHELL:
         pass
     elif role != CALLER_ROLE_PROFILE:
@@ -5366,9 +5464,14 @@ class ServiceAccountAuthenticator:
 
     ``scope_callers`` binds the scope role exactly as ``mcp_callers`` binds
     the mcp role, empty set included.
+    ``a2a_reports_callers`` binds the a2a-reports role the same way, empty
+    meaning nobody, with one difference: a caller named there (the A2A
+    gateway) may present the a2a-chat audience as well, which its Google Chat
+    adapter holds, and no other.
     ``a2a_chat_callers`` binds the a2a-chat role as ``session_callers`` binds
     the session role, empty set included: a caller named there (the A2A
-    gateway) may present only the a2a-chat audience, and when the set is
+    gateway) may present only the a2a-chat audience, or the a2a-reports one
+    when ``a2a_reports_callers`` names it too, and when the set is
     non-empty the a2a-chat audience is refused to anyone not named. Empty
     leaves the audience alone deciding, as an older operator's rendering, which
     names no a2a-chat callers, still needs.
@@ -5397,6 +5500,7 @@ class ServiceAccountAuthenticator:
         scope_callers: frozenset[str] = frozenset(),
         curator_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
+        a2a_reports_callers: frozenset[str] = frozenset(),
         a2a_chat_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
@@ -5410,6 +5514,7 @@ class ServiceAccountAuthenticator:
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
         self.scope_callers = scope_callers
+        self.a2a_reports_callers = a2a_reports_callers
         self.curator_callers = curator_callers
         self.a2a_chat_callers = a2a_chat_callers
         self.profile_identities = dict(profile_identities or {})
@@ -5555,14 +5660,22 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a scope caller may present only the scope audience")
         if role == CALLER_ROLE_SCOPE and username not in self.scope_callers:
             raise AuthenticationError("the scope audience is only for scope callers")
+        # The a2a-reports binding, as the mcp one (empty names nobody), except
+        # that its caller holds the a2a-chat token too.
+        if username in self.a2a_reports_callers and role not in (CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_A2A_CHAT):
+            raise AuthenticationError("an a2a-reports caller may present only the a2a-reports or a2a-chat audience")
+        if role == CALLER_ROLE_A2A_REPORTS and username not in self.a2a_reports_callers:
+            raise AuthenticationError("the a2a-reports audience is only for a2a-reports callers")
         if username in self.curator_callers and role != CALLER_ROLE_CURATOR:
             raise AuthenticationError("a curator caller may present only the curator audience")
         if role == CALLER_ROLE_CURATOR and username not in self.curator_callers:
             raise AuthenticationError("the curator audience is only for curator callers")
         # The a2a-chat binding, as the session one: empty leaves the audience
         # deciding, for an operator that renders no a2a-chat callers.
-        if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:
-            raise AuthenticationError("the A2A gateway may present only the a2a-chat audience")
+        # The gateway also holds the a2a-reports token, which the a2a-reports
+        # binding above confines to its own callers.
+        if username in self.a2a_chat_callers and role not in (CALLER_ROLE_A2A_CHAT, CALLER_ROLE_A2A_REPORTS):
+            raise AuthenticationError("the A2A gateway may present only the a2a-chat or a2a-reports audience")
         if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:
             raise AuthenticationError("the a2a-chat audience is only for the A2A gateway")
         # The profile binding, as the mcp one: empty names nobody.
@@ -5785,6 +5898,15 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(SCOPE_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    # The A2A gateway's ServiceAccount, bound to the a2a-reports audience, read
+    # with the mcp meaning: unset confers the role to nobody. Read whether or
+    # not the audience is conferred here, so a broker that does not confer it
+    # (the exec tier) still holds the gateway to its own audiences.
+    a2a_reports_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(A2A_REPORTS_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     curator_callers = frozenset(
         caller.strip()
         for caller in os.getenv(CURATOR_CALLERS_ENV, "").split(",")
@@ -5867,6 +5989,25 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "CREDENTIAL_PROXY_MCP_AUDIENCE is set but CREDENTIAL_PROXY_MCP_CALLERS "
                     "is not; the mcp role is bound to the callers named there, so every "
                     "caller presenting the mcp audience is refused"
+                )
+        # The A2A gateway's report-reader audience, read raw and refused on a
+        # collision for the mcp audience's reasons.
+        a2a_reports_audience = os.getenv(A2A_REPORTS_AUDIENCE_ENV, "").strip()
+        if a2a_reports_audience and a2a_reports_audience in audience_roles:
+            LOGGER.warning(
+                "%s equals the %s audience; the a2a-reports role needs an audience of its own, "
+                "so it is not conferred",
+                A2A_REPORTS_AUDIENCE_ENV,
+                audience_roles[a2a_reports_audience] or CALLER_ROLE_SHELL,
+            )
+        elif a2a_reports_audience:
+            audience_roles[a2a_reports_audience] = CALLER_ROLE_A2A_REPORTS
+            if not a2a_reports_callers:
+                LOGGER.warning(
+                    "%s is set but %s is not; the a2a-reports role is bound to the callers named "
+                    "there, so every caller presenting the a2a-reports audience is refused",
+                    A2A_REPORTS_AUDIENCE_ENV,
+                    A2A_REPORTS_CALLERS_ENV,
                 )
         # The scope publisher's audience, read raw and refused on a collision
         # for the mcp audience's reasons.
@@ -5951,6 +6092,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the session role only exists once the chat audience split does, "
                 "so the session audience is ignored"
             )
+        if os.getenv(A2A_REPORTS_AUDIENCE_ENV, "").strip():
+            LOGGER.warning(
+                "%s is set but CREDENTIAL_PROXY_CHAT_AUDIENCE is not; the a2a-reports role only "
+                "exists once the chat audience split does, so the a2a-reports audience is ignored",
+                A2A_REPORTS_AUDIENCE_ENV,
+            )
         if os.getenv("CREDENTIAL_PROXY_MCP_AUDIENCE", "").strip():
             LOGGER.warning(
                 "CREDENTIAL_PROXY_MCP_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
@@ -5975,6 +6122,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         session_callers=session_callers,
         mcp_callers=mcp_callers,
         scope_callers=scope_callers,
+        a2a_reports_callers=a2a_reports_callers,
         curator_callers=curator_callers,
         a2a_chat_callers=a2a_chat_callers,
         profile_identities=profile_identities,
@@ -14876,7 +15024,29 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 registered,
             )
         else:
-            rule = report_read_permitted(role, profile, self.report_profiles)
+            route = report_route_kind(path)
+            key = segments[REPORT_STORE_KEY_SEGMENT] if len(segments) > REPORT_STORE_KEY_SEGMENT else None
+            rule = report_read_permitted(role, profile, self.report_profiles, route, key)
+            # The a2a-reports reader's REPORT_A2A_PUBLISH_KEY becomes the
+            # install's publish key here, once the read is permitted, so a
+            # refused read costs no ConfigMap read. No other role's key is
+            # resolved: the shell's or a profile's `publish` goes upstream as sent.
+            if rule is None and role == CALLER_ROLE_A2A_REPORTS:
+                try:
+                    publish = report_publish_store_key()
+                except ReportStoreUnavailable as exc:
+                    LOGGER.warning("audit-report a2a-reports read refused: %s", exc)
+                    self._log_audit_report(HTTPStatus.SERVICE_UNAVAILABLE, "gitops-repo-unavailable")
+                    self._refuse_audit_report(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {
+                            "error": "the install's repositories could not be read, so no read is checked",
+                            "code": "GITOPS_REPO_UNAVAILABLE",
+                        },
+                    )
+                    return
+                segments[REPORT_STORE_KEY_SEGMENT] = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY
+                path = "/".join(segments)
         if rule is not None:
             self._log_audit_report(HTTPStatus.FORBIDDEN, rule)
             self._refuse_audit_report(

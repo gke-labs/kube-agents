@@ -4992,6 +4992,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
 	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
 	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
+	// The A2A gateway's report-reader audience and its binding, on every
+	// install (a2a_report_reader.go).
+	envVars = append(envVars, a2aReportsBrokerEnv(agent)...)
 	envVars = append(envVars, a2aCuratorBrokerEnv(agent)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
@@ -5182,6 +5185,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// the a2a-chat role. Rendered only while Chat is armed, so reserved
 		// by name.
 		credentialProxyA2AChatCallersEnvVar,
+		// The report reader's audience, callers and the gateway's pair
+		// (a2a_report_reader.go, a2aReportsEnvNames).
+		credentialProxyA2AReportsAudienceEnvVar,
+		credentialProxyA2AReportsCallersEnvVar,
+		a2aReportStoreURLEnvVar,
+		a2aReportStoreTokenFileEnvVar,
 		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
 		// shell's audience would hand the session the shell's role.
 		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
