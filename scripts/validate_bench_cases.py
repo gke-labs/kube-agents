@@ -654,6 +654,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # session daemon folded into its newest incident. The count is the
     # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
     "workload_incident_folded": ("min_folded",),
+    "post_merge_outcome": ("outcome",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
@@ -1350,9 +1351,10 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
     singular and `fixtures:` accept."""
     if not isinstance(node, dict):
         return
-    role = node.get("fixture_role")
-    if isinstance(role, str):
-        found.add(role)
+    for key in ("fixture_role", "apply_fixture_role"):
+        role = node.get(key)
+        if isinstance(role, str):
+            found.add(role)
     roles = node.get("fixture_roles")
     if isinstance(roles, list):
         for role in roles:
@@ -1365,12 +1367,13 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
 
 
 def _singular_fixture_roles(node: Any, found: set[str]) -> None:
-    """Every singular `fixture_role:` in one check subtree."""
+    """Every singular `fixture_role:` (and post_merge_outcome's `apply_fixture_role:`) in one check subtree."""
     if not isinstance(node, dict):
         return
-    role = node.get("fixture_role")
-    if isinstance(role, str):
-        found.add(role)
+    for key in ("fixture_role", "apply_fixture_role"):
+        role = node.get(key)
+        if isinstance(role, str):
+            found.add(role)
     for child in node.get("checks") or []:
         _singular_fixture_roles(child, found)
 
