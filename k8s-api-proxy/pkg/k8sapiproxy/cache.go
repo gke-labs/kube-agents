@@ -385,14 +385,21 @@ type responseCache struct {
 
 	flightMu sync.Mutex
 	flights  map[string]*inflightCall
-	// epoch counts invalidations. A flight started before one may carry
-	// pre-write state, so a later request does not join it and its result
-	// is not stored.
+	// epoch counts invalidations that reach every partition (a write). A flight started
+	// before one may carry pre-write state, so a later request does not join it and its
+	// result is not stored. A flight compares epochFor its partition, which also counts the
+	// invalidations of its partition alone (a 401 or 403).
 	epoch atomic.Uint64
+	// partitionEpochs counts, per partition, invalidations that reached that partition
+	// alone: an auth failure says the caller's own access changed, not the data.
+	partitionEpochMu sync.Mutex
+	partitionEpochs  map[string]uint64
 
 	scopeMu   sync.Mutex
 	scopeKeys map[string]map[string]time.Time
 	keyScope  map[string]string
+	// keyPartition is the partition each indexed key was stored for.
+	keyPartition map[string]string
 	// staleKeys holds keys whose eviction the store refused. A read treats them as a miss
 	// until a later store or delete of the key succeeds.
 	staleKeys map[string]struct{}
@@ -441,6 +448,8 @@ func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
 		flights:             make(map[string]*inflightCall),
 		scopeKeys:           make(map[string]map[string]time.Time),
 		keyScope:            make(map[string]string),
+		keyPartition:        make(map[string]string),
+		partitionEpochs:     make(map[string]uint64),
 		staleKeys:           make(map[string]struct{}),
 	}
 	if mem, ok := store.(*MemoryCacheStore); ok {
@@ -507,7 +516,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	if !cacheable {
 		resp, err := next(req)
 		if err == nil && resp != nil && info != nil && info.IsResourceRequest && isAuthFailureStatus(resp.StatusCode) {
-			c.invalidateResourceScope(req.Context(), clusterID, info)
+			c.invalidatePartitionScope(req.Context(), clusterID, info)
 		}
 		return resp, err
 	}
@@ -523,7 +532,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		resp, err := next(req)
 		if err == nil && resp != nil {
 			if info != nil && info.IsResourceRequest && isAuthFailureStatus(resp.StatusCode) {
-				c.invalidateResourceScope(req.Context(), clusterID, info)
+				c.invalidatePartitionScope(req.Context(), clusterID, info)
 			}
 			resp.Header.Set(headerCacheStatus, cacheStatusBypass)
 		}
@@ -614,7 +623,7 @@ func (c *responseCache) acquireFlight(
 	next func(*http.Request) (*http.Response, error),
 ) *inflightCall {
 	c.flightMu.Lock()
-	epoch := c.epoch.Load()
+	epoch := c.epochFor(requestPartition(req))
 	if call, ok := c.flights[key]; ok && call.epoch == epoch {
 		call.waiters++
 		call.shared = true
@@ -720,7 +729,7 @@ func (c *responseCache) fetchAndPopulate(
 		return nil, err
 	}
 	if info != nil && info.IsResourceRequest && isAuthFailureStatus(resp.StatusCode) {
-		c.invalidateResourceScope(req.Context(), clusterID, info)
+		c.invalidatePartitionScope(req.Context(), clusterID, info)
 	}
 
 	if resp.ContentLength > c.maxEntryBytes {
@@ -780,7 +789,8 @@ func (c *responseCache) fetchAndPopulate(
 	}
 
 	cleanHeaders := sanitizeCachedHeaders(resp.Header)
-	if storeTTL > 0 && freshTTL > 0 && c.epoch.Load() == epoch {
+	partition := requestPartition(req)
+	if storeTTL > 0 && freshTTL > 0 && c.epochFor(partition) == epoch {
 		now := c.now()
 		encoded, err := encodeCachedResponse(cachedResponseMeta{
 			StatusCode: resp.StatusCode,
@@ -796,11 +806,11 @@ func (c *responseCache) fetchAndPopulate(
 					c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
 				}
 				if info != nil && info.IsResourceRequest {
-					c.recordScopeKey(clusterID, info, key, now, storeTTL)
+					c.recordScopeKey(clusterID, partition, info, key, now, storeTTL)
 				}
 				// A write that bumped the epoch after the check above may have collected the
 				// scope before this key joined it.
-				if c.epoch.Load() != epoch {
+				if c.epochFor(partition) != epoch {
 					c.evictKey(req.Context(), key)
 				}
 			}
@@ -900,7 +910,7 @@ func resourceScopeID(clusterID, group, resource, namespace string) string {
 	return clusterID + "|" + group + "|" + resource + "|" + namespace
 }
 
-func (c *responseCache) recordScopeKey(clusterID string, info *request.RequestInfo, key string, now time.Time, ttl time.Duration) {
+func (c *responseCache) recordScopeKey(clusterID, partition string, info *request.RequestInfo, key string, now time.Time, ttl time.Duration) {
 	c.scopeMu.Lock()
 	defer c.scopeMu.Unlock()
 
@@ -921,6 +931,7 @@ func (c *responseCache) recordScopeKey(clusterID string, info *request.RequestIn
 	}
 	keys[key] = now.Add(ttl)
 	c.keyScope[key] = nsScope
+	c.keyPartition[key] = partition
 }
 
 func (c *responseCache) removeScopeKey(key string) {
@@ -932,6 +943,7 @@ func (c *responseCache) removeScopeKey(key string) {
 		return
 	}
 	delete(c.keyScope, key)
+	delete(c.keyPartition, key)
 	if keys, exists := c.scopeKeys[scope]; exists {
 		delete(keys, key)
 		if len(keys) == 0 {
@@ -961,6 +973,7 @@ func (c *responseCache) setStale(key string, stale bool) {
 type indexedKey struct {
 	key       string
 	scope     string
+	partition string
 	expiresAt time.Time
 }
 
@@ -980,6 +993,7 @@ func (c *responseCache) restoreScopeKey(k indexedKey) {
 	}
 	keys[k.key] = k.expiresAt
 	c.keyScope[k.key] = k.scope
+	c.keyPartition[k.key] = k.partition
 }
 
 func (c *responseCache) pruneExpiredScopeKeysLocked(now time.Time) {
@@ -988,6 +1002,7 @@ func (c *responseCache) pruneExpiredScopeKeysLocked(now time.Time) {
 			if !now.Before(exp) {
 				delete(keys, k)
 				delete(c.keyScope, k)
+				delete(c.keyPartition, k)
 			}
 		}
 		if len(keys) == 0 {
@@ -996,8 +1011,42 @@ func (c *responseCache) pruneExpiredScopeKeysLocked(now time.Time) {
 	}
 }
 
+// invalidateResourceScope evicts the resource scope's entries in every partition: a write
+// changed the data every caller reads.
 func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID string, info *request.RequestInfo) {
 	c.epoch.Add(1)
+	c.evictScope(ctx, clusterID, info, func(string) bool { return true })
+}
+
+// invalidatePartitionScope evicts the resource scope's entries in the request's partition
+// only: a 401 or 403 says that caller's access changed, and other partitions' credentials
+// are unaffected. Without a CallerPartition every caller is in one partition, so this is
+// the whole scope, as before partitions existed.
+func (c *responseCache) invalidatePartitionScope(ctx context.Context, clusterID string, info *request.RequestInfo) {
+	partition, _ := PartitionFromContext(ctx)
+	c.partitionEpochMu.Lock()
+	c.partitionEpochs[partition]++
+	c.partitionEpochMu.Unlock()
+	c.evictScope(ctx, clusterID, info, func(p string) bool { return p == partition })
+}
+
+// epochFor is the invalidation count a flight in partition compares: every invalidation
+// that reached all partitions, plus those that reached this one alone. Both only grow, so
+// the sum changes whenever either does.
+func (c *responseCache) epochFor(partition string) uint64 {
+	c.partitionEpochMu.Lock()
+	defer c.partitionEpochMu.Unlock()
+	return c.epoch.Load() + c.partitionEpochs[partition]
+}
+
+// requestPartition is the CallerPartition value the request carries, "" without one.
+func requestPartition(req *http.Request) string {
+	partition, _ := PartitionFromContext(req.Context())
+	return partition
+}
+
+// evictScope evicts the scope's indexed entries whose partition match accepts.
+func (c *responseCache) evictScope(ctx context.Context, clusterID string, info *request.RequestInfo, match func(partition string) bool) {
 	// A caller that disconnects must not leave a deleted-from-index entry in the store.
 	ctx = context.WithoutCancel(ctx)
 	now := c.now()
@@ -1007,10 +1056,18 @@ func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID s
 	collect := func(scope string) {
 		if keys, ok := c.scopeKeys[scope]; ok {
 			for k, exp := range keys {
-				toDelete = append(toDelete, indexedKey{key: k, scope: scope, expiresAt: exp})
+				partition := c.keyPartition[k]
+				if !match(partition) {
+					continue
+				}
+				toDelete = append(toDelete, indexedKey{key: k, scope: scope, partition: partition, expiresAt: exp})
+				delete(keys, k)
 				delete(c.keyScope, k)
+				delete(c.keyPartition, k)
 			}
-			delete(c.scopeKeys, scope)
+			if len(keys) == 0 {
+				delete(c.scopeKeys, scope)
+			}
 		}
 	}
 

@@ -246,3 +246,128 @@ func TestBuildCacheKeyKeepsPartitionsApart(t *testing.T) {
 		seen[key] = name
 	}
 }
+
+// forbiddingUpstream answers 403 for the partitions in forbid and an echo of the partition
+// otherwise, counting calls per partition.
+type forbiddingUpstream struct {
+	mu     sync.Mutex
+	forbid map[string]bool
+	calls  map[string]int
+}
+
+func (u *forbiddingUpstream) RoundTripCluster(_ context.Context, _ string, req *http.Request) (*http.Response, error) {
+	partition, _ := PartitionFromContext(req.Context())
+	u.mu.Lock()
+	u.calls[partition]++
+	forbidden := u.forbid[partition]
+	u.mu.Unlock()
+	status, body := http.StatusOK, `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"`+partition+`"},"items":[]}`
+	if forbidden {
+		status, body = http.StatusForbidden, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":403}`
+	}
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}, nil
+}
+
+func (u *forbiddingUpstream) set(partition string, forbidden bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.forbid[partition] = forbidden
+}
+
+func (u *forbiddingUpstream) count(partition string) int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls[partition]
+}
+
+// A 403 in one partition evicts that partition's entries only: another tenant's
+// credential, and so its cached responses, are unaffected.
+func TestHandlerAuthFailureInvalidatesItsOwnPartitionOnly(t *testing.T) {
+	upstream := &forbiddingUpstream{forbid: map[string]bool{}, calls: map[string]int{}}
+	h, _ := newTestHandler(t, Config{
+		Authenticator:   tenantAuthenticator{},
+		Upstream:        upstream,
+		Cache:           &CacheConfig{DefaultResourceTTL: testPartitionTTL},
+		CallerPartition: partitionByTenant,
+	})
+	serve(h, tenantRequest("a"))
+	serve(h, tenantRequest("b"))
+
+	upstream.set("a", true)
+	if rec := serve(h, tenantRequest("a")); rec.Code == http.StatusOK && rec.Header().Get(headerCacheStatus) == cacheStatusHit {
+		// Still fresh for a: force a's 403 through a bypass so it reaches the upstream.
+		req := tenantRequest("a")
+		req.Header.Set("Cache-Control", "no-cache")
+		if rec := serve(h, req); rec.Code != http.StatusForbidden {
+			t.Fatalf("tenant a after losing access: code %d, want 403", rec.Code)
+		}
+	}
+
+	rec := serve(h, tenantRequest("b"))
+	if got := rec.Header().Get(headerCacheStatus); got != cacheStatusHit {
+		t.Errorf("tenant b after tenant a's 403: Cache-Status %q, want %q", got, cacheStatusHit)
+	}
+	if got := upstream.count("b"); got != 1 {
+		t.Errorf("tenant b upstream calls = %d, want 1", got)
+	}
+
+	upstream.set("a", false)
+	beforeA := upstream.count("a")
+	if rec := serve(h, tenantRequest("a")); rec.Header().Get(headerCacheStatus) == cacheStatusHit {
+		t.Errorf("tenant a after its own 403: served from cache, want a fresh fetch")
+	}
+	if got := upstream.count("a"); got != beforeA+1 {
+		t.Errorf("tenant a upstream calls after its 403 = %d, want %d", got, beforeA+1)
+	}
+}
+
+// A write evicts the scope in every partition: the data changed for every caller.
+func TestHandlerWriteInvalidatesEveryPartition(t *testing.T) {
+	upstream := &forbiddingUpstream{forbid: map[string]bool{}, calls: map[string]int{}}
+	h, _ := newTestHandler(t, Config{
+		Authenticator:   tenantAuthenticator{},
+		Upstream:        upstream,
+		Policy:          Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Cache:           &CacheConfig{DefaultResourceTTL: testPartitionTTL},
+		CallerPartition: partitionByTenant,
+	})
+	serve(h, tenantRequest("a"))
+	serve(h, tenantRequest("b"))
+
+	patch := newClusterRequest(http.MethodPatch, testPodsPath+"/web-0", strings.NewReader(`{}`))
+	patch.Header.Set(testTenantHeader, "a")
+	patch.Header.Set(headerContentType, "application/merge-patch+json")
+	serve(h, patch)
+
+	if got := serve(h, tenantRequest("b")).Header().Get(headerCacheStatus); got == cacheStatusHit {
+		t.Errorf("tenant b after tenant a's write: served from cache, want a fresh fetch")
+	}
+}
+
+// Without CallerPartition every caller is in one partition, so a 403 evicts the scope for
+// all of them, as it did before partitions existed.
+func TestHandlerAuthFailureWithoutPartitionsInvalidatesEveryone(t *testing.T) {
+	upstream := &forbiddingUpstream{forbid: map[string]bool{}, calls: map[string]int{}}
+	h, _ := newTestHandler(t, Config{
+		Authenticator: tenantAuthenticator{},
+		Upstream:      upstream,
+		Cache:         &CacheConfig{DefaultResourceTTL: testPartitionTTL},
+	})
+	serve(h, tenantRequest("a"))
+
+	upstream.set("", true)
+	req := tenantRequest("b")
+	req.Header.Set("Cache-Control", "no-cache")
+	if rec := serve(h, req); rec.Code != http.StatusForbidden {
+		t.Fatalf("code %d, want 403", rec.Code)
+	}
+	upstream.set("", false)
+	if got := serve(h, tenantRequest("a")).Header().Get(headerCacheStatus); got == cacheStatusHit {
+		t.Errorf("after a 403 with no partitions: served from cache, want a fresh fetch")
+	}
+}
