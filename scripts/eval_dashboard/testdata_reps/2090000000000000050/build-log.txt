@@ -1,0 +1,24 @@
+✓ Successfully leased project: kube-agents-evals-4
+>>> [2025-09-01T17:05:25Z] Running Task: case-02 (./tasks/case-02/task.yaml) x3 <<<
+--- [2025-09-01T17:05:25Z] case-02 repetition 1/3
+--- [2025-09-01T17:08:04Z] case-02 repetition 2/3
+--- [2025-09-01T17:11:16Z] case-02 repetition 3/3
+Task case-02 Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.55 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-01T17:15:16Z] Running Task: case-16 (./tasks/case-16/task.yaml) x3 <<<
+--- [2025-09-01T17:15:16Z] case-16 repetition 1/3
+--- [2025-09-01T17:19:22Z] case-16 repetition 2/3
+--- [2025-09-01T17:21:59Z] case-16 repetition 3/3
+Task case-16 Result: [UNSTABLE] passed 1 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-2: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-3: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.0 (floor 1.0) -- check-1: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-2: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it; check-3: the ledger the report names was written by an earlier run, so this run published nothing and the check cannot credit it [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.85 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2025-09-01T17:25:05Z] Running Task: case-29 (./tasks/case-29/task.yaml) x3 <<<
+--- [2025-09-01T17:25:05Z] case-29 repetition 1/3
+--- [2025-09-01T17:27:29Z] case-29 repetition 2/3

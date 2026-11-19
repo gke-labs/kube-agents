@@ -1512,7 +1512,8 @@ parse_args() {
 
 write_report() {
   local status="$1"
-  local report_file="/tmp/kube-agents-upgrade-report.json"
+  # KUBE_AGENTS_UPGRADE_REPORT_FILE is for tests.
+  local report_file="${KUBE_AGENTS_UPGRADE_REPORT_FILE:-/tmp/kube-agents-upgrade-report.json}"
   cat << EOF > "$report_file"
 {
   "status": "$(json_escape "$status")",
@@ -2109,6 +2110,7 @@ main() {
   # deliberately does not opt in.
   NAMESPACE="$target_namespace" \
     KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+    KUBE_AGENTS_REQUIRE_SECRET_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"
 
   if [ "$PARAM_PLAN" = "true" ]; then

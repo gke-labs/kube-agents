@@ -30,11 +30,22 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 _ADAPTER = (
     pathlib.Path(__file__).resolve().parents[1]
     / "files" / "platforms" / "pubsub" / "adapter.py"
 )
+# The name the adapter is loaded under, which is also the name of its logger.
+ADAPTER_MODULE_NAME = "pubsub_adapter"
+# What a load leaves in the process: the adapter sets this variable when it is imported, and
+# the load puts the stubs and the adapter into sys.modules.
+_HOME_CHANNEL_VAR = "PUBSUB_HOME_CHANNEL"
+_LOADED_MODULES = (
+    "gateway", "gateway.platforms", "gateway.platforms.base", "gateway.config", "gateway.session",
+    ADAPTER_MODULE_NAME,
+)
+_MISSING = object()
 
 
 def _load_adapter_module():
@@ -62,14 +73,55 @@ def _load_adapter_module():
     cfg.PlatformConfig = _Stub
     sys.modules["gateway.session"].build_session_key = lambda *a, **k: "session-key"
 
-    spec = importlib.util.spec_from_file_location("pubsub_adapter", _ADAPTER)
+    spec = importlib.util.spec_from_file_location(ADAPTER_MODULE_NAME, _ADAPTER)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["pubsub_adapter"] = module
+    sys.modules[ADAPTER_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
 
-adapter_mod = _load_adapter_module()
+def load_adapter_for_a_test_file():
+    """The adapter, and a function that puts back what the load changed in the process.
+
+    A test file calls this in its `setUpModule` and the function in its `tearDownModule`, so the
+    next test file in the process meets neither the variable nor the stubs.
+    """
+    variable = os.environ.get(_HOME_CHANNEL_VAR, _MISSING)
+    modules = {name: sys.modules.get(name, _MISSING) for name in _LOADED_MODULES}
+
+    def put_back():
+        if variable is _MISSING:
+            os.environ.pop(_HOME_CHANNEL_VAR, None)
+        else:
+            os.environ[_HOME_CHANNEL_VAR] = variable
+        for name, before in modules.items():
+            if before is _MISSING:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = before
+
+    try:
+        module = _load_adapter_module()
+    except BaseException:
+        # A load that stops half way has set the variable and the stubs already,
+        # and no tearDownModule runs after a setUpModule that raised.
+        put_back()
+        raise
+    return module, put_back
+
+
+adapter_mod = None
+_put_back = None
+
+
+def setUpModule():
+    global adapter_mod, _put_back
+    adapter_mod, _put_back = load_adapter_for_a_test_file()
+
+
+def tearDownModule():
+    _put_back()
+
 
 ROUTE = "gke_stockout_alerts"
 NS = "jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0"
@@ -163,8 +215,12 @@ class AdapterTestCase(unittest.TestCase):
 
         logging.disable(logging.CRITICAL)
         self.addCleanup(logging.disable, logging.NOTSET)
+        # The tests start with the switch not set, and two of them set it. The patch puts back
+        # the value that the process had before the test, or the absence of one.
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
         os.environ.pop("DISABLE_PUBSUB_DEDUP", None)
-        self.addCleanup(os.environ.pop, "DISABLE_PUBSUB_DEDUP", None)
 
     def is_duplicate(self, payload, config=None):
         return self.adapter._is_duplicate(payload, config or dict(ROUTE_CONFIG), ROUTE)

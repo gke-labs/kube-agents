@@ -66,8 +66,10 @@
 # error about the environment, not a failure blamed on the agent.
 #
 # A project-scoped role (`cluster_slot: null` in the catalog) is a Compute
-# Engine object that no cluster carries: a VM, a firewall rule. Its probes are
-# `<kind>/<name-prefix>*`, read with `gcloud compute ... list` in the project.
+# Engine object that no cluster carries: a VM, a firewall rule, a VPC network,
+# a Persistent Disk snapshot. Its probes are `<kind>/<name-prefix>*` (`instance`,
+# `firewall`, `network` or `snapshot`), read with `gcloud compute ... list` in
+# the project.
 # It has no kubeconfig, so the role is published as "<role>.confirmed" alone,
 # with the same warnings and the same counts as a cluster role.
 #
@@ -155,7 +157,7 @@ NAME = re.compile(r'[a-z0-9]+(-[a-z0-9]+)*')
 # metacharacter into that command line.
 PROBE = re.compile(r'[a-z][a-z0-9.]*(/[a-z0-9][a-z0-9.-]*|\?[A-Za-z0-9][A-Za-z0-9._/=,-]*)')
 # A project-scoped role's probe: a Compute Engine kind and a name prefix.
-PROJECT_PROBE = re.compile(r'(instance|firewall)/[a-z0-9][a-z0-9-]*\*')
+PROJECT_PROBE = re.compile(r'(instance|firewall|network|snapshot)/[a-z0-9][a-z0-9-]*\*')
 with open(sys.argv[1]) as fh:
     catalog = json.load(fh)
 roles = catalog.get('roles') or {}
@@ -270,6 +272,8 @@ _fleet_project_probe_present() {
   case "$kind" in
     instance) collection="instances" ;;
     firewall) collection="firewall-rules" ;;
+    network) collection="networks" ;;
+    snapshot) collection="snapshots" ;;
     *)
       _FLEET_PROBE_ERR="unknown project probe kind ${kind}"
       return 2

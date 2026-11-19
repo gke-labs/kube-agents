@@ -283,6 +283,16 @@ publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so
 a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
 is #4173.
 
+**Re-creating a durable.** The operator re-creates a profile durable only when it is really
+gone. A re-created durable starts from the stream's first message with a fresh ack floor, and a
+new stream leader can answer "not found" before a durable's assignment reaches it, as after a
+replica change. So a durable whose tier is in the profile's `status.durableTiers` (written only
+by a pass whose durable sync succeeded, and kept through passes the bus refuses) is re-created
+only if it is still missing a pass later (`durableRecreateDelay`, 30s), with the card reading
+`DurableRecheck` meanwhile. A new profile, or a tier new to it, gets its durables at once.
+`lib.EnsureHeldConsumer` offers the refusal as a primitive (`HeldConsumerConfig.Existed`) and
+leaves the timing to its caller (#6283).
+
 ### Admission and holding
 
 **The dispatcher is the only fetcher and holder** (decided 2026-10-22), on both execution
@@ -337,7 +347,8 @@ leave open:
 - **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
   `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
   dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
-  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  concurrency, queue timeout and deadline (the dispatcher derives each profile's durables from
+  its tiers and draining tiers, and the config is written compact; #5479), and four intervals: `leaseSeconds`
   (default 90), `renewSeconds` (20; a lease is at least three renewals),
   `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
   offers. A task already handed out keeps the intervals its offer carried.
@@ -365,10 +376,27 @@ leave open:
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
   admission, and a task that names no cluster gets none. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
-  found equal to the grant's at admission (added 11/11, #4685). The broker also accepts a
+  found equal to the grant's at admission (added 11/11, #4685). A `script` must also be one
+  the profile allowlists in `spec.scripts`, which the operator renders into the dispatch config with
+  each script's path and timeout. A script-run task's path comes from that render, never from the
+  task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
+  worker image. The CRD and the dispatcher's config check both hold paths to it, and
+  `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
+  group- or world-writable (#5622). The broker also accepts a
   `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
   credential, which reaches only the audit-report routes and is refused on every other route,
-  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. Both name the task, its profile and
+  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod, at
+  whatever tier it was admitted at and of either kind (a confirmed chain's children and wakes
+  inherit the flag, so each of them runs on a Job too): one whose tier has no Job runner is
+  refused at admission (`change-needs-job`), and the permit is minted only for a task on a Job
+  (#5646). Under Job mode every profile has a Job template at each of its live tiers for
+  this, so the refusal is what an install without Job mode, or a profile without a
+  template, gets. Otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
@@ -456,7 +484,9 @@ leave open:
   Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
-  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both; contract
+  addendum 6, #5301), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
@@ -464,7 +494,9 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid`, `queue-timeout`, and for a child of an AgentProfile task
+  `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`, `parameters-invalid`,
+  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, #5622),
+  and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`
@@ -490,7 +522,10 @@ leave open:
   grace is never shorter than a renewal and two ticks, so one silent since before the stop is
   always past the count's threshold when it ends). The
   state is in memory, and the dispatcher's health lists open and half-open breakers. A held
-  task isn't told it is held yet (#4362).
+  task isn't told it is held yet (#4362). The breaker guards the tier's runner: at an
+  unattended tier that is Job mode, and at any other tier the warm pool. A permit-carrying
+  task's own Job at a pool's tier (#5646) stays clear of that breaker: it doesn't wait on it,
+  is never its probe, and its finish or lost worker neither opens nor closes it.
 - **Job mode (#3655 PR 6b).** With a Job runner, an unattended task runs on a Job of its own:
   the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
   Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm
@@ -498,12 +533,35 @@ leave open:
   it serves that one task and exits. A Job that never comes up, fails or doesn't take the task
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
-  re-adopts the task.
-  The dispatch config doesn't carry the Job's pod template. It names the profile's own
-  `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
-  Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
-  object when it launches the Job, with `get` alone on those objects, and uses it only while
-  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
+  re-adopts the task; the lease record says the task ran on a Job (`onJob`), so the Job of a
+  task re-adopted at any tier goes when it ends. A Job's name is a hash of the task's whole
+  key, its kind included, and a Job pod already holding a task is never offered another.
+  A read-tier task with no permit stays on the warm pool, and a Job an earlier pass launched
+  for it, while its submission (replaced under the same subject) still carried a permit,
+  goes first. Isolating the credential this way leaves the task's bus traffic where it was:
+  the Job's pod shares the bus with every other worker (#3889).
+  The dispatch config doesn't carry the Job's pod template. It carries one hash for the
+  renderings of the profile's `DispatchJobTemplate`s in the profile namespace, the params the
+  Job admission policy holds each Job to (`jobTemplateRef`), and `perTier: true` (#5646):
+  the profile has one per live tier, each under its tier's ServiceAccount. The
+  unattended-mode tier's param is the profile's own, `kube-agents-dispatch-job-profile-<profile>`,
+  and any other tier's is `kube-agents-dispatch-job-tier-<profile>.<tier>`, where only
+  permit-carrying tasks run. The dispatcher derives each name from the task's (profile,
+  tier), never from the config (#5479), and holds the template's own profile and tier labels
+  to the task's. It reads that object when it launches the Job, with `get` alone on those
+  objects, and uses it only while the object's `kubeagents.x-k8s.io/dispatch-template-hash`
+  annotation matches. The one hash covers every tier's rendering, so a change to any of them
+  moves it on every param of the profile, and the config's entry stays one hash wide however
+  many tiers the profile has. A reference without `perTier` is the unattended-mode tier's
+  template alone, as an operator from before #5646 sends it. The admission policy is
+  unchanged: it holds a Job to the template of the ServiceAccount it runs as, and those are
+  unique per (profile, tier). It reads every param on each Job, so admitting one takes
+  longer as params grow: about 1.3s at 2,500 one-tier profiles and 2.5s at 2,500 two-tier
+  ones, against a Job's cold start of 30 to 90s. Those are measurements, not a gate:
+  `TestTheJobPolicyAtTwentyFiveHundredTwoTierProfiles` (envtest) logs them only when
+  `KUBE_AGENTS_JOB_POLICY_SCALE` is set, and asserts no bound. A param whose rendering,
+  labels, template and defaulting API server are all current isn't defaulted or applied
+  again on the next pass. Any mismatch, a
   missing param, or one with no containers keeps that profile's task queued, shows on the
   dispatcher's health as a Job admission error, and leaves every other profile alone. The
   operator writes params before the config, so the usual transient is a param ahead of the

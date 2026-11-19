@@ -23,7 +23,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -44,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
@@ -85,6 +88,19 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// The operator image also runs the bus migration's own pods (#4225):
+	// the same binary, so their version contract is the operator's.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "bus-migrate":
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			code := busmigrate.Main(ctx, os.Args[2:], os.Stderr)
+			stop()
+			os.Exit(code)
+		case "bus-hash":
+			os.Exit(busmigrate.HashMain(os.Args[2:], os.Stderr))
+		}
+	}
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -238,6 +254,20 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		// Step down on shutdown rather than holding the lease until it
+		// expires, so the next pod takes over in seconds, not after the
+		// lease duration (#6217 measured ~45 s from a helm upgrade to the
+		// new pod's first reconcile). controller-runtime releases the lease
+		// after the leader-elected runnables have stopped, or once its
+		// graceful-shutdown timeout (default 30 s) runs out. The pod's
+		// terminationGracePeriodSeconds is 10, so a stop slower than that
+		// is killed first and the lease simply expires, as without this
+		// option: a release never races a reconcile that is still running.
+		// It is safe only because main returns as soon as mgr.Start does:
+		// the Start call is main's last statement, its error branch only
+		// logs and exits, and main has no defer or go statement that could
+		// act after it (manager_wiring_test.go).
+		LeaderElectionReleaseOnCancel: true,
 		// What this process holds in memory; controller.ManagerCacheOptions
 		// says what is in the cache, what is kept out of it, and why.
 		Cache:  controller.ManagerCacheOptions(),

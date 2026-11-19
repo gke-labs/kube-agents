@@ -104,7 +104,7 @@ in, where the operator sets it.
    [Handing over a chat-less install](#handing-over-a-chat-less-install)), `--enable-google-chat`,
    or `--enable-slack` (tokens in `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`).
    `--enable-web-console` adds a browser chat page for chat-less installs, reached by port-forward
-   ([Web console](../../../docs/site/src/content/docs/deploy/web-console.md)).
+   ([Web console](../../../docs/site/src/content/docs/deploy/web-console.mdx)).
    `--enable-hermes-dashboard=true` adds the Hermes Web UI, which a port-forward cannot reach under
    gVisor; the
    [PlatformAgent reference](../../../docs/site/src/content/docs/operator/platformagent-crd.md)
