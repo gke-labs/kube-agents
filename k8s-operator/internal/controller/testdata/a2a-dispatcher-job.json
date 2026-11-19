@@ -215,10 +215,6 @@
                 "value": "http://inference-gateway.test-ns.svc.cluster.local"
               },
               {
-                "name": "ANTHROPIC_API_KEY",
-                "value": "a2a-playground"
-              },
-              {
                 "name": "CREDENTIAL_PROXY_URL",
                 "value": "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
               },

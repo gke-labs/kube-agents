@@ -216,7 +216,9 @@ platform-agent image that same build produced, by the tag it just pushed and nev
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
 `A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
 eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
-"The inject door on every lane"). Either way the sidecar and the agent
+"The inject door on every lane"). `scripts/dev/dev_rebuild_agent.sh` builds a dev install's own,
+`FROM` the agent image it just built, and the root Makefile's `docker-build-hermes-bridge` builds a
+local one `FROM` the platform-agent image of the same `make` run. In each case the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the
@@ -388,7 +390,7 @@ Hermes API server in the same pod (`BRIDGE_API_URL`, default
 `model-default`) with `Authorization: Bearer $API_SERVER_KEY` and three headers:
 `X-Hermes-Session-Key` and `X-Hermes-Session-Id`, both set to the session id below, and
 `Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice (a
-follow-up turn's key adds its envelope id; see **Steering** below). The
+follow-up turn's key adds its envelope id; see **Steering** below). On an inject-door conversation, whose key is `inject:<run>/<case>/<rep>`, it also sends `X-Kube-Agents-Eval-Run: <run>/<case>/<rep>`; the API server records it for the session while the install has `KUBEAGENTS_EVAL_RUN_TAGS` on and ignores it otherwise (`deploy/docker/patches/eval_run_tag.py`). The
 server loads the session's history from its own store before the turn and appends to it after,
 so the second task in a thread sees the first. The session id is `a2a-` plus the task's
 `contextId`, which the gateway mints once per backend conversation. A `contextId` that is not

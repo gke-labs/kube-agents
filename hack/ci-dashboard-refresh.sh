@@ -186,7 +186,7 @@ EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-}"
 # and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
 # lists them.
 EVAL_DASHBOARD_LANE_PR_GLOBS="${EVAL_DASHBOARD_LANE_PR_GLOBS-ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/* gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*}"
-EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
+EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
 # The release-candidate archives, which feed the Brief's release-candidate
 # table: the presubmit lanes' private bucket the lane logs to, then the Prow
 # cluster's default it logged to before the move (kept until the newest

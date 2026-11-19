@@ -1179,7 +1179,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
+	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway," + sessionCaller
 	if got := allowedBrokerCallers(agent, allBrokerCallersOwned); got != want {
 		t.Fatalf("callers = %q, want %q", got, want)
 	}
