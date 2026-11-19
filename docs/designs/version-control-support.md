@@ -681,11 +681,12 @@ only with a verified task credential. `ROLE_VCS_VERBS` gives it the reads
 `vcs:proposal-create` permit. Each write is held to the install's own work: a
 `platform-agent/` branch named bare, no branch carrying somebody else's open
 proposal, a proposal opened by the install's login from its own branch in this
-repository, and no label edit. Its `identity` with no repository answers the managed list's
-names (`{managedRepositories: [host/path, …]}`, the same entries the managed check compares
-against, without their provider prefix), so a task that names no repository can find the one
-it may use; the verb table's `identity` row is every other caller's. [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
-owns that caller.
+repository, and no label edit. Its `issue-list` search fields may start no search
+qualifier of their own (plain words in `query`, no quote or backslash in a label name), and
+its `identity` with no repository answers the managed list's names (`{managedRepositories:
+[host/path, …]}`, the entries the managed check compares against, without their provider
+prefix), so a task that names no repository can find the one it may use.
+[`spec-subagent-profiles.md`](spec-subagent-profiles.md) owns that caller.
 
 ### No shallow clones
 
@@ -943,6 +944,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                                      |
 | `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                                      |
 | `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                                            |
+| `proposal-reviews`                   | `{repository, number, limit?}`                                       | `{reviews, count, truncated}` (library callers only)                                     |
 | `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                                         |
 | `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                                |
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                                 |
@@ -978,11 +980,11 @@ thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
 The rows down to `issue-create` except `snapshot`, `proposal-claim` and `proposal-practice-label`, and the two branch rows, are the
-version-control skill's. `snapshot`, `proposal-claim`, `revision-contains` and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
+version-control skill's. `snapshot`, `proposal-claim`, `revision-contains`, `proposal-reviews` and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
 `providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
 (`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
 which presents the token from a proposal record line. `revision-contains` is for the
-post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-practice-label` is served to fleet-audit's
+post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-reviews`, every submitted review with its state, is for the post-merge check too: a change request makes a merged fix not clean. `proposal-practice-label` is served to fleet-audit's
 `audit_report.py` after it opens a disruption-budget fix: the broker judges the proposal from its own reads
 and adds or removes the reserved `kube-agents:would-auto-merge` or `kube-agents:auto-merge` label
 ([automation rules](../site/src/content/docs/reference/automation-rules.md) says when), and every other
@@ -993,7 +995,7 @@ a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
 than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
 requires. `issue-list`'s `query?` is free text each forge composes into
-its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own search grammar (plain words only for the profile role, above), and its `excludeLabels?` is what a sweep that must skip
 its own claim marker asks with. `proposal-list` filters on the branches instead
 — `source?` and `target?` — because "is there already a proposal for this
 branch" is the question every write flow opens with. A comment carries `id` and

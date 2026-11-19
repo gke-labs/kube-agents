@@ -107,7 +107,7 @@ func TestHandlerAuditEvents(t *testing.T) {
 		},
 		{
 			name: "authentication unavailable", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/pods",
-			cfg:     Config{Authenticator: staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))}},
+			cfg:     Config{Authenticator: staticAuthenticator{err: fmt.Errorf("%w: %w", ErrAuthenticationUnavailable, errors.New("connection refused"))}},
 			want:    AuditEvent{Path: "/clusters/in-cluster/api/v1/pods", Outcome: OutcomeAuthUnavailable, StatusCode: http.StatusServiceUnavailable},
 			wantErr: "caller authentication is unavailable: connection refused", noCaller: true,
 		},
@@ -294,7 +294,7 @@ func TestSlogAuditSink(t *testing.T) {
 		},
 		{
 			name:      "authentication unavailable",
-			event:     AuditEvent{Outcome: OutcomeAuthUnavailable, Err: errAuthenticationUnavailable, StatusCode: http.StatusServiceUnavailable},
+			event:     AuditEvent{Outcome: OutcomeAuthUnavailable, Err: ErrAuthenticationUnavailable, StatusCode: http.StatusServiceUnavailable},
 			wantLevel: "ERROR",
 			want:      map[string]any{auditKeyOutcome: "auth_unavailable", auditKeyError: "caller authentication is unavailable"},
 		},

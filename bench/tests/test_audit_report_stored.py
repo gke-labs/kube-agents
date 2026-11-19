@@ -172,6 +172,27 @@ def test_an_id_the_run_only_held_does_not_count(root):
     assert _verify().status == "fail"
 
 
+SCOPED_ID = "serviceentry-host-collision.local._.serviceentry-host-ledger-example"
+
+
+def test_a_forbidden_finding_in_the_report_fails_naming_it(root):
+    _store(root, finished=STARTED + timedelta(minutes=12), ids=(BINDING_ID, SCOPED_ID))
+    result = _verify(forbidden_finding_phrases=["serviceentry-host-ledger-example"])
+    assert result.status == "fail"
+    assert "serviceentry-host-ledger-example" in result.reason
+
+
+def test_a_report_without_the_forbidden_finding_passes(root):
+    _store(root, finished=STARTED + timedelta(minutes=12))
+    assert _verify(forbidden_finding_phrases=["serviceentry-host-ledger-example"]).status == "pass"
+
+
+def test_a_missing_required_finding_is_named_before_a_forbidden_one(root):
+    _store(root, finished=STARTED + timedelta(minutes=12), ids=(SCOPED_ID,))
+    result = _verify(forbidden_finding_phrases=["serviceentry-host-ledger-example"])
+    assert result.status == "fail"
+    assert "no finding in its document has an id containing ['debug-binding']" in result.reason
+
 def test_unreadable_pods_are_an_error(root, monkeypatch):
     monkeypatch.setattr(onboarding, "sandbox_shell", _silent_shell)
     assert _verify().status == "error"
