@@ -1475,7 +1475,7 @@
       "cluster_slot": "c",
       "namespace": "seeded-compute-class",
       "probes": ["deployment/app-worker-b", "computeclass/general-ccc"],
-      "fixture": "app-worker-b Deployment, one replica, naming ComputeClass general-ccc only in a required nodeAffinity term and never in nodeSelector, which the Cluster Autoscaler's ComputeClass pre-filter reads alone",
+      "fixture": "app-worker-b Deployment, one replica, naming ComputeClass general-ccc only in a required nodeAffinity term and never in nodeSelector; a required nodeAffinity on the class key also requests the class, so this is the targeted control beside app-worker-a and no check flags it",
       "state": [
         {
           "subject": "deployment/app-worker-b",
@@ -1488,7 +1488,7 @@
           "subject": "deployment/app-worker-b",
           "path": "spec.template.spec.nodeSelector",
           "op": "absent",
-          "why": "the defect is the class named in affinity instead of the selector; a selector added heals it"
+          "why": "the control is the class named in affinity and not in the selector; a selector added makes it the plain selector form"
         }
       ]
     },

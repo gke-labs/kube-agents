@@ -304,6 +304,16 @@ type Gateway struct {
 	// session by construction (a message during a running task is a steer,
 	// never a second task). Entries are refcounted and pruned when idle.
 	sessionLocks map[string]*sessionLockEntry
+	// capCheck lets one session cap check run at a time (refuseAtSessionCap,
+	// #6033): the count, the eviction and the slot's reservation happen as
+	// one, so a burst of conversations can't all pass on the same count. It
+	// is a channel so a wait can give up with its turn's context. capHolds,
+	// guarded by capMu, are the slots granted whose pod isn't created yet,
+	// by conversation key.
+	capOnce  sync.Once
+	capCheck chan struct{}
+	capMu    sync.Mutex
+	capHolds map[string]capHold
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -616,6 +626,7 @@ func New(o Options) (*Gateway, error) {
 		log:              log,
 		runCtx:           context.Background(),
 		sessionLocks:     map[string]*sessionLockEntry{},
+		capHolds:         map[string]capHold{},
 		profiles:         newProfileDirectory(),
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
@@ -1196,6 +1207,9 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	// A cap slot this turn took ends with the turn, whatever happened between
+	// the grant and the spawn (#6033).
+	defer g.releaseCapHold(msg.Conversation)
 	// The stop may have begun while this turn waited for the lock.
 	if g.droppedAtStop(msg) {
 		return
@@ -1226,6 +1240,7 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, prin
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	defer g.releaseCapHold(msg.Conversation)
 	if g.droppedAtStop(msg) {
 		return
 	}
