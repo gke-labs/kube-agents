@@ -73,11 +73,10 @@ readonly CRD_DELETE_TIMEOUT="5m"
 # next lease's install, which the API server refuses to create CRs into. So
 # Step 3 lists the CRs of every kind the chart's crds/ declare, releases
 # their finalizers with this patch, deletes them, and deletes the CRDs again.
-# The release skips the operator's own deletion cleanup, most of which
-# Steps 4 to 6 sweep by label and name (not the A2A callout
-# ClusterRoleBinding, labelled part-of=a2a-next, which stays as it did
-# before); it runs only after the timed-out delete gave a live operator its
-# chance. The columns read each CR's namespace and name;
+# The release skips the operator's own deletion cleanup, which Steps 4 to 6
+# sweep by label and name (the A2A callout ClusterRoleBinding under its own
+# label, below); it runs only after the timed-out delete gave a live operator
+# its chance. The columns read each CR's namespace and name;
 # every chart CRD is Namespaced (tests/test_ci_teardown_release_record.py
 # pins it, so a cluster-scoped one fails there and not here).
 readonly CR_FINALIZERS_RELEASE_PATCH='{"metadata":{"finalizers":null}}'
@@ -108,6 +107,17 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 # name ci-deploy.sh installs (PLATFORM_AGENT_CR_NAME). Matched whole with an
 # ordinal, so no other claim can match; the same name handleDeletion reaps.
 readonly NATS_CLAIM_NAME_RE='^persistentvolumeclaim/data-platform-agent-a2a-nats-[0-9]+$'
+# Step 4's second selector: the A2A stack's objects carry part-of=a2a-next
+# (a2aLabels in platformagent_a2a_manifests.go), not the part-of the first
+# sweep selects. Its namespaced objects go with the PlatformAgent through
+# owner GC and Step 6; the one cluster-scoped object the operator builds under
+# that label, the auth callout's ClusterRoleBinding
+# (kubeagents:a2a-callout-tokenreview:<namespace>:<name>, a grant of
+# tokenreviews/create and subjectaccessreviews/create to a ServiceAccount name),
+# carries no owner reference and is reaped by handleDeletion alone, which a
+# CR released in Step 3, or a run killed mid-install, never runs. Left, it is
+# a standing grant on the pool project between leases (#6458).
+readonly A2A_SWEEP_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 
 # Endpoint and owner convention the Prow wrapper leases with
 # (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
@@ -360,9 +370,7 @@ CRD_STEP_RESULT="deleted"
 # summary. A release is traced by its WARNING line and the step's result
 # text, not by the count: the CRDs are gone and the next lease installs, and
 # a ✗ would read as a teardown that left them. What the operator's own
-# deletion handler would have reaped and no sweep here reaches (the A2A
-# callout ClusterRoleBinding, labelled part-of=a2a-next) stays either way:
-# it stayed before this release existed too, with the operator equally gone.
+# deletion handler would have reaped, Step 4 sweeps.
 CRD_STEP_STATUS=0
 PROBE_ERROR_LOG="$(mktemp)"
 if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
@@ -420,7 +428,8 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Sweeping cluster-scoped kub
 # them carry app.kubernetes.io/part-of=kube-agents — the label contract in
 # docs/site/src/content/docs/reference/resource-labels.md — except the CRDs,
 # which Step 3 already deletes by file because Helm's crds/ convention installs
-# them unlabelled.
+# them unlabelled, and the A2A callout's ClusterRoleBinding, which carries
+# part-of=a2a-next and gets its own sweep below.
 #
 # One kind per call, failures counted but never fatal: an API group missing
 # from this cluster (ValidatingAdmissionPolicy needs 1.30+) or one flaky
@@ -440,18 +449,23 @@ SWEEP_KINDS=(
   clusterroles.rbac.authorization.k8s.io
   clusterrolebindings.rbac.authorization.k8s.io
 )
+# The kinds swept under A2A_SWEEP_SELECTOR: the callout ClusterRoleBinding is
+# the only cluster-scoped object the operator builds with that label.
+A2A_SWEEP_KINDS=(
+  clusterrolebindings.rbac.authorization.k8s.io
+)
 # A kind whose API group this cluster does not serve ("doesn't have a
 # resource type") is counted absent, not failed: VAP needs 1.30+, the
 # cert-manager and managed-collection groups exist only where those are
 # installed, and a permanent ✗ on healthy clusters would teach readers to
 # ignore the one that matters. Any other error is a real failure.
-sweep_kinds() { # <label> <namespace-or-""> <kind...>
-  local label="$1" ns="$2" failed=0 absent=0 total=0 out
-  shift 2
+sweep_kinds() { # <label> <namespace-or-""> <selector> <kind...>
+  local label="$1" ns="$2" selector="$3" failed=0 absent=0 total=0 out
+  shift 3
   for kind in "$@"; do
     total=$((total + 1))
     # shellcheck disable=SC2086
-    if out="$(kubectl delete "${kind}" ${ns:+-n "${ns}"} -l "${SWEEP_SELECTOR}" \
+    if out="$(kubectl delete "${kind}" ${ns:+-n "${ns}"} -l "${selector}" \
       --ignore-not-found --timeout="${SWEEP_DELETE_TIMEOUT}" \
       --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" 2>&1)"; then
       echo "${out}"
@@ -467,7 +481,11 @@ sweep_kinds() { # <label> <namespace-or-""> <kind...>
   finish_step "${label} (${failed}/${total} kinds failed, ${absent} absent)" "${failed}"
 }
 
-sweep_kinds "Cluster-scoped sweep" "" "${SWEEP_KINDS[@]}"
+sweep_kinds "Cluster-scoped sweep" "" "${SWEEP_SELECTOR}" "${SWEEP_KINDS[@]}"
+# The same sweep under the A2A stack's label, for the callout
+# ClusterRoleBinding (A2A_SWEEP_SELECTOR above); its own step line, so the
+# first sweep's count still reads as the #1006 audit.
+sweep_kinds "Cluster-scoped A2A sweep" "" "${A2A_SWEEP_SELECTOR}" "${A2A_SWEEP_KINDS[@]}"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Sweeping namespaced kube-agents resources ==="
@@ -513,7 +531,7 @@ SWEEP_NAMESPACED_KINDS=(
   issuers.cert-manager.io
   persistentvolumeclaims
 )
-sweep_kinds "Namespaced sweep" "${NAMESPACE}" "${SWEEP_NAMESPACED_KINDS[@]}"
+sweep_kinds "Namespaced sweep" "${NAMESPACE}" "${SWEEP_SELECTOR}" "${SWEEP_NAMESPACED_KINDS[@]}"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 6: Deleting the NATS JetStream claims ==="
