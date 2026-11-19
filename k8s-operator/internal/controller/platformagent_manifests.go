@@ -581,13 +581,17 @@ type scopeExcludeDeclaration struct {
 // `present` flag tells a CR with no block (false) from one whose block is present
 // but empty (true): an empty block and a block whose every list is empty render the
 // same bytes, and a missing block renders differently by that one field.
+//
+// spec.scope.hold is not rendered here (scopeForDeclaration): it rides in its own
+// ConfigMap (buildScopeHoldConfigMap), so that holding a cluster rolls no pod.
 func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
-	scope := agent.Spec.Scope
+	declared := scopeForDeclaration(agent)
+	scope := declared
 	if scope == nil {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
-		Present:        agent.Spec.Scope != nil,
+		Present:        declared != nil,
 		Projects:       append([]string{}, scope.Projects...),
 		Folders:        append([]string{}, scope.Folders...),
 		Organizations:  append([]string{}, scope.Organizations...),
@@ -5215,6 +5219,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		// One that could set the hold file would lift an operator's hold.
+		credentialProxyHoldFileEnvVar,
 		credentialProxyCuratorAudienceEnvVar,
 		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,

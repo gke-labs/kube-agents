@@ -1264,6 +1264,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileEventWatcherAlertExcludeConfigMap(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
+	// spec.scope.hold, for kube-proxy and the broker. In no pod-template hash
+	// either: both re-read the mounted file, so a hold rolls nothing.
+	if err := r.reconcileScopeHoldConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
 	// The gateway's annotation leaves out what only the broker reads, so a
 	// forge configuration change rolls the broker and not the gateway.
 	gatewayPolicyHash, err := getConfigMapHash(gatewayPolicyView(buildCredentialProxyPolicyConfigMap(instance)))
