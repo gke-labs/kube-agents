@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/mcpproto"
 )
 
 func TestParseStepStreamingReadsAutoOnOffAndRefusesTheRest(t *testing.T) {
@@ -205,4 +207,84 @@ func TestInitializeLogsTheClientAndItsCapabilities(t *testing.T) {
 			t.Errorf("initialize log %q lacks %s", got, want)
 		}
 	}
+}
+
+// A client whose clientInfo or capabilities don't decode as expected still negotiates its
+// protocol version: the log line reads each field on its own.
+func TestAnOddClientInfoStillNegotiatesTheProtocol(t *testing.T) {
+	srv, err := NewServer(ServerOptions{Store: newTestStore(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	for _, params := range []string{
+		`{"protocolVersion":"%s","clientInfo":{"name":"x","version":1}}`,
+		`{"protocolVersion":"%s","capabilities":[]}`,
+		`{"protocolVersion":"%s","clientInfo":"x"}`,
+	} {
+		want := mcpproto.SupportedProtocolVersions()[len(mcpproto.SupportedProtocolVersions())-1]
+		if want == defaultMCPProtocolVersion {
+			want = mcpproto.SupportedProtocolVersions()[0]
+		}
+		req := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":`+params+`}`, want)
+		var resp struct {
+			Result struct {
+				ProtocolVersion string `json:"protocolVersion"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(srv.HandleJSONRPC(context.Background(), []byte(req)), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Result.ProtocolVersion != want {
+			t.Errorf("%s: negotiated %q, want %q", params, resp.Result.ProtocolVersion, want)
+		}
+	}
+}
+
+// End to end through the tools/call handler: a bridge set to off sends stream_steps false on a
+// send_message from a host that passes a conversation id, and a null per-call value counts as
+// none.
+func TestOffSendsStreamStepsFalseThroughTheHandler(t *testing.T) {
+	for _, args := range []string{`{"message":"hello"}`, `{"message":"hello","stream_steps":null}`} {
+		gw := startBlockingGateway(t, "")
+		srv := newStdioTestServer(t, gw)
+		srv.stepStreaming = StepStreamingOff
+		req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":` + args + `,"_meta":{"conversation_id":"conv-1"}}}`
+		srv.HandleJSONRPC(context.Background(), []byte(req))
+		var sent map[string]any
+		for len(gw.calls) > 0 {
+			c := <-gw.calls
+			if c["name"] == ToolSendMessage {
+				sent, _ = c["arguments"].(map[string]any)
+			}
+		}
+		if sent == nil {
+			t.Fatalf("%s: send_message never reached the install", args)
+		}
+		if v, has := sent["stream_steps"]; !has || v != false {
+			t.Fatalf("%s: the install got stream_steps %v (present %v), want false", args, v, has)
+		}
+	}
+}
+
+// A host integration's own CallRemoteTool call follows the bridge's setting when its CallMeta
+// names none.
+func TestCallRemoteToolFollowsTheServersSetting(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	srv.stepStreaming = StepStreamingOff
+	if _, _, _, err := srv.CallRemoteTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"hello"}`), CallMeta{ConversationID: "conv-1"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for len(gw.calls) > 0 {
+		c := <-gw.calls
+		if c["name"] != ToolSendMessage {
+			continue
+		}
+		if args, _ := c["arguments"].(map[string]any); args["stream_steps"] != false {
+			t.Fatalf("the install got %v, want stream_steps false", args)
+		}
+		return
+	}
+	t.Fatal("send_message never reached the install")
 }

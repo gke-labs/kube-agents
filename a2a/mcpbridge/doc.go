@@ -28,6 +28,11 @@
 //
 //	KUBE_AGENTS_MCP_CONFIG         bridge state file
 //	                               (default ~/.config/kube-agents/mcp-config.json)
+//	KUBE_AGENTS_MCP_STREAM_STEPS   auto (default), on or off: whether
+//	                               send_message and task_control return a turn
+//	                               step by step (auto: for a host that sends
+//	                               _meta.conversation_id); --stream-steps
+//	                               overrides it
 //	KUBE_AGENTS_MCP_TOKEN          explicit Bearer token override for the
 //	                               in-cluster a2a-mcp listener: the
 //	                               deployment's when only one is configured;

@@ -245,7 +245,8 @@ type ServerOptions struct {
 	Runner     CommandRunner
 	APIBaseURL string
 	Host       HostIntegration
-	// StepStreaming is the bridge's step-streaming setting; empty is StepStreamingAuto.
+	// StepStreaming is the bridge's step-streaming setting; empty reads EnvStreamSteps, and
+	// that unset is StepStreamingAuto.
 	StepStreaming StepStreaming
 }
 
@@ -461,7 +462,9 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	}
 	if value, inject := meta.streamSteps(); inject && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
 		if m, ok := argsAny.(map[string]any); ok {
-			if _, has := m["stream_steps"]; !has {
+			// A null stream_steps is no value: the install would read it as unset and stream
+			// on the conversation id, which the setting is there to decide.
+			if v, has := m["stream_steps"]; !has || v == nil {
 				m["stream_steps"] = value
 			}
 		}
@@ -712,7 +715,11 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if cluster == nil {
 		cluster = noClusterAccess{}
 	}
-	stepStreaming, err := ParseStepStreaming(string(opts.StepStreaming))
+	setting := string(opts.StepStreaming)
+	if setting == "" {
+		setting = os.Getenv(EnvStreamSteps)
+	}
+	stepStreaming, err := ParseStepStreaming(setting)
 	if err != nil {
 		return nil, err
 	}
@@ -792,6 +799,9 @@ func (s *Server) EnsureConnected(ctx context.Context) error {
 // bridge's argument names: they get the same gating (a refused action or mode is refused before
 // connecting) and the same translation to the server's names as the bridge's own tools.
 func (s *Server) CallRemoteTool(ctx context.Context, toolName string, rawArgs json.RawMessage, meta CallMeta, onProgress func(int, string)) (string, string, string, error) {
+	if meta.StepStreaming == "" {
+		meta.StepStreaming = s.stepStreaming
+	}
 	fwd, err := s.upstreamArgs(ctx, toolName, rawArgs)
 	if err != nil {
 		return "", "", "", err
@@ -935,12 +945,52 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 	return scanner.Err()
 }
 
-// RunCLI parses CLI flags (--config, --version) and runs the stdio MCP server with clean signal handling.
+// logClient logs one line per initialize naming the host: its clientInfo and capability names,
+// so a host that needs its own step-streaming default can be told apart from the others it
+// currently looks like. It reads each field on its own, so an odd field (a numeric version, a
+// capabilities array) costs only that field, and it never affects protocol negotiation.
+func logClient(params json.RawMessage, mode StepStreaming) {
+	var raw struct {
+		ClientInfo   json.RawMessage `json:"clientInfo"`
+		Capabilities json.RawMessage `json:"capabilities"`
+	}
+	if len(params) == 0 || json.Unmarshal(params, &raw) != nil {
+		return
+	}
+	var info struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	_ = json.Unmarshal(raw.ClientInfo, &info)
+	var caps map[string]json.RawMessage
+	_ = json.Unmarshal(raw.Capabilities, &caps)
+	names := slices.Sorted(maps.Keys(caps))
+	if len(names) > maxLoggedCapabilities {
+		names = append(names[:maxLoggedCapabilities], "...")
+	}
+	slog.Info("mcp client", "name", truncateForLog(info.Name), "version", truncateForLog(info.Version),
+		"capabilities", names, "stepStreaming", string(mode))
+}
+
+// maxLoggedCapabilities and maxLoggedClientField bound the initialize log line.
+const (
+	maxLoggedCapabilities = 32
+	maxLoggedClientField  = 128
+)
+
+func truncateForLog(v string) string {
+	if len(v) <= maxLoggedClientField {
+		return v
+	}
+	return v[:maxLoggedClientField] + "..."
+}
+
+// RunCLI parses CLI flags (--config, --version, --stream-steps) and runs the stdio MCP server with clean signal handling.
 func RunCLI(args []string, cluster ClusterAccess) error {
 	return RunCLIWithOptions(args, ServerOptions{Cluster: cluster})
 }
 
-// RunCLIWithOptions parses CLI flags (--config, --version) and runs the stdio MCP server using opts.
+// RunCLIWithOptions parses CLI flags (--config, --version, --stream-steps) and runs the stdio MCP server using opts.
 func RunCLIWithOptions(args []string, opts ServerOptions) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to persistent MCP configuration file (default: ~/.config/kube-agents/mcp-config.json)")
@@ -1089,20 +1139,9 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 		protoVer := defaultMCPProtocolVersion
 		var initParams struct {
 			ProtocolVersion string `json:"protocolVersion"`
-			ClientInfo      struct {
-				Name    string `json:"name"`
-				Version string `json:"version"`
-			} `json:"clientInfo"`
-			Capabilities map[string]json.RawMessage `json:"capabilities"`
 		}
-		parsed := len(req.Params) > 0 && json.Unmarshal(req.Params, &initParams) == nil
-		if parsed {
-			// One line per session naming the host, so a host that needs its own step-streaming
-			// default can be told apart from the others it currently looks like.
-			slog.Info("mcp client", "name", initParams.ClientInfo.Name, "version", initParams.ClientInfo.Version,
-				"capabilities", slices.Sorted(maps.Keys(initParams.Capabilities)), "stepStreaming", string(s.stepStreaming))
-		}
-		if parsed && initParams.ProtocolVersion != "" {
+		logClient(req.Params, s.stepStreaming)
+		if len(req.Params) > 0 && json.Unmarshal(req.Params, &initParams) == nil && initParams.ProtocolVersion != "" {
 			supported := mcpproto.SupportedProtocolVersions()
 			if slices.Contains(supported, initParams.ProtocolVersion) {
 				protoVer = initParams.ProtocolVersion
