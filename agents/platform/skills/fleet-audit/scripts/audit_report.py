@@ -3186,6 +3186,11 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # other three are set by `collect.py` for the same reason, on §2.7,
 # §3.16 and §3.19; `collect.py`'s `TRIAGE_BY_SLUG` says what each fix risks.
 #
+# The stockout collector sets `manual-pool-fallback` on every §3.13 finding:
+# the fix adds a node pool for each rule that has none, or lets GKE create
+# node pools for the class, and the collector cannot tell which the owners
+# want.
+#
 # The text beside each marker is what the ledger prints after the finding's
 # title in the "fix needs a decision" block, so a reader sees why the sweep
 # passed over that one without opening it. Keep it a clause about the fix.
@@ -3200,6 +3205,7 @@ TRIAGE_REASONS = {
     "service-selector": "rewrites or deletes a Service on a judgement about its backend",
     "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
     "serviceentry-owner": "narrows one team's ServiceEntry, and which team keeps the host is the owners' call",
+    "manual-pool-fallback": "adds node pools or turns node pool auto-creation on, and which of the two is the owners' call",
 }
 NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 

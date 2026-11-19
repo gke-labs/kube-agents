@@ -4358,8 +4358,21 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         self.assertIn("1 of 2", hit["excerpt"])
         self.assertIn("rule 1 (nodepools gone-pool)", hit["excerpt"])
 
-    def test_a_class_with_no_pool_at_all_says_no_rule_is_backed(self):
-        self.assertIn("No rule is backed", self.check(FLEET_CLASS_RULES, [])["excerpt"])
+    def test_a_class_with_no_rule_backed_is_not_filed(self):
+        """No pool for the class on this cluster: nothing there falls back,
+        and 3.12 (c) names a workload that selects such a class."""
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, []))
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, [manual_pool("other", "e2-medium", "general-ccc")]))
+        self.assertIsNone(self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")]))
+
+    def test_a_nodepools_rule_with_several_names_is_backed_by_one_that_exists(self):
+        rules = [{"nodepools": ["gone-pool", "default-pool"]}, {"machineFamily": "n4"}]
+        hit = self.check(rules, [FLEET_POOL])
+        self.assertIn("Backed: rule 1 (nodepools gone-pool, default-pool)", hit["excerpt"])
+
+    def test_the_finding_is_marked_for_triage(self):
+        self.assertEqual(self.check(FLEET_CLASS_RULES, [FLEET_POOL])["needs_triage"], fs.MANUAL_POOL_TRIAGE)
+        self.assertIn(fs.MANUAL_POOL_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
 
     def test_auto_creation_on_is_out_of_scope(self):
         cc = compute_class("general-ccc", FLEET_CLASS_RULES, node_pool_auto_creation=True)
@@ -4399,6 +4412,7 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         entry = self.run_with(dump_items=[self.fleet_class()], pools=[FLEET_POOL])
         [filed] = [c for c in entry["candidates"] if c["check"] == self.SLUG]
         self.assertEqual((filed["object"], filed["severity"], filed["namespace"]), ("ComputeClass/general-ccc", "major", ""))
+        self.assertEqual(filed["needs_triage"], fs.MANUAL_POOL_TRIAGE)
         self.assertIn("kubectl get computeclasses -A -o json; gcloud container node-pools list", filed["command"])
         self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
 

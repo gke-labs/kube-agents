@@ -7,7 +7,7 @@ which `audit_report.py finish --manifest-file` cross-checks the published
 document against; the checks it runs are defined in
 governance/stockout_prevention_sop.md.
 
-**All twelve checks are converted.** Ten read structures this repository's
+**All thirteen checks are converted.** Eleven read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
 `StatefulSet`/`StorageClass`/`Node` dump, the node pools (the discovery
 `clusters list` item's `nodePools`, else `gcloud container node-pools list`),
@@ -227,6 +227,11 @@ MIN_FALLBACK_FAMILIES = 2
 # §3.13: with fewer rules than this a class has no later rule to fall back to.
 MIN_RULES_WITH_A_FALLBACK = 2
 UNBACKED_MANUAL_FALLBACK = "ccc-unbacked-manual-fallback"
+# The `needs_triage` marker on a §3.13 finding. Its fix adds node pools or
+# turns node pool auto-creation on, and which of the two is the owners' call,
+# so the automatic sweep leaves it to `/remediate`. The string matches
+# `TRIAGE_REASONS` in audit_report.py.
+MANUAL_POOL_TRIAGE = "manual-pool-fallback"
 ERROR_EXCERPT_CHARS = 300
 STDERR_EXCERPT_CHARS = 200
 # `2026-09-30T14:43:39`: an RFC 3339 log timestamp cut to whole seconds.
@@ -1288,12 +1293,15 @@ def _rule_label(position: int, rule: dict) -> str:
 
 
 def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict | None:
-    """§3.13: a class in `_manual_fallback_class`'s scope with a priority rule
-    no node pool backs. GKE creates no pool for that rule, so the fallback the
-    class lists does not exist.
+    """§3.13: a class in `_manual_fallback_class`'s scope with one priority
+    rule a node pool backs and another no node pool backs. GKE creates no pool
+    for that rule, so the fallback the class lists does not exist.
 
-    A rule `_rule_has_manual_pool` cannot judge is neither counted as backed
-    nor flagged; the excerpt names it.
+    A class with no rule backed is not filed: the cluster holds no pool for
+    it, so nothing there falls back, and `check_dangling_compute_class` names
+    a workload that selects such a class. A rule `_rule_has_manual_pool`
+    cannot judge is neither counted as backed nor flagged; the excerpt names
+    it.
     """
     if not _manual_fallback_class(cc):
         return None
@@ -1301,16 +1309,18 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     priorities = cc["spec"]["priorities"]
     verdicts = [_rule_has_manual_pool(rule, name, node_pools) for rule in priorities]
     labels = [_rule_label(position, rule) for position, rule in enumerate(priorities, 1)]
-    unbacked = [label for label, backed in zip(labels, verdicts) if backed is False]
-    if not unbacked:
-        return None
+    unbacked = [label for label, verdict in zip(labels, verdicts) if verdict is False]
     backed = [label for label, verdict in zip(labels, verdicts) if verdict is True]
+    if not unbacked or not backed:
+        return None
     unjudged = [label for label, verdict in zip(labels, verdicts) if verdict is None]
-    excerpt = f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: {'; '.join(unbacked)}"
-    excerpt += f". Backed: {'; '.join(backed)}" if backed else ". No rule is backed"
+    excerpt = (
+        f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: "
+        f"{'; '.join(unbacked)}. Backed: {'; '.join(backed)}"
+    )
     if unjudged:
         excerpt += f". Not judged, the rule names neither pools nor a machine: {'; '.join(unjudged)}"
-    return {"object": f"ComputeClass/{name}", "excerpt": excerpt}
+    return {"object": f"ComputeClass/{name}", "excerpt": excerpt, "needs_triage": MANUAL_POOL_TRIAGE}
 
 
 def _reads_pool_labels(workload: dict, compute_classes_by_name: dict[str, dict]) -> bool:
