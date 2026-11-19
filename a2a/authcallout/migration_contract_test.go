@@ -49,8 +49,8 @@ func TestTheOperatorsMigrationMapParses(t *testing.T) {
 
 // What the stream identity may publish in each phase, against the rendered
 // grants, and the nearest things it may not. In Snapshotting it reads and
-// acks only; in Restoring it restores, sends chunks, raises replicas and
-// deletes, and no longer snapshots. In both, every verb only on the
+// acks only; in Restoring it restores, sends chunks, raises replicas,
+// deletes, and reads (never changes) consumers, and no longer snapshots. In both, every verb only on the
 // provisioned streams by name, restore chunks only on those names (a
 // restore's data travels on the chunk subject, which the server derives
 // from the request's stream name, so a request can only deliver data to a
@@ -68,6 +68,14 @@ func TestTheRenderedStreamIdentityReachesItsPhasesWorkAndNothingNear(t *testing.
 		"$JS.API.STREAM.CREATE.TASKS":          true,
 		"$JS.API.STREAM.MSG.DELETE.TASKS":      true,
 		"a2a.tasks.x":                          true,
+		// Consumers are never changed, and read only on the provisioned
+		// streams.
+		"$JS.API.CONSUMER.CREATE.TASKS":            true,
+		"$JS.API.CONSUMER.DURABLE.CREATE.TASKS.w":  true,
+		"$JS.API.CONSUMER.DELETE.TASKS.worker":     true,
+		"$JS.API.CONSUMER.LEADER.STEPDOWN.TASKS.w": true,
+		"$JS.API.CONSUMER.INFO.OTHER.worker":       true,
+		"$JS.API.CONSUMER.NAMES.OTHER":             true,
 	}
 	for name, tc := range map[string]struct {
 		fixture string
@@ -94,13 +102,16 @@ func TestTheRenderedStreamIdentityReachesItsPhasesWorkAndNothingNear(t *testing.
 			"$JS.API.STREAM.UPDATE.TASKS":    true,
 		}},
 		"Restoring": {migrationRestoreFixturePath, map[string]bool{
-			"$JS.API.STREAM.INFO.TASKS":      false,
-			"$JS.API.STREAM.RESTORE.TASKS":   false,
-			"$JS.SNAPSHOT.RESTORE.TASKS.abc": false,
-			"$JS.API.STREAM.UPDATE.KV_cap":   false,
-			"$JS.API.STREAM.DELETE.TASKS":    false,
-			"$JS.API.STREAM.SNAPSHOT.TASKS":  true,
-			"$JS.SNAPSHOT.ACK.TASKS.abc":     true,
+			// The settle wait reads each restored durable by name.
+			"$JS.API.CONSUMER.NAMES.TASKS":       false,
+			"$JS.API.CONSUMER.INFO.TASKS.worker": false,
+			"$JS.API.STREAM.INFO.TASKS":          false,
+			"$JS.API.STREAM.RESTORE.TASKS":       false,
+			"$JS.SNAPSHOT.RESTORE.TASKS.abc":     false,
+			"$JS.API.STREAM.UPDATE.KV_cap":       false,
+			"$JS.API.STREAM.DELETE.TASKS":        false,
+			"$JS.API.STREAM.SNAPSHOT.TASKS":      true,
+			"$JS.SNAPSHOT.ACK.TASKS.abc":         true,
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -161,6 +161,16 @@ MUTATIONS: list[Mutation] = [
         "as the shell does with no per-task identity",
     ),
     Mutation(
+        "A3-identity-lists-for-any-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('                if role == CALLER_ROLE_PROFILE and verb == "identity" and not payload.get("repository"):\n',
+         '                if verb == "identity" and not payload.get("repository"):\n'),
+        "test_A3_only_a_profile_learns_the_managed_list_from_identity",
+        "answer every caller's repository-less identity with the managed list, "
+        "since the names are harmless -- and so hand them to a role that has "
+        "capabilities' own gate, or to the socket with no role at all",
+    ),
+    Mutation(
         "A3-profile-update-not-owned",
         "agents/platform/scripts/credential_proxy.py",
         ("                        self.vcs.require_agent_proposal(verb, payload)\n",

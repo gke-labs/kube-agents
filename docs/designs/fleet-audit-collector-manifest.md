@@ -691,7 +691,7 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
 and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
 are all projects, declares `project` alone; the networking stream declares a `subnet` kind for
-`subnet-ip-exhaustion` and a `project` kind for its other five checks. A fleet that holds no cluster is not
+`subnet-ip-exhaustion` and a `project` kind for its other six checks. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs

@@ -7018,7 +7018,7 @@ func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
 	// the platform on the auto-generated `hermes-google_chat` composite and unions in every
 	// enabled MCP server, which is broader than the worker surface this pins, not narrower.
 	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
-	for _, platform := range []string{"google_chat", "slack"} {
+	for _, platform := range []string{"google_chat", "slack", "teams"} {
 		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
 		want := slices.Sorted(slices.Values(frontDoorToolsets))
 		if !slices.Equal(got, want) {

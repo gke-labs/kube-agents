@@ -255,6 +255,7 @@ AUDITS: dict[str, AuditSpec] = {
             "pdb-overlapping",
             "untargeted-compute-class-workload",
             "hpa-aggressive-scaledown",
+            "ingress-gateway-healthcheck-mismatch",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -450,10 +451,11 @@ AUDITS: dict[str, AuditSpec] = {
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
             "firewall-world-open-ingress",
+            "missing-nodelocal-dnscache",
         ),
         # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
         # subnet for the IPAM check, one `project/<id>` entry for the other
-        # five. This stream enumerates no clusters.
+        # six. This stream enumerates no clusters.
         scopes=(
             ("subnet", ("subnet-ip-exhaustion",)),
             (
@@ -464,6 +466,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "mtu-packet-fragmentation",
                     "cloud-armor-false-positive",
                     "firewall-world-open-ingress",
+                    "missing-nodelocal-dnscache",
                 ),
             ),
         ),
@@ -493,6 +496,16 @@ AUDITS: dict[str, AuditSpec] = {
                 ),
             ),
         ),
+        # §2a of the SOP: the one check that judges a retained object an
+        # owner may keep on purpose, a snapshot whose source disk is gone
+        # (a legal hold, a pre-migration copy), and so the only one a
+        # repository declaration may keep off the ledger; the waste audit
+        # already lets an owner declare the same shape for a kept disk. One
+        # arm, one object kind (`Snapshot/<name>`), so no arm rule. The other
+        # three are live faults no declaration excuses: a startup script that
+        # failed on the last boot, a group creating and deleting at once, a
+        # reservation with less than one host free.
+        declarable=("orphaned-snapshots",),
     ),
     "upgrade-retrospective": AuditSpec(
         "Upgrade Retrospective",
@@ -1264,6 +1277,7 @@ CHECK_PHRASES = {
     "pdb-overlapping": "{object} has overlapping disruption budgets",
     "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
     "hpa-aggressive-scaledown": "{object} scales down aggressively with no preStop hook",
+    "ingress-gateway-healthcheck-mismatch": "{object} routes or health-checks a port no pod exposes",
     # Fleet Waste Audit
     "overrequest": "{object} requests far more than it uses",
     "orphan-pv": "{object} is a volume nothing uses",
@@ -1328,6 +1342,7 @@ CHECK_PHRASES = {
     "mtu-packet-fragmentation": "MTU settings fragment packets",
     "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
     "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
+    "missing-nodelocal-dnscache": "{object} cluster runs without NodeLocal DNSCache",
     # GCE Compute Engine and MIG Fleet Audit
     "gce-startup-script-status": "{object} startup script failed",
     "mig-convergence-stalled": "{object} instance group isn't converging",
@@ -2062,13 +2077,24 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
 STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     ZONE_ARM_CHECK: frozenset({"nodepool"}),
 }
+# The compute stream's one declarable check, 2.5 `orphaned-snapshots`, names
+# the snapshot and nothing else: the collector files `Snapshot/<name>` (a
+# global object, no zone segment), and a `Disk/` or a `Project/` covers no
+# snapshot. One arm: the excerpt carries nothing live, so the join needs no
+# arm rule and the plain `_declaration_covers` path moves it.
+ORPHANED_SNAPSHOT_CHECK = "orphaned-snapshots"
+COMPUTE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    ORPHANED_SNAPSHOT_CHECK: frozenset({"snapshot"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
-# reads it for the measured-size title, which a stockout row does not carry.
+# reads it for the measured-size title, which a stockout or a compute row
+# does not carry.
 DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **COST_DECLARABLE_OBJECT_KINDS,
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+    **COMPUTE_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -2088,9 +2114,11 @@ COST_DECLARED_MINOR = "minor"
 # stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
 # its collector files `NodePool/<pool>` with no namespace, and a worker's
 # namespace on the finding would give the pool an identity no declaration and
-# no candidate matches. Every slug here belongs to one stream, so no stream
-# test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK})
+# no candidate matches. So does the compute snapshot check
+# (`ORPHANED_SNAPSHOT_CHECK`), filed on a `project/<id>` target with no
+# namespace. Every slug here belongs to one stream, so no stream test is
+# needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -9698,8 +9726,8 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
     A check with fixed object kinds accepts only those
-    (`DECLARABLE_OBJECT_KINDS`: the cost checks and the stockout pool check).
-    The two controller checks file whatever
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
+    the compute snapshot check). The two controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5
