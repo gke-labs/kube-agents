@@ -232,48 +232,48 @@ func TestTheReshapeGuards(t *testing.T) {
 	rendered := a2aTasksMaxConsumers(a2aTestAgent())
 	for _, c := range []struct {
 		name string
-		set  func(m *migrationRig)
+		set  func(t *testing.T, m *migrationRig)
 		want string
 	}{
-		{"wide enough", func(m *migrationRig) {
+		{"wide enough", func(t *testing.T, m *migrationRig) {
 			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 				return map[string]a2aBusStream{"TASKS": {MaxConsumers: rendered}}, nil
 			}
 		}, "already holds max_consumers"},
-		{"no limit", func(m *migrationRig) {
+		{"no limit", func(t *testing.T, m *migrationRig) {
 			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 				return map[string]a2aBusStream{"TASKS": {MaxConsumers: -1}}, nil
 			}
 		}, "already holds max_consumers -1"},
-		{"not provisioned", func(m *migrationRig) {
+		{"not provisioned", func(t *testing.T, m *migrationRig) {
 			meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
 		}, "not provisioned"},
-		{"unreadable", func(m *migrationRig) {
+		{"unreadable", func(t *testing.T, m *migrationRig) {
 			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 				return nil, errors.New("monitor down")
 			}
 		}, "could not be read (monitor down)"},
-		{"no TASKS", func(m *migrationRig) {
+		{"no TASKS", func(t *testing.T, m *migrationRig) {
 			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 				return map[string]a2aBusStream{"DIRECTORY": {}}, nil
 			}
 		}, "no TASKS stream"},
-		{"over cap", func(m *migrationRig) {
+		{"over cap", func(t *testing.T, m *migrationRig) {
 			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 				return map[string]a2aBusStream{"TASKS": {MaxConsumers: rendered - 20, Bytes: a2aTasksMaxBytes + 1}}, nil
 			}
 		}, "TASKS holds"},
-		{"failed run waits", func(m *migrationRig) {
+		{"failed run waits", func(t *testing.T, m *migrationRig) {
 			m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationFailed), FailedIn: string(busMigrationRollbackRestoring)}
 		}, "waits for a person"},
-		{"no operator image", func(m *migrationRig) {
+		{"no operator image", func(t *testing.T, m *migrationRig) {
 			t.Setenv(operatorImageEnvVar, "")
 		}, "without OPERATOR_IMAGE"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := reshapeTrigger(t, rendered-20)
 			m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "n1"}
-			c.set(m)
+			c.set(t, m)
 			before := m.agent.Status.BusMigration
 			for i := 0; i < 2; i++ {
 				if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
@@ -336,5 +336,33 @@ func TestAReshapeHasNoTargetCount(t *testing.T) {
 	cond, ok := busMigratingCondition(agent)
 	if !ok || cond.Status != metav1.ConditionTrue || !strings.Contains(cond.Message, "TASKS") || strings.Contains(cond.Message, "NATS servers to") {
 		t.Errorf("condition %+v (%v), want True naming TASKS", cond, ok)
+	}
+}
+
+// A reshape's bus principal is granted TASKS alone, in every phase that has
+// one; one to three's is granted every provisioned stream, as before.
+func TestAReshapesPrincipalReachesTasksAlone(t *testing.T) {
+	for _, phase := range []busMigrationPhase{busMigrationSnapshot, busMigrationClearing, busMigrationRestoring, busMigrationRollbackRestoring} {
+		agent := a2aTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationReshape), RunID: "3-rabc", Phase: string(phase)}
+		ids := busMigrationIdentities(agent)
+		if len(ids) == 0 {
+			t.Fatalf("%s: no migration identity", phase)
+		}
+		for _, id := range ids {
+			for _, subject := range id.publish {
+				if strings.Contains(subject, "STREAM.") && !strings.Contains(subject, ".TASKS") {
+					t.Errorf("%s: the reshape's principal may publish %s", phase, subject)
+				}
+			}
+		}
+		agent.Status.BusMigration.Leg = string(busMigrationGrow)
+		var all string
+		for _, id := range busMigrationIdentities(agent) {
+			all += strings.Join(id.publish, " ")
+		}
+		if !strings.Contains(all, ".DIRECTORY") {
+			t.Errorf("%s: one to three's principal lost DIRECTORY: %s", phase, all)
+		}
 	}
 }

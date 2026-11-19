@@ -806,7 +806,14 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	}
 	user := busMigrationPrincipal(step, run.RunID)
 	var publish []string
-	for _, stream := range a2aProvisionedStreams {
+	// The run's own streams only: a reshape's principal reaches TASKS and
+	// nothing else. The other legs' grants keep the provisioned order the
+	// rendered identity map has always had.
+	granted := a2aProvisionedStreams
+	if busMigrationLeg(run.Leg) == busMigrationReshape {
+		granted = a2aBusMigrationStreamsFor(busMigrationReshape)
+	}
+	for _, stream := range granted {
 		for _, verb := range verbs {
 			publish = append(publish, "$JS.API.STREAM."+verb+"."+stream)
 		}
