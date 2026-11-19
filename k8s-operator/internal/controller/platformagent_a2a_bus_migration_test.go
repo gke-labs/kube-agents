@@ -1448,8 +1448,8 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 
 // TASKS's policy width is the CR's, not the fresh install's: with
 // maxSessions raised it is a2aTasksMaxConsumers(agent), the width the
-// provision script creates TASKS with for that CR, and a one to three
-// restore widens to it.
+// provision script creates TASKS with for that CR, which is the width a
+// one to three restore widens to.
 func TestTheTasksPolicyWidthFollowsTheCR(t *testing.T) {
 	agent := a2aTestAgent()
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: ptr.To(20)}}
@@ -1457,10 +1457,17 @@ func TestTheTasksPolicyWidthFollowsTheCR(t *testing.T) {
 	if want == a2aTasksMaxConsumers(a2aTestAgent()) {
 		t.Fatalf("maxSessions 20 renders the default width %d; the test can't tell them apart", want)
 	}
+	found := false
 	for _, p := range a2aStreamPolicies(agent, 1) {
-		if p.Name == "TASKS" && p.MaxConsumers != want {
-			t.Errorf("TASKS policy max_consumers %d, want the CR's %d", p.MaxConsumers, want)
+		if p.Name == "TASKS" {
+			found = true
+			if p.MaxConsumers != want {
+				t.Errorf("TASKS policy max_consumers %d, want the CR's %d", p.MaxConsumers, want)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("no TASKS policy")
 	}
 	if got := provisionCreateLinesFor(t, agent)["TASKS"]["max-consumers"]; got != strconv.Itoa(want) {
 		t.Errorf("provision script --max-consumers %q, want %d: the policy and the script disagree", got, want)

@@ -205,11 +205,11 @@ func TestTheRestorePodWidensForwardAndNotOnTheWayBack(t *testing.T) {
 	}
 }
 
-// The restore's drift warnings are of the stream as it is restored. A TASKS
-// the forward restore widens to a fresh install's width (110, the reference)
-// is not reported at the snapshot's narrower width; one it keeps wider still
-// is, at its own width; and the way back, which restores the snapshot's
-// width, reports that.
+// The restore's drift warnings are of the stream as it is restored. Going
+// forward, a policy that renders max_consumers decides it: a TASKS widened
+// to the render, kept wider than it, or widened to a CR's width above the
+// fresh install's (the reference's 110) is not drift. The way back, which
+// restores the snapshot's width, reports that width against the reference.
 func TestTheDriftWarningIsOfTheRestoredWidth(t *testing.T) {
 	ctx := context.Background()
 	widthWarnings := func(warnings []string) []string {
@@ -222,17 +222,19 @@ func TestTheDriftWarningIsOfTheRestoredWidth(t *testing.T) {
 		return got
 	}
 	for _, c := range []struct {
-		snapshot, replicas int
-		want               string // the TASKS max_consumers warning, "" for none
+		snapshot, rendered, replicas int
+		want                         string // the TASKS max_consumers warning, "" for none
 	}{
-		{64, 3, ""},
-		{200, 3, "stream TASKS: max_consumers is 200; a fresh install has 110"},
-		{64, 1, "stream TASKS: max_consumers is 64; a fresh install has 110"},
+		{64, 110, 3, ""},
+		{200, 110, 3, ""},
+		{110, 150, 3, ""}, // a CR rendering above the fresh install's width
+		{64, 110, 1, "stream TASKS: max_consumers is 64; a fresh install has 110"},
+		{64, 0, 3, "stream TASKS: max_consumers is 64; a fresh install has 110"}, // a run file with no width: as before
 	} {
 		meta, data := snapshotTasks(t)
 		meta.Config.MaxConsumers = c.snapshot
 		policy := policyOf(meta.Config)
-		policy.MaxConsumers = 110
+		policy.MaxConsumers = c.rendered
 		dir, run := stageTasks(t, meta, data, policy)
 		var nc *nats.Conn
 		var stop func()
@@ -268,11 +270,11 @@ func TestTheDriftWarningIsOfTheRestoredWidth(t *testing.T) {
 		nc.Close()
 		stop()
 		if err != nil {
-			t.Fatalf("snapshot %d into %d: %v", c.snapshot, c.replicas, err)
+			t.Fatalf("snapshot %d, render %d, into %d: %v", c.snapshot, c.rendered, c.replicas, err)
 		}
 		got := widthWarnings(warnings)
 		if (c.want == "" && len(got) != 0) || (c.want != "" && (len(got) != 1 || got[0] != c.want)) {
-			t.Errorf("snapshot %d into %d servers: width warnings %q, want %q", c.snapshot, c.replicas, got, c.want)
+			t.Errorf("snapshot %d, render %d, into %d servers: width warnings %q, want %q", c.snapshot, c.rendered, c.replicas, got, c.want)
 		}
 	}
 }
