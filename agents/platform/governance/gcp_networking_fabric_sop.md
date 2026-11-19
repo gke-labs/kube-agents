@@ -1,6 +1,6 @@
 # SOP: GCP Networking Fabric & VPC IPAM Audit (Daily Governance)
 
-**Purpose:** Sweep all managed VPC networks, subnets, Cloud NAT gateways, Private Service Connect (PSC) endpoints, Cloud Armor security policies and firewall rules across target GCP projects for subnet IP exhaustion, NAT port allocation saturation, PSC routing deadlocks, MTU fragmentation mismatches, Cloud Armor policy anomalies, and management ports open to the whole internet. The question this audit answers for a platform admin is: _which subnets are running out of secondary IP ranges for GKE Pods, where are Cloud NAT gateways dropping connections due to port exhaustion, and which VPCs have MTU mismatches causing packet fragmentation?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
+**Purpose:** Sweep all managed VPC networks, subnets, Cloud NAT gateways, Private Service Connect (PSC) endpoints, Cloud Armor security policies, firewall rules and GKE cluster add-ons across target GCP projects for subnet IP exhaustion, NAT port allocation saturation, PSC routing deadlocks, MTU fragmentation mismatches, Cloud Armor policy anomalies, management ports open to the whole internet, and Standard clusters without NodeLocal DNSCache. The question this audit answers for a platform admin is: _which subnets are running out of secondary IP ranges for GKE Pods, where are Cloud NAT gateways dropping connections due to port exhaustion, and which VPCs have MTU mismatches causing packet fragmentation?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
 
 **Cron:** id `gcp-networking-fabric-audit`, schedule `0 8 * * *` (daily 08:00 UTC).
 
@@ -31,7 +31,7 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 
 The collector (§2) applies all of this itself: it sweeps the `--scope-projects` you pass from `fleet_scope`, else resolves the scope as above, leaves out a project whose own Compute Engine API is off, and hands back `project/UNENUMERATED_PROJECTS` as a `gate-failed` target carrying the reason, the unread declared projects among them. The rules above are for a target you fall back on by hand.
 
-- A target is either a subnet, named `<project>/<region>/<subnet>`, which owes `subnet-ip-exhaustion` alone, or a project, named `project/<project-id>`, which owes the other five checks. Record `{name, location, project, checks_run}` into `scope.clusters` for each.
+- A target is either a subnet, named `<project>/<region>/<subnet>`, which owes `subnet-ip-exhaustion` alone, or a project, named `project/<project-id>`, which owes the other six checks. Record `{name, location, project, checks_run}` into `scope.clusters` for each.
 - **`checks_run` is mandatory on every scope entry:** Each entry is an object `{"check": "<slug>", "command": "<literal command>"}` naming the exact inspection command executed on that target.
 - A project or target you cannot reach goes in `scope.skipped` with a reason string, **and the sweep continues** — one project's permission error never decides the outcome for the rest of the fleet. If a target is partially readable, record the refusal in its `limitations` string.
 
@@ -121,6 +121,16 @@ The cron prompt of a scheduled run names the flag to add to this command, the sa
 - **Impact:** "Any host on the internet can open a TCP connection to these ports on the instances named, so whatever authenticates on the far side of the port is the entire perimeter."
 - **Remediation:** `kind: manifest`. Declare a Config Connector `ComputeFirewall` for the rule in the reconciled GCP directory, with `spec.sourceRanges` narrowed to `35.235.240.0/20` — the IAP TCP-forwarding range — in place of the world range, and everything else copied from the live rule. Config Connector acquires an existing rule of the same name rather than failing on it, so the object adopts the rule the finding names instead of creating a second one. Narrow rather than delete: `gcloud compute ssh --tunnel-through-iap` keeps working through the IAP range, so the fix closes the internet without removing the access path, and a manifest that deletes the rule outright leaves nothing for a reviewer to compare against. **Do not propose private nodes as the fix**, however obviously it presents itself when every instance in the excerpt is a GKE node holding a public address. Taking the external IPs away is the larger correct change and the wrong one to derive from this finding: a private node reaches Artifact Registry only through Cloud NAT, so on a project whose `cloud-nat-exhaustion` scope entry recorded no NAT gateway (only the `routers list` read, no `get-status`) — §2.2's own read establishes this, at no extra cost — flipping `enablePrivateNodes` stops every image pull in the fleet. Name it in `recommendation.rationale` as the alternative considered and rejected, with the router count as the reason.
 
+#### 2.7 Standard cluster without NodeLocal DNSCache (`missing-nodelocal-dnscache`)
+
+- **Command:** `gcloud container clusters list --project=$PROJECT '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'`. The subnet sweep and this check share one `clusters list` read per project.
+- **Flag when:** a cluster that is not Autopilot does not carry `addonsConfig.dnsCacheConfig.enabled: true`. Without the add-on every Pod DNS lookup is a UDP request to the `kube-dns` ClusterIP that takes a conntrack entry on the node, and `ndots:5` search-path expansion turns one application lookup into several.
+- **A missing `dnsCacheConfig` key means off, not unknown.** The listing omits the block on a cluster that never enabled the add-on, so reading absence as unread would skip exactly the clusters this check is for.
+- **Do NOT flag:** an Autopilot cluster, where the cache is always on and cannot be turned off; a cluster that uses Cloud DNS for GKE (`networkConfig.dnsConfig.clusterDns: CLOUD_DNS`), whose Pods resolve at the metadata address and send no lookup to `kube-dns`; a cluster the declared scope excludes (`--scope-exclude-clusters`), which the collector drops before it judges; a cluster whose listing carries no `addonsConfig` at all, which is unread and is named in the target's `limitations`; a project whose Kubernetes Engine API is off, which holds no cluster (the collector lists the check in that target's `checks_not_applicable`).
+- **Severity:** `minor`. The finding names a latency and dropped-lookup risk under load, not an outage in progress.
+- **Impact:** "Every Pod DNS lookup goes to the kube-dns ClusterIP and takes a conntrack entry on its node, so lookups slow down under load and are dropped when the table fills."
+- **Remediation:** `kind: manual`. `gcloud container clusters update <cluster> --location <location> --update-addons=NodeLocalDNS=ENABLED`, in a maintenance window: the change re-creates the cluster's nodes. This audit never runs it.
+
 ### 3. Generate remediation artifacts
 
 For promoted findings requiring `kind: manifest` remediation, write the updated Terraform or manifest file to `remediation.path` resolved within the `workspace` GitOps repository:
@@ -148,7 +158,7 @@ Every finding must conform to the full findings schema:
         "checks_run": [
           {
             "check": "subnet-ip-exhaustion",
-            "command": "gcloud compute networks subnets list --project=proj-1 '--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)' && gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)' && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute addresses list --project=proj-1 --filter=addressType=INTERNAL '--format=json(address,subnetwork)' && gcloud compute forwarding-rules list --project=proj-1 '--format=json(IPAddress,subnetwork)'"
+            "command": "gcloud compute networks subnets list --project=proj-1 '--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)' && gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)' && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute addresses list --project=proj-1 --filter=addressType=INTERNAL '--format=json(address,subnetwork)' && gcloud compute forwarding-rules list --project=proj-1 '--format=json(IPAddress,subnetwork)'"
           }
         ]
       },
@@ -176,6 +186,10 @@ Every finding must conform to the full findings schema:
           {
             "check": "firewall-world-open-ingress",
             "command": "gcloud compute firewall-rules list --project=proj-1 --format=json && gcloud compute instances list --project=proj-1 '--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)' && gcloud compute forwarding-rules list --project=proj-1 --format=json"
+          },
+          {
+            "check": "missing-nodelocal-dnscache",
+            "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'"
           }
         ]
       }
@@ -192,7 +206,7 @@ Every finding must conform to the full findings schema:
       "object": "SecondaryRange/gke-pods",
       "impact": "GKE cannot add nodes that take their Pod block from gke-pods once it is fully allocated, so autoscaling and surge upgrades on those node pools fail.",
       "evidence": {
-        "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)'",
+        "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot,addonsConfig)'",
         "excerpt": "Pod range gke-pods (10.4.0.0/18): GKE reports 93.8% allocated (cluster prod-1, node pool default-pool); about 4 more /24 node blocks fit"
       },
       "recommendation": {

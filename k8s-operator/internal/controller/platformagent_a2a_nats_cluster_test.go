@@ -1887,9 +1887,9 @@ func a2aSingleServerTestAgent() *agentv1alpha1.PlatformAgent {
 
 // emptyBusStreams is a bus whose provisioned streams hold nothing: none is
 // over a limit, so a one to three migration may start.
-func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+func emptyBusStreams(_ context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 	streams := map[string]a2aBusStream{}
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(agent, 1) {
 		streams[p.Name] = a2aBusStream{}
 	}
 	return streams, nil
@@ -1903,7 +1903,7 @@ func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]
 func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	var tasks busmigratePolicy
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		if p.Name == "TASKS" {
 			tasks = busmigratePolicy{p.MaxBytes, p.MaxAge}
 		}

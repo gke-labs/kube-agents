@@ -62,7 +62,7 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 _NO_KEY = object()
 
 
-def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BINDING_ID,), started=_NO_KEY) -> None:
+def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BINDING_ID,), started=_NO_KEY, excerpts=None) -> None:
     directory = root / AUDIT / "no_forge" / "local"
     directory.mkdir(parents=True)
     envelope = {
@@ -71,7 +71,7 @@ def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BIN
         "status": status,
         "finished_at": finished.isoformat(),
         "current_ids": list(ids),
-        "document": {"findings": [{"id": fid} for fid in ids]},
+        "document": {"findings": [{"id": fid, "evidence": {"excerpt": (excerpts or {}).get(fid, "")}} for fid in ids]},
     }
     if started is not _NO_KEY:
         envelope["started_at"] = started.isoformat() if isinstance(started, datetime) else started
@@ -192,6 +192,31 @@ def test_a_missing_required_finding_is_named_before_a_forbidden_one(root):
     result = _verify(forbidden_finding_phrases=["serviceentry-host-ledger-example"])
     assert result.status == "fail"
     assert "no finding in its document has an id containing ['debug-binding']" in result.reason
+
+
+EVIDENCE = "They differ in addresses 10.0.0.1 in team-a/x, 10.0.0.2 in team-b/x."
+
+
+def test_a_required_evidence_phrase_in_the_matched_finding_passes(root):
+    _store(root, finished=STARTED + timedelta(minutes=12), excerpts={BINDING_ID: EVIDENCE})
+    assert _verify(required_evidence_phrases=["They differ in addresses"]).status == "pass"
+
+
+def test_a_missing_evidence_phrase_fails_naming_it(root):
+    _store(root, finished=STARTED + timedelta(minutes=12), excerpts={BINDING_ID: "and they disagree: {...}"})
+    result = _verify(required_evidence_phrases=["They differ in addresses"])
+    assert result.status == "fail"
+    assert "They differ in addresses" in result.reason
+
+
+def test_evidence_on_a_finding_the_phrases_do_not_match_does_not_count(root):
+    _store(root, finished=STARTED + timedelta(minutes=12), ids=(BINDING_ID, SCOPED_ID), excerpts={SCOPED_ID: EVIDENCE})
+    assert _verify(required_evidence_phrases=["They differ in addresses"]).status == "fail"
+
+
+def test_evidence_phrases_without_finding_phrases_fail_at_load():
+    with pytest.raises(ValueError):
+        AuditReportStoredVerifier(type="audit_report_stored", audit=AUDIT, required_evidence_phrases=["x"])
 
 def test_unreadable_pods_are_an_error(root, monkeypatch):
     monkeypatch.setattr(onboarding, "sandbox_shell", _silent_shell)

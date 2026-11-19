@@ -98,7 +98,9 @@ var dispatcherSubmitKinds = []string{SubmitKindTop, SubmitKindChild}
 //   - every durable (top and child): INFO, MSG.NEXT and ACK on PROFILE_SUBMITS.
 //
 // For every profile, draining or not:
-//   - publish on a2a.tasks.<profile>.*.supervisor (failing a task it can't run);
+//   - publish on a2a.tasks.<profile>.*.supervisor (failing a task it can't run).
+//     The six-token form (ProfileSupervisorSubject) comes with the operator
+//     change that sets DispatchConfig.ProfileSupervisorForm (#5301);
 //   - publish on the stop stream's direct get for a2a.stop.<profile>.*
 //     (catching up after a restart);
 //   - subscribe on a2a.stop.<profile>.*.

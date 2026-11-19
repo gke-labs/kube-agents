@@ -16,7 +16,7 @@
 
 EVERY failure mode is a MUTATION OF A REAL RECORD, never a hand-written dict.
 The six directories under ``fixtures/runs/`` are captured devops-bench output
-(see their README for provenance and the one redacted field), and the helpers
+(see their README for provenance and the two redacted fields), and the helpers
 here copy one and change
 exactly the field under test. That discipline is not stylistic: the first draft
 of the ladder gated rung 3 on ``metadata.session_id``, a key a devops-bench
