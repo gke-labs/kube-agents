@@ -12026,6 +12026,21 @@ class VcsGitPathTest(unittest.TestCase):
         )
         self.assertEqual(str(scratch.resolve()), result.stdout.strip())
 
+    def test_a_call_that_names_its_bare_working_directory_runs(self):
+        # The broker names its own bare repositories (`vcs_broker.GIT_DIR_IS_CWD`):
+        # under `safe.bareRepository=explicit` git does not take one from the
+        # working directory. The door reads the subcommand behind the argument.
+        executor = self.executor()
+        bare = executor.vcs_root / "bare.git"
+        bare.mkdir(parents=True)
+        executor.execute_vcs_git(["git", "init", "--quiet", "--bare"], bare)
+        explicit = (("safe.bareRepository", "explicit"),)
+        argv = ["git", "rev-parse", "--is-bare-repository"]
+        unnamed = executor.execute_vcs_git(argv, bare, check=False, config=explicit)
+        self.assertNotEqual(0, unnamed.returncode)
+        named = executor.execute_vcs_git([argv[0], vcs_broker.GIT_DIR_IS_CWD, *argv[1:]], bare, config=explicit)
+        self.assertEqual("true", named.stdout.strip())
+
     def test_it_cannot_run_outside_its_own_root(self):
         executor = self.executor()
         for cwd in (

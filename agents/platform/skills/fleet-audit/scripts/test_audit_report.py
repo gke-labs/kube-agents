@@ -562,6 +562,11 @@ BROKER_GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "test@example.com",
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
+    # The default from Git 3.0, on every git the broker runs here: a call that
+    # takes a bare repository from its working directory fails.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.bareRepository",
+    "GIT_CONFIG_VALUE_0": "explicit",
 }
 
 
