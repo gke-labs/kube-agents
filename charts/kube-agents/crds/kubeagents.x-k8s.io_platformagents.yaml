@@ -10153,6 +10153,21 @@ spec:
                               minimum: 1
                               type: integer
                           type: object
+                        defaultRoute:
+                          description: |-
+                            DefaultRoute is the addressee the A2A gateway sends a plain
+                            conversation's first message to: `session` opens a session pod of the
+                            conversation's own, `platform` hands it to the platform agent. Unset
+                            means `platform` for now; a later change flips the default to
+                            `session`. `platform` stays reachable by handle either way, and a
+                            `delegate:` still opens a session pod on either route. The operator
+                            renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
+                            on the platform agent container, so a change rolls the gateway and the
+                            platform agent pod.
+                          enum:
+                            - session
+                            - platform
+                          type: string
                         maxInProgress:
                           description: |-
                             MaxInProgress caps how many kanban workers run concurrently across the whole

@@ -536,6 +536,12 @@ const (
 	// the single switch exists to make unreachable.
 	a2aCapabilityRequiredEnvVar = "A2A_CAPABILITY_REQUIRED"
 
+	// a2aDefaultAddresseeEnvVar carries spec.harness.tuning.defaultRoute,
+	// resolved by resolveA2ADefaultRoute, onto the gateway (which routes a
+	// plain conversation's first message by it) and onto the platform agent
+	// container, so both read the one value.
+	a2aDefaultAddresseeEnvVar = "A2A_DEFAULT_ADDRESSEE"
+
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
 	// the key name so moving a credential from one user to another is still a
@@ -1097,19 +1103,20 @@ const (
 	// a chat backend's, whose turn runs under the session lock and replays
 	// twice back to back, or the inject door's, whose read takes no lock and
 	// replays before and after its wait -- one asker, two replays, either
-	// way. The operator leaves the gateway's A2A_DEFAULT_ADDRESSEE at its
-	// default, "platform", so a plain conversation's task is a bridge run
-	// and a session pod is spawned only for a Delegate or a session-routed
-	// record; the conversations being asked about while their task runs are
+	// way. The operator renders the gateway's A2A_DEFAULT_ADDRESSEE from
+	// spec.harness.tuning.defaultRoute, "platform" unless the field says
+	// otherwise (resolveA2ADefaultRoute), so on that default a plain
+	// conversation's task is a bridge run and a session pod is spawned only
+	// for a Delegate or a session-routed record; the conversations being asked about while their task runs are
 	// therefore the bridge's Concurrency runs. A conversation with a queued
 	// bridge task, or with a session pod, can be asked about too; that is a
 	// person or a harness at one conversation, once per ask, and the tail
 	// factor is the allowance for it. It is not a per-session term today,
 	// because maxSessions counts pods and a conversation's task is not one;
 	// put in the multiplier it would size the reserve by the wrong number.
-	// The day A2A_DEFAULT_ADDRESSEE flips to the session route (the
-	// RouteSession sentinel in a2a/gateway; gke-labs#2033 is the open design
-	// change that plans it), every conversation's task IS a pod, the asks row
+	// On an install whose defaultRoute is `session` (the RouteSession
+	// sentinel in a2a/gateway; gke-labs#2033 is the open design change that
+	// plans the default's flip), every conversation's task IS a pod, the asks row
 	// becomes per-session, and it moves into the multiplier beside
 	// a2aSessionConsumersPerSession.
 	//
@@ -5140,6 +5147,28 @@ func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name core
 	return q.String()
 }
 
+// resolveA2ADefaultRoute is spec.harness.tuning.defaultRoute, or
+// DefaultRoutePlatform when it is unset: the gateway's own default, so an
+// install that sets nothing routes as it did before the field existed. The
+// gateway's A2A_DEFAULT_ADDRESSEE and the platform agent container's both
+// come from here, so the two cannot disagree. Only the CRD's two values are
+// routes: anything else that reaches here (a CR written past the schema)
+// falls through to DefaultRoutePlatform rather than naming an addressee no
+// executor owns.
+func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
+	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil &&
+		*limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
+		return agentv1alpha1.DefaultRouteSession
+	}
+	return agentv1alpha1.DefaultRoutePlatform
+}
+
+// a2aDefaultAddresseeEnv is the A2A_DEFAULT_ADDRESSEE entry both containers
+// carry.
+func a2aDefaultAddresseeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
+	return corev1.EnvVar{Name: a2aDefaultAddresseeEnvVar, Value: resolveA2ADefaultRoute(agent)}
+}
+
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
 		return *limits.MaxSessions
@@ -6972,6 +7001,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// it are in this same change, so the flag flips
 		// where all three become true together.
 		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+		// Where a plain conversation's first message goes:
+		// spec.harness.tuning.defaultRoute, `platform` when
+		// unset (resolveA2ADefaultRoute). Rendered explicitly
+		// at that default, like A2A_MAX_SESSIONS above, so
+		// the flip to the session route is an edit to a value
+		// already in the live Deployment. The session route
+		// needs the spawner the line above arms.
+		a2aDefaultAddresseeEnv(agent),
 		// The image those sessions run. Rendered even
 		// when it matches the gateway's own default, so
 		// the operator-side override reaches it.

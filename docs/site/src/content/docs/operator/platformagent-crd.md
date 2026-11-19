@@ -545,9 +545,16 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, the gateway's
+`defaultRoute`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
+`maxSessions` renders `10`, `defaultRoute` renders `platform`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`.
+
+`defaultRoute` is where the A2A gateway sends a plain conversation's first message: `platform` to the
+Platform Agent, `session` to a session pod of the conversation's own. The operator renders it as
+`A2A_DEFAULT_ADDRESSEE` on the gateway and on the Platform Agent container, so changing it rolls both.
+On either route the Platform Agent stays reachable by handle and `delegate:` opens a session pod. A
+later release flips the unset default to `session`.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short
