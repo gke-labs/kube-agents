@@ -18,7 +18,7 @@ from tests.testing.common import (
     create_mock_git_repo,
     get_isolated_test_env,
 )
-from tests.testing.release import MOCK_TARGET_RELEASE_TAG, create_mock_go_binary
+from tests.testing.release import MOCK_TARGET_RELEASE_TAG, create_mock_go_binary, create_mock_tar_binary
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "release" / "build_release_binaries.sh"
@@ -328,6 +328,51 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         # Only the Windows archive needs zip, so the archive fails after the others are written.
         proc = self._run([MOCK_TARGET_RELEASE_TAG], script=self._script_with_windows())
         self._assert_kube_agents_mcp_left_out(proc, _WINDOWS)
+
+    def test_a_failed_kube_agents_mcp_tar_leaves_the_release_without_it(self):
+        self._commit_module_and_tag(with_mcp=True)
+        self._seed_dist()
+        create_mock_tar_binary(self.bin_dir, f"*-czf*{_archive_name('linux/amd64', _MCP)}.tar.gz*")
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self._assert_kube_agents_mcp_left_out(proc, "linux/amd64")
+
+    def test_a_failed_k8s_api_proxy_tar_fails_the_script(self):
+        self._commit_module_and_tag(with_mcp=True)
+        create_mock_tar_binary(self.bin_dir, f"*-czf*{_archive_name('darwin/amd64')}.tar.gz*")
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"mock tar: failing -czf {self.dist}/{_archive_name('darwin/amd64')}.tar.gz", proc.stderr)
+        self.assertNotIn("::warning::", proc.stdout)
+        self.assertNotIn(f"./cmd/{_MCP}", self._go_log())
+
+    def test_a_dropped_kube_agents_mcp_is_in_the_job_summary(self):
+        self._commit_module_and_tag(with_mcp=True)
+        summary = pathlib.Path(self.repo_dir).parent / "step-summary.md"
+        summary.write_text("earlier step\n")
+
+        proc = self._run(
+            [MOCK_TARGET_RELEASE_TAG],
+            env={"GITHUB_STEP_SUMMARY": str(summary)},
+            fail_build_matching=f"linux/arm64*./cmd/{_MCP}*",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warning = next(line for line in proc.stdout.splitlines() if line.startswith("::warning::"))
+        lines = summary.read_text().splitlines()
+        self.assertEqual(lines[0], "earlier step")
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[1].endswith(warning.removeprefix("::warning::")), lines[1])
+        self.assertIn("linux/arm64", lines[1])
+
+    def test_a_clean_run_leaves_the_job_summary_alone(self):
+        self._commit_module_and_tag(with_mcp=True)
+        summary = pathlib.Path(self.repo_dir).parent / "step-summary.md"
+        summary.write_text("earlier step\n")
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], env={"GITHUB_STEP_SUMMARY": str(summary)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(summary.read_text(), "earlier step\n")
 
     def test_a_failed_k8s_api_proxy_build_still_fails_beside_kube_agents_mcp(self):
         self._commit_module_and_tag(with_mcp=True)

@@ -2,6 +2,7 @@
 
 import pathlib
 import re
+import shutil
 
 from tests.testing.common import (
     INVALID_GA_RELEASE_TAGS,
@@ -513,6 +514,27 @@ exit 0
     go_path.write_text(content)
     go_path.chmod(0o755)
     return go_path
+
+
+def create_mock_tar_binary(bin_dir, fail_matching):
+    """Replaces tar in bin_dir with a wrapper that fails when its arguments match.
+
+    fail_matching is a shell case pattern matched against the arguments; any
+    other call runs the real tar.
+    """
+    real_tar = shutil.which("tar")
+    if real_tar is None:
+        raise RuntimeError("tar is not on PATH")
+    tar_path = pathlib.Path(bin_dir) / "tar"
+    tar_path.unlink(missing_ok=True)
+    tar_path.write_text(
+        f"""#!/bin/sh
+case "$*" in {fail_matching}) echo "mock tar: failing $*" >&2; exit 1 ;; esac
+exec "{real_tar}" "$@"
+"""
+    )
+    tar_path.chmod(0o755)
+    return tar_path
 
 
 def create_mock_syft_binary(bin_dir, log_file=None, fail_on_images=None):

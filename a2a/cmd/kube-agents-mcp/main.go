@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/gke-labs/kube-agents/a2a/mcpbridge"
 	"github.com/gke-labs/kube-agents/a2a/mcpbridge/kube"
@@ -17,17 +18,37 @@ import (
 
 const (
 	binaryName = "kube-agents-mcp"
-	// devVersion is what a build without the release's -ldflags reports.
+	// devVersion is what a build without the release's -ldflags reports when Go
+	// recorded no module version either.
 	devVersion = "dev"
+	// develModuleVersion is the module version Go records for a build of the
+	// main module from a working tree with no version control information.
+	develModuleVersion = "(devel)"
 )
 
 // version is the release (X.Y.Z) a release archive was built for, stamped by
 // scripts/release/build_release_binaries.sh with -ldflags "-X main.version=...".
 var version = devVersion
 
+// readBuildInfo is debug.ReadBuildInfo, replaced in tests.
+var readBuildInfo = debug.ReadBuildInfo
+
+// resolvedVersion is the stamped release, or for a build without one the module
+// version Go recorded (the version or pseudo-version `go install ...@<ref>`
+// resolved), or devVersion when it recorded none.
+func resolvedVersion() string {
+	if version != devVersion {
+		return version
+	}
+	if info, ok := readBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != develModuleVersion {
+		return info.Main.Version
+	}
+	return devVersion
+}
+
 // versionString is what --version prints.
 func versionString() string {
-	return binaryName + " " + version
+	return binaryName + " " + resolvedVersion()
 }
 
 func main() {

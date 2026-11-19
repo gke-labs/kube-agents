@@ -207,5 +207,10 @@ for spec in "${present_specs[@]}"; do
     exit 1
   fi
   remove_binary_archives "${spec_name}" "${spec_platforms}"
-  echo "::warning::${spec_name} failed to build or package (${failed_step}); the release publishes without ${spec_name} archives."
+  dropped_message="${spec_name} failed to build or package (${failed_step}); the release publishes without ${spec_name} archives."
+  echo "::warning::${dropped_message}"
+  # The job summary too, where a dropped binary shows without opening the log.
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    echo "⚠️ ${dropped_message}" >>"${GITHUB_STEP_SUMMARY}"
+  fi
 done
