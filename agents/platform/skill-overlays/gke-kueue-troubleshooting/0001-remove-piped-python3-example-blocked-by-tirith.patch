@@ -1,0 +1,80 @@
+Subject: Remove piped python3 example blocked by Tirith
+
+Why: The platform image build runs Tirith (`deploy/docker/check_skill_commands.py`) over every fenced shell block in shipped skills, and Tirith blocks example `(b)` (`<read-only export command> | python3 scripts/trace_logs.py ... --data-path -`) with a HIGH `pipe_to_interpreter` finding. Removing both the piped example and the accompanying `--data-path -` / stdin prose in `SKILL.md` and `references/log-sources.md` avoids the Tirith block and prevents agents from piping exports into `python3` at runtime while preserving the file-based `--data-path <file-or-dir>` workflow.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Upstream-Issue: none filed yet
+Retire-When: upstream removes the piped `| python3` example from `references/log-sources.md` or Tirith exempts local script pipes
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -34,7 +34,7 @@ MUST read and follow the instructions in
+   to initialize `gcloud` and select the target project, and follow
+   [Install kubectl and configure cluster access](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl.md.txt)
+   to configure cluster credentials (`offline_data` and `logs_archive` read local
+-  files or stdin only).
++  files only).
+ - **Cloud Billing and APIs**: For `live` cluster inspection or Cloud Logging
+   exports, ensure the project has an active Cloud Billing account and the Google
+   Kubernetes Engine API (`container.googleapis.com`) and Cloud Logging API
+@@ -95,10 +95,10 @@ Remediation YAML still uses the detected `apiVersion`.
+ - `live`: when `kubectl` reaches the cluster.
+ - `offline_data`: directory of YAML/JSON manifests (optionally with `logs/`);
+   pass `--data-path <dir>`.
+-- `logs_archive`: exported logs only (no cluster or manifests); pass
+-  `--data-path <file-or-dir>` or pipe a read-only export to `--data-path -`
+-  (scoped per [Log sources](references/log-sources.md); never `cat` or page raw
+-  log exports into context).
++- `logs_archive`: exported logs only (no cluster or manifests); export to a
++  local file first and pass `--data-path <file-or-dir>` (scoped per
++  [Log sources](references/log-sources.md); never `cat` or page raw log exports
++  into context).
+ 
+ Pass the **same** `--ledger-path <ledger>` to every script call; Step 3
+ verifies quotes and schema against it. **Do not read or parse the ledger.**
+@@ -126,8 +126,8 @@ bundle files (at most **twice**). Never read the skill's own Python scripts.
+      2 log commands total).
+    - `logs_archive`: run
+      `scripts/trace_logs.py --mode logs_archive --ledger-path <ledger>` with
+-     `--data-path <file-or-dir>` or `--data-path -` first (add
+-     `--workload <name>` to focus). Never call `kubectl` in this mode.
++     `--data-path <file-or-dir>` first (add `--workload <name>` to focus).
++     Never call `kubectl` in this mode.
+    - **Schema lookup (optional):** `scripts/snapshot.py --action explain` with
+      `--kind <Kind[.field.path]> --ledger-path <ledger>`.
+    - **If a script fails:** read the error once, follow `next_step`, and
+diff --git a/references/log-sources.md b/references/log-sources.md
+--- a/references/log-sources.md
++++ b/references/log-sources.md
+@@ -1,24 +1,19 @@
+ # Log sources for `logs_archive` mode
+ 
+-`trace_logs.py --mode logs_archive` reads exported log **files** or standard
+-input (`--data-path -`). How those exports are produced is up to the operator or
++`trace_logs.py --mode logs_archive` reads exported log **files** or directories
++(`--data-path <file-or-dir>`). How those exports are produced is up to the operator or
+ the agent; the scripts never call a cloud SDK, provider CLI, or subshell
+-themselves. Two ways to hand logs over without printing raw records into agent
+-context:
++themselves. To hand logs over without printing raw records into agent context,
++export them to a local file first and point `--data-path` at the file or
++directory:
+ 
+ ```bash
+-# (a) export to a local file first, then point --data-path at the file or dir
++# export to a local file first, then point --data-path at the file or dir
+ <read-only export command> > /tmp/kueue-logs/export.json
+ python3 scripts/trace_logs.py \
+   --mode logs_archive \
+   --data-path /tmp/kueue-logs \
+   --ledger-path /tmp/kueue-ledger.json
+-
+-# (b) pipe a read-only export command into --data-path - (stdin)
+-<read-only export command> | python3 scripts/trace_logs.py \
+-  --mode logs_archive \
+-  --data-path - \
+-  --ledger-path /tmp/kueue-ledger.json
+ ```
+ 
+ Export commands run by the caller must be strictly read-only and scoped to the

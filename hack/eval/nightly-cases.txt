@@ -1319,6 +1319,15 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# gke-kueue-troubleshooting skill probe: an unannotated Job in a ClusterQueue
+# combining a TAS ResourceFlavor and a non-TAS ResourceFlavor cannot implicitly
+# use the TAS flavor when the non-TAS flavor has no unused quota. Graded on the
+# standalone IMPLICIT-TAS verdict line, the skill's offline logs_archive
+# script workflow (trace_logs.py and validate_report.py, without piping into
+# python3), and the Kueue configuration Scope classification.
+# deployer: noop, transcript-only.
+./tasks/kueue-troubleshooting-mixed-flavor-tas-probe/task.yaml
+
 # The networking audit's firewall-world-open-ingress check over a standing
 # plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
 # the internet on one VM with an external IP. deployer: noop, read-only on the

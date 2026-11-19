@@ -122,7 +122,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Area | Skills |
 | ---- | ------ |
 | Cluster lifecycle | `cluster-agent-lifecycle`, `gke-cluster-creation`, `gke-multitenancy`, `manage-cluster` |
-| Workloads | `gke-app-onboarding`, `gke-batch-hpc`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `workload-rebalancing` |
+| Workloads | `gke-app-onboarding`, `gke-batch-hpc`, `gke-kueue-troubleshooting`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `workload-rebalancing` |
 | Cost and capacity | `capacity-obtainability`, `gce-compute-fleet-audit`, `gke-cluster-autoscaler`, `gke-compute-classes`, `gke-cost-analysis`, `gke-cost-optimization`, `gke-productionize` |
 | Security and compliance | `gke-backup-dr`, `gke-platform-security`, `gke-workload-identity` |
 | Networking and storage | `gcp-networking-fabric-audit`, `gke-networking`, `gke-service-networking`, `gke-storage` |
