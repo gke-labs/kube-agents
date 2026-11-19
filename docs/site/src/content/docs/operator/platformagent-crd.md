@@ -1068,11 +1068,11 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `scaleToZero` — when `true`, scales the gateway Deployment to 0 replicas (idle cost saving). The shell sandbox, the credential broker and the A2A stack keep running. Once the gateway has no ready replica the `PlatformAgent` reads `phase: Paused`, with `Ready` `False` and reason `ScaledToZero`. That tells a paused install from one whose rollout never finishes. Set the field to `false` or remove it, and the normal phases return: `Provisioning` while the gateway starts, then `Ready`. [What `Ready` reports](#what-ready-reports) has the detail. On the way back the Platform Agent's scheduled audits do not all start at once: [Catch-ups after a pause](/kube-agents/concepts/autonomous-watchdogs/#catch-ups-after-a-pause).
 - `sizingProfile` — the preset row the credential-proxy container, the `agent-api-auth` sidecar and the shell container start from, before the per-key overrides above and under [`shellSandbox`](#shellsandbox) are applied over it; an explicit key always wins. One of `small` (the default, and what an absent field means: the operator's defaults as documented above), `medium`, `fleet` or `auto`. The agent container's own `resources` are not part of a profile.
 
-  | Tier     | Credential proxy                                                                                                   | `agent-api-auth`   | Shell            |
-  | -------- | ------------------------------------------------------------------------------------------------------------------ | ------------------ | ---------------- |
-  | `small`  | the defaults above (8 slots)                                                                                       | the defaults above | the defaults     |
-  | `medium` | 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE Autopilot), 2 CPU and 4Gi limits, 8Gi ephemeral-storage, 12 slots     | 4Gi memory limit   | the defaults     |
-  | `fleet`  | 4 CPU and 8Gi requests, 8 CPU and 8Gi limits, 8Gi ephemeral-storage, 16 slots                                      | 8Gi memory limit   | 4Gi memory limit |
+  | Tier     | Credential proxy                                                                                               | `agent-api-auth`   | Shell            |
+  | -------- | -------------------------------------------------------------------------------------------------------------- | ------------------ | ---------------- |
+  | `small`  | the defaults above (8 slots)                                                                                   | the defaults above | the defaults     |
+  | `medium` | 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE Autopilot), 2 CPU and 4Gi limits, 8Gi ephemeral-storage, 12 slots | 4Gi memory limit   | the defaults     |
+  | `fleet`  | 4 CPU and 8Gi requests, 8 CPU and 8Gi limits, 8Gi ephemeral-storage, 16 slots                                  | 8Gi memory limit   | 4Gi memory limit |
 
   Figures a row does not name keep the small row's. `auto` sets the minimum floor from the cluster count the operator polls into `status.usage`, the larger of `clustersRegistered` and `clustersMonitored`: `medium` at 10 clusters, `fleet` at 25. It starts from `status.effectiveSizingTier` (`small` when unset, or the explicit tier an edited CR held).
 

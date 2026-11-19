@@ -14638,9 +14638,11 @@ class MetricsServer(HandlerErrorsToLog, ConnectionCap, ThreadingHTTPServer):
 class HealthHandler(MetricsHandler):
     """The health-only listener: GET /healthz, and nothing else.
 
-    MetricsHandler's bounds, deadline and silence, serving the answer the
-    credentialed listener's /healthz gives outside an exec pod's drain (see
-    HEALTHZ_DRAINING_PAYLOAD), and nothing the process knows:
+    MetricsHandler's bounds, deadline and silence, serving `healthz_response()`
+    (matching the credentialed listener's `/healthz`: `503 {"status":"standby"}`
+    in standby, `503 {"status":"draining"}` on exec drain or shutdown, and
+    `200 {"status":"ok"}` while active or holding endpoints during handoff before
+    SIGTERM), and nothing else the process knows:
     unauthenticated, like that route, because the probe runs before any
     token would be available and reveals nothing. A separate port so that a
     credentialed listener at its thread cap still reads as alive.

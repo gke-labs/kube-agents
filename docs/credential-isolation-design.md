@@ -231,8 +231,8 @@ credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. The runtime opens up
 to two TCP listeners of its own. The health-only one, closed unless
 `CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers
-`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765, with
-a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
+`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765,
+returning the same active/standby/draining status as that route (`200 {"status":"ok"}` while active or holding endpoints during active-standby handoff before `SIGTERM`, `503 {"status":"standby"}` in warm standby, `503 {"status":"draining"}` on exec drain or shutdown) under the same sixteen-connection cap and
 ten-second deadline as the metrics listener, so that a probe an operator
 points at the broker directly reads it as alive while the credentialed
 listener is at its thread cap; the operator's readiness probe reads `/healthz`
