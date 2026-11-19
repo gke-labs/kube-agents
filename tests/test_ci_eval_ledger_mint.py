@@ -1206,6 +1206,20 @@ class LedgerReaderSelectionTest(unittest.TestCase):
         self.assertEqual("APP=1000 INST=5000 KEY=/etc/ledger-app-key/key.pem", self._picked(first))
         self.assertNotIn("WARNING", first.stderr)
 
+    def test_a_blank_key_list_falls_back_to_the_single_key_file(self):
+        """EVAL_LEDGER_APP_KEY_FILES set but blank (a templated list whose
+        entries all expanded empty) is no list: the single key file stands,
+        and a later App's project reads through the first App with the
+        warning rather than minting its ids against the first App's key."""
+        proc = self._select("kube-agents-evals-23", EVAL_LEDGER_APP_KEY_FILES="  ", EVAL_LEDGER_APP_KEY_FILE="/etc/ledger-app-key/key.pem")
+        self.assertEqual("APP=1000 INST=5000 KEY=/etc/ledger-app-key/key.pem", self._picked(proc))
+        self.assertIn("the job mounted 1 key file(s)", proc.stderr)
+
+    def test_a_single_key_path_with_spaces_is_one_entry(self):
+        proc = self._select("kube-agents-evals-7", EVAL_LEDGER_APP_KEY_FILE="/my keys/ledger app/key.pem")
+        self.assertEqual("APP=1000 INST=5000 KEY=/my keys/ledger app/key.pem", self._picked(proc))
+        self.assertNotIn("WARNING", proc.stderr)
+
     def test_a_project_past_the_tables_last_row_reads_through_the_first_app(self):
         """No row for the shard yet: the first App reads it, with a warning
         naming the App to register. scripts/test_verify_ci_pool_project.py

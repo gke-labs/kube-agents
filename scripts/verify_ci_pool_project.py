@@ -4398,7 +4398,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
 
     pem, reason = _read_ledger_app_key(key_holder=reader.key_holder)
     if pem is None:
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"Not checked: {reason}, so nothing here says whether the eval runner can read "
             f"{repo_slug}'s issues -- the read that failed on kube-agents-evals-6's first lease. "
             f"The key is secret {reader.key_holder} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
@@ -4409,7 +4409,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     if status == "failed":
         return CheckResult(name, False, "Ledger issues not readable", details=[message], warnings=warnings)
     if token is None:
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"{message}, so the eval runner's access to {repo_slug}'s issues is unknown"
         )])
 
@@ -4435,7 +4435,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
                 name,
                 True,
                 "Not checked",
-                warnings=[Unread(
+                warnings=[*warnings, Unread(
                     f"GitHub rate-limited the read of {repo_slug}'s issues, so the eval runner's "
                     "access to them was never established. Re-run when the limit resets"
                 )],
@@ -4457,7 +4457,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
                 "docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
             ], warnings=warnings)
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of allowing or refusing the "
             f"read of {repo_slug}'s issues, so the eval runner's access is unknown. Re-run when "
             "it clears"
@@ -4468,7 +4468,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             if "CERTIFICATE_VERIFY_FAILED" in str(exc)
             else "re-run from somewhere with egress to api.github.com"
         )
-        return CheckResult(name, True, "Not checked", warnings=[Unread(
+        return CheckResult(name, True, "Not checked", warnings=[*warnings, Unread(
             f"Could not reach api.github.com to read {repo_slug}'s issues "
             f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
         )])

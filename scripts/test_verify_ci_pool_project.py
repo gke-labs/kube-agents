@@ -3750,6 +3750,21 @@ class LedgerReadCredentialTest(unittest.TestCase):
         self.assertIn("installation 5002", detail)
         self.assertIn("keep it on reader App 1's installation as well", detail)
 
+    def test_a_project_past_the_tables_last_row_keeps_its_warning_when_the_check_is_not_checked(self):
+        """An operator without the build cluster's kubectl still has to be
+        told the App to register: the rollout warning rides on the
+        "Not checked" result beside the unread reason."""
+        readers = tuple(checker.LedgerReader(1000 + k, 5000 + k, f"secret-{k}") for k in range(3))
+        with mock.patch.object(checker, "LEDGER_READERS", readers), \
+             mock.patch.object(checker, "_read_ledger_app_key", return_value=(None, "kubectl is not on PATH")):
+            result = checker.check_ledger_read_credential("kube-agents-evals-31")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        warning = " ".join(str(w) for w in result.warnings)
+        self.assertIn("kube-agents-evals-31 is on reader App 4", warning)
+        self.assertIn("Register App 4", warning)
+        self.assertIn("kubectl is not on PATH", warning)
+
     def test_a_project_past_the_tables_last_row_is_checked_through_the_first_app_with_a_warning(self):
         """The rollout state: hack/ci-eval-pr.sh reads such a project through
         the first App, so that is what is attested, and the warning names the

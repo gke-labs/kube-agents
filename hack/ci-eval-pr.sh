@@ -1423,7 +1423,15 @@ select_ledger_reader() { # <project id>
     echo "ERROR: ${EVAL_LEDGER_READER_APPS_FILE} names no ledger-reader App; nothing can mint the grading token." >&2
     return 1
   fi
-  read -r -a keys <<< "${EVAL_LEDGER_APP_KEY_FILES:-${EVAL_LEDGER_APP_KEY_FILE:-}}"
+  # Only the list is split on whitespace; the single key file is one entry
+  # whatever it contains, and a list that is set but blank falls back to it
+  # rather than leaving a later App's ids paired with the first App's key.
+  if [ -n "${EVAL_LEDGER_APP_KEY_FILES:-}" ]; then
+    read -r -a keys <<< "${EVAL_LEDGER_APP_KEY_FILES}"
+  fi
+  if [ "${#keys[@]}" -eq 0 ] && [ -n "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    keys=("${EVAL_LEDGER_APP_KEY_FILE}")
+  fi
   shard="$(ledger_reader_shard "$1")"
   # Messages count Apps from 1, as the App names and the file's rows do:
   # "reader App 2 of 5" is the second row, which holds projects 11 to 20.
