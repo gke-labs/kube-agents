@@ -5254,7 +5254,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		// record and the provision Job that earned it still stand. Both go:
 		// the Job runs again now and recreates what is missing, empty, and
 		// Ready and the rendered bridge wait for it.
-		if busMigrationLeg(agent.Status.BusMigration.Leg) == busMigrationGrow {
+		if busMigrationLeg(agent.Status.BusMigration.Leg) != busMigrationShrink {
 			meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
 			if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
 				return err
@@ -5306,6 +5306,16 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
 			return err
 		}
+	}
+	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) && !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		// A run of a leg this operator does not run is held: the bus keeps
+		// the count it runs, and nothing advances.
+		r.holdUnknownBusMigrationLeg(agent)
+		if running == 0 {
+			running = int(agent.Status.BusReplicas)
+		}
+		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3, or what the last pass recorded
+		return nil
 	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
 		// A migration under way decides the count, whatever the field and
