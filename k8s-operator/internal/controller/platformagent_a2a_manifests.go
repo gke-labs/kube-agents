@@ -1106,7 +1106,7 @@ const (
 	// replays before and after its wait -- one asker, two replays, either
 	// way. The operator renders the gateway's A2A_DEFAULT_ADDRESSEE from
 	// spec.harness.tuning.defaultRoute (resolveA2ADefaultRoute); where it
-	// resolves to "platform" (the default, or a fallback) a plain
+	// resolves to "platform" (the opt-out, or a fallback) a plain
 	// conversation's task is a bridge run and a session pod is spawned only
 	// for a Delegate or a session-routed record; the conversations being
 	// asked about while their task runs are therefore the bridge's
@@ -5227,15 +5227,15 @@ func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name core
 }
 
 // a2aSpecDefaultRoute is the route spec.harness.tuning.defaultRoute asks
-// for: DefaultRouteSession when it says `session`, DefaultRoutePlatform when
-// it is unset or says `platform`, so an install that sets nothing routes as
-// it did before the field existed. Only the CRD's two values are routes:
+// for: DefaultRouteSession when it is unset or says `session`,
+// DefaultRoutePlatform when it says `platform`. Only the CRD's two values are routes:
 // anything else that reaches here (a CR written past the schema) is
 // DefaultRoutePlatform rather than an addressee no executor owns. Everything
 // the session route adds (the session cap's fit to TASKS, its condition and
-// the provision Job's wait for it) runs only where this says session.
+// the provision Job's wait for it) runs only where this says session, so
+// `platform` opts out of all of it.
 func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil && *limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
+	if limits := agentTuning(agent); limits == nil || limits.DefaultRoute == nil || *limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
 		return agentv1alpha1.DefaultRouteSession
 	}
 	return agentv1alpha1.DefaultRoutePlatform
@@ -5251,12 +5251,11 @@ func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 //
 // A cap still waiting on its first reading (a2aSessionCapWaiting: a pass on
 // a provisioned bus that could not read its width and has no earlier
-// reading) keeps `session` where the field says so and `platform` where it
-// is unset. An unset field resolves to platform today, so that second case
-// waits on a later change making session the default; until then the wait
-// is an opted-in install's, whose route stays session at maxSessions while
-// resolveA2ASessionCap holds the provision Job, and the pass that reads the
-// width fits the cap. A bus never provisioned does not wait: its TASKS will
+// reading) keeps what the operator before sessions became the default
+// rendered: `session` where the field says so, at maxSessions, and
+// `platform` where it is unset. That is an upgrade's first pass on an
+// unreadable bus; resolveA2ASessionCap holds the provision Job meanwhile,
+// and the pass that reads the width moves the route and fits the cap. A bus never provisioned does not wait: its TASKS will
 // be created at maxSessions' width. With no cap and no wait, which the
 // reconcile never renders on the session route (resolveA2ASessionCap sets
 // one or the other first), the route is the spec's at maxSessions.
@@ -7222,7 +7221,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// where all three become true together.
 		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
 		// Where a plain conversation's first message goes:
-		// spec.harness.tuning.defaultRoute, `platform` when
+		// spec.harness.tuning.defaultRoute, `session` when
 		// unset (resolveA2ADefaultRoute, which on the session
 		// route also reads the fitted session cap). Rendered
 		// explicitly at every value, like A2A_MAX_SESSIONS

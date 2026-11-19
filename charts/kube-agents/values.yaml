@@ -1404,13 +1404,12 @@ platformAgent:
       #     cpu: 150m
       #     memory: 384Mi
       # defaultRoute is where the A2A gateway sends a plain conversation's first
-      # message: platform to the Platform Agent, session to a session pod of the
-      # conversation's own. Unset means platform, today's behaviour. session
-      # opts in, with the session cap fitted to the bus's TASKS stream
-      # (status.effectiveSessionCap). The Platform Agent stays reachable by
-      # handle either way. A change rolls the gateway and the Platform Agent
-      # pod. Against a PlatformAgent CRD that predates the field the chart
-      # fails; apply crds/ first (upgrade.sh does).
+      # message: session to a session pod of the conversation's own, platform to
+      # the Platform Agent. Unset means session, with the session cap fitted to
+      # the bus's TASKS stream (status.effectiveSessionCap); platform opts out.
+      # The Platform Agent stays reachable by handle either way. A change rolls
+      # the gateway and the Platform Agent pod. Against a PlatformAgent CRD that
+      # predates the field the chart fails; apply crds/ first (upgrade.sh does).
       # defaultRoute: platform
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server

@@ -35,9 +35,8 @@ func TestMain(m *testing.M) {
 	for _, name := range operatorEnv {
 		_ = os.Unsetenv(name)
 	}
-	// No golden runs a bus: a golden on the session route reads a fresh one,
-	// with no TASKS stream yet, so its cap renders at maxSessions. The
-	// platform route, every golden's today, reads none.
+	// No golden runs a bus: the session cap reads a fresh one, with no TASKS
+	// stream yet, so it renders at maxSessions on the session route.
 	controller.UseA2ABusWithoutTasksForTesting()
 	os.Exit(m.Run())
 }

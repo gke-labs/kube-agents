@@ -1126,9 +1126,10 @@ type TuningSpec struct {
 	// DefaultRoute is the addressee the A2A gateway sends a plain
 	// conversation's first message to: `session` opens a session pod of the
 	// conversation's own, `platform` hands it to the platform agent. Unset
-	// means `platform`, today's behaviour; a later change, gated on evidence,
-	// makes `session` the default. `platform` stays reachable by handle either
-	// way, and a `delegate:` still opens a session pod on either route. The
+	// means `session`: each new conversation holds a session pod, bounded by
+	// maxSessions and the session idle TTLs. `platform` stays reachable by
+	// handle either way, a `delegate:` still opens a session pod on either
+	// route, and `platform` here opts out of sessions by default. The
 	// operator renders the resolved value as A2A_DEFAULT_ADDRESSEE on the
 	// gateway and on the platform agent container (which the hermes-bridge
 	// sidecar copies), so a change rolls the gateway and the platform agent
@@ -1137,18 +1138,19 @@ type TuningSpec struct {
 	// `session` widens the TASKS consumer budget: each session also counts
 	// the replays of its conversation's task, 7 consumers rather than 3, so
 	// 40 more at the default 10 sessions. TASKS cannot be widened once it
-	// exists, so on `session` the operator reads the stream's live
+	// exists, so on the session route the operator reads the stream's live
 	// max_consumers off the bus and fits the session cap to it
 	// (status.effectiveSessionCap, with the SessionCapFitted condition while
 	// the fit is below maxSessions). A stream with no room for one session
 	// sends plain conversations to `platform` instead. The cap stays fitted
 	// until TASKS is widened: on a one-server bus, busReplicas 3 widens it
 	// and keeps its history, and a planned opt-in TASKS reshape will on any
-	// bus. On an existing install, until the operator has read the bus's
-	// width once, the provision Job waits. While the operator's
-	// A2A_SESSION_CLUSTER_VIEW is on, `session` routes to `platform`, so the
-	// session route never widens what a plain turn reaches. On `platform`
-	// none of this applies.
+	// bus. On an existing install, until the operator has read
+	// the bus's width once, an unset field keeps routing to `platform` and
+	// the provision Job waits. On `platform` no fit applies. While the
+	// operator's A2A_SESSION_CLUSTER_VIEW is on, every install routes to
+	// `platform`, `session` here included, so the default never widens what
+	// a plain turn reaches.
 	// +kubebuilder:validation:Enum=session;platform
 	// +optional
 	DefaultRoute *string `json:"defaultRoute,omitempty"`
@@ -3036,11 +3038,11 @@ type AgentStatus struct {
 	// follows maxSessions. 0 means not one session fits, and plain
 	// conversations go to `platform`. Read off the bus's monitoring
 	// endpoint, at most every five minutes once set; a pass that cannot read
-	// it keeps the value here. Written only where
-	// spec.harness.tuning.defaultRoute is `session`, and not while the
-	// operator's A2A_SESSION_CLUSTER_VIEW is on or before the operator has
-	// read an existing install's bus once. On `platform`, which an unset
-	// field means, a value an earlier opt-in left is cleared.
+	// it keeps the value here. Written on the session route, which an unset
+	// spec.harness.tuning.defaultRoute means, and not while the operator's
+	// A2A_SESSION_CLUSTER_VIEW is on or before the operator has read an
+	// existing install's bus once. On `platform`, the opt-out, a value left
+	// from the session route is cleared.
 	// +optional
 	EffectiveSessionCap *int `json:"effectiveSessionCap,omitempty"`
 }

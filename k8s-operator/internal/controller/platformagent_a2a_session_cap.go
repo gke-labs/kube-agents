@@ -33,9 +33,9 @@ import (
 // The session cap on the session route, fitted to the TASKS stream's live
 // width.
 //
-// All of this runs only where spec.harness.tuning.defaultRoute says
-// `session`. On `platform`, which an unset field resolves to, nothing here
-// runs: no read of the bus, no provision Job wait, and the session cap is
+// All of this runs only on the session route, which an unset
+// spec.harness.tuning.defaultRoute resolves to. On `platform`, the opt-out,
+// nothing here runs: no read of the bus, no provision Job wait, and the session cap is
 // maxSessions. The one write there is clearing a cap and condition an earlier
 // opt-in left (clearA2ASessionCap); an install that never opted in has
 // neither and is not written.
@@ -62,8 +62,10 @@ import (
 // needs (a2aTasksMaxConsumers), so there is
 // nothing to fit, and a fresh install renders the spec's route from its first
 // pass. Only a provisioned bus with no stored cap, an existing install's
-// first pass after it opts in, waits: it renders the session route at the
-// configured cap, holds the provision Job, and says so in the
+// first pass after the upgrade or after it opts in, waits: it renders what
+// the operator before sessions became the default rendered (platform routing
+// where the field is unset, at the configured cap), holds the provision Job,
+// and says so in the
 // SessionCapFitted condition; the reconcile's requeue for the held Job brings
 // the pass that reads it. "No TASKS stream" counts as a reading only on a bus
 // never provisioned. On a provisioned bus a missing TASKS is a server that has
@@ -93,8 +95,8 @@ const (
 	// the provision Job waits and routing stays as it was.
 	sessionCapWaitingReason = "WaitingOnBusWidth"
 	// sessionCapClusterViewReason: the operator's A2A_SESSION_CLUSTER_VIEW is
-	// on, so defaultRoute: session does not engage and plain turns stay
-	// with the platform agent (resolveA2ADefaultRoute).
+	// on, so the session default does not engage and plain turns stay with
+	// the platform agent (resolveA2ADefaultRoute).
 	sessionCapClusterViewReason = "SessionClusterViewOn"
 
 	// sessionCapReadingTTL is how long a reading of the bus's TASKS width is
@@ -115,8 +117,8 @@ const (
 		"spec.harness.tuning.busReplicas to 3 widens it and keeps its history, and the planned opt-in TASKS " +
 		"reshape (gke-labs/kube-agents#6466) will widen it on any bus"
 	sessionCapClusterViewMessage = "the operator's " + a2aSessionClusterViewEnvVar + " is on, so the session pods' temporary cluster view is still rendered " +
-		"and spec.harness.tuning.defaultRoute: session is not engaged: plain conversations stay with platform, " +
-		"so the session route never widens what a plain turn reaches; the view's retirement is tracked in gke-labs/kube-agents#6483"
+		"and the session default is not engaged: plain conversations stay with platform, whatever spec.harness.tuning.defaultRoute says, " +
+		"so the default never widens what a plain turn reaches; the view's retirement is tracked in gke-labs/kube-agents#6483"
 	sessionCapNarrowMessage = "the TASKS stream has room for fewer sessions than spec.harness.tuning.maxSessions on the session route, " +
 		"and a stream's max_consumers cannot change once it exists, so the session cap is fitted to it (status.effectiveSessionCap); " +
 		sessionCapRemedy
@@ -194,7 +196,7 @@ func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *
 // is set in memory for the render and not written.
 func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent) {
 	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
-		// The platform route, the default: no fit applies, and nothing is
+		// The platform route, the opt-out: no fit applies, and nothing is
 		// read off the bus. This reconciler's memory of the route is
 		// dropped, so an install that opts back in reads the bus afresh.
 		key := client.ObjectKeyFromObject(agent)
@@ -305,7 +307,7 @@ func (r *PlatformAgentReconciler) sessionCapStatusPruned(agent *agentv1alpha1.Pl
 // CRD the cap this reconciler last rendered stands in for the stored one.
 func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pruned bool) (*int, *metav1.Condition, string) {
 	if a2aSessionClusterViewEnabled(agent) {
-		// The cluster view holds the session route off (resolveA2ADefaultRoute):
+		// The cluster view holds the session default off (resolveA2ADefaultRoute):
 		// platform routing at maxSessions, and no fit.
 		return nil, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapClusterViewReason, sessionCapClusterViewMessage), ""
 	}
