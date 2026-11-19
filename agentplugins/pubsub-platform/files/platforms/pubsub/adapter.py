@@ -157,7 +157,8 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 
 
 # For the gateway's own API, which is on loopback. No proxy from the
-# environment: a proxy in between would get the API server key on each call.
+# environment: a proxy cannot reach this pod's loopback, so the turn would
+# fail, and the proxy would get the alert's prompt and the call's headers.
 _GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 

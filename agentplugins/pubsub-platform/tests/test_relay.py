@@ -375,7 +375,7 @@ class NoProxyTest(RelayTestCase):
         self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
 
     def test_a_proxy_in_the_environment_is_not_used_to_reach_the_gateway_api(self):
-        """The gateway's API is on loopback, and each call to it has the API server key on it."""
+        """The gateway's API is on loopback: a proxy cannot reach it, and would get the alert's prompt."""
         proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
         os.environ["PLATFORM_API_URL"] = self.broker.url
         os.environ["API_SERVER_KEY"] = "api-server-key"
