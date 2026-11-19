@@ -585,6 +585,57 @@ resource "google_container_node_pool" "declared_zonal_pool" {
   }
 }
 
+# Posture (capacity, reservations): a pool that consumes one named
+# reservation, and that reservation exists in no zone of the project. GKE
+# accepts such a pool at zero nodes and reports it RUNNING; the first node it
+# tries to add is refused, because the reservation is not found. So the pool
+# can never grow, and nothing says so until a workload needs it. The stack
+# plants no reservation: the missing one is the defect, and a reservation
+# with the name below would heal it. Zero nodes cost nothing. No autoscaling,
+# so the stockout SOP's 3.9 (an autoscaling pool in one zone) does not name
+# it; the taint keeps every pod off it. n2-standard-2 is the shape the pool
+# was accepted with; a 20 GB disk as the fleet's other pools, so the drift
+# audit's pool cohort gets no new outlier. Catalogue role:
+# missing-reservation-pool.
+resource "google_container_node_pool" "missing_reservation_pool" {
+  name       = "missing-reservation-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  node_config {
+    machine_type    = "n2-standard-2"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, as on the pools above.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "missing-reservation"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "missing-reservation"
+      effect = "NO_SCHEDULE"
+    }
+
+    reservation_affinity {
+      consume_reservation_type = "SPECIFIC_RESERVATION"
+      key                      = "compute.googleapis.com/reservation-name"
+      values                   = ["seeded-absent-reservation"]
+    }
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's
@@ -931,9 +982,9 @@ resource "google_compute_disk" "orphan_pd" {
 # `sourceDisk` names no live disk, that no snapshot schedule took, and that is
 # more than 90 full days old. Its own exclusion names a legal hold or a
 # compliance retention the collector cannot read, which is why the check is
-# proposed as the stream's one declarable posture: once it is, the pool
-# project's GitOps knowledge/ note declares `declared-orphan-snap-<prefix>`
-# on purpose and the audit lists it under Declared intent, while
+# the stream's one declarable posture: the pool project's GitOps knowledge/
+# note declares `declared-orphan-snap-<prefix>` on purpose and the audit
+# lists it under Declared intent, while
 # `orphan-snap-<prefix>`, undeclared, stays a finding beside it (the control
 # that shows a declaration moved one snapshot and not the check). Catalogue
 # roles: declared-orphan-snapshot and orphan-snapshot.

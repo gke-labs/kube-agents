@@ -646,6 +646,7 @@ var knownPlatformSkills = []string{
 	"gke-ai-troubleshooting-tpu-vbar-oom",
 	"fleet-audit",
 	"fleet-audit-reports",
+	"first-run-report",
 	"fleet-upgrade-verification",
 	"gce-compute-fleet-audit",
 	"gcp-networking-fabric-audit",

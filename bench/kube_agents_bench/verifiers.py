@@ -4453,10 +4453,10 @@ def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
     if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
         return None
     if forges.forge_name() != forges.FORGE_GITHUB:
-        # Only GitHub's evals repositories share one installation's budget.
+        # Only GitHub's evals repositories share an installation's budget (one per shard).
         return f"GitLab rate-limited {what} (answered {status}), so this check could not be evaluated"
     return (
-        f"GitHub rate-limited {what} (answered {status}); the evals repositories share one App "
+        f"GitHub rate-limited {what} (answered {status}); the evals repositories of a shard share one App "
         "installation's hourly budget, so this check could not be evaluated"
     )
 
@@ -8595,6 +8595,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
+        "ingress-gateway-healthcheck-mismatch",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",

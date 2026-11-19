@@ -25,10 +25,35 @@ from unittest import mock
 
 import providers
 import vcs_broker
-from providers.transport import HttpTransport, _RefuseRedirect
+from providers.transport import _ERROR_BODY_BYTES, HttpTransport, _RefuseRedirect
 from workspace_paths import WorkspaceError
 
 BASE = "https://forge.example.test/api/v4"
+# The `max_bytes` of the answer that `nested_past_the_parser` builds; the search
+# tries no document larger than this.
+DEEP_ANSWER_MAX_BYTES = 1 << 20
+# Why a test skips when the search of `nested_past_the_parser` finds no document.
+NO_DOCUMENT_REFUSED = "the JSON parser of this Python parses %d levels, the deepest that this test tries"
+
+
+def nested_past_the_parser(levels, most):
+    """A JSON array nested `levels` deep or deeper that `json.loads` refuses for its
+    depth on this run, or None when one of `most` levels still parses.
+
+    The parser's depth limit is the interpreter's: about 10,000 levels on Python
+    3.12 and 3.13, and on 3.14 as many as the stack holds (more than 100,000
+    with a 16 MB stack). So no fixed depth is past it on every run.
+    """
+    depth = levels
+    while True:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        if depth >= most:
+            return None
+        depth = min(2 * depth, most)
 
 
 class _Response(io.BytesIO):
@@ -408,11 +433,26 @@ class RefusalTest(unittest.TestCase):
 
     def test_a_body_nested_past_the_recursion_limit_keeps_the_status(self):
         # Review finding: RecursionError escaped and the 404 was lost.
-        deep = "[" * 100_000 + "]" * 100_000
-        err = self.refuse(404, deep)
-        self.assertEqual("FORGE_NOT_FOUND", err.fields["code"])
+        with self.subTest("a refusal's body"):
+            # The parser gets the first `_ERROR_BODY_BYTES` of a refusal's body, so
+            # it refuses that body for depth only where its limit is below them.
+            deep = "[" * 100_000 + "]" * 100_000
+            err = self.refuse(404, deep)
+            self.assertEqual("FORGE_NOT_FOUND", err.fields["code"])
+            try:
+                json.loads(deep[:_ERROR_BODY_BYTES])
+            except RecursionError:
+                pass
+            except json.JSONDecodeError:
+                self.skipTest(
+                    "the JSON parser of this Python parses the %d levels that the transport keeps of a refusal's body"
+                    % _ERROR_BODY_BYTES
+                )
+        deep = nested_past_the_parser(100_000, DEEP_ANSWER_MAX_BYTES // 2)
+        if deep is None:
+            self.skipTest(NO_DOCUMENT_REFUSED % (DEEP_ANSWER_MAX_BYTES // 2))
         with self.assertRaises(WorkspaceError) as caught:
-            transport(Opener(_Response(deep.encode())), max_bytes=1 << 20).api("GET", "projects")
+            transport(Opener(_Response(deep.encode())), max_bytes=DEEP_ANSWER_MAX_BYTES).api("GET", "projects")
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
 
     def test_a_body_the_parser_accepts_but_nests_past_the_frame_limit_keeps_the_status(self):

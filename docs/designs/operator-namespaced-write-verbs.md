@@ -56,7 +56,7 @@ and only the Secret reads have a dedicated pin (`TestTheMinimalRoleSecretsReadLa
 The guard in §3 supplies the pin for the rest: the Role document carries write verbs only.
 `dispatchjobtemplates` looked like an exception (no `watch`, read only through the uncached reader
 in the profile namespace, not in the `minimal` ClusterRole), and is not one: the teardown walk
-lists the kind in `<ns>-profiles` on every deletion and every flip to `today`, before any check
+lists the kind in `<ns>-profiles` on every deletion, before any check
 that the namespace or a RoleBinding in it exists. The API server authorises a namespaced `list` before it looks
 for the namespace, so a read in the Role is a 403 there. Its reads stay cluster-wide like every
 other kind's.
@@ -144,7 +144,7 @@ namespace at all, so this is the first time that path carries one.
 
 Guard. `test_C5_the_operators_secret_grant_is_namespaced` becomes
 `test_C5_the_operators_write_verbs_are_namespaced`. Its sources are `role.yaml`
-(`operator_clusterrole`) and a rendered chart: `helm template` with `platformAgent.mode=next`,
+(`operator_clusterrole`) and a rendered chart: `helm template`,
 through a new harness helper. The existing `chart_operator_rbac` source goes through
 `helm_documents`, which reads the template as text and drops every template line, so a `range`
 collapses to one Role and a Role whose rules arrive through an `include` reads as a Role with no
@@ -266,7 +266,7 @@ during the apply can be refused once; the reconcile requeues and the next pass s
 operator pod of the old image, if it outlives the RBAC apply, keeps writing in the install namespace
 under the new Role and reports `RBACIncomplete` for the cluster-wide probes until its replacement
 starts. A kustomize `make deploy` behaves the same, and applies `config/profiles` after
-`config/default`. An install whose profile namespace was created by hand (kustomize, `mode: next`)
+`config/default`. An install whose profile namespace was created by hand (kustomize)
 needs the Role and RoleBinding added there, or under shape (b) the RoleBinding; the self-check names
 the namespace until then. Revert: revert the commits, `make manifests && make chart-sync`, upgrade
 again.
