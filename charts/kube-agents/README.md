@@ -1017,7 +1017,9 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset. Setting `platformAgent.harness.universeDomain` fails
 `helm upgrade` on an install whose served `PlatformAgent` CRD predates
-`spec.harness.universeDomain`; apply this chart's `crds/` directory first. When set
+`spec.harness.universeDomain`; apply this chart's `crds/` directory first. A value under
+`googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
+of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
 `GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
 renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
@@ -1443,7 +1445,12 @@ or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.
 folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
 hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
 provisioning Job, so it overstates both.
-The session pods the install spawns on demand are not counted; the operator caps those with
+It counts the session pods the gateway spawns on demand at their cap:
+`platformAgent.harness.tuning.maxSessions` (10 by default) times one session pod, from
+`files/footprint.yaml`'s `operatorRenderedPerReplica.sessionPod` with each key
+`platformAgent.harness.tuning.sessionResources` sets laid over it, as the operator resolves
+them, and on GKE Autopilot at Autopilot's per-Pod minimums. The refusal says how much of
+what it requires is that share. The operator also caps the session pods with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
@@ -1562,9 +1569,10 @@ apply. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them, but not the preflight's quota gate: it sums
 on every render, a namespace with no ResourceQuota and `helm template` included, so the
-refusals the preflight section lists apply wherever the summary prints. It says what it
-leaves out: the session pods, which the
-[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+refusals the preflight section lists apply wherever the summary prints. Its figures
+and cost are the standing release; it prints the session pods' share at the cap on a line
+of its own, as the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) do.
 
 #### Upgrade notes: operator memory floor
 

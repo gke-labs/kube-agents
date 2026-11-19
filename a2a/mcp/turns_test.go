@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,6 +112,13 @@ func publishSubmissionCorr(t *testing.T, js jetstream.JetStream, addressee, task
 // account does. A core publish, as JetStream here holds TASKS alone.
 func publishProfileSubmission(t *testing.T, nc *nats.Conn, profile, taskID, conversation, text, viaTask string) {
 	t.Helper()
+	publishProfileSubmissionOf(t, nc, lib.SubmitKindChild, profile, taskID, conversation, text, viaTask)
+}
+
+// publishProfileSubmissionOf is publishProfileSubmission for a submission of
+// kind: a child, or a top-level task a turn addressed to the profile.
+func publishProfileSubmissionOf(t *testing.T, nc *nats.Conn, kind, profile, taskID, conversation, text, viaTask string) {
+	t.Helper()
 	msg := mustJSON(t, lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: text}}, MessageID: "m-" + taskID})
 	env, err := lib.NewMessageEnvelope(fakeGateway, taskID, "ctx-"+taskID, "corr-"+taskID, msg, lib.WithAuthority(authorityFor(t, conversation, viaTask)))
 	if err != nil {
@@ -120,7 +128,7 @@ func publishProfileSubmission(t *testing.T, nc *nats.Conn, profile, taskID, conv
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := nc.Publish(lib.TaskSubmitSubject(profile, "unattended", lib.SubmitKindChild, taskID), data); err != nil {
+	if err := nc.Publish(lib.TaskSubmitSubject(profile, "unattended", kind, taskID), data); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -172,8 +180,12 @@ type gatewayScenario struct {
 	// profileChild, with delegate: the child is submitted on a2a.submit, as
 	// for an AgentProfile with the profile dispatcher on (#5494).
 	profileChild bool
-	decoys       bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
-	frames       *frameLog // when set, every frame the gateway reads is recorded
+	// profileDelegates, on an addressed turn: the profile root hands work to
+	// another profile (a delegate artifact) and then finishes with its own
+	// result, as a profile parent does once its children end.
+	profileDelegates bool
+	decoys           bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	frames           *frameLog // when set, every frame the gateway reads is recorded
 	// after, when set, runs once the turn's tasks are published, on its
 	// own goroutine, with the gateway's connection: a card's posts come
 	// from there (publishNotify).
@@ -189,6 +201,15 @@ type gatewayScenario struct {
 	// gateway publishes on can produce. A delay inside noticeSettle is the
 	// notice the window exists to catch; past it, the notice is dropped.
 	lateNotice time.Duration
+	// refuseProfiles maps an addressee to the reason the gateway refuses a
+	// turn naming it (an unknown profile, a tier it doesn't run at, a
+	// target out of scope): a notice and no task, as the console door's
+	// profile routing answers. Any other addressee is taken as an ordinary
+	// turn, so a test can read the frame it came in.
+	refuseProfiles map[string]string
+	// strayLine, on a profile turn, posts another turn's status line
+	// (another task, answering another frame) before this turn's own.
+	strayLine bool
 }
 
 // sentFrame is one console frame as the fake gateway read it.
@@ -197,12 +218,26 @@ type sentFrame struct{ token, text string }
 type frameLog struct {
 	mu     sync.Mutex
 	frames []sentFrame
+	raw    []string
 }
 
 func (l *frameLog) add(f sentFrame) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.frames = append(l.frames, f)
+}
+
+func (l *frameLog) addRaw(data []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.raw = append(l.raw, string(data))
+}
+
+// rawAll is every frame the gateway read, as the bytes it read.
+func (l *frameLog) rawAll() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.raw...)
 }
 
 func (l *frameLog) all() []sentFrame {
@@ -231,9 +266,46 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		}
 		if sc.frames != nil {
 			sc.frames.add(sentFrame{token, f.Text})
+			sc.frames.addRaw(m.Data)
 		}
 		notice := func(text string) {
 			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "n1", Text: text}))
+		}
+		// The addressee is read off the wire, not through the frame type
+		// under test.
+		var addressed struct {
+			Addressee string `json:"addressee"`
+		}
+		_ = json.Unmarshal(m.Data, &addressed)
+		if why, ok := sc.refuseProfiles[addressed.Addressee]; ok && addressed.Addressee != "" {
+			notice("⚠️ not started: " + why)
+			return
+		}
+		if addressed.Addressee != "" {
+			// A profile turn, as the gateway routes one: the submission goes
+			// on a2a.submit, which the console account can't see, and the
+			// status line names the task and its profile.
+			i := n.Add(1)
+			root := fmt.Sprintf("task-root%d", i)
+			publishProfileSubmissionOf(t, nc, lib.SubmitKindTop, addressed.Addressee, root, conv, f.Text, "")
+			if sc.strayLine {
+				// Another client's profile turn on the same conversation (the
+				// page, a second replica, or this server's earlier turn whose
+				// line came late): its line names its own frame, not this one.
+				publishRun(t, js, addressed.Addressee, "task-stray", forgedAnswer, true)
+				_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s0", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: "task-stray", InReplyTo: "page-0123"}))
+			}
+			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: addressed.Addressee, TaskID: root, InReplyTo: f.MessageID}))
+			if sc.profileDelegates {
+				publishStatus(t, js, addressed.Addressee, root, lib.StateSubmitted, false)
+				publishStatus(t, js, addressed.Addressee, root, lib.StateWorking, false)
+				publishArtifact(t, js, addressed.Addressee, root, lib.ArtifactDelegate, "cluster: look at the node pool")
+				publishResult(t, js, addressed.Addressee, root, answerText)
+				publishStatus(t, js, addressed.Addressee, root, lib.StateCompleted, true)
+				return
+			}
+			publishRun(t, js, addressed.Addressee, root, answerText, sc.finish)
+			return
 		}
 		switch f.Text {
 		case statusQuery, statusText:
@@ -642,7 +714,7 @@ func TestACallerThatGivesUpOnTheLockDoesNotSend(t *testing.T) {
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() {
-		_, _, err := b.SendTurn(ctx, convs, token, "queued", time.Minute)
+		_, _, err := b.SendTurn(ctx, convs, token, "queued", TurnAddress{}, time.Minute)
 		errc <- err
 	}()
 	select {
@@ -702,14 +774,24 @@ func TestTurnToolsRefuseBadInput(t *testing.T) {
 		tool string
 		args map[string]any
 	}{
-		"an empty message":     {ToolSendMessage, map[string]any{"text": "  "}},
-		"an oversized message": {ToolSendMessage, map[string]any{"text": strings.Repeat("x", consoleTextCap+1)}},
-		"a wildcard token":     {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "*"}},
-		"a dotted token":       {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "a.b"}},
-		"get without a task":   {ToolTaskControl, map[string]any{"action": "get"}},
-		"a wildcard task id":   {ToolTaskControl, map[string]any{"action": "get", "task": ">"}},
-		"a wildcard addressee": {ToolTaskControl, map[string]any{"action": "get", "task": "*/task-x"}},
-		"an unknown action":    {ToolTaskControl, map[string]any{"action": "steer"}},
+		"an empty message":                        {ToolSendMessage, map[string]any{"text": "  "}},
+		"an oversized message":                    {ToolSendMessage, map[string]any{"text": strings.Repeat("x", consoleTextCap+1)}},
+		"a wildcard token":                        {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "*"}},
+		"a dotted token":                          {ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "a.b"}},
+		"get without a task":                      {ToolTaskControl, map[string]any{"action": "get"}},
+		"a wildcard task id":                      {ToolTaskControl, map[string]any{"action": "get", "task": ">"}},
+		"a wildcard addressee":                    {ToolTaskControl, map[string]any{"action": "get", "task": "*/task-x"}},
+		"an unknown action":                       {ToolTaskControl, map[string]any{"action": "steer"}},
+		"parameters without an addressee":         {ToolSendMessage, map[string]any{"text": "hi", "parameters": map[string]any{"cluster": "c1"}}},
+		"a blank addressee":                       {ToolSendMessage, map[string]any{"text": "hi", "addressee": "  "}},
+		"a wildcard addressee on send":            {ToolSendMessage, map[string]any{"text": "hi", "addressee": "*"}},
+		"a dotted addressee":                      {ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster.x"}},
+		"an addressee with a space":               {ToolSendMessage, map[string]any{"text": "hi", "addressee": "the cluster"}},
+		"a parameter that is not a string":        {ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster", "parameters": map[string]any{"cluster": 3}}},
+		"an addressee on a stop":                  {ToolSendMessage, map[string]any{"text": "stop", "addressee": "cluster"}},
+		"an addressee on a bare /session":         {ToolSendMessage, map[string]any{"text": "/session", "addressee": "cluster"}},
+		"an addressee on /session with a message": {ToolSendMessage, map[string]any{"text": "/session list the pods", "addressee": "cluster"}},
+		"an addressee on /session off":            {ToolSendMessage, map[string]any{"text": "/session off", "addressee": "cluster"}},
 	} {
 		start := time.Now()
 		res := callTool(t, s, args.tool, args.args)
@@ -1123,7 +1205,7 @@ func TestATurnHoldsTheLockUntilItsWatchCloses(t *testing.T) {
 	b := dial(t, url)
 	convs := NewConversations()
 	token, _ := convs.Resolve("c", "")
-	_, w, err := b.SendTurn(context.Background(), convs, token, "hi", time.Minute)
+	_, w, err := b.SendTurn(context.Background(), convs, token, "hi", TurnAddress{}, time.Minute)
 	if err != nil || w == nil {
 		t.Fatalf("SendTurn = %v, %v", w, err)
 	}
@@ -1532,7 +1614,7 @@ func TestASecondMessageLeavesTheFirstTurnsStreamToItsClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "first delegated turn", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "first delegated turn", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -1549,7 +1631,7 @@ func TestASecondMessageLeavesTheFirstTurnsStreamToItsClient(t *testing.T) {
 		publishResult(t, js, "cluster-a", "task-second-child", wakeAnswer)
 		publishStatus(t, js, "cluster-a", "task-second-child", lib.StateCompleted, true)
 	}()
-	res2, w2, err := b.SendTurn(t.Context(), convs, token, "second turn", 5*time.Second)
+	res2, w2, err := b.SendTurn(t.Context(), convs, token, "second turn", TurnAddress{}, 5*time.Second)
 	if err != nil || res2.Task == nil {
 		t.Fatalf("second SendTurn: res=%+v err=%v", res2, err)
 	}
@@ -1733,7 +1815,7 @@ type errOnFirstStepBus struct {
 	firstErr error
 }
 
-func (b *errOnFirstStepBus) SendTurn(_ context.Context, convs *Conversations, token, _ string, _ time.Duration) (TurnResult, *turnWatch, error) {
+func (b *errOnFirstStepBus) SendTurn(_ context.Context, convs *Conversations, token, _ string, _ TurnAddress, _ time.Duration) (TurnResult, *turnWatch, error) {
 	r := b.ref
 	convs.setRunning(token, &r)
 	w := &turnWatch{stop: make(chan struct{}), token: token}
@@ -1828,7 +1910,7 @@ func TestWaitForTurnStepPersistsDelegationSettleAcrossShortPolls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate short polls", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate short polls", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -1921,7 +2003,7 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			res, w, err := b.SendTurn(t.Context(), convs, token, "delegate", 5*time.Second)
+			res, w, err := b.SendTurn(t.Context(), convs, token, "delegate", TurnAddress{}, 5*time.Second)
 			if err != nil || res.Task == nil {
 				t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 			}
@@ -1992,7 +2074,7 @@ func TestAStreamedDelegationSettlesOnTheRootsResultFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -2077,7 +2159,7 @@ func TestACutOffStreamedPollLeavesItsStepsForTheRetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", 5*time.Second)
+			res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", TurnAddress{}, 5*time.Second)
 			if err != nil || res.Task == nil {
 				t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 			}
@@ -2158,7 +2240,7 @@ func TestWaitForTurnStepReusesTaskWatchAcrossPollsWithReapDelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "long streaming turn", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "long streaming turn", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -2240,7 +2322,7 @@ func TestWaitForTurnStepReportsALateActivityOfAStepAlreadyShown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -2317,7 +2399,7 @@ func TestWaitForTurnStepFollowsDelegatedChildAfterTurnWatchCloses(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate long child", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate long child", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -2472,7 +2554,7 @@ func TestAChildThatTrailsItsDelegatingRootIsStillStreamed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate trailing child", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate trailing child", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -2637,7 +2719,7 @@ func TestTheClosingPollAfterAStopDoesNotRepeatSteps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", 5*time.Second)
+	res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", TurnAddress{}, 5*time.Second)
 	if err != nil || res.Task == nil {
 		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
 	}
@@ -2804,4 +2886,191 @@ func TestFollowLinksAnUnseenViaByTheTurnsCorrelation(t *testing.T) {
 	if len(got) != 1 || got[0].TaskID != "task-wake" {
 		t.Fatalf("followed %v; want only task-wake, linked by the turn's correlationId", got)
 	}
+}
+
+// An unaddressed turn's frame is the bytes it always was: no addressee or
+// parameters key, not even an empty one.
+func TestAnUnaddressedTurnsFrameIsUnchanged(t *testing.T) {
+	frames := &frameLog{}
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, frames: frames})
+	if res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi"}); res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	want := regexp.MustCompile(`^\{"messageId":"mcp-[0-9a-f]{16}","text":"hi"\}$`)
+	if got := frames.rawAll(); len(got) != 1 || !want.MatchString(got[0]) {
+		t.Errorf("frames = %q; want one matching %s", got, want)
+	}
+}
+
+// An addressed turn's frame names the AgentProfile and carries its
+// parameters, under the keys the gateway's ConsoleInFrame reads.
+func TestAnAddressedTurnsFrameNamesTheProfile(t *testing.T) {
+	frames := &frameLog{}
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, frames: frames})
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":       "why is checkout crash-looping?",
+		"addressee":  "cluster",
+		"parameters": map[string]any{"project": "p1", "location": "us-central1", "cluster": "c1"},
+	})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	id := regexp.MustCompile(`"messageId":"mcp-[0-9a-f]{16}"`)
+	want := `{"messageId":"ID","text":"why is checkout crash-looping?","addressee":"cluster","parameters":{"cluster":"c1","location":"us-central1","project":"p1"}}`
+	got := frames.rawAll()
+	if len(got) != 1 || id.ReplaceAllString(got[0], `"messageId":"ID"`) != want {
+		t.Errorf("frames = %q; want one %s", got, want)
+	}
+}
+
+// An addressee alone, with no parameters, goes without a parameters key.
+func TestAnAddresseeWithoutParametersSendsNoParametersKey(t *testing.T) {
+	frames := &frameLog{}
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, frames: frames})
+	if res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "addressee": "cluster", "parameters": map[string]any{}}); res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	want := regexp.MustCompile(`^\{"messageId":"mcp-[0-9a-f]{16}","text":"hi","addressee":"cluster"\}$`)
+	if got := frames.rawAll(); len(got) != 1 || !want.MatchString(got[0]) {
+		t.Errorf("frames = %q; want one matching %s", got, want)
+	}
+}
+
+// The gateway's refusal of an addressed turn (here, an unknown profile) is
+// the turn's answer: a notice, and no task.
+func TestAGatewayRefusalOfAnAddressedTurnIsTheAnswer(t *testing.T) {
+	why := `no AgentProfile named "nosuch" is bound on this install`
+	s, _, n, _ := turnServer(t, gatewayScenario{finish: true, refuseProfiles: map[string]string{"nosuch": why}})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "look at it", "addressee": "nosuch"})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "⚠️ not started: "+why)
+	mustNotContain(t, res.Content[0].Text, answerText)
+	if n.Load() != 0 {
+		t.Error("the fake gateway opened a task for a refused profile")
+	}
+}
+
+// send_message advertises the two fields, and says where the profiles a
+// client may address are listed.
+func TestSendMessageAdvertisesAddressing(t *testing.T) {
+	def := SendMessageTool(nil, NewConversations()).Definition
+	props := def.InputSchema["properties"].(map[string]any)
+	addressee, ok := props["addressee"].(map[string]any)
+	if !ok || addressee["type"] != "string" {
+		t.Errorf("addressee = %#v; want a string property", props["addressee"])
+	}
+	params, ok := props["parameters"].(map[string]any)
+	if !ok || params["type"] != "object" {
+		t.Fatalf("parameters = %#v; want an object property", props["parameters"])
+	}
+	if ap, ok := params["additionalProperties"].(map[string]any); !ok || ap["type"] != "string" {
+		t.Errorf("parameters.additionalProperties = %#v; want string values", params["additionalProperties"])
+	}
+	mustContain(t, def.Description, "addressee", "parameters", "read_topics", "cards", "unknown profile", "tier", "scope")
+}
+
+// An addressed turn's task is the one the gateway's status line names, since
+// its submission is on a2a.submit, out of the console's sight; the turn is
+// answered from that task, under its profile, well within the wait.
+func TestAnAddressedTurnIsAnsweredFromTheProfileTask(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true})
+	start := time.Now()
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text": "why is checkout crash-looping?", "addressee": "cluster",
+		"parameters": map[string]any{"project": "p1", "location": "us-central1", "cluster": "c1"},
+	})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
+	if elapsed := time.Since(start); elapsed > noticeGrace {
+		t.Errorf("the answer took %s; it must not wait out the notice grace", elapsed)
+	}
+}
+
+// An addressed turn whose profile task delegated, and then finished with its
+// own result, is answered from that result at once: a profile parent ends
+// after its children, so no wake follows and the chain has ended.
+func TestAnAddressedTurnWhoseProfileDelegatedIsAnsweredAtOnce(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{profileDelegates: true})
+	start := time.Now()
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text": "why is checkout crash-looping?", "addressee": "cluster", "wait_seconds": 30,
+		"parameters": map[string]any{"project": "p1", "location": "us-central1", "cluster": "c1"},
+	})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
+	if strings.Contains(res.Content[0].Text, "still running") {
+		t.Errorf("a finished profile parent was reported as still running:\n%s", res.Content[0].Text)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("the answer took %s; it waited for a wake that never comes", elapsed)
+	}
+}
+
+// An addressed turn still running when the wait ends returns its task, under
+// its profile, for task_control, as a plain turn does.
+func TestARunningAddressedTurnReturnsItsTaskForTaskControl(t *testing.T) {
+	s, js, _, _ := turnServer(t, gatewayScenario{})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "long job", "addressee": "cluster", "wait_seconds": 3})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "cluster/task-root1", "still running")
+	publishResult(t, js, "cluster", "task-root1", answerText)
+	publishStatus(t, js, "cluster", "task-root1", lib.StateCompleted, true)
+	got := callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": "cluster/task-root1", "wait_seconds": 10})
+	if got.IsError || !strings.Contains(got.Content[0].Text, answerText) {
+		t.Errorf("get after finish = %+v", got)
+	}
+}
+
+// A plain turn does not take a task from a notice: its own submission names
+// it, and a notice naming another task (a profile turn's line, say) is shown
+// as a notice and nothing more.
+func TestAPlainTurnTakesNoTaskFromANotice(t *testing.T) {
+	w := &turnWatch{known: map[string]bool{}, messageID: "mcp-mine"}
+	m := &nats.Msg{Data: mustJSON(t, ConsoleOutFrame{MessageID: "s1", Text: "⏳ submitted…", Addressee: "cluster", TaskID: "task-x", InReplyTo: "mcp-mine"})}
+	if _, ok := w.noticedTask(m); ok {
+		t.Error("an unaddressed turn took the task a notice named")
+	}
+	w.addressed = true
+	if ref, ok := w.noticedTask(m); !ok || ref != (TaskRef{Addressee: "cluster", TaskID: "task-x"}) {
+		t.Errorf("an addressed turn's noticed task = %v, %v; want cluster/task-x", ref, ok)
+	}
+	for name, f := range map[string]ConsoleOutFrame{
+		"a result frame":       {MessageID: "r", Text: "x", Kind: "result", Addressee: "cluster", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"an edit":              {MessageID: "s1", Text: "x", Edit: true, Addressee: "cluster", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"no addressee":         {MessageID: "s1", Text: "x", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"a wildcard addressee": {MessageID: "s1", Text: "x", Addressee: "*", TaskID: "task-x", InReplyTo: "mcp-mine"},
+		"a dotted task id":     {MessageID: "s1", Text: "x", Addressee: "cluster", TaskID: "a.b", InReplyTo: "mcp-mine"},
+		// The line of this server's earlier addressed turn, arriving after
+		// that turn gave up on it, answers that turn's frame.
+		"an earlier turn's late line": {MessageID: "s0", Text: "x", Addressee: "cluster", TaskID: "task-prod", InReplyTo: "mcp-earlier"},
+		// Another client on the same token: the page or a second replica.
+		"another client's line": {MessageID: "s2", Text: "x", Addressee: "cluster", TaskID: "task-page", InReplyTo: "page-0123"},
+		// A gateway that names no inbound frame can't say whose turn it is.
+		"a line answering no frame": {MessageID: "s3", Text: "x", Addressee: "cluster", TaskID: "task-x"},
+	} {
+		if _, ok := w.noticedTask(&nats.Msg{Data: mustJSON(t, f)}); ok {
+			t.Errorf("%s named the turn's task", name)
+		}
+	}
+}
+
+// Another turn's status line on the conversation, arriving first, is not
+// taken for this turn's: the answer comes from the task whose line names this
+// turn's own frame.
+func TestAnAddressedTurnSkipsAnotherTurnsStatusLine(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, strayLine: true})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "look at staging", "addressee": "cluster"})
+	if res.IsError {
+		t.Fatalf("result = %+v", res)
+	}
+	mustContain(t, res.Content[0].Text, "Task `cluster/task-root1`: **completed**", answerText)
+	mustNotContain(t, res.Content[0].Text, "task-stray", forgedAnswer)
 }

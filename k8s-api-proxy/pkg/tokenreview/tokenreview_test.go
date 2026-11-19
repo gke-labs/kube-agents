@@ -1,9 +1,12 @@
-package k8sapiproxy
+package tokenreview
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -13,14 +16,18 @@ import (
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/client-go/rest"
+
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
 )
 
 const (
-	testAudience      = "kube-agents-k8s-api-proxy"
-	testReviewerToken = "proxy-sa-token"
-	testCallerToken   = "caller-token"
-	shellUsername     = "system:serviceaccount:agents:shell"
-	tokenReviewPath   = "/apis/authentication.k8s.io/v1/tokenreviews"
+	testContentTypeJSON   = "application/json"
+	testHeaderContentType = "Content-Type"
+	testAudience          = "kube-agents-k8s-api-proxy"
+	testReviewerToken     = "proxy-sa-token"
+	testCallerToken       = "caller-token"
+	shellUsername         = "system:serviceaccount:agents:shell"
+	tokenReviewPath       = "/apis/authentication.k8s.io/v1/tokenreviews"
 	// The Basic credentials are fake. This package's tests build their Basic headers at run
 	// time with basicAuthHeader, so no literal in this package reads as a credential to a
 	// secret scanner.
@@ -29,7 +36,7 @@ const (
 )
 
 // jsonContent makes the client send JSON, which the fake decodes; it defaults to protobuf.
-var jsonContent = rest.ContentConfig{ContentType: contentTypeJSON}
+var jsonContent = rest.ContentConfig{ContentType: testContentTypeJSON}
 
 // fakeTokenReviewServer answers TokenReviews with status and records each request.
 type fakeTokenReviewServer struct {
@@ -59,7 +66,7 @@ func (f *fakeTokenReviewServer) ServeHTTP(w http.ResponseWriter, r *http.Request
 		return
 	}
 	review.Status = f.status
-	w.Header().Set(headerContentType, contentTypeJSON)
+	w.Header().Set(testHeaderContentType, testContentTypeJSON)
 	_ = json.NewEncoder(w).Encode(review)
 }
 
@@ -77,17 +84,17 @@ func shellReview() authenticationv1.TokenReviewStatus {
 	}
 }
 
-func newTestTokenReviewAuthenticator(t *testing.T, fake *fakeTokenReviewServer) CallerAuthenticator {
+func newTestTokenReviewAuthenticator(t *testing.T, fake *fakeTokenReviewServer) k8sapiproxy.CallerAuthenticator {
 	t.Helper()
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
-	a, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+	a, err := NewAuthenticator(Config{
 		Kubernetes:     &rest.Config{Host: srv.URL, BearerToken: testReviewerToken, ContentConfig: jsonContent},
 		Audience:       testAudience,
 		AllowedCallers: []string{shellUsername},
 	})
 	if err != nil {
-		t.Fatalf("NewTokenReviewAuthenticator: %v", err)
+		t.Fatalf("NewAuthenticator: %v", err)
 	}
 	return a
 }
@@ -106,23 +113,23 @@ func bearerRequest(token string) *http.Request {
 }
 
 func TestNewTokenReviewAuthenticatorConfig(t *testing.T) {
-	valid := func() TokenReviewConfig {
-		return TokenReviewConfig{Kubernetes: &rest.Config{Host: "https://127.0.0.1"}, Audience: testAudience, AllowedCallers: []string{shellUsername}}
+	valid := func() Config {
+		return Config{Kubernetes: &rest.Config{Host: "https://127.0.0.1"}, Audience: testAudience, AllowedCallers: []string{shellUsername}}
 	}
-	if _, err := NewTokenReviewAuthenticator(valid()); err != nil {
+	if _, err := NewAuthenticator(valid()); err != nil {
 		t.Fatalf("valid config: %v", err)
 	}
-	for name, mutate := range map[string]func(*TokenReviewConfig){
-		"no Kubernetes": func(c *TokenReviewConfig) { c.Kubernetes = nil },
-		"no audience":   func(c *TokenReviewConfig) { c.Audience = "  " },
-		"no callers":    func(c *TokenReviewConfig) { c.AllowedCallers = nil },
-		"blank callers": func(c *TokenReviewConfig) { c.AllowedCallers = []string{"", " "} },
+	for name, mutate := range map[string]func(*Config){
+		"no Kubernetes": func(c *Config) { c.Kubernetes = nil },
+		"no audience":   func(c *Config) { c.Audience = "  " },
+		"no callers":    func(c *Config) { c.AllowedCallers = nil },
+		"blank callers": func(c *Config) { c.AllowedCallers = []string{"", " "} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := valid()
 			mutate(&cfg)
-			if _, err := NewTokenReviewAuthenticator(cfg); err == nil {
-				t.Error("NewTokenReviewAuthenticator accepted the config")
+			if _, err := NewAuthenticator(cfg); err == nil {
+				t.Error("NewAuthenticator accepted the config")
 			}
 		})
 	}
@@ -204,7 +211,7 @@ func TestTokenReviewAuthenticatorRefuses(t *testing.T) {
 				if strings.Contains(err.Error(), testCallerToken) {
 					t.Errorf("error %q contains the caller's token", err)
 				}
-				if got := errors.Is(err, errAuthenticationUnavailable); got != tc.unavailable {
+				if got := errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable); got != tc.unavailable {
 					t.Errorf("error %q: unavailable = %t, want %t", err, got, tc.unavailable)
 				}
 			}
@@ -215,9 +222,43 @@ func TestTokenReviewAuthenticatorRefuses(t *testing.T) {
 	}
 }
 
+// recordingUpstream answers every forwarded request with an empty PodList and keeps the last one.
+type recordingUpstream struct{ req *http.Request }
+
+func (u *recordingUpstream) RoundTripCluster(_ context.Context, _ string, req *http.Request) (*http.Response, error) {
+	u.req = req.Clone(context.Background())
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{testHeaderContentType: []string{testContentTypeJSON}},
+		Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[]}`)),
+		Request:    req,
+	}, nil
+}
+
+func newTestHandler(t *testing.T, a k8sapiproxy.CallerAuthenticator) (http.Handler, *recordingUpstream) {
+	t.Helper()
+	upstream := &recordingUpstream{}
+	h, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+		Authenticator: a,
+		Upstream:      upstream,
+		Policy:        k8sapiproxy.Policy{Mode: k8sapiproxy.ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return h, upstream
+}
+
+func serve(h http.Handler, req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestHandlerWithTokenReviewAuthenticator(t *testing.T) {
 	a := newTestTokenReviewAuthenticator(t, &fakeTokenReviewServer{status: shellReview()})
-	h, upstream := newTestHandler(t, Config{Authenticator: a})
+	h, upstream := newTestHandler(t, a)
 	if rec := serve(h, bearerRequest(testCallerToken)); rec.Code != http.StatusOK {
 		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -232,13 +273,13 @@ func TestHandlerWithTokenReviewAuthenticator(t *testing.T) {
 	fake := &fakeTokenReviewServer{code: http.StatusInternalServerError}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
-	a, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+	a, err := NewAuthenticator(Config{
 		Kubernetes: &rest.Config{Host: srv.URL, ContentConfig: jsonContent}, Audience: testAudience, AllowedCallers: []string{shellUsername},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, _ = newTestHandler(t, Config{Authenticator: a})
+	h, _ = newTestHandler(t, a)
 	rec := serve(h, bearerRequest(testCallerToken))
 	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), srv.Listener.Addr().String()) {
 		t.Errorf("failed review: code %d, body %s", rec.Code, rec.Body.String())
@@ -261,7 +302,7 @@ func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
 	}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
-	a, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+	a, err := NewAuthenticator(Config{
 		Kubernetes:     &rest.Config{Host: srv.URL, BearerToken: testReviewerToken, ContentConfig: jsonContent},
 		Audience:       testAudience,
 		AllowedCallers: []string{shellUsername},
@@ -271,7 +312,7 @@ func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewTokenReviewAuthenticator: %v", err)
+		t.Fatalf("NewAuthenticator: %v", err)
 	}
 	id, err := a.AuthenticateRequest(bearerRequest("profile-token"))
 	if err != nil {
@@ -291,7 +332,7 @@ func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
 	}
 
 	// Colliding audience between Audience and AudienceCallers is rejected at construction.
-	if _, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+	if _, err := NewAuthenticator(Config{
 		Kubernetes:      &rest.Config{Host: srv.URL, ContentConfig: jsonContent},
 		Audience:        testAudience,
 		AllowedCallers:  []string{shellUsername},
@@ -301,7 +342,7 @@ func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
 	}
 
 	// Overlapping caller across AllowedCallers and AudienceCallers is rejected at construction.
-	if _, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+	if _, err := NewAuthenticator(Config{
 		Kubernetes:      &rest.Config{Host: srv.URL, ContentConfig: jsonContent},
 		Audience:        testAudience,
 		AllowedCallers:  []string{shellUsername, sessionUsername},

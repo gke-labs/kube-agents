@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -63,6 +64,29 @@ func TestTheConsoleNotifierPostsOneFrameNamingTheTurn(t *testing.T) {
 	}
 	if len(conv.posts) != 0 {
 		t.Fatalf("the report also went out as chat posts: %+v", conv.posts)
+	}
+}
+
+// A post marked as a card's report that names its task is kept for the
+// reply under it. Not kept: a progress note on a console card (reply_to,
+// no update, no report mark: the console's rolling lines are unkeyed, since
+// the stand-in cannot edit), a keyed plan line, a report naming no task,
+// and a post that was refused; so a sibling card's note never shadows a
+// report.
+func TestTheConsoleNotifierKeepsReportsOnly(t *testing.T) {
+	n, _, conv := newTestConsoleNotifier(t)
+	serveJSON(t, n, lib.NotifyRequest{Text: "np-quartz-7 is at 92%", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7", Report: true})
+	serveJSON(t, n, lib.NotifyRequest{Text: "⏳ reading pod state", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7"})
+	serveJSON(t, n, lib.NotifyRequest{Text: "1 of 3", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-7", Update: "plan"})
+	serveJSON(t, n, lib.NotifyRequest{Text: "a report on no task", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, Report: true})
+	serveJSON(t, n, lib.NotifyRequest{Text: "refused", Conversation: testConsoleConversation, ContextID: "ctx-other", Report: true})
+	want := []string{testConsoleConversation + " task-7 np-quartz-7 is at 92%"}
+	if !reflect.DeepEqual(conv.kept, want) {
+		t.Fatalf("kept = %q, want %q", conv.kept, want)
 	}
 }
 

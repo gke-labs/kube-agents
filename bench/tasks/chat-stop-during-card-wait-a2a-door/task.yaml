@@ -1,7 +1,6 @@
-# Registered in hack/eval/nightly-cases.txt (nightly tier), and in
-# hack/eval/api-lane-exclusions.txt with every stopped ask. Whatever the lane's
+# Registered in hack/eval/nightly-cases.txt (nightly tier). Whatever the lane's
 # AGENT_TRANSPORT, the harness sends it through the gateway's A2A door, which
-# hack/ci-deploy.sh turns on for every EVAL_MODE_NEXT=1 install (#5407).
+# hack/ci-deploy.sh turns on for every eval install (#5407).
 #
 # Domain: chat-and-routing.
 # Journey: an A2A caller asks for a change the Planning Agent hands to a kanban

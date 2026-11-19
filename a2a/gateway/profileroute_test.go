@@ -329,6 +329,22 @@ func TestAProfileParentDelegatesWaitsAndEndsItsChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	childEnv := submissionOn(t, r, "prod-east")
+	// A delegated child's status line names neither its profile nor a
+	// turn: only a top-level profile task's line does, for the console
+	// client whose turn started it.
+	waitFor(t, "the child's status line", func() bool {
+		for _, m := range r.adapter.stopPostsCopy() {
+			if m.Stop == childEnv.TaskID {
+				return true
+			}
+		}
+		return false
+	})
+	for _, m := range r.adapter.stopPostsCopy() {
+		if m.Stop == childEnv.TaskID && (m.Profile != "" || m.InReplyTo != "") {
+			t.Errorf("the child's status line names profile %q, answering %q", m.Profile, m.InReplyTo)
+		}
+	}
 	childSubject := ""
 	for _, e := range streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>") {
 		childSubject = e.subject
@@ -825,5 +841,41 @@ func TestADelegationToANoTargetProfileIsHeldToItsCard(t *testing.T) {
 	})
 	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"triage.>"); len(envs) != 0 {
 		t.Fatalf("%d submission(s) for a refused delegation", len(envs))
+	}
+}
+
+// A profile turn's status line names the profile its task went to, beside
+// the task (Stop): a console client can't see a profile's submission, so the
+// console door puts both on the frame. A plain turn's line names none.
+func TestAProfileTurnsStatusLineNamesItsProfile(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	r.adapter.inbox <- profileTurn("discord:3/1", "cluster", targetParams("p1", "us-east1", "prod"))
+	var line OutMessage
+	waitFor(t, "the profile task's status line", func() bool {
+		for _, m := range r.adapter.stopPostsCopy() {
+			if strings.HasPrefix(m.Text, "⏳ submitted") {
+				line = m
+				return true
+			}
+		}
+		return false
+	})
+	if line.Profile != "prod-east" {
+		t.Errorf("status line profile = %q, want the resolved profile prod-east", line.Profile)
+	}
+	if line.InReplyTo != "m-discord:3/1" {
+		t.Errorf("status line answers %q, want the turn's message id m-discord:3/1", line.InReplyTo)
+	}
+	sub := submissionOn(t, r, "prod-east")
+	if line.Stop != sub.TaskID {
+		t.Errorf("status line task = %q, want the submitted task %q", line.Stop, sub.TaskID)
+	}
+
+	plain := startProfileRig(t)
+	plain.adapter.inbox <- InboundMessage{Conversation: "discord:3/2", Kind: "dm", AuthorID: "1001", MessageID: "m-plain", Text: "hello"}
+	waitFor(t, "the plain task's status line", func() bool { return len(plain.adapter.stopPostsCopy()) > 0 })
+	if p := plain.adapter.stopPostsCopy()[0]; p.Profile != "" || p.InReplyTo != "" {
+		t.Errorf("a plain turn's status line names profile %q, answering %q", p.Profile, p.InReplyTo)
 	}
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -110,6 +111,61 @@ class ClientUniverseDomainTest(EnvironmentRestoredTestCase):
             ),
             CUSTOM_UNIVERSE,
         )
+
+    def test_a_universe_domain_under_googleapis_com_is_refused(self) -> None:
+        # `<service>.mtls.googleapis.com` is a host of the commercial universe,
+        # so a value under googleapis.com names no other universe.
+        for under in ("mtls.googleapis.com", " MTLS.GoogleAPIs.com. ", "a.b.googleapis.com"):
+            with self.subTest(under=under):
+                with self.assertRaises(ValueError):
+                    credential_proxy_client.normalize_universe_domain(under)
+                with self.assertRaises(ValueError):
+                    credential_proxy_client.google_universe_domain(
+                        {"GOOGLE_CLOUD_UNIVERSE_DOMAIN": under}
+                    )
+                # What the broker's `serve` calls before it starts a listener.
+                with self.assertRaises(ValueError):
+                    credential_proxy.resolve_universe_domain(
+                        environ={"GOOGLE_CLOUD_UNIVERSE_DOMAIN": under}
+                    )
+        # The issue's request: the relay has no routed host in such a value.
+        decision = api_policy.evaluate(
+            "GET", "monitoring.mtls.googleapis.com", "v3/projects/sample-project/timeSeries", "",
+            universe_domain="mtls.googleapis.com",
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.rule_id, api_policy.RULE_HOST)
+        # The commercial domain itself, and domains that only look like it, are as before.
+        for accepted, normalized in (
+            ("googleapis.com", "googleapis.com"),
+            (" GoogleAPIs.com. ", "googleapis.com"),
+            ("notgoogleapis.com", "notgoogleapis.com"),
+            ("googleapis.com.example", "googleapis.com.example"),
+            (CUSTOM_UNIVERSE, CUSTOM_UNIVERSE),
+        ):
+            with self.subTest(accepted=accepted):
+                self.assertEqual(normalized, credential_proxy_client.normalize_universe_domain(accepted))
+
+    def test_the_broker_does_not_start_with_a_universe_domain_under_googleapis_com(self) -> None:
+        # The real entry point in a new interpreter, as the pod starts it: the
+        # value is refused before a listener exists.
+        with tempfile.TemporaryDirectory() as temp:
+            policy = Path(temp) / "policy.json"
+            policy.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+            listener = Path(temp) / "broker.sock"
+            environment = {
+                name: value for name, value in os.environ.items() if not name.startswith("CREDENTIAL_PROXY_")
+            }
+            environment["GOOGLE_CLOUD_UNIVERSE_DOMAIN"] = "mtls.googleapis.com"
+            completed = subprocess.run(
+                [sys.executable, credential_proxy.__file__, "--policy", str(policy), "--unix-socket", str(listener)],
+                env=environment, capture_output=True, text=True, timeout=60, check=False,
+            )
+            self.assertFalse(listener.exists())
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stderr)
+        last = json.loads(completed.stdout.splitlines()[-1])
+        self.assertEqual("credential proxy failed to start type=ValueError", last["message"])
+        self.assertIn("mtls.googleapis.com", last["exception"])
 
     def test_api_session_rewrites_googleapis_host_in_custom_universe(self) -> None:
         fake_http = mock.MagicMock()
