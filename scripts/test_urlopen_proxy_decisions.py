@@ -196,11 +196,13 @@ THIS_FILE = "scripts/test_urlopen_proxy_decisions.py"
 
 
 def _refuses_the_proxy(call: ast.Call) -> bool:
-    """Whether a `build_opener(...)` call has `ProxyHandler({})` among its arguments."""
+    """Whether a `build_opener(...)` call has `ProxyHandler({})` among its arguments, by attribute or by bare name."""
     return any(
         isinstance(argument, ast.Call)
-        and isinstance(argument.func, ast.Attribute)
-        and argument.func.attr == PROXY_HANDLER
+        and (
+            (isinstance(argument.func, ast.Attribute) and argument.func.attr == PROXY_HANDLER)
+            or (isinstance(argument.func, ast.Name) and argument.func.id == PROXY_HANDLER)
+        )
         and len(argument.args) == 1
         and isinstance(argument.args[0], ast.Dict)
         and not argument.args[0].keys
@@ -318,6 +320,8 @@ class CallSitesTest(unittest.TestCase):
         cases = (
             ("urllib.request.build_opener(urllib.request.ProxyHandler({}))", REFUSES),
             ("urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())", REFUSES),
+            ("build_opener(ProxyHandler({}))", REFUSES),
+            ("build_opener(ProxyHandler())", TAKES),
             ("urllib.request.build_opener(_NoRedirect())", TAKES),
             ("urllib.request.build_opener()", TAKES),
             ("urllib.request.build_opener(urllib.request.ProxyHandler())", TAKES),
