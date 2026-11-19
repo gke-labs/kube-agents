@@ -3395,6 +3395,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
 	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
+	ref.Lineless = lineless
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
 		// The message the chain's mark is drawn on (mark.go).

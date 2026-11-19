@@ -1131,6 +1131,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// (slack_stop.go), Google Chat's on the line, as does a stop typed
 		// on Google Chat with a line (chat_stop_press.go).
 		switch {
+		case muted && ref.Lineless && !ref.QuietCancel:
+			// A canceled task started with no line at all (a backend that
+			// shows task status itself gives a delegated child none) would
+			// otherwise end unseen after the stop's "cancel sent": its one
+			// "🛑 canceled" is the only end the room can read. Every other
+			// late write of it stays dropped.
+			g.post(rec.Key, terminalNotice(lib.StateCanceled, ""))
 		case muted:
 			g.logCanceledDrop(rec, taskID, droppedTerminal)
 		case s.Status.State != lib.StateCanceled || !ref.QuietCancel:

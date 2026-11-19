@@ -417,6 +417,11 @@ type TaskRef struct {
 	// parent's line is kept here to close on the parent's terminal. A batch
 	// child, which never takes ActiveTask, keeps its own line here too.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// Lineless marks a task started with no rolling line at all: its
+	// backend shows task status itself (startTaskWith). A canceled one has
+	// no line to close at 🛑, so its terminal posts its one "🛑 canceled"
+	// (relayTerminal). Entries written before it read false, as before.
+	Lineless bool `json:"lineless,omitempty"`
 	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
 	// with its line because the child never holds the active task, whose
 	// LineNote the single-child path reads.

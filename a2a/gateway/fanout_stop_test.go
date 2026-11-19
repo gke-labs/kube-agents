@@ -466,3 +466,39 @@ func TestAStoppedFanOutChildWritesNothingLate(t *testing.T) {
 		t.Fatal("a stopped fan-out child woke the session")
 	}
 }
+
+// TestAStoppedChildWithNoLineStillSaysItEnded: on a backend that shows a
+// task's status itself (Slack's Agent Sessions), a delegated child has no
+// rolling line, so nothing in the room closes at 🛑 when it's stopped. Its
+// terminal still posts the one "🛑 canceled" the stop's "cancel sent"
+// promises; every other late write of the canceled child stays dropped.
+func TestAStoppedChildWithNoLineStillSaysItEnded(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
+		return statusShowingAdapter{a}
+	})
+	conv := "discord:g1/t-stop-lineless-child"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	if ref := refOf(t, r, conv, child.TaskID); ref.StatusMsgID != "" {
+		t.Fatalf("the child has a line (%q); this test needs a lineless child", ref.StatusMsgID)
+	}
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
+	exec := r.execFor(t, child, targetPlatform)
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "late progress"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the one canceled notice", func() bool { return countPosts(r, "canceled") >= 1 })
+	if n := countPosts(r, "canceled"); n != 1 {
+		t.Fatalf("%d canceled posts, want exactly 1: %q", n, r.adapter.postTexts())
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "late progress") {
+			t.Fatalf("a late write of the canceled child posted: %q", p)
+		}
+	}
+}
