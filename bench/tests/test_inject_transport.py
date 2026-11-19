@@ -274,6 +274,12 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # as the task is active -- what the real gateway answers for a task an
     # executor took. "" is a stream with no event.
     executor_states: list[str]
+    # Entries the stub appends at the start of the first probed read after
+    # finish_after_active_reads reads of the active task, so a test can
+    # finish the task after the harness has seen given states, whatever the
+    # runner's speed. 0 leaves the entries alone.
+    on_finish: list[dict[str, Any]]
+    finish_after_active_reads: int = 0
     probed_reads: int = 0
     active_reads: int = 0
     # Overrides on the probe. probe_active None derives it: active until the
@@ -364,6 +370,13 @@ class _StubGatewayServer(ThreadingHTTPServer):
 
     def probe_report(self, task: str = "", chain: bool = False) -> dict[str, Any]:
         self.probed_reads += 1
+        if (
+            self.finish_after_active_reads
+            and self.active_reads >= self.finish_after_active_reads
+            and self.on_finish
+        ):
+            self.entries = self.entries + self.on_finish
+            self.on_finish = []
         finished = any(
             e["kind"] == inject.ENTRY_TERMINAL and e.get("taskId") == self.task_id
             for e in self.entries
@@ -445,6 +458,7 @@ def stub_gateway(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubGatewayServe
     server.calls = []
     server.on_cancel = []
     server.executor_states = []
+    server.on_finish = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_TRANSPORT", "inject")
@@ -717,18 +731,15 @@ def test_the_record_carries_the_lifecycle_as_status_events(
     transport uses, and the final one is what rung 3 accepts in place of a
     token count. Tokens stay null (the stub reports no usage); latency is the harness's."""
     stub_gateway.executor_states = ["submitted", "working"]
-    # Let two reads see the task running before the terminal appears.
     stub_gateway.entries = running_transcript(stub_gateway.task_id)
-
-    def finish() -> None:
-        time.sleep(0.3)
-        stub_gateway.entries = stub_gateway.entries + [
-            entry(4, inject.ENTRY_POST, text="all quiet", messageId=RESULT_ID),
-            entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="completed",
-                  source=inject.TERMINAL_SOURCE_EXECUTOR),
-        ]
-
-    threading.Thread(target=finish, daemon=True).start()
+    # Two reads see the task running before the terminal appears. Counted in
+    # reads, not seconds: a timer lost the race on a slow runner (#6212).
+    stub_gateway.finish_after_active_reads = len(stub_gateway.executor_states)
+    stub_gateway.on_finish = [
+        entry(4, inject.ENTRY_POST, text="all quiet", messageId=RESULT_ID),
+        entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="completed",
+              source=inject.TERMINAL_SOURCE_EXECUTOR),
+    ]
     result = KubeAgentsHarness().run("watch it")
 
     assert result.output == "all quiet"
@@ -1002,12 +1013,10 @@ def test_a_task_inside_the_grace_is_still_waited_for(stub_gateway: _StubGatewayS
     stub_gateway.entries = running_transcript(stub_gateway.task_id)[:2]
     stub_gateway.executor_states = ["", "", "working"]
     stub_gateway.probe_age_seconds = 0
-
-    def finish() -> None:
-        time.sleep(0.4)
-        stub_gateway.entries = completed_transcript(stub_gateway.task_id, "late but fine")
-
-    threading.Thread(target=finish, daemon=True).start()
+    # Finish only after every scripted state was read, so the run reaches the
+    # in-grace reads however slow the runner is.
+    stub_gateway.finish_after_active_reads = len(stub_gateway.executor_states)
+    stub_gateway.on_finish = completed_transcript(stub_gateway.task_id, "late but fine")[2:]
     result = KubeAgentsHarness().run("patience")
 
     assert result.output == "late but fine"
@@ -1023,7 +1032,7 @@ def test_a_failed_task_is_graded_rather_than_classified(
     stub_gateway.entries = [
         entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
         entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
-        entry(3, inject.ENTRY_POST, text="❌ failed: the cluster is unreachable", messageId=RESULT_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed — the cluster is unreachable", messageId=RESULT_ID),
         entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
               source=inject.TERMINAL_SOURCE_EXECUTOR,
               reason="reason: hermes-exited-nonzero - exit status 1"),
@@ -1048,7 +1057,7 @@ def test_an_executors_own_failure_is_infrastructure(
     stub_gateway.entries = [
         entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
         entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
-        entry(3, inject.ENTRY_POST, text=f"❌ failed: reason: {token}", messageId=RESULT_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed — detail here", messageId=RESULT_ID),
         entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
               source=inject.TERMINAL_SOURCE_EXECUTOR, reason=f"reason: {token} - detail here"),
     ]
@@ -3705,6 +3714,35 @@ def test_a_withheld_turn_keeps_the_captures_own_gap_entry(
     assert scoring._inject_blind(result.trajectory)
 
 
+def test_a_withheld_turn_keeps_the_no_worker_calls_entry(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a door that showed no trace, a card closed with no worker call keeps
+    ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` on the trajectory: nothing is
+    withheld, no withheld gap entry is added, and the record still reads as
+    blind."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {CARD_A: ""})
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: [])
+    monkeypatch.setattr(board, "read_board_cards", lambda shell, ids, to: {CARD_A: board.BoardCard("done")})
+
+    def capture(shell: Any, task_ids: list[str], timeout: float) -> Any:
+        return worker_trajectory.WorkerCapture(entries=[], summary={"cards": {CARD_A: {"sessions": ["s1"]}}})
+
+    monkeypatch.setattr(worker_trajectory, "capture", capture)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert worker_trajectory.no_worker_calls_entry([CARD_A]) in result.trajectory
+    assert worker_trajectory.GAP_ENTRY not in [e.get("name") for e in result.trajectory]
+    assert result.metadata["worker_entries_withheld"] == 0
+    assert scoring._inject_blind(result.trajectory)
+
+
 def _failing_first(shell: Any, failures: int) -> Any:
     """``shell`` with its first ``failures`` session-cards reads failing."""
     seen = []
@@ -4545,3 +4583,44 @@ def test_a_cancel_settle_adopted_off_the_stream_still_carries_the_usage(
 
     assert any("did not reach a terminal state" in e for e in result.errors)
     assert (result.tokens["input"], result.tokens["output"], result.tokens["total"]) == (1500, 200, 1700)
+
+
+def test_a_profile_directive_addresses_the_opening_turn_to_that_profile(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """[bench:profile ...] sends the opening turn to the named profile with its
+    parameters (#5945), and the directive itself never reaches the agent."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run(
+        "[bench:profile name=cluster project=p1 location=us-east1 cluster=prod] what's failing in kube-system"
+    )
+
+    opening = stub_gateway.submissions[0]
+    assert opening["profile"] == "cluster"
+    assert opening["parameters"] == {"project": "p1", "location": "us-east1", "cluster": "prod"}
+    assert opening["text"] == "what's failing in kube-system"
+
+
+def test_a_prompt_without_the_directive_sends_no_profile(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("what's failing in kube-system")
+
+    assert "profile" not in stub_gateway.submissions[0]
+    assert "parameters" not in stub_gateway.submissions[0]
+
+
+def test_a_malformed_profile_directive_errors_and_sends_nothing(stub_gateway: _StubGatewayServer) -> None:
+    result = KubeAgentsHarness().run("[bench:profile project=p1] no name given")
+
+    assert result.errors and "name= is required" in result.errors[0]
+    assert stub_gateway.submissions == []
+
+
+def test_the_api_transport_refuses_a_profile_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the inject door can address a profile; over api the directive would
+    reach the agent as text and be graded, so the run errors instead."""
+    monkeypatch.setenv("AGENT_TRANSPORT", harness.TRANSPORT_API)
+    result = KubeAgentsHarness().run("[bench:profile name=cluster project=p1 location=l cluster=c] ask")
+    assert result.errors and "needs AGENT_TRANSPORT=inject" in result.errors[0]

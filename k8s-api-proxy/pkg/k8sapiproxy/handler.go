@@ -54,6 +54,18 @@ type Config struct {
 	TracerProvider trace.TracerProvider
 	// Cache configures HTTP response caching and in-flight request coalescing; disabled when nil.
 	Cache *CacheConfig
+	// Exclusions refuses every request to a cluster spec.scope.exclude.clusters names,
+	// before policy, cache or upstream; nil excludes nothing.
+	Exclusions *Exclusions
+	// CallerPartition names the upstream credential an authenticated caller's requests use,
+	// for an Upstream that chooses a credential per caller or tenant. Its value is part of
+	// the cache key and the in-flight coalescing key, so requests share a cached response or
+	// an upstream fetch only within one partition, and the Upstream reads it with
+	// PartitionFromContext. Nil puts every caller in one partition: the handler then shares
+	// responses across callers, which is safe only when the Upstream uses one credential.
+	// It runs once per authenticated request, refused ones included, with a non-nil caller,
+	// and must not panic.
+	CallerPartition func(*CallerIdentity) string
 	// MaxInFlight caps the forwarded requests in flight; one over it is answered 429 with
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
 	// bounds its memory. Watches and long-running subresources do not count. Zero is no cap.
@@ -65,11 +77,13 @@ type auditEventKey struct{}
 
 type handler struct {
 	authenticator  CallerAuthenticator
+	exclusions     *Exclusions
 	policy         Policy
 	audit          AuditSink
 	metrics        *Metrics
 	tracerProvider trace.TracerProvider
 	cache          *responseCache
+	partition      func(*CallerIdentity) string
 	factory        *request.RequestInfoFactory
 	proxy          *httputil.ReverseProxy
 	// slots holds one token per counted request in flight; nil when there is no cap.
@@ -127,11 +141,13 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	}
 	return &handler{
 		authenticator:  cfg.Authenticator,
+		exclusions:     cfg.Exclusions,
 		policy:         cfg.Policy,
 		audit:          audit,
 		metrics:        metrics,
 		tracerProvider: tp,
 		cache:          cache,
+		partition:      cfg.CallerPartition,
 		factory:        NewRequestInfoFactory(),
 		slots:          slots,
 		proxy: &httputil.ReverseProxy{
@@ -248,7 +264,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	// The authenticator's error goes to the audit event, not to the caller, as the transport's
 	// does: it can describe the proxy's own authentication setup.
 	caller, err := h.authenticator.AuthenticateRequest(r)
-	if errors.Is(err, errAuthenticationUnavailable) {
+	if errors.Is(err, ErrAuthenticationUnavailable) {
 		// The cause can name the host API server; it is not the caller's to read.
 		ev.Outcome, ev.Err = OutcomeAuthUnavailable, err
 		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, authUnavailableMessage)
@@ -260,6 +276,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 	ev.Caller = caller
+	// Before anything is recorded as forwarded: a panic in the embedder's func is then
+	// audited as the panic it is.
+	var partition string
+	if h.partition != nil {
+		partition = h.partition(caller)
+	}
 
 	clusterID, apiPath, perr := SplitClusterPath(r.URL)
 	if perr != nil {
@@ -267,6 +289,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 	ev.ClusterID, ev.Path = clusterID, apiPath
+	// Before anything reads the request or a cached answer: an excluded cluster's API is
+	// never reached, whatever the request asks of it.
+	if perr := h.exclusions.check(clusterID); perr != nil {
+		refuse(w, ev, perr)
+		return
+	}
 
 	out := r.Clone(r.Context())
 	out.URL.Path = apiPath
@@ -305,6 +333,10 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	sanitizeRequestHeaders(out.Header, h.policy.permitsUpgrade(info))
 	ev.Outcome = OutcomeForwarded
 	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
+	if h.partition != nil {
+		// Read by the cache key and by the Upstream; a coalesced fetch inherits it.
+		ctx = context.WithValue(ctx, partitionKey{}, partition)
+	}
 	callerAccept := normalizeAcceptHeader(out.Header)
 	if h.cache != nil {
 		ctx = context.WithValue(ctx, cacheRequestMetaKey{}, cacheRequestMeta{info: info, callerAccept: callerAccept})

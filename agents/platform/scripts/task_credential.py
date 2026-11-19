@@ -14,9 +14,9 @@ and cannot import the Go package. So this is a second implementation of
     TestCredentialProxyFixtures -update-proxy-fixtures`` regenerates them) and
     verified again here by ``test_task_credential.py``, so the two verifiers
     are held to one verdict per token.
-  * Where this is stricter it says so: ``target`` is required (Go makes it
-    optional for this audience, and a proxy credential with no target confines
-    nothing), base64url must be canonical, the header must carry exactly
+  * Where this is stricter it says so: ``target`` is required except on a
+    report credential (Go makes it optional for this audience, and a proxy
+    credential with no target confines nothing; see REPORT_TIER), base64url must be canonical, the header must carry exactly
     ``typ`` and ``alg``, and a JSON ``null`` is refused where Go would read the
     zero value. Each of those is a fixture with ``go_ok`` and ``proxy_ok``
     apart.
@@ -97,13 +97,40 @@ ED25519_PUBLIC_LENGTH = 32
 ED25519_SIGNATURE_LENGTH = 64
 
 # The claim keys a credential may carry, exactly as spelled, at each level:
-# taskcred's topLevelClaims, natsClaims and targetClaims. A key outside the set
+# taskcred's topLevelClaims, natsClaims, targetClaims and triggerClaims. A key outside the set
 # is refused at every level (taskcred refuses an unknown nats or target key in
 # decodePayload, and a case variant of an allowed one in checkStrictClaims).
 TOP_LEVEL_CLAIMS = frozenset({"jti", "iat", "iss", "name", "sub", "aud", "exp", "nbf", "nats"})
-NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target"})
+NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target", "trigger", "permits"})
+# Every nats key but target, trigger and permits is required. Permits is
+# taskcred's Permits, which Mint omits when there is none (#3993). Target is optional in Go
+# for this audience; here it may be absent only on a report credential (below),
+# so this is stricter than Go everywhere else. Trigger is optional in both.
+NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid"})
+# A report credential (#5619): a proxy credential with no target, which only an
+# unattended task started by a trigger may carry. A fleet audit names no
+# cluster, so it confines nothing; the broker admits it to the audit-report
+# routes alone (credential_proxy.REPORT_CREDENTIAL_ROUTES) and refuses it on
+# every other route, /v1/exec and the relays included. capability.TierUnattended.
+REPORT_TIER = "unattended"
 TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
+TRIGGER_CLAIMS = frozenset({"name", "origin", "stream", "script"})
+TRIGGER_REQUIRED = frozenset({"name", "origin"})
+# taskcred.TriggerOriginBuiltin: the one origin a trigger may name today (#4685).
+TRIGGER_ORIGINS = frozenset({"builtin"})
+# The one source whose triggers may bind a report stream, and only their own:
+# lib.ValidateTrigger's schedule/<stream> rule.
+TRIGGER_SCHEDULE_SOURCE = "schedule"
 HEADER_KEYS = frozenset({"typ", "alg"})
+
+# taskcred.PermitVCSProposalCreate: what a profile worker's credential carries
+# when its submission asked for a change, and what the broker's version-control
+# write verbs require of a profile caller.
+PERMIT_VCS_PROPOSAL_CREATE = "vcs:proposal-create"
+
+# Every permit taskcred mints and verifies. Closed: a credential naming any
+# other is refused, not read as carrying fewer permits.
+KNOWN_PERMITS = frozenset({PERMIT_VCS_PROPOSAL_CREATE})
 
 # int64, the width of jwt/v2's time claims. A JSON integer outside it fails
 # Go's decode; Python would read it as a bignum.
@@ -141,6 +168,23 @@ class TaskTarget:
 
 
 @dataclass(frozen=True)
+class TaskTrigger:
+    """The unattended trigger the grant binds (taskcred.Trigger).
+
+    ``name`` is ``schedule/<name>`` or a bare source, ``origin`` is
+    ``builtin``, and ``stream`` is the report stream the grant binds, which can
+    only be the schedule's own name, "" when it binds none.
+    """
+
+    name: str
+    origin: str
+    stream: str = ""
+    # The profile script a built-in schedule's run executes (taskcred.Trigger's
+    # script, #5622); empty on every other trigger.
+    script: str = ""
+
+
+@dataclass(frozen=True)
 class TaskClaims:
     """A verified credential's content (taskcred.Claims)."""
 
@@ -153,7 +197,18 @@ class TaskClaims:
     issued_at: int
     jti: str
     issuer: str
-    target: TaskTarget
+    # None only on a report credential: see REPORT_TIER and ``report_only``.
+    target: TaskTarget | None
+    # The unattended trigger that started the task, when one did (#4685).
+    trigger: TaskTrigger | None = None
+    # The permits the credential carries (taskcred.Claims.Permits), empty
+    # when it carries none.
+    permits: frozenset[str] = frozenset()
+
+    @property
+    def report_only(self) -> bool:
+        """True for a report credential: no target, so no cluster to confine to."""
+        return self.target is None
 
 
 # ---------------------------------------------------------------------------
@@ -347,10 +402,39 @@ def _label(value: str, name: str) -> str:
     return value
 
 
+def _is_label(value: str) -> bool:
+    """_label's test without the refusal: taskcred's lib.ValidSubjectToken."""
+    return len(value) <= MAX_LABEL and bool(_LABEL.match(value))
+
+
 def _target_field(value: str, name: str) -> str:
     if not value or len(value) > MAX_TARGET_FIELD or any(not ("!" <= c <= "~") for c in value):
         raise TaskCredentialError(f"task credential target {name} is empty, too long or not printable")
     return value
+
+
+def _permits(nats: Mapping[str, Any]) -> frozenset[str]:
+    """The permits claim: absent, or a non-empty list of known permits, none twice.
+
+    taskcred's validate, plus what this verifier refuses on its own account: a
+    null or empty list (Mint omits the claim when there is no permit, so a
+    present-but-empty one was not minted there).
+    """
+    if "permits" not in nats:
+        return frozenset()
+    value = nats["permits"]
+    if type(value) is not list or not value:
+        raise TaskCredentialError("task credential permits is not a non-empty list")
+    seen: set[str] = set()
+    for permit in value:
+        if type(permit) is not str:
+            raise TaskCredentialError("task credential permits holds a value that is not a string")
+        if permit not in KNOWN_PERMITS:
+            raise TaskCredentialError(f"task credential permit {permit[:MAX_LABEL]!r} is not one this verifier knows")
+        if permit in seen:
+            raise TaskCredentialError(f"task credential permit {permit!r} appears twice")
+        seen.add(permit)
+    return frozenset(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -415,17 +499,34 @@ def verify(
     nats = claims["nats"]
     if not isinstance(nats, dict):
         raise TaskCredentialError("task credential nats claim is not an object")
-    _exact_keys(nats, NATS_CLAIMS, NATS_CLAIMS, "nats")
+    _exact_keys(nats, NATS_CLAIMS, NATS_REQUIRED, "nats")
     if _string(nats, "type", "nats") != TOKEN_TYPE:
         raise TaskCredentialError("task credential type is not a task credential")
     if _integer(nats, "version", "nats") != JWT_CLAIMS_VERSION:
         raise TaskCredentialError(f"task credential claims version is not {JWT_CLAIMS_VERSION}")
-    target_claim = nats["target"]
-    if not isinstance(target_claim, dict):
-        raise TaskCredentialError("task credential target is not an object")
-    _exact_keys(target_claim, TARGET_CLAIMS, TARGET_CLAIMS, "nats.target")
+    target_claim = None
+    if "target" in nats:
+        # Present means an object: a JSON null is refused, not read as absent.
+        target_claim = nats["target"]
+        if not isinstance(target_claim, dict):
+            raise TaskCredentialError("task credential target is not an object")
+        _exact_keys(target_claim, TARGET_CLAIMS, TARGET_CLAIMS, "nats.target")
+    trigger = _trigger(nats["trigger"]) if "trigger" in nats else None
+    # Only a report credential omits the target: an unattended task that a
+    # trigger started. Anything else with no target is refused as before.
+    if target_claim is None and (_string(nats, "tier", "nats") != REPORT_TIER or trigger is None):
+        raise TaskCredentialError(
+            "task credential names no target; only an unattended task started by a trigger may omit it"
+        )
 
     audience = claims["aud"]
+    # taskcred's rule for permits, stated here although the audience check
+    # below refuses every other audience anyway: a permit is a grant only this
+    # audience enforces, so a credential for any other carrying one is refused
+    # for that, whatever else this verifier comes to accept.
+    if "permits" in nats and audience != AUDIENCE:
+        raise TaskCredentialError(f"task credential permits may appear only on a {AUDIENCE!r} credential")
+    permits = _permits(nats)
     if type(audience) is not str or audience != AUDIENCE:
         raise TaskCredentialError(f"task credential is not for {AUDIENCE!r}")
 
@@ -468,12 +569,41 @@ def verify(
         issued_at=iat,
         jti=jti,
         issuer=issuer,
-        target=TaskTarget(
+        target=None if target_claim is None else TaskTarget(
             project=_target_field(_string(target_claim, "project", "nats.target"), "project"),
             location=_target_field(_string(target_claim, "location", "nats.target"), "location"),
             cluster=_target_field(_string(target_claim, "cluster", "nats.target"), "cluster"),
         ),
+        permits=permits,
+        trigger=trigger,
     )
+
+
+def _trigger(claim: Any) -> TaskTrigger:
+    """The nats.trigger claim, shape-checked as taskcred's Trigger.validate."""
+    if not isinstance(claim, dict):
+        raise TaskCredentialError("task credential trigger is not an object")
+    _exact_keys(claim, TRIGGER_CLAIMS, TRIGGER_REQUIRED, "nats.trigger")
+    name = _string(claim, "name", "nats.trigger")
+    source, slash, rest = name.partition("/")
+    if not _is_label(source) or (slash and not _is_label(rest)):
+        raise TaskCredentialError("task credential trigger name is not <source> or <source>/<name> of labels")
+    origin = _string(claim, "origin", "nats.trigger")
+    if origin not in TRIGGER_ORIGINS:
+        raise TaskCredentialError("task credential trigger origin is not builtin")
+    stream = _string(claim, "stream", "nats.trigger") if "stream" in claim else ""
+    # A stream is only ever the trigger's own schedule name, compared whole: no
+    # prefix stripping, so nothing but schedule/<stream> can bind <stream>.
+    if stream and (source != TRIGGER_SCHEDULE_SOURCE or rest != stream):
+        raise TaskCredentialError("task credential trigger stream is not the trigger's own schedule name")
+    script = _string(claim, "script", "nats.trigger") if "script" in claim else ""
+    if script and not _is_label(script):
+        raise TaskCredentialError("task credential trigger script is not a DNS-1123 label")
+    # As with stream: only one schedule's trigger, schedule/<name>, names a
+    # script; a bare schedule doesn't.
+    if script and (source != TRIGGER_SCHEDULE_SOURCE or not slash):
+        raise TaskCredentialError("task credential trigger script is not on a schedule's trigger")
+    return TaskTrigger(name=name, origin=origin, stream=stream, script=script)
 
 
 # ---------------------------------------------------------------------------

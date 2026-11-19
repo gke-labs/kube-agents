@@ -1,7 +1,7 @@
 """The lane safeguards step in hack/ci-eval-pr.sh (#2079, #2611).
 
-On every transport -- the api lane as well as the inject lane, so both are
-graded against the same bar -- the step exports BENCH_GITOPS_REPO from the
+For every case in the matrix, whatever AGENT_TRANSPORT says (every CI lane
+exports inject), the step exports BENCH_GITOPS_REPO from the
 leased project's mapping, materialises every task in the matrix as
 `<scratch>/<case>/task.yaml` with hack/eval/inject-lane-safeguards.yaml's
 entries appended, and `unit_task_path` hands devops-bench that copy. The
@@ -157,8 +157,9 @@ def spec_names(task_yaml: pathlib.Path) -> list[str]:
 
 
 class InjectLaneTest(unittest.TestCase):
-    """The step under AGENT_TRANSPORT=inject; ApiLaneTest below runs every
-    test here again on the api lane, where the step does the same."""
+    """The step under AGENT_TRANSPORT=inject, every CI lane's; ApiLaneTest
+    below runs every test here again over the agent API, where the step does
+    the same."""
 
     TRANSPORT = {"AGENT_TRANSPORT": "inject"}
 
@@ -183,9 +184,9 @@ class InjectLaneTest(unittest.TestCase):
         self.assertIn("every task in the matrix carries the lane safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
         # The presubmit cases that request a pull request, by their own
-        # checks or the file's `requesting:` list: the second phase holds
+        # checks or their own `requested_pull_requests:` key: the second phase holds
         # them and the log says so. obtainability-remediation-proposal left
-        # the list when the persona's rule put its manifest in the reply
+        # the lane file's former `requesting:` list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
         # phase. pdb-remediation-pr, which asks for its pull request by its
         # own check, was the presubmit's one requesting case from 2026-10-14
@@ -307,9 +308,9 @@ class InjectLaneTest(unittest.TestCase):
 
 
 class ApiLaneTest(InjectLaneTest):
-    """The api lane (`today`) carries the same safeguards as the inject lane
-    (`next`), so the two modes face the same bar (#2611): every test above,
-    with the transport the api lane exports, and with none at all."""
+    """A run over the agent API (a developer's, outside CI) carries the same
+    safeguards (#2611): every test above, with that transport, and with none
+    at all."""
 
     TRANSPORT = {"AGENT_TRANSPORT": "api"}
 
@@ -350,6 +351,10 @@ class TwoPhaseFanOutTest(unittest.TestCase):
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 f'STOPPED_ASK_CASES="{stopped}"',
                 f'WRITES_ALONE_CASES="{alone}"',
+                'REPLAY_LANE_SAFETY_NAMES=""',
+                lifted_block(r"^case_repetitions\(\) \{.*?^\}$"),
+                lifted_block(r"^first_queued_rep\(\) \{.*?^\}$"),
+                lifted_block(r"^run_replay_lane_live_arm\(\) \{.*?^\}$"),
                 lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
@@ -447,7 +452,8 @@ class WiringTest(unittest.TestCase):
 
 class StoppedAsksTest(unittest.TestCase):
     """The second phase's stopped asks are read from each task's prompt by
-    the harness's own grammar, on the inject lane only."""
+    the harness's own grammar, whatever the transport says: every CI lane
+    grades through the inject door."""
 
     STOP_CASE = "./tasks/chat-stop-halts-delegated-remediation/task.yaml"
     OTHER_CASE = "./tasks/agent-kanban-smoke/task.yaml"
@@ -472,8 +478,8 @@ class StoppedAsksTest(unittest.TestCase):
     def test_the_inject_lane_names_the_stopped_ask_and_nothing_else(self):
         self.assertEqual(self.run_block("inject"), "STOPPED=chat-stop-halts-delegated-remediation")
 
-    def test_another_lane_names_none(self):
-        self.assertEqual(self.run_block("api"), "STOPPED=")
+    def test_the_read_does_not_key_on_the_transport(self):
+        self.assertEqual(self.run_block("api"), "STOPPED=chat-stop-halts-delegated-remediation")
 
     ALONE_CASE = "./tasks/provisioning-cluster-request-never-creates/task.yaml"
 

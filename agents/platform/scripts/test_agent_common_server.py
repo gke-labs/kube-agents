@@ -201,6 +201,10 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
     # chat identities, which has to be here because the hashing is here.
     # Neither grants access to any external system.
     EXPECTED = {"SESSION_KV_API_KEY", "SESSION_KV_SALT"}
+    # Held by the agent container for its own process, never passed to a
+    # child: hermes signs its tool-call deliveries to the bridge's loopback
+    # door with it, and _run_env withholds it (_WITHHELD_FROM_CHILDREN).
+    HELD_NOT_PASSED = {"A2A_ACTIVITY_SECRET"}
     # The container `_run_env` itself runs in. It is not the shell sandbox --
     # that is a StatefulSet of its own and holds no Secret at all -- but it is
     # the process that spawns children with the whole environment, so it is the
@@ -269,10 +273,12 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
         return {mount["name"] for mount in container.get("volumeMounts", [])}
 
     def test_the_agent_holds_only_the_two_pod_scoped_secrets(self):
+        # The two pod-scoped secrets a child may see, plus the activity
+        # signing key the container holds and _run_env withholds.
         self.assertEqual(
             self._secret_backed(
                 self._container(self.AGENT_DEPLOYMENT, self.AGENT_CONTAINER)),
-            self.EXPECTED,
+            self.EXPECTED | self.HELD_NOT_PASSED,
             "The agent container's Secret-backed environment changed. "
             "_run_env in agent_common_server.py passes the whole environment to "
             "every gcloud/kubectl/hermes child it spawns, and its docstring "
@@ -281,6 +287,20 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
             "the allowlist in platformagent_manifests_test.go. If it is a real "
             "credential, it belongs in the credential-proxy container, or "
             "_run_env's call sites need an explicit allowlist.")
+
+    def test_run_env_withholds_what_the_agent_holds_but_children_must_not(self):
+        held = sorted(self.HELD_NOT_PASSED)
+        self.assertEqual(sorted(_agent_common_server._WITHHELD_FROM_CHILDREN), held)
+        planted = {name: "planted" for name in held}
+        with unittest.mock.patch.dict(os.environ, planted):
+            for extra in (None, dict(planted)):
+                env = _agent_common_server._run_env(extra)
+                for name in held:
+                    self.assertNotIn(name, env, f"_run_env passed {name} to a child (extra={extra is not None})")
+        # What a child can still see of the container's Secret-backed set is
+        # exactly the two pod-scoped values.
+        agent = self._secret_backed(self._container(self.AGENT_DEPLOYMENT, self.AGENT_CONTAINER))
+        self.assertEqual(agent - set(_agent_common_server._WITHHELD_FROM_CHILDREN), self.EXPECTED)
 
     def test_the_agent_bulk_mounts_no_secret(self):
         # The half the Go allowlist loop cannot see: it walks `env` only, so an

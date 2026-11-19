@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -1463,6 +1464,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "300s",
                     "--clusters",
                     "p1/us-central1/c1,p1/us-east1/c2",
                 ]
@@ -1502,6 +1505,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "300s",
                     "--clusters",
                     "p1/us-east1-b/east,p1/us-west1/west",
                 ],
@@ -1559,6 +1564,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "300s",
                     "--clusters",
                     "p1/us-central1/c1,p2/us-east1/c2",
                 ]
@@ -1634,6 +1641,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "300s",
                     "--clusters",
                     "p-scoped/us-central1/c-included",
                 ]
@@ -1672,6 +1681,8 @@ class DiscoveryTests(unittest.TestCase):
                     "--topology-tier-c-signals",
                     "--parallelism",
                     "2",
+                    "--timeout",
+                    "300s",
                     "--clusters",
                     "p1/us-central1/c-ok",
                 ]
@@ -1701,6 +1712,98 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("ScopeRenderUnreadable: unreadable json", output)
 
 
+class ClusterTimeoutTests(unittest.TestCase):
+    def test_one_wave_gets_the_whole_call_less_overhead(self) -> None:
+        # Two clusters read in parallel finish in one wave.
+        # Capped: one or two clusters would otherwise get 870 s each.
+        self.assertEqual(watch.cluster_timeout_seconds(900, 1), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 2), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(330, 1), 300)
+        self.assertEqual(watch.cluster_timeout_seconds(200, 1), 170)
+
+    def test_waves_split_the_call(self) -> None:
+        self.assertEqual(watch.cluster_timeout_seconds(900, 3), watch.MAX_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(900, 10), 174)
+        self.assertEqual(watch.cluster_timeout_seconds(600, 5), 190)
+
+    def test_never_below_leeways_own_default(self) -> None:
+        self.assertEqual(watch.cluster_timeout_seconds(900, 100), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
+        self.assertEqual(watch.cluster_timeout_seconds(60, 1), watch.MIN_CLUSTER_TIMEOUT_SECONDS)
+
+    def test_the_smallest_started_call_of_one_wave_lets_the_cluster_deadline_fire_first(self) -> None:
+        # The smallest call sweep_fleet starts leaves room for one cluster's
+        # floor and leeway's overhead inside the sandbox timeout.
+        smallest = watch.MIN_PROJECT_RUN_SECONDS
+        self.assertGreaterEqual(smallest - watch.LEEWAY_OVERHEAD_SECONDS, watch.cluster_timeout_seconds(smallest, 1))
+
+    def test_run_passes_the_timeout_sized_to_the_call(self) -> None:
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p/l/a", "status": "ok"}]))
+
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run):
+            watch.run_leeway_report(watch.CLUSTERS_FLAG, "p/l/a,p/l/b,p/l/c", timeout=300)
+
+        argv = seen_argv[0]
+        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "135s")
+        self.assertEqual(argv[-2:], [watch.CLUSTERS_FLAG, "p/l/a,p/l/b,p/l/c"])
+
+    def test_budget_cut_call_shrinks_the_cluster_timeout(self) -> None:
+        # Late in the tick the call's timeout is the remaining budget, and the
+        # per-cluster deadline follows it down.
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}]))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {watch.WATCH_HOME_ENV: tmp, watch.CLUSTERS_ENV: "p1/us-central1/c1", watch.PROJECTS_ENV: ""},
+            clear=False,
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run), mock.patch.object(
+            watch.time, "monotonic", return_value=0.0
+        ):
+            watch.sweep_fleet({}, T0, deadline=200.0)
+
+        argv = seen_argv[0]
+        self.assertEqual(argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], "170s")
+
+    def test_a_call_starts_only_with_the_floor_plus_overhead_left(self) -> None:
+        # One second short of MIN_PROJECT_RUN_SECONDS the tick budget is spent
+        # and leeway is not run; at it, the call runs with the floor.
+        for left, runs in ((watch.MIN_PROJECT_RUN_SECONDS - 1, False), (watch.MIN_PROJECT_RUN_SECONDS, True)):
+            with self.subTest(left=left):
+                seen_argv: list[list[str]] = []
+
+                def fake_run(argv, **kw):
+                    seen_argv.append(list(argv))
+                    return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}]))
+
+                with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                    os.environ,
+                    {watch.WATCH_HOME_ENV: tmp, watch.CLUSTERS_ENV: "p1/us-central1/c1", watch.PROJECTS_ENV: ""},
+                    clear=False,
+                ), mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run), mock.patch.object(
+                    watch.time, "monotonic", return_value=0.0
+                ):
+                    if runs:
+                        watch.sweep_fleet({}, T0, deadline=float(left))
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            watch.sweep_fleet({}, T0, deadline=float(left))
+
+                if runs:
+                    argv = seen_argv[0]
+                    self.assertEqual(
+                        argv[argv.index(watch.CLUSTER_TIMEOUT_FLAG) + 1], f"{watch.MIN_CLUSTER_TIMEOUT_SECONDS}s"
+                    )
+                else:
+                    self.assertEqual(seen_argv, [])
+
+
 class RosterTest(unittest.TestCase):
     def test_the_platform_roster_carries_leeway_watch_as_a_daily_no_agent_entry(self) -> None:
         jobs = {j["id"]: j for j in json.loads(ROSTER.read_text(encoding="utf-8"))["jobs"]}
@@ -1713,6 +1816,85 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(entry["schedule"]["expr"].split()[2:], ["*", "*", "*"], "a daily job")
         self.assertTrue(entry["enabled"])
         self.assertEqual(entry["risk"], "high")
+
+
+class ResolvedScopeTests(unittest.TestCase):
+    """#5621: under spec.mode: next the resolved scope names the projects and
+    each member project's clusters; the management and explicit projects are
+    listed live, a member nothing listed is a scan error, and the profiles
+    directory is not walked."""
+
+    def test_next_mode_sweeps_from_the_resolved_scope(self) -> None:
+        argvs: list[list[str]] = []
+
+        def sandbox(argv, **kw):
+            argvs.append(list(argv))
+            if argv[0] == "gcloud":
+                return subprocess.CompletedProcess(args=argv, returncode=0, stdout="m1\tus-central1\nm-old\tus-east1\n", stderr="")
+            target = argv[argv.index(watch.CLUSTERS_FLAG) + 1]
+            return completed_json(make_report([{"cluster": c, "status": "ok"} for c in target.split(",")]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "profiles" / "cluster-ghost").mkdir(parents=True)
+            (root / "profiles" / "cluster-ghost" / "config.yaml").write_text(
+                "cluster_identity:\n  project: member-a\n  cluster: ghost\n  location: l\n", encoding="utf-8")
+            (root / "scope.json").write_text(json.dumps({
+                "present": True, "projects": [], "folders": ["1"],
+                "exclude": {"clusters": [{"projectId": "mgmt", "location": "us-east1", "clusterName": "m-old"}]},
+            }), encoding="utf-8")
+            (root / "resolved-scope.json").write_text(json.dumps({
+                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": __import__("scope_publisher").member_hash(json.loads((root / "scope.json").read_text())), "excludedProjects": [],
+                "projects": [{"id": p, "via": ["folders/1"], "outcome": o} for p, o in (("member-a", "ok"), ("member-b", "denied"), ("member-empty", "ok"))],
+                "clusters": {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "a1"]]},
+                             "member-empty": {"at": "2026-11-10T12:00:00Z", "clusters": []}},
+            }), encoding="utf-8")
+            env = {
+                watch.WATCH_HOME_ENV: str(root / "leeway"), watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "",
+                watch.MANAGEMENT_PROJECT_ENV: "mgmt", "PLATFORM_AGENT_HOME": tmp,
+                watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json"),
+            }
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                watch, "roster_clusters_by_project", side_effect=AssertionError("walked the profiles")
+            ), mock.patch.object(
+                watch.fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")
+            ), mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox):
+                _, _, scan_errors, error_kinds, scanned, requested = watch.sweep_fleet({}, T0, time.monotonic() + 3600)
+        self.assertEqual([a for a in argvs if a[0] == "gcloud"], [[*watch.LIST_CLUSTERS_ARGV, "mgmt"]], "only the management project is listed live")
+        self.assertEqual(requested, {"mgmt/us-central1/m1", "member-a/us-central1/a1"})
+        self.assertEqual(scanned, {"mgmt", "member-a", "member-empty"})
+        self.assertEqual(set(scan_errors), {"member-b"})
+        self.assertIn("denied", scan_errors["member-b"])
+        self.assertEqual(error_kinds["member-b"], watch.ERROR_KIND_SCAN_FAILED)
+
+    def test_an_explicit_roster_with_an_unusable_resolved_scope_retires_nothing_on_its_members(self) -> None:
+        """LEEWAY_WATCH_PROJECTS names a member, the resolved scope is missing:
+        the member is never scanned, so a finding it holds is not retired."""
+
+        def sandbox(argv, **kw):
+            if argv[0] == "gcloud":
+                return subprocess.CompletedProcess(args=argv, returncode=0, stdout="m1\tus-central1\n", stderr="")
+            target = argv[argv.index(watch.CLUSTERS_FLAG) + 1]
+            return completed_json(make_report([{"cluster": c, "status": "ok"} for c in target.split(",")]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scope.json").write_text(json.dumps({"present": True, "projects": [], "folders": ["1"]}), encoding="utf-8")
+            env = {
+                watch.WATCH_HOME_ENV: str(root / "leeway"), watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "mgmt,member-a",
+                watch.MANAGEMENT_PROJECT_ENV: "mgmt", "PLATFORM_AGENT_HOME": tmp,
+                watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json"),
+            }
+            with mock.patch.dict(os.environ, env), mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox):
+                _, _, scan_errors, _, scanned, _ = watch.sweep_fleet({}, T0, time.monotonic() + 3600)
+        self.assertNotIn("member-a", scanned)
+        self.assertTrue(scan_errors, "the members the unusable scope could not name are a scan error")
+        self.assertFalse(watch.can_retire_finding(
+            "member-a/us-central1/a1", {"cluster": "member-a/us-central1/a1"},
+            {"mgmt/us-central1/m1"}, {}, scanned, scan_errors,
+        ))
 
 
 if __name__ == "__main__":

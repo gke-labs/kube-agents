@@ -27,7 +27,7 @@ import (
 
 // reconcileIterations bounds a golden's reconcile loop; a settled run takes a
 // pass per step of the bring-up it waits through (the callout serving, the
-// provisioning Job completing, the bridge joining the agent pod), so it gets more.
+// provisioning Job completing), so it gets more.
 const (
 	reconcileIterations        = 5
 	settledReconcileIterations = 12
@@ -212,8 +212,9 @@ func RunGoldenTest(
 // it is given: between reconcile passes every Deployment and StatefulSet is
 // marked ready and every Job complete, so the golden is the steady state rather
 // than the first pass. Next mode needs it: the A2A gateway waits for the
-// callout to serve and the hermes bridge for the provisioning Job, so a
-// first-pass golden leaves out the pods an installed cluster runs.
+// callout to serve, so a first-pass golden leaves out the pods an installed
+// cluster runs. (The hermes bridge is in the agent pod from the first pass,
+// #5962.)
 func RunSettledGoldenTest(
 	t *testing.T,
 	inputPath, expectedPath string,
@@ -336,9 +337,13 @@ const hashPlaceholder = "<SHA256_FOR_TESTS>"
 // sha256Hex matches the hex encoding of a SHA-256 digest.
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// a2aConfigHashKey is the one hash annotation cut short: next mode's
-// a2aConfigHashLength is 16 characters, and a2aConfigHex is its shape.
-const a2aConfigHashKey = "kubeagents.x-k8s.io/a2a-config-hash"
+// a2aConfigHashKey and a2aTaskSigningKeyHashKey are the hash annotations cut
+// short: next mode's a2aConfigHashLength, and the dispatcher's
+// a2aTaskSigningKeyHash, are 16 characters, and a2aConfigHex is their shape.
+const (
+	a2aConfigHashKey         = "kubeagents.x-k8s.io/a2a-config-hash"
+	a2aTaskSigningKeyHashKey = "kubeagents.x-k8s.io/task-signing-key-hash"
+)
 
 var a2aConfigHex = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
@@ -352,7 +357,7 @@ func redactHashAnnotations(t *testing.T, annotations map[string]string) {
 			continue
 		}
 		want := sha256Hex
-		if key == a2aConfigHashKey {
+		if key == a2aConfigHashKey || key == a2aTaskSigningKeyHashKey {
 			want = a2aConfigHex
 		}
 		if !want.MatchString(value) {

@@ -25,6 +25,7 @@ import functools
 import json
 import re
 import shlex
+import subprocess
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -192,6 +193,14 @@ SOURCES: dict[str, Source] = {
         ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
          "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
+    "kube_proxy_manifests_go": Source(
+        "k8s-operator/internal/controller/kube_proxy_manifests.go",
+        ("func buildKubeProxyDeployment(", "CREDENTIAL_PROXY_SESSION_AUDIENCE", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+    ),
+    "k8s_api_proxy_main_go": Source(
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ("sessionAudienceEnv", "sessionCallersEnv", "func parseSessionAudienceCallers("),
+    ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("DefaultPlatformAgentVersion",),
@@ -204,8 +213,15 @@ SOURCES: dict[str, Source] = {
         # (system:auth-delegator), and A4 is once again a statement about how
         # that bind is bounded rather than about its absence. Deleting the
         # scoping is the mutation this anchor exists to make loud.
+        #
+        # "kind: Role" is the second document: the operator's write verbs on
+        # every namespaced kind it renders, rendered as a namespaced Role by
+        # the markers that carry `namespace=`. C5 asserts the ClusterRole
+        # grants no write verb on any of them,
+        # and that assertion is vacuous the day the Role document disappears
+        # with the grant moved back.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings", "resourceNames"),
+        ("clusterrolebindings", "resourceNames", "kind: Role"),
     ),
     # The other Role a kustomize install ships. role.yaml is the operator's
     # ClusterRole and was for a long time the only RBAC A4 read; this one is
@@ -222,7 +238,9 @@ SOURCES: dict[str, Source] = {
         # is anchored too because it is the chart's RBAC object OUTSIDE that
         # block -- the one `make chart-sync` does not manage and a
         # block-scoped parse never reached.
-        ("END GENERATED RULES", "operator-leader-election-role"),
+        # The namespaced block is the chart's copy of role.yaml's Role
+        # document (the write verbs on every rendered kind); C5 reads it.
+        ("END GENERATED RULES", "operator-leader-election-role", "END GENERATED NAMESPACED RULES"),
     ),
     "admission_policy": Source(
         "k8s-operator/config/admission/agent-rbac-policy.yaml",
@@ -240,6 +258,19 @@ SOURCES: dict[str, Source] = {
         "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
         ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
     ),
+    # C1 reads the guard on the hindsight-postgresql NetworkPolicy, the only
+    # thing between a passwordless Postgres and the namespace. The template
+    # carries multi-line Helm comments, which helm_documents() cannot read, so
+    # the test slices the policy's block by these anchors instead.
+    "chart_hindsight": Source(
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "$postgresqlNetworkPolicy :=",
+            "{{- if $postgresqlNetworkPolicy }}",
+            "name: hindsight-postgresql",
+            "POSTGRES_HOST_AUTH_METHOD",
+        ),
+    ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
         "k8s-operator/internal/controller/shell_sandbox_manifests.go",
@@ -252,6 +283,17 @@ SOURCES: dict[str, Source] = {
     "golden_default": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("kind: Deployment", "policy.json"),
+    ),
+    # The settled fixture: the default CR reconciled until nothing changes,
+    # so it carries what later passes add (the A2A gateway Deployment and the
+    # bridge's activity hook) beside the roles every golden renders for the
+    # A2A stack. Not in _GOLDEN_KEYS: the first-pass invariants that walk
+    # those (one `-gateway` Deployment, say) don't hold for it, so a test that
+    # wants it reads it by name.
+    "golden_settled": Source(
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-settled.yaml",
+        ("name: platformagent-a2a-gateway", "name: platformagent-a2a-callout"),
     ),
     "golden_scoped_sa": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
@@ -292,6 +334,20 @@ SOURCES: dict[str, Source] = {
     # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
     # can compare them, and a NetworkPolicy that selects nothing is
     # indistinguishable from one that is working.
+    # The broker's a2a-chat caller binding (#6090): the env name the operator
+    # renders, which the Python broker reads under its own constant. Two
+    # modules, so only this suite can see the two names drift apart.
+    "a2a_chat_callers_env_go": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("credentialProxyA2AChatCallersEnvVar =",),
+    ),
+    # The exec tier's list of the broker env it leaves out (#6090): the A2A
+    # gateway stays an allowed caller there, so its a2a-chat binding must not
+    # be on that list.
+    "exec_tier_env_go": Source(
+        "k8s-operator/internal/controller/credential_proxy_exec_tier.go",
+        ("credentialProxyA2AChatAudienceEnvVar: true,",),
+    ),
     "a2a_session_fence": Source(
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
@@ -299,8 +355,8 @@ SOURCES: dict[str, Source] = {
     # The A2A gateway's rendered ingress: its three fences and the gateway
     # container's declared ports, written by an operator Go test
     # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
-    # golden renders mode next with both doors armed (the next-mode golden is
-    # the example CR, which arms neither). The anchors are the collector's namespace and
+    # golden arms both doors (the door flags are operator env, unset when the
+    # goldens render). The anchors are the collector's namespace and
     # the metrics port's name: lose either and C1's assertion has nothing to
     # hold the fences to.
     "a2a_gateway_ingress_fixture": Source(
@@ -382,6 +438,18 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
     ),
+    # The audit-report store's operator half (#5619): the env names it
+    # reserves, and the gateway-policy rule.
+    "audit_report_store_operator": Source(
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("auditReportStoreEnvNames", "auditReportStoreIngressRule("),
+    ),
+    # The listener itself, read as text: the suite does not import it (it
+    # needs FastAPI and cryptography).
+    "audit_report_store_listener": Source(
+        "agents/platform/scripts/audit_report_store.py",
+        ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
+    ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("operatorPodNameLabel", "operatorPodNameValue"),
@@ -390,18 +458,26 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/spawn.go",
         ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
     ),
-    # The broker's shim, which the worker image carries as kubectl/gcloud and
-    # the spawner configures through three env names it spells itself.
+    # The broker's shim, which the worker image carries as gcloud (alongside
+    # stock kubectl wired to kube-proxy) and the spawner configures through env
+    # names it spells itself.
     "credential_proxy_client": Source(
         "agents/platform/scripts/credential_proxy_client.py",
-        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME", "KUBE_PROXY_URL", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT"),
     ),
     # The gateway's env contract with the operator (module a2a reading what
     # module k8s-operator renders). C1 pins the cluster-view names across the
-    # boundary; the anchors are the two names and a long-standing neighbour.
+    # boundary; the anchors are the cluster-view names and a long-standing neighbour.
     "a2a_gateway_config": Source(
         "a2a/gateway/config.go",
-        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
+        (
+            "A2A_DEFAULT_ADDRESSEE",
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ),
     ),
     # The platform agent's allowlists as the gateway reads them: the per-target
     # check a session's delegation is held to. The names cross the module
@@ -607,7 +683,7 @@ SOURCES: dict[str, Source] = {
     # test can hold them equal.
     "a2a_worker_adapter_mcp": Source(
         "a2a/worker-adapter/mcp.go",
-        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+        ("func delegateToolSchema(", 'required := []string{"addressee", "text"}'),
     ),
     # The gateway's side of the delegate artifact: the switch that routes it
     # off the ordinary chat-rendering path, and the gateway's own copy of the
@@ -799,6 +875,20 @@ def site_pages() -> list[Path]:
 
 _HELM_DIRECTIVE = re.compile(r"^\s*\{\{-?.*-?\}\}\s*$")
 
+# A rendered chart, for the assertions a text read of a template cannot make:
+# `helm_documents` drops every template line, so a `range` collapses to one
+# object and rules that arrive through an `include` vanish. The release name
+# and namespace are the install defaults; the three harness values are the
+# ones the chart's schema requires before it renders at all.
+HELM_CHART_DIR = "charts/kube-agents"
+HELM_RELEASE_NAME = "kube-agents"
+HELM_RENDER_NAMESPACE = "kubeagents-system"
+HELM_REQUIRED_SETS = (
+    "platformAgent.harness.clusterName=ci-cluster",
+    "platformAgent.harness.location=us-central1",
+    "platformAgent.harness.projectId=ci-project",
+)
+
 
 @functools.lru_cache(maxsize=None)
 def yaml_documents(name: str) -> tuple[dict, ...]:
@@ -854,6 +944,27 @@ def helm_documents(name: str) -> tuple[dict, ...]:
     )
     body = _HELM_EXPRESSION.sub(HELM_PLACEHOLDER, body)
     return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
+
+
+@functools.lru_cache(maxsize=None)
+def helm_rendered(*sets: str) -> tuple[dict, ...]:
+    """Every object `helm template` renders for the chart, with `sets` as extra `--set` values.
+
+    The rendered form, where the text reader above cannot see: a Role rendered
+    once per namespace from a `range`, or rules that come through an `include`.
+    Raises rather than returning () when helm is missing or refuses the values,
+    so a test asserting on the render never passes on nothing.
+    """
+    command = ["helm", "template", HELM_RELEASE_NAME, str(REPO_ROOT / HELM_CHART_DIR), "-n", HELM_RENDER_NAMESPACE]
+    for value in (*HELM_REQUIRED_SETS, *sets):
+        command += ["--set", value]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(f"helm template failed ({proc.returncode}): {proc.stderr.strip()}")
+    documents = tuple(d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict))
+    if not documents:
+        raise AssertionError("helm template rendered no object; the chart is empty or the values gate everything off")
+    return documents
 
 
 def golden_documents() -> dict[str, tuple[dict, ...]]:

@@ -175,6 +175,8 @@ var (
 		ReasonSubresourceBlocked:       {},
 		ReasonDryRunRequired:           {},
 		ReasonVerbBlocked:              {},
+		ReasonExcludedCluster:          {},
+		ReasonExcludeUnreadable:        {},
 	}
 
 	knownOutcomes = map[string]struct{}{

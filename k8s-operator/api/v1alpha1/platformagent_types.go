@@ -22,6 +22,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// PlatformAgentModeNext is the one value spec.mode takes. The field is
+// deprecated: "today" named a stack no release renders any more, so the
+// admission webhook rewrites it, and an absent field, to this value, and the
+// operator patches a stored "today" to it. The CRD markers on Mode below
+// spell the same value by hand, since a marker cannot name a constant.
+const PlatformAgentModeNext = "next"
+
 // PlatformAgentSpec defines the desired state of PlatformAgent
 type PlatformAgentSpec struct {
 	AgentSpec `json:",inline"`
@@ -34,10 +41,14 @@ type PlatformAgentSpec struct {
 	// +optional
 	Integration *PlatformAgentIntegrationSpec `json:"integration,omitempty"`
 
-	// Mode selects which component stack the operator renders.  "today" is the
-	// current architecture.  "next" additionally renders the NATS and A2A
-	// gateway components, which are otherwise dark.  Absent means "today".
+	// Mode is deprecated and ignored: every install runs the A2A stack (the
+	// NATS bus and the A2A gateway), which "next" once selected.
+	// The field stays so a stored object that still carries "today" remains
+	// valid; the admission webhook rewrites "today" to "next", the schema
+	// defaults an absent field to "next", and the operator patches a stored
+	// "today" to "next" on its first pass. A later release removes the field.
 	// +kubebuilder:validation:Enum=today;next
+	// +kubebuilder:default=next
 	// +optional
 	Mode *string `json:"mode,omitempty"`
 
@@ -52,8 +63,8 @@ type PlatformAgentSpec struct {
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 
-	// Storage sizes the agent's /opt/data volume and the shell sandbox's
-	// matching data volume.
+	// Storage sizes the agent's /opt/data volume and the shell sandbox's data
+	// volume.
 	// +optional
 	Storage *PlatformAgentStorageSpec `json:"storage,omitempty"`
 }
@@ -61,8 +72,9 @@ type PlatformAgentSpec struct {
 // PlatformAgentStorageSpec sizes the agent's persistent data volumes.
 type PlatformAgentStorageSpec struct {
 	// Size is the request of the <name>-data claim and of the shell sandbox's
-	// data claim. The operator requests the same size for both claims and grows
-	// the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+	// data claim. The operator requests the same base size for both and grows
+	// the sandbox's claim first, so the sandbox mirror fits;
+	// expectedClusterProfiles can raise the agent's claim alone. A StorageClass or a
 	// quota that refuses the growth of one claim can leave the two claims at
 	// different sizes. Absent, the operator default applies (50Gi). Raising it
 	// expands both existing claims online where the StorageClass sets
@@ -72,6 +84,21 @@ type PlatformAgentStorageSpec struct {
 	// Removing the field never shrinks a claim.
 	// +optional
 	Size *resource.Quantity `json:"size,omitempty"`
+
+	// ExpectedClusterProfiles is how many Cluster Agent profiles the install is
+	// expected to hold, one per cluster in scope. It sizes the agent's own
+	// <name>-data claim to at least a base for the Platform Agent's stores plus
+	// a per-profile budget for each, 8Gi plus 400Mi per profile rounded up to
+	// whole GiB, measured at the default 90-day session retention. The claim
+	// takes the larger of that and Size, or the operator
+	// default when Size is absent, so this only ever raises it. Raising it
+	// expands the existing claim online where the StorageClass allows. The
+	// shell sandbox's claim holds no session stores and keeps Size or the
+	// default. The formula passes the 50Gi default above 107 profiles.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=20000
+	// +optional
+	ExpectedClusterProfiles *int32 `json:"expectedClusterProfiles,omitempty"`
 }
 
 // ScopeSpec is the opt-in set of projects, folders and organisations, plus the Shared
@@ -198,16 +225,17 @@ type ScopeExcludeSpec struct {
 	// every project.
 	// An excluded cluster gets no Cluster Agent, and fleet answers, the
 	// onboarding sweep and the fleet-audit collectors that list clusters leave
-	// it out. Still covering it: the daily upgrade-readiness watch, the
-	// networking audit's subnet usage, the GCE audit's instance listing, and
-	// the third-party gke MCP server's list_clusters.
-	// Excluding a cluster narrows what the agents look at, but it is not yet
-	// enforced: the credential proxy still issues a kubeconfig for an excluded
-	// cluster, so a worker that fetches the cluster's credentials itself, or
-	// names it as a kubectl context, can still read it with the agent's read
-	// roles. Only a project where the agent holds no roles, granted there or
-	// inherited from a folder or organization above it, keeps the agent off a
-	// cluster; a cluster in the management project can't be fenced off yet.
+	// it out. The credential broker and kube-proxy refuse every route to its
+	// Kubernetes API, for every caller, the agents' own commands included: a
+	// kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
+	// MCP server's in-cluster tools. Spell entries by project ID: one spelled
+	// by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
+	// list, a cluster's describe), and these still cover it through them only:
+	// the daily upgrade-readiness watch's version table (its in-cluster
+	// readiness rules skip the cluster), the networking audit's subnet usage,
+	// the GCE audit's instance listing, and the gke MCP server's list_clusters.
+	// The broker enforces it, not IAM: the agent's roles still reach the
+	// cluster, so the service account itself is not fenced off.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId
@@ -300,7 +328,7 @@ type GoogleChatSpec struct {
 	Mode string `json:"mode,omitempty"`
 
 	// AnswerFeedback draws thumbs-up and thumbs-down buttons under each
-	// final answer on Google Chat under spec.mode next, and keeps each rating
+	// final answer on Google Chat, and keeps each rating
 	// with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
@@ -345,7 +373,7 @@ type SlackSpec struct {
 	HomeChannelName string `json:"homeChannelName,omitempty"`
 
 	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
-	// each final answer under spec.mode next, and keeps each rating with
+	// each final answer, and keeps each rating with
 	// its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
@@ -353,10 +381,9 @@ type SlackSpec struct {
 	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 
 	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
-	// A2A gateway may learn the Slack home channel under spec.mode next with
-	// Slack on the gateway (Google Chat not enabled) when HomeChannel is
-	// empty. Under "auto" the channel of the first top-level
-	// mention of the agent in a channel becomes the home channel: the gateway
+	// A2A gateway may learn the Slack home channel when HomeChannel is
+	// empty. Under "auto" the channel of the first top-level mention of the
+	// agent in a channel becomes the home channel: the gateway
 	// records it in the <agent>-home-channel ConfigMap, the operator projects
 	// it into the <agent>-chat-home ConfigMap it mounts as a directory in the
 	// agent pod and the gateway pod, both read the file within about a minute

@@ -79,22 +79,23 @@ export BENCH_TF_ROOT=./tf
 export GCP_PROJECT_ID="$PROJECT_ID"   # the judge: Vertex AI through your gcloud ADC, as in CI
 PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret platform-agent-secrets \
   -n kubeagents-system -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
-  JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview \
+  JUDGE_PROVIDER=google JUDGE_MODEL=<judge model> \
   uv run devops-bench ./tasks/<id> --agent-type kubeagents
 ```
 
 Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`); the eval
 still needs the judge even though only the deterministic checks decide.
 
-The blocking presubmit grades a `spec.mode: next` install through the A2A gateway's inject door,
-so that is the lane a case on its matrix goes red or green on. Against a next install, add the
-two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
-from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
-`hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
-the nightlies); run it without them. A case on `hack/eval/api-lane-exclusions.txt` is the
-reverse: it runs only with them, and without them its run errors rather than going red. The lane also appends the GitHub-write safeguard in
-`hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
-it in CI.
+Every CI lane, the blocking presubmit and the nightlies, grades the install through the A2A
+gateway's inject door, so that is the lane a case goes red or green on. Add the two exports
+`hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN` from the
+`token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
+`hack/eval/inject-lane-exclusions.txt` runs on no CI lane until it is moved off that list; run it
+over the agent API, without the two exports, and say so in the pull request. The card-wait stopped ask (`[bench:stop-in-card-wait]`) also needs `AGENT_A2A_DOOR_TOKEN`, from the
+`token` key of the `platform-agent-a2a-door` Secret, which the lane turns on; without it the run is
+infrastructure. The lane also appends
+the GitHub-write safeguard in `hack/eval/inject-lane-safeguards.yaml` to every task, so a case that
+passes here can still trip it in CI.
 
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
@@ -105,9 +106,10 @@ set `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` â€
 grants token-creator to the CI identities only, and `roles/owner` does not include it. Without the fleet the case
 fails every time with the fleet phrases absent, which is broken, not red.
 
-It must fail, and fail for the reason your change addresses. Keep the failing entry from
-`verification_report[]` in the run's `results.json` (its `status` and `reason`) and the line of the
-agent's report that shows the gap; the pull request quotes both. A case that passes before the
+It must fail, and fail for the reason your change addresses. Keep the run directory: its
+`results.json` carries the failing entry of `verification_report[]` and the agent's report. The pull
+request names the failing check and cites the run; it quotes neither
+([`public_surfaces.md`](public_surfaces.md)). A case that passes before the
 change proves nothing about it. A case that fails for an unrelated reason (a missing fixture, a
 token, a 429) is not red, it is broken; fix that first or pick another case.
 
@@ -122,8 +124,8 @@ run directories; the pull request cites them.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
 request: in that file's sorted section, at its place in case-id order, with its reason as the
-`#` lines above it (a case with `suite: certification` registers in
-`hack/eval/certification-cases.txt` instead: [`bench/README.md`](../../bench/README.md#certification-suite)). The case has a `docs/designs/domains.yaml` slug (a new row there, with its
+`#` lines above it (a case with the bare line `suite: validated-capabilities` in its task file is registered by that
+line and sits in no roster file: [`bench/README.md`](../../bench/README.md#validated-capabilities-suite)). The case has a `docs/designs/domains.yaml` slug (a new row there, with its
 owner, backup and meaning, when none describes the case); you may set `owner:` to yourself so
 the case's bugs reach you before the domain owner
 ([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership)). The nightly is where a
@@ -168,9 +170,10 @@ Under **Testing â†’ Live validation** in the template, which for a change to age
 is this loop and nothing less, unless one of the two agent-behaviour exemptions applies:
 
 - the case id, and whether it is new or existing;
-- red: the install and the `main` commit it ran against, the failing check and its reason, one
-  line of the agent's report;
-- green: the three runs (directories or a one-line summary each) against the branch's build;
+- red: the install and the `main` commit it ran against, the failing check's name, and the run's
+  build id or directory path (the record stays in the run: [`public_surfaces.md`](public_surfaces.md);
+  a dev run's directory is shared with the reviewer who asks, off GitHub);
+- green: the three runs' build ids or directory paths against the branch's build;
 - where the case is registered, or the exemption (one line, or the fuller record the two
   agent-behaviour exemptions take).
 

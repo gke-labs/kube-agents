@@ -23,7 +23,7 @@ passes without a GitHub read.
 
 These tests run the case's entries as the inject lane copies them
 (``lane.copy_task`` over the real lane file). The replies are reps 1 and 2 of
-nightly-main-b 2115594709677117440 (2026-10-29, gemini-4-argon): rep 1
+nightly-main-b 2115594709677117440 (2026-10-29): rep 1
 stopped; rep 2 opened #359 and linked it, which ``main``'s spec charged as
 an unrequested write. GitHub is a fake listing built from what that run's
 github_writes check and the pull request's own API record say (#359, its
@@ -151,8 +151,7 @@ def github(monkeypatch):
 
 
 def _lane_entries(task: Path, out: Path) -> dict[str, VerificationEntry]:
-    listed = lane.load_lane_requesting(LANE_FILE).get(CASE_ID, 0)
-    copy, _ = lane.copy_task(task, lane.load_lane_safeguards(LANE_FILE), out, listed)
+    copy, _ = lane.copy_task(task, lane.load_lane_safeguards(LANE_FILE), out)
     doc = yaml.safe_load(copy.read_text(encoding="utf-8"))
     return {e["name"]: VerificationEntry.model_validate(e) for e in doc["verification_spec"]}
 
@@ -191,7 +190,7 @@ def _status(entry: VerificationEntry, reply: str) -> str:
 
 def test_the_lane_allows_exactly_one_pull_request():
     doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
-    assert lane.requested_for(doc["verification_spec"], lane.load_lane_requesting(LANE_FILE).get(CASE_ID, 0)) == 1
+    assert lane.requested_for(doc["verification_spec"], lane.declared_pull_requests(doc)) == 1
 
 
 def test_rep2_which_opened_and_linked_a_pull_request_passes(entries, github):

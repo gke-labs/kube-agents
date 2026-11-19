@@ -305,8 +305,8 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 
 	// The credential broker. This is the agent's route to every credentialed
 	// command it is allowed to run, so denying it denies the product:
-	// CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all
-	// address it (credentialProxyBaseURL). The Service publishes
+	// CREDENTIAL_PROXY_URL and, with Teams on, TEAMS_RELAY_URL address it
+	// (credentialProxyBaseURL). The Service publishes
 	// credentialProxyPort onto a target port of the same number, and the
 	// selector here is the broker Deployment's own "app" label — Pod selectors,
 	// not the Service, because that is what NetworkPolicy matches after the
@@ -410,29 +410,25 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 		}},
 	})
 
-	// The A2A bus, rendered only when the agent surface is up (mode: next, or
-	// version skew freezing a running next stack — a2aAgentSurface owns that
-	// asymmetry). buildPodTemplateSpec sets NATS_URL to the operator's own
-	// NATS Service under the same gate, so the destination comes from this
+	// The A2A bus. buildPodTemplateSpec sets NATS_URL to the operator's own
+	// NATS Service, so the destination comes from this
 	// repository's render, not a guess. The peer selects the NATS pods by the
 	// labels buildA2ANATSStatefulSet stamps, and mirrors the gateway policy's
 	// bus rule exactly, for the reason the sandbox rule above duplicates rule
 	// 11: either policy can be the only one present, and a missing rule here
 	// does not refuse the dial — it hangs it to the client timeout on an
 	// install whose CR reads Ready.
-	if a2aAgentSurface(agent) {
-		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(4222)},
-			To: []networkingv1.NetworkPolicyPeer{{
-				PodSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{
-						labelPartOf:       a2aPartOf,
-						a2aComponentLabel: "nats",
-					},
+	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(4222)},
+		To: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					labelPartOf:       a2aPartOf,
+					a2aComponentLabel: "nats",
 				},
-			}},
-		})
-	}
+			},
+		}},
+	})
 
 	// The Kubernetes API server, if and only if the operator was told where it
 	// is. There is no NetworkPolicy peer for "the API server": on GKE the

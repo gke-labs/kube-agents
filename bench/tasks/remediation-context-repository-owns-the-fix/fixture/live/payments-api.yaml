@@ -3,7 +3,9 @@
 # asks to remove. Apply it to the agent host once (kubectl apply -f) so the
 # agent's read of the cluster matches the GitOps declaration; delete the
 # namespace to remove it. No reconciler runs on the eval installs, so the
-# HelmRelease in the GitOps repository does not create it.
+# HelmRelease in the GitOps repository does not create it. The case's stack
+# (bench/tf/prebuilt/context-repository-owns-the-fix) creates the namespace
+# itself, labelled, and applies every document here but the Namespace.
 apiVersion: v1
 kind: Namespace
 metadata:

@@ -10,12 +10,12 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm` and
-# `world-open-ingress` are project-scoped, so they have no cluster slot).
-# fixtures.json carries `startup-fail-vm` and `world-open-ingress` as
-# project-scoped roles (`cluster_slot: null`), which the runner probes in the
-# project with gcloud; `orphan-disks` is in this file alone. A project-scoped
-# role in fixtures.json must appear here with `slot: null`.
+# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`,
+# `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot` are
+# project-scoped, so they have no cluster slot). fixtures.json carries all but
+# `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
+# probes in the project with gcloud; `orphan-disks` is in this file alone. A
+# project-scoped role in fixtures.json must appear here with `slot: null`.
 #
 # A case names a fixture by role and never by a cluster name or a project id.
 # Each eval project carries its own set of clusters (`bench/tf/fleet/`,
@@ -47,7 +47,7 @@ slots:
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, on the control plane and its default pool, and no workloads
+    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures over that pool
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -165,6 +165,21 @@ fixtures:
       count is not stable across projects (measured 3/2/3 on 2026-08-24), so
       assert the pin and the unmet demand and never a number.
 
+  - role: declared-single-zone-pool
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/declared-zonal-pool
+    namespace: null
+    defect: >-
+      A single-zone autoscaling pool (min 0, max 2) held at zero nodes behind
+      the taint seeded-role=declared-zonal, so it is the stockout SOP's 3.9
+      zone-locked posture and never its at-ceiling arm. Not a defect: the pool
+      project's GitOps knowledge/ note declares it on purpose, and the capacity
+      audit lists it under Declared intent rather than as a finding.
+      pinned-inference-pool cannot play this part, since its backlog is the
+      defect stockout-pinned-pool grades.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0
@@ -205,8 +220,9 @@ fixtures:
       - instance/startup-fail-<prefix>
     defect: >-
       A standalone e2-micro, startup-fail-<prefix>, whose startup script
-      exits 1 on every boot, so the guest agent's failure line is on its
-      serial console from the first boot onward.
+      exits 1 on every boot. The guest agent prints the failure line once
+      per boot, and the serial buffer rotates it out within about three
+      weeks, so each reconcile resets the VM to print it again.
 
   - role: world-open-ingress
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
@@ -220,6 +236,20 @@ fixtures:
       carries its tag, which holds an external IP. Nothing listens on 2379.
       A deny rule blocks tcp:22 and tcp:3389 on that VM.
 
+  - role: declared-mtu-peering
+    slot: null # Project-scoped, global; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - network/mtu-peer-declared
+    defect: >-
+      A custom-mode VPC at MTU 8896 with no subnet, peered both ways with
+      `default` (MTU 1460), so the networking SOP's 2.4 reads the ACTIVE
+      peering as an MTU mismatch. Not a defect: the one check of that stream
+      proposed as declarable on purpose. Inert for the audit until the
+      stream's declared-intent slice lands and the pool project's GitOps
+      knowledge/ note declares the peering; until then the finding publishes
+      and no case grades it.
+
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
     available_from_day: 30
@@ -229,6 +259,32 @@ fixtures:
     defect: >-
       Two unattached 10 GB persistent disks. The cost SOP's unattached-disk
       collector filters server-side on creationTimestamp<-P30D.
+
+  - role: declared-orphan-snapshot
+    slot: null # Project-scoped, a global object; not attached to any cluster.
+    available_from_day: 91
+    objects:
+      - snapshot/declared-orphan-snap-<prefix>
+    defect: >-
+      A Persistent Disk snapshot whose source disk is gone: the stack's
+      planter (orphan_snapshot.py) snapshots a 10 GB throwaway disk and
+      deletes it, and no snapshot schedule took the snapshot. The GCE compute
+      audit's orphaned-snapshots check flags it once
+      (now - creationTimestamp).days > 90, so the role is not ready, rather
+      than drifted, until day 91. The posture the pool project's GitOps
+      knowledge/ note is to declare on purpose once the check is ruled
+      declarable, so the compute audit lists it under Declared intent.
+
+  - role: orphan-snapshot
+    slot: null # Project-scoped, a global object; not attached to any cluster.
+    available_from_day: 91
+    objects:
+      - snapshot/orphan-snap-<prefix>
+    defect: >-
+      The second snapshot of the same throwaway disk, the same
+      orphaned-snapshots shape, which no note declares: the control the
+      compute audit keeps filing as a finding beside the declared one.
+      Not ready, rather than drifted, until day 91, as its sibling.
 
   - role: version-laggard
     slot: b
@@ -276,6 +332,96 @@ fixtures:
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
+
+  - role: untargeted-compute-class-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/app-worker-a
+      - computeclass/general-ccc
+    namespace: seeded-compute-class
+    defect: >-
+      A three-replica Deployment with no cloud.google.com/compute-class
+      nodeSelector and no compute-class affinity, in a namespace with no
+      default class, on the cluster whose only untainted pool carries the
+      general-ccc label: the untargeted workload the Cluster Autoscaler's
+      ComputeClass pre-filter leaves out of its scale-up simulation. The pods
+      run on the labelled node; the checks read the manifest, never the phase.
+
+  - role: compute-class-affinity-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/app-worker-b
+      - computeclass/general-ccc
+    namespace: seeded-compute-class
+    defect: >-
+      A Deployment naming ComputeClass general-ccc only in a required
+      nodeAffinity term and never in nodeSelector. A required nodeAffinity on
+      the class key also requests the class, so this is the targeted control
+      beside the untargeted workload and no check flags it.
+
+  - role: compute-class-toleration-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/batch-worker-a
+      - computeclass/general-ccc
+    namespace: seeded-compute-class
+    defect: >-
+      A Deployment targeted through the nodeSelector with a hand-written
+      toleration for the class taint that names key, value and effect and no
+      operator. The pool it targets carries no taint, so the pod runs; the
+      toleration's shape is the fixture.
+
+  - role: no-ephemeral-limit-workload
+    slot: c
+    available_from_day: 0
+    objects:
+      - deployment/batch-worker-a
+    namespace: seeded-compute-class
+    defect: >-
+      The same batch-worker-a Deployment, read for a second defect: its
+      container sets no ephemeral-storage request or limit, so its writable
+      layer and logs can fill the node's boot disk until the kubelet evicts
+      pods under DiskPressure. GKE Standard admission adds none, where
+      Autopilot writes a 1Gi request and limit onto every container.
+
+  - role: untainted-compute-class-pool
+    slot: c
+    available_from_day: 0
+    objects:
+      - nodepool/default-pool
+      - computeclass/general-ccc
+    defect: >-
+      Slot c's default-pool labelled cloud.google.com/compute-class=general-ccc
+      with no matching NoSchedule taint, so the scheduler fills it with
+      untargeted pods before the pre-filter drops them. The label is also what
+      leaves the cluster with no untainted pool without a class label, which
+      the obtainability audit's 3.24 needs before it files anything.
+
+  - role: manual-pools-compute-class
+    slot: c
+    available_from_day: 0
+    objects:
+      - computeclass/general-ccc
+    defect: >-
+      ComputeClass general-ccc with nodePoolAutoCreation off and priority
+      rules across the nodepools rule default-pool backs and two machine
+      families no pool backs, so a stockout on the first rule leaves pods with
+      no fallback GKE can create.
+
+  - role: no-nodelocal-dnscache
+    slot: c
+    available_from_day: 0
+    objects:
+      - cluster/self
+    defect: >-
+      The NodeLocal DNSCache add-on off on slot c, where GKE turns it on by
+      default on Standard from 1.34.1 and Autopilot cannot turn it off, so it
+      is the one cluster in a pool project without it. Inert for the other
+      fixtures; GKE re-creates the pool's node once for the change, inside the
+      maintenance window.
 
   - role: drift-peer-a
     slot: a
@@ -367,6 +513,21 @@ fixtures:
       Service that does not exist. The missing backend is the defect; Fail
       alone is set by healthy webhooks. Selectors confine it so it rejects no
       other scenario's writes.
+
+  - role: readiness-crd-webhook
+    slot: b
+    available_from_day: 0
+    objects:
+      - validatingwebhookconfiguration/seeded-crd-gate
+    defect: >-
+      failurePolicy Fail with a 2-second timeout and one rule on
+      CapacityBuffer creates and updates in the autoscaling.x-k8s.io group,
+      pointing at a Service that does not exist: the fail-closed webhook that
+      refuses the writes GKE's control plane makes in that group after a
+      1.35+ upgrade, where it installs capacitybuffers. An objectSelector on
+      the fleet label keeps it off every real object; the rule stays off
+      apiextensions.k8s.io so a dropped selector could never refuse a CRD
+      write.
 
   - role: node-local-state
     slot: a

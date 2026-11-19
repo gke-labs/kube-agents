@@ -697,6 +697,62 @@ func TestShellSandboxScopeDeclaredEnv(t *testing.T) {
 	}
 }
 
+// The earned-autonomy switches reach the sandbox pod only when
+// spec.deployment.env carries them, as one of each switch's known values:
+// anything else, a quoted literal included, arrives as "off", and a valueFrom
+// does not arrive at all.
+func TestShellSandboxAutonomySwitchEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent, name string) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == name {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	for _, name := range []string{envPostMergeCheck, envAutomerge, envDial} {
+		if _, ok := read(shellSandboxTestAgent(), name); ok {
+			t.Errorf("%s is set on the sandbox container with no spec.deployment.env entry; the entrypoint writes off for it", name)
+		}
+	}
+	cases := []struct{ name, value, want string }{
+		{envPostMergeCheck, "silent", "silent"},
+		{envPostMergeCheck, " REPORT ", "report"},
+		{envPostMergeCheck, "on", "off"},
+		{envAutomerge, "practice", "practice"},
+		{envAutomerge, "on", "on"},
+		{envAutomerge, "\"on\"", "off"},
+		{envDial, "On", "on"},
+		{envDial, "true", "off"},
+		{envDial, "", "off"},
+	}
+	for _, c := range cases {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: c.name, Value: c.value}}}
+		if got, ok := read(agent, c.name); !ok || got != c.want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", c.name, got, ok, c.value, c.want)
+		}
+	}
+	// Named twice, the last literal wins, as it would in a container's env.
+	twice := shellSandboxTestAgent()
+	twice.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: envAutomerge, Value: "on"},
+		{Name: envAutomerge, Value: "off"},
+	}}
+	if got, ok := read(twice, envAutomerge); !ok || got != "off" {
+		t.Errorf("%s = %q, %v when set to on and then off; want the last, off", envAutomerge, got, ok)
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envAutomerge,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret, envAutomerge); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envAutomerge)
+	}
+}
+
 // The audits' auto-promotion switch reaches the sandbox pod only when
 // spec.deployment.env carries it, and with the value given: finish runs here,
 // and an operator who set it on the agent would otherwise have set it on a
@@ -1577,7 +1633,6 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 // caller peer on the credentialed port, present exactly when the view is on.
 func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
 	agent := shellSandboxTestAgent()
-	agent.Spec.Mode = ptr.To("next")
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
 		t.Fatalf("flag off: %d caller peers, want 2", got)
@@ -2179,6 +2234,26 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 		np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app"] != shellSandboxName(agent) {
 		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress only from %q, got %#v", shellSandboxName(agent), np.Spec.Ingress[0].From)
 	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	sessDep := buildKubeProxyDeployment(agent, "", true, "tls-hash")
+	sessEnvs := make(map[string]string)
+	for _, e := range sessDep.Spec.Template.Spec.Containers[0].Env {
+		sessEnvs[e.Name] = e.Value
+	}
+	if got := sessEnvs["CREDENTIAL_PROXY_SESSION_AUDIENCE"]; got != credentialProxySessionAudience {
+		t.Errorf("CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", got, credentialProxySessionAudience)
+	}
+	if got := sessEnvs["CREDENTIAL_PROXY_SESSION_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-a2a-session" {
+		t.Errorf("CREDENTIAL_PROXY_SESSION_CALLERS = %q, want session SA", got)
+	}
+	if got := sessEnvs["CREDENTIAL_PROXY_ALLOWED_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-shell" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want only shell SA", got)
+	}
+	sessNP := buildKubeProxyNetworkPolicy(agent)
+	if len(sessNP.Spec.Ingress[0].From) != 2 {
+		t.Fatalf("expected 2 peers (shell, a2a-session) on kube-proxy NetworkPolicy, got %#v", sessNP.Spec.Ingress[0].From)
+	}
 }
 
 func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {
@@ -2205,5 +2280,45 @@ func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {
 	// /clusters/<context> prefix is refused, so the env is gone on every harness.
 	if v, ok := kpEnv["KUBE_PROXY_DEFAULT_CLUSTER"]; ok {
 		t.Errorf("kube-proxy still renders KUBE_PROXY_DEFAULT_CLUSTER=%q; it routes nothing now", v)
+	}
+}
+
+// The kubectl cost tier reaches the shell container only as a plain lowercase
+// literal from spec.deployment.env: the entrypoint writes it to a file the
+// admission opens by tier name.
+func TestShellSandboxKubectlCostTierEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envKubectlCostTier {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	if _, ok := read(shellSandboxTestAgent()); ok {
+		t.Errorf("%s is set with no spec.deployment.env entry; unset means the default tier", envKubectlCostTier)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envKubectlCostTier, Value: value}}}
+		if got, ok := read(agent); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", envKubectlCostTier, got, ok, value, want)
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envKubectlCostTier, Value: value}}}
+		if got, ok := read(agent); ok {
+			t.Errorf("%s = %q reached the sandbox for the CR value %q; only a plain tier name may", envKubectlCostTier, got, value)
+		}
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envKubectlCostTier,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envKubectlCostTier)
 	}
 }

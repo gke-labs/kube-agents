@@ -146,6 +146,22 @@ type notifyFeedbackTarget interface {
 	AnswerFeedbackTarget(conversation, answerTo string) string
 }
 
+// notifyReportKeeper is the optional extension NotifyConversations
+// implements to keep the text of a report the route posted into a
+// conversation (Gateway.reports), under the root of the task it reported
+// on, so a reply under it can carry the report to the executor.
+type notifyReportKeeper interface {
+	KeepReport(conversation, root, text string)
+}
+
+// notifyPostFeedback is the optional extension NotifyConversations
+// implements to rate the home posts the agent makes on its own: the id a post
+// of kind with update key (empty for none) is rated under, or "" when answer
+// feedback is off (Gateway.postFeedbackTarget).
+type notifyPostFeedback interface {
+	PostFeedbackTarget(kind, key string) string
+}
+
 // notifyPoster is the backend half: post text into a space, new thread or
 // reply, and say where it landed. GoogleChatAdapter and SlackAdapter
 // implement it; the Notifier, not the poster, holds the home-only bound.
@@ -154,10 +170,11 @@ type notifyPoster interface {
 }
 
 // notifyBlocksPoster is the optional half a backend that renders Block Kit
-// adds: one message, blocks with text as the fallback. SlackAdapter is the
-// one implementation; a request with blocks to any other backend is refused.
+// adds: one message, blocks with text as the fallback, and the rating
+// controls for feedback when it is set. SlackAdapter is the one
+// implementation; a request with blocks to any other backend is refused.
 type notifyBlocksPoster interface {
-	PostNotifyBlocks(home, thread, text string, blocks json.RawMessage) (message, landed string, err error)
+	PostNotifyBlocks(home, thread, text string, blocks json.RawMessage, feedback string) (message, landed string, err error)
 }
 
 // notifyChatPoster is the optional half a backend that lays out a chat
@@ -424,6 +441,10 @@ type notifyJob struct {
 	// when it carried none; reply draws it once the request is answered
 	// with a post, and never for a request that posted nothing.
 	mark *MarkState
+	// rootTask is the root of the task the request's reply_to named, as
+	// postConsole resolved it for the frame; "" when it named none. reply
+	// keeps the post under it.
+	rootTask string
 }
 
 // reply answers the job. When the answer says nothing was posted and the
@@ -437,6 +458,17 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 			"text", firstLine(job.req.Text, notifyLostLineMax))
 	}
 	job.answer(r)
+	// A report that landed is kept for the reply under it: a post the
+	// kanban notifier marked as a card's report (report, set on the settled
+	// card's report post alone) that names the task it reports on
+	// (reply_to, which the notifier puts on every post into a console
+	// thread, progress notes included, so reply_to alone cannot tell them
+	// apart).
+	if r.Error == "" && r.MessageID != "" && job.req.Report && job.rootTask != "" {
+		if keeper, ok := n.conv.(notifyReportKeeper); ok {
+			keeper.KeepReport(job.req.Conversation, job.rootTask, job.req.Text)
+		}
+	}
 	// After the answer, so the requester does not wait on the session lock,
 	// and only for a post that landed, so the ask's reaction comes off when
 	// the answer is in the thread and not when it failed to be.
@@ -827,12 +859,24 @@ func (n *Notifier) post(job notifyJob) {
 	}
 	var first string
 	answered := false
-	for i, chunk := range chatChunks(job.req.Text, discordChunk) {
+	// A home post the agent made on its own carries the rating controls on
+	// its last chunk (postHomeText), as a rated answer's text does.
+	feedback := ""
+	// Only a post that opens a thread: a keyed edit that fell through to
+	// chunks here is a reply under its alert, which keeps the controls.
+	if job.req.Conversation == "" && job.req.Thread == "" {
+		feedback = n.homeFeedback(job.req.Update, "")
+	}
+	chunks := chatChunks(job.req.Text, discordChunk)
+	for i, chunk := range chunks {
 		var message, landed string
 		var err error
-		if job.req.Conversation != "" {
+		switch {
+		case job.req.Conversation != "":
 			message, err = n.conv.Post(job.req.Conversation, chunk)
-		} else {
+		case i == len(chunks)-1:
+			message, landed, err = n.postHomeText(job.home, thread, OutMessage{Text: chunk, Feedback: feedback})
+		default:
 			message, landed, err = n.poster.PostNotify(job.home, thread, chunk)
 		}
 		if err != nil {
@@ -882,6 +926,7 @@ func (n *Notifier) postConsole(job notifyJob) {
 		replyTo = rooter.ReplyToRoot(ctx, conversation, replyTo)
 		cancel()
 	}
+	job.rootTask = replyTo
 	message, err := n.frames.PostNotifyFrame(conversation, messageID, job.req.Text, replyTo, edit)
 	if err != nil {
 		n.log.Error("notify post failed", "conversation", conversation, "update", key, "err", err)
@@ -1049,7 +1094,7 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 // none of.
 func (n *Notifier) postHome(job notifyJob) bool {
 	home, thread, key := job.home, job.req.Thread, job.req.Update
-	m := OutMessage{Text: job.req.Text}
+	m := OutMessage{Text: job.req.Text, Feedback: n.homeFeedback(key, thread)}
 	if len(job.req.Chat) > 0 {
 		reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
 		if len(reading.Problems) > 0 {
@@ -1078,7 +1123,7 @@ func (n *Notifier) postHome(job notifyJob) bool {
 		n.log.Info("notify posted", "home", home, "thread", landed, "message", message, "chat", true)
 		return true
 	}
-	text := OutMessage{Text: m.Text}
+	text := OutMessage{Text: m.Text, Feedback: m.Feedback}
 	fits := utf8.RuneCountInString(m.Text) <= discordChunk
 	if m.Chat == nil && !fits {
 		return false
@@ -1113,10 +1158,10 @@ func (n *Notifier) postHome(job notifyJob) bool {
 			if !fits {
 				return false
 			}
-			message, landed, err = n.poster.PostNotify(home, thread, text.Text)
+			message, landed, err = n.postHomeText(home, thread, text)
 		}
 	} else {
-		message, landed, err = n.poster.PostNotify(home, thread, text.Text)
+		message, landed, err = n.postHomeText(home, thread, text)
 	}
 	if err != nil {
 		n.log.Error("notify post failed", "home", home, "thread", thread, "update", key, "err", err, "hint", n.homePostHint(err))
@@ -1128,10 +1173,31 @@ func (n *Notifier) postHome(job notifyJob) bool {
 	}
 	if landed != "" {
 		n.updates.put(notifyHomeKeyPrefix+landed, key, message)
+		if m.Feedback != "" {
+			// The thread's opening post was rated: its key's later edit
+			// keeps the controls (homeFeedback).
+			n.updates.markRated(notifyHomeKeyPrefix+landed, key)
+		}
 	}
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
 	n.log.Info("notify posted", "home", home, "thread", landed, "message", message, "update", key, "chat", m.Chat != nil)
 	return true
+}
+
+// postHomeText posts m's text as one home message: with its rating controls
+// when it is marked for rating and the backend draws them on a home post
+// (notifyChatPoster), and as plain text otherwise or when the backend
+// refuses the controls. Any other failure is returned as it is: the post
+// may have landed, and a second one would post it twice.
+func (n *Notifier) postHomeText(home, thread string, m OutMessage) (message, landed string, err error) {
+	if poster, lays := n.poster.(notifyChatPoster); lays && m.Feedback != "" {
+		message, landed, err = poster.PostNotifyMessage(home, thread, OutMessage{Text: m.Text, Feedback: m.Feedback})
+		if !errors.Is(err, ErrLayoutRefused) {
+			return message, landed, err
+		}
+		n.log.Warn("notify: the rated home post was refused; posting it without rating controls", "home", home, "thread", thread, "err", err)
+	}
+	return n.poster.PostNotify(home, thread, m.Text)
 }
 
 // editKeyed edits a keyed message to m, laid out when the adapter lays it
@@ -1239,6 +1305,33 @@ type notifyUpdates struct {
 type notifyKeys struct {
 	messages map[string]string
 	order    []string
+	// ratedKeys are the keys whose message was posted with rating controls
+	// (markRated), forgotten with the key.
+	ratedKeys map[string]bool
+}
+
+// markRated records that key's message on conversation carries rating
+// controls, so the edit that rewrites it keeps them. A key not in the
+// table records nothing.
+func (u *notifyUpdates) markRated(conversation, key string) {
+	keys := u.byConversation[conversation]
+	if keys == nil {
+		return
+	}
+	if _, ok := keys.messages[key]; !ok {
+		return
+	}
+	if keys.ratedKeys == nil {
+		keys.ratedKeys = map[string]bool{}
+	}
+	keys.ratedKeys[key] = true
+}
+
+// rated reports whether key's message on conversation carries rating
+// controls.
+func (u *notifyUpdates) rated(conversation, key string) bool {
+	keys := u.byConversation[conversation]
+	return keys != nil && keys.ratedKeys[key]
 }
 
 func (u *notifyUpdates) get(conversation, key string) (string, bool) {
@@ -1285,6 +1378,7 @@ func (u *notifyUpdates) put(conversation, key, message string) {
 		keys.order = append(keys.order, key)
 		if len(keys.order) > notifyUpdateKeysMax {
 			delete(keys.messages, keys.order[0])
+			delete(keys.ratedKeys, keys.order[0])
 			keys.order = keys.order[1:]
 		}
 	}
@@ -1387,7 +1481,8 @@ func slackThreadTS(thread string) string {
 // chunk. validate has already refused blocks to a backend without them.
 func (n *Notifier) postBlocks(job notifyJob) {
 	poster := n.poster.(notifyBlocksPoster)
-	message, landed, err := poster.PostNotifyBlocks(job.home, job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks)
+	message, landed, err := poster.PostNotifyBlocks(job.home, job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks,
+		n.homeFeedback("", job.req.Thread))
 	if err != nil {
 		n.log.Error("notify blocks post failed", "home", job.home, "thread", job.req.Thread, "err", err, "hint", n.homePostHint(err))
 		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
@@ -1395,6 +1490,29 @@ func (n *Notifier) postBlocks(job notifyJob) {
 	}
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
 	n.log.Info("notify posted", "home", job.home, "thread", landed, "message", message, "blocks", true)
+}
+
+// homeFeedback is the id a home post with update key (empty for none) on
+// thread (empty: it opens one) is rated under, or "" when it is not rated:
+// answer feedback is off, the route has no conversations to ask, or the post
+// is a reply in a thread. A thread's opening post is what the agent posted
+// on its own: a keyed one is an alert, whose thread its triage edits under
+// the same key, and any other a report. A reply (a triage card's plan or
+// progress under the alert) is not rated, except the edit of an opening post
+// that was, which keeps its controls.
+func (n *Notifier) homeFeedback(key, thread string) string {
+	pf, ok := n.conv.(notifyPostFeedback)
+	if !ok {
+		return ""
+	}
+	if thread != "" && (key == "" || !n.updates.rated(notifyHomeKeyPrefix+thread, key)) {
+		return ""
+	}
+	kind := postKindReport
+	if key != "" {
+		kind = postKindAlert
+	}
+	return pf.PostFeedbackTarget(kind, key)
 }
 
 // inHome reports whether thread is a thread resource of the home space
@@ -1503,6 +1621,12 @@ func (c gatewayConversations) ReplyToRoot(ctx context.Context, conversation, tas
 	return root
 }
 
+// KeepReport keeps a report the route posted into a conversation, under
+// the root of the task it reported on (notifyReportKeeper).
+func (c gatewayConversations) KeepReport(conversation, root, text string) {
+	c.g.reports.put(conversation, root, text)
+}
+
 func (c gatewayConversations) Post(conversation, text string) (string, error) {
 	return c.poster.Post(conversation, text)
 }
@@ -1546,6 +1670,12 @@ func (c gatewayConversations) MarkConversation(conversation, update string, mark
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("notify: session record write failed after a mark", "conversation", conversation, "err", err)
 	}
+}
+
+// PostFeedbackTarget is the id a home post the agent made on its own is
+// rated under (notifyPostFeedback).
+func (c gatewayConversations) PostFeedbackTarget(kind, key string) string {
+	return c.g.postFeedbackTarget(kind, key)
 }
 
 // Conversations is what Notifier.SetConversations takes: the gateway's

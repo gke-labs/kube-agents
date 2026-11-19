@@ -218,6 +218,7 @@ func TestNotifyReportsAFirstPostFailure(t *testing.T) {
 // is dropped unanswered - the gateway does not reply on a subject the
 // requester chose freely.
 func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -233,7 +234,7 @@ func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
 	}
 	defer sub.Stop()
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +303,7 @@ func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
 	defer sub.Stop()
 	defer close(poster.release)
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +334,7 @@ func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
 // left silent (silence reads as "may have posted" and is not retried). A
 // request arriving after Stop is refused, not sent on the closed queue.
 func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -351,7 +353,7 @@ func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +435,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 	done := make(chan struct{})
 	go func() { n.Run(runCtx, client); close(done) }()
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,6 +466,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 // A bind that cannot succeed (the client is closed) is retried, not given
 // up on, until the context ends.
 func TestRunRetriesAFailedBind(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -567,6 +570,14 @@ type fakeConversations struct {
 	// posts made by then.
 	marks       []string
 	postsAtMark []int
+	// kept records KeepReport calls as "conversation root text".
+	kept []string
+}
+
+func (f *fakeConversations) KeepReport(conversation, root, text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kept = append(f.kept, conversation+" "+root+" "+text)
 }
 
 func (f *fakeConversations) MarkConversation(conversation, update string, mark MarkState) {
@@ -798,7 +809,7 @@ func TestBlockingConversationLookupDoesNotHoldFollowingHomeRequestAcceptance(t *
 	defer sub.Stop()
 	defer close(release)
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -867,7 +878,7 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,6 +962,7 @@ func TestARecordThatDoesntDecodeIsMarkedAsSuch(t *testing.T) {
 // answered with the stopping refusal marked retry, which the CLI turns into
 // "route unavailable" rather than a failure charged to the destination.
 func TestARequestWhileStoppingIsARetry(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -969,7 +981,7 @@ func TestARequestWhileStoppingIsARetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { sub.Stop() }()
-	agent, err := nats.Connect(s.ClientURL())
+	agent, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,16 @@
 
 set -e
 
+# The Hermes bridge sidecar's image. The operator takes it from the agent image
+# on the PlatformAgent: the same registry path and tag, with this name
+# (a2aBridgeImage in k8s-operator/internal/controller/platformagent_a2a_bridge.go).
+# So a dev tag that has no bridge image leaves the agent pod unable to start.
+# It is built FROM the agent image, from the a2a module (paths from the repository root).
+readonly BRIDGE_IMAGE_NAME="hermes-bridge"
+readonly BRIDGE_DOCKERFILE="a2a/Dockerfile.hermes-bridge"
+readonly BRIDGE_BUILD_CONTEXT="a2a"
+readonly BRIDGE_BUILD_CONFIG="scripts/dev/cloudbuild-hermes-bridge.yaml"
+
 # scripts/dev/ is two levels below the repository root, and the shared helpers
 # are its sibling in scripts/installer/.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -116,6 +126,7 @@ IMAGE_URI_LATEST="$IMAGE_BASE:latest"
 PROXY_IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/credential-proxy"
 PROXY_IMAGE_URI="$PROXY_IMAGE_BASE:$DEV_TAG"
 PROXY_IMAGE_URI_LATEST="$PROXY_IMAGE_BASE:latest"
+BRIDGE_IMAGE_URI="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$BRIDGE_IMAGE_NAME:$DEV_TAG"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -157,6 +168,9 @@ execute_image_build() {
     DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$PROXY_IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target credential-proxy -t "$PROXY_IMAGE_URI" -t "$PROXY_IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     docker push "$PROXY_IMAGE_URI" || return 1
     docker push "$PROXY_IMAGE_URI_LATEST" || return 1
+    # After the agent image is pushed: the bridge image is built FROM it.
+    docker build --platform linux/amd64 --build-arg PLATFORM_AGENT_IMAGE="$IMAGE_URI" -t "$BRIDGE_IMAGE_URI" -f "${REPO_ROOT}/${BRIDGE_DOCKERFILE}" "${REPO_ROOT}/${BRIDGE_BUILD_CONTEXT}" || return 1
+    docker push "$BRIDGE_IMAGE_URI" || return 1
   else
     print_info "Submitting build for '$AGENT_TARGET' agent to Google Cloud Build..."
     print_info "Target Images: $IMAGE_URI and $IMAGE_URI_LATEST"
@@ -174,6 +188,16 @@ execute_image_build() {
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
           --substitutions="_IMAGE_URI=${PROXY_IMAGE_URI},_IMAGE_URI_LATEST=${PROXY_IMAGE_URI_LATEST},_TARGET=credential-proxy,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+          --project="${PROJECT_ID}" \
+          ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
+          .
+    ) || return 1
+    # After the agent build: the bridge image is built FROM the image it pushed.
+    (
+      cd "${REPO_ROOT}"
+      gcloud builds submit \
+          --config="${BRIDGE_BUILD_CONFIG}" \
+          --substitutions="_BRIDGE_URI=${BRIDGE_IMAGE_URI},_PLATFORM_URI=${IMAGE_URI}" \
           --project="${PROJECT_ID}" \
           ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .
@@ -278,4 +302,5 @@ run_step "4. Trigger Redeployment in GKE" verify_redeploy execute_redeploy 0
 echo -e "\n${C_GREEN}${C_BOLD}🚀 Fast iteration update complete for ${SELECTED_AGENT}!${C_RESET}"
 echo -e "  ${C_CYAN}New sandbox image deployed:${C_RESET} ${IMAGE_URI}"
 echo -e "  ${C_CYAN}New credential proxy image deployed:${C_RESET} ${PROXY_IMAGE_URI}"
+echo -e "  ${C_CYAN}New Hermes bridge image built:${C_RESET} ${BRIDGE_IMAGE_URI}"
 echo ""

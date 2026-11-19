@@ -78,11 +78,12 @@ const (
 	// equals either audience above.
 	credentialProxyA2AChatAudience = "kubeagents-credential-proxy-a2a-chat" // #nosec G101 -- Token audience name, not a credential
 	// credentialProxySessionAudience is the session pod's, under
-	// a2aSessionClusterViewEnvVar. A third audience for the same reason as
-	// the second: the session ServiceAccount is on the callers list, so only
-	// the audience can tell a session token from the shell's, and the
-	// broker's `session` role (exec only, kubectl and gcloud only) hangs off
-	// it. Spelled identically in credential_proxy.py and a2a/gateway/spawn.go.
+	// a2aSessionClusterViewEnvVar. A distinct audience so neither
+	// <agent>-kube-proxy nor the credential broker confuses a session token
+	// with the shell's: <agent>-kube-proxy binds it to the session
+	// ServiceAccount for kubectl, and the broker's `session` role (exec
+	// only, gcloud only) hangs off it. Spelled identically in
+	// kube_proxy_manifests.go, credential_proxy.py, and a2a/gateway/spawn.go.
 	credentialProxySessionAudience = "kubeagents-credential-proxy-session" // #nosec G101 -- Token audience name, not a credential
 
 	// credentialProxyTokenMountPath is where the agent container finds the
@@ -234,7 +235,7 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	// pulls the relay hosted here, and a next install that gives it no Chat
 	// backend has no reason to widen the broker's callers by one.
 	if a2aChatArmed(agent) {
-		callers = append(callers, fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent)))
+		callers = append(callers, a2aGatewayBrokerCaller(agent))
 	}
 	// The third caller exists only under the cluster-view flag. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
@@ -260,7 +261,17 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	if scopePublisherMayRun(agent, owned.scope) {
 		callers = append(callers, scopePublisherBrokerCaller(agent))
 	}
+	if a2aCuratorEnabled() {
+		callers = append(callers, a2aCuratorBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
+}
+
+// a2aGatewayBrokerCaller is the TokenReview username of the A2A gateway's
+// ServiceAccount, as the broker sees it: an allowed caller while Chat is
+// armed, and the one CREDENTIAL_PROXY_A2A_CHAT_CALLERS names.
+func a2aGatewayBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent))
 }
 
 // a2aSessionBrokerCaller is the TokenReview username of the session pods'

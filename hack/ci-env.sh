@@ -129,7 +129,7 @@ readonly LITELLM_LOG_CONTAINER="litellm-container"
 # ─── Agent pod diagnostics ───────────────────────────────────────────────────
 # collect_agent_pod_diagnostics keeps, on every eval run, what says why a pod
 # in the install was replaced or a container restarted mid-run: the Hermes
-# bridge sidecar's log (the executor under EVAL_MODE_NEXT=1), the previous
+# bridge sidecar's log (the executor), the previous
 # instance of the agent and bridge containers, each pod's restart counts and
 # last termination, and the namespace's events. The gateway log alone cannot:
 # a replaced pod starts a fresh log, so a green run whose repetitions ended
@@ -148,7 +148,7 @@ readonly AGENT_DIAG_LOG_MAX_BYTES=$((8 * 1024 * 1024))
 # Events are one line each; the namespace's whole retained window fits.
 readonly AGENT_DIAG_EVENTS_TAIL_LINES=5000
 # The agent's own container, and the bridge sidecar the operator renders
-# beside it under EVAL_MODE_NEXT=1 (hack/ci-deploy.sh's BRIDGE_SIDECAR_NAME).
+# beside it (hack/ci-deploy.sh's BRIDGE_SIDECAR_NAME).
 # Named apart from that constant because ci-deploy.sh sources this file and
 # both are readonly.
 readonly AGENT_DIAG_AGENT_CONTAINER="platform-agent"
@@ -208,6 +208,34 @@ readonly A2A_DIAG_LOG_MAX_BYTES=$((4 * 1024 * 1024))
 # into hundreds of files. The operator renders under a dozen pods and the
 # gateway caps sessions at A2A_MAX_SESSIONS, so a healthy install is well under.
 readonly A2A_DIAG_MAX_PODS=40
+# Each bus server's own view, read from its monitoring port inside its pod:
+# /jsz carries the JetStream meta cluster, and on its leader every peer with
+# current and offline, the state a stream placement counts (a create refused
+# "no suitable peers for placement" on three servers that all serve is
+# otherwise undiagnosable from logs: #5644's smoke run); /routez the
+# routes the server holds; /varz its version and build. The image each
+# server's containers ran goes to a2a-nats-images.txt, so servers on
+# different builds of a floating tag show. Each read is bounded by
+# `timeout`, not by --request-timeout: that governs plain API calls and not an
+# exec's stream, so a wedged node tunnel would otherwise hold the exit trap
+# (the credential-proxy scrape above has the same bound for the same reason).
+# 3 servers x 3 reads x the bound caps the whole at 90s.
+readonly A2A_DIAG_NATS_COMPONENT="nats"
+readonly A2A_DIAG_NATS_CONTAINER="nats"
+readonly A2A_DIAG_NATS_MONITOR_URL="http://127.0.0.1:8222"
+readonly A2A_DIAG_NATS_MONITOR_PATHS="jsz routez varz"
+readonly A2A_DIAG_NATS_READ_MAX_BYTES=$((1024 * 1024))
+readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
+# wget's own read timeout, inside the exec's bound, so a monitor that accepts
+# and then stalls ends the read before the bound kills the exec.
+readonly A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS=5
+# The first bytes of each bus server's current log file, beside the tail the
+# component logs keep (A2A_DIAG_LOG_MAX_BYTES). The lane runs the bus at debug
+# (#5708), and a server's bring-up, where its meta group forms, is at the start
+# of a log a long run can push out of the tail. A log the kubelet rotated has
+# lost it; the file then says so (collect_a2a_nats_monitor).
+readonly A2A_DIAG_NATS_HEAD_MAX_BYTES=$((2 * 1024 * 1024))
+readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
 # On by default (EVAL_REPLAY_SHADOW=false turns it off), this puts the shadow-mode replay proxy
@@ -294,6 +322,16 @@ readonly REPLAY_MODE_STOP_WAIT_SECONDS=255
 # beside its logs (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_LANE_CACHE_MAX_AGE_HOURS=30
 readonly REPLAY_LANE_CACHE_MAX_BYTES=$((512 * 1024 * 1024))
+# A recording names the commit its checkout was at, and the lane's report the
+# commit it replayed: a full SHA-1, publish_cache.COMMIT_PATTERN. Anything else
+# goes to the collector as empty, which it takes, rather than as a value it
+# would refuse and so collect nothing.
+readonly REPLAY_COMMIT_RE='^[0-9a-f]{40}$'
+# What the lane's Prow job exports as REPLAY_LANE_COMMIT_SOURCE: it checked out
+# the commit the newest recording night ran (fetch_cache.py --print-commit), or
+# stayed on main because no record named one or the fetch failed.
+readonly REPLAY_LANE_COMMIT_SOURCE_RECORDING="recording"
+readonly REPLAY_LANE_COMMIT_SOURCE_MAIN="main"
 # The variable the chart stamps the mode into, read back the same way: the
 # deploy decides the mode once, and the eval's collector runs in that mode.
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
@@ -320,6 +358,8 @@ readonly REPLAY_SHADOW_COLLECTOR_POLL_SECONDS=1
 readonly REPLAY_SHADOW_COLLECTOR_LOG="replay-shadow-collector.log"
 REPLAY_SHADOW_COLLECTOR_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/collect_shadow.py"
 REPLAY_CACHE_FETCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/fetch_cache.py"
+# A directory in this checkout, for the commit it is at (_replay_checkout_commit).
+REPLAY_CHECKOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
@@ -409,9 +449,9 @@ last_bytes() {
 # cannot be reached costs the run its gateway log and nothing else. The
 # failure dumper below calls this rather than taking its own, shorter tail, so
 # the failure path never overwrites the every-run capture with less.
-# Once per process, like collect_agent_pod_diagnostics: ci-eval-pr.sh takes it
-# before a next-mode run's rollback round trip replaces the pod, and the EXIT
-# trap's call after that must not overwrite the eval's log with the new pod's.
+# Once per process, like collect_agent_pod_diagnostics: a later call in the
+# same process (the failure dumper's through the EXIT trap) must not
+# overwrite the eval's log with a replacement pod's.
 # Read with a default, so the function alone, without this assignment, still
 # runs under `set -u` (the test suites lift it that way).
 GATEWAY_LOG_COLLECTED=""
@@ -473,7 +513,7 @@ collect_litellm_log() {
 # collect_gateway_log: every command ends in `|| true`, so `$?` is left for
 # the dumper; pinned to AGENT_CLUSTER_CONTEXT for the same reason; once per
 # process, so the eval's capture is the one kept when the trap or the failure
-# dumper calls again after a round trip replaced the pod. An install without
+# dumper calls again. An install without
 # the Deployment is a note, not a failure: the note is the log artifact's
 # content, so the file says why it holds nothing, and no scrape is attempted.
 CREDENTIAL_PROXY_EVIDENCE_COLLECTED=""
@@ -837,7 +877,7 @@ resolve_replay_shadow() {
 # The chart values that turn the proxy on, into REPLAY_SHADOW_HELM_ARGS, for
 # the image at <repository>:<tag>. Empty unless resolve_replay_shadow left
 # REPLAY_SHADOW_ACTIVE=true, so a run without the proxy installs exactly what
-# it did before. The next-mode flip's `helm upgrade --reuse-values` keeps them.
+# it did before.
 replay_shadow_helm_args() {
   local repository="$1" tag="$2"
   REPLAY_SHADOW_HELM_ARGS=()
@@ -896,11 +936,44 @@ replay_shadow_helm_args() {
 # resolution decide; the proxy then bounds its own cache (REPLAY_DATA_MAX_BYTES).
 # Record and replay keep what they copy in a private directory on this machine
 # (REPLAY_KEEP_DIR), never the artifacts.
+#
+# A recording collector passes the checkout's commit (--commit), which every
+# publish record names; the lane's passes the commit it replays on and
+# REPLAY_LANE_COMMIT_SOURCE (--lane-commit, --lane-commit-source), which its
+# report names.
 REPLAY_SHADOW_COLLECTOR_PID=""
 REPLAY_SHADOW_COLLECTOR_WAIT_SECONDS=""
 REPLAY_KEEP_DIR=""
 REPLAY_LANE_SEED_DIR=""
 REPLAY_LANE_NIGHTLY_RUNS=""
+# The commit this checkout is at, or nothing when git can't say or prints
+# something other than a full SHA-1 (REPLAY_COMMIT_RE).
+_replay_checkout_commit() {
+  local commit=""
+  if [ -n "${REPLAY_CHECKOUT_DIR:-}" ] && command -v git >/dev/null 2>&1; then
+    commit="$(git -C "${REPLAY_CHECKOUT_DIR}" rev-parse --verify --quiet HEAD 2>/dev/null)" || commit=""
+  fi
+  if [ -n "${commit}" ] && ! [[ "${commit}" =~ ${REPLAY_COMMIT_RE} ]]; then
+    echo "WARNING: git names this checkout's commit '${commit}', not a full SHA-1; the collector is told none." >&2
+    commit=""
+  fi
+  echo "${commit}"
+}
+
+# The lane's REPLAY_LANE_COMMIT_SOURCE, or nothing when it is unset or neither
+# REPLAY_LANE_COMMIT_SOURCE_RECORDING nor REPLAY_LANE_COMMIT_SOURCE_MAIN.
+_replay_lane_commit_source() {
+  case "${REPLAY_LANE_COMMIT_SOURCE:-}" in
+  "${REPLAY_LANE_COMMIT_SOURCE_RECORDING}" | "${REPLAY_LANE_COMMIT_SOURCE_MAIN}")
+    echo "${REPLAY_LANE_COMMIT_SOURCE}"
+    ;;
+  "") ;;
+  *)
+    echo "WARNING: REPLAY_LANE_COMMIT_SOURCE='${REPLAY_LANE_COMMIT_SOURCE}' is neither ${REPLAY_LANE_COMMIT_SOURCE_RECORDING} nor ${REPLAY_LANE_COMMIT_SOURCE_MAIN}; the lane's report leaves it unstated." >&2
+    ;;
+  esac
+}
+
 start_replay_shadow_collector() {
   [ -z "${REPLAY_SHADOW_COLLECTOR_PID}" ] || return 0
   if ! resolve_replay_shadow; then
@@ -997,12 +1070,14 @@ start_replay_shadow_collector() {
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --publish-bucket "${REPLAY_CACHE_BUCKET}" --verdicts-dir "${artifact_dir}"
       --publish-interval "${REPLAY_RECORD_PUBLISH_INTERVAL_SECONDS}"
-      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}")
+      --job-name "${JOB_NAME:-}" --forge "${EVAL_FORGE:-}"
+      --commit "$(_replay_checkout_commit)")
     ;;
   "${REPLAY_MODE_REPLAY}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --seed-dir "${REPLAY_LANE_SEED_DIR:-}" --verdicts-dir "${artifact_dir}"
-      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}")
+      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}"
+      --lane-commit "$(_replay_checkout_commit)" --lane-commit-source "$(_replay_lane_commit_source)")
     ;;
   esac
   if [ "${mode}" != "${REPLAY_MODE_SHADOW}" ]; then
@@ -1021,16 +1096,14 @@ start_replay_shadow_collector() {
   return 0
 }
 
-# ─── The replay lane: the cache, in every proxy pod, before any case ─────────
+# ─── The replay lane: the cache, fetched before any case ─────────────────────
 # A no-op unless EVAL_REPLAY_LANE=true. Downloads what recent
 # trusted nightlies selected from the shared cache (fetch_cache.py, into
 # REPLAY_LANE_SEED_DIR, with their runs in REPLAY_LANE_NIGHTLY_RUNS) and seeds
-# every live proxy pod with it (collect_shadow.py --seed-once; a pod draining
-# after a rollout is skipped); the collector then seeds any pod that replaces
-# one. Returns 1, with the reason, when there is nothing to replay, no live pod,
-# or a live pod did not take it: the lane would measure nothing,
-# so the caller stops before its cases. Call once AGENT_CLUSTER_CONTEXT is set,
-# before start_replay_shadow_collector.
+# no pod: seed_replay_lane_cache does that, after the lane's live arm.
+# Returns 1, with the reason, when there is nothing to replay: the lane would
+# measure nothing, so the caller stops before its cases. Call once
+# AGENT_CLUSTER_CONTEXT is set.
 prepare_replay_lane_cache() {
   # Every other run is the collector's to resolve, which only warns.
   [ "${EVAL_REPLAY_LANE:-false}" = "true" ] || return 0
@@ -1049,11 +1122,27 @@ prepare_replay_lane_cache() {
   mkdir -p "${REPLAY_KEEP_DIR}" "${REPLAY_LANE_SEED_DIR}" || return 1
   if ! python3 "${REPLAY_CACHE_FETCH_SCRIPT}" --bucket "${REPLAY_CACHE_BUCKET}" --dest "${REPLAY_LANE_SEED_DIR}" \
     --runs-out "${REPLAY_LANE_NIGHTLY_RUNS}" --max-age-hours "${REPLAY_LANE_CACHE_MAX_AGE_HOURS}" \
-    --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}" \
+    --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" --forge "${EVAL_FORGE:-}" \
     < /dev/null; then
     echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2
     return 1
   fi
+  echo "Replay lane: the cache is fetched; no proxy pod holds it until seed_replay_lane_cache."
+  return 0
+}
+
+# Seeds every live proxy pod with what prepare_replay_lane_cache fetched
+# (collect_shadow.py --seed-once; a pod draining after a rollout is skipped);
+# the collector then seeds any pod that replaces one. Until this runs, a
+# replay proxy's cache is empty, so every request misses and goes to the model:
+# the lane's live arm runs before it. A no-op when nothing was fetched (off the
+# lane, or a lane proxy not in replay mode). Returns 1, with the reason, when no
+# live pod ran or one did not take the cache. Call before
+# start_replay_shadow_collector.
+seed_replay_lane_cache() {
+  [ "${EVAL_REPLAY_LANE:-false}" = "true" ] || return 0
+  [ -n "${REPLAY_LANE_SEED_DIR:-}" ] || return 0
+  local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   local args=(
     --namespace "${namespace}" --selector "${REPLAY_SHADOW_POD_SELECTOR}" --container "${REPLAY_SHADOW_CONTAINER}"
     --bucket "${REPLAY_SHADOW_BUCKET}" --kind "${REPLAY_SHADOW_KIND}" --build "${REPLAY_SHADOW_BUILD}"
@@ -1188,16 +1277,14 @@ _stop_agent_pod_watch() {
 # pinned to AGENT_CLUSTER_CONTEXT for the same reason. A `--previous` read of
 # a container that never restarted writes kubectl's "not found" into its file,
 # which is the answer, not an error. The bridge files are written only when
-# the Deployment declares the sidecar, so a today-mode run gains no empty ones.
+# the Deployment declares the sidecar, so a pod without one gains no empty files.
 # Runs once per process: the eval's trap takes it and the failure dumper's
 # second call returns at once, rather than repeating every read against a
-# cluster that may be what failed, inside the deadline's grace.
-#
-# `--keep-watch` snapshots and leaves the watch running, for a caller that
-# replaces pods after it (ci-eval-pr.sh's rollback round trip). That caller
-# then clears AGENT_DIAG_COLLECTED and sets AGENT_DIAG_PREFIX, so the trap's
-# call stops the watch, whose tails then cover the replacement too, and
-# writes a second snapshot under the prefix beside the first.
+# cluster that may be what failed, inside the deadline's grace. A caller
+# that clears AGENT_DIAG_COLLECTED and sets AGENT_DIAG_PREFIX gets a second
+# snapshot under the prefix beside the first; nothing in the tree sets the
+# prefix now (the rollback round trip did), and
+# tests/test_ci_a2a_component_logs.py keeps the contract.
 AGENT_DIAG_COLLECTED=""
 AGENT_DIAG_PREFIX=""
 collect_agent_pod_diagnostics() {
@@ -1211,9 +1298,7 @@ collect_agent_pod_diagnostics() {
     kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
   fi
   mkdir -p "${artifact_dir}" || true
-  if [ "${1:-}" != "--keep-watch" ]; then
-    _stop_agent_pod_watch "${artifact_dir}"
-  fi
+  _stop_agent_pod_watch "${artifact_dir}"
 
   "${kctl[@]}" get pods -n "${ns}" -o jsonpath="${AGENT_DIAG_POD_STATUS_JSONPATH}" \
     > "${artifact_dir}/${prefix}agent-pod-status.txt" 2>&1 || true
@@ -1250,8 +1335,8 @@ collect_agent_pod_diagnostics() {
 # The A2A_DIAG_ constants above say what and why. Called by
 # collect_agent_pod_diagnostics, so it inherits that function's once-per-run
 # guard, its artifact prefix and its context pin; `$4...` is that function's
-# kubectl command line. Same contract: every command ends in `|| true`. A
-# today-mode install has no pods under either selector and gains no log files.
+# kubectl command line. Same contract: every command ends in `|| true`. An
+# install with no pods under either selector gains no log files.
 # The pod list goes to a2a-component-pods.txt, so a list that failed (an
 # unreachable cluster) is on record rather than looking like no A2A stack.
 #
@@ -1273,7 +1358,7 @@ collect_a2a_component_logs() {
       -o jsonpath="${A2A_DIAG_PODS_JSONPATH}" 2>&1 || true
   } > "${listing}" || true
 
-  local line rest pod component restarts base read_pods=0
+  local line rest pod component restarts base read_pods=0 read_nats=
   while IFS= read -r line; do
     # Only pod lines: an error kubectl wrote into the listing has no tab.
     [[ "${line}" == *$'\t'* ]] || continue
@@ -1303,7 +1388,45 @@ collect_a2a_component_logs() {
           | last_bytes "${A2A_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-previous.log" || true
         ;;
     esac
+    if [ "${component}" = "${A2A_DIAG_NATS_COMPONENT}" ]; then
+      collect_a2a_nats_monitor "${artifact_dir}" "${prefix}" "${ns}" "${pod}" "${base}" "${kctl[@]}"
+      read_nats=1
+    fi
   done < <(cat "${listing}" 2>/dev/null || true)
+  if [ -n "${read_nats:-}" ]; then
+    "${kctl[@]}" get pods -n "${ns}" -l "${A2A_DIAG_COMPONENT_LABEL}=${A2A_DIAG_NATS_COMPONENT}" \
+      -o jsonpath="${A2A_DIAG_NATS_IMAGES_JSONPATH}" > "${artifact_dir}/${prefix}a2a-nats-images.txt" 2>&1 || true
+  fi
+  return 0
+}
+
+# collect_a2a_nats_monitor reads one bus server's monitoring endpoints
+# (A2A_DIAG_NATS_MONITOR_PATHS) from inside its pod, one file each:
+# <base>-<path>.json, and the head of its server log, <base>-head.log
+# (A2A_DIAG_NATS_HEAD_MAX_BYTES). Same contract as its caller: every command
+# ends in `|| true`, so a server that doesn't answer leaves the error in its
+# file.
+collect_a2a_nats_monitor() {
+  local artifact_dir="$1" prefix="$2" ns="$3" pod="$4" base="$5"
+  shift 5
+  local kctl=("$@")
+  local path
+  local bound=(timeout --foreground "${A2A_DIAG_NATS_EXEC_BOUND_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  for path in ${A2A_DIAG_NATS_MONITOR_PATHS}; do
+    ${bound[@]+"${bound[@]}"} "${kctl[@]}" exec "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" -- \
+      wget -qO- -T "${A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS}" "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
+      | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
+  done
+  "${kctl[@]}" logs "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" \
+    --limit-bytes="${A2A_DIAG_NATS_HEAD_MAX_BYTES}" \
+    >"${artifact_dir}/${prefix}${base}-head.log" 2>&1 || true
+  # kubectl serves the container's current log file only, which the kubelet
+  # rotates at 10Mi: past a rotation the head is the newest file's start, not
+  # the bring-up. Say so in the file rather than let it pass for one.
+  grep -q "Starting nats-server" "${artifact_dir}/${prefix}${base}-head.log" 2>/dev/null \
+    || echo "# no 'Starting nats-server' line: the log rotated, or the read failed; this is not the server's bring-up" \
+      >>"${artifact_dir}/${prefix}${base}-head.log" || true
   return 0
 }
 

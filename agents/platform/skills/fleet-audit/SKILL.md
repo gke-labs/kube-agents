@@ -58,7 +58,7 @@ title anywhere else.
 
 Which request you have decides what you do:
 
-1. **Run one stream, per its SOP** (a kanban card or a delegated task naming the stream): you are
+1. **Run one stream, per its SOP** (a kanban card or a delegated task asking for the stream's run): you are
    the audit worker. Run the steps below yourself; do not reach for `hermes cron run`. If the
    audit cannot run in this session (no credentials, a broker that never answers, or a
    `START REFUSED`), call `kanban_block` with the reason; never `kanban_complete` a card as done
@@ -68,11 +68,20 @@ Which request you have decides what you do:
    Run `start` and `finish` and report the ledger URL. The ledger is the report, not a change; the
    line forbids a pull request, so on such a card pass `--no-promote` to `finish`: the ledger
    publishes and the automatic sweep opens nothing on that run (the fixes wait for `/remediate`).
-   Findings in `result` with no ledger are the audit not done (#4637).
+   Findings in `result` with no ledger are the audit not done (#4637). A card that only asks a
+   question on the stream's topic is form 4, not this form.
 2. **Trigger the scheduled cron job, or run several or all audits:** never run an audit inline.
    Open `references/on-demand.md` first.
 3. **What an audit found:** run nothing. The
    [`fleet-audit-reports`](../fleet-audit-reports/SKILL.md) skill answers from the stored reports.
+4. **A fleet-wide question, not a run** (it does not ask to run an audit, names no SOP, and is
+   not form 3: "check the security of our AI workloads", "look at our VMs for problems"): follow
+   `SOUL.md`'s chat route for fleet-wide questions, including what it keeps elsewhere. Where it
+   runs a collector, run the command it gives for the stream, once; for a stream it has no row
+   for, run the stream skill's collector the same way, to
+   `/opt/data/scratch/chat_manifest_<stream>.json`. Answer in chat as that route says. Never run
+   `start`, `draft` or `finish`: a chat answer publishes nothing, and "don't change anything" or
+   the `Propose only` line does not make the question a run.
 
 Run every script by its full path. A kanban worker starts in its card's workspace, where
 `./skills/...` and `governance/...` name nothing.
@@ -99,11 +108,15 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    means the SOP continues. Append each check's slug and
    the exact command you issued to that cluster's `checks_run` as the check completes. Content-mode
    reads (`grep`, `list`, `fetch`), `draft` and `precheck`: `references/lifecycle.md`.
-3. **Write the findings document at `findings_path`.** On a stream whose SOP runs a collector,
-   start it from the manifest with
-   `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit <audit-id> --manifest-file <manifest>`:
-   it fills `scope` and one finding per candidate, and you write each finding's `recommendation`
-   and `remediation`. Fields, validator rules, scope, `declared` and the evidence rules:
+3. **Fill the findings document at `findings_path`.** On a stream whose SOP runs a collector,
+   `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit <audit-id> --manifest-file <manifest>`
+   writes it there: `scope` and one finding per candidate. Yours is each finding's `recommendation`
+   and `remediation`, written into that file in place: a short script that loads the file, sets the
+   fields and writes it back, or one `patch` for one finding's fields. Keep every tool call under
+   about 12,000 characters. **Never send the document, or a block of its findings, through a tool
+   call** (`write_file`, `patch`, a heredoc, `execute_code`): a tool call's text arrives only when
+   it is complete, a call that large is dropped before then, and the audit files nothing. Fields,
+   validator rules, scope, `declared` and the evidence rules:
    `references/findings-document.md`. Write every `manifest` remediation file under `workspace`
    before `finish`.
 4. **`finish`, once your `start` succeeded, `mode: none` included.** With no forge it is what writes

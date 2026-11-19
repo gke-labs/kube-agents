@@ -4,6 +4,8 @@
 - **Date:** 2026-08-24
 - **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented; `next` is the default for a first `install.sh` install, and `today` is supported as a rollback for one release
 
+- **Status (2026-11-16):** retired. The installer and the chart pass no mode (#5815), the operator defaults `spec.mode` to `next`, migrates a stored `today` and renders the A2A stack on every install (#5752), and the agent image no longer reads `KUBEAGENTS_MODE` (this change). The body below is the design as it was.
+
 ## Purpose
 
 Stage 1 lands the new stack dark: the NATS component, the A2A gateway skeleton, and the
@@ -94,7 +96,7 @@ hanging at the dial. Found live during stage 1 bring-up (8/26).
 A deliberate flip back to `today` is the other half, and it does clean up: the A2A stack
 is torn down, with two objects kept so a later flip forward reuses them. The bus creds
 Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
-credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
+credentials. The JetStream PVCs `data-<agent>-a2a-nats-<n>`, one per bus server, stay, because flipping a mode
 is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
 against a live install: it flips `next` to `today` and back, asserts the two keep their
 UIDs and the agent answers on each side. A next-mode eval run on `main` runs it after its
@@ -143,13 +145,14 @@ today's path until something happens to kill its pods.
 
 ## Agent-side rule
 
-Agent-side code asks one helper in the shared settings module - `runtime_mode.is_next()`
-or equivalent - and that helper reads the managed key. No component reads its own env
-var. A grep for `KUBEAGENTS_MODE` should hit exactly two places: the operator builder
-that writes it and the helper that reads it. A third hit is a review comment.
+Agent-side code asked one helper in the shared settings module, `runtime_mode.is_next()`,
+which read the managed key. No component read its own env var, and a grep for
+`KUBEAGENTS_MODE` hit exactly two places: the operator builder that writes it and the helper
+that read it. The reader went with the switch: today a grep hits the operator writer alone,
+which `tests/test_mode_grep.py` pins until the pin itself goes.
 
-"What mode am I in" gets one answer per agent, computed in one place. This also means the
-delivery mechanism can change later without touching call sites.
+"What mode am I in" got one answer per agent, computed in one place, so the delivery
+mechanism could have changed without touching call sites.
 
 ## Choosing it at install
 
@@ -205,17 +208,17 @@ and that the flag is not a CRD field.
 
 A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
 `spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
-clusters. The operator names the session ServiceAccount on the credential broker's allowed
-callers, renders a session audience the broker maps to a role that reaches the exec route for
-`kubectl` and `gcloud` only, binds the two so that ServiceAccount may present only that audience
-and no other caller may present it, opens the broker's ingress and the session pod's egress to each
-other, and tells the gateway, whose spawner projects the audience-bound token and enables the
-worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
-broker, read-only in verbs, and with the broker's permissions: under a `custom` permission set
-with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
-data, as
+clusters. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
+session audience (`CREDENTIAL_PROXY_SESSION_AUDIENCE`) on both `<agent>-kube-proxy` and the
+credential broker, where the broker's `session` role reaches `/v1/exec` for `gcloud` only and no
+other caller may present that audience. It opens ingress and session egress to `<agent>-kube-proxy`
+(`:8443`) and the credential broker (`:8765`), and tells the gateway, whose spawner mounts
+`<agent>-kube-proxy-ca-bundle`, projects the audience-bound token, sets `KUBE_PROXY_*` and
+`CREDENTIAL_PROXY_*`, and enables the worker's shell. The session ServiceAccount gains no RBAC in
+either state; `kubectl` routes through `<agent>-kube-proxy` under its `read-only-dry-run` policy
+(`get`, `list`, `watch`, and `?dryRun=All` validation) with `Secret` value redaction, as
 [credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
-says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
+describes. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
 widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
 between a person and that read is the gateway's ingress allowlist. That differs from the design of
 record ([architecture 02](../architecture/02-agent-personas.md) §2.4,

@@ -361,7 +361,7 @@ func TestTheBusApplyReplacesAStuckPodAndRequeuesForTheGrace(t *testing.T) {
 // An out-of-date ClusterRole requeues at rbacReprobeInterval; a bus pod due
 // sooner brings the pass forward.
 func TestARBACDegradedPassStillRequeuesForTheStuckPod(t *testing.T) {
-	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews())
+	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews(), "")
 	if _, err := checker.Probe(context.Background()); err != nil {
 		t.Fatalf("boot probe: %v", err)
 	}

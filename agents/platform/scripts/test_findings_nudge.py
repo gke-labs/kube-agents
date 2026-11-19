@@ -169,7 +169,7 @@ class NudgeHarness(unittest.TestCase):
         for name in fq.PACING_ENV.values():
             os.environ.pop(name, None)
 
-    def run_at(self, now, ranked, added=None, fail=None, surfaced_error=None):
+    def run_at(self, now, ranked, added=None, fail=None, surfaced_error=None, failing_marks=()):
         """Drive `main` at `now` against a stubbed queue, recording every request."""
         self.out.seek(0)
         self.out.truncate()
@@ -189,6 +189,8 @@ class NudgeHarness(unittest.TestCase):
             if path.endswith("/surfaced"):
                 if surfaced_error:
                     raise surfaced_error
+                if path.split("/")[3] in failing_marks:
+                    raise urllib.error.URLError("refused")
                 self.marks.append((path.split("/")[3], body))
                 return {}
             raise AssertionError(f"unexpected request {path}")
@@ -351,6 +353,67 @@ class MainTests(NudgeHarness):
         self.run_at(at(6, 17), [finding(id="c", check_slug="c"), major])
         self.assertNotIn("New:", self.out.getvalue())
         self.assertEqual(self.marks, [])
+
+    def test_a_row_left_open_on_an_announced_line_does_not_stop_the_days_additions(self):
+        # #4262: the nudge adds K (m0); a sweep adds m1 to K, still queued; the
+        # user decides m0, and the decision leaves m1 open. The next run adds
+        # another item and names m1, which no message has named.
+        m0 = finding(id="m0", check_slug="K", severity="major", object="api")
+        self.run_at(at(6, 16), [m0])
+        self.assertIn("none of them critical", self.out.getvalue())
+        self.assertEqual(self.state()[nudge.ANNOUNCED_KEY]["ids"], ["m0"])
+        decided = finding(id="m0", check_slug="K", severity="major", object="api", state="dismissed", first_shown_at="2026-10-06 16:00:00")
+        m1 = finding(id="m1", check_slug="K", severity="major", object="web")
+        n0 = finding(id="n0", check_slug="N", severity="major", rank_score=80)
+        self.run_at(at(6, 17), [decided, m1, n0], added={"critical": 0, "noncritical": 1})
+        self.assertIn("m1", self.out.getvalue())
+        self.assertEqual(sorted(fid for fid, _ in self.marks), ["m1", "n0"])
+        self.assertEqual(self.state()[nudge.ANNOUNCED_KEY]["ids"], ["m0", "m1", "n0"])
+
+    def test_a_line_whose_marks_partly_failed_does_not_stop_the_days_additions(self):
+        # #5329: the nudge adds K (m0, m1); the mark of m1 fails, so the queue
+        # holds K's addition and m1 is still new. The user decides m0, which
+        # leaves m1 open. The next run adds another item and does not name K.
+        m0 = finding(id="m0", check_slug="K", severity="major", object="api")
+        m1 = finding(id="m1", check_slug="K", severity="major", object="web")
+        self.run_at(at(6, 16), [m0, m1], failing_marks={"m1"})
+        self.assertIn("New: 1 finding, none of them critical.", self.out.getvalue())
+        self.assertEqual([fid for fid, _ in self.marks], ["m0"])
+        n0 = finding(id="n0", check_slug="N", severity="major", rank_score=80, title="no memory limit on orders")
+        added = {"critical": 0, "noncritical": 1, "lines": [list(fq.item_key(m0))]}
+        self.run_at(at(6, 17), [m1, n0], added=added)
+        self.assertIn("New: 1 finding, none of them critical.", self.out.getvalue())
+        self.assertIn("no memory limit on orders", self.out.getvalue())
+        self.assertEqual([fid for fid, _ in self.marks], ["n0"])
+
+    def test_a_record_an_older_build_wrote_today_keeps_the_key_rule_until_the_day_ends(self):
+        m1 = finding(id="m1", check_slug="K", severity="major", object="web")
+        n0 = finding(id="n0", check_slug="N", severity="major", rank_score=80)
+        key = list(nudge.fq.item_key(m1))
+        (self.home / nudge.STATE_FILE).write_text(json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": [key]}}))
+        self.run_at(at(6, 17), [m1, n0], added={"critical": 0, "noncritical": 1})
+        self.assertEqual(self.out.getvalue(), "")
+        self.assertEqual(self.marks, [])
+        # The next day starts a record with ids, and m1 is added.
+        self.run_at(at(7, 16), [m1, n0])
+        self.assertEqual(sorted(fid for fid, _ in self.marks), ["m1", "n0"])
+        self.assertEqual(sorted(self.state()[nudge.ANNOUNCED_KEY]["ids"]), ["m1", "n0"])
+
+    def test_additions_under_an_older_record_keep_it_without_ids(self):
+        critical = finding(id="c", check_slug="c")
+        m1 = finding(id="m1", check_slug="K", severity="major", object="web")
+        (self.home / nudge.STATE_FILE).write_text(json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": [["x", "acme", "prod"]]}}))
+        self.run_at(at(6, 12), [critical, m1])
+        self.assertEqual([fid for fid, _ in self.marks], ["c"])
+        record = self.state()[nudge.ANNOUNCED_KEY]
+        self.assertNotIn("ids", record)
+        self.assertEqual(len(record["keys"]), 2)
+
+    def test_malformed_announced_keys_are_ignored_not_fatal(self):
+        for keys in ("x", [1]):
+            (self.home / nudge.STATE_FILE).write_text(json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": keys}}))
+            self.assertEqual(self.run_at(at(6, 12), [finding(id="c", check_slug="c")]), 0, keys)
+            self.assertEqual([fid for fid, _ in self.marks], ["c"], keys)
 
     def test_a_mark_that_raises_skips_neither_the_other_marks_nor_the_daily_record(self):
         rows = [shown(at(5, 12), id="old"), finding(id="new", check_slug="x")]

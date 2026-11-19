@@ -34,7 +34,7 @@
 id: networking-ip-masq-agent-missing-ccc-toleration
 name: "Node-Networking DaemonSet Missing the Tainted Pool's Toleration (coverage check)"
 domain: fleet-audits
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - obtainability-audit

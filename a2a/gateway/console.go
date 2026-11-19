@@ -132,7 +132,8 @@ const (
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
 )
 
-// ConsoleInFrame is what the browser publishes. Kind is empty or "text";
+// ConsoleInFrame is what a console client (the browser, the MCP server)
+// publishes. Kind is empty or "text";
 // it is the seam for gateway-side commands later, and a frame of any other
 // kind is dropped (logged, no notice) rather than forwarded as an ask.
 type ConsoleInFrame struct {
@@ -144,6 +145,13 @@ type ConsoleInFrame struct {
 	// the turn goes to the conversation's route, as every page turn does.
 	Addressee  string            `json:"addressee,omitempty"`
 	Parameters map[string]string `json:"parameters,omitempty"`
+	// ReplyTo, when set, names the task a notify frame reported on
+	// (ConsoleOutFrame.ReplyTo): this turn answers that report, and the
+	// gateway puts the task on the submission so the agent's turn starts
+	// with the report in front of it. A reply while the turn is still
+	// running is steered into it and carries no replyTo; the report is
+	// attached on an opening turn only.
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
 // ConsoleOutFrame is what the gateway publishes back. Edit true means
@@ -152,7 +160,10 @@ type ConsoleInFrame struct {
 // A terminal frame (Kind "result") also names its task (Addressee, TaskID)
 // and the state it ended in. The page reads a completed answer off TASKS and
 // skips that frame; another console client (the MCP server) reads it here,
-// and from TASKS for a frame it missed. Every other field is absent on a notice.
+// and from TASKS for a frame it missed. A top-level profile task's status
+// line names its task too (Addressee, TaskID) and the inbound frame whose
+// turn started it (InReplyTo), since a console client cannot see the
+// profile's submission. Every other field is absent on a notice.
 type ConsoleOutFrame struct {
 	MessageID string        `json:"messageId"`
 	Text      string        `json:"text"`
@@ -168,6 +179,10 @@ type ConsoleOutFrame struct {
 	// work to kanban cards, whose reports follow as notify frames naming it
 	// (ReplyTo). Absent, no handoff was seen, so a client need not wait.
 	CardsPending bool `json:"cardsPending,omitempty"`
+	// InReplyTo, on a profile task's status line, is the messageId of the
+	// inbound frame whose turn started the task, so a client takes only its
+	// own turn's task. Absent on every other frame.
+	InReplyTo string `json:"inReplyTo,omitempty"`
 }
 
 // ConsoleTerminal is one task's end as a console conversation is told it.
@@ -485,10 +500,11 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		a.log.Warn("console frame dropped", "reason", "empty text", "conversation", conversation, "messageId", f.MessageID)
 		return InboundMessage{}, "", false
 	}
-	// Backend is stamped here rather than left to the gateway's configured
-	// one: the console runs beside whichever chat backend the process was
-	// configured for, so a frame that said nothing would be attributed to
-	// that backend and verified against its mapping table (Gateway.backendFor).
+	// Backend is stamped here so the frame is attributed to the console with
+	// or without a mux. Behind the mux an unstamped frame would get the
+	// console key from the mux; a console without a mux (no real backend)
+	// has no one else to stamp it, and Gateway.backendFor would fall back to
+	// the gateway's configured backend (the door default).
 	// The addressee is sender-chosen and becomes a subject token, so it is
 	// held to a profile name's shape here; the parameters are checked where
 	// the turn is routed (resolveProfile), which says why in the room.
@@ -499,7 +515,7 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	msg := InboundMessage{
 		Conversation: conversation, Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: f.MessageID,
-		Profile: f.Addressee, Parameters: f.Parameters,
+		Profile: f.Addressee, Parameters: f.Parameters, ReplyTo: f.ReplyTo,
 	}
 	if len(text) > consoleTextCap {
 		a.log.Warn("console frame dropped", "reason", "oversize", "conversation", conversation, "messageId", f.MessageID, "bytes", len(text))
@@ -600,12 +616,17 @@ func cutConsoleText(text string, max int, note string) string {
 	return strings.ToValidUTF8(text[:max-len(note)], "") + note
 }
 
+// mintID is a new notice frame's id.
+func (a *ConsoleAdapter) mintID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nextID++
+	return fmt.Sprintf("c-%s-%d", a.bootID, a.nextID)
+}
+
 // Post publishes a new notice frame and returns its id.
 func (a *ConsoleAdapter) Post(conversation, text string) (string, error) {
-	a.mu.Lock()
-	a.nextID++
-	id := fmt.Sprintf("c-%s-%d", a.bootID, a.nextID)
-	a.mu.Unlock()
+	id := a.mintID()
 	if err := a.publish(conversation, id, text, false); err != nil {
 		return "", err
 	}
@@ -618,9 +639,19 @@ func (a *ConsoleAdapter) Edit(conversation, messageID, text string) error {
 }
 
 // PostMessage and EditMessage publish text only: a chat message falls back
-// to its text (ErrTextOnly).
+// to its text (ErrTextOnly). A profile task's status line also names its
+// task and profile (addressee, taskId) and the inbound frame it answers
+// (inReplyTo), the one notice that does: a console client sees no profile
+// submission to learn the task from.
 func (a *ConsoleAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	return postTextOnly(a.Post, conversation, m)
+	if m.Chat != nil || m.Stop == "" || m.Profile == "" {
+		return postTextOnly(a.Post, conversation, m)
+	}
+	id := a.mintID()
+	if err := a.publishFrame(conversation, ConsoleOutFrame{MessageID: id, Text: m.Text, Addressee: m.Profile, TaskID: m.Stop, InReplyTo: m.InReplyTo}); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (a *ConsoleAdapter) EditMessage(conversation, messageID string, m OutMessage) error {

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -215,6 +217,9 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 		corev1.EnvVar{Name: "SLACK_BOT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s"}, Key: "k"}}},
 		corev1.EnvVar{Name: "TOKEN_BROKER_URL", Value: "http://minter"},
 		corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "sub"},
+		corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: "a2a-sub"},
+		corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: "aud"},
+		corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: "system:serviceaccount:ns:a2a-gateway"},
 	)
 	bc.EnvFrom = append(bc.EnvFrom, corev1.EnvFromSource{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "plugin"}}})
 	broker.Spec.Template.Annotations[secretEnvHashAnnotation] = "digest"
@@ -253,10 +258,17 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 			t.Errorf("exec pod reads %s from a Secret", e.Name)
 		}
 	}
-	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME"} {
+	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar} {
 		if _, ok := env[name]; ok {
 			t.Errorf("exec pod carries %s", name)
 		}
+	}
+	// The A2A gateway stays an allowed caller on the exec tier while Chat is
+	// armed, so the binding that holds it to the a2a-chat audience (which
+	// this tier never confers) comes along: here it refuses the gateway's
+	// identity every audience (#6090).
+	if got := env[credentialProxyA2AChatCallersEnvVar].Value; got != "system:serviceaccount:ns:a2a-gateway" {
+		t.Errorf("exec pod %s = %q, want the A2A gateway's binding carried over", credentialProxyA2AChatCallersEnvVar, got)
 	}
 	if env[credentialProxyRoleEnv].Value != credentialProxyExecRole {
 		t.Errorf("role %q, want exec", env[credentialProxyRoleEnv].Value)
@@ -289,10 +301,10 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 	if !c.Resources.Requests.Memory().Equal(wantMem) || !c.Resources.Limits.Memory().Equal(wantMem) {
 		t.Errorf("memory %v/%v, want 2Gi/2Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
 	}
-	// Ephemeral storage stays the broker's: a namespace quota on it refuses a
-	// pod that declares none.
-	if !c.Resources.Limits.StorageEphemeral().Equal(*bc.Resources.Limits.StorageEphemeral()) || c.Resources.Limits.StorageEphemeral().IsZero() {
-		t.Errorf("ephemeral-storage limit %v, want the broker's %v", c.Resources.Limits.StorageEphemeral(), bc.Resources.Limits.StorageEphemeral())
+	// Ephemeral storage is the tier's own, and declared: a namespace quota on
+	// it refuses a pod that declares none.
+	if want := resource.MustParse(credentialProxyExecTierEphemeralStorageLimit); !c.Resources.Limits.StorageEphemeral().Equal(want) {
+		t.Errorf("ephemeral-storage limit %v, want the tier's %v", c.Resources.Limits.StorageEphemeral(), want)
 	}
 	if broker.Spec.Template.Labels["kubeagents.x-k8s.io/has-credential-proxy"] != "true" || len(bc.EnvFrom) == 0 {
 		t.Error("deriving the exec tier changed the broker's Deployment")
@@ -485,7 +497,7 @@ func TestTheExecTierFenceAdmitsItsCallersOnly(t *testing.T) {
 		}
 	}
 	// The session pods only under the cluster view, which points them at the
-	// tier; the agent is already mode next.
+	// tier.
 	for _, view := range []string{"true", ""} {
 		t.Setenv(a2aSessionClusterViewEnvVar, view)
 		admitted := false
@@ -730,5 +742,112 @@ func TestARefusedNameGivesCallersNoExecTier(t *testing.T) {
 	profile := testAgentProfile(agent.Namespace, "auditor")
 	if _, set := execTierEnvValue(buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false).Containers[0].Env, credentialProxyExecURLEnv); set {
 		t.Error("the profile worker gets the URL of a refused tier")
+	}
+}
+
+// TestTheExecTierCarriesItsOwnEphemeralStorage pins the tier's own figures: the
+// two emptyDir caps, the watermark gate told the same caps, the limit holding
+// both with room for the layer and the logs, and the broker left at its own.
+func TestTheExecTierCarriesItsOwnEphemeralStorage(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(1)))
+	broker := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+	brokerBefore := broker.DeepCopy()
+	dep := buildCredentialProxyExecTierDeployment(agent, broker)
+
+	sizes := map[string]*resource.Quantity{}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.EmptyDir != nil {
+			sizes[v.Name] = v.EmptyDir.SizeLimit
+		}
+	}
+	state, tmp := resource.MustParse(credentialProxyExecTierStateSizeLimit), resource.MustParse(credentialProxyExecTierTmpSizeLimit)
+	for name, want := range map[string]resource.Quantity{credentialProxyStateVolumeName: state, credentialProxyTmpVolumeName: tmp} {
+		if got := sizes[name]; got == nil || !got.Equal(want) {
+			t.Errorf("exec %s sizeLimit = %v, want %v", name, got, want)
+		}
+	}
+	var c *corev1.Container
+	for i := range dep.Spec.Template.Spec.Containers {
+		if dep.Spec.Template.Spec.Containers[i].Name == credentialProxyContainerName {
+			c = &dep.Spec.Template.Spec.Containers[i]
+		}
+	}
+	if c == nil {
+		t.Fatal("exec Deployment has no credential proxy container")
+	}
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if got, want := env[credentialProxyStateLimitEnv], strconv.FormatInt(state.Value(), 10); got != want {
+		t.Errorf("%s = %q, want %q, the state cap the kubelet evicts on", credentialProxyStateLimitEnv, got, want)
+	}
+	if got, want := env[credentialProxyTmpLimitEnv], strconv.FormatInt(tmp.Value(), 10); got != want {
+		t.Errorf("%s = %q, want %q, the /tmp cap the kubelet evicts on", credentialProxyTmpLimitEnv, got, want)
+	}
+	limit := c.Resources.Limits.StorageEphemeral()
+	both := state.DeepCopy()
+	both.Add(tmp)
+	if limit.Cmp(both) <= 0 {
+		t.Errorf("exec ephemeral-storage limit %v does not hold the two caps (%v) with room for the layer and the logs", limit, &both)
+	}
+	if !equality.Semantic.DeepEqual(broker, brokerBefore) {
+		t.Error("building the exec tier changed the broker's Deployment")
+	}
+}
+
+// TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier: the tier's figures
+// are fixed, as its cpu and memory are, so an override that raises, lowers or
+// only requests the broker's ephemeral storage leaves the exec pod at its own
+// caps, its gate at the same caps, and its request no larger than its limit.
+func TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier(t *testing.T) {
+	for name, res := range map[string]corev1.ResourceRequirements{
+		"raised": {
+			Requests: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+			Limits:   corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("12Gi")},
+		},
+		"lowered":      {Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")}},
+		"request only": {Requests: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("6Gi")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := execTierTestAgent(ptr.To(int32(1)))
+			agent.Spec.Deployment.CredentialProxy.Resources = &res
+			dep := buildCredentialProxyExecTierDeployment(agent, buildCredentialProxyDeployment(agent, brokerTestPolicyHash))
+			want := resource.MustParse(credentialProxyExecTierEphemeralStorageLimit)
+			for _, c := range dep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				if got := c.Resources.Limits.StorageEphemeral(); !got.Equal(want) {
+					t.Errorf("exec ephemeral-storage limit = %v, want %v", got, &want)
+				}
+				if req, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok && req.Cmp(want) > 0 {
+					t.Errorf("exec ephemeral-storage request %v is above its %v limit", &req, &want)
+				}
+				for _, e := range c.Env {
+					if e.Name == credentialProxyStateLimitEnv && e.Value != credentialProxyExecTierLimitBytes(credentialProxyExecTierStateSizeLimit) {
+						t.Errorf("%s = %s, want the tier's state cap", e.Name, e.Value)
+					}
+					if e.Name == credentialProxyTmpLimitEnv && e.Value != credentialProxyExecTierLimitBytes(credentialProxyExecTierTmpSizeLimit) {
+						t.Errorf("%s = %s, want the tier's /tmp cap", e.Name, e.Value)
+					}
+				}
+			}
+			for _, v := range dep.Spec.Template.Spec.Volumes {
+				if v.EmptyDir == nil {
+					continue
+				}
+				switch v.Name {
+				case credentialProxyStateVolumeName:
+					if !v.EmptyDir.SizeLimit.Equal(resource.MustParse(credentialProxyExecTierStateSizeLimit)) {
+						t.Errorf("exec state sizeLimit = %v", v.EmptyDir.SizeLimit)
+					}
+				case credentialProxyTmpVolumeName:
+					if !v.EmptyDir.SizeLimit.Equal(resource.MustParse(credentialProxyExecTierTmpSizeLimit)) {
+						t.Errorf("exec /tmp sizeLimit = %v", v.EmptyDir.SizeLimit)
+					}
+				}
+			}
+		})
 	}
 }

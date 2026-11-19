@@ -35,6 +35,9 @@ REP = {
     "f": {"result": "fail", "reason": GRADED_FAIL},
     "e": {"result": "fail", "reason": EMPTY},
     "i": {"result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE"},
+    "g": {"result": "infra", "reason": "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"},
+    "b": {"result": "fail", "reason": "KUBE_AGENTS_FORGE_SAFEGUARD: checks errored rather than ran: ['writes'] -- writes: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied the pull-request list"},
+    "c": {"result": "infra", "reason": "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result"},
 }
 
 
@@ -246,6 +249,21 @@ class Shapes(Harness):
         self.assertIn("· [Incident brief →]", box)
         self.assertNotIn("Reason", self.gh.bodies()[0])
 
+    def test_a_run_every_case_of_which_the_safeguard_blocked_is_still_commented_on(self):
+        # Nothing graded, but the rung-2 blocks red the run and the suite marks it red, not not-evaluated.
+        tasks = [task(name, "bbb") for name in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        self.assertIn("hard failure", self.gh.bodies()[0].split("\n")[1])
+
+    def test_a_run_of_infra_forge_repetitions_only_gets_no_comment(self):
+        # No verdict line recorded (no eval_outcome), nothing graded, nothing blocked: not a red.
+        tasks = [task(name, "ggg") for name in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [])
+
     def test_hard_failure(self):
         # FAILURE with every gate case passing: an absolute check tripped.
         tasks = [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HELD_OUT, "fff")]
@@ -259,16 +277,44 @@ class Shapes(Harness):
         self.assertNotIn(HELD_OUT, body)
         self.assertNotIn("cases passed", body)
 
+    def test_a_hard_failure_during_a_forge_outage_names_it(self):
+        tasks = [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HELD_OUT, "ggg")]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        outage = {"state": "DEGRADED", "condition": "forge_outage", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [],
+                  "cause": "forge outage: grading's GitHub reads failed on 2 PRs 13:15–14:25 UTC",
+                  "incident": {"prs": [1, 2], "runs": 4, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+        self.tick(data(mine, *green_others()), outage)
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> 🔴 **The run failed without a gate case collapsing.**"), box)
+        self.assertIn("🟡 **Gate degraded** since Tue 9:00 AM ET. grading could not read GitHub on 2 PRs 9:15 AM–10:25 AM ET", box)
+        self.assertNotIn("rep", box)
+        # Any other incident, or a hard failure with no forge repetition (a
+        # real trip), leaves the hard box as it was.
+        self.tick(data(dict(mine, build_id="101", pr=1301), *green_others()), dict(outage, condition="storm"))
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+        tripped = run(102, 1302, NOW - timedelta(minutes=5), tasks=tasks[:-1], result="FAILURE")
+        self.tick(data(tripped, *green_others()), outage)
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+        # Below the signature (fewer than one case's three forge reps) is not the outage's either.
+        thin = run(103, 1303, NOW - timedelta(minutes=5), tasks=tasks[:-1] + [task(HELD_OUT, "gpp")], result="FAILURE")
+        tripped = thin
+        self.tick(data(tripped, *green_others()), outage)
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+
     def test_degraded_storm_match(self):
         names = sorted(ADMITTED)
         stormy = [task(names[0], "ffe")] + [task(name, "eee") for name in names[1:3]] + [task(name, "ppp") for name in names[3:]]
         mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=stormy, result="FAILURE")
-        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]}}
         self.tick(data(mine, *green_others()), storm)
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> 🟡 **Gate degraded** since Tue 9:00 AM ET. quota storm 9:15 AM–10:25 AM ET hit 3 PRs."), box)
         self.assertIn("Your failures are exactly the gate's, so this red is not your code.", box)
+        # The incident's `causes` are the reps' words and counts; the public
+        # comment prints neither.
         self.assertNotIn("reps", self.gh.bodies()[0])
+        self.assertNotIn("hermes-rate-limited", self.gh.bodies()[0])
+        self.assertNotIn("27", box)
 
     def test_a_run_that_records_where_it_lives_links_the_console_browser(self):
         """runs[].gcs_base (the smoke lanes' own bucket, which Deck cannot
@@ -670,12 +716,14 @@ class WhenItComments(Harness):
 
 
 
-def not_evaluated(build, pr, finished, lost=("security-overgrant-probe",), every=False, minutes=27, **fields):
+def not_evaluated(build, pr, finished, lost=("security-overgrant-probe",), every=False, minutes=27, letters="iii", **fields):
     """A run the suite could not evaluate (SCHEMA.md, `eval_outcome`): the
     lost cases graded nothing, the rest passed, Prow says FAILURE, and the
     suite's list names the lost ones."""
     names = sorted(ADMITTED)
-    tasks = [task(n, "iii" if (every or n in lost) else "ppp") for n in names] + [task(HELD_OUT, "iii" if every else "ppp")]
+    if isinstance(letters, str):
+        letters = {n: letters for n in names + [HELD_OUT]}
+    tasks = [task(n, letters.get(n, "iii") if (every or n in lost) else "ppp") for n in names] + [task(HELD_OUT, letters.get(HELD_OUT, "iii") if every else "ppp")]
     raw = run(build, pr, finished, tasks=tasks, result="FAILURE", minutes=minutes)
     raw.update({"eval_outcome": "not_evaluated", "not_evaluated": names + [HELD_OUT] if every else list(lost), **fields})
     return raw
@@ -686,7 +734,7 @@ def health_doc_for(condition, cause, since, incident):
 
 
 def storm_health():
-    return {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+    return {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]}}
 
 
 class NotEvaluatedComment(Harness):
@@ -765,6 +813,47 @@ class NotEvaluatedComment(Harness):
         self.tick(data(mine, *green_others()), green_health())
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> No case could be graded: infrastructure failed before the agent ran. The suite evaluated nothing"), box)
+
+    def test_cases_lost_to_a_forge_outage_name_the_grading_stage(self):
+        """#5503: the agent ran; a forge read failed during grading."""
+        for every, opening in ((False, "> Some cases could not be graded: "), (True, "> No case could be graded: ")):
+            with self.subTest(every=every):
+                mine = not_evaluated(100 + every, 1300 + every, NOW - timedelta(minutes=5), every=every, letters="ggg")
+                self.tick(data(mine, *green_others()), green_health())
+                box = self.gh.bodies()[-1].split("\n")[3]
+                self.assertTrue(box.startswith(opening + "a forge read failed during grading, so the checks that read it could not be evaluated."), box)
+                self.assertNotIn("before the agent ran", box)
+
+    def test_cases_lost_to_the_delegation_ceiling_name_the_wait(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), letters="ccc")
+        self.tick(data(mine, *green_others()), green_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> Some cases could not be graded: delegated work was still running when the harness stopped waiting."), box)
+
+    def test_a_mix_of_causes_names_one_stage_only_when_it_is_shared(self):
+        """Forge beside the ceiling: the agent ran for both. Forge beside a
+        storm case, or beside a lost case with no record: the never-ran wording."""
+        lost = ("agent-kanban-smoke", "security-overgrant-probe")
+        for n, (mix, opening) in enumerate((
+            ("ccc", "the agent ran, but the harness could not grade the result."),
+            ("iii", "infrastructure failed before the agent ran."),
+            (None, "infrastructure failed before the agent ran."),
+        )):
+            with self.subTest(beside_forge=mix):
+                mine = not_evaluated(100 + n, 1300 + n, NOW - timedelta(minutes=5), lost=lost, letters={lost[0]: "ggg", lost[1]: mix or "iii"})
+                if mix is None:
+                    mine["tasks"] = [t for t in mine["tasks"] if t["name"] != lost[1]]
+                self.tick(data(mine, *green_others()), green_health())
+                box = self.gh.bodies()[-1].split("\n")[3]
+                self.assertTrue(box.startswith("> Some cases could not be graded: " + opening), box)
+
+    def test_a_declared_storm_is_not_hung_on_a_forge_outage(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), letters="ggg")
+        self.tick(data(mine, *green_others()), storm_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertIn("a forge read failed during grading", box)
+        self.assertNotIn("quota storm", box)
+        self.assertNotIn("Incident brief", box, "the storm brief is not this outage's")
 
     def test_inside_a_declared_storm_the_box_names_it_and_links_the_brief(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
@@ -879,7 +968,7 @@ class PublicCommentCarriesNoCaseResultsTest(Harness):
     def test_not_evaluated_names_no_case(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), lost=("agent-kanban-smoke", "security-overgrant-probe"))
         mine["tasks"].append(task("reliability-pdb-probe", "fff"))
-        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": ["security-overgrant-probe"], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": ["security-overgrant-probe"], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]}}
         self.tick(data(mine, *green_others()), storm)
         [body] = self.gh.bodies()
         self.assertIn("### ⚪ Smoke gate: run not evaluated", body)

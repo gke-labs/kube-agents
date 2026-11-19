@@ -157,12 +157,15 @@ def main() -> None:
     #    findings queue's pacing limits take it to `findings_nudge.py` and to
     #    `bootstrap_handoff.py`, which hands them to the first inventory
     #    report's selection; a scrubbed one would silently fall back to its
-    #    default. Onboarding's delivery under next runs `a2a notify` from the
+    #    default. Onboarding's conversation-path delivery runs `a2a notify` from the
     #    `oobe` child, which needs the bus and the conversation route's
     #    platform; scrubbed, the report would wait for good. The stall watch's
     #    knobs, which the operator pins in the managed .env from
     #    spec.harness.stallWatch, take it to `stall_watch.py`; scrubbed, the
-    #    watch would read every namespace the CR excludes.
+    #    watch would read every namespace the CR excludes. The kube-api
+    #    proxy's sign goes the same way, to the gke_endpoint the watch calls;
+    #    scrubbed, each first read of a cluster would probe its endpoint in
+    #    the broker again.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",
@@ -180,6 +183,7 @@ def main() -> None:
         "STALL_WATCH_EXCLUDE_NAMESPACES",
         "STALL_WATCH_MIN_AGE_MINUTES",
         "STALL_WATCH_KINDS",
+        "KUBE_PROXY_IN_USE_URL",
     ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(

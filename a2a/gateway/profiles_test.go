@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -18,10 +21,12 @@ var clusterParams = []lib.ProfileParameter{{Name: "project", Required: true}, {N
 
 func testDirectory() *profileDirectory {
 	d := newProfileDirectory()
-	d.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	d.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 	d.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	d.put("chat", &lib.AgentCard{Name: "chat"})
+	// A specialist that takes a target and doesn't yield to pinned profiles.
+	d.put("tse", &lib.AgentCard{Name: "tse", Parameters: clusterParams})
 	return d
 }
 
@@ -47,6 +52,11 @@ func TestResolveProfile(t *testing.T) {
 			wantProfile: "cluster", wantTarget: "p1/us-east1/dev"},
 		{name: "generic with a pinned target goes to the pinned profile", addressee: "cluster", params: targetParams("p1", "us-east1", "prod"),
 			wantProfile: "prod-east", wantTarget: "p1/us-east1/prod"},
+		{name: "a specialist with a pinned target keeps the task", addressee: "tse", params: targetParams("p1", "us-east1", "prod"),
+			wantProfile: "tse", wantTarget: "p1/us-east1/prod"},
+		{name: "a specialist with an unpinned target", addressee: "tse", params: targetParams("p1", "us-east1", "dev"),
+			wantProfile: "tse", wantTarget: "p1/us-east1/dev"},
+		{name: "a specialist with no target", addressee: "tse", wantRefusal: "needs a target cluster"},
 		{name: "pinned with its own target", addressee: "prod-east", params: targetParams("p1", "us-east1", "prod"),
 			wantProfile: "prod-east", wantTarget: "p1/us-east1/prod"},
 		{name: "pinned with no target takes its own cluster", addressee: "prod-east",
@@ -91,6 +101,47 @@ func TestResolveProfile(t *testing.T) {
 	}
 }
 
+func TestCheckDeclaredParameters(t *testing.T) {
+	withNamespace := append(append([]lib.ProfileParameter(nil), clusterParams...), lib.ProfileParameter{Name: "namespace"})
+	cases := []struct {
+		name        string
+		card        lib.AgentCard
+		params      map[string]string
+		wantRefusal string
+	}{
+		{name: "every required one", card: lib.AgentCard{Parameters: clusterParams}, params: targetParams("p1", "us-east1", "dev")},
+		{name: "an optional one too", card: lib.AgentCard{Parameters: withNamespace},
+			params: map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev", "namespace": "web"}},
+		{name: "an optional one left out", card: lib.AgentCard{Parameters: withNamespace}, params: targetParams("p1", "us-east1", "dev")},
+		{name: "an undeclared name", card: lib.AgentCard{Parameters: clusterParams},
+			params:      map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev", "namespace": "web"},
+			wantRefusal: `p doesn't take parameter "namespace"; it takes project (required), location (required), cluster (required)`},
+		{name: "a required one left out", card: lib.AgentCard{Parameters: withNamespace},
+			params:      map[string]string{"project": "p1", "location": "us-east1", "namespace": "web"},
+			wantRefusal: "p needs parameter cluster; it takes project (required), location (required), cluster (required), namespace"},
+		{name: "a profile that declares none", card: lib.AgentCard{}, params: map[string]string{"namespace": "web"},
+			wantRefusal: `p doesn't take parameter "namespace"; it takes none`},
+		{name: "none to a profile that declares none", card: lib.AgentCard{}},
+		{name: "a pinned profile takes its own target undeclared",
+			card:   lib.AgentCard{ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}},
+			params: targetParams("p1", "us-east1", "prod")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkDeclaredParameters("p", tc.card, tc.params)
+			if tc.wantRefusal == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if got := refusalOf(t, err); got != tc.wantRefusal {
+				t.Fatalf("refusal = %q, want %q", got, tc.wantRefusal)
+			}
+		})
+	}
+}
+
 func TestResolveProfile_TwoProfilesPinnedToOneClusterIsRefused(t *testing.T) {
 	d := testDirectory()
 	d.put("prod-east-2", &lib.AgentCard{Name: "prod-east-2", Parameters: clusterParams,
@@ -98,6 +149,18 @@ func TestResolveProfile_TwoProfilesPinnedToOneClusterIsRefused(t *testing.T) {
 	_, _, err := resolveProfile(d, "cluster", targetParams("p1", "us-east1", "prod"))
 	if got := refusalOf(t, err); !strings.Contains(got, "more than one agent profile is pinned") {
 		t.Fatalf("refusal = %q", got)
+	}
+}
+
+// Two pinned profiles on one cluster don't stop a specialist: it never looks
+// for a pinned profile, so there is nothing to choose between.
+func TestResolveProfile_ASpecialistIgnoresAnAmbiguousPin(t *testing.T) {
+	d := testDirectory()
+	d.put("prod-east-2", &lib.AgentCard{Name: "prod-east-2", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	profile, _, err := resolveProfile(d, "tse", targetParams("p1", "us-east1", "prod"))
+	if err != nil || profile != "tse" {
+		t.Fatalf("profile, err = %q, %v; want tse", profile, err)
 	}
 }
 
@@ -514,5 +577,37 @@ func TestCheckTargetScope_NoDeclarationRefusesEveryTarget(t *testing.T) {
 	}
 	if _, err := loadScope(filepath.Join(t.TempDir(), "absent.json")); !errors.Is(err, errNoScopeFile) {
 		t.Fatalf("loadScope(absent) = %v, want errNoScopeFile", err)
+	}
+}
+
+// A pin keeps capping its cluster's tier while the handoff is opt-in: a
+// specialist that keeps a pinned cluster's task runs only at a tier the pin
+// allows (#5435). Unattended is the tier above Read here; requesterTier
+// gives every person Read today, so the route is asked directly.
+func TestProfileRoute_ASpecialistOnAPinnedReadOnlyClusterIsRefusedAboveRead(t *testing.T) {
+	d := testDirectory()
+	d.put("tse", &lib.AgentCard{Name: "tse", Parameters: clusterParams, Tiers: []string{"read", "unattended"}})
+	d.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams, Tiers: []string{"read"},
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	g := &Gateway{profiles: d, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	_, err := g.profileRouteFor("tse", targetParams("p1", "us-east1", "prod"), capability.TierUnattended, "top")
+	if got := refusalOf(t, err); !strings.Contains(got, "pinned to prod-east, which doesn't allow tier unattended") {
+		t.Fatalf("refusal = %q", got)
+	}
+	prod := clusterTarget{Project: "p1", Location: "us-east1", Cluster: "prod"}
+	if err := g.checkPinnedTiers("tse", &prod, capability.TierRead); err != nil {
+		t.Fatalf("read on the pinned cluster: %v", err)
+	}
+	// An unpinned cluster has no pin to cap it.
+	dev := clusterTarget{Project: "p1", Location: "us-east1", Cluster: "dev"}
+	if err := g.checkPinnedTiers("tse", &dev, capability.TierUnattended); err != nil {
+		t.Fatalf("unattended on an unpinned cluster: %v", err)
+	}
+	// A pin's card from an operator that predates tiers caps nothing.
+	d.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	if err := g.checkPinnedTiers("tse", &prod, capability.TierUnattended); err != nil {
+		t.Fatalf("a tierless pin: %v", err)
 	}
 }

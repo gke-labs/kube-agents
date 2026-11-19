@@ -408,3 +408,88 @@ func TestParseLiteLLMModelInfo(t *testing.T) {
 		})
 	}
 }
+
+// insightsServerWithStatus is insightsServer with a kube client reading the
+// PlatformAgent off a fake API whose status.usage is statusUsage.
+func insightsServerWithStatus(t *testing.T, cfg config, resolver hostResolver, bodies map[string]string, statusUsage string) *server {
+	t.Helper()
+	api := fakeUsageStatusAPI(t, statusUsage)
+	t.Cleanup(api.Close)
+	cfg.PodNamespace, cfg.PlatformAgentName = "kubeagents-system", "platform-agent"
+	s := insightsServer(cfg, resolver, bodies, nil)
+	s.kube = &kubeClient{base: api.URL, client: api.Client()}
+	return s
+}
+
+func TestInsightsPrefersTheStatusTotals(t *testing.T) {
+	resolver := &fakeResolver{addrs: []string{"10.0.0.1"}}
+	cfg := config{LiteLLMPeersHost: "peers"}
+	h := insightsServerWithStatus(t, cfg, resolver, map[string]string{"10.0.0.1": replicaMetrics(1)}, fullUsageStatus).routes()
+
+	u := decode[insightsResponse](t, serve(h, insightsReq())).Usage
+	if u.Source != usageSourcePlatformAgent {
+		t.Errorf("source = %q, want the PlatformAgent's totals", u.Source)
+	}
+	if u.InputTokens != 1234567 || u.OutputTokens != 89012 || u.TotalTokens != 1234567+89012 || u.SpendUSD != 4.56789 {
+		t.Errorf("headline = %+v, want the totals since install", u.usageReading)
+	}
+	if u.ReplicasFound != 1 || u.ReplicasRead != 1 || u.Error != "" {
+		t.Errorf("replicas = %d of %d, error %q", u.ReplicasRead, u.ReplicasFound, u.Error)
+	}
+	if u.Live == nil || u.Live.InputTokens != 150 || u.Live.OutputTokens != 30 || u.Live.TotalTokens != 180 || u.Live.SpendUSD != 1.25 {
+		t.Errorf("live = %+v, want the one replica's scrape", u.Live)
+	}
+	serve(h, insightsReq())
+	if resolver.calls != 1 {
+		t.Errorf("a second request inside the cache interval read again (%d lookups)", resolver.calls)
+	}
+}
+
+func TestInsightsKeepsTheStatusTotalsWhenNoReplicaAnswers(t *testing.T) {
+	resolver := &fakeResolver{err: &net.DNSError{IsNotFound: true}}
+	cfg := config{LiteLLMPeersHost: "peers"}
+	h := insightsServerWithStatus(t, cfg, resolver, nil, fullUsageStatus).routes()
+
+	u := decode[insightsResponse](t, serve(h, insightsReq())).Usage
+	if u.Source != usageSourcePlatformAgent || u.TotalTokens != 1234567+89012 || u.Live != nil {
+		t.Errorf("usage = %+v, want the totals since install and no live reading", u)
+	}
+	if u.ReplicasRead != 0 || u.Error != errNoReplicaReady {
+		t.Errorf("replicas = %d, error %q; the scrape's failure should still be reported", u.ReplicasRead, u.Error)
+	}
+	serve(h, insightsReq())
+	if resolver.calls != 1 {
+		t.Errorf("a read that carried the totals was not cached (%d lookups)", resolver.calls)
+	}
+}
+
+func TestInsightsFallsBackToTheScrapeWithoutTotals(t *testing.T) {
+	resolver := &fakeResolver{addrs: []string{"10.0.0.1"}}
+	cfg := config{LiteLLMPeersHost: "peers"}
+	for name, status := range map[string]string{
+		"no usage block": "",
+		"no totals":      `{"clustersRegistered": 1, "toolExecutionsTotal": 7}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := insightsServerWithStatus(t, cfg, resolver, map[string]string{"10.0.0.1": replicaMetrics(1)}, status).routes()
+			u := decode[insightsResponse](t, serve(h, insightsReq())).Usage
+			if u.Source != usageSourceLiteLLM || u.InputTokens != 150 || u.TotalTokens != 180 || u.Live != nil {
+				t.Errorf("usage = %+v, want the scrape as the headline", u)
+			}
+		})
+	}
+}
+
+func TestInsightsWithoutAKubeClientKeepsTheScrape(t *testing.T) {
+	resolver := &fakeResolver{addrs: []string{"10.0.0.1"}}
+	s := insightsServer(config{LiteLLMPeersHost: "peers"}, resolver, map[string]string{"10.0.0.1": replicaMetrics(2)}, nil)
+	s.kube = nil
+	u := decode[insightsResponse](t, serve(s.routes(), insightsReq())).Usage
+	if u.Source != usageSourceLiteLLM || u.InputTokens != 300 || u.Live != nil {
+		t.Errorf("usage = %+v", u)
+	}
+	body := serve(s.routes(), insightsReq()).Body.String()
+	if strings.Contains(body, `"live"`) {
+		t.Errorf("a scrape-only reading should carry no live sub-object: %s", body)
+	}
+}

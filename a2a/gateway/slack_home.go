@@ -73,7 +73,7 @@ const (
 
 	// slackDateToken is Slack's date formatting: rendered in the viewer's
 	// own time zone, with the fallback shown by a client that cannot.
-	slackDateToken    = "<!date^%d^%s|%s>"
+	slackDateToken    = "<!date^%d^%s|%s>" // #nosec G101 -- a Slack format string, not a credential
 	slackDateTime     = "{time}"
 	slackDateDayTime  = "{date_short_pretty} {time}"
 	slackDateFallback = "Jan 2 15:04 UTC"
@@ -84,19 +84,27 @@ const (
 
 	slackHomeClusterCount = "%d cluster%s"
 	slackHomeMoreClusters = "%d more cluster%s"
-	slackHomeBoardUnread  = "Could not read the board at %s."
-	slackHomeMoreFindings = " · %d more finding%s"
-	slackHomeNoFindings   = "no open findings"
-	slackHomeNotYet       = "no findings registered yet"
-	slackHomeFirstReport  = "Send me a message to get your first report and findings."
-	slackHomeAuditCounts  = "*%s:* %d finding%s, %d critical"
-	slackHomeAuditClean   = "*%s:* clean"
-	slackHomeUpdated      = "updated "
-	slackHomeAsked        = "asked "
-	slackHomeStarted      = "started "
-	slackHomeOpened       = "opened "
+	// slackHomeNoListedClusters heads a fleet of unlisted rows only (#3658),
+	// which is not a fleet of no clusters.
+	slackHomeNoListedClusters = "No clusters listed"
+	slackHomeBoardUnread      = "Could not read the board at %s."
+	slackHomeMoreFindings     = " · %d more finding%s"
+	slackHomeNoFindings       = "no open findings"
+	slackHomeNotYet           = "no findings registered yet"
+	slackHomeFirstReport      = "Send me a message to get your first report and findings."
+	slackHomeAuditCounts      = "*%s:* %d finding%s, %d critical"
+	slackHomeAuditClean       = "*%s:* clean"
+	slackHomeUpdated          = "updated "
+	slackHomeAsked            = "asked "
+	slackHomeStarted          = "started "
+	slackHomeOpened           = "opened "
 	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
 	slackHomePRLink = "<%s|#%d %s>"
+
+	// slackHomeUnlisted follows an unlisted row's name, which already says
+	// whether its clusters were not listed here or unread; what both kinds
+	// share is that nothing vouches for their health.
+	slackHomeUnlisted = "health unknown"
 
 	// slackHomeFeedbackWeek is the answer ratings line, over the last
 	// slackHomeFeedbackWindow, drawn when answer feedback is on.
@@ -169,6 +177,10 @@ type slackHome struct {
 	// superseded once the count has moved past its own.
 	moves uint64
 	picks map[string]slackHomePickStatus
+	// dialPicks is each member's picked repository per dial row, and
+	// dialStatuses the answer to their last dial tap (slack_home_dial.go).
+	dialPicks    map[string]map[string]string
+	dialStatuses map[string]slackDialStatus
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -224,6 +236,7 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 			board = &lib.Board{Error: err.Error()}
 		}
 		blocks := s.homeBlocks(board, s.waitingOn(member), time.Now())
+		blocks = append(blocks, s.homeDialBlocks(member, board.Dial)...)
 		blocks = append(blocks, s.homeChannelBlocks(member)...)
 		view.Blocks = slack.Blocks{BlockSet: append(blocks, s.homeFeedback()...)}
 	}
@@ -348,11 +361,17 @@ func (s *SlackAdapter) noteViewer(member string) {
 	if s.home.viewers == nil {
 		s.home.viewers = map[string]time.Time{}
 	}
+	// The prune drops dial picks of members it does not count as viewers;
+	// keep this member's, made just before an admitted redraw.
+	picks := s.home.dialPicks[member]
 	s.pruneViewersLocked(time.Now())
 	if _, ok := s.home.viewers[member]; !ok && len(s.home.viewers) >= slackHomeViewersCap {
 		return
 	}
 	s.home.viewers[member] = time.Now()
+	if picks != nil {
+		s.home.dialPicks[member] = picks
+	}
 }
 
 func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
@@ -364,6 +383,16 @@ func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
 	for m, st := range s.home.picks {
 		if now.Sub(st.at) > slackHomeViewerTTL {
 			delete(s.home.picks, m)
+		}
+	}
+	for m, st := range s.home.dialStatuses {
+		if now.Sub(st.at) > slackHomeViewerTTL {
+			delete(s.home.dialStatuses, m)
+		}
+	}
+	for m := range s.home.dialPicks {
+		if _, viewing := s.home.viewers[m]; !viewing {
+			delete(s.home.dialPicks, m)
 		}
 	}
 }
@@ -492,20 +521,40 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 	if b.Error != "" {
 		note(fmt.Sprintf(slackHomeBoardUnread, slackDate(now, slackDateTime)))
 	} else {
-		total := max(b.ClusterCount, len(b.Clusters))
-		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
-			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
+		// An unlisted row (lib.BoardCluster.Unlisted) stands for projects, not
+		// a cluster: the cap and both counts are clusters, and an unlisted row
+		// is drawn wherever it sits, so the cap never hides it. Nor is it no
+		// clusters: with only unlisted rows the header says none are listed,
+		// never "0 clusters".
+		real, unlisted := 0, 0
+		for _, c := range b.Clusters {
+			if c.Unlisted {
+				unlisted++
+			} else {
+				real++
+			}
+		}
+		total := max(b.ClusterCount, real)
+		count := fmt.Sprintf(slackHomeClusterCount, total, plural(total))
+		if total == 0 && unlisted > 0 {
+			count = slackHomeNoListedClusters
+		}
+		note(count, slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
 		if b.FirstReportPending && b.FirstMessagePending {
 			note(slackHomeFirstReport)
 		}
-		for i, c := range b.Clusters {
-			if i == slackHomeClustersMax {
-				break
+		drawn := 0
+		for _, c := range b.Clusters {
+			if !c.Unlisted {
+				if drawn == slackHomeClustersMax {
+					continue
+				}
+				drawn++
 			}
 			section(clusterLine(c, b.FirstReportPending), nil)
 		}
-		if shown := min(len(b.Clusters), slackHomeClustersMax); total > shown {
-			note(fmt.Sprintf(slackHomeMoreClusters, total-shown, plural(total-shown)))
+		if total > drawn {
+			note(fmt.Sprintf(slackHomeMoreClusters, total-drawn, plural(total-drawn)))
 		}
 	}
 
@@ -565,9 +614,13 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 
 // clusterLine is one cluster: a dot for its worst open finding, its name,
 // that finding's title and how many more there are. Before the first report,
-// no finding means not checked yet, so it is not drawn green.
+// no finding means not checked yet, so it is not drawn green; nor is a row
+// for projects whose clusters the board holds no list for (Unlisted).
 func clusterLine(c lib.BoardCluster, firstReportPending bool) string {
 	name := "*" + slackEscaper.Replace(c.Name) + "*"
+	if c.Unlisted {
+		return slackHomeNeutral + " " + name + "  " + slackHomeUnlisted
+	}
 	if c.Findings == 0 && firstReportPending {
 		return slackHomeNeutral + " " + name + "  " + slackHomeNotYet
 	}

@@ -23,7 +23,10 @@ The remote verbs are exactly these:
 reacts to a comment (its `id` and `kind` come from `view --comments`) so its
 author sees it was read — `capabilities` says whether this forge supports it.
 `issue list --query <text>` searches, and `--without-labels` skips issues
-carrying any of them — that is how a queue is read for unclaimed work.
+carrying any of them — that is how a queue is read for unclaimed work. On an
+AgentProfile worker `--query` takes plain words only (no `:`, quotes or
+parentheses, no `OR`/`AND`/`NOT`), and a label name no quote: anything else is
+refused with `PROFILE_QUERY_QUALIFIER`, so filter with `--labels` instead.
 `label ensure` creates a label or updates it if it exists. `identity` says
 who this install is on the forge and, with `--login`, whether that login may
 write to the repository. `remote-branch view` says whether the shared
@@ -72,6 +75,13 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 - **Anything about the past.** When a value changed, which revision removed a
   flag, who last touched a file, what a file looked like three revisions ago.
+  When the question asks _why_ a file or field in a managed GitOps repository is
+  configured a certain way and the checkout contains `knowledge/`
+  (`knowledge/decision/`, `knowledge/lesson/`, `knowledge/decisions/`,
+  `knowledge/lessons/`, or `.kube-agents/intent.yaml`), also run
+  `python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> why <path>`
+  and cite the matching `DEC-YYYY-NNN` and `LES-YYYY-NNN` record IDs alongside
+  the commit and pull request history.
 - **File modes.** Whether a script is executable is a tree-entry property;
   `files` reports it and it survives the round trip.
 - **Changing a repository** and opening the change proposal for it.
@@ -151,7 +161,10 @@ python3 $V discard
 
 `branch` and `commit` are local and make no network call. `publish` sends every
 revision made since the clone, and the identifiers `log` printed here are the
-identifiers that land on the forge.
+identifiers that land on the forge. When the base branch holds OKF records that
+touch the changed files, `publish` returns `decisionMemoryMarkdown` and
+`proposal create` appends that `### Prior decisions and lessons this change touches`
+section to the proposal body automatically when absent.
 
 **Name the paths you mean.** `commit` with no paths records changes to files
 the copy already tracks and nothing else — it is never `git add .`. A file the
@@ -218,7 +231,11 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   `FORGE_RATE_LIMITED` and `FORGE_UNAVAILABLE` from the delete are the forge
   turning it away for now: wait, then do the same. A forge without `proposal-list`
   does not list `remote-branch delete` in `capabilities` and refuses it
-  `FORGE_UNSUPPORTED`.
+  `FORGE_UNSUPPORTED`. `DECISION_MEMORY_BLOCKED` means an active `severity: block`
+  OKF guard on the base branch forbids the change: stop without opening a
+  proposal and quote the blocking record IDs and evidence to the user.
+  `DECISION_MEMORY_CHECK_FAILED` means an active OKF record on the base branch
+  failed validation or could not be evaluated: report the error and stop.
 - **A repository can have a configured base, and proposals go onto it.** When
   the operator configured one, `clone` and `capabilities` answer it as
   `baseBranch` (it is `null` otherwise), a `clone` with no `--branch` comes
@@ -249,7 +266,10 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   this install cannot see answers the same way.
   `LABELS_UNSUPPORTED` means this forge has no labels (`capabilities` says
   `labels: false`): send the call again without the label option, do not call
-  `label ensure`, and find your own proposals by their branch name. `FORGE_IDENTITY_UNKNOWN` means the
+  `label ensure`, and find your own proposals by their branch name.
+  `FORBIDDEN_LABEL` means a `decision-override:*` label was supplied; those
+  labels are reserved for human reviewers on the forge, so drop the label and
+  never set it from an agent. `FORGE_IDENTITY_UNKNOWN` means the
   forge cannot say which account this install is: report it.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
   credential side, so there is nothing else to release.

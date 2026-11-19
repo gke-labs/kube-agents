@@ -160,6 +160,7 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	cfg := &Config{
 		NATSURL:          s.ClientURL(),
 		PrincipalMapPath: filepath.Join(t.TempDir(), "absent"),
+		DiscordToken:     "x",
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
@@ -172,10 +173,121 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	}
 }
 
+// A console turn that names the task a report was on carries it to the
+// executor as a replyTo part.
+func TestConsoleReplyToRidesTheSubmission(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-rt", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "and the other pool?", ReplyTo: "task-7",
+	}
+	origin := r.awaitTask(t, "platform")
+	got, found, err := lib.ReplyToOf(messageParts(t, origin))
+	if err != nil || !found || got.TaskID != "task-7" {
+		t.Fatalf("replyTo part = %+v found=%v err=%v, want task-7", got, found, err)
+	}
+}
+
+// A replyTo that is not a task id's shape is dropped with one warn and the
+// turn starts without the part: the report is a help, not a condition.
+func TestAMalformedReplyToStartsTheTurnWithoutThePart(t *testing.T) {
+	t.Parallel()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-bad", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "and the other pool?", ReplyTo: "not a task",
+	}
+	origin := r.awaitTask(t, "platform")
+	if _, found, _ := lib.ReplyToOf(messageParts(t, origin)); found {
+		t.Fatal("a malformed replyTo reached the submission")
+	}
+	if n := strings.Count(logs.String(), "replyTo dropped: not a task id"); n != 1 {
+		t.Fatalf("warns = %d, want one:\n%s", n, logs.String())
+	}
+}
+
+// The dropped value is sender-chosen, so the warn carries it bounded, as
+// the console door logs its other frame fields, and never the whole string.
+func TestAMalformedReplyToIsLoggedBounded(t *testing.T) {
+	t.Parallel()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	r.adapter.roster = []string{consoleAuthor}
+	long := strings.Repeat("x", 10*1024) + " not a task"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-long", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "and the other pool?", ReplyTo: long,
+	}
+	r.awaitTask(t, "platform")
+	got := logs.String()
+	if !strings.Contains(got, "replyTo dropped: not a task id") {
+		t.Fatalf("no warn:\n%s", got)
+	}
+	if strings.Contains(got, long) || strings.Contains(got, strings.Repeat("x", consoleMessageIDCap+1)) {
+		t.Fatalf("the warn carries the whole %d-byte value; want it cut to %d runes", len(long), consoleMessageIDCap)
+	}
+	if !strings.Contains(got, fmt.Sprintf("bytes=%d", len(long))) {
+		t.Fatalf("the warn does not say the value's length:\n%s", got)
+	}
+}
+
+// A reply that names a report while the conversation's turn still runs is
+// steered into that turn, which carries no replyTo part; the gateway says so
+// once in its log.
+func TestAConsoleReplyWhileTheTurnRunsIsSteeredWithoutReplyTo(t *testing.T) {
+	t.Parallel()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	r.adapter.roster = []string{consoleAuthor}
+	conv := "console:tab-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "check the pools"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	long := "task-7" + strings.Repeat("x", 10*1024)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m2", Text: "and the other pool?", ReplyTo: long}
+	waitFor(t, "steer envelope", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) >= 2 })
+	envs := inSubjectEnvelopes(t, r.url, "platform")
+	steer := envs[len(envs)-1]
+	if steer.TaskID != origin.TaskID {
+		t.Fatalf("the reply started a new task %s; want a steer into %s", steer.TaskID, origin.TaskID)
+	}
+	if _, found, _ := lib.ReplyToOf(messageParts(t, steer)); found {
+		t.Fatal("the steer carried a replyTo part, which no executor reads")
+	}
+	if n := strings.Count(logs.String(), "replyTo not carried: the turn is still running"); n != 1 {
+		t.Fatalf("warns = %d, want one:\n%s", n, logs.String())
+	}
+	if got := logs.String(); strings.Contains(got, long) || !strings.Contains(got, fmt.Sprintf("bytes=%d", len(long))) {
+		t.Fatalf("the steer warn carries the whole %d-byte value or no length", len(long))
+	}
+}
+
+func TestAConsoleTurnNamingNoReportCarriesNoReplyTo(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-rt2", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m2", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	if _, found, _ := lib.ReplyToOf(messageParts(t, origin)); found {
+		t.Fatal("a turn that named no report carried a replyTo part")
+	}
+}
+
 // The console page renders answers off TASKS, so the deliverable never goes
 // out as a notice on chat.console.<token>.out. Here the backend takes no
 // terminal frames, so the answer goes nowhere on the console subject at all.
 func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
@@ -212,6 +324,7 @@ func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
 // learn the task died. The notice goes out whatever the backend does with
 // terminal frames; this one takes none.
 func TestConsoleStillGetsTerminalNotices(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
@@ -237,6 +350,7 @@ func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 // task, so a console client (the MCP server) reads it there. It is
 // still never a notice.
 func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -272,6 +386,7 @@ func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
 // one that did not leaves the field off (TestAConsoleAnswerIsATerminalFrame
 // pins that), and the client need not wait.
 func TestAConsoleTurnThatFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -295,6 +410,7 @@ func TestAConsoleTurnThatFiledCardsSaysSoOnItsFrame(t *testing.T) {
 // A failure on a console conversation is a terminal frame too, carrying the
 // notice text.
 func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -322,6 +438,7 @@ func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
 // the relay saw it too, so the heal's frame repeats the relay's for the same
 // task, which a client drops on its repeated id.
 func TestAHealedConsoleTaskIsAFrame(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}
@@ -355,6 +472,7 @@ func TestAHealedConsoleTaskIsAFrame(t *testing.T) {
 // that delegated or for its child, and one for the wake's end, under the task
 // the turn started (observedAs), as every observer is told.
 func TestAConsoleDelegationChainEndsInOneFrame(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-chain"
@@ -376,6 +494,7 @@ func TestAConsoleDelegationChainEndsInOneFrame(t *testing.T) {
 // reason, though its executor said completed: the hand-off line ("delegated
 // to ...") is never an answer (handOffEnd).
 func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-handoff"
@@ -393,7 +512,8 @@ func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
 	waitFor(t, "the frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
 	got := r.adapter.terminalPosts()
 	if len(got) != 1 || got[0].TaskID != origin.TaskID || got[0].State != lib.StateFailed ||
-		!strings.HasPrefix(got[0].Text, "❌ failed: ") || !strings.Contains(got[0].Text, "delegation refused") ||
+		got[0].Text != "❌ failed — "+reasonSentences["delegation-refused"] ||
+		strings.Contains(got[0].Text, reasonPrefix) ||
 		strings.Contains(got[0].Text, "delegated to nobody-here") {
 		t.Fatalf("terminal frames = %+v, want one failed frame for %s with the reason", got, origin.TaskID)
 	}
@@ -402,6 +522,7 @@ func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
 // A chat conversation's terminals are notices as before: the relay asks for
 // a terminal frame only on a console conversation.
 func TestAChatConversationGetsNoTerminalFrames(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	conv := "discord:g1/c-terminal"
@@ -419,6 +540,7 @@ func TestAChatConversationGetsNoTerminalFrames(t *testing.T) {
 // back from the stream: the render state that held it is gone, and the frame
 // carries the answer, not the non-text stand-in.
 func TestAConsoleAnswerSurvivesLostRenderState(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	r.adapter.roster = []string{consoleAuthor}
 	conv := "console:tab-lost"
@@ -612,6 +734,7 @@ func TestTheConsoleStashEvictsOneEntryAtTheCap(t *testing.T) {
 // report's replyTo is mapped to the root. A task the record does not hold
 // passes through unchanged.
 func TestAConsoleReportFromADelegatedChildRepliesToTheRoot(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := consoleKeyPrefix + "t-replyto"
 	origin, _, child := delegated(t, r, spawn, conv, "")
@@ -657,6 +780,7 @@ func TestAConsoleGatewayDeclaredEndIsWordedBySource(t *testing.T) {
 // handoff marks the chain's root, and the chain's one frame (the wake's end,
 // under the root) carries cardsPending.
 func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-chain-cards"
@@ -680,6 +804,7 @@ func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
 // The heal reads the task's fold from the stream, handoff included, so a
 // frame it produces carries cardsPending as the relay's does.
 func TestAHealedConsoleTaskThatFiledCardsSaysSo(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
 	r.adapter.roster = []string{consoleAuthor}

@@ -1,17 +1,28 @@
 # Development Scripts
 
 Local iteration tooling for this repository: rebuilding and redeploying agent images,
-setting up Workload Identity Federation for CI, and tearing down the dev Artifact
-Registry. These sat under `k8s-operator/scripts/dev/` until they moved here — they are
-repository tooling rather than operator code, and the shared helpers they source now
-live in the sibling [`../installer/`](../installer/README.md).
+repeating a test under load, setting up Workload Identity Federation for CI, and tearing
+down the dev Artifact Registry. They are repository tooling rather than operator code; the
+shared helpers two of them source live in the sibling [`../installer/`](../installer/README.md).
 
 | Script                                     | What it does                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `dev_rebuild_agent.sh`                     | Rebuilds one agent image and redeploys it; what `make dev-rebuild-agent` runs           |
+| `dev_rebuild_agent.sh`                     | Rebuilds the agent image and the two that follow its tag, and redeploys (see below)     |
+| `profile_kubectl_costs.py`                 | Profiles each fleet-wide `kubectl get` and writes `deploy/sandbox/kubectl-costs.json`   |
+| `profile_kubectl_costs_job.sh`             | Runs that profiler as a Job on a tier's reference cluster                               |
+| `repeat_under_load.sh`                     | Runs a new or changed test several times under CPU load; prints the PR body's line      |
 | `setup-gcp-github-wif.sh`                  | Workload Identity Federation for CI, documented below                                   |
 | `teardown_dev_01_gcp_artifact_registry.sh` | Deletes the throwaway dev Artifact Registry this tooling created                        |
 | `update_cluster_name.sh`                   | Patches the target GKE cluster name into the deployed `PlatformAgent` spec; run by hand |
+
+`dev_rebuild_agent.sh` is what `make dev-rebuild-agent` runs. It builds three images under one
+dev tag, because the operator takes two sidecar images from the agent image on the
+`PlatformAgent` (the same registry path and tag): `platform-agent`, `credential-proxy` and
+`hermes-bridge`, the last one built from the new agent image
+([where the bridge runs](../../a2a/docs/hermes-bridge.md)). An operator that has
+`A2A_BRIDGE_IMAGE` or `CREDENTIAL_PROXY_IMAGE` set keeps that image for the sidecar. `kube-proxy`,
+the shell sandbox and the `a2a-*` images follow the operator's image, so a rebuild does not move
+them.
 
 `teardown_dev_01_gcp_artifact_registry.sh` asks before it deletes anything. `--no-confirm` (or
 `-y`) answers yes for an unattended run and `--dry-run` shows the delete without making it; a

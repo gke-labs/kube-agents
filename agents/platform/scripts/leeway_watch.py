@@ -32,13 +32,23 @@ Which clusters. Target clusters are resolved on the agent pod:
    `kubectl --context=gke_<project>_<location>_<cluster>` read through the
    credential-proxy shim, which is the one route the sandbox has to a
    cluster.
+4. Under `spec.mode: next` (`KUBEAGENTS_RESOLVED_SCOPE_FILE` set), steps 2
+   and 3 read the scope publisher's resolved scope instead
+   (`fleet_scope_targets.list_scope_clusters`, #5621): the management and
+   explicit projects are enumerated with `gcloud` as above, a member
+   project is swept by the triples the publisher listed for it, and a
+   member it holds no list for is a scan error, not an empty project. No
+   Cluster Agent profile is read.
 
 Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
 and routes Kubernetes object reads through the sandbox's `kubectl`
 `credential-proxy` shim (`CREDENTIAL_PROXY_URL`). `leeway_watch.py` invokes
-`leeway report --topology-tier-c-signals --parallelism 2` in the sandbox
-through `sandbox_exec.run` and parses the `leeway.report/v1alpha1` JSON
-document from stdout.
+`leeway report --topology-tier-c-signals --parallelism 2 --timeout <n>s` in the
+sandbox through `sandbox_exec.run` and parses the `leeway.report/v1alpha1` JSON
+document from stdout. `--timeout` is leeway's per-cluster deadline (its own
+default is one minute, which a large cluster can exceed); it is sized so every
+cluster in the call can use its share of the call's sandbox timeout, capped so
+one stuck cluster cannot spend the tick (`cluster_timeout_seconds`).
 
 Threshold filtering and environment knobs. Before ledger gating,
 `filter_report_findings` drops `unknown`-cause topology findings at their
@@ -148,10 +158,6 @@ CLUSTERS_ENV = "LEEWAY_WATCH_CLUSTERS"
 PROJECTS_ENV = "LEEWAY_WATCH_PROJECTS"
 CSV_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
-PROFILES_DIR = "profiles"
-IDENTITY_PROJECT_KEY = "project"
-IDENTITY_LOCATION_KEY = "location"
-IDENTITY_CLUSTER_KEY = "cluster"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 NO_PROJECT_DETAIL = (
@@ -172,18 +178,37 @@ LEEWAY_EXECUTABLE = "leeway"
 LEEWAY_REPORT_SUBCOMMAND = "report"
 TIER_C_FLAG = "--topology-tier-c-signals"
 PARALLELISM_FLAG = "--parallelism"
-PARALLELISM_VALUE = "2"
+PARALLELISM = 2
+PARALLELISM_VALUE = str(PARALLELISM)
+CLUSTER_TIMEOUT_FLAG = "--timeout"
+CLUSTER_TIMEOUT_FORMAT = "{seconds}s"
+# leeway's own `--timeout` default (`DefaultClusterTimeout`), kept as the floor
+# so a short call never gives a cluster less than leeway would on its own.
+MIN_CLUSTER_TIMEOUT_SECONDS = 60
+# The ceiling, so one cluster whose read stalls rather than fails spends at most
+# this much of the tick: five projects each with one stalled cluster still fit
+# TICK_BUDGET_SECONDS.
+MAX_CLUSTER_TIMEOUT_SECONDS = 300
+# Held back from the call's sandbox timeout for leeway's start-up and report
+# assembly, so the per-cluster deadline fires before the sandbox kills the call.
+LEEWAY_OVERHEAD_SECONDS = 30
+CLUSTER_SEPARATOR = ","
 CLUSTERS_FLAG = "--clusters"
 LIST_CLUSTERS_ARGV = ("gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project")
 LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project} exited {code}: {error}"
 PROJECT_TIMEOUT_SECONDS = 900
 TICK_BUDGET_SECONDS = 2700
-MIN_PROJECT_RUN_SECONDS = 60
+# The least a project call is started with: enough for one cluster's floor plus
+# the overhead, so a budget-cut call of one wave (one or two clusters) lets
+# leeway's deadline fire before the sandbox kills the call.
+MIN_PROJECT_RUN_SECONDS = MIN_CLUSTER_TIMEOUT_SECONDS + LEEWAY_OVERHEAD_SECONDS
 STDERR_EXCERPT_CHARS = 300
 TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
 SCAN_CUT_SHORT_DETAIL = "leeway scan for {target} cut short by the tick budget"
 SCAN_FAILED_DETAIL = "leeway scan for {target} failed: {error}"
+# A project the resolved scope names but holds no cluster list for (spec.mode: next).
+UNREAD_PROJECT_DETAIL = "{target} was not swept: {reason}"
 
 # Partial-scan error kinds (used as deduplication signature keys so rotating
 # project names do not re-page every day for the same underlying condition).
@@ -441,30 +466,12 @@ def explicit_clusters() -> list[str]:
 
 
 def roster_clusters_by_project() -> dict[str, list[str]]:
-    """Map each project to its sorted `<project>/<location>/<cluster>` triples from Cluster Agent profiles."""
-    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return {}
-    by_proj: dict[str, set[str]] = {}
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or not home.is_dir():
-            continue
-        try:
-            identity = read_cluster_identity(home)
-        except Exception:  # noqa: BLE001
-            identity = None
-        if not identity:
-            continue
-        proj = str(identity.get(IDENTITY_PROJECT_KEY) or "").strip()
-        loc = str(identity.get(IDENTITY_LOCATION_KEY) or "").strip()
-        cluster = str(identity.get(IDENTITY_CLUSTER_KEY) or "").strip()
-        if proj:
-            by_proj.setdefault(proj, set())
-            if loc and cluster:
-                by_proj[proj].add(CLUSTER_KEY_SEPARATOR.join([proj, loc, cluster]))
-    return {proj: sorted(triples) for proj, triples in by_proj.items()}
+    """Map each project to its sorted `<project>/<location>/<cluster>` triples
+    from Cluster Agent profiles: the profiles walk
+    `fleet_scope_targets.list_scope_clusters` makes outside spec.mode: next.
+    A project only incomplete identities name maps to no triple."""
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    return {entry.project: [CLUSTER_KEY_SEPARATOR.join(t) for t in entry.clusters or ()] for entry in scope.projects}
 
 
 def roster_projects() -> set[str]:
@@ -524,9 +531,38 @@ def order_by_least_recent(items: list[str], stamps: dict[str, Any]) -> list[str]
 # --- sandbox execution -------------------------------------------------------
 
 
+def cluster_timeout_seconds(call_timeout: int, cluster_count: int) -> int:
+    """leeway's per-cluster `--timeout` for a call of `cluster_count` clusters.
+
+    leeway reads `PARALLELISM` clusters at a time, so the call runs in
+    `ceil(cluster_count / PARALLELISM)` waves; each wave gets an equal share of
+    the call's sandbox timeout, less `LEEWAY_OVERHEAD_SECONDS`, between
+    `MIN_CLUSTER_TIMEOUT_SECONDS` and `MAX_CLUSTER_TIMEOUT_SECONDS`. A slow
+    cluster then ends as a per-cluster `error` row instead of the sandbox
+    killing the whole call and discarding the clusters that finished. When the
+    floor wins, a call of several waves can still overrun the sandbox timeout,
+    as it could before: more than about 28 clusters at the full call timeout,
+    or a few clusters in a call the tick budget has cut short.
+    """
+    waves = math.ceil(max(cluster_count, 1) / PARALLELISM)
+    share = (call_timeout - LEEWAY_OVERHEAD_SECONDS) // waves
+    return max(MIN_CLUSTER_TIMEOUT_SECONDS, min(MAX_CLUSTER_TIMEOUT_SECONDS, share))
+
+
 def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Run `leeway report --topology-tier-c-signals --parallelism 2 <flag> <value>` in the sandbox."""
-    argv = [LEEWAY_EXECUTABLE, LEEWAY_REPORT_SUBCOMMAND, TIER_C_FLAG, PARALLELISM_FLAG, PARALLELISM_VALUE, flag, value]
+    """Run `leeway report --topology-tier-c-signals --parallelism 2 --timeout <n>s <flag> <value>` in the sandbox."""
+    per_cluster = cluster_timeout_seconds(timeout, len(value.split(CLUSTER_SEPARATOR)))
+    argv = [
+        LEEWAY_EXECUTABLE,
+        LEEWAY_REPORT_SUBCOMMAND,
+        TIER_C_FLAG,
+        PARALLELISM_FLAG,
+        PARALLELISM_VALUE,
+        CLUSTER_TIMEOUT_FLAG,
+        CLUSTER_TIMEOUT_FORMAT.format(seconds=per_cluster),
+        flag,
+        value,
+    ]
     try:
         completed = sandbox_exec.run(argv, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
@@ -1333,9 +1369,36 @@ def sweep_fleet(
             requested_clusters,
         )
 
-    known_triples_by_proj = roster_clusters_by_project()
-    target_projects = order_by_least_recent(projects(scope), project_runs)
+    # Under spec.mode: next the resolved scope names the projects and each
+    # member project's clusters (#5621); the management and explicit projects
+    # are listed live, and a member nothing listed is recorded unread.
+    # Outside it the profiles' triples sweep their projects, as before.
+    entries: dict[str, fleet_scope_targets.ProjectClusters] = {}
+    if fleet_scope_targets.resolved_scope_file():
+        cluster_scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+        entries = cluster_scope.by_project()
+        excluded |= {CLUSTER_KEY_SEPARATOR.join(ref) for ref in cluster_scope.excluded_clusters}
+        known_triples_by_proj = {
+            proj: [CLUSTER_KEY_SEPARATOR.join(t) for t in entry.clusters or ()] for proj, entry in entries.items()
+        }
+        explicit = {p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(CSV_SEPARATOR) if p.strip()}
+        # LEEWAY_WATCH_PROJECTS narrows the sweep, but never past the row an
+        # unusable resolved scope leaves for the members it could not name:
+        # that row is a scan error, so nothing a member holds is retired.
+        names = [
+            proj for proj in entries
+            if not explicit or proj in explicit or proj == fleet_scope_targets.UNRESOLVED_SCOPE_ROW
+        ]
+        target_projects = order_by_least_recent(names, project_runs)
+    else:
+        known_triples_by_proj = roster_clusters_by_project()
+        target_projects = order_by_least_recent(projects(scope), project_runs)
     for proj in target_projects:
+        entry = entries.get(proj)
+        if entry is not None and entry.status == fleet_scope_targets.STATUS_UNREAD:
+            scan_errors[proj] = UNREAD_PROJECT_DETAIL.format(target=proj, reason=entry.reason)
+            error_kinds[proj] = ERROR_KIND_SCAN_FAILED
+            continue
         remaining = int(deadline - time.monotonic())
         if remaining < MIN_PROJECT_RUN_SECONDS:
             scan_errors[proj] = BUDGET_EXHAUSTED_DETAIL.format(target=proj)
@@ -1344,7 +1407,7 @@ def sweep_fleet(
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
         triples = [t for t in (known_triples_by_proj.get(proj) or []) if t not in excluded]
         try:
-            if not triples:
+            if not triples and (entry is None or entry.status == fleet_scope_targets.STATUS_LIST_LIVE):
                 triples = [t for t in project_cluster_triples(proj) if t not in excluded]
             if not triples:
                 # A project with no clusters is a clean, empty read.

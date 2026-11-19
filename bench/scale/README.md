@@ -120,7 +120,14 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `trigger_reconcile`: run the Cluster Agent reconcile when the profiles differ from the test fleet,
   instead of waiting for its hourly run;
 - `cluster_create_parallelism`: how many clusters or node pools change at once;
-- `watcher_wait_seconds`: how long a restarted event watcher may take to report every test cluster;
+- `watcher_wait_seconds`: how long the event watcher may take to report every test cluster; the
+  runner looks every 30 s and stops at the first match, but gives up no sooner than 180 s, one
+  profile rescan plus the new cluster's initial list. Runs recorded before the runner waited for
+  the rescan (before `restart_unwatched_watcher` existed) started on a gateway restart when the
+  watch set differed; later runs do not, and an error marks a run whose watch set never matched;
+- `restart_unwatched_watcher`: restart the gateway Pod when the event watcher still does not watch
+  every test cluster after that wait, and record that a restart was needed (default off: the
+  mismatch is recorded as an error instead);
 - `default_pool_pods`: how many fixture Pods each cluster's default pool holds before a fixture pool
   is needed;
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
@@ -203,7 +210,7 @@ one. `commit` is the commit the agent image's tag pins (the tag itself when it i
 from the install. The key holds the commit's first 8 characters, or the whole tag when the tag is not a commit, so a new build is a new set of keys. A base record has `factor` `base` and `level`
 0; `values` holds every factor's planned value at the point, base records included. `totals` holds
 what the test clusters really had, summed over the fleet; fits use the totals for the factors the totals count (clusters, nodes, objects), the achieved rate for churn (`churn_achieved_per_minute`), and `values` for the rest. `limits`, `requests` and
-`replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>` (the preview is cut before a word, never inside one; `reclassify` also redacts a cut-off start of the ID in records stored before that), so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
+`replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`next` when its spec leaves the mode unset, which the CRD now defaults). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>` (the preview is cut before a word, never inside one; `reclassify` also redacts a cut-off start of the ID in records stored before that), so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
 run. `excluded_from` names the fits the record is left out of: `["response_seconds"]` when a prompt
 run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade readiness record written
 before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics,

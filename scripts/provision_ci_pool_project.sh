@@ -45,12 +45,12 @@ PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceacc
 # creates one custom role on this project with exactly these permissions and
 # grants it, which is the whole reach the identity has here. The reason for
 # each permission is beside COMPUTE_SWEEP_PERMISSIONS in
-# scripts/verify_ci_pool_project.py, whose tests keep the two copies equal.
+# scripts/verify_ci_pool_project.py, whose tests keep the three copies equal.
 readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
 readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
 readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
-readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
+readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.backendServices.delete,compute.backendServices.list,compute.forwardingRules.delete,compute.forwardingRules.list,compute.forwardingRules.pscDelete,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalForwardingRules.delete,compute.globalForwardingRules.list,compute.globalForwardingRules.pscDelete,compute.globalOperations.get,compute.healthChecks.delete,compute.healthChecks.list,compute.networks.delete,compute.networks.list,compute.regionBackendServices.delete,compute.regionBackendServices.list,compute.regionHealthChecks.delete,compute.regionHealthChecks.list,compute.regionOperations.get,compute.serviceAttachments.delete,compute.serviceAttachments.list,compute.subnetworks.delete,compute.subnetworks.list,container.clusters.delete,container.clusters.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
 # The once-per-project pieces of a self-managed forge (hack/ci-forge.sh reads
 # them per run; docs/ci-pool-projects.md 5.8): the private zone, one reserved
 # address and one A record per row, the 443 firewall rule and the VM identity,
@@ -74,6 +74,15 @@ readonly FORGE_DENY_RULES="all"
 readonly FORGE_NETWORK_TAG="forge"
 readonly FORGE_VM_SA_ID="forge-vm"
 readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
+# A project-level binding on a service account created a moment earlier is
+# refused with "does not exist" until IAM has seen the account; evals-43, -49
+# and -50 each stopped there on 2026-11-13..15 and passed on the rerun. The
+# binding is retried for about a minute before the step gives up.
+readonly FORGE_VM_BIND_ATTEMPTS=6
+readonly FORGE_VM_BIND_DELAY_S=10
+# The one refusal the binding retries on: IAM's answer for an account it has
+# not seen yet. Any other failure stops the step at once.
+readonly FORGE_VM_BIND_RETRY_PATTERN="does not exist"
 readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
@@ -93,17 +102,18 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # The declared-intent note the declared-intent cases read (GITOPS_INTENT_NOTE_CASES
 # in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
 # runs without a budget or a NetworkPolicy, declared-token-workload's
-# token-reader keeps its mounted token, and declared-overrequest-workload's
-# burst-ingest keeps its headroom, all on purpose. The harness reads the
+# token-reader keeps its mounted token, declared-overrequest-workload's
+# burst-ingest keeps its headroom, and declared-single-zone-pool's
+# declared-zonal-pool stays in one zone, all on purpose. The harness reads the
 # frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -120,6 +130,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -129,9 +142,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings.'
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings.'
 # checkout-gateway's declaration, the file the remediation cases propose a
 # PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
 # With no manifest in the repository the agent finds nothing to fix and refuses
@@ -192,6 +206,23 @@ HOST_CLUSTER_NAME="platform-agent-host"
 # host cluster lacks this exact value and its tests pin the two copies equal
 # (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
 readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+# GKE runs one cluster operation at a time, and right after the apply an
+# Autopilot host is still creating node pools for the pods Helm installed:
+# evals-48's update was refused CLUSTER_ALREADY_HAS_OPERATION on 2026-11-16.
+# Step 2.1 waits for the cluster's running operations before the update,
+# polling every HOST_OTEL_WAIT_DELAY_S for up to the attempt count (about
+# twenty minutes), then updates with the same retry if an operation slipped
+# in between the poll and the call.
+readonly HOST_OTEL_WAIT_ATTEMPTS=40
+readonly HOST_OTEL_WAIT_DELAY_S=30
+# GKE's refusal while another operation holds the cluster, the one error the
+# update retries on; the poll's filter matches the cluster's own operations and
+# its node pools' (targetLink ends in /clusters/<name> or continues with
+# /nodePools/...), since an Autopilot host creates pools after the apply. The
+# regex operand is quoted inside the filter: gcloud's filter lexer ends an
+# unquoted operand at "(", which would turn the alternation into a second,
+# always-false term and match nothing.
+readonly HOST_OTEL_BUSY_PATTERN="CLUSTER_ALREADY_HAS_OPERATION"
 
 usage() {
   cat <<EOF
@@ -288,8 +319,11 @@ echo -e "\n==> [Step 0/5] Checking preconditions..."
 # -- swapping a binary would point it at state the other wrote. Checked here for
 # the reason at the top of Step 0: without it, a missing `tofu` surfaces as
 # "command not found" at Step 2.2, twelve minutes and two applies in.
+# gke-gcloud-auth-plugin because the fleet stack's Kubernetes providers run it
+# on every call: without it the second Step 2.2 apply fails at its first
+# in-cluster read, after the clusters are up.
 MISSING_TOOLS=()
-for tool in gcloud gh git go jq python3 terraform tofu; do
+for tool in gcloud gh git gke-gcloud-auth-plugin go jq python3 terraform tofu; do
   command -v "${tool}" >/dev/null 2>&1 || MISSING_TOOLS+=("${tool}")
 done
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
@@ -297,7 +331,7 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   echo "       This script needs terraform and tofu both; see the comment above." >&2
   exit 1
 fi
-echo "✓ Toolchain present (gcloud, gh, git, go, jq, python3, terraform, tofu)"
+echo "✓ Toolchain present (gcloud, gh, git, gke-gcloud-auth-plugin, go, jq, python3, terraform, tofu)"
 
 # Step 2.1's post-apply `clusters update --managed-otel-scope` is issued on the
 # GA surface, which gcloud grew in MIN_GCLOUD_VERSION; an older SDK fails the
@@ -499,11 +533,16 @@ done
 # check on the default pool's instance group (readiness-lb-drain-timeout,
 # defects-b.tf), and the create needs compute.backendServices.*,
 # compute.healthChecks.* and compute.instanceGroups.use.
+# compute.networkAdmin: the stack plants a VPC network peered with `default`
+# (declared-mtu-peering, main.tf), and the create needs compute.networks.create,
+# .delete, .addPeering, .removePeering and .updatePeering, which no other role
+# here carries.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
   roles/compute.loadBalancerAdmin \
   roles/compute.securityAdmin \
+  roles/compute.networkAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \
@@ -549,7 +588,11 @@ if ! gcloud artifacts repositories describe kube-agents --location="${REGION}" -
 fi
 
 CLEANUP_POLICY_FILE="$(mktemp)"
-trap 'rm -f "${CLEANUP_POLICY_FILE}"' EXIT
+# The stderr of the two retried gcloud calls below (step 1.5's binding, step
+# 2.1's scope update), read back to classify the failure; per run, so two
+# provisioning runs on one host never read each other's answer.
+GCLOUD_ERR_FILE="$(mktemp)"
+trap 'rm -f "${CLEANUP_POLICY_FILE}" "${GCLOUD_ERR_FILE}"' EXIT
 cat > "${CLEANUP_POLICY_FILE}" <<'EOF'
 [
   {
@@ -699,7 +742,29 @@ FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
   gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
 fi
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
+bound=false
+bind_failed=false
+for attempt in $(seq 1 "${FORGE_VM_BIND_ATTEMPTS}"); do
+  if gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null 2>"${GCLOUD_ERR_FILE}"; then
+    bound=true
+    break
+  fi
+  if ! grep -q "${FORGE_VM_BIND_RETRY_PATTERN}" "${GCLOUD_ERR_FILE}"; then
+    cat "${GCLOUD_ERR_FILE}" >&2
+    bind_failed=true
+    break
+  fi
+  echo "  ⚠ ${FORGE_VM_SA} is not visible to IAM yet (attempt ${attempt}/${FORGE_VM_BIND_ATTEMPTS}); waiting ${FORGE_VM_BIND_DELAY_S}s..."
+  sleep "${FORGE_VM_BIND_DELAY_S}"
+done
+if [ "${bound}" != "true" ]; then
+  if [ "${bind_failed}" = "true" ]; then
+    echo "FATAL: binding ${FORGE_VM_SA_ROLE} to ${FORGE_VM_SA} failed (above)." >&2
+  else
+    echo "FATAL: ${FORGE_VM_SA} was still not visible to IAM after ${FORGE_VM_BIND_ATTEMPTS} attempts ($((FORGE_VM_BIND_ATTEMPTS * FORGE_VM_BIND_DELAY_S))s); re-run the script." >&2
+  fi
+  exit 1
+fi
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
 # ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
@@ -853,11 +918,35 @@ fi
 # set -e: a pool project without the scope passes every lease and exports no
 # traces, and the verifier in Step 5 would fail it anyway.
 echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
-gcloud container clusters update "${HOST_CLUSTER_NAME}" \
-  --project="${PROJECT_ID}" \
-  --location="${REGION}" \
-  --managed-otel-scope="${HOST_OTEL_SCOPE}" \
-  --quiet
+scope_set=false
+for attempt in $(seq 1 "${HOST_OTEL_WAIT_ATTEMPTS}"); do
+  running="$(gcloud container operations list --project="${PROJECT_ID}" --location="${REGION}" \
+    --filter="status!=DONE AND targetLink~'/clusters/${HOST_CLUSTER_NAME}(/|\$)'" --format="value(name,operationType)" 2>/dev/null || true)"
+  if [ -n "${running}" ]; then
+    echo "  ⏳ ${HOST_CLUSTER_NAME} is running an operation (${running//$'\n'/; }); waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
+    sleep "${HOST_OTEL_WAIT_DELAY_S}"
+    continue
+  fi
+  if gcloud container clusters update "${HOST_CLUSTER_NAME}" \
+      --project="${PROJECT_ID}" \
+      --location="${REGION}" \
+      --managed-otel-scope="${HOST_OTEL_SCOPE}" \
+      --quiet 2>"${GCLOUD_ERR_FILE}"; then
+    scope_set=true
+    break
+  fi
+  if ! grep -q "${HOST_OTEL_BUSY_PATTERN}" "${GCLOUD_ERR_FILE}"; then
+    cat "${GCLOUD_ERR_FILE}" >&2
+    break
+  fi
+  echo "  ⏳ an operation started between the poll and the update; waiting ${HOST_OTEL_WAIT_DELAY_S}s (${attempt}/${HOST_OTEL_WAIT_ATTEMPTS})..."
+  sleep "${HOST_OTEL_WAIT_DELAY_S}"
+done
+if [ "${scope_set}" != "true" ]; then
+  echo "FATAL: could not set the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}: the cluster kept running operations for $((HOST_OTEL_WAIT_ATTEMPTS * HOST_OTEL_WAIT_DELAY_S))s, or the update failed (above)." >&2
+  echo "       Re-run with --skip-host-cluster once \`gcloud container operations list --project=${PROJECT_ID} --filter=status!=DONE\` is empty." >&2
+  exit 1
+fi
 echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 
 if [ "${SKIP_FLEET}" != "true" ]; then
@@ -875,8 +964,10 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     # resources read the Gateway API CRDs at plan time, and those exist only
     # once GKE has created seeded-a with gateway_api_config. The first apply
     # creates that cluster on its own; on a project that has it, it changes
-    # nothing.
-    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a
+    # nothing. The ComputeClass fixture's kubernetes_manifest (defects-c.tf)
+    # reads the ComputeClass CRD the same way, which GKE installs with
+    # seeded-c, so the first apply targets that cluster too.
+    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a -target=google_container_cluster.seeded_c
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else

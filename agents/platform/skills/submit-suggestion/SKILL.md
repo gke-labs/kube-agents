@@ -122,6 +122,8 @@ name, which is why the name has to describe the change.
 }
 ```
 
+When `knowledge/` or `.kube-agents/intent.yaml` exists in the checkout, `prepare` also includes `"decision_memory": true` in that JSON object.
+
 `base` is what the change merges into: the branch the operator configured for
 this repository when there is one (the broker refuses a pull request onto any
 other), else the repository's own default branch, not a hardcoded `main` — or,
@@ -225,7 +227,7 @@ the synced workload manifest(s). Never bundle unchosen options
 or optional hardening into the same pull request, and never touch unrelated
 manifests or infrastructure definitions.
 
-Generate or edit the files **inside the returned `workspace`**.
+Generate or edit the files **inside the returned `workspace`**. If Step 1 reported `"decision_memory": true` (or `knowledge/` exists in `workspace`), run `python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <workspace> why <path>` on the target files before editing so your change respects active `DEC-YYYY-NNN` and `LES-YYYY-NNN` guards. If a guard blocks the requested change, stop immediately without opening a pull request and report the blocking record IDs and evidence to the user.
 
 When modifying an existing Kubernetes object, edit the file that declares it in place. When
 creating a new Kubernetes object (such as a `PodDisruptionBudget` for a `Deployment` or a
@@ -442,13 +444,51 @@ the file and tells you to name the paths that belong in the change — so a
 description left in the working copy stops the submit instead of riding along
 in it.
 
+Write the evidence to a second file the same way. `submit` refuses a body
+without it, before anything is published, and appends it to the body as an
+`## Evidence` section:
+
+```bash
+EVIDENCE=$(mktemp -p /opt/data/scratch pr_evidence.XXXXXX.json)
+cat > "$EVIDENCE" <<'EOF'
+{
+  "finding": "<what is wrong, on which cluster and object>",
+  "checks": [
+    {"command": "<read-only command you ran>", "output": "<excerpt of what it printed>"}
+  ],
+  "change": "<what merging this changes>",
+  "verify": [
+    {"command": "<read-only command to run after merge>", "expect": "<what it should show>"}
+  ]
+}
+EOF
+```
+
+- `checks`: commands you ran this session, each with the output lines that show
+  the finding. Read-only commands only (`kubectl get`, `kubectl describe`,
+  `gcloud ... describe`). Long output is clipped.
+- `verify`: what a reviewer runs after merge to see the fix took. `expect` is
+  optional.
+- A requested change with no defect: `finding` is the request; `checks` is the
+  read that shows the current state.
+- No secret values in any field: name a Secret and its keys, never its
+  `data`. `submit` refuses any field holding a Secret manifest, a `data:` value,
+  key material or a `kubectl get secret -o …` read, and redacts known token
+  shapes; do not rely on either.
+- At most five entries per list. JSON escaping applies: `\n` for a newline,
+  `\"` for a quote.
+
 ```bash
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --repo "<owner>/<repo>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
-  --body-file "$BODY"
+  --body-file "$BODY" \
+  --evidence-file "$EVIDENCE"
 ```
+
+A refusal naming `--evidence-file` or an evidence field: fix the file and run
+the same `submit` again. Nothing was published.
 
 `--base <branch>` names what the change merges into, for the rare case where it
 is not the `base` Step 1 reported. It may not name the branch you are
@@ -485,9 +525,15 @@ say nothing and hide the real cause. A card that prepared before an upgrade
 cannot submit after one; its clone was on a volume this script no longer has.
 Prepare again. Do not write new commands with these flags.
 
-### Step 4: Confirm Suggestion
+### Step 4: Confirm Suggestion (or Report Decision Memory Refusal)
 
-Record the PR link returned by the script, update the pending status inside your local state registry (if applicable), and present a clean, human-readable confirmation containing the PR URL link back to the user.
+`submit` automatically evaluates the staged changes against any active Decision Memory records (`knowledge/decision/*.md`, `knowledge/lesson/*.md`, `knowledge/decisions/*.md`, `knowledge/lessons/*.md`, and `.kube-agents/intent.yaml` paths) both locally and on the credential broker against the base branch:
+
+- If `submit` refuses with `DECISION MEMORY GUARD BLOCKED THIS CHANGE` or `DECISION MEMORY OVERSEER BLOCKED THIS CHANGE` (`DECISION_MEMORY_BLOCKED`):
+  - **Stop immediately.** Do **not** open a pull request and do **not** modify `knowledge/` to weaken or delete the guard.
+  - Report the refusal to the user: explain why the change was rejected, describe the exact failure mechanism from the record, cite the record ID (`DEC-...` / `LES-...`), breaking PR `#`, Incident Issue `#`, and revert/fix PR `#` printed by `submit`, and note that overriding an active `severity: block` guard requires a human-reviewed `knowledge/` supersession pull request (or a human reviewer applying `decision-override:<RECORD-ID>` on a human pull request).
+- If `submit` succeeds and logs a `DECISION MEMORY CONTEXT` (`### Prior decisions and lessons this change touches`) block (which `submit` also appends to the PR description), include both the PR URL and the supersession or decision context (citing both the superseded incident/revert and the superseding PR `#`) in your confirmation to the user.
+- Otherwise, record the PR link returned by the script, update the pending status inside your local state registry (if applicable), and present a clean, human-readable confirmation containing the PR URL link back to the user.
 
 ### Step 5: Addressing Review Feedback on an Existing PR
 
@@ -525,8 +571,9 @@ no token to refresh.
    submit do not apply: stay on `<source>` in this copy. Stage only those specific files
    (**never `git add .` / `-A`**).
 
-   Pass `--title` and `--body-file` again so the description matches the
-   revisions now on the branch — or `--keep-description` and no body-file, when
+   Pass `--title`, `--body-file` and `--evidence-file` again so the description
+   matches the revisions now on the branch — or `--keep-description` and neither
+   file, when
    what you were asked for does not alter what the pull request is for. That
    flag keeps the title along with the body, so a `--title` passed beside it
    does **not** reach the pull request, and the run says so. It is not inert,

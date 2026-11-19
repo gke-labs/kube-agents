@@ -258,6 +258,66 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(json.loads(forwarded), tools_call("get_cluster"))
         self.assertNotIn(b" ", forwarded)
 
+    def exclude(self, *clusters):
+        """Hold the handler to a scope.json excluding these (project, location, cluster) triples."""
+        import os
+        import tempfile
+
+        import scope_exclude
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scope_file = os.path.join(directory.name, "scope.json")
+        with open(scope_file, "w", encoding="utf-8") as stream:
+            json.dump({"exclude": {"projects": [], "clusters": [
+                {"projectId": p, "location": l, "clusterName": c} for p, l, c in clusters]}}, stream)
+        original = CredentialProxyHandler.__dict__.get("exclusions")
+        self.addCleanup(setattr, CredentialProxyHandler, "exclusions", original)
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: scope_file)
+
+    def k8s_call(self, parent, name="get_k8s_resource", request_id=4):
+        return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {"name": name, "arguments": {"parent": parent, "resourceType": "pod"}}}
+
+    def test_an_in_cluster_tool_on_an_excluded_cluster_never_reaches_the_upstream(self):
+        import scope_exclude
+
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.k8s_call("projects/p/locations/us-east4/clusters/scratch"),
+            self.k8s_call("projects/p/locations/us-east4/clusters/scratch", name="get_k8s_logs"),
+            # One the broker can't tie to a cluster, while any is excluded.
+            self.k8s_call("projects/p/locations/-/clusters/scratch"),
+            self.k8s_call("scratch"),
+            # A readable allowed name can't vouch for one the broker can't read.
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "get_k8s_resource", "arguments": {
+                "parent": "projects/p/locations/us-east4/clusters/%73cratch",
+                "context": "projects/p/locations/us-east4/clusters/other"}}},
+            self.k8s_call("projects/p/locations/us-east4/clusters/other/../scratch"),
+            self.k8s_call("projects/p/zones/us-east4-a/clusters/scratch"),
+            self.k8s_call("projects/P/locations/us-east4/clusters/scratch"),
+        ):
+            with self.subTest(message=message):
+                status, _, body = self._request(message=message)
+                self.assertEqual(status, 200)
+                reply = json.loads(body)
+                self.assertTrue(reply["result"]["isError"], reply)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_control_plane_tools_and_other_clusters_still_reach_the_upstream(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.k8s_call("projects/p/locations/us-east4/clusters/other"),
+            tools_call("get_cluster"),
+            tools_call("list_clusters"),
+        ):
+            with self.subTest(message=message):
+                status, _, body = self._request(message=message)
+                self.assertEqual(status, 200, body)
+                self.assertNotIn("isError", json.loads(body).get("result", {}))
+        self.assertEqual(len(self.upstream_requests), 3)
+
     def test_a_write_tool_never_reaches_the_upstream(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
             status, _, body = self._request(message=tools_call("patch_k8s_resource", request_id=9))

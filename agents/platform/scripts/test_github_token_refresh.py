@@ -42,6 +42,13 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         no_metadata = patch("github_token_refresh.metadata_identity_token", return_value=None)
         no_metadata.start()
         self.addCleanup(no_metadata.stop)
+        # A credentials file is asked before gcloud too: `wif_credentials.load_document` opens
+        # the file that any of these names. A developer's shell may carry one.
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("CREDENTIAL_PROXY_WIF_CREDENTIAL_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"):
+            os.environ.pop(name, None)
 
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_https(self, run):
@@ -104,6 +111,72 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             with self.subTest(url=url):
                 res.stdout = url + "\n"
                 self.assertIsNone(get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_a_credential_in_a_remote_url_is_never_logged(self, run):
+        """Whatever the remote, refused or not, its userinfo never reaches the log."""
+        secret = "s3cr3t-remote-credential-value"
+        res = MagicMock()
+        run.return_value = res
+        for url in (
+            f"https://x-access-token:{secret}@github.com/gke-labs/kube-agents.git",
+            f"https://{secret}@github.com/gke-labs/kube-agents/tree/main",
+            f"https://{secret}@github.com/%zz",
+            f"https://user:{secret}@gitlab.com/gke-labs/kube-agents.git",
+            f"ssh://{secret}@example.com/repo",
+            f"https://u:{secret}@more@github.com/gke-labs/kube-agents.git",
+            f"https://u:p@{secret}@github.com/%zz",
+            f"x_https://u:{secret}@github.com/%zz",
+            f"9https://{secret}@github.com/o/r/x/y",
+            f"https://u:a/{secret}@github.com/o/r",
+            f"git@{secret}@gitlab.example:o/r.git",
+            f"https://user:{secret}@",
+            f"not a url user:{secret}@ http://u:{secret}@h/x",
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                err = io.StringIO()
+                with patch("sys.stderr", err):
+                    get_current_git_repo()
+                self.assertNotIn(secret, err.getvalue())
+
+    def test_redact_url_blanks_every_urls_userinfo(self):
+        self.assertEqual(
+            github_token_refresh.redact_url("fetch https://a:b@github.com/o/r and ssh://tok@h/x"),
+            "fetch https://[REDACTED]@github.com/o/r and ssh://[REDACTED]@h/x",
+        )
+        # The userinfo ends at the last "@" before the path, as a URL parser reads it.
+        self.assertEqual(
+            github_token_refresh.redact_url("https://u:p@ss@github.com/o/r"),
+            "https://[REDACTED]@github.com/o/r",
+        )
+        # A URL without userinfo, and an scp-style remote, are left as they are.
+        for text in ("https://github.com/o/r.git", "git@github.com:o/r.git"):
+            self.assertEqual(github_token_refresh.redact_url(text), text)
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_a_refused_remote_is_never_quoted_in_the_log(self, run):
+        """The refusal says why, never what: the remote's text stays out of the log."""
+        res = MagicMock()
+        run.return_value = res
+        for url, why in (
+            ("https://github.com/%zz-marker", "not a repository URL"),
+            ("https://gitlab.com/marker-org/marker-repo.git", "not a GitHub host"),
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                err = io.StringIO()
+                with patch("sys.stderr", err):
+                    self.assertIsNone(get_current_git_repo())
+                self.assertIn(why, err.getvalue())
+                self.assertNotIn("marker", err.getvalue())
+
+    def test_log_redacts_whatever_its_caller_formatted(self):
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            github_token_refresh.log("refresh failed: https://t0ken@github.com/o/r")
+        self.assertNotIn("t0ken", err.getvalue())
+        self.assertIn("https://[REDACTED]@github.com/o/r", err.getvalue())
 
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_non_github_remote_returns_none(self, run):

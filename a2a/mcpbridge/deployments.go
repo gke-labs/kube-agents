@@ -24,20 +24,20 @@ const (
 	// MCPServiceSuffix is appended to the PlatformAgent name to form its in-cluster MCP Service.
 	MCPServiceSuffix = "-a2a-mcp"
 	// MCPTokenSecretSuffix is appended to the PlatformAgent name to form its MCP bearer token Secret.
-	MCPTokenSecretSuffix = "-a2a-mcp-token"
+	MCPTokenSecretSuffix = "-a2a-mcp-token" // #nosec G101 -- a Secret name suffix, not a credential
 	// MCPTokenSecretKey is the Secret data key holding the MCP bearer token.
 	MCPTokenSecretKey = "token"
 	// EnvMCPToken is the environment variable that overrides the MCP bearer token. EnvMCPTokenFor
 	// is its only reader: it is the deployment's EnvMCPTokenDeployment names when that is set;
 	// unset, it is the only deployment configured, if there is one. Either way it goes only to
 	// that deployment's saved target, never to a connection that overrides it.
-	EnvMCPToken = "KUBE_AGENTS_MCP_TOKEN"
+	EnvMCPToken = "KUBE_AGENTS_MCP_TOKEN" // #nosec G101 -- an env var name, not a credential
 	// EnvMCPTokenDeployment names the saved deployment profile EnvMCPToken belongs to by its exact
 	// saved key, compared byte for byte and never parsed. Set, it decides even with one deployment
 	// configured; naming no saved key (including the old key after a rename or a prune), the token
 	// is sent nowhere. Unset, the token goes to the only deployment configured, or nowhere with
 	// several.
-	EnvMCPTokenDeployment = "KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT"
+	EnvMCPTokenDeployment = "KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT" // #nosec G101 -- an env var name, not a credential
 
 	// DefaultUpstreamRepoURL and friends are the canonical upstream GitHub documentation links.
 	DefaultUpstreamRepoURL         = "https://github.com/gke-labs/kube-agents"
@@ -472,7 +472,7 @@ func loadReleaseCache(path string) {
 	if path == "" {
 		return
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the CLI's release cache beside its config
 	if err != nil || len(raw) == 0 {
 		return
 	}

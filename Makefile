@@ -32,7 +32,7 @@ KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--bui
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -67,7 +67,7 @@ docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 docker-build-kube-proxy: ## Build the kube-proxy image.
-	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
+	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) $(VERSION_ARG) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
 
 # Context is the repository root, not deploy/sandbox: the image ships the same
 # credential-proxy client and PATH script the agent image does, and copying
@@ -91,7 +91,7 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents).
 	@./scripts/mirror_images.sh $(ARGS)
 
-images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, and that the chart renders nothing off a public registry when mirrored (CI runs this).
+images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, that the chart renders nothing off a public registry when mirrored, and that cert_manager_version matches the cert-manager pins (CI runs this).
 	@./hack/check-image-inventory.sh
 
 # Prefer an installed `prettier` over `npx prettier`, falling back to npx where
@@ -205,6 +205,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard deploy/sandbox/test_*.py) \
 	$(wildcard hack/replay-proxy/test_*.py) \
 	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
@@ -255,7 +256,7 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # The files the sweep hands out first. xargs feeds the workers in list order,
 # and the globs above sort by path, so a long file that sorts late started
 # late: on 2026-10-14 (run 38592675526) every other file had finished at
-# 16:01:24 and tests/test_rollback_roundtrip.py, 182 s on its own and sorted
+# 16:01:24 and one 182 s file (since deleted), sorted
 # into the last tenth of the list, ran alone until 16:03:32 with three of four
 # workers idle.
 # Longest-first is the schedule that closes that gap, and the simulation over
@@ -269,7 +270,6 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # tail again until someone adds it; the per-file blocks the sweep prints carry
 # the `Ran N tests in S s` line to find it by.
 PYTHON_TEST_HEAVY_FILES := \
-	tests/test_rollback_roundtrip.py \
 	agents/platform/scripts/test_credential_proxy.py \
 	tests/test_fleet_fixture_state.py \
 	scripts/test_eval_dashboard_pages.py \
@@ -394,6 +394,13 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # ever produce files that exist; a hand-typed PYTHON_TEST_FILES=tests/, the
 # old per-directory habit on the new variable, is how such a path arrives.
 #
+# Each file runs with KUBECONFIG set to an empty file of its own. A kubectl or
+# helm call that a test leaves unstubbed, and that inherits the file's
+# environment, then finds no cluster, on a developer's machine as in CI. A call
+# a test starts with an environment of its own is outside this.
+# One file per test file, not one for the sweep, so a test that writes a
+# context into its KUBECONFIG cannot hand it to a file running beside it.
+#
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
 # a single quote. It also must not contain a comma: $(call) splits arguments on
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
@@ -411,6 +418,7 @@ xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	name="$$(basename "$$file")"; \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
 	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
+	     : >"$$stem.kubeconfig" && export KUBECONFIG="$$stem.kubeconfig" && \
 	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
 		rc=0; printf "    ok  %s\n" "$$file"; \
 	else \
@@ -448,6 +456,30 @@ e2e-tests: ## Run the live E2E promotion test suite against the target GKE clust
 test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 	@python3 -m pip install -r tests/e2e/requirements.txt
 
+# gosec over every Go module: the scan CI runs on each module, in one local
+# target. k8s-operator/go.mod is the one pin (its tools.go imports the
+# command), so the binary is built there once and run from each module's own
+# directory: `go -C <module> run` would scan k8s-operator, since -C is also
+# the directory the program starts in. The operator excludes G703 and G706:
+# both take os.Args and os.Getenv as taint sources, and every flag the
+# operator and k8s-event-watcher read is rendered by the operator into their
+# own Deployments, inside the trust boundary (the workflow that scans the
+# operator carries the same list and the full reasoning;
+# tests/test_gosec_in_module_checks.py holds the two lists equal). The other
+# modules exclude nothing. Not part of `verify`: a cold build and scan take
+# minutes.
+GOSEC_PIN_MODULE := k8s-operator
+GOSEC_BIN := $(CURDIR)/$(GOSEC_PIN_MODULE)/bin/gosec
+GOSEC_OPERATOR_EXCLUDE := G703,G706
+GOSEC_UNEXCLUDED_MODULES := a2a hack/ghes-proxy k8s-api-proxy
+
+gosec: ## Run gosec from k8s-operator/go.mod's pin over every Go module, the scan CI runs on each.
+	@echo "==> build gosec"; cd "$(GOSEC_PIN_MODULE)" && go build -o "$(GOSEC_BIN)" github.com/securego/gosec/v2/cmd/gosec
+	@echo "==> gosec ($(GOSEC_PIN_MODULE))"; cd "$(GOSEC_PIN_MODULE)" && "$(GOSEC_BIN)" -exclude=$(GOSEC_OPERATOR_EXCLUDE) ./...
+	@for m in $(GOSEC_UNEXCLUDED_MODULES); do \
+		echo "==> gosec ($$m)"; (cd "$$m" && "$(GOSEC_BIN)" ./...) || exit 1; \
+	done
+
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.
 #
@@ -457,7 +489,7 @@ test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. gosec is separate (`make gosec`); the bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -780,7 +812,9 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # broken are static -- an unknown domain slug, a fixture role the seeded fleet
 # never planted, a check with no assertion, a case in no TASKS entry -- so they
 # fail here in a second instead. The same rules gate in CI through
-# scripts/test_task_registration.py; this target is the fast path to them.
+# scripts/test_task_registration.py (the tree-level scans, the sanitizer and
+# the run-record guard, as assertions of their own there); this target is the
+# fast path to them.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
@@ -854,7 +888,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -862,6 +896,9 @@ docs-check-generated:
 
 docs-check-links:
 	@python3 scripts/check_docs_links.py
+
+docs-check-cron-inventory: ## Fail when a cron roster job has no row in docs/designs/scheduling-on-profiles-inventory.md, or (on a pull request, the merge queue, or locally against main) a roster change didn't update its row (#5626).
+	@python3 scripts/check_cron_inventory.py
 
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
@@ -875,16 +912,16 @@ docs-check-prose: ## Fail when a published site page's prose is out of step with
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it, or says pending after a release contains it (needs the full history and the release tags).
+docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (or the one scripts/upgrade_table_traces.txt names), or says pending after a release contains it, or sits out of newest-first order (needs the full history and the release tags).
 	@python3 scripts/check_upgrade_table_releases.py
 
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
 	@python3 scripts/check_pr_template.py
 
-chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
+chart-sync: ## Sync the chart's CRD, RBAC-rule and admission-policy copies from k8s-operator/config, write config/profiles/role.yaml (the Role document's copy for the profile namespace), and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies and config/profiles/role.yaml match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
@@ -916,38 +953,47 @@ tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for 
 # mock_provider put this at 1.7. drift-pubsub's suite raised it to 1.11, for
 # `override_during = plan`: a postcondition on a computed attribute is
 # unreachable without it, since the attribute is unknown at plan time and an
-# apply run leaves state behind that the runs after it silently reuse.
-TERRAFORM_TEST_MIN_VERSION := 1.11.0
+# apply run leaves state behind that the runs after it silently reuse. The
+# scope resolver's suites raised it to 1.15, the first release that accepts a
+# function call (jsonencode) in an override_data value.
+TERRAFORM_TEST_MIN_VERSION := 1.15.0
 
-# Every module and composition that carries a tests/ directory -- the set
-# the validate job initialises -- against mocked providers, so a plan-time
-# rule -- a precondition, a postcondition on a read, the set of bindings a
-# declaration plans -- runs rather than being grepped for
-# (tests/test_scope_iam.py pins the text; these pin the behaviour). A
-# directory without tests/ is skipped, and a new one's tests/ is reached with
-# no edit here; tests/test_terraform_module_tests.py pins the loop, the step
-# and that no test file sits outside it. Every directory runs even after one
-# fails and the failures are named again at the end, for the reason
-# test-python gives: a red run that hides the next suite's result costs a CI
-# round trip to discover.
-terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.11, see TERRAFORM_TEST_MIN_VERSION).
-	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider and override_during); none on PATH" >&2; exit 1; }; \
+# Where each root keeps its suites. Not Terraform's default `tests`: from 1.6
+# `terraform init` parses a root's tests/ directory, so suites there would
+# break init on every release from 1.6 up to the one their newest test syntax
+# needs, inside the `~> 1.5` the roots declare (1.5 itself never reads tests/;
+# see scripts/installer/min_versions.sh). Both commands below name it.
+TERRAFORM_TEST_DIR := tftests
+
+# Every module and composition that carries a $(TERRAFORM_TEST_DIR)/
+# directory -- the set the validate job initialises -- against mocked
+# providers, so a plan-time rule -- a precondition, a postcondition on a read,
+# the set of bindings a declaration plans -- runs rather than being grepped
+# for (tests/test_scope_iam.py pins the text; these pin the behaviour). A
+# directory without one is skipped, and a new one's is reached with no edit
+# here; tests/test_terraform_module_tests.py pins the loop, the step and that
+# no test file sits outside it. Every directory runs even after one fails and
+# the failures are named again at the end, for the reason test-python gives:
+# a red run that hides the next suite's result costs a CI round trip to
+# discover.
+terraform-test: ## Run each terraform/{modules,examples}/*/tftests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.15, see TERRAFORM_TEST_MIN_VERSION).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider, override_during and functions in override values); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
 	if [ -z "$$version" ]; then \
 	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
 	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
-	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider and override_during (the install floor is lower, the suites are not)" >&2; exit 1; \
+	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider, override_during and functions in override values (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
-	  if [ -d "$$dir/tests" ]; then \
+	  if [ -d "$$dir/$(TERRAFORM_TEST_DIR)" ]; then \
 	    stale="$$(ls "$$dir"*_override.tf 2>/dev/null)"; \
 	    if [ -n "$$stale" ]; then \
 	      echo "terraform-test: $$dir holds an override file that terraform test would merge silently, so its assertions would run against the override rather than the module; remove it first (lifecycle.sh writes one around each import and removes it, unless killed outright):" >&2; \
 	      printf '  %s\n' $$stale >&2; failed="$$failed $$dir"; continue; \
 	    fi; \
 	    echo "Testing $$dir..."; \
-	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
+	    (cd "$$dir" && terraform init -backend=false -input=false -test-directory=$(TERRAFORM_TEST_DIR) >/dev/null && terraform test -test-directory=$(TERRAFORM_TEST_DIR)) || failed="$$failed $$dir"; \
 	  fi; \
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi

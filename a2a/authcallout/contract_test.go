@@ -2,6 +2,7 @@ package authcallout
 
 import (
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -64,7 +65,15 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// `verifier` is the one entry here whose grants include a read that no
 	// other principal on the bus holds, so its arrival or departure from this
 	// list is worth a deliberate edit rather than a fixture regeneration.
-	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true}
+	// `dispatcher`, the AgentProfile dispatcher, which the operator renders by
+	// default: its grants name each profile durable it reads on PROFILE_SUBMITS.
+	//
+	// `gateway` is its token entry (#5301), rendered beside its static user
+	// for a bounded window: the gateway's A2A_GATEWAY_BUS_AUTH picks the
+	// password or the token, so the two are keyed apart and neither path
+	// can be taken by the other's credential. Its static user goes a
+	// release after the flip; this entry stays.
+	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true, "dispatcher": true, "gateway": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)
@@ -79,13 +88,10 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// callout and nats.conf's auth_users exemption is authenticated by
 	// whichever path the client happened to take.
 	//
-	// gateway is on this list rather than the one above on purpose: it has a
-	// ServiceAccount and will move, but its client program lands separately
-	// from the render, so the identity may not move before the program that
-	// presents a token for it.
+	// gateway is the one static principal that is also mapped, above.
 	for _, id := range m.Identities {
 		switch id.User {
-		case "gateway", "bridge", "seed", "web", "sys":
+		case "bridge", "seed", "web", "sys":
 			t.Errorf("%q is a static principal and must not appear in the callout's map", id.User)
 		}
 	}
@@ -114,6 +120,17 @@ func TestEveryRenderedPrincipalIsUsable(t *testing.T) {
 			t.Errorf("%q resolves to %q", id.ServiceAccount, found.User)
 		}
 
+		if id.Narrowing == NarrowingDispatcher {
+			// The dispatcher's entry keeps its control connection's
+			// grants as written, inbox included; its per-profile grants
+			// are derived per bucket connection (dispatcherBucketGrants),
+			// each of which holds its own inbox.
+			inbox := "_INBOX." + id.User + ".>"
+			if !contains(id.Grants.Subscribe, inbox) {
+				t.Errorf("%q cannot subscribe to %s on its control connection", id.User, inbox)
+			}
+			continue
+		}
 		if id.Narrowing != "" {
 			// A narrowed entry is usable by construction rather than by
 			// its rendered lists: it has none, and the callout builds
@@ -161,7 +178,7 @@ func TestEveryRenderedNarrowingIsOneThisCalloutImplements(t *testing.T) {
 			continue
 		}
 		found = true
-		if id.Narrowing != NarrowingPod {
+		if id.Narrowing != NarrowingPod && id.Narrowing != NarrowingDispatcher {
 			t.Errorf("%q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
 		}
 	}
@@ -177,4 +194,35 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// The gateway's token entry (#5301) is a plain mapped entry: no narrowing, the
+// control account, and the publish deny that keeps its consumer-create
+// wildcard on TASKS off the pre-created durables. That deny is the reason
+// callout grants carry deny lists at all; an entry that lost it would mint a
+// gateway able to create over, or delete, the relay it binds.
+func TestTheGatewaysTokenEntryKeepsItsDurableDeny(t *testing.T) {
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := ParseIdentityMap(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range m.Identities {
+		if id.User != "gateway" {
+			continue
+		}
+		if id.Narrowing != "" || id.Account != AccountControl {
+			t.Errorf("gateway narrows on %q in account %q, want no narrowing in %q", id.Narrowing, id.Account, AccountControl)
+		}
+		for _, subject := range []string{"$JS.API.CONSUMER.CREATE.TASKS.gateway-relay", "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay"} {
+			if !slices.Contains(id.Grants.DenyPublish, subject) {
+				t.Errorf("gateway's publish deny %v lacks %q", id.Grants.DenyPublish, subject)
+			}
+		}
+		return
+	}
+	t.Fatal("the rendered map has no gateway entry")
 }

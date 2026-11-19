@@ -87,7 +87,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	// Before any operator param: DispatchJobTemplates without its labels, one
 	// posing as the index and listing tse's account, one as tse's template.
 	// Neither is selected, so the Job finds no param and is denied.
-	foreignIndex := buildDispatchJobIndex(agent, map[string]*corev1.PodTemplateSpec{"tse": tse})
+	foreignIndex := buildDispatchJobIndex(agent, unattendedJobTemplateSets(map[string]*corev1.PodTemplateSpec{"tse": tse}))
 	foreignIndex.Labels = map[string]string{"x": "y"}
 	foreignTemplate := envtestParam(ctx, t, admin, agent, "tse", tse)
 	foreignTemplate.Labels = nil
@@ -185,7 +185,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	for profile, tmpl := range templates {
 		mustCreate(ctx, t, admin, envtestParam(ctx, t, admin, agent, profile, tmpl))
 	}
-	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
+	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, unattendedJobTemplateSets(templates)))
 
 	// The policy's params come from an informer; wait until the rendered
 	// template is admitted.
@@ -213,6 +213,26 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	}
 	if err := dispatcher.Create(ctx, &builtJob); err != nil {
 		t.Errorf("the Job the dispatcher builds (%s): refused, want admitted: %v", dispatcherJobFixture, err)
+	}
+
+	// The dispatcher reads its profile's param by name (its Jobs Role's
+	// get), can't list the params, and a Job built from the param's own
+	// template, the API server's defaulted form, is admitted: that is the
+	// template the dispatcher launches from in production.
+	reader := impersonatedClientWith(t, cfg, scheme, agent.Namespace, a2aDispatcherName(agent))
+	var tseParam agentv1alpha1.DispatchJobTemplate
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &tseParam); err != nil {
+		t.Fatalf("the dispatcher can't read tse's param: %v", err)
+	}
+	if err := reader.List(ctx, &agentv1alpha1.DispatchJobTemplateList{}, client.InNamespace(pns)); !apierrors.IsForbidden(err) {
+		t.Errorf("the dispatcher listing the params: %v, want forbidden", err)
+	}
+	held, ok := dispatchJobParamTemplate(&tseParam)
+	if !ok {
+		t.Fatalf("tse's param holds no template")
+	}
+	if err := dispatcher.Create(ctx, dispatcherJob("from-the-param", &held, nil)); err != nil {
+		t.Errorf("a Job from the param's defaulted template: refused, want admitted: %v", err)
 	}
 
 	// Each case its own Job name, so one wrongly admitted doesn't make
@@ -458,11 +478,11 @@ func applyDispatcherJobPolicy(ctx context.Context, t *testing.T, c client.Client
 func envtestParam(ctx context.Context, t *testing.T, c client.Client, agent *agentv1alpha1.PlatformAgent, profile string, tmpl *corev1.PodTemplateSpec) *agentv1alpha1.DispatchJobTemplate {
 	t.Helper()
 	r := &PlatformAgentReconciler{Client: c}
-	defaulted, err := r.defaultedJobTemplate(ctx, profileNamespaceName(agent), profile, tmpl)
+	defaulted, err := r.defaultedJobTemplate(ctx, profileNamespaceName(agent), dispatchJobTemplatePrefix+profile, tmpl)
 	if err != nil {
 		t.Fatal(err)
 	}
-	param, err := buildDispatchJobTemplate(agent, profile, defaulted)
+	param, err := buildDispatchJobTemplate(agent, dispatchJobTemplatePrefix+profile, dispatchJobTemplateHash(tmpl), defaulted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +564,7 @@ func TestTheDispatcherJobPolicyFailsClosedOnAFreshInstall(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
+	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, unattendedJobTemplateSets(templates)))
 
 	admittedAt := time.Duration(0)
 	for n := 0; time.Since(start) < 2*gatewayPodPolicyActivation; n++ {

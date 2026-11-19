@@ -21,6 +21,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 import collect_shadow as C
 
@@ -319,6 +320,29 @@ class UnsafeNamesTest(CollectorTestCase):
         self.assertEqual(self.collector.totals.errors.get("list_files_unsafe_name"), 1)
         self.assertFalse(os.path.exists(os.path.join(self.root, "escape.json")))
 
+    def test_a_listed_name_with_a_trailing_newline_is_dropped(self):
+        self.put("store/requests/ok.json", b"{}")
+        real = self.cluster.kubectl
+
+        def forge(cmd, input):
+            if C.LIST_SCRIPT in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(
+                    [["store/requests/ok.json", 2], ["store/requests/ok.json\n", 2]]).encode(), b"")
+            return real(cmd, input)
+
+        self.cluster.kubectl = forge
+        self.collector.collect_pass()
+        self.assertEqual(self.cluster.objects(), {self.key("store/requests/ok.json"): b"{}"})
+        self.assertEqual(self.collector.totals.errors.get("list_files_unsafe_name"), 1)
+
+    def test_shapes_refuse_a_trailing_newline(self):
+        for pattern, good in ((C.SAFE_NAME, "logs/seg-1.jsonl"), (C.CACHE_SUBDIR_RE, C.DEFAULT_CACHE_SUBDIR),
+                              (C.POD_NAME_RE, "proxy-a"), (C.BUCKET_SHAPE, BUCKET),
+                              (C.BUILD_SHAPE, "1790000000000000000")):
+            with self.subTest(pattern=pattern.pattern):
+                self.assertTrue(pattern.match(good))
+                self.assertIsNone(pattern.match(good + "\n"))
+
     def test_a_tar_member_with_an_unsafe_name_is_not_written(self):
         import tarfile
         buf = io.BytesIO()
@@ -351,6 +375,18 @@ class FinalPassTest(CollectorTestCase):
         self.collector.deadline = self.now + 60
         self.collector.collect_pass(final=True)
         self.assertEqual(self.cluster.objects(), {})
+
+    def test_outside_replay_mode_the_last_pass_uploads_each_pod_before_the_next(self):
+        other = self.cluster.add_pod("proxy-b")
+        self.put("logs/p-1-000001.jsonl", b"a\n")
+        self.put("logs/p-2-000001.jsonl", b"b\n", pod=other)
+        self.collector.lane_report = lambda out_dir: None
+        self.collector.deadline = self.now + 60
+        self.collector.collect_pass(final=True)
+        steps = [("upload" if c[0] == "gcloud" else "list" if C.LIST_SCRIPT in c else "")
+                 for c in self.cluster.calls]
+        self.assertEqual([s for s in steps if s], ["list", "upload", "list", "upload"])
+        self.assertFalse(self.collector.lane_report_tried, "only replay mode writes the report in the pass")
 
     def test_ordinary_pass_never_takes_open_segments(self):
         self.put("logs/p-1-000002.jsonl.open", b"whole\n")
@@ -397,6 +433,33 @@ class DeadlineTest(CollectorTestCase):
             C.default_runner([sys.executable, "-c", "import time; time.sleep(30)"],
                              remaining=lambda: 1.5 - (time.monotonic() - started))
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_default_runner_is_not_held_by_a_descendant_keeping_its_pipes(self):
+        # `gcloud storage cp` hands the copy to worker processes, which inherit
+        # stdout and stderr; killing only the command left them holding the
+        # pipes, and the wait for EOF after the kill never returned.
+        started = time.monotonic()
+        script = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); time.sleep(30)"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_default_runner_is_not_held_by_a_descendant_that_left_its_process_group(self):
+        # A descendant in a session of its own escapes the group kill; the
+        # bounded drain, then closing the pipes, still ends the wait.
+        started = time.monotonic()
+        child = "import os, time; os.setsid(); time.sleep(30)"
+        script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_default_runner_is_not_held_by_a_descendant_of_a_command_that_exited(self):
+        started = time.monotonic()
+        script = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])"
+        with self.assertRaises(subprocess.TimeoutExpired):
+            C.default_runner([sys.executable, "-c", script], remaining=lambda: 1.5 - (time.monotonic() - started))
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_default_runner_feeds_input_and_returns_output(self):
         proc = C.default_runner([sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read()[::-1])"],
@@ -579,6 +642,22 @@ class RecordModeTest(CollectorTestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.keep, "store", "requests", f"{HEX}.json")))
         self.assertIn(self.key("logs/seg-1.jsonl"), self.cluster.objects())
 
+    def test_a_listed_cache_name_with_a_trailing_newline_is_neither_copied_nor_emptied(self):
+        answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
+        real = self.cluster.kubectl
+        forged = f"{CACHE}/answers/{fp(1)}.json\n"
+
+        def forge(cmd, input):
+            if C.CACHE_LIST_SCRIPT in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([[forged, 13]]).encode(), b"")
+            return real(cmd, input)
+
+        self.cluster.kubectl = forge
+        self.collector.collect_pass()
+        self.assertEqual(self.collector.totals.errors.get("list_cache_unsafe_name"), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.keep, "pods", POD_NAME, "cache")), "nothing kept")
+        self.assertEqual(os.path.getsize(answer), 13, "not emptied")
+
     def test_a_name_outside_the_cache_layout_is_neither_copied_nor_emptied(self):
         odd = self.cache("answers/not-a-key.json", b"x")
         self.collector.collect_pass()
@@ -717,6 +796,24 @@ class ReplayModeTest(CollectorTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.root, "escape.json")))
         self.assertFalse(os.path.exists(os.path.join(self.root, "pods", f"{fp(1)}.json")))
 
+    def test_seed_script_writes_no_member_whose_name_ends_in_a_newline(self):
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as tar:
+            for name in (f"answers/{fp(1)}.json", f"answers/{fp(2)}.json\n"):
+                info = tarfile.TarInfo(name)
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+        proc = subprocess.run([sys.executable, "-c", C.SEED_SCRIPT, self.pod, CACHE, C.CACHE_SEED_MARKER,
+                               C.CACHE_REL_RE.pattern], input=stream.getvalue(), capture_output=True)
+        self.assertEqual(proc.stdout.strip(), b"1")
+        self.assertEqual(sorted(os.listdir(os.path.join(self.pod, CACHE, "answers"))), [f"{fp(1)}.json"])
+
+    def test_the_seed_tar_leaves_out_a_file_whose_name_ends_in_a_newline(self):
+        with open(os.path.join(self.seed_dir, "answers", f"{fp(3)}.json\n"), "wb") as handle:
+            handle.write(b"{}")
+        with tarfile.open(self.collector._seed_tar()) as tar:
+            self.assertEqual(sorted(tar.getnames()), [f"answers/{fp(1)}.json", f"variants/{fp(2)}/{'b' * 16}.json"])
+
     def test_seed_all_reports_how_many_pods_took_it(self):
         self.cluster.add_pod("proxy-b")
         self.assertEqual(self.collector.seed_all(), (2, 2))
@@ -790,6 +887,43 @@ class ReplayModeTest(CollectorTestCase):
         C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
         self.assertIn(self.key("report/verdicts.json"), self.cluster.objects())
         self.assertIn("case-a: lane 3/3", self.out.getvalue())
+
+    def slow_bulk_uploads(self):
+        """Every logs/store upload runs out the last pass's deadline; the report's upload is quick."""
+        def runner(cmd, input=None, remaining=None, env=None, stdin_path=None):
+            if cmd[0] == "gcloud" and "-I" in cmd and f"/{C.REPORT_DIR}/" not in cmd[-1]:
+                self.cluster.calls.append(list(cmd))
+                self.now = self.collector.deadline + 1
+                raise subprocess.TimeoutExpired(cmd, 0)
+            return self.cluster(cmd, input=input, remaining=remaining, env=env, stdin_path=stdin_path)
+
+        self.collector.runner = runner
+
+    def test_a_last_pass_whose_bulk_upload_times_out_still_uploads_the_report(self):
+        self.put("logs/p-1-000001.jsonl", b"last\n")
+        seen = []
+
+        def report(out_dir):
+            seen.append(sorted(os.listdir(os.path.join(self.collector.keep_dir, C.KEEP_PODS_DIR, "proxy-a", "logs"))))
+            with open(os.path.join(out_dir, "verdicts.json"), "w") as handle:
+                handle.write("{}")
+            return "case-a: lane 3/3"
+
+        self.collector.lane_report = report
+        self.slow_bulk_uploads()
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertEqual(seen, [["p-1-000001.jsonl"]], "the report reads the last pass's lines, copied first")
+        objects = self.cluster.objects()
+        self.assertIn(self.key("report/verdicts.json"), objects)
+        self.assertNotIn(self.key("logs/p-1-000001.jsonl"), objects)
+        self.assertEqual(self.collector.totals.errors, {"upload_timeout": 1})
+        self.assertEqual(self.size("logs/p-1-000001.jsonl"), 5, "a file not uploaded is not emptied")
+
+    def test_the_report_is_written_once(self):
+        calls = []
+        self.collector.lane_report = lambda out_dir: calls.append(out_dir) or ""
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
 
 
 class ProcessTest(unittest.TestCase):
@@ -909,6 +1043,30 @@ class ProcessTest(unittest.TestCase):
                     C.parse_args([*base, "--bucket", bucket, "--build", build])
         args = C.parse_args([*base, "--bucket", BUCKET, "--build", "1790000000000000000"])
         self.assertNotRegex(C.job_prefix(args.bucket, args.kind, "2026-11-05", args.build), r"/\.\.?(/|$)")
+
+    def test_a_commit_is_a_full_sha_or_empty_and_reaches_the_record_and_the_report(self):
+        base = ["--namespace", NAMESPACE, "--selector", SELECTOR, "--container", CONTAINER, "--bucket", BUCKET,
+                "--build", "1790000000000000000"]
+        record = [*base, "--kind", "nightly", "--mode", "record", "--keep-dir", self.root, "--verdicts-dir",
+                  self.root, "--publish-bucket", BUCKET, "--job-name", "ci-kube-agents-eval-nightly"]
+        for bad in ("abc", "AB" * 20, "ab" * 20 + "\n", "ab" * 32, "-x", "HEAD"):
+            for flag in ("--commit", "--lane-commit"):
+                with self.subTest(flag=flag, bad=bad):
+                    with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                        C.parse_args([*record, flag, bad])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            C.parse_args([*base, "--kind", "replay-lane", "--lane-commit-source", "nightly"])
+        for commit in ("ab" * 20, ""):
+            with self.subTest(commit=commit):
+                publisher = C.make_publisher(C.parse_args([*record, "--commit", commit]), mock.Mock())
+                self.assertEqual(publisher.job["commit"], commit)
+        replay = C.parse_args([*base, "--kind", "replay-lane", "--mode", "replay", "--keep-dir", self.root,
+                               "--seed-dir", self.root, "--verdicts-dir", self.root, "--lane-commit", "cd" * 20,
+                               "--lane-commit-source", "recording"])
+        with mock.patch("lane_report.write_report", return_value="") as write:
+            C.make_lane_report(replay)(self.root)
+        self.assertEqual((write.call_args.kwargs["commit"], write.call_args.kwargs["commit_source"]),
+                         ("cd" * 20, "recording"))
 
     def test_bad_arguments_still_exit_0(self):
         proc = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--kind", "weekly"],

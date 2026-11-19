@@ -50,6 +50,10 @@ import (
 // never reads the map.
 func TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale(t *testing.T) {
 	withOperatorBusPrincipal(t)
+	// With the dispatcher off: on, only the profiles its identity can carry
+	// are bound, and this measures 2,500 (TestTheDispatcherCeiling holds the
+	// dispatcher's side, gke-labs/kube-agents#5381).
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	agent := authMapTestAgent()
 	const profileCount = 2500
 	profiles := make([]agentv1alpha1.AgentProfile, 0, profileCount)
@@ -270,17 +274,5 @@ func TestPruningRemovesTheLegacyMapAndTheShardsAboveTheCount(t *testing.T) {
 		if got := exists(name); got != want {
 			t.Errorf("after pruning to 2 shards, %s exists = %v, want %v", name, got, want)
 		}
-	}
-
-	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
-		t.Fatalf("deleteA2AAuthMapShards: %v", err)
-	}
-	for _, i := range []int{0, 1} {
-		if exists(a2aAuthMapShardName(agent, i)) {
-			t.Errorf("shard %d survives the teardown", i)
-		}
-	}
-	if !exists(a2aAuthMapShardName(agent, 5)) {
-		t.Error("the teardown deleted a ConfigMap under a shard name that this CR does not own")
 	}
 }

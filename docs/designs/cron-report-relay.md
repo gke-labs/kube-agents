@@ -70,14 +70,18 @@ The pieces that make an alert answerable — a thread, a routing row bound to it
 and the report stored against that thread — are reused unchanged.
 
 Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
-than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
+than `hermes send`, for the platforms the gateway serves (spec-chatops-gateway.md,
 "Proactive posts: the chat.notify route"). The report still lands in a thread and the
 same `incidents` row is stored against it, but a reply typed into it reaches the A2A
 gateway and runs through the hermes-bridge's `api` executor, never through the Hermes
 gateway's `incident_context` hook. The bridge makes the hook's by-thread read instead
 (`a2a/hermes-bridge/incident.go`; the hook's other two steps, the recent-reports index for a
 message with no row and the Google Chat first-reply recovery, do not run on the `api`
-executor): before the task's first turn it looks the
+executor): when the submission carries no `pushedReport` part (the A2A gateway relays a report
+it posted into a conversation; `a2a/docs/hermes-bridge.md`; a relayed scheduled report is a
+home-channel thread post the gateway does not keep, so the by-thread read still serves it),
+before the task's first turn it tries the row a console reply names with its
+`replyTo` part (`<key>#<task>`, `a2a/docs/hermes-bridge.md`), then looks the
 conversation's thread up in the same table, and the row the kanban notifier stores for
 a card's report inviting a reply, posted into a Slack or Google Chat gateway conversation (keyed by the Hermes
 session and the conversation key; a key naming a whole DM or space rather than a thread is not looked
@@ -93,16 +97,18 @@ home channel is known (or the leg is one the gateway routes, which holds its hom
 with a link to an issue in a managed repository, and enough of the posts' budget is
 left to read that issue. The headline reads that issue if it is open and labelled
 `agent:audit`: the title's critical count when the body lists a critical, the body's
-summary line for the other severities (the findings its sections list when it has none), the findings
+summary line for the other severities (the findings the body lists when it has none), the findings
 themselves, and the Scope section's skipped clusters. Held rows are not findings,
 a `#` line inside a finding's fenced evidence ends no section, and a finding title,
 a skipped cluster or the audit name keeps a link's text but not its target. It
-carries one number, the count of the most severe findings a section lists ("<Name>: 2
+carries one number, the count of the most severe findings the body lists ("<Name>: 2
 critical findings", the name as the title writes it), and lists the critical
-findings (up to ten), or the top two of the highest severity listed when there is none, each
+findings (up to ten), or the top two of the highest severity listed when there is none — reading
+full blocks first and then one-line rows inside `<!-- audit-listed:begin -->` /
+`<!-- audit-listed:end -->` when the ledger overflows — each
 row led by its severity and ending "· _new_" when fleet-audit marked the finding
-new since the last run (a `<!-- finding-new -->` line under its heading, written
-only when the run knows what the last one carried). Under the rows, a line counts
+new since the last run (a `<!-- finding-new -->` line under its heading or indented under its
+listed row, written only when the run knows what the last one carried). Under the rows, a line counts
 the rest by severity ("5 more (1 major, 4 minor) are in the ledger issue."), left
 off when there are none; a line names the clusters the run skipped ("Couldn't
 reach seeded-c, so this run didn't check it." when every reason says the cluster
@@ -650,15 +656,21 @@ An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
-exists. A `next` install whose only chat platform is held by the gateway with no home
-channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it, the relay
-sends, and the gateway refuses the post and keeps it for the digest it posts once a
-home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
-the relay's `composed but not delivered to <platform>`; the gateway's refusal, which
-says the post is kept, is in the gateway's and the session server's logs. A pod
-rendered before the operator routed it still answers the platform-naming detail
+exists. The operator names every armed platform in `A2A_NOTIFY_CONVERSATIONS` and every
+armed platform with a home channel set on the CR in `A2A_NOTIFY_PLATFORM` (each a
+comma-separated list of platform names). The agent adds Slack when the gateway learned a
+channel, and sends home posts to every armed platform when no platform has a home
+(`chat_notify.routed_platforms()`). So an install whose gateway holds no platform
+with a home channel is routed anyway: the relay sends to every armed platform, and the
+gateway refuses the post and keeps it for the digest it posts once a home channel is set
+(the gateway design, "Proactive posts"). With a home channel on one platform, the agent
+sends only to that platform and the report posts there. The 502's detail is then the
+relay's `composed but not delivered to <platform>`. The gateway's refusal, which says the
+post is kept, is in the gateway's and the session server's logs. The platform-naming detail
 (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`, one such sentence per gateway
+platform without a home channel, joined by `; `) is reached only by an agent that names a
+gateway platform it does not route, which this rule never does.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the

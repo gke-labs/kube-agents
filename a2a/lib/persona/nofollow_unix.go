@@ -14,7 +14,7 @@ import (
 // blocking the open until a writer appears; readFile then refuses it as not
 // a regular file.
 func openNoFollow(name string) (*os.File, error) {
-	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) // #nosec G304 -- the persona reader's opener for every file it lists; O_NOFOLLOW is the safeguard
 	if errors.Is(err, syscall.ELOOP) {
 		return nil, errSymlink
 	}

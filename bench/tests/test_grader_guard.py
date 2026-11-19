@@ -78,7 +78,7 @@ SAFEGUARD_TASK = GUARD / "grader-guard-safeguard" / "task.yaml"
 #: ``BOOTSTRAP_ADMITTED`` alone, as it does for the roster.
 SHIPPED_BASELINES = Path(__file__).resolve().parents[1] / "baselines"
 REPLAY_AGENT = "grader-guard-replay"
-JUDGE = "gemini-3.1-pro-preview"
+JUDGE = "model-x"
 #: How hack/ci-eval-pr.sh finds the run directory in devops-bench's output.
 RESULTS_LINE = re.compile(r"results: (\S+)/results\.json")
 
@@ -101,8 +101,9 @@ PIPELINE_ENV = (
     "EVAL_JUDGED_MARGIN",
     "EVAL_JUDGED_METRICS",
     "EVAL_LIMIT",
-    "EVAL_ROLLBACK_LANE",
+    "EVAL_REASONING_EFFORT",
     "JUDGE_MODEL",
+    "MODEL_PROVIDER",
     "JUDGE_PROVIDER",
     "PULL_NUMBER",
     "RESULTS_ROOT",

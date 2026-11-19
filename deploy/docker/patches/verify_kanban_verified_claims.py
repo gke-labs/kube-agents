@@ -129,7 +129,7 @@ os.environ["HERMES_KANBAN_RUN_ID"] = str(K.latest_run(conn, parent).id)
 check("the parent card ran no command itself", not kvc.card_terminal_calls(parent))
 out = json.loads(kt._handle_complete({"summary": "node-b", "result": "**node-b is NotReady.**", kvc.PARAM: [BACKED]}))
 check("the parent's relayed claim is accepted", out.get("ok"), str(out))
-check("the evidence names the child card", f"on card {child}" in (card(parent).result or ""), card(parent).result)
+check("the evidence says the claim is relayed, without the card id", kvc.RELAY_NOTE in (card(parent).result or "") and child not in card(parent).result, card(parent).result)
 
 if FAILURES:
     print(f"\nverify_kanban_verified_claims: {len(FAILURES)} check(s) FAILED")

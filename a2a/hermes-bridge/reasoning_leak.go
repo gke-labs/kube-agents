@@ -19,7 +19,7 @@ import (
 // and the two must agree.
 const (
 	// unstructuredReasoningToken is the terminal's reason token.
-	unstructuredReasoningToken = "hermes-unstructured-reasoning"
+	unstructuredReasoningToken = "hermes-unstructured-reasoning" // #nosec G101 -- a reason label, not a credential
 	// unstructuredReasoningWord and unstructuredReasoningSeparator spell
 	// the rule opensWithUnstructuredReasoning applies.
 	unstructuredReasoningWord      = "thought"

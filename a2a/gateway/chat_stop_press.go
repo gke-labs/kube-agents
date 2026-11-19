@@ -7,9 +7,11 @@ import (
 )
 
 // Google Chat's Stop button (gchat_stop.go) answers on the task's own line,
-// as Slack's answers with one reply of its own (slack_stop.go): a press
-// sends the cancel a typed stop sends, quietly (no "cancel sent" post, and
-// no "canceled" notice from the relay, TaskRef.QuietCancel), and edits the
+// as Slack's answers with one reply of its own (slack_stop.go). Both take a
+// press from a requester of the thread alone (stopgate.go); a press that
+// reaches here passed that gate. A press sends the cancel a typed stop
+// sends, quietly (no "cancel sent" post, and no "canceled" notice from the
+// relay, TaskRef.QuietCancel), and edits the
 // line to cancelSentNotice with the Stop control gone, so the line a person
 // pressed is the one that answers. The relay leaves the line so
 // (ActiveTask.LineClosed) until its terminal edit makes it "canceled". A
@@ -35,10 +37,9 @@ import (
 const staleStopNotice = "ℹ️ this task has ended"
 
 // isChatStopPress reports a stop from Google Chat's Stop button rather than
-// the word: the Google Chat adapter sets IntentCancel only on a kage.stop
-// click, which it marks as one.
+// the word, as stopGatedBackends describes Chat's press (stopgate.go).
 func isChatStopPress(msg InboundMessage, backend string) bool {
-	return backend == gchatBackend && msg.Intent == IntentCancel && msg.Click
+	return backend == gchatBackend && isStopPress(msg, backend)
 }
 
 // chatStopPress answers a Stop press on rec's active task: the quiet cancel,

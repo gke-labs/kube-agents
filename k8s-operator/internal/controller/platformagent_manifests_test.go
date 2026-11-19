@@ -137,8 +137,10 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "api_mode: chat_completions") {
 		t.Errorf("expected config to pin the wire protocol, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "enabled: true") {
-		t.Errorf("expected config to enable google_chat platform, got:\n%s", yamlContent)
+	// The A2A gateway consumes Chat; the Hermes google_chat platform stays off
+	// so one Chat app never has two consumers.
+	if !strings.Contains(yamlContent, "google_chat:\n    enabled: false") {
+		t.Errorf("expected config to leave the google_chat platform off (the gateway consumes Chat), got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "cron_mode: approve") {
 		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
@@ -323,8 +325,8 @@ func TestBuildSystemPVC(t *testing.T) {
 		t.Errorf("expected PVC name system-metadata, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "1Gi" {
-		t.Errorf("expected storage request 1Gi, got %s", storageReq.String())
+	if storageReq.String() != "4Gi" {
+		t.Errorf("expected storage request 4Gi, got %s", storageReq.String())
 	}
 }
 
@@ -487,9 +489,11 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected sandbox service account token automount to be disabled")
 	}
 
-	// 4, not 5: the credential proxy is a native sidecar and lives in InitContainers.
-	if len(dep.Spec.Template.Spec.Containers) != 4 {
-		t.Errorf("expected 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	// 5, not 6: the credential proxy is a native sidecar and lives in
+	// InitContainers. The fifth is the rendered hermes-bridge, in the pod from
+	// the first render (#5962).
+	if len(dep.Spec.Template.Spec.Containers) != 5 {
+		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
 		dashboardC := containerByName(t, dep.Spec.Template.Spec.Containers, "platform-agent-dashboard")
 		if dashboardC.Name != "platform-agent-dashboard" {
@@ -677,7 +681,7 @@ func TestBuildDeployment(t *testing.T) {
 		if seen[env.Name] {
 			t.Errorf("duplicate env var found: %s", env.Name)
 		}
-		// The allowlist is two entries long and stays that way unless someone
+		// The allowlist is three entries long and stays that way unless someone
 		// argues the same case again. Both are pod-scoped: SESSION_KV_API_KEY
 		// authenticates callers of the Session KV server on this pod's
 		// loopback, and SESSION_KV_SALT is the HMAC salt for pseudonymising
@@ -685,8 +689,13 @@ func TestBuildDeployment(t *testing.T) {
 		// Neither reaches a cloud API, a repository, or anything off the pod —
 		// which is what the isolation boundary is for. A Secret-backed variable
 		// that does not meet that bar belongs in the credential-proxy container.
+		// A2A_ACTIVITY_SECRET joined on the same terms: it signs the agent's
+		// tool-call deliveries to the bridge's door on this pod's loopback
+		// (a2aActivitySecretEnv), and nothing off the pod reads it. The agent
+		// held it once the bus was provisioned before #5962; it now holds it
+		// from the first render, which is the only reason this test sees it.
 		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil &&
-			env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" {
+			env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" && env.Name != a2aActivitySecretEnvVar {
 			t.Errorf("sandbox must not receive Secret-backed environment variable %s", env.Name)
 		}
 		seen[env.Name] = true
@@ -820,21 +829,12 @@ func TestBuildDeployment(t *testing.T) {
 	if _, ok := envMap["GEMINI_API_KEY"]; ok {
 		t.Errorf("expected GEMINI_API_KEY to not be set on platform agent container")
 	}
-	if envMap["GOOGLE_CHAT_PROJECT_ID"].Value != "my-gcp-project" {
-		t.Errorf("expected GOOGLE_CHAT_PROJECT_ID my-gcp-project, got %s", envMap["GOOGLE_CHAT_PROJECT_ID"].Value)
-	}
-	if envMap["GOOGLE_CHAT_SUBSCRIPTION_NAME"].Value != "projects/my-gcp-project/subscriptions/chat-sub" {
-		t.Errorf("expected GOOGLE_CHAT_SUBSCRIPTION_NAME project sub, got %s", envMap["GOOGLE_CHAT_SUBSCRIPTION_NAME"].Value)
-	}
-	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "alice,bob" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS alice,bob, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
-	}
-	// Emitted with the real answer rather than omitted. Omitting it is what let a
-	// leftover GOOGLE_CHAT_ALLOW_ALL_USERS=true from an earlier, allowlist-free spec
-	// survive on the PVC's .env and beat the allowlist this CR sets — the authz check
-	// reads the per-platform allow-all before it reads any allowlist at all.
-	if got, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; !ok || got.Value != "false" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS=false when allowed users is populated, got %#v", got)
+	// The A2A gateway consumes Chat (TestChatConsumerIsChosenByTheChatConfig),
+	// so the agent container carries none of the legacy Chat consumer's env.
+	for _, name := range []string{"GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME", "GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS"} {
+		if got, ok := envMap[name]; ok {
+			t.Errorf("expected no %s on the agent container (the gateway consumes Chat), got %#v", name, got)
+		}
 	}
 	if envMap["API_SERVER_ENABLED"].Value != "true" {
 		t.Errorf("expected API_SERVER_ENABLED true, got %s", envMap["API_SERVER_ENABLED"].Value)
@@ -926,8 +926,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.1.2" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.2, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.5" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.5, got %s", fbContainer.Image)
 	}
 	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
@@ -1078,10 +1078,11 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 				t.Errorf("expected ShareProcessNamespace to be unset with the dashboard enabled, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			// 3: the front door is a native sidecar and lives in InitContainers,
-			// and the credential runtime is not in this Pod at all.
-			if len(dep.Spec.Template.Spec.Containers) != 3 {
-				t.Fatalf("expected dashboard deployment to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			// 4: the front door is a native sidecar and lives in InitContainers,
+			// the credential runtime is not in this Pod at all, and the
+			// rendered hermes-bridge is in it from the first render (#5962).
+			if len(dep.Spec.Template.Spec.Containers) != 4 {
+				t.Fatalf("expected dashboard deployment to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 			}
 			if _, ok := findContainer(dep.Spec.Template.Spec, "agent-api-auth"); !ok {
 				t.Fatal("the agent-API front door is missing")
@@ -1134,10 +1135,11 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	// 2: the front door is a native sidecar and lives in InitContainers, and the
-	// credential runtime is not in this Pod at all.
-	if len(dep.Spec.Template.Spec.Containers) != 2 {
-		t.Fatalf("expected dashboard-disabled deployment to have 2 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	// 3: the front door is a native sidecar and lives in InitContainers, the
+	// credential runtime is not in this Pod at all, and the rendered
+	// hermes-bridge is in it from the first render (#5962).
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Fatalf("expected dashboard-disabled deployment to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 	if _, ok := findContainer(dep.Spec.Template.Spec, "agent-api-auth"); !ok {
 		t.Fatal("the agent-API front door is missing")
@@ -1294,6 +1296,21 @@ func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesThePostMergeReadCap(t *testing.T) {
+	// POST_MERGE_READS_PER_TICK bounds how many records one post-merge check
+	// step reads; it reaches the agent only through this allowlist, and only
+	// as a literal value.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "POST_MERGE_READS_PER_TICK", Value: "50"},
+		{Name: "POST_MERGE_READS_PER_TICK", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "cap"},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "POST_MERGE_READS_PER_TICK" || got[0].Value != "50" || got[0].ValueFrom != nil {
+		t.Fatalf("expected only the literal POST_MERGE_READS_PER_TICK=50 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
@@ -1428,6 +1445,42 @@ func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
 	}
 }
 
+// The dial's admin list reaches the agent through the managed .env only, on
+// every render: unpinned, a line in the PVC .env (which Hermes applies over the
+// container env, and save_env_value can write) would name who may move the dial.
+func TestManagedEnvPinsTheDialAdmins(t *testing.T) {
+	pinned := func(agent *agentv1alpha1.PlatformAgent) []string {
+		var got []string
+		for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+			if value, ok := strings.CutPrefix(line, dialAdminsEnvKey+"="); ok {
+				got = append(got, value)
+			}
+		}
+		return got
+	}
+	agent := newTestPlatformAgent()
+	if got := pinned(agent); !slices.Equal(got, []string{""}) {
+		t.Errorf("dial admins with none set = %q, want one empty pin", got)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: dialAdminsEnvKey, Value: " U0123ABCD , not-an-id,W0456EFGH\nKUBEAGENTS_DIAL=on,u0lower"},
+		{Name: dialAdminsEnvKey, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	}}
+	if got := pinned(agent); !slices.Equal(got, []string{"U0123ABCD"}) {
+		t.Errorf("dial admins = %q, want [U0123ABCD]", got)
+	}
+	// A list with no member id names nobody, rather than falling back to every
+	// workspace admin.
+	agent.Spec.Deployment.Env = []corev1.EnvVar{{Name: dialAdminsEnvKey, Value: "alice@corp.com, u0lower"}}
+	if got := pinned(agent); !slices.Equal(got, []string{dialAdminsNone}) {
+		t.Errorf("dial admins with no valid entry = %q, want [%s]", got, dialAdminsNone)
+	}
+	// One delivery path: the container env does not carry it.
+	if got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: dialAdminsEnvKey, Value: "U0123ABCD"}}); len(got) != 0 {
+		t.Errorf("%s passed the agent container's env allowlist, got %#v; the managed .env is its only path", dialAdminsEnvKey, got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
 	// reads both from the environment on every tick and there is no config
@@ -1539,6 +1592,47 @@ func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
 	}})
 	if len(got) != 0 {
 		t.Errorf("a ValueFrom KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD must not pass, got %#v", got)
+	}
+}
+
+// The earned-autonomy switches reach the agent through the managed .env only,
+// every one on every render: a switch left out because it is off is one the
+// agent could turn on with a line in the PVC .env, which Hermes applies over
+// the container env. kubeagents_switches.py reads the managed file.
+func TestManagedEnvPinsTheAutonomySwitches(t *testing.T) {
+	switches := func(agent *agentv1alpha1.PlatformAgent) map[string]string {
+		got := map[string]string{}
+		for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+			for _, name := range autonomySwitchNames {
+				if value, ok := strings.CutPrefix(line, name+"="); ok {
+					if _, dup := got[name]; dup {
+						t.Errorf("%s is pinned twice in the managed .env", name)
+					}
+					got[name] = value
+				}
+			}
+		}
+		return got
+	}
+	agent := shellSandboxTestAgent()
+	want := map[string]string{envPostMergeCheck: "off", envAutomerge: "off", envDial: "off"}
+	if got := switches(agent); !maps.Equal(got, want) {
+		t.Errorf("managed .env switches with none set = %v, want %v", got, want)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: envPostMergeCheck, Value: " Report "},
+		{Name: envAutomerge, Value: "on\nKUBEAGENTS_DIAL=on"},
+		{Name: envDial, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	}}
+	want = map[string]string{envPostMergeCheck: "report", envAutomerge: "off", envDial: "off"}
+	if got := switches(agent); !maps.Equal(got, want) {
+		t.Errorf("managed .env switches = %v, want %v", got, want)
+	}
+	// One delivery path, as for the mode: the container env does not carry them.
+	for _, name := range autonomySwitchNames {
+		if got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: name, Value: "on"}}); len(got) != 0 {
+			t.Errorf("%s passed the agent container's env allowlist, got %#v; the managed .env is its only path", name, got)
+		}
 	}
 }
 
@@ -2027,10 +2121,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.2" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.5" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.2")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.5")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -2040,7 +2134,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.1.2" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.5" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -2059,7 +2153,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.2")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.5")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -2279,14 +2373,20 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS empty, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
-	}
-	if envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value != "true" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS true, got %s", envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value)
+	// The gateway consumes Chat and reads the allowlist itself
+	// (TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt); the agent
+	// container carries neither the allowlist nor the allow-all.
+	for _, name := range []string{"GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS"} {
+		if got, ok := envMap[name]; ok {
+			t.Errorf("expected no %s on the agent container (the gateway consumes Chat), got %#v", name, got)
+		}
 	}
 }
 
+// With Google Chat on as well, the A2A gateway takes both: the agent
+// container carries no Slack token and no legacy relay env, the broker is
+// not handed the pair, and the CR's home channel reaches the agent beside
+// the notify lists (agentSlackHomeChannelEnvVar).
 func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2295,6 +2395,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
 					BotTokenSecretRef: &corev1.SecretKeySelector{
@@ -2326,71 +2427,41 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	if _, ok := envMap["SLACK_APP_TOKEN"]; ok {
 		t.Error("expected SLACK_APP_TOKEN to be absent from sandbox")
 	}
-	// The relay is hosted in the broker's process, which is a Pod of its own, so
-	// the URL names its Service. What makes it credential-free is unchanged: the
-	// tokens above stay on the far side of it.
-	wantRelay := credentialProxyBaseURL(agent)
-	if envMap["SLACK_RELAY_URL"].Value != wantRelay {
-		t.Errorf("expected Slack relay URL %q, got %v", wantRelay, envMap["SLACK_RELAY_URL"])
-	}
-	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
-		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
+	// The legacy relay env pointed the Hermes slack platform at the broker;
+	// the gateway holds Slack, so none of it renders. The home channel still
+	// reaches the agent's readers (the audit relay's report card).
+	for _, name := range []string{"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS", "SLACK_HOME_CHANNEL_NAME"} {
+		if got, ok := envMap[name]; ok {
+			t.Errorf("expected no %s on the agent container (the gateway consumes Slack), got %#v", name, got)
+		}
 	}
 	if envMap["SLACK_HOME_CHANNEL"].Value != "C999" {
 		t.Errorf("expected SLACK_HOME_CHANNEL C999, got %s", envMap["SLACK_HOME_CHANNEL"].Value)
-	}
-	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
-		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
 	}
 
 	proxyEnv := make(map[string]corev1.EnvVar)
 	for _, env := range buildCredentialProxyContainer(agent).Env {
 		proxyEnv[env.Name] = env
 	}
-	if proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
-		t.Errorf("expected proxy SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", proxyEnv["SLACK_BOT_TOKEN"].ValueFrom)
+	for _, name := range []string{"SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"} {
+		if got, ok := proxyEnv[name]; ok {
+			t.Errorf("expected no %s on the broker (the gateway opens the app's one Socket Mode connection), got %#v", name, got)
+		}
 	}
-	if proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
-		t.Errorf("expected proxy SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", proxyEnv["SLACK_APP_TOKEN"].ValueFrom)
+	gatewayEnv := make(map[string]corev1.EnvVar)
+	for _, env := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		gatewayEnv[env.Name] = env
 	}
-}
-
-func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-agent",
-			Namespace: "my-ns",
-		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				Slack: &agentv1alpha1.SlackSpec{
-					Enabled:      ptr.To(true),
-					AllowedUsers: []string{""},
-				},
-			},
-		},
+	if gatewayEnv[a2aSlackBotTokenEnvVar].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || gatewayEnv[a2aSlackBotTokenEnvVar].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
+		t.Errorf("expected gateway SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", gatewayEnv[a2aSlackBotTokenEnvVar].ValueFrom)
 	}
-
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
-	container := dep.Spec.Template.Spec.Containers[0]
-	envMap := make(map[string]corev1.EnvVar)
-	for _, env := range container.Env {
-		envMap[env.Name] = env
-	}
-
-	// Emitted, and empty. The managed .env pins SLACK_ALLOWED_USERS on every reconcile so
-	// the agent cannot write its own; a container env that omits the key when the CR sets
-	// no allowlist would leave the two renders disagreeing about a key that decides who
-	// may talk to the agent.
-	v, ok := envMap["SLACK_ALLOWED_USERS"]
-	if !ok || v.Value != "" {
-		t.Errorf("expected SLACK_ALLOWED_USERS present and empty, got %q (present=%v)", v.Value, ok)
-	}
-	if envMap["SLACK_ALLOW_ALL_USERS"].Value != "true" {
-		t.Errorf("expected SLACK_ALLOW_ALL_USERS true, got %s", envMap["SLACK_ALLOW_ALL_USERS"].Value)
+	if gatewayEnv[a2aSlackAppTokenEnvVar].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || gatewayEnv[a2aSlackAppTokenEnvVar].ValueFrom.SecretKeyRef.Key != "app-token-key" {
+		t.Errorf("expected gateway SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", gatewayEnv[a2aSlackAppTokenEnvVar].ValueFrom)
 	}
 }
 
+// With Google Chat on as well, the Hermes slack platform stays off in the
+// rendered config: the A2A gateway is the one Slack consumer.
 func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2399,6 +2470,7 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
 				},
@@ -2408,8 +2480,8 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 
 	cm := buildConfigMap(agent, nil)
 	yamlContent := defaultProfileYAML(t, cm)
-	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
-		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "slack:") || strings.Contains(yamlContent, "slack:\n    enabled: true") {
+		t.Errorf("expected config.yaml to render the slack platform off, got:\n%s", yamlContent)
 	}
 }
 
@@ -3299,7 +3371,7 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 		t.Errorf("expected APIGroups [''], got %v", ruleCore.APIGroups)
 	}
 
-	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"}
+	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts", "secrets"}
 	if !slices.Equal(ruleCore.Resources, expectedCoreResources) {
 		t.Errorf("expected Resources %v, got %v", expectedCoreResources, ruleCore.Resources)
 	}
@@ -3322,13 +3394,45 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
 	}
+
+	// DisallowSecretsRead=true omits secrets from the core group rule.
+	disallowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(true),
+				},
+			},
+		},
+	}
+	disallowedRole := buildMinimalPlatformRole(disallowedAgent)
+	if slices.Contains(disallowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=true to omit secrets, got %v", disallowedRole.Rules[0].Resources)
+	}
+
+	// DisallowSecretsRead=false includes secrets in the core group rule.
+	allowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(false),
+				},
+			},
+		},
+	}
+	allowedRole := buildMinimalPlatformRole(allowedAgent)
+	if !slices.Contains(allowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=false to include secrets, got %v", allowedRole.Rules[0].Resources)
+	}
 }
 
 // The agent reads the GitOps reconcilers' sync objects to learn which repository
-// and directory syncs a cluster. Nothing in that grant may write or reach a Secret
-// (Argo CD keeps cluster and repository credentials in Secrets), and the kinds the
-// sync lookup does not need stay out, so the readable inline values are bounded
-// to what Applications and Kustomizations carry.
+// and directory syncs a cluster. Nothing in that grant may write (and only the
+// core API group may read Secrets for `<agent>-kube-proxy`'s redacted metadata
+// path), and the kinds the sync lookup does not need stay out, so the readable
+// inline values are bounded to what Applications and Kustomizations carry.
 func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 	role := buildMinimalPlatformRole(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -3348,8 +3452,8 @@ func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 	readOnly := []string{"get", "list", "watch"}
 	seen := map[string]bool{}
 	for _, rule := range role.Rules {
-		if slices.Contains(rule.Resources, "secrets") {
-			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
+		if slices.Contains(rule.Resources, "secrets") && (!slices.Equal(rule.APIGroups, []string{""}) || !slices.Equal(rule.Verbs, readOnly)) {
+			t.Errorf("minimal role grants secrets outside read-only core group: groups=%v verbs=%v", rule.APIGroups, rule.Verbs)
 		}
 		if slices.Contains(rule.Resources, "*") || slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Verbs, "*") {
 			t.Errorf("minimal role carries a wildcard: %+v", rule)
@@ -3956,13 +4060,27 @@ func TestManagedConfigPinsModelAndPlatformsButNotHomeChannel(t *testing.T) {
 // The home-channel vars are excluded on purpose. They stay ordinary container env, which
 // the PVC .env (also override=True) beats, so the CR value seeds the home channel and
 // `/sethome` wins from then on.
+//
+// The Chat and Slack keys are not among the pins: the A2A gateway consumes
+// both and the Hermes google_chat and slack platforms render nothing for
+// them (TestTheLegacyChatConsumerIsNotRendered,
+// TestTheLegacySlackConsumerIsNeverRendered). Teams is the one platform
+// Hermes still serves, so its keys and the gateway-wide pair are pinned.
 func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	env := renderManagedEnv(chatAgent())
-
 	for _, key := range []string{
-		"GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME",
-		"GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS",
 		"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS",
+		"GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+	} {
+		if strings.Contains(env, key+"=") {
+			t.Errorf("%s is pinned for a platform Hermes does not run:\n%s", key, env)
+		}
+	}
+	teams := chatAgent()
+	teams.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true), AllowedUsers: []string{"alice@example.com"}}
+	env = renderManagedEnv(teams)
+	for _, key := range []string{
+		"TEAMS_RELAY_URL", "TEAMS_ALLOWED_USERS", "TEAMS_ALLOW_ALL_USERS",
 		"GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
 	} {
 		if !strings.Contains(env, key+"=") {
@@ -3980,16 +4098,23 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// ten unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, the
-	// empty management-project override, the stall watch's three knobs, empty, the
+	// fifteen unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode pin (always next), the three
+	// earned-autonomy switches, the scope path, the resolved scope's path, the empty
+	// management-project override, the dial's admin list, empty, the stall watch's three
+	// knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
-		kubeagentsModeEnvKey + "=today\n" +
+		kubeagentsModeEnvKey + "=" + kubeagentsModeValue + "\n" +
+		envPostMergeCheck + "=off\n" +
+		envAutomerge + "=off\n" +
+		envDial + "=off\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
+		resolvedScopeFileEnvKey + "=" + resolvedScopeDir + "/" + scopeResolvedDataKey + "\n" +
 		reconcileProjectEnvKey + "=\n" +
+		dialAdminsEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +
 		stallWatchKindsEnvKey + "=\n" +
@@ -4034,17 +4159,25 @@ func TestManagedEnvPinsTheLoopbackKeyUnconditionally(t *testing.T) {
 // but by different code, and the managed one is applied LAST with override=True — so a
 // disagreement is not a warning, it is the container env silently losing.
 func TestManagedEnvAgreesWithContainerEnv(t *testing.T) {
-	// Both answers to the access question. With an allowlist the allow-all keys render
-	// `false`, without one they render `true` and the allowlists render empty — and it is
-	// the second shape that never appears in the goldens, so nothing else compares its two
-	// renders to each other.
-	t.Run("allowlisted", func(t *testing.T) { assertManagedEnvAgrees(t, chatAgent()) })
-	t.Run("allow all", func(t *testing.T) {
+	// Both answers to the access question, on Teams, the one platform Hermes still
+	// serves (the gateway holds Chat and Slack, so their keys are not pinned). With an
+	// allowlist the allow-all key renders `false`, with allowAllUsers it renders `true`
+	// and the allowlist renders empty — and it is the second shape that never appears in
+	// the goldens, so nothing else compares its two renders to each other.
+	teamsAgent := func(allowAll bool) *agentv1alpha1.PlatformAgent {
 		agent := chatAgent()
-		agent.Spec.Integration.GoogleChat.AllowedUsers = nil
-		agent.Spec.Integration.Slack.AllowedUsers = nil
-		if !strings.Contains(renderManagedEnv(agent), "SLACK_ALLOW_ALL_USERS=true") {
-			t.Fatalf("an empty allowlist must pin allow-all as true, got:\n%s", renderManagedEnv(agent))
+		agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true), AllowedUsers: []string{"alice@example.com"}}
+		if allowAll {
+			agent.Spec.Integration.Teams.AllowedUsers = nil
+			agent.Spec.Integration.Teams.AllowAllUsers = ptr.To(true)
+		}
+		return agent
+	}
+	t.Run("allowlisted", func(t *testing.T) { assertManagedEnvAgrees(t, teamsAgent(false)) })
+	t.Run("allow all", func(t *testing.T) {
+		agent := teamsAgent(true)
+		if !strings.Contains(renderManagedEnv(agent), "TEAMS_ALLOW_ALL_USERS=true") {
+			t.Fatalf("allowAllUsers must pin allow-all as true, got:\n%s", renderManagedEnv(agent))
 		}
 		assertManagedEnvAgrees(t, agent)
 	})
@@ -4062,7 +4195,9 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
 	// would be a second answer to a question that must have exactly one. The stall
-	// watch's knobs take the same single path to stall_watch.py.
+	// watch's knobs take the same single path to stall_watch.py, the
+	// earned-autonomy switches theirs to kubeagents_switches.py, and the dial's
+	// admin list its own to session-kv's dial actions.
 	pinnedOnly := map[string]bool{
 		"GATEWAY_ALLOWED_USERS":           true,
 		"GATEWAY_ALLOW_ALL_USERS":         true,
@@ -4070,6 +4205,10 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 		stallWatchExcludeNamespacesEnvKey: true,
 		stallWatchMinAgeEnvKey:            true,
 		stallWatchKindsEnvKey:             true,
+		dialAdminsEnvKey:                  true,
+		envPostMergeCheck:                 true,
+		envAutomerge:                      true,
+		envDial:                           true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {
@@ -7431,6 +7570,9 @@ func TestUnrelatedExtraMountKeepsTmpScratch(t *testing.T) {
 // touch this file: the test below fails on a name it does not know, and the fix is to add
 // it here and give it hardenedSecurityContext().
 var operatorBuiltContainers = []string{
+	// The rendered bridge: buildA2ABridgeContainer copies the agent
+	// container's securityContext.
+	"hermes-bridge",
 	"sandbox-credential-cleanup",
 	"sandbox-ssh-key",
 	"agent-api-auth",
@@ -7672,52 +7814,38 @@ func TestBuildPluginStagingInitContainer_AssertsNonEmptyAndFailsOnErrors(t *test
 	}
 }
 
-// The mode pin (docs/designs/spec-mode-switch.md): the managed key is the only
-// way the mode reaches the agent runtime, and it is emitted always, with the
-// real value, per this file's pin doctrine — an absent key is a key the agent
-// may write into the PVC .env, and the mode must not be the agent's to fake.
+// The mode pin: the managed key is emitted always, as "next", whatever
+// spec.mode says, per this file's pin doctrine — an absent key is a key the
+// agent may write into the PVC .env, and an agent image from before the
+// removal of spec.mode today still reads it.
 func TestManagedEnvPinsTheMode(t *testing.T) {
-	bare := newTestPlatformAgent()
-	if env := renderManagedEnv(bare); !strings.Contains(env, kubeagentsModeEnvKey+"=today") {
-		t.Errorf("mode absent must pin today, got:\n%s", env)
-	}
-
-	next := newTestPlatformAgent()
-	next.Spec.Mode = ptr.To("next")
-	if env := renderManagedEnv(next); !strings.Contains(env, kubeagentsModeEnvKey+"=next") {
-		t.Errorf("mode next must pin next, got:\n%s", env)
-	}
-
-	// Flipping the mode rolls the agent pod: the managed .env feeds the config
-	// ConfigMap, whose hash is a pod-template annotation (config-hash). Same
-	// mechanism as every other config change; this asserts the mode rides it.
-	todayHash, err := getConfigMapHash(buildConfigMap(bare, nil))
-	if err != nil {
-		t.Fatalf("hashing today's config: %v", err)
-	}
-	nextHash, err := getConfigMapHash(buildConfigMap(next, nil))
-	if err != nil {
-		t.Fatalf("hashing next's config: %v", err)
-	}
-	if todayHash == nextHash {
-		t.Error("flipping the mode does not move the config hash, so the pod never rolls and the running agent keeps the old mode")
+	for name, mode := range map[string]*string{"mode absent": nil, "mode next": ptr.To("next"), "a stored today": ptr.To("today")} {
+		agent := newTestPlatformAgent()
+		agent.Spec.Mode = mode
+		if env := renderManagedEnv(agent); !strings.Contains(env, kubeagentsModeEnvKey+"=next") {
+			t.Errorf("%s must pin next, got:\n%s", name, env)
+		}
 	}
 }
 
 func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
+	// The Teams allowlist is a CR value the managed .env pins; Google Chat and
+	// Slack pin nothing, so they cannot reach the strip.
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
 					Enabled:      ptr.To(true),
-					ProjectID:    "p",
-					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=next"},
+					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=today"},
 				},
 			},
 		},
 	}
 	rendered := renderManagedEnv(agent)
+	if !strings.Contains(rendered, "TEAMS_ALLOWED_USERS=someoneKUBEAGENTS_MODE=today\n") {
+		t.Fatalf("the Teams allowlist must render with its newline stripped:\n%s", rendered)
+	}
 	// The property is about LINES, which is how every reader of this file
 	// parses it: the smuggled text surviving inside another key's value is
 	// harmless (the parser splits on the first `=`, so it stays that key's
@@ -7726,7 +7854,7 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 	for _, line := range strings.Split(rendered, "\n") {
 		if strings.HasPrefix(line, "KUBEAGENTS_MODE=") {
 			modeLines++
-			if line != "KUBEAGENTS_MODE=today" {
+			if line != kubeagentsModeEnvKey+"="+kubeagentsModeValue {
 				t.Errorf("a CR value smuggled a mode line: %q", line)
 			}
 		}
@@ -8149,5 +8277,94 @@ func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) 
 	}
 	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
 		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
+	}
+}
+
+// A plugin mounted inside the data PVC (a default-profile plugin, at
+// <home>/plugins/<name>) has its parent folder made by an earlier init container
+// that mounts the PVC and runs as the pod's user, the agent's. Without it the container
+// runtime makes <home>/plugins as root when it creates the agent container, and
+// on a new volume the entrypoint cannot copy the image's plugins into it.
+func TestAPluginMountedUnderTheHomeHasItsParentMadeFirst(t *testing.T) {
+	const dataVolume = "platform-agent-data-vol"
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "plugin-agent", Namespace: "test-ns"}}
+	untargeted := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "myplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "gcr.io/my-plugin:v1"},
+	}
+	targeted := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "profileplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "gcr.io/profile-plugin:v1", TargetProfile: "platform"},
+	}
+	// dataMount is where a container mounts the PVC's root, or "".
+	dataMount := func(c corev1.Container) string {
+		for _, m := range c.VolumeMounts {
+			if m.Name == dataVolume && m.SubPath == "" {
+				return m.MountPath
+			}
+		}
+		return ""
+	}
+	// makesDir reports whether an init container makes dir, a path on the PVC:
+	// a line of its script is `mkdir -p <path>`, alone or before `||`. It must
+	// run as the pod's user, with no user of its own.
+	makesDir := func(c corev1.Container, dir string) bool {
+		root := dataMount(c)
+		if root == "" || len(c.Args) != 1 || (c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil) {
+			return false
+		}
+		want := "mkdir -p " + path.Join(root, dir)
+		for _, line := range strings.Split(c.Args[0], "\n") {
+			if line == want || strings.HasPrefix(line, want+" ||") {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, imageVolumes := range []bool{true, false} {
+		dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4",
+			[]*agentv1alpha1.AgentPlugin{untargeted, targeted}, renderOptions{imageVolumeSupported: imageVolumes})
+		spec := dep.Spec.Template.Spec
+		if spec.SecurityContext == nil || spec.SecurityContext.RunAsUser == nil || *spec.SecurityContext.RunAsUser != sandboxUID {
+			t.Fatalf("imageVolumeSupported=%v: the pod does not run as the agent's user: %+v", imageVolumes, spec.SecurityContext)
+		}
+		// Every container in start order: the init containers, then the rest.
+		inOrder := append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+		checked := 0
+		for i, c := range inOrder {
+			root := dataMount(c)
+			if root == "" {
+				continue
+			}
+			for _, m := range c.VolumeMounts {
+				if !strings.HasPrefix(m.Name, "plugin-") || !strings.HasPrefix(m.MountPath, root+"/") {
+					continue
+				}
+				checked++
+				parent := strings.TrimPrefix(path.Dir(m.MountPath), root+"/")
+				made := false
+				for _, earlier := range spec.InitContainers[:min(i, len(spec.InitContainers))] {
+					made = made || makesDir(earlier, parent)
+				}
+				if !made {
+					t.Errorf("imageVolumeSupported=%v: %s mounts %s inside the data PVC, and no earlier init container makes %s on it",
+						imageVolumes, c.Name, m.MountPath, parent)
+				}
+			}
+		}
+		if checked == 0 {
+			t.Errorf("imageVolumeSupported=%v: no plugin mount inside the data PVC was found, so nothing was checked", imageVolumes)
+		}
+	}
+
+	// With no plugin under the home, the cleanup container is as it was: an
+	// install without a default-profile plugin keeps its pod template.
+	for name, plugins := range map[string][]*agentv1alpha1.AgentPlugin{"no plugin": nil, "a targeted plugin only": {targeted}} {
+		dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins, renderOptions{imageVolumeSupported: true})
+		cleanup := containerByName(t, dep.Spec.Template.Spec.InitContainers, "sandbox-credential-cleanup")
+		if len(cleanup.Args) != 1 || strings.Contains(cleanup.Args[0], "mkdir") {
+			t.Errorf("%s: the cleanup container makes a folder: %q", name, cleanup.Args)
+		}
 	}
 }

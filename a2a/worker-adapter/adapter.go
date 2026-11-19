@@ -377,6 +377,12 @@ type adapter struct {
 	costKnown      bool
 	resumedSession bool
 
+	// delegateWidth is how many children one delegate call from this turn
+	// may ask for, as the gateway advertised it on the submission's
+	// delegateTargets part (delegateWidthOf); zero or one is the single
+	// shape only.
+	delegateWidth int
+
 	// dispatched is a task a profile worker took from the dispatcher
 	// (profile.go). The dispatcher checked the grant at admission
 	// (CheckProfileRun), and a profile pod holds no verify subject, so the
@@ -815,6 +821,14 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		}
 	}
 
+	if delegate {
+		// The agents this turn's requester may delegate to, as the gateway
+		// listed them on the submission: per turn, so a reused pod's tool
+		// keeps up with profiles added and removed.
+		argv, _ = withDelegateTargets(argv, origin)
+		a.delegateWidth = delegateWidthOf(origin)
+	}
+
 	if cfg.SessionReuse {
 		if err := removeUserSettings(cfg.HarnessUserSettings); err != nil {
 			state := lib.StateFailed
@@ -1045,7 +1059,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				ask.reply <- delegateReply{Message: "this turn has already ended"}
 				continue
 			}
-			if why := validateDelegate(ask.req); why != "" {
+			if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {
 				ask.reply <- delegateReply{Message: why}
 				continue
 			}
@@ -1055,10 +1069,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				continue
 			}
 			delegated = true
-			addressee := ask.req.Addressee
-			ask.reply <- delegateReply{OK: true, Message: "delegated to " + addressee + "; this turn ends now and the result arrives as your next turn"}
-			log.Info("delegation published; ending the turn", "task", a.taskID, "addressee", addressee)
-			sawResult, resultErr, resultText = true, "", "delegated to "+addressee
+			line := delegatedTo(ask.req)
+			next := "; this turn ends now and the result arrives as your next turn"
+			if ask.req.IsBatch() {
+				next = "; this turn ends now and the results arrive together as your next turn"
+			}
+			ask.reply <- delegateReply{OK: true, Message: line + next}
+			log.Info("delegation published; ending the turn", "task", a.taskID, "tasks", len(ask.req.Entries()), "delegated", line)
+			sawResult, resultErr, resultText = true, "", line
 			// End the harness the way cancel does: closed stdin, SIGTERM to
 			// the process group, SIGKILL after KillGrace. Whatever it does
 			// next cannot change the deliverable, so waiting on it only
