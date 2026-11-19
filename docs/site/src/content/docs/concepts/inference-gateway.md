@@ -357,7 +357,7 @@ Where Workload Identity is not available, the chart can read a service-account k
 
 Both fields are chart-only and read only with `modelProvider: vertex_ai`; the render fails if either is set for another provider or omits `name` or `key`. Mint the key for a dedicated service account holding only `roles/aiplatform.user` on the serving project (see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity)), rotate it in the Secret, and prefer Workload Identity wherever the cluster supports it. Changing either Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it so the process reloads `VERTEXAI_PROJECT` and the key file.
 
-To override the Vertex AI endpoint through the [gateway environment Secret](#a-credentials-secret-for-the-gateway), pair `--litellm-env-secret` (`LITELLM_ENV_SECRET_NAME` / `litellm.envFromSecret`) with `--vertex-project-id` (`VERTEX_PROJECT_ID` / `litellm.vertex.projectId`) and `--vertex-location` (`VERTEX_LOCATION` / `litellm.vertex.location`):
+To pass custom Vertex AI environment variables to the gateway container through the [gateway environment Secret](#a-credentials-secret-for-the-gateway), pair `--litellm-env-secret` (`LITELLM_ENV_SECRET_NAME` / `litellm.envFromSecret`) with `--vertex-project-id` (`VERTEX_PROJECT_ID` / `litellm.vertex.projectId`) and `--vertex-location` (`VERTEX_LOCATION` / `litellm.vertex.location`):
 
 ```bash
 kubectl create secret generic vertex-endpoint -n kubeagents-system \
@@ -371,13 +371,25 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --litellm-env-secret=vertex-endpoint
 ```
 
-Kubernetes resolves explicit container `env` entries after `envFrom`. Because the chart always renders `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` in the gateway container's `env`, those values override any `VERTEXAI_PROJECT` or `VERTEXAI_LOCATION` key present in `litellm.envFromSecret`. Set the serving project and model location through the installer flags or `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and `litellm.vertex.location` so the endpoint host and the `projects/<project>/locations/<location>` path agree.
+`litellm.envFromSecret` mounts its keys into the gateway container via `envFrom` and does not render `api_base` in `config.yaml`. Because Kubernetes resolves explicit container `env` entries after `envFrom`, the `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` entries rendered by the chart always override those keys in `litellm.envFromSecret`. Set the serving project and model location through the installer flags or `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and `litellm.vertex.location` rather than inside the Secret.
 
-On a chart install that sets `platformAgent.harness.universeDomain` to a domain other than `googleapis.com`, the chart renders `GOOGLE_CLOUD_UNIVERSE_DOMAIN` directly in the gateway container's `env` (overriding `litellm.envFromSecret`). It also sets `api_base` on each `model_list` entry in `config.yaml` to `https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`, or `https://<location>-aiplatform.<universeDomain>` for a regional location.
+To render a custom Vertex AI `api_base` on each `model_list` entry in `config.yaml`, set `platformAgent.harness.universeDomain` to a domain other than `googleapis.com` (`install.sh` has no flag for `universeDomain`, so set it via Helm or `TF_VAR_extra_helm_values`). The chart then renders `api_base` as `https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`, or `https://<location>-aiplatform.<universeDomain>` for a regional location. It also sets `GOOGLE_CLOUD_UNIVERSE_DOMAIN` directly in container `env`, overriding any `GOOGLE_CLOUD_UNIVERSE_DOMAIN` key in `litellm.envFromSecret`:
+
+```bash
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set platformAgent.harness.universeDomain=universe.example.com \
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.modelDefaultName=gemini-3.8-flash \
+  --set litellm.vertex.projectId=my-serving-project \
+  --set litellm.vertex.location=us-east4
+```
 
 ### A credentials Secret for the gateway
 
-`LITELLM_ENV_SECRET_NAME` (`--litellm-env-secret`, chart value `litellm.envFromSecret`, Terraform `litellm_env_secret_name`) names a Secret in the agent's namespace that the gateway container reads whole as environment variables. You create it with `kubectl`; the install only names it, so the credentials never pass through `install.env`, `terraform.tfvars` or Terraform state, and `upgrade.sh` never rewrites them. The mount is optional: the pod starts without the Secret, and the first model call, not the rollout, reports a missing credential. It is how the two provider shapes below, and an OAuth2 gateway, get their credentials.
+`LITELLM_ENV_SECRET_NAME` (`--litellm-env-secret`, chart value `litellm.envFromSecret`, Terraform `litellm_env_secret_name`) names a Secret in the agent's namespace that the gateway container reads whole as environment variables. You create it with `kubectl`; the install only names it, so the credentials never pass through `install.env`, `terraform.tfvars` or Terraform state, and `upgrade.sh` never rewrites them. The mount is optional: the pod starts without the Secret, and the first model call, not the rollout, reports a missing credential. It carries credentials for the two provider shapes below and for an OAuth2 gateway, as well as custom environment variables on `vertex_ai`.
 
 A variable the chart sets directly in container `env` — keys from `platform-agent-secrets` (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY` and the others), `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` on `vertex_ai`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN` when `platformAgent.harness.universeDomain` is non-default — wins over the same name in this Secret. Changing the Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it.
 

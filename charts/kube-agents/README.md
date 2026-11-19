@@ -413,12 +413,15 @@ conversation a Vertex `session_id` so a new conversation's first turn can read
 a prompt another conversation warmed:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
 
-To supply a custom Vertex AI endpoint or `GOOGLE_CLOUD_UNIVERSE_DOMAIN` through
-`litellm.envFromSecret` ([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)),
-pair the Secret with `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`)
-and `litellm.vertex.location`:
+To pass custom Vertex AI environment variables through `litellm.envFromSecret`
+([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)) or render
+a custom-universe Vertex `api_base` in `config.yaml` via
+`platformAgent.harness.universeDomain`, pair them with
+`litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`) and
+`litellm.vertex.location`:
 
 ```bash
+--set platformAgent.harness.universeDomain=universe.example.com \
 --set litellm.modelProvider=vertex_ai \
 --set litellm.modelDefaultName=gemini-3.8-flash \
 --set litellm.vertex.projectId=my-serving-project \
@@ -426,14 +429,16 @@ and `litellm.vertex.location`:
 --set litellm.envFromSecret=vertex-endpoint
 ```
 
-Kubernetes resolves explicit container `env` entries after `envFrom`, so
-`VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` rendered by the chart always override
-those keys in `litellm.envFromSecret`. When `platformAgent.harness.universeDomain`
-is set to a domain other than `googleapis.com`, the chart also sets
-`GOOGLE_CLOUD_UNIVERSE_DOMAIN` in container `env` (overriding `envFromSecret`)
-and renders `api_base` on each `model_list` entry in `config.yaml` as
-`https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`
-or `https://<location>-aiplatform.<universeDomain>` for a regional location.
+`litellm.envFromSecret` mounts environment variables via `envFrom` without
+rendering `api_base` in `config.yaml`, and container `env` entries
+(`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+when `platformAgent.harness.universeDomain` is non-default) always override
+matching keys in `litellm.envFromSecret`; only a non-default
+`platformAgent.harness.universeDomain` renders `api_base`
+(`https://aiplatform.<universeDomain>` for `global` or
+`https://<location>-aiplatform.<universeDomain>` for a regional location) in
+`config.yaml`. Full precedence and examples:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden).
 
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
@@ -498,8 +503,8 @@ including `/v1`) are required, and the render fails without them. Set
 mounts whole into the gateway container as environment variables (`envFrom`,
 optional, so the pod starts without it). You create it; the chart only names
 it, and a Helm upgrade never touches it. It carries whatever the LiteLLM
-provider reads from the environment, which is how the providers without a
-key in the credentials Secret get theirs:
+provider reads from the environment — credentials for providers without a key
+in the credentials Secret, or custom environment variables for `vertex_ai`:
 
 - **SAP AI Core (`litellm.modelProvider=sap`).** LiteLLM's `sap/` driver
   exchanges the service key's client credentials at your tenant's token URL
@@ -518,9 +523,10 @@ key in the credentials Secret get theirs:
   in the Secret, the chart ships a pre-call hook that fetches the bearer token,
   caches it and renews it before expiry
   ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
-- **Vertex AI custom endpoint variables (`litellm.modelProvider=vertex_ai`).**
-  Pair the Secret with `litellm.vertex.projectId` (or `projectSecretRef`) and
-  `litellm.vertex.location` ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
+- **Vertex AI custom environment variables (`litellm.modelProvider=vertex_ai`).**
+  Mounts environment variables via `envFrom` without rendering `api_base` in
+  `config.yaml`; pair with `litellm.vertex.projectId` (or `projectSecretRef`)
+  and `litellm.vertex.location` ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
 
 A variable the chart sets directly in container `env` — keys from the
 credentials Secret (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY`, ...), plus
@@ -1049,8 +1055,10 @@ means zero rather than unset. Setting `platformAgent.harness.universeDomain` fai
 `googleapis.com`, such as `mtls.googleapis.com`, also fails `helm upgrade`: it names hosts
 of standard Google Cloud, so use `googleapis.com` or leave the value empty. When set
 to a domain other than `googleapis.com`, the chart also sets
-`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter` and
-renders `githubMinter`'s `ISSUER_ALLOWLIST` against `https://container.<universeDomain>/...`.
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` on `litellm` (`vertex_ai`) and `githubMinter`,
+renders `api_base` on `litellm` (`vertex_ai`) `model_list` entries in
+`config.yaml`, and renders `githubMinter`'s `ISSUER_ALLOWLIST` against
+`https://container.<universeDomain>/...`.
 
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
