@@ -1608,6 +1608,12 @@ func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 	run := agent.Status.BusMigration
 	if run.GivenUp {
 		if busMigrationStageIsTheOnlyCopy(run) {
+			if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+				// A leg this operator does not run may not have made the claim
+				// or the Secret; what it made is kept all the same.
+				return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data may be only on the staging claim %s, if the run made one, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
+					busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
+			}
 			return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data is only on the staging claim %s, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
 				busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
 		}
@@ -1860,7 +1866,7 @@ const reasonA2ABusMigrationLegUnknown = "A2ABusMigrationLegUnknown"
 // busMigrationLegUnknownMessage says what holding a run of an unknown leg
 // means, and the two ways out.
 func busMigrationLegUnknownMessage(run *agentv1alpha1.BusMigrationStatus) string {
-	return fmt.Sprintf("unrecognised migration leg %s (run %s, phase %s): holding; nothing advances, the bus keeps its server count and the write freeze, and the provision Job waits. Upgrade the operator to the release that started the run, which carries it on, or abandon the run: annotate the PlatformAgent %s=%s, which lifts the freeze and recreates every stream the run did not put back, empty",
+	return fmt.Sprintf("unrecognised migration leg %s (run %s, phase %s): holding; nothing advances, the bus keeps its server count and the write freeze, and the provision Job waits. Upgrade the operator to the release that started the run, which carries it on, or turns it back if its deadline has passed meanwhile, or abandon the run: annotate the PlatformAgent %s=%s, which lifts the freeze and recreates every stream the run did not put back, empty",
 		run.Leg, run.RunID, run.Phase, a2aBusMigrationAbandonAnnotation, run.RunID)
 }
 

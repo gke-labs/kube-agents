@@ -93,7 +93,7 @@ func TestAnUnknownLegIsHeldInEveryPhase(t *testing.T) {
 					t.Errorf("%s %s at %d: events %v, want one %s", leg, phase, running, events, reasonA2ABusMigrationLegUnknown)
 				}
 				msg := strings.Join(events, "\n")
-				for _, want := range []string{"unrecognised migration leg " + string(leg), "holding", "Upgrade the operator", a2aBusMigrationAbandonAnnotation + "=3-1"} {
+				for _, want := range []string{"unrecognised migration leg " + string(leg), "holding", "Upgrade the operator", "turns it back if its deadline has passed", a2aBusMigrationAbandonAnnotation + "=3-1"} {
 					if !strings.Contains(msg, want) {
 						t.Errorf("%s %s at %d: Warning %q does not say %q", leg, phase, running, msg, want)
 					}
@@ -168,7 +168,7 @@ func TestAHeldUnknownLegIsGivenUpByTheAbandonAnnotation(t *testing.T) {
 		t.Error("the provisioned record stands, so the provision Job would not recreate what the run did not put back")
 	}
 	cond, _ := busMigratingCondition(m.agent)
-	if cond.Reason != "Failed" || strings.Contains(cond.Message, "To retry") || !strings.Contains(cond.Message, "recreated empty") || !strings.Contains(cond.Message, busMigrationStageClaim(m.agent, "3-1")) {
+	if cond.Reason != "Failed" || strings.Contains(cond.Message, "To retry") || !strings.Contains(cond.Message, "recreated empty") || !strings.Contains(cond.Message, busMigrationStageClaim(m.agent, "3-1")+", if the run made one") {
 		t.Errorf("condition %+v, want Failed, no retry, streams recreated, and the staging claim kept as their only copy", cond)
 	}
 }
