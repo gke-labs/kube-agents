@@ -152,14 +152,24 @@ A finding is due for reporting when:
    or
 3. Its **7-day scheduled refresh** window has elapsed (`now - last_report_at >=
    7 days - 10m`).
-Chat report lines name up to six due subjects with their cause and share.
-Findings on clusters whose scan succeeded (`status == "ok"`) and that are no
-longer present are retired from `ledger.json` with a single resolution line.
-A finding on a cluster its project's cluster list no longer names retires once
-that list was read. Clusters whose scan failed (`status == "error"`), that were
-not reached, or whose project could not be scanned retain their existing ledger
-entries so a transient outage does not erase state and re-page as new tomorrow.
-A quiet tick prints nothing.
+The chat message for due findings opens with a bold headline (how many pod
+placement problems, on which cluster or how many, and how many are new,
+changed or still open), then names up to three of them, most severe and most
+concentrated first, each as its workload, zone or compute class, its cluster,
+leeway's suspected cause in plain words (`CAUSE_PHRASES`), and a share where it
+has one (a workload's pods in one zone; a compute class's time on its last
+machine choice), with "and N more" past that. It closes by pointing at the
+agent for fixes, and with the date its findings are next posted if still
+open; the report's path on the pod is not in it. Findings on clusters
+whose scan succeeded (`status == "ok"`) and that are no longer present are
+retired from `ledger.json` under their own headline in the same post, counting
+the cleared problems, then up to three of them by name. Lines about the scan
+itself (a partial scan, a recovery, a failed publish) follow both. A finding on a cluster its
+project's cluster list no longer names retires once that list was read.
+Clusters whose scan failed (`status == "error"`), that were not reached, or
+whose project could not be scanned retain their existing ledger entries so a
+transient outage does not erase state and re-page as new tomorrow. A quiet
+tick prints nothing.
 """
 
 from __future__ import annotations
@@ -478,11 +488,88 @@ RECOVERED_LINE = "{prefix} watch: the tick runs again"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
-RETIRED_LINE = "{prefix}: {count} finding(s) resolved ({names}); retired from the watch"
-REPORT_LINE = (
-    "{prefix}: {due_count} finding(s) due ({reasons}) across {cluster_count} cluster(s) ({clusters}): {names}; "
-    "report on the gateway pod at {path}; next refresh after {next_date}"
-)
+# The due and resolved messages: a bold headline that answers, then at most
+# MAX_CHAT_ITEMS items, most severe and most concentrated first, then
+# "and N more". Names and items are cut so the message stays bounded however
+# many findings or however long a workload name.
+CHAT_HEADLINE = "**{text}**"
+CHAT_ITEM = "- {text}"
+CHAT_MORE_ITEM = "- and {count} more"
+CHAT_LINE_SEPARATOR = "\n"
+MAX_CHAT_ITEMS = 3
+CHAT_NAME_MAX_CHARS = 60
+CHAT_ITEM_MAX_CHARS = 160
+# An over-long item is cut in its subject, before the cluster it names, so the
+# cluster and the share and cause that follow survive; what is cut keeps at
+# least this much.
+CHAT_SUBJECT_MIN_CHARS = 20
+# Every subject template ends "... on {cluster}".
+SUBJECT_CLUSTER_JOIN = " on "
+CHAT_ELLIPSIS = "…"
+PROBLEM_NOUN = ("pod placement problem", "pod placement problems")
+CLUSTER_NOUN = ("cluster", "clusters")
+HAS_VERB = ("has", "have")
+DUE_HEADLINE = "{count} {problems} on {where} ({breakdown})"
+DUE_WHERE_CLUSTER = "cluster {cluster}"
+DUE_WHERE_CLUSTERS = "{count} {clusters}"
+RESOLVED_HEADLINE = "{count} {problems} {has} cleared"
+# Where the detail is: the agent's topology-drift skill runs `leeway report`
+# again on request. The ledger re-posts these findings on the first run after
+# their refresh window ends that reads their cluster: usually the daily run on
+# that date, later when that run starts early or the cluster is not read.
+DUE_FOLLOW_UP = "Ask me how to fix any of these. If they're still open, I'll post them again on or after {next_date}."
+# Why a finding is in this message, in the order the headline lists them.
+REASON_LABELS: dict[str, str] = {
+    REASON_NEW: "new",
+    REASON_CHANGED: "changed",
+    REASON_REFRESH: "still open",
+}
+BREAKDOWN_PART = "{count} {label}"
+# One reason for every item: "(new)" for one, "(all new)" for several.
+BREAKDOWN_ALL = "all {label}"
+# How an item names what it is about.
+SUBJECT_NAMESPACED = "{name} ({namespace}) on {cluster}"
+SUBJECT_CLUSTER_WIDE = "{name} on {cluster}"
+SUBJECT_ZONE = "zone {name} on {cluster}"
+SUBJECT_COMPUTE_CLASS = "compute class {name} on {cluster}"
+RANK_KIND_PREFIX = "leeway.rank_"
+# What it says about it: the share of pods in the fullest zone (a rank
+# finding's share is the time spent on the class's last machine choice).
+ITEM_WORKLOAD = "{subject}: {pct}% of its pods in one zone; {cause}"
+ITEM_CLUSTER_WIDE = "{subject}: {pct}% in one zone; {cause}"
+ITEM_ZONE = "{subject}: {cause}"
+ITEM_RANK = "{subject}: {cause}"
+ITEM_RANK_WITH_SHARE = "{subject}: {cause} (last choice {pct}% of the time)"
+# leeway's suspectedCause (pkg/leeway/cause.go) and, for a rank finding, its
+# judging rule (pkg/leeway/rankjudge.go), in plain words. On a workload,
+# taint_exclusion and domain_outage are about an under-filled zone behind its
+# skew, not the zone it sits in, and say only what leeway measured there: a node
+# cordoned or tainted as the skew began, or at least half the nodes not ready.
+CAUSE_PHRASES: dict[str, str] = {
+    "constraint_ignored": "its zone spread rule is not being kept",
+    "volume_pinning": "zonal disks hold the pods there",
+    "domain_capacity_shortfall": "the other zones are out of room",
+    "taint_exclusion": "a node in another zone was cordoned or tainted",
+    "domain_outage": "another zone has nodes that are not ready",
+    "consolidation": "node consolidation packed the pods together",
+    "rollout_bias": "a rollout placed the pods unevenly",
+    "selector_confined": "its node selector allows only one zone",
+    "unknown": "no clear cause found",
+    "wedged": "pods are stuck with no allowed machines to run on",
+    "rank0-share": "too little time on its first machine choice",
+    "last-rank": "running on its last machine choice too long",
+    "no-migration": "not moving back to its preferred machines",
+    "tier-unused": "one of its machine choices is never used",
+    "rank-baseline": "running on lower machine choices than usual",
+}
+CAUSE_PHRASE_FALLBACK = "cause not identified"
+# On a zone finding the cause is about the zone itself (pkg/leeway/domain.go);
+# leeway's consolidation there only means the zone has no nodes, a guess at why.
+ZONE_CAUSE_PHRASES: dict[str, str] = {
+    "taint_exclusion": "it takes no new pods because every node is cordoned or tainted",
+    "domain_outage": "it takes no new pods because its nodes are not ready",
+    "consolidation": "it has no nodes left",
+}
 TOPIC_PUBLISH_FAILED_LINE = (
     "{prefix} watch: publishing to blackboard topic {topic} failed ({detail}); "
     "on upgraded installs, check `kubectl describe platformagent` for TopicsStateSubjectMissing "
@@ -1178,14 +1265,127 @@ def finding_trigger_reason(
     return None
 
 
+def clip_text(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, the cut marked with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(CHAT_ELLIPSIS)] + CHAT_ELLIPSIS
+
+
+def plural(nouns: tuple[str, str], count: int) -> str:
+    return nouns[count != 1]
+
+
+def is_rank_finding(item: dict[str, Any]) -> bool:
+    return str(item.get(KIND_FIELD) or "").startswith(RANK_KIND_PREFIX)
+
+
+def cause_phrase(cause: object, *, zone: bool = False) -> str:
+    """leeway's cause code (or a rank finding's rule) in plain words, worded for
+    a zone finding when `zone` is set."""
+    code = str(cause or DEFAULT_UNKNOWN)
+    if zone and code in ZONE_CAUSE_PHRASES:
+        return ZONE_CAUSE_PHRASES[code]
+    return CAUSE_PHRASES.get(code, CAUSE_PHRASE_FALLBACK)
+
+
 def short_finding_label(item: dict[str, Any]) -> str:
-    """Concise human label for chat lines."""
-    cluster_short = str(item.get("cluster") or "").rsplit("/", 1)[-1]
-    ns = str(item.get("namespace") or "")
-    name = str(item.get("subject_name") or "")
+    """What a finding is about, in plain words: the workload, zone or compute
+    class and the cluster it is on (`kube-dns (kube-system) on prod-east`)."""
+    cluster = clip_text(str(item.get(CLUSTER_FIELD) or "").rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1], CHAT_NAME_MAX_CHARS)
+    ns = str(item.get(NAMESPACE_FIELD) or "")
+    name = clip_text(str(item.get(SUBJECT_NAME_FIELD) or DEFAULT_UNKNOWN), CHAT_NAME_MAX_CHARS)
+    if str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE:
+        return SUBJECT_ZONE.format(name=name, cluster=cluster)
+    if is_rank_finding(item):
+        return SUBJECT_COMPUTE_CLASS.format(name=name, cluster=cluster)
     if ns and ns != CLUSTER_WIDE_NAMESPACE:
-        return f"{cluster_short}:{ns}/{name}"
-    return f"{cluster_short}:{name}"
+        return SUBJECT_NAMESPACED.format(name=name, namespace=clip_text(ns, CHAT_NAME_MAX_CHARS), cluster=cluster)
+    return SUBJECT_CLUSTER_WIDE.format(name=name, cluster=cluster)
+
+
+def due_chat_item(item: dict[str, Any]) -> str:
+    """One due finding as a chat item: what it is about, how concentrated, and why."""
+    subject = short_finding_label(item)
+    is_zone = str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE
+    cause = cause_phrase(item.get(SUSPECTED_CAUSE_FIELD), zone=is_zone)
+    pct = round(_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT) * PERCENT_SCALE)
+    ns = str(item.get(NAMESPACE_FIELD) or "")
+    if is_zone:
+        text = ITEM_ZONE.format(subject=subject, cause=cause)
+    elif is_rank_finding(item):
+        template = ITEM_RANK_WITH_SHARE if pct > 0 else ITEM_RANK
+        text = template.format(subject=subject, cause=cause, pct=pct)
+    elif ns and ns != CLUSTER_WIDE_NAMESPACE:
+        text = ITEM_WORKLOAD.format(subject=subject, pct=pct, cause=cause)
+    else:
+        text = ITEM_CLUSTER_WIDE.format(subject=subject, pct=pct, cause=cause)
+    if len(text) > CHAT_ITEM_MAX_CHARS:
+        head, join, cluster = subject.rpartition(SUBJECT_CLUSTER_JOIN)
+        tail = join + cluster + text[len(subject) :]
+        room = max(CHAT_ITEM_MAX_CHARS - len(tail), CHAT_SUBJECT_MIN_CHARS)
+        text = clip_text(head, room) + tail
+    return clip_text(text, CHAT_ITEM_MAX_CHARS)
+
+
+def chat_item_order(item: dict[str, Any]) -> tuple[int, bool, float, str]:
+    """Most severe first; at one severity a zone that takes no pods (the cause
+    of the skew around it), then the most concentrated; then by key."""
+    return (
+        -SEVERITY_RANKS.get(str(item.get(SEVERITY_FIELD) or ""), 0),
+        str(item.get(KIND_FIELD) or "") != FINDING_KIND_DOMAIN_UNAVAILABLE,
+        -_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT),
+        str(item.get(KEY_FIELD) or ""),
+    )
+
+
+def topic_summary(message: str) -> str:
+    """A chat message's headline as plain text: the summary other agents read
+    on the blackboard topic, which carries the report itself as data."""
+    headline = message.split(CHAT_LINE_SEPARATOR, 1)[0]
+    bold_open, bold_close = CHAT_HEADLINE.split("{text}")
+    if headline.startswith(bold_open) and headline.endswith(bold_close):
+        headline = headline[len(bold_open) : len(headline) - len(bold_close)]
+    return headline
+
+
+def chat_message(headline: str, items: list[str], tail: str = "") -> str:
+    """A bold headline, at most MAX_CHAT_ITEMS items and "and N more", then `tail`."""
+    lines = [CHAT_HEADLINE.format(text=headline)]
+    lines.extend(CHAT_ITEM.format(text=text) for text in items[:MAX_CHAT_ITEMS])
+    if len(items) > MAX_CHAT_ITEMS:
+        lines.append(CHAT_MORE_ITEM.format(count=len(items) - MAX_CHAT_ITEMS))
+    if tail:
+        lines.append(tail)
+    return CHAT_LINE_SEPARATOR.join(lines)
+
+
+def resolved_message(labels: list[str]) -> str:
+    """The chat message for findings that cleared, named by `short_finding_label`."""
+    count = len(labels)
+    headline = RESOLVED_HEADLINE.format(count=count, problems=plural(PROBLEM_NOUN, count), has=plural(HAS_VERB, count))
+    return chat_message(headline, labels)
+
+
+def due_message(due_items: list[dict[str, Any]], due_reasons: list[str], next_date: str) -> str:
+    """The chat message for findings due this tick: how many, where, and why."""
+    count = len(due_items)
+    clusters = sorted({str(item.get(CLUSTER_FIELD) or "") for item in due_items})
+    if len(clusters) == 1:
+        where = DUE_WHERE_CLUSTER.format(
+            cluster=clip_text(clusters[0].rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1], CHAT_NAME_MAX_CHARS)
+        )
+    else:
+        where = DUE_WHERE_CLUSTERS.format(count=len(clusters), clusters=plural(CLUSTER_NOUN, len(clusters)))
+    labels = [(label, due_reasons.count(reason)) for reason, label in REASON_LABELS.items() if reason in due_reasons]
+    if len(labels) == 1:
+        label = labels[0][0]
+        breakdown = label if count == 1 else BREAKDOWN_ALL.format(label=label)
+    else:
+        breakdown = LIST_SEPARATOR.join(BREAKDOWN_PART.format(count=n, label=label) for label, n in labels)
+    headline = DUE_HEADLINE.format(count=count, problems=plural(PROBLEM_NOUN, count), where=where, breakdown=breakdown)
+    items = [due_chat_item(item) for item in sorted(due_items, key=chat_item_order)]
+    return chat_message(headline, items, DUE_FOLLOW_UP.format(next_date=next_date))
 
 
 def due_finding_summary(item: dict[str, Any], *, include_cluster: bool) -> str:
@@ -2280,14 +2480,13 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         and announced.get(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY) != current_thresholds
     )
 
+    # The answer leads the post: what is due, then what cleared, then any
+    # status lines about the scan itself.
+    retired_line: str | None = None
+    report_line: str | None = None
     try:
         if retired_labels:
-            retired_line = RETIRED_LINE.format(
-                prefix=LINE_PREFIX,
-                count=len(retired_labels),
-                names=format_name_list(retired_labels),
-            )
-            lines.append(retired_line)
+            retired_line = resolved_message(retired_labels)
         if due_reasons:
             announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
             if thresholds_overridden:
@@ -2299,27 +2498,11 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             )
             md_path = write_report_files(home, report, markdown, moment)
             due_items = [active_findings[k] for k in sorted(due_reasons)]
-            due_clusters = sorted({item[CLUSTER_FIELD] for item in due_items})
-            multi_cluster = len(due_clusters) > 1
-            reasons_counts = {}
-            for r in due_reasons.values():
-                reasons_counts[r] = reasons_counts.get(r, 0) + 1
-            reasons_str = LIST_SEPARATOR.join(
-                REASON_COUNT_FORMAT.format(count=c, reason=r) for r, c in sorted(reasons_counts.items())
-            )
             next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
-            report_line = REPORT_LINE.format(
-                prefix=LINE_PREFIX,
-                due_count=len(due_reasons),
-                reasons=reasons_str,
-                cluster_count=len(due_clusters),
-                clusters=format_name_list(due_clusters),
-                names=format_name_list([due_finding_summary(i, include_cluster=multi_cluster) for i in due_items]),
-                path=md_path,
-                next_date=next_date,
+            report_line = due_message(due_items, [due_reasons[k] for k in sorted(due_reasons)], next_date)
+            published, err_detail = publish_blackboard_topic(
+                topic_summary(report_line), md_path.with_suffix(REPORT_JSON_SUFFIX)
             )
-            lines.append(report_line)
-            published, err_detail = publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
             record_topic_publish_result(published, err_detail, announced, lines)
         elif retired_labels and scan_errors:
             # A finding retired on a readable cluster during a partial scan (a
@@ -2336,7 +2519,9 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
                 report, active_findings, due_reasons, all_errors, moment, days, not_reached=not_reached
             )
             md_path = write_report_files(home, report, markdown, moment)
-            summary_line = retired_line if retired_labels else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
+            summary_line = (
+                topic_summary(retired_line) if retired_line else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
+            )
             published, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
             record_topic_publish_result(published, err_detail, announced, lines)
         elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not scan_errors:
@@ -2362,7 +2547,8 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         if announced:
             updated_ledger[ANNOUNCED_KEY] = announced
         save_ledger(home, updated_ledger)
-        lines = clear_tick_failure(home, dry_run=dry_run) + lines
+        messages = [message for message in (report_line, retired_line) if message]
+        lines = messages + clear_tick_failure(home, dry_run=dry_run) + lines
     except WriteFailed as exc:
         print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
         return WRITE_FAILED_EXIT

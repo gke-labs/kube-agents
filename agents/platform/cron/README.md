@@ -513,19 +513,28 @@ key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
 `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
 by cluster, class, judging rule and kind. A finding earns a report under
 `<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
-`latest.md` and `latest.json` symlinks) and a chat summary line naming up to
-six due subjects with their cause and share when it first appears, when its
-`suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
-or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
-of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
-clusters are retired with a single resolution line, while clusters whose scan
-failed or that were not reached retain their ledger entries so transient
-errors do not erase state and re-page tomorrow. A run with a finding due
-writes and publishes its own report, partial or not. The JSON report carries
-a `coverage` block: `clusters_swept`, `clusters_read`, and the projects
-`not_reached` or with `scan_errors` this run (each with its summary), since
-`summary` counts only the clusters read; a cluster missing from a partial
-report is unread, not clean. Every other rewrite of
+`latest.md` and `latest.json` symlinks) and a place in one chat message when
+it first appears, when its `suspectedCause` (a rank finding's `rule`) changes
+or its `severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. The
+message opens with a bold headline ("**2 pod placement problems on 2 clusters
+(1 new, 1 still open)**"), names up to three of them, most severe first, by
+workload, zone or compute class and cluster, with leeway's cause in plain
+words (`CAUSE_PHRASES` in the script) and a share where there is one (a
+workload's pods in one zone, a compute class's time on its last machine
+choice), adds "and N more" past that, and ends by pointing at the agent for
+fixes and with the date its findings are next posted if still open.
+The report's path on the pod is left out, since a chat reader cannot open it.
+Resolved findings on cleanly scanned (`status: "ok"`) clusters are retired
+under their own headline in the same post ("**1 pod placement problem has
+cleared**", then up to three names), while clusters whose scan failed or that
+were not reached retain their ledger entries so transient errors do not erase
+state and re-page tomorrow. Lines about the scan itself follow the headlines. A run
+with a finding due writes and publishes its own report, partial or not. The
+JSON report carries a `coverage` block: `clusters_swept`, `clusters_read`, and
+the projects `not_reached` or with `scan_errors` this run (each with its
+summary), since `summary` counts only the clusters read; a cluster missing
+from a partial report is unread, not clean. Every other rewrite of
 `latest.*` waits for a run that reads every project in full without a
 failure: the refresh after findings retire, a refresh deferred from an
 earlier run, and the one after a threshold override changes. A failed project
