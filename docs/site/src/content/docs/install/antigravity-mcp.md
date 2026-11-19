@@ -166,6 +166,8 @@ The other tools are `read_topics` (the install's standing topics and agent cards
 
 A question the install hands to a card, which is common for anything that reads a cluster, can come back first as a short acknowledgement such as "checking namespaces on the host cluster." The card's report arrives after `send_message` has returned. The answer ends with the `conversation_token` and `since` cursor to read it with: call `poll_events` with those two, and it returns the reports posted since that cursor. Set `wait_seconds` (60 at most) to have it wait for a report when none has arrived yet, and pass the cursor it returns on the next call. A `status` message on the same conversation lists the cards and whether each is done, but not what they found.
 
+To answer a report, send the next message with `reply_to` set to the task its heading gave as `on task`; the agent then reads that report before answering. That read happens on the [platform route](/kube-agents/concepts/chatops/#session), the install's default; a conversation on its own session pod does not read it yet.
+
 ## Troubleshooting
 
 The bridge answers a failed call with an error that names the tool, followed by the cause quoted below. It writes warnings to standard error. To see both outside Antigravity, run the bridge in a terminal with the same environment and send it a status call:

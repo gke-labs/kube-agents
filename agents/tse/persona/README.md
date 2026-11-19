@@ -55,9 +55,20 @@ What it holds:
   The platform-agent image's skill manifest does not hash its copy under
   `/opt/tse-template/persona`, because nothing in that image loads it.
 
-`instructions.md` is a rewrite, not a copy, so no test holds it to `SOUL.md`,
-`AGENTS.md` and `CAPABILITIES.md`: a rule added there has to be carried here
-by hand. The test pins the red lines it states.
+`instructions.md` is a rewrite, not a copy, so it isn't compared with
+`SOUL.md` and `AGENTS.md` whole. `tse_profile_drift_test.go`, beside the
+persona test, compares what has to agree:
+
+- **Shared text:** the passages both carry word for word, which are who the
+  agent is, the diagnostic loop's opening line and its first and third
+  stages, the Google-side escalation criteria, the self-audit gate and the
+  tone.
+- **Red lines:** every red line in `AGENTS.md`'s Scope & Red Lines,
+  `SOUL.md`'s Core Truths and this persona's §2, each carried to the other
+  home or left out there for a reason the test states. A rule added to one of
+  those sections fails the test until it's placed.
+- **Redaction:** the redaction red line against every rule in the skill's
+  Step 2.
 
 Left out of the Hermes profile's text, because a profile pod has none of it:
 the kanban loop (`kanban_*` calls and `$HERMES_KANBAN_TASK`; the result is the
