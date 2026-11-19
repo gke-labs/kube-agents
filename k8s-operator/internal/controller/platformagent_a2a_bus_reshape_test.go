@@ -386,3 +386,23 @@ func TestAReshapesPrincipalReachesTasksAlone(t *testing.T) {
 		}
 	}
 }
+
+// A bus whose monitor fails differently on each pass is one reason, so one
+// Event, not one per error text.
+func TestAnUnreadableBusIsOneReshapeEvent(t *testing.T) {
+	m := reshapeTrigger(t, 1)
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "n1"}
+	pass := 0
+	m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+		pass++
+		return nil, fmt.Errorf("dial tcp: i/o timeout after %d ms", 1000+pass)
+	}
+	for i := 0; i < 3; i++ {
+		if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ev := m.reshapeEvents(); len(ev) != 1 {
+		t.Errorf("%d Events over three passes with varying errors, want 1: %q", len(ev), ev)
+	}
+}
