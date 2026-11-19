@@ -289,21 +289,17 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			return warnings, fmt.Errorf("stream %s: %w", name, err)
 		}
 		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
-		// Drift is of the stream as it is restored. Going forward that is
-		// the config the restore sends; and where the policy renders a
-		// max_consumers, the policy decides it, as it does max_bytes: the
-		// restore sends at least the CR's width and the read-back holds the
-		// stream to what it sent, so a width that differs from the fresh
-		// install's (the default CR's) is the CR's, not drift. The way back
+		// Going forward, a policy that renders max_consumers decides it, as
+		// it does max_bytes: the restore sends at least the CR's width
+		// (withRenderedLimits) and the read-back holds the stream to what it
+		// sent, so a width other than the fresh install's (the default CR's)
+		// is the CR's, not drift, and is left out of it. The way back
 		// restores the snapshot as it was and reports it as it was.
-		restored := meta.Config
-		if replicas > 1 {
-			restored = withRenderedLimits(meta.Config, policy)
-			if ref, ok := fresh.Streams[name]; ok && policy.MaxConsumers != 0 {
-				restored.MaxConsumers = ref.MaxConsumers
-			}
+		compared := meta.Config
+		if ref, ok := fresh.Streams[name]; ok && replicas > 1 && policy.MaxConsumers != 0 {
+			compared.MaxConsumers = ref.MaxConsumers
 		}
-		warnings = append(warnings, fresh.OutsidePolicyDrift(restored)...)
+		warnings = append(warnings, fresh.OutsidePolicyDrift(compared)...)
 		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) } // #nosec G304 -- under the Job's own --snapshot-dir
 		// What a restored stream is held to: the render's limits going
 		// forward, the snapshot's own on the way back (RestoreAsItWas).
