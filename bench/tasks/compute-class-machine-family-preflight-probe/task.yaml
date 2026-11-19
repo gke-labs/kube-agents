@@ -2,15 +2,17 @@
 # before proposing a machine-family migration (such as migrating a legacy N1
 # node pool to N4), the worker runs /opt/data/scripts/machine_family_preflight.py
 # against the source pool configuration and target family (`n4`) and surfaces
-# incompatible Shielded VM / Secure Boot / vTPM settings, Persistent Disk
-# (`pd-standard`) versus Hyperdisk (`hyperdisk-balanced`), and Local SSD
-# (`localSsdCount: 2`, unsupported on N4) blockers before generating any
-# ComputeClass or NodePool YAML.
+# the validator's verdict (`VERDICT: INCOMPATIBLE`) and exact blocker rule IDs
+# (`shielded-vtpm-disabled`, `shielded-secure-boot-disabled`,
+# `disk-type-pd-on-hyperdisk-only`, and `local-ssd-unsupported-on-n4`) before
+# generating any ComputeClass or NodePool YAML.
 #
 # On main, `machine_family_preflight.py` is neither staged in the sandbox image
-# nor referenced in `gke-compute-classes/SKILL.md`, so the `worker_commands`
-# objective (`the-machine-family-preflight-validator-ran`) fails red by
-# construction.
+# nor referenced in `gke-compute-classes/SKILL.md`, so both the `worker_commands`
+# objective (`the-machine-family-preflight-validator-ran`) and the rule-ID
+# report check (`the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers`,
+# whose required rule IDs appear in neither the prompt nor main's skill text)
+# fail red by construction.
 #
 # Planted defect required: none. deployer: noop, no fixture, no cluster read.
 # Isolation class: read-only (no cluster touched at all).
@@ -30,17 +32,17 @@ prompt: >-
   Load the installed `gke-compute-classes` skill and run its pre-flight
   machine-family migration validator script against this source node pool JSON
   for target family `n4` before generating any YAML. If you delegate this task
-  to another agent, pass the JSON and instructions verbatim. Report the
-  validator's verdict (`VERDICT: INCOMPATIBLE` or `VERDICT: COMPATIBLE`), every
-  security, disk, and Local SSD blocker rule ID and remediation, and what must
-  change before migrating to `n4`. Do not apply anything.
+  to another agent, pass the JSON and instructions verbatim. Include the
+  validator's exact verdict line, every blocker rule ID it emitted, and the
+  remediation required before migrating to `n4`. Do not apply anything.
 expected_output: >-
   The Platform Agent loads `gke-compute-classes`, runs
   `/opt/data/scripts/machine_family_preflight.py` against `legacy-n1-pool`'s
   JSON with `--target-family n4`, and reports `VERDICT: INCOMPATIBLE` with four
   blockers before proposing any YAML:
   (1) `shielded-vtpm-disabled` (`shieldedInstanceConfig.enableVtpm=false` is
-  rejected on `n4` and violates the security floor; enable vTPM),
+  rejected on `n4` and violates the security floor; remove `enableVtpm: false`
+  and keep `shieldedNodes.enabled: true` and `enableIntegrityMonitoring: true`),
   (2) `shielded-secure-boot-disabled` (`shieldedInstanceConfig.enableSecureBoot=false`
   violates the baseline node security floor; verify no unsigned kernel modules
   and enable Secure Boot),
@@ -60,45 +62,26 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      after_result_pattern: '[\s\S]'
+      # Read each tagged `terminal` call as typed alongside the card log;
+      # `(?! )` never opens a post-call window so a single-command worker turn
+      # is graded directly by `required_runs`.
+      after_result_pattern: "(?!)"
       required_runs:
         - script: machine_family_preflight.py
-      forbidden_result_patterns:
-        - 'machine_family_preflight\.py[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
-        - "can't open file '[^']*machine_family_preflight\\.py'"
   - name: the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers
     role: objective
     mode: assert
     check:
-      type: all
-      checks:
-        - type: report_contains
-          any_of_phrases:
-            - "VERDICT: INCOMPATIBLE"
-            - "shielded-vtpm-disabled"
-            - "shielded-secure-boot-disabled"
-          forbidden_phrases:
-            - "VERDICT: COMPATIBLE"
-        - type: report_contains
-          any_of_phrases:
-            - "enableVtpm"
-            - "vTPM"
-            - "shielded-vtpm-disabled"
-        - type: report_contains
-          any_of_phrases:
-            - "enableSecureBoot"
-            - "Secure Boot"
-            - "shielded-secure-boot-disabled"
-        - type: report_contains
-          any_of_phrases:
-            - "disk-type-pd-on-hyperdisk-only"
-            - "hyperdisk-balanced"
-            - "Hyperdisk"
-        - type: report_contains
-          any_of_phrases:
-            - "local-ssd-unsupported-on-n4"
-            - "localSsdCount"
-            - "Local SSD"
+      type: report_contains
+      required_phrases:
+        - "VERDICT: INCOMPATIBLE"
+        - "shielded-vtpm-disabled"
+        - "shielded-secure-boot-disabled"
+        - "disk-type-pd-on-hyperdisk-only"
+        - "local-ssd-unsupported-on-n4"
+        - "hyperdisk-balanced"
+      forbidden_phrases:
+        - "VERDICT: COMPATIBLE"
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic

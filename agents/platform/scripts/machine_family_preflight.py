@@ -51,10 +51,15 @@ EXIT_READ_ERROR = 2
 GCLOUD_BIN = "gcloud"
 GCLOUD_TIMEOUT_SECONDS = 60
 JSON_FORMAT_FLAG = "--format=json"
+# Disables retry sleeps in the sandbox's credential-proxy shim so a broker
+# refusal returns immediately instead of retrying past GCLOUD_TIMEOUT_SECONDS.
+SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
+SHIM_NO_RETRY_DEADLINE = "0"
 PROJECT_ENV_VARS = ("GKE_PROJECT_ID", "GCP_PROJECT_ID", "PROJECT_ID")
 STDIN_MARKER = "-"
 INLINE_JSON_PREFIXES = ("{", "[")
 OUTPUT_TMP_PREFIX = ".machine-family-preflight-"
+OUTPUT_TMP_SUFFIX = ".json"
 JSON_INDENT = 2
 
 FAMILY_N1 = "n1"
@@ -67,6 +72,7 @@ FAMILY_C4 = "c4"
 DEFAULT_SOURCE_MACHINE_TYPE = "e2-medium"
 MACHINE_TYPE_SEPARATOR = "-"
 COMMA_SEPARATOR = ","
+GKE_BUILD_MARKER = "-gke."
 
 SUPPORTED_TARGET_FAMILIES = (
     FAMILY_N2,
@@ -128,6 +134,11 @@ C3_TDX_ALLOWED_SHAPE_PREFIX = "c3-standard-"
 
 # GKE / Config Connector / Terraform field names.
 FIELD_NAME = "name"
+FIELD_METADATA = "metadata"
+FIELD_SPEC = "spec"
+FIELD_RESOURCE_ID = "resourceID"
+FIELD_LOCATION = "location"
+FIELD_STORAGE = "storage"
 FIELD_NODE_POOLS = "nodePools"
 FIELD_NODE_POOLS_SNAKE = "node_pools"
 FIELD_CONFIG = "config"
@@ -155,6 +166,8 @@ FIELD_DATA_CACHE_COUNT = "dataCacheCount"
 FIELD_DATA_CACHE_COUNT_SNAKE = "data_cache_count"
 FIELD_SHIELDED_NODES = "shieldedNodes"
 FIELD_SHIELDED_NODES_SNAKE = "shielded_nodes"
+FIELD_ENABLE_SHIELDED_NODES = "enableShieldedNodes"
+FIELD_ENABLE_SHIELDED_NODES_SNAKE = "enable_shielded_nodes"
 FIELD_SHIELDED_INSTANCE_CONFIG = "shieldedInstanceConfig"
 FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE = "shielded_instance_config"
 FIELD_ENABLE_SECURE_BOOT = "enableSecureBoot"
@@ -180,7 +193,9 @@ FIELD_MASTER_VERSION_SNAKE = "current_master_version"
 FIELD_VERSION = "version"
 FIELD_NODE_VERSION = "currentNodeVersion"
 FIELD_INITIAL_NODE_VERSION = "initialNodeVersion"
+FIELD_ACCELERATORS = "accelerators"
 FIELD_GUEST_ACCELERATORS = "guestAccelerators"
+FIELD_GUEST_ACCELERATOR_KCC = "guestAccelerator"
 FIELD_GUEST_ACCELERATORS_SNAKE = "guest_accelerator"
 FIELD_ACCELERATOR_COUNT = "acceleratorCount"
 FIELD_ACCELERATOR_COUNT_SNAKE = "count"
@@ -348,7 +363,7 @@ def _version_below_floor(version_text: str, floor_text: str) -> bool:
         return False
     if parsed is None:
         return True
-    if "-gke." not in version_text.strip():
+    if GKE_BUILD_MARKER not in version_text.strip():
         return parsed[:3] < floor[:3]
     return parsed < floor
 
@@ -365,7 +380,7 @@ def parse_target_spec(raw_spec: str) -> tuple[str, str]:
     """Return `(target_family, target_machine_type)` from a `--target-family` token.
 
     Accepts either a bare family (`n4`, `c3`) or a concrete machine shape
-    (`c3-standard-8-lssd`, `n4-standard-16`).Raises ValueError if the family is
+    (`c3-standard-8-lssd`, `n4-standard-16`). Raises ValueError if the family is
     not in SUPPORTED_TARGET_FAMILIES.
     """
     cleaned = (raw_spec or "").strip().lower()
@@ -390,6 +405,62 @@ def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _safe_positive_int(value: Any) -> int:
+    """Parse a positive integer from `int` or numeric `str` (Proto3 int64), else 0."""
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+            return parsed if parsed > 0 else 0
+        except ValueError:
+            return 0
+    return 0
+
+
+def _extract_pool_name(node_pool: dict[str, Any]) -> str:
+    """Extract the node pool name from a GKE, KCC (`spec.resourceID`/`metadata.name`), or Terraform dict."""
+    direct = node_pool.get(FIELD_NAME)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    spec = node_pool.get(FIELD_SPEC)
+    if isinstance(spec, dict):
+        res_id = spec.get(FIELD_RESOURCE_ID)
+        if isinstance(res_id, str) and res_id.strip():
+            return res_id.strip()
+    metadata = node_pool.get(FIELD_METADATA)
+    if isinstance(metadata, dict):
+        meta_name = metadata.get(FIELD_NAME)
+        if isinstance(meta_name, str) and meta_name.strip():
+            return meta_name.strip()
+    return ""
+
+
+def _extract_pool_version(node_pool: dict[str, Any]) -> str:
+    """Extract the GKE node version from top-level fields or KCC `spec.version`."""
+    raw = _first_present(
+        node_pool,
+        FIELD_VERSION,
+        FIELD_NODE_VERSION,
+        FIELD_INITIAL_NODE_VERSION,
+    )
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    spec = node_pool.get(FIELD_SPEC)
+    if isinstance(spec, dict):
+        spec_ver = _first_present(
+            spec,
+            FIELD_VERSION,
+            FIELD_NODE_VERSION,
+            FIELD_INITIAL_NODE_VERSION,
+        )
+        if isinstance(spec_ver, str) and spec_ver.strip():
+            return spec_ver.strip()
+    return ""
+
+
 def _node_config_of(node_pool: dict[str, Any]) -> dict[str, Any]:
     """Return the node configuration dict from a GKE, KCC, or Terraform pool object."""
     nested = _first_present(
@@ -400,7 +471,7 @@ def _node_config_of(node_pool: dict[str, Any]) -> dict[str, Any]:
     )
     if isinstance(nested, dict):
         return nested
-    spec = node_pool.get("spec")
+    spec = node_pool.get(FIELD_SPEC)
     if isinstance(spec, dict):
         spec_config = _first_present(
             spec,
@@ -433,7 +504,7 @@ def _extract_boot_disk_type(config: dict[str, Any]) -> str:
         )
         if isinstance(nested, str) and nested.strip():
             return nested.strip().lower()
-    storage = config.get("storage")
+    storage = config.get(FIELD_STORAGE)
     if isinstance(storage, dict):
         nested_storage = _first_present(
             storage,
@@ -446,16 +517,28 @@ def _extract_boot_disk_type(config: dict[str, Any]) -> str:
     return ""
 
 
+def _default_cvm_type_for_family(source_family: str) -> str:
+    """Return the platform's default Confidential VM technology when omitted by `describe`."""
+    if source_family == FAMILY_C3:
+        return CVM_TYPE_TDX
+    if source_family == FAMILY_N2D:
+        return CVM_TYPE_SEV
+    return ""
+
+
 def _extract_cvm_state(
     config: dict[str, Any],
     cluster: dict[str, Any] | None,
+    source_family: str = "",
 ) -> tuple[bool, str, str]:
     """Return `(cvm_enabled, matched_cvm_type, field_path)` from pool and cluster.
 
-    Maps the raw encryption technology string against `KNOWN_CVM_TYPES` so only
-    a constant literal from `KNOWN_CVM_TYPES` is returned.
+    A node-pool level explicit `enabled: false` (or `enableConfidentialCompute:
+    false`) overrides cluster-level Confidential Nodes. Maps the raw encryption
+    technology string against `KNOWN_CVM_TYPES` so only a constant literal from
+    `KNOWN_CVM_TYPES` is returned.
     """
-    sources: list[tuple[str, Any]] = [
+    pool_sources: list[tuple[str, Any]] = [
         (
             f"config.{FIELD_CVM_NODES}",
             _first_present(config, FIELD_CVM_NODES, FIELD_CVM_NODES_SNAKE),
@@ -465,8 +548,9 @@ def _extract_cvm_state(
             _first_present(config, FIELD_CVM_CONFIG, FIELD_CVM_CONFIG_SNAKE),
         ),
     ]
+    cluster_sources: list[tuple[str, Any]] = []
     if isinstance(cluster, dict):
-        sources.extend(
+        cluster_sources.extend(
             [
                 (
                     f"cluster.{FIELD_CVM_NODES}",
@@ -479,10 +563,13 @@ def _extract_cvm_state(
             ]
         )
 
-    for path_label, block in sources:
+    for path_label, block in pool_sources + cluster_sources:
+        is_pool_level = path_label.startswith("config.")
         if isinstance(block, bool):
             if block:
-                return True, "", path_label
+                return True, _default_cvm_type_for_family(source_family), path_label
+            if is_pool_level:
+                return False, "", ""
             continue
         if not isinstance(block, dict):
             continue
@@ -506,8 +593,11 @@ def _extract_cvm_state(
         has_active_kind = bool(
             normalized_kind and normalized_kind != CVM_TYPE_UNSPECIFIED
         )
+        if enabled_flag is False and is_pool_level:
+            return False, "", ""
         if enabled_flag is True or (enabled_flag is not False and has_active_kind):
-            return True, matched_kind, path_label
+            effective_kind = matched_kind or _default_cvm_type_for_family(source_family)
+            return True, effective_kind, path_label
     return False, "", ""
 
 
@@ -525,8 +615,9 @@ def _extract_local_ssd_configs(
         FIELD_LOCAL_SSD_COUNT_SNAKE,
         FIELD_LOCAL_SSD_COUNT_CC,
     )
-    if isinstance(raw_legacy, int) and not isinstance(raw_legacy, bool) and raw_legacy > 0:
-        details.append(f"{FIELD_LOCAL_SSD_COUNT}={raw_legacy}")
+    legacy_count = _safe_positive_int(raw_legacy)
+    if legacy_count > 0:
+        details.append(f"{FIELD_LOCAL_SSD_COUNT}={legacy_count}")
         has_legacy_count = True
 
     ephemeral_lssd = _first_present(
@@ -535,29 +626,20 @@ def _extract_local_ssd_configs(
         FIELD_EPHEMERAL_LOCAL_SSD_SNAKE,
     )
     if isinstance(ephemeral_lssd, dict):
-        count = _first_present(
-            ephemeral_lssd,
-            FIELD_LOCAL_SSD_COUNT,
-            FIELD_LOCAL_SSD_COUNT_SNAKE,
-        )
-        cache_count = _first_present(
-            ephemeral_lssd,
-            FIELD_DATA_CACHE_COUNT,
-            FIELD_DATA_CACHE_COUNT_SNAKE,
-        )
-        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        count_keys = (FIELD_LOCAL_SSD_COUNT, FIELD_LOCAL_SSD_COUNT_SNAKE)
+        cache_keys = (FIELD_DATA_CACHE_COUNT, FIELD_DATA_CACHE_COUNT_SNAKE)
+        has_any_count_key = any(k in ephemeral_lssd for k in (*count_keys, *cache_keys))
+        count = _safe_positive_int(_first_present(ephemeral_lssd, *count_keys))
+        cache_count = _safe_positive_int(_first_present(ephemeral_lssd, *cache_keys))
+        if count > 0:
             details.append(
                 f"{FIELD_EPHEMERAL_LOCAL_SSD}.{FIELD_LOCAL_SSD_COUNT}={count}"
             )
-        elif (
-            isinstance(cache_count, int)
-            and not isinstance(cache_count, bool)
-            and cache_count > 0
-        ):
+        if cache_count > 0:
             details.append(
                 f"{FIELD_EPHEMERAL_LOCAL_SSD}.{FIELD_DATA_CACHE_COUNT}={cache_count}"
             )
-        elif ephemeral_lssd:
+        if not has_any_count_key and ephemeral_lssd:
             details.append(FIELD_EPHEMERAL_LOCAL_SSD)
 
     nvme_block = _first_present(
@@ -566,14 +648,12 @@ def _extract_local_ssd_configs(
         FIELD_NVME_SSD_BLOCK_SNAKE,
     )
     if isinstance(nvme_block, dict):
-        count = _first_present(
-            nvme_block,
-            FIELD_LOCAL_SSD_COUNT,
-            FIELD_LOCAL_SSD_COUNT_SNAKE,
-        )
-        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        count_keys = (FIELD_LOCAL_SSD_COUNT, FIELD_LOCAL_SSD_COUNT_SNAKE)
+        has_count_key = any(k in nvme_block for k in count_keys)
+        count = _safe_positive_int(_first_present(nvme_block, *count_keys))
+        if count > 0:
             details.append(f"{FIELD_NVME_SSD_BLOCK}.{FIELD_LOCAL_SSD_COUNT}={count}")
-        elif nvme_block:
+        elif not has_count_key and nvme_block:
             details.append(FIELD_NVME_SSD_BLOCK)
 
     ephemeral_storage = _first_present(
@@ -582,12 +662,14 @@ def _extract_local_ssd_configs(
         FIELD_EPHEMERAL_STORAGE_SNAKE,
     )
     if isinstance(ephemeral_storage, dict):
-        count = _first_present(
-            ephemeral_storage,
-            FIELD_LOCAL_SSD_COUNT,
-            FIELD_LOCAL_SSD_COUNT_SNAKE,
+        count = _safe_positive_int(
+            _first_present(
+                ephemeral_storage,
+                FIELD_LOCAL_SSD_COUNT,
+                FIELD_LOCAL_SSD_COUNT_SNAKE,
+            )
         )
-        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        if count > 0:
             details.append(f"{FIELD_EPHEMERAL_STORAGE}.{FIELD_LOCAL_SSD_COUNT}={count}")
 
     if source_machine_type.lower().endswith(LSSD_MACHINE_SUFFIX):
@@ -599,6 +681,7 @@ def _extract_local_ssd_configs(
 def _evaluate_security(
     config: dict[str, Any],
     cluster: dict[str, Any] | None,
+    source_family: str,
     target_family: str,
     target_machine_type: str,
 ) -> list[Finding]:
@@ -607,15 +690,32 @@ def _evaluate_security(
 
     if target_family in SHIELDED_ONLY_FAMILIES:
         if isinstance(cluster, dict):
+            has_shielded_block = (
+                FIELD_SHIELDED_NODES in cluster
+                or FIELD_SHIELDED_NODES_SNAKE in cluster
+            )
             shielded_nodes = _first_present(
                 cluster,
                 FIELD_SHIELDED_NODES,
                 FIELD_SHIELDED_NODES_SNAKE,
             )
-            if (
-                isinstance(shielded_nodes, dict)
-                and shielded_nodes.get(FIELD_ENABLED) is False
-            ):
+            flat_shielded = _first_present(
+                cluster,
+                FIELD_ENABLE_SHIELDED_NODES,
+                FIELD_ENABLE_SHIELDED_NODES_SNAKE,
+            )
+            # GKE's Proto3 JSON serializer omits `enabled: false`, serializing a
+            # disabled `shieldedNodes` message as `{}`.
+            shielded_disabled = (
+                (
+                    has_shielded_block
+                    and isinstance(shielded_nodes, dict)
+                    and shielded_nodes.get(FIELD_ENABLED) is not True
+                )
+                or shielded_nodes is False
+                or flat_shielded is False
+            )
+            if shielded_disabled:
                 blockers.append(
                     Finding(
                         rule=RULE_SHIELDED_NODES_DISABLED,
@@ -670,9 +770,12 @@ def _evaluate_security(
                             "forbids disabling vTPM."
                         ),
                         remediation=(
-                            f"Set {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_VTPM}: true "
-                            "(or omit the override so GKE defaults it to true) on the "
-                            f"replacement node pool or ComputeClass targeting {target_family}."
+                            f"Remove {FIELD_ENABLE_VTPM}: false from the source configuration, "
+                            f"ensure cluster {FIELD_SHIELDED_NODES}.{FIELD_ENABLED} is true, and "
+                            f"keep {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}: true "
+                            f"on the target {target_family} node pool or ComputeClass (GKE enables "
+                            "vTPM automatically on Shielded GKE Nodes and does not accept an "
+                            "enableVtpm field in ComputeClass or NodePool YAML)."
                         ),
                     )
                 )
@@ -682,7 +785,10 @@ def _evaluate_security(
                 FIELD_ENABLE_INTEGRITY,
                 FIELD_ENABLE_INTEGRITY_SNAKE,
             )
-            if integrity is False:
+            # In GKE's ShieldedInstanceConfig Proto3 JSON (which carries only
+            # enableSecureBoot and enableIntegrityMonitoring, no enableVtpm), a
+            # false boolean is omitted from the serialized object.
+            if integrity is False or (integrity is None and vtpm is None):
                 blockers.append(
                     Finding(
                         rule=RULE_SHIELDED_INTEGRITY_DISABLED,
@@ -707,7 +813,7 @@ def _evaluate_security(
                 FIELD_ENABLE_SECURE_BOOT,
                 FIELD_ENABLE_SECURE_BOOT_SNAKE,
             )
-            if secure_boot is False:
+            if secure_boot is False or (secure_boot is None and vtpm is None):
                 blockers.append(
                     Finding(
                         rule=RULE_SHIELDED_SECURE_BOOT_DISABLED,
@@ -728,7 +834,11 @@ def _evaluate_security(
                     )
                 )
 
-    cvm_enabled, cvm_type, cvm_field = _extract_cvm_state(config, cluster)
+    cvm_enabled, cvm_type, cvm_field = _extract_cvm_state(
+        config,
+        cluster,
+        source_family=source_family,
+    )
     if cvm_enabled:
         if target_family in NON_CVM_FAMILIES:
             blockers.append(
@@ -769,10 +879,10 @@ def _evaluate_security(
                         ),
                     )
                 )
-            elif (
-                target_machine_type
-                and not target_machine_type.startswith(C3_TDX_ALLOWED_SHAPE_PREFIX)
-            ) or target_machine_type.endswith(LSSD_MACHINE_SUFFIX):
+            if target_machine_type and (
+                not target_machine_type.startswith(C3_TDX_ALLOWED_SHAPE_PREFIX)
+                or target_machine_type.endswith(LSSD_MACHINE_SUFFIX)
+            ):
                 blockers.append(
                     Finding(
                         rule=RULE_CVM_TECHNOLOGY_MISMATCH,
@@ -975,7 +1085,8 @@ def _evaluate_disk_and_local_ssd(
                         ),
                     )
                 )
-            elif has_legacy_lssd_count:
+            if has_legacy_lssd_count:
+                shape_label = target_machine_type or f"{target_family}-*-lssd"
                 blockers.append(
                     Finding(
                         rule=RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4,
@@ -983,7 +1094,7 @@ def _evaluate_disk_and_local_ssd(
                         field=FIELD_LOCAL_SSD_COUNT,
                         message=(
                             f"Source node pool sets legacy {FIELD_LOCAL_SSD_COUNT} "
-                            f"({joined_details}), which is rejected on {target_machine_type} "
+                            f"({joined_details}), which is rejected on {shape_label} "
                             f"because {target_family} '*-lssd' shapes bundle a fixed Local SSD "
                             "count determined by the machine type."
                         ),
@@ -991,14 +1102,16 @@ def _evaluate_disk_and_local_ssd(
                             f"Omit legacy {FIELD_LOCAL_SSD_COUNT} and configure "
                             f"{FIELD_EPHEMERAL_LOCAL_SSD} or {FIELD_NVME_SSD_BLOCK} "
                             f"(or ComputeClass ephemeralLocalSsdProfile / dedicatedLocalSsdProfile) "
-                            f"matching {target_machine_type}'s bundled NVMe disks."
+                            f"matching {shape_label}'s bundled NVMe disks."
                         ),
                     )
                 )
 
     accelerators = _first_present(
         config,
+        FIELD_ACCELERATORS,
         FIELD_GUEST_ACCELERATORS,
+        FIELD_GUEST_ACCELERATOR_KCC,
         FIELD_GUEST_ACCELERATORS_SNAKE,
     )
     if isinstance(accelerators, list):
@@ -1006,13 +1119,12 @@ def _evaluate_disk_and_local_ssd(
             acc
             for acc in accelerators
             if isinstance(acc, dict)
-            and int(
+            and _safe_positive_int(
                 _first_present(
                     acc,
                     FIELD_ACCELERATOR_COUNT,
                     FIELD_ACCELERATOR_COUNT_SNAKE,
                 )
-                or 0
             )
             > 0
         ]
@@ -1021,16 +1133,16 @@ def _evaluate_disk_and_local_ssd(
                 Finding(
                     rule=RULE_GPU_UNSUPPORTED_ON_TARGET,
                     category=CATEGORY_ACCELERATOR,
-                    field=FIELD_GUEST_ACCELERATORS,
+                    field=FIELD_ACCELERATORS,
                     message=(
-                        f"Source node pool attaches guest accelerators ({FIELD_GUEST_ACCELERATORS}), "
+                        f"Source node pool attaches guest accelerators ({FIELD_ACCELERATORS}), "
                         f"which cannot be attached to general-purpose/compute-optimized target "
                         f"family {target_family}."
                     ),
                     remediation=(
                         "Use an accelerator-optimized GKE machine family (such as g2, a2, or a3) "
-                        f"for GPU workloads, or remove {FIELD_GUEST_ACCELERATORS} before "
-                        f"migrating CPU workloads to {target_family}."
+                        f"for GPU workloads, or remove {FIELD_ACCELERATORS} / {FIELD_GUEST_ACCELERATORS} "
+                        f"before migrating CPU workloads to {target_family}."
                     ),
                 )
             )
@@ -1065,15 +1177,7 @@ def _evaluate_versions_and_os_image(
         if isinstance(raw_master, str):
             control_plane_version = raw_master.strip()
 
-    node_version = ""
-    raw_node_ver = _first_present(
-        node_pool,
-        FIELD_VERSION,
-        FIELD_NODE_VERSION,
-        FIELD_INITIAL_NODE_VERSION,
-    )
-    if isinstance(raw_node_ver, str):
-        node_version = raw_node_ver.strip()
+    node_version = _extract_pool_version(node_pool)
 
     family_floor = MIN_GKE_VERSIONS[target_family]
     if control_plane_version and _version_below_floor(control_plane_version, family_floor):
@@ -1112,7 +1216,11 @@ def _evaluate_versions_and_os_image(
             )
         )
 
-    cvm_enabled, cvm_type, _ = _extract_cvm_state(config, cluster)
+    cvm_enabled, cvm_type, _ = _extract_cvm_state(
+        config,
+        cluster,
+        source_family=source_family,
+    )
     if target_family == FAMILY_C3 and (cvm_enabled or cvm_type == CVM_TYPE_TDX):
         for ver_label, field_name, ver_value in (
             ("control-plane", FIELD_MASTER_VERSION, control_plane_version),
@@ -1240,7 +1348,7 @@ def _evaluate_versions_and_os_image(
                     category=CATEGORY_OS_IMAGE,
                     field=FIELD_IMAGE_TYPE,
                     message=(
-                        f"Source node pool uses unsupported OS image '{raw_image.strip()}' "
+                        f"Source node pool uses unsupported OS image '{raw_image.strip()}', "
                         f"for target family {target_family} "
                         f"(supported Linux images: {', '.join(ALLOWED_LINUX_IMAGES)})."
                     ),
@@ -1276,7 +1384,7 @@ def evaluate_node_pool_transition(
             )
 
     config = _node_config_of(node_pool)
-    pool_name = str(node_pool.get(FIELD_NAME) or UNNAMED_POOL).strip() or UNNAMED_POOL
+    pool_name = _extract_pool_name(node_pool) or UNNAMED_POOL
     raw_machine_type = _first_present(
         config,
         FIELD_MACHINE_TYPE,
@@ -1294,6 +1402,7 @@ def evaluate_node_pool_transition(
         _evaluate_security(
             config,
             cluster,
+            source_family,
             parsed_family,
             effective_target_shape,
         )
@@ -1329,7 +1438,8 @@ def evaluate_node_pool_transition(
 
 
 def _default_runner(timeout: int = GCLOUD_TIMEOUT_SECONDS) -> Runner:
-    """Execute a read-only gcloud command with a timeout."""
+    """Execute a read-only gcloud command with a timeout and shim retries disabled."""
+    child_env = {SHIM_RETRY_DEADLINE_ENV: SHIM_NO_RETRY_DEADLINE, **os.environ}
 
     def run(argv: list[str]) -> tuple[int, str, str]:
         try:
@@ -1339,6 +1449,7 @@ def _default_runner(timeout: int = GCLOUD_TIMEOUT_SECONDS) -> Runner:
                 text=True,
                 timeout=timeout,
                 check=False,
+                env=child_env,
             )
             return completed.returncode, completed.stdout, completed.stderr
         except subprocess.TimeoutExpired as exc:
@@ -1479,7 +1590,7 @@ def _write_output_atomic(path_str: str, payload: dict[str, Any]) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=OUTPUT_TMP_PREFIX,
-        suffix=".json",
+        suffix=OUTPUT_TMP_SUFFIX,
         dir=str(target_path.parent),
     )
     try:
@@ -1659,9 +1770,9 @@ def run_preflight(
         requested_names = [n.strip() for n in (node_pool_names or []) if n.strip()]
         if requested_names:
             by_name = {
-                str(p.get(FIELD_NAME) or "").strip(): p
+                _extract_pool_name(p): p
                 for p in cluster_pools
-                if p.get(FIELD_NAME)
+                if _extract_pool_name(p)
             }
             for req_name in requested_names:
                 if req_name in by_name:
@@ -1699,9 +1810,9 @@ def run_preflight(
         requested_names = [n.strip() for n in node_pool_names if n.strip()]
         if requested_names:
             by_name = {
-                str(p.get(FIELD_NAME) or "").strip(): p
+                _extract_pool_name(p): p
                 for p in pools_to_check
-                if p.get(FIELD_NAME)
+                if _extract_pool_name(p)
             }
             filtered: list[dict[str, Any]] = []
             for req_name in requested_names:
@@ -1759,7 +1870,11 @@ def run_preflight(
     )
     effective_location = (
         location
-        or (str(cluster_doc.get("location") or "") if isinstance(cluster_doc, dict) else "")
+        or (
+            str(cluster_doc.get(FIELD_LOCATION) or "")
+            if isinstance(cluster_doc, dict)
+            else ""
+        )
     )
 
     if errors:
