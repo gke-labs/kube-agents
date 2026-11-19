@@ -6918,12 +6918,21 @@ def test_an_unset_gitops_repo_is_a_setup_problem_not_the_models(monkeypatch):
         assert expanded == prompt
 
 
-def test_a_run_whose_prompt_names_the_gitops_repo_without_one_is_a_setup_failure(monkeypatch):
-    monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_a_run_whose_prompt_names_the_gitops_repo_without_one_is_a_setup_failure(monkeypatch, value):
+    # Infrastructure naming the variable, and nothing sent: an empty repository
+    # is never rendered into the prompt.
+    if value is None:
+        monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+    else:
+        monkeypatch.setenv("BENCH_GITOPS_REPO", value)
+    sent: list[str] = []
+    monkeypatch.setattr(harness.inject, "_request", lambda url, *a, **k: sent.append(url) or {})
     result = harness.KubeAgentsHarness().run("open it on {{BENCH_GITOPS_REPO}}")
     assert result.output == ""
     assert result.errors and result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "BENCH_GITOPS_REPO" in result.errors[0]
+    assert sent == []
 
 
 # ------------------------------------------------ a fleet fixture's cluster in a prompt
