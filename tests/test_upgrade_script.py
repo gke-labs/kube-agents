@@ -3832,6 +3832,15 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         self.assertLess(out.index("Pub/Sub Topic Name:"), out.index("SUMMARY"))
         self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
 
+    def test_reuses_exported_project_number_without_second_gcloud_call(self):
+        proc, calls = self._run(
+            "full",
+            {"GOOGLE_CHAT_ENABLED": "true", "CHAT_TOPIC_NAME": "t", "PROJECT_NUMBER": "987654321"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST args=[] number=987654321 env=/x/install.env topic=t", "SUMMARY"])
+        self.assertEqual(calls, "")
+
 
 class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):
     """#3615. The chat checklist's re-run command names the run's install.env,
@@ -4373,6 +4382,65 @@ class UpgradeSizingProfileAndScanTest(unittest.TestCase):
                         self.assertIn("--set platformAgent.deployment.image.tag=0.3.0", p_schema.stdout)
                     else:
                         self.assertNotIn("HELM:", p_schema.stdout)
+
+        # 7. Target checkout predating #6470 (installer_common.sh lacks crd_supports_platform_agent_sizing_profile
+        #    and its helper constants): schema refusal must still fire when schema lacks sizingProfile, and
+        #    inline CRD probe fallback must apply or refuse cleanly when schema declares sizingProfile.
+        for schema_has_field, crd_json, explicit, expect_rc, want_msg, want_set in (
+            (False, with_field, "true", 1, "does not declare platformAgent.deployment.sizingProfile", False),
+            (False, with_field, "false", 0, "does not declare platformAgent.deployment.sizingProfile", False),
+            (True, with_field, "true", 0, None, True),
+            (True, without_field, "true", 1, "predates spec.deployment.sizingProfile", False),
+            (True, without_field, "false", 0, "predates spec.deployment.sizingProfile", False),
+            (True, "", "true", 1, "Cannot verify whether the installed PlatformAgent CRD supports", False),
+        ):
+            with self.subTest(legacy_target_checkout=True, schema_has_field=schema_has_field, crd_ok=(crd_json == with_field), explicit=explicit):
+                with tempfile.TemporaryDirectory() as tmp:
+                    bin_dir = pathlib.Path(tmp) / "bin"
+                    bin_dir.mkdir()
+                    k = bin_dir / "kubectl"
+                    k_rc = 0 if crd_json else 1
+                    k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(crd_json)}\nexit {k_rc}\n")
+                    k.chmod(0o755)
+                    helm = bin_dir / "helm"
+                    helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                    helm.chmod(0o755)
+                    schema_dir = pathlib.Path(tmp) / "charts" / "kube-agents"
+                    schema_dir.mkdir(parents=True)
+                    field_json = '{"sizingProfile":{"type":"string"}}' if schema_has_field else '{}'
+                    (schema_dir / "values.schema.json").write_text(
+                        f'{{"properties":{{"platformAgent":{{"properties":{{"deployment":{{"properties":{field_json}}}}}}}}}}}'
+                    )
+                    script = (
+                        f'set -u\nKUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                        f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                        'unset -f crd_supports_platform_agent_sizing_profile\n'
+                        'unset DEFAULT_PLATFORM_AGENT_SIZING_PROFILE\n'
+                        'unset -f gke_context_name\n'
+                        f'{helm_retag_fn}\n'
+                        f'repo_dir={shlex.quote(tmp)}\ntarget_namespace="kubeagents-system"\nPARAM_IMAGE_TAG="0.3.0"\n'
+                        'HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag")\n'
+                        'RETAG_VALUES_JSON="{}"\n'
+                        f'sizing_profile_explicit={shlex.quote(explicit)}\n'
+                        'PLATFORM_AGENT_SIZING_PROFILE="fleet"\n'
+                        f'run_harness_prep() {{\n{prep_block}\n}}\n'
+                        'run_harness_prep\n'
+                        'helm_retag "${HARNESS_RETAG_KEYS[@]}"\n'
+                    )
+                    p_old = subprocess.run(
+                        ["bash", "-c", script],
+                        capture_output=True, text=True,
+                        env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                        cwd=str(_REPO_ROOT),
+                    )
+                    out = p_old.stdout + p_old.stderr
+                    self.assertEqual(p_old.returncode, expect_rc, out)
+                    if want_msg:
+                        self.assertIn(want_msg, out)
+                    if want_set:
+                        self.assertIn("--set platformAgent.deployment.sizingProfile=fleet", p_old.stdout)
+                    else:
+                        self.assertNotIn("--set platformAgent.deployment.sizingProfile=", p_old.stdout)
 
     def test_validates_and_prints_without_default_var_or_helper_under_set_u(self):
         text = _UPGRADE_SH.read_text(encoding="utf-8")

@@ -67,6 +67,10 @@ readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
 readonly SIZING_PROFILE_SCHEMA_JQ='.properties.platformAgent.properties.deployment.properties.sizingProfile != null'
 readonly RETAG_SIZING_PROFILE_JQ='.platformAgent.deployment.sizingProfile // ""'
 readonly PLATFORM_AGENT_SIZING_PROFILE_DEFAULT="auto"
+readonly UPGRADE_PLATFORM_AGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+readonly UPGRADE_CRD_SIZING_PROFILE_JQ='[.spec.versions[]? | select(.storage == true or .served == true) | .schema.openAPIV3Schema.properties.spec.properties.deployment.properties.sizingProfile] | map(select(. != null)) | length > 0'
+readonly UPGRADE_KUBECTL_PROBE_TIMEOUT="10s"
+readonly UPGRADE_CRD_PROBE_UNREADABLE_RC=2
 readonly UPGRADE_SIZING_PROFILE_VALUES="small medium fleet auto"
 readonly UPGRADE_SIZING_PROFILE_CHOICES="small | medium | fleet | auto"
 # What marks a commit as a breaking change: a `type!:` subject or a BREAKING
@@ -2287,41 +2291,68 @@ main() {
       # its own message shown.
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
       HARNESS_EXTRA_SET_ARGS=()
-      if declare -F crd_supports_platform_agent_sizing_profile >/dev/null; then
-        local existing_retag_sizing crd_sizing_rc=0 target_harness_sizing schema_file schema_has_sizing="true"
-        existing_retag_sizing="$(jq -r "$RETAG_SIZING_PROFILE_JQ" <<<"$RETAG_VALUES_JSON" 2>/dev/null || echo "")"
-        target_harness_sizing="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$PLATFORM_AGENT_SIZING_PROFILE_DEFAULT}}"
-        schema_file="${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
-        if [ -f "$schema_file" ] && ! jq -e "$SIZING_PROFILE_SCHEMA_JQ" "$schema_file" >/dev/null 2>&1; then
-          schema_has_sizing="false"
-        fi
-        if [ "$sizing_profile_explicit" = "true" ] || [ -z "$existing_retag_sizing" ]; then
-          if [ "$schema_has_sizing" != "true" ]; then
+      local existing_retag_sizing crd_sizing_rc=0 target_harness_sizing schema_file schema_has_sizing="true" crd_name="${PLATFORM_AGENT_CRD_NAME:-$UPGRADE_PLATFORM_AGENT_CRD_NAME}"
+      existing_retag_sizing="$(jq -r "$RETAG_SIZING_PROFILE_JQ" <<<"$RETAG_VALUES_JSON" 2>/dev/null || echo "")"
+      target_harness_sizing="${PLATFORM_AGENT_SIZING_PROFILE:-${DEFAULT_PLATFORM_AGENT_SIZING_PROFILE:-$PLATFORM_AGENT_SIZING_PROFILE_DEFAULT}}"
+      schema_file="${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      if [ -f "$schema_file" ] && ! jq -e "$SIZING_PROFILE_SCHEMA_JQ" "$schema_file" >/dev/null 2>&1; then
+        schema_has_sizing="false"
+      fi
+      if [ "$sizing_profile_explicit" = "true" ] || [ -z "$existing_retag_sizing" ]; then
+        if [ "$schema_has_sizing" != "true" ]; then
+          if [ "$sizing_profile_explicit" = "true" ]; then
+            print_error "Cannot apply sizingProfile='${target_harness_sizing}' in --upgrade-mode=harness: chart schema ${KUBE_AGENTS_VALUES_SCHEMA} does not declare platformAgent.deployment.sizingProfile."
+            print_info "Choose a target revision that declares platformAgent.deployment.sizingProfile, or drop PLATFORM_AGENT_SIZING_PROFILE for this rollback."
+            exit 1
+          fi
+          print_warning "Chart schema ${KUBE_AGENTS_VALUES_SCHEMA} does not declare platformAgent.deployment.sizingProfile; leaving sizingProfile unset in --upgrade-mode=harness."
+        else
+          if declare -F crd_supports_platform_agent_sizing_profile >/dev/null; then
+            crd_supports_platform_agent_sizing_profile || crd_sizing_rc=$?
+          else
+            # Target checkouts older than #6470 lack crd_supports_platform_agent_sizing_profile in
+            # installer_common.sh; probe the live CRD inline so supported profiles still apply and
+            # legacy CRDs still warn or refuse.
+            crd_sizing_rc="$UPGRADE_CRD_PROBE_UNREADABLE_RC"
+            if command -v kubectl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+              local _crd_ctx_args=() _crd_ctx="" _crd_json="" _crd_ctx_ok="true"
+              if [ -n "${PROJECT_ID:-}" ] && [ -n "${REGION:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+                if declare -F gke_context_name >/dev/null; then
+                  _crd_ctx="$(gke_context_name)"
+                else
+                  _crd_ctx="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
+                fi
+                if kubectl config get-contexts "$_crd_ctx" >/dev/null 2>&1; then
+                  _crd_ctx_args=(--context "$_crd_ctx")
+                else
+                  _crd_ctx_ok="false"
+                fi
+              fi
+              if [ "$_crd_ctx_ok" = "true" ] && _crd_json="$(trap - ERR; kubectl ${_crd_ctx_args[@]+"${_crd_ctx_args[@]}"} get crd "$crd_name" -o json --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT:-$UPGRADE_KUBECTL_PROBE_TIMEOUT}" 2>/dev/null)" && [ -n "$_crd_json" ]; then
+                if printf '%s' "$_crd_json" | jq -e "${CRD_SIZING_PROFILE_JQ:-$UPGRADE_CRD_SIZING_PROFILE_JQ}" >/dev/null 2>&1; then
+                  crd_sizing_rc=0
+                else
+                  crd_sizing_rc=1
+                fi
+              fi
+            fi
+          fi
+          if [ "$crd_sizing_rc" -eq 0 ]; then
+            HARNESS_EXTRA_SET_ARGS=(--set "platformAgent.deployment.sizingProfile=${target_harness_sizing}")
+          elif [ "$crd_sizing_rc" -eq 1 ]; then
             if [ "$sizing_profile_explicit" = "true" ]; then
-              print_error "Cannot apply sizingProfile='${target_harness_sizing}' in --upgrade-mode=harness: chart schema ${KUBE_AGENTS_VALUES_SCHEMA} does not declare platformAgent.deployment.sizingProfile."
-              print_info "Choose a target revision that declares platformAgent.deployment.sizingProfile, or drop PLATFORM_AGENT_SIZING_PROFILE for this rollback."
+              print_error "Cannot apply sizingProfile='${target_harness_sizing}' in --upgrade-mode=harness: the installed PlatformAgent CRD predates spec.deployment.sizingProfile."
+              print_info "Run ./upgrade.sh --upgrade-mode=operator or ./upgrade.sh --upgrade-mode=full to apply the updated CRDs first."
               exit 1
             fi
-            print_warning "Chart schema ${KUBE_AGENTS_VALUES_SCHEMA} does not declare platformAgent.deployment.sizingProfile; leaving sizingProfile unset in --upgrade-mode=harness."
+            print_warning "Installed PlatformAgent CRD predates spec.deployment.sizingProfile; run ./upgrade.sh --upgrade-mode=operator or --upgrade-mode=full to update CRDs and wire sizingProfile='${target_harness_sizing}'."
           else
-            crd_supports_platform_agent_sizing_profile || crd_sizing_rc=$?
-            if [ "$crd_sizing_rc" -eq 0 ]; then
-              HARNESS_EXTRA_SET_ARGS=(--set "platformAgent.deployment.sizingProfile=${target_harness_sizing}")
-            elif [ "$crd_sizing_rc" -eq 1 ]; then
-              if [ "$sizing_profile_explicit" = "true" ]; then
-                print_error "Cannot apply sizingProfile='${target_harness_sizing}' in --upgrade-mode=harness: the installed PlatformAgent CRD predates spec.deployment.sizingProfile."
-                print_info "Run ./upgrade.sh --upgrade-mode=operator or ./upgrade.sh --upgrade-mode=full to apply the updated CRDs first."
-                exit 1
-              fi
-              print_warning "Installed PlatformAgent CRD predates spec.deployment.sizingProfile; run ./upgrade.sh --upgrade-mode=operator or --upgrade-mode=full to update CRDs and wire sizingProfile='${target_harness_sizing}'."
-            else
-              if [ "$sizing_profile_explicit" = "true" ]; then
-                print_error "Cannot verify whether the installed PlatformAgent CRD supports spec.deployment.sizingProfile to apply '${target_harness_sizing}' in --upgrade-mode=harness."
-                print_info "Ensure kubectl can read CRD ${PLATFORM_AGENT_CRD_NAME} (and its GKE context exists), or run ./upgrade.sh --upgrade-mode=operator or --upgrade-mode=full."
-                exit 1
-              fi
-              print_warning "Could not probe installed PlatformAgent CRD for spec.deployment.sizingProfile (leaving recorded sizingProfile unchanged); ensure cluster CRD access or run --upgrade-mode=operator or --upgrade-mode=full."
+            if [ "$sizing_profile_explicit" = "true" ]; then
+              print_error "Cannot verify whether the installed PlatformAgent CRD supports spec.deployment.sizingProfile to apply '${target_harness_sizing}' in --upgrade-mode=harness."
+              print_info "Ensure kubectl can read CRD ${crd_name} (and its GKE context exists), or run ./upgrade.sh --upgrade-mode=operator or --upgrade-mode=full."
+              exit 1
             fi
+            print_warning "Could not probe installed PlatformAgent CRD for spec.deployment.sizingProfile (leaving recorded sizingProfile unchanged); ensure cluster CRD access or run --upgrade-mode=operator or --upgrade-mode=full."
           fi
         fi
       fi
@@ -2480,8 +2511,8 @@ main() {
   # file that names none renders the default, which the helper must be handed,
   # since the generator keeps it local.
   if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
-    local project_number=""
-    if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    local project_number="${PROJECT_NUMBER:-}"
+    if [ -z "$project_number" ] && is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
       project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
     fi
     CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
