@@ -5395,6 +5395,16 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			if n == 0 {
 				n = busReshapeServers(agent)
 			}
+			if busMigrationTerminal(busMigrationPhase(run.Phase)) {
+				// The provision Job that refused the narrow TASKS has the
+				// same digested name for the same render, so nothing would
+				// run it again and Ready would stay down on its failure.
+				// Deleted, the next pass runs a fresh one against the
+				// widened (or, if the run was undone, unchanged) TASKS.
+				if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
+					return err
+				}
+			}
 		}
 		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
 		return nil

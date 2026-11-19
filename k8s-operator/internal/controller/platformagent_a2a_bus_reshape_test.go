@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
@@ -136,8 +138,18 @@ func TestAReshapeRunsAtTheCountTheBusRuns(t *testing.T) {
 		}
 		m.finishPod("restore", corev1.PodSucceeded, `{}`, "")
 		m.pass(busMigrationReleasing, n)
+		// The provision Job that refused the narrow TASKS, failed: its name
+		// is the same for the same render, so only its deletion runs it again.
+		job := buildA2AProvisionJob(m.agent)
+		m.own(job)
+		if err := m.cl.Create(context.Background(), job); err != nil {
+			t.Fatal(err)
+		}
 		m.rollOut(n)
 		m.pass(busMigrationDone, n)
+		if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{}); !apierrors.IsNotFound(err) {
+			t.Errorf("at %d: the provision Job after the reshape: %v, want it deleted so a fresh one runs", n, err)
+		}
 	}
 }
 
