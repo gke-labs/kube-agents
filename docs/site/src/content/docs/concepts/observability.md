@@ -307,6 +307,8 @@ The credential broker's own log is one JSON object per line, the record that say
 
 A read through the broker's Cloud API relay adds the same records, with `tool` set to `gcp-api`. Its `subcommand` is the Google service: `monitoring`, `cloudtrace`, `container`, `logging`, or `other` for a host the relay does not serve. A forwarded read carries `upstream_status`, the HTTP status Google returned, in place of `exit_code`. The `message` of a relay record names the host and the path as the caller sent them, cut to a fixed length, and never the query.
 
+A log read that the relay accepts writes one more broker log line, `api body checked`, before it asks Google. That line ends with `resource=projects/<project>`, the project whose entries the read asked for, so a read that fails after that point still names its project. The line is not a `tool_execution_audit` record and has no fields of its own: its `message` carries `request_id=<id>`, so search the message text for the `request_id` of the read's records. The record of a forwarded log read ends its `message` with the same `resource=`. A refused log read names no project.
+
 `broker_tier` is `exec` on an exec-tier replica and `stateful` on the stateful broker. `class` is the admission class the request runs under, `interactive` or `background`. `broker_pod` is the pod of the broker that wrote the record, so each record is traced to one replica.
 
 The record's `status` is `started`, `completed`, `blocked`, `rejected`, `failed`, `abandoned` or `busy`, a different vocabulary from the metric's above: `completed` says the command ran, whatever its exit code, and `exit_code` says how it went. Those fields carry identifiers and outcomes only.

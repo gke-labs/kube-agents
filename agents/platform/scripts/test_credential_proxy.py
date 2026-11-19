@@ -20040,6 +20040,110 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertNotIn("k8s_cluster", "\n".join(r.getMessage() for r in logs.records))
         self.assertNotIn("k8s_cluster", json.dumps(self._audits(logs)))
 
+    def test_a_forwarded_entries_list_names_its_project_in_the_forwarded_line(self):
+        # The path of this read is `v2/entries:list` for every project, so the line that
+        # says the read was forwarded carries the one resource the body check passed.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertTrue(forwarded.endswith(" resource=projects/kagents-dev"), forwarded)
+        # Beside the line at the check, no other line names it, and the audit fields
+        # stay identifiers and outcomes.
+        named = ("api forwarded request_id=", "api body checked request_id=")
+        others = [r.getMessage() for r in logs.records if not r.getMessage().startswith(named)]
+        self.assertNotIn("kagents-dev", "\n".join(others))
+        self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_checked_body_names_its_project_before_each_verdict(self):
+        # A read whose body passed the check and then failed still asked Google for
+        # that project's entries, and over the cap Google served them. So the project
+        # is on a line of its own at the check, and the verdict of the request follows
+        # it under the same request id, whatever the verdict is.
+        cap = 4096
+
+        def forwarded():
+            pass
+
+        def over_the_cap():
+            self.reply.update(body=b"x" * (cap + 1))
+
+        def no_relay():
+            CredentialProxyHandler.api_relay = None
+
+        def no_credential():
+            def failing():
+                raise RuntimeError("no credential")
+
+            self.relay.authorization_header = failing
+
+        def unreachable():
+            spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            self.relay.port = spare.server_address[1]
+            spare.server_close()
+
+        cases = (
+            ("forwarded", forwarded, 200, "api forwarded"),
+            ("over the cap", over_the_cap, 502, "api response too large"),
+            ("no relay", no_relay, 503, "api disabled"),
+            ("no credential", no_credential, 503, "api credential unavailable"),
+            ("unreachable", unreachable, 502, "api upstream unreachable"),
+        )
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            for name, arrange, expected, verdict in cases:
+                with self.subTest(name):
+                    arrange()
+                    try:
+                        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+                    finally:
+                        # Each case leaves the handler as the next one expects it.
+                        CredentialProxyHandler.api_relay = self.relay
+                        self.relay.__dict__.pop("authorization_header", None)
+                        self.relay.port = self.upstream.server_address[1]
+                        self.reply.update(status=200, content_type="application/json; charset=UTF-8",
+                                          body=b'{"timeSeries":[]}', headers={})
+                    self.assertEqual(expected, status)
+                    lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+                    [checked] = [line for line in lines if line.startswith("api body checked request_id=")]
+                    self.assertTrue(checked.endswith(" resource=projects/kagents-dev"), checked)
+                    request_id = checked.split("request_id=")[1].split(" ")[0]
+                    # The verdict is the last line of the request, after the check line.
+                    self.assertGreater(len(lines) - 1, lines.index(checked))
+                    self.assertTrue(lines[-1].startswith(f"{verdict} request_id={request_id}"), lines[-1])
+                    # The check line carries no audit mapping: the audit fields stay identifiers and outcomes.
+                    self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_forwarded_get_names_no_resource_in_the_forwarded_line(self):
+        # A GET's project is in its path, which the first line of the request carries.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertNotIn("resource=", forwarded)
+
+    def test_a_refused_body_leaves_its_project_out_of_every_log_line(self):
+        # A project the check did not pass is caller text. No line carried it before
+        # the forwarded line named a project, and this holds that. Each body here
+        # names the project and is refused.
+        project = "refused-project-1"
+        cases = (
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}", "projects/kagents-dev"]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "projectIds": [project]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "orderBy": "severity desc"},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "pageSize": 100000},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}/logs/syslog"]},
+            {**self.ENTRIES_BODY, "resourceNames": f"projects/{project}"},
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                status, _, payload = self._entries_list(body)
+                self.assertEqual(403, status)
+                self.assertEqual("gcp.api.body", payload["rule"])
+                self.assertNotIn(project, "\n".join(r.getMessage() for r in logs.records))
+                self.assertNotIn(project, json.dumps(self._audits(logs)))
+        self.assertEqual([], self.upstream_requests)
+
     def test_the_upstream_gets_the_brokers_serialisation_not_the_callers_bytes(self):
         # A duplicate key: the parser keeps the last, the check reads the last,
         # and the upstream is sent one key with that value. Nothing of the
