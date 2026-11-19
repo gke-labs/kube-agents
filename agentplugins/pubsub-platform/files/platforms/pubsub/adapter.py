@@ -156,6 +156,11 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# For the gateway's own API, which is on loopback. No proxy from the
+# environment: a proxy in between would get the API server key on each call.
+_GATEWAY_API_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 class PubsubRelay:
     """The Pub/Sub REST API, spoken to the credential broker's relay.
 
@@ -1261,7 +1266,7 @@ class PubSubAdapter(BasePlatformAdapter):
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
             )
-            return urllib.request.urlopen(req, timeout=timeout)
+            return _GATEWAY_API_OPENER.open(req, timeout=timeout)
 
         try:
             await asyncio.to_thread(

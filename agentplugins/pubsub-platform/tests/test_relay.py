@@ -351,8 +351,8 @@ class SettleTest(RelayTestCase):
 
 
 class NoProxyTest(RelayTestCase):
-    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_relay(self):
-        """The relay is an in-cluster Service, and each call to it has the gateway's token on it."""
+    def _the_adapter_loaded_with_a_proxy_in_the_environment(self):
+        """A stand-in proxy that records requests, and the adapter loaded after the proxy is set."""
         proxy = FakeBroker()
         self.addCleanup(proxy.close)
         # The patch of os.environ in setUp puts these back. urllib reads the name in any case.
@@ -364,10 +364,31 @@ class NoProxyTest(RelayTestCase):
         # it loads takes its proxy at that time.
         loaded, put_back = test_dedup.load_adapter_for_a_test_file()
         self.addCleanup(put_back)
+        return proxy, loaded
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_relay(self):
+        """The relay is an in-cluster Service, and each call to it has the gateway's token on it."""
+        proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
         relay = loaded.PubsubRelay(self.broker.url, self.token_file.name)
         relay.get_subscription(SUB_PATH, timeout=5)
         self.assertEqual(proxy.calls, [])
         self.assertEqual([(method, path) for method, path, _, _ in self.broker.calls], [("GET", GET_PATH)])
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_gateway_api(self):
+        """The gateway's API is on loopback, and each call to it has the API server key on it."""
+        proxy, loaded = self._the_adapter_loaded_with_a_proxy_in_the_environment()
+        os.environ["PLATFORM_API_URL"] = self.broker.url
+        os.environ["API_SERVER_KEY"] = "api-server-key"
+        adapter = loaded.PubSubAdapter.__new__(loaded.PubSubAdapter)
+        asyncio.run(adapter._run_turn_via_api("platform", "look at this alert", "alert-1", ROUTE))
+        self.assertEqual(proxy.calls, [])
+        self.assertEqual(
+            [(method, path, headers["Authorization"]) for method, path, headers, _ in self.broker.calls],
+            [
+                ("POST", "/p/platform/api/sessions", "Bearer api-server-key"),
+                ("POST", "/p/platform/api/sessions/alert-1/chat", "Bearer api-server-key"),
+            ],
+        )
 
 
 class PreflightTest(RelayTestCase):
