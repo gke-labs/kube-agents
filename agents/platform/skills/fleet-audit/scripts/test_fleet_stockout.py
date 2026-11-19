@@ -4358,12 +4358,32 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         self.assertIn("1 of 2", hit["excerpt"])
         self.assertIn("rule 1 (nodepools gone-pool)", hit["excerpt"])
 
-    def test_a_class_with_no_rule_backed_is_not_filed(self):
-        """No pool for the class on this cluster: nothing there falls back,
-        and 3.12 (c) names a workload that selects such a class."""
+    def test_a_class_with_no_node_pool_of_its_own_is_not_filed(self):
+        """No pool a rule names and none with the class label: nothing on this
+        cluster falls back on the class, and 3.12 (c) names a workload that
+        selects it."""
         self.assertIsNone(self.check(FLEET_CLASS_RULES, []))
-        self.assertIsNone(self.check(FLEET_CLASS_RULES, [manual_pool("other", "e2-medium", "general-ccc")]))
-        self.assertIsNone(self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")]))
+        self.assertIsNone(self.check(FLEET_CLASS_RULES, [manual_pool("other", "n4-standard-4"), manual_pool("else", "c3-standard-8", "another-class")]))
+
+    def test_a_labelled_pool_that_backs_no_rule_is_filed(self):
+        """3.12 (c) passes on the label, so nothing else names this class."""
+        hit = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")])
+        self.assertIn("2 of 2 priority rules have no manual node pool", hit["excerpt"])
+        self.assertIn("No rule is backed; the node pools with the class label: e2-pool (e2-medium)", hit["excerpt"])
+        workload = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "general-ccc"})
+        cc = compute_class("general-ccc", [{"machineFamily": "n4"}, {"machineFamily": "c3"}], node_pool_auto_creation=False)
+        self.assertIsNone(fs.check_dangling_compute_class(workload, {"general-ccc": cc}, {"general-ccc"}))
+
+    def test_the_cluster_default_class_is_out_of_scope(self):
+        """Node pools serve the default class without the class label."""
+        cc = compute_class(fs.CLUSTER_DEFAULT_CLASS, [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}], node_pool_auto_creation=False)
+        pools = [manual_pool("default-pool", "e2-medium"), manual_pool("n4-pool", "n4-standard-4")]
+        self.assertIsNone(fs.check_ccc_unbacked_manual_fallback(cc, pools))
+
+    def test_an_n1_custom_pool_backs_an_n1_rule(self):
+        rules = [{"nodepools": ["default-pool"]}, {"machineFamily": "n1"}]
+        self.assertIsNone(self.check(rules, [FLEET_POOL, manual_pool("custom-pool", "custom-4-8192", "general-ccc")]))
+        self.assertIsNotNone(self.check(rules, [FLEET_POOL, manual_pool("custom-pool", "n2-custom-4-8192", "general-ccc")]))
 
     def test_a_nodepools_rule_with_several_names_is_backed_by_one_that_exists(self):
         rules = [{"nodepools": ["gone-pool", "default-pool"]}, {"machineFamily": "n4"}]
@@ -4430,7 +4450,9 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         self.assertIn("ComputeClass/general-ccc", reason)
         self.assertIn("node-pools list", reason)
         self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
-        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc", entry["limitations"])
+        self.assertIn(f"{self.SLUG} could not be judged for ComputeClass/general-ccc: the node pools were not read", entry["limitations"])
+        # The failed read is named once, by the sentence before this one.
+        self.assertNotIn("the node pools were not read (", entry["limitations"])
 
     def test_autopilot_declares_the_check_not_applicable(self):
         entry = self.run_with(dump_items=[self.fleet_class()], cluster={**self.CLUSTER, "autopilot": True})

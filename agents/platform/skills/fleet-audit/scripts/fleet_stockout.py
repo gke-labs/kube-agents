@@ -232,6 +232,14 @@ UNBACKED_MANUAL_FALLBACK = "ccc-unbacked-manual-fallback"
 # so the automatic sweep leaves it to `/remediate`. The string matches
 # `TRIAGE_REASONS` in audit_report.py.
 MANUAL_POOL_TRIAGE = "manual-pool-fallback"
+# The fields of a priority rule that §3.13 judges, in the order its excerpt
+# labels a rule by.
+RULE_LABEL_FIELDS = ("nodepools", "machineType", "machineFamily")
+# The name GKE gives the cluster-level default ComputeClass.
+CLUSTER_DEFAULT_CLASS = "default"
+# What `_priority_family` returns for an N1 custom machine type, and the family it is.
+UNPREFIXED_CUSTOM_TYPE = "custom"
+N1_FAMILY = "n1"
 ERROR_EXCERPT_CHARS = 300
 STDERR_EXCERPT_CHARS = 200
 # `2026-09-30T14:43:39`: an RFC 3339 log timestamp cut to whole seconds.
@@ -1252,40 +1260,54 @@ def _manual_fallback_class(cc: dict) -> bool:
     `is not True`, as `check_dangling_compute_class` reads the field: the CRD
     defaults it to off. A class in Autopilot mode (`spec.autopilot.enabled`)
     is out of scope: GKE creates its nodes, so it has no manual pool to lack.
+    So is the cluster default class: node pools serve it without the class
+    label, so the pool list does not say which pools are its own.
     """
     spec = cc.get("spec") or {}
+    if (cc.get("metadata") or {}).get("name") == CLUSTER_DEFAULT_CLASS:
+        return False
     if (spec.get("nodePoolAutoCreation") or {}).get("enabled") is True or (spec.get("autopilot") or {}).get("enabled") is True:
         return False
     return len(spec.get("priorities") or []) >= MIN_RULES_WITH_A_FALLBACK
+
+
+def _class_pools(class_name: str, node_pools: list[dict]) -> list[dict]:
+    """The node pools that carry the class label."""
+    return [pool for pool in node_pools if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == class_name]
+
+
+def _pool_family(machine_type: str) -> str:
+    """A pool's machine family. Compute Engine names an N1 custom type with no
+    family prefix (`custom-4-8192`); every other family leads its custom types
+    (`n2-custom-4-8192`)."""
+    family = _priority_family({"machineType": machine_type})
+    return N1_FAMILY if family == UNPREFIXED_CUSTOM_TYPE else family
 
 
 def _rule_has_manual_pool(rule: dict, class_name: str, node_pools: list[dict]) -> bool | None:
     """Whether a node pool backs one priority rule, or None when the rule names
     neither pools nor a machine, so the pool list cannot answer.
 
-    A `nodepools` rule is backed by a pool it names. A `machineType` or
-    `machineFamily` rule is backed by a pool that carries the class label and
-    has that type or family; a pool without the label is not the class's.
+    A `nodepools` rule is backed by a pool it names; one existing name is
+    enough. A `machineType` or `machineFamily` rule is backed by a pool that
+    carries the class label and has that type or family; a pool without the
+    label is not the class's.
     """
     named = rule.get("nodepools") or []
     if named:
         return any(pool.get("name") in named for pool in node_pools)
     if _priority_names_no_machine(rule):
         return None
-    class_machine_types = [
-        (pool.get("config") or {}).get("machineType") or ""
-        for pool in node_pools
-        if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == class_name
-    ]
+    class_machine_types = [(pool.get("config") or {}).get("machineType") or "" for pool in _class_pools(class_name, node_pools)]
     if rule.get("machineType"):
         return rule["machineType"] in class_machine_types
-    return any(_priority_family({"machineType": machine_type}) == rule["machineFamily"] for machine_type in class_machine_types)
+    return any(_pool_family(machine_type) == rule["machineFamily"] for machine_type in class_machine_types)
 
 
 def _rule_label(position: int, rule: dict) -> str:
     """A priority rule as the excerpt names it: its place in the chain and the
     field that says what it needs."""
-    for field in ("nodepools", "machineType", "machineFamily"):
+    for field in RULE_LABEL_FIELDS:
         if rule.get(field):
             value = rule[field]
             return f"rule {position} ({field} {', '.join(value) if isinstance(value, list) else value})"
@@ -1293,15 +1315,15 @@ def _rule_label(position: int, rule: dict) -> str:
 
 
 def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict | None:
-    """§3.13: a class in `_manual_fallback_class`'s scope with one priority
-    rule a node pool backs and another no node pool backs. GKE creates no pool
-    for that rule, so the fallback the class lists does not exist.
+    """§3.13: a class in `_manual_fallback_class`'s scope that has a node pool
+    on this cluster and a priority rule no node pool backs. GKE creates no
+    pool for that rule, so the fallback the class lists does not exist.
 
-    A class with no rule backed is not filed: the cluster holds no pool for
-    it, so nothing there falls back, and `check_dangling_compute_class` names
-    a workload that selects such a class. A rule `_rule_has_manual_pool`
-    cannot judge is neither counted as backed nor flagged; the excerpt names
-    it.
+    A class with no node pool of its own here -- none a rule names, none with
+    the class label -- is not filed: nothing on this cluster falls back on it,
+    and `check_dangling_compute_class` names a workload that selects it. A
+    rule `_rule_has_manual_pool` cannot judge is neither counted as backed nor
+    flagged; the excerpt names it.
     """
     if not _manual_fallback_class(cc):
         return None
@@ -1311,13 +1333,16 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     labels = [_rule_label(position, rule) for position, rule in enumerate(priorities, 1)]
     unbacked = [label for label, verdict in zip(labels, verdicts) if verdict is False]
     backed = [label for label, verdict in zip(labels, verdicts) if verdict is True]
-    if not unbacked or not backed:
+    labelled = _class_pools(name, node_pools)
+    if not unbacked or not (backed or labelled):
         return None
     unjudged = [label for label, verdict in zip(labels, verdicts) if verdict is None]
-    excerpt = (
-        f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: "
-        f"{'; '.join(unbacked)}. Backed: {'; '.join(backed)}"
-    )
+    excerpt = f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: {'; '.join(unbacked)}"
+    if backed:
+        excerpt += f". Backed: {'; '.join(backed)}"
+    else:
+        pools = "; ".join(f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in labelled)
+        excerpt += f". No rule is backed; the node pools with the class label: {pools}"
     if unjudged:
         excerpt += f". Not judged, the rule names neither pools nor a machine: {'; '.join(unjudged)}"
     return {"object": f"ComputeClass/{name}", "excerpt": excerpt, "needs_triage": MANUAL_POOL_TRIAGE}
@@ -2137,8 +2162,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # Not attempted on Autopilot: `node-pools list` answers HTTP 400 there
     # ("Autopilot node pools cannot be accessed or modified"), so the record
     # would be a guaranteed failure for a read whose only consumers -- §3.9's
-    # single-zone-nodepool and the node pool labels below -- cannot apply to a
-    # cluster with no user node pools anyway.
+    # single-zone-nodepool, §3.13's manual pools and the node pool labels
+    # below -- cannot apply to a cluster with no user node pools anyway.
     #
     # `pools_readable` rather than testing `node_pools` for emptiness. A read
     # that failed and a Standard cluster that genuinely holds no pools both
@@ -2424,7 +2449,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             )
             limitations.append(
                 f"{UNBACKED_MANUAL_FALLBACK} could not be judged for {', '.join(manual_fallback_unread)}: "
-                f"the node pools were not read ({pools_failure})"
+                f"the node pools were not read"
             )
         else:
             commands[UNBACKED_MANUAL_FALLBACK] = dump_record

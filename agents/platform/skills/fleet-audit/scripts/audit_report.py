@@ -436,7 +436,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other eleven are capacity faults no
+        # other twelve are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
@@ -1323,7 +1323,7 @@ CHECK_PHRASES = {
     "reservation-mismatch-risk": "a reservation doesn't match what runs",
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
-    "ccc-unbacked-manual-fallback": "{object} compute class lists fallbacks it has no node pool for",
+    "ccc-unbacked-manual-fallback": "{object} compute class has priority rules with no node pool",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -3144,7 +3144,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Nine markers. A cost collector sets `service-fronted` on an idle
+# The markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
