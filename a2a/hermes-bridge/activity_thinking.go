@@ -1854,7 +1854,14 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 		default:
 			if sep == ':' && openQuote == "" && closeQuote == "" && lineLeading {
 				lineRest := strings.TrimRight(rest[:lineEndIn(rest)], " \t")
-				if n, ok := firstTokenBeforeLaterPair(lineRest); ok && !strings.ContainsAny(lineRest, "{}") {
+				// takenByScheme's marker stands for the credential's first
+				// token, so a later pair after it is read as after the plain
+				// key's token: its brackets aren't a value's.
+				probe := lineRest
+				if takenByScheme && strings.HasPrefix(probe, redactedValue) {
+					probe = strings.Repeat("x", len(redactedValue)) + probe[len(redactedValue):]
+				}
+				if n, ok := firstTokenBeforeLaterPair(probe); ok && !strings.ContainsAny(lineRest, "{}") {
 					if redacts(lineRest[:n], "") {
 						rec(matchEnd, matchEnd+n, named)
 						pos = matchEnd + n

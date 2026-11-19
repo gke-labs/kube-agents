@@ -860,7 +860,9 @@ func TestScrubInlineSecretsAMarkedAuthorizationKeyKeepsItsWholeValue(t *testing.
 	// one: #6415 is about the mark.)
 	for _, f := range []string{"%s%s: %s", "- %s%s: %s", "curl -H '%s%s: %s' x", "see %s%s: %s ok", "%s%s=%s", "headers %s%s: %s, more", "  %s%s: %s"} {
 		for _, key := range []string{"Authorization", "authorization", "Proxy-Authorization"} {
-			for _, v := range []string{`Digest username="u", response="` + later + `", nonce="n"`, "Bearer abcDEF123456789 tail-word", "Basic dXNlcjpwYXNzd29yZDEyMw== x"} {
+			for _, v := range []string{`Digest username="u", response="` + later + `", nonce="n"`, "Bearer abcDEF123456789 tail-word", "Basic dXNlcjpwYXNzd29yZDEyMw== x",
+				// A later pair on the line: a non-secret one keeps its value, a secret one doesn't.
+				"Bearer abcDEF123456789 host: api.example", "Bearer abcDEF123456789, password: Synth3tic-Pass-0001"} {
 				want := scrubInlineSecrets(fmt.Sprintf(f, key, "", v))
 				for _, mark := range []string{"*", "_", " *", " _"} {
 					in := fmt.Sprintf(f, key, mark, v)
