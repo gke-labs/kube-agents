@@ -1,0 +1,68 @@
+Subject: Fetch nodes separately so kubectl admit reserves cluster node cost
+
+Why: Upstream combines cluster-scoped Kueue CRDs and `nodes` into one comma-joined `kubectl get <crds>,nodes -o json` call. Because Kueue CRDs are not in `deploy/sandbox/kubectl-admit.py`'s `KINDS` table, `scope_of()` (`all(k in clustered for k in kinds)`) classifies the combined command as `NAMESPACE_SCOPE` (`charged=False`) and skips the 255 MiB `fleet`-tier memory reservation for `get nodes cluster json`. Fetching `nodes` in its own `kubectl get nodes -o json` call lets `kubectl-admit` reserve its profiled memory cost cleanly.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Upstream-Issue: none (specific to this repository)
+Retire-When: `deploy/sandbox/kubectl-admit.py` charges mixed-kind queries containing any cluster-scoped kind or upstream fetches `nodes` separately
+
+diff --git a/scripts/snapshot_loaders.py b/scripts/snapshot_loaders.py
+--- a/scripts/snapshot_loaders.py
++++ b/scripts/snapshot_loaders.py
+@@ -918,15 +918,37 @@ def _live_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+         "Check `kubectl config current-context` and that Kueue is installed"
+         " (`kubectl api-resources --api-group=kueue.x-k8s.io`).",
+     )
+-  cluster_obj, err = _kubectl_json(
+-      ["kubectl", "get", cluster_list, "-o", "json", "--ignore-not-found=true"]
+-  )
+-  if cluster_obj is None:
+-    raise LoadError(
+-        f"kubectl error while listing cluster-scoped Kueue objects: {err}",
+-        "Check `kubectl config current-context` and that Kueue CRDs are"
+-        " installed (`kubectl api-resources --api-group=kueue.x-k8s.io`).",
++  cluster_kinds = [k for k in cluster_list.split(",") if k]
++  kueue_cluster_kinds = [k for k in cluster_kinds if k != "nodes"]
++  has_nodes = "nodes" in cluster_kinds
++  cluster_items: list[dict[str, Any]] = []
++  if kueue_cluster_kinds:
++    cluster_obj, err = _kubectl_json([
++        "kubectl",
++        "get",
++        ",".join(kueue_cluster_kinds),
++        "-o",
++        "json",
++        "--ignore-not-found=true",
++    ])
++    if cluster_obj is None:
++      raise LoadError(
++          f"kubectl error while listing cluster-scoped Kueue objects: {err}",
++          "Check `kubectl config current-context` and that Kueue CRDs are"
++          " installed (`kubectl api-resources --api-group=kueue.x-k8s.io`).",
++      )
++    cluster_items.extend(cluster_obj.get("items", []))
++  if has_nodes:
++    nodes_obj, err = _kubectl_json(
++        ["kubectl", "get", "nodes", "-o", "json", "--ignore-not-found=true"]
+     )
++    if nodes_obj is None:
++      raise LoadError(
++          f"kubectl error while listing cluster nodes: {err}",
++          "Check `kubectl config current-context` and RBAC permissions for"
++          " listing nodes.",
++      )
++    cluster_items.extend(nodes_obj.get("items", []))
+   ns_cmd = ["kubectl", "get", ns_list, "-o", "json", "--ignore-not-found=true"]
+   ns_cmd.extend(["-n", args.namespace] if args.namespace else ["-A"])
+   ns_obj, err = _kubectl_json(ns_cmd)
+@@ -938,9 +960,7 @@ def _live_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+     )
+   raw_obj = {
+       "kind": "List",
+-      "items": (
+-          list(cluster_obj.get("items", [])) + list(ns_obj.get("items", []))
+-      ),
++      "items": cluster_items + list(ns_obj.get("items", [])),
+   }
+   if missing_kinds:
+     raw_obj.setdefault("_warnings", []).append(

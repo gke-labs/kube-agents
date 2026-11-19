@@ -1,0 +1,40 @@
+Subject: Name shipped kube-agents skills for handoffs
+
+Why: Upstream names three sibling skills (`gke-node-notready`, `gke-workload-scaling-troubleshooting`, `gke-ai-troubleshooting-tpu-reservation-stockout`) that do not exist in this repository; `SKILL.md`'s frontmatter `description` is copied into the published skill catalog (`README.md` and `docs/site/src/content/docs/skills/index.mdx`) by `make docs-generate`. Naming shipped kube-agents skills keeps handoff guidance and published docs accurate.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Upstream-Issue: none (specific to this repository)
+Retire-When: this repository ships `gke-node-notready`, `gke-workload-scaling-troubleshooting`, and `gke-ai-troubleshooting-tpu-reservation-stockout`
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1,6 +1,6 @@
+ ---
+ name: gke-kueue-troubleshooting
+-description: Diagnose a GKE batch or AI workload (Job, JobSet, LeaderWorkerSet, RayJob, Kubeflow training jobs, or plain Pods) that is pending, suspended, stuck, evicted or misconfigured when Kueue manages it - from a live GKE cluster, a support bundle or exported controller/audit logs. Load it as soon as the investigation shows a Kueue footprint, even if the user never said "Kueue" - anything under kueue.x-k8s.io (labels, Pod scheduling gates, Workload/LocalQueue/ClusterQueue objects and their conditions), kueue-controller-manager events or logs, or a Job with spec.suspend=true together with a Workload object in its namespace. Scripts compact cluster state and logs into verifiable facts and validate the report, while the agent classifies the cause as Kueue configuration, Kueue defect, or outside Kueue. Don't use for workloads with no Kueue footprint (use gke-node-notready, gke-workload-scaling-troubleshooting, gke-ai-troubleshooting-tpu-reservation-stockout, or gke-ai-troubleshooting-jobset-interruption).
++description: Diagnose a GKE batch or AI workload (Job, JobSet, LeaderWorkerSet, RayJob, Kubeflow training jobs, or plain Pods) that is pending, suspended, stuck, evicted or misconfigured when Kueue manages it - from a live GKE cluster, a support bundle or exported controller/audit logs. Load it as soon as the investigation shows a Kueue footprint, even if the user never said "Kueue" - anything under kueue.x-k8s.io (labels, Pod scheduling gates, Workload/LocalQueue/ClusterQueue objects and their conditions), kueue-controller-manager events or logs, or a Job with spec.suspend=true together with a Workload object in its namespace. Scripts compact cluster state and logs into verifiable facts and validate the report, while the agent classifies the cause as Kueue configuration, Kueue defect, or outside Kueue. Don't use for workloads with no Kueue footprint (use gke-workload-troubleshooting, gke-workload-scaling, gke-cluster-autoscaler, capacity-obtainability, or gke-ai-troubleshooting-jobset-interruption).
+ metadata:
+   version: "1.1.0"
+   category: Containers
+@@ -190,7 +190,7 @@ bundle files (at most **twice**). Never read the skill's own Python scripts.
+         `NotReady` (`NetworkPluginNotReady` / CNI not initialized — follow
+         "Troubleshoot network connectivity" in
+         [Troubleshoot nodes with the NotReady status in GKE](https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/node-notready.md.txt)
+-        or hand off to `gke-node-notready`).
++        or hand off to `gke-workload-troubleshooting`).
+      6. **Controller health and configuration**: `KueueConfiguration`
+         (`kueue-manager-config` ConfigMap) fields (`integrations.frameworks`,
+         `manageJobsWithoutQueueName`, `featureGates`,
+@@ -359,9 +359,8 @@ bundle files (at most **twice**). Never read the skill's own Python scripts.
+        `ResourceFlavor`, or `KueueConfiguration` patch to mask an external
+        infrastructure failure. State the external-layer remediation (linking the
+        relevant GKE guide from [Documentation catalog](references/doc-links.md)
+-       or handing off to `gke-node-notready`,
+-       `gke-workload-scaling-troubleshooting`,
+-       `gke-ai-troubleshooting-tpu-reservation-stockout`, or
++       or handing off to `gke-workload-troubleshooting`, `gke-workload-scaling`,
++       `gke-cluster-autoscaler`, `capacity-obtainability`, or
+        `gke-ai-troubleshooting-jobset-interruption`), state the **confirmation
+        signal** (`Confirm by checking that <object condition> transitions to
+        <expected state>`), and for persistent control-plane or hardware issues

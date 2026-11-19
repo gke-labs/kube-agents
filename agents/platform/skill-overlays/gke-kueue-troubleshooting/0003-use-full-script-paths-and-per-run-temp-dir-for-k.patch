@@ -1,0 +1,97 @@
+Subject: Use full script paths and per run temp dir for kanban workers
+
+Why: Kanban workers start in `/opt/data/kanban/workspaces/<task-id>` where relative `scripts/*.py` paths fail with `No such file or directory`, and concurrent workers share `/tmp` so fixed `/tmp/kueue-logs` and `/tmp/kueue-ledger.json` paths race across sessions (`agents/platform/AGENTS.md`). Invoking scripts by their full `/opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/<name>.py` path with literal `python3` and using a per-run `mktemp -d /tmp/kueue-triage.XXXXXX` directory fixes both.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; the platform profile script path and shared-sandbox temp-dir rules are this repository's
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -28,7 +28,10 @@ MUST read and follow the instructions in
+ ## Prerequisites
+ 
+ - **Tools and cluster access**: Python 3.10+ with `PyYAML` (all diagnostic
+-  scripts live in `scripts/` next to this file and require no cloud SDKs). In
++  scripts live under
++  `/opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/` and
++  require no cloud SDKs; always invoke them by full path with `python3` because
++  kanban workers start in their card workspace, not the skill directory). In
+   `live` mode, follow "Before you begin" in
+   [Deploy a batch system using Kueue](https://docs.cloud.google.com/kubernetes-engine/docs/tutorials/kueue-intro.md.txt)
+   to initialize `gcloud` and select the target project, and follow
+@@ -100,8 +103,10 @@ Remediation YAML still uses the detected `apiVersion`.
+   [Log sources](references/log-sources.md); never `cat` or page raw log exports
+   into context).
+ 
+-Pass the **same** `--ledger-path <ledger>` to every script call; Step 3
+-verifies quotes and schema against it. **Do not read or parse the ledger.**
++Pass the **same** `--ledger-path <ledger>` inside a per-run temporary directory
++(`WORK_DIR=$(mktemp -d /tmp/kueue-triage.XXXXXX)`) to every script call so
++concurrent workers never collide on fixed `/tmp` filenames; Step 3 verifies
++quotes and schema against it. **Do not read or parse the ledger.**
+ 
+ **Output contract.** `snapshot.py` and `trace_logs.py` print a **digest ordered
+ most-important-first** (`detected_kueue_version`, derived facts,
+@@ -117,19 +122,21 @@ same `kind/name` twice) or read a ≤ 200-line slice of `full_report_file` / raw
+ bundle files (at most **twice**). Never read the skill's own Python scripts.
+ 
+ 1. **Step 1 — one-shot snapshot or log timeline (schema attached)**
+-   - `live` / `offline_data`: run `scripts/snapshot.py` with
+-     `--mode <mode> --action snapshot --ledger-path <ledger>` (add
++   - `live` / `offline_data`: run
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/snapshot.py`
++     with `--mode <mode> --action snapshot --ledger-path <ledger>` (add
+      `--namespace <ns>` if known; `--kueue-namespace` if not `kueue-system`;
+      `--ignore-namespaces ns1,ns2` for extra add-on namespaces). If no active
+      `Workload`/`Job` is present or controller/audit history is needed, also run
+-     `scripts/trace_logs.py --mode <mode> --ledger-path <ledger>` once (at most
+-     2 log commands total).
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode <mode> --ledger-path <ledger>`
++     once (at most 2 log commands total).
+    - `logs_archive`: run
+-     `scripts/trace_logs.py --mode logs_archive --ledger-path <ledger>` with
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode logs_archive --ledger-path <ledger>` with
+      `--data-path <file-or-dir>` first (add `--workload <name>` to focus).
+      Never call `kubectl` in this mode.
+-   - **Schema lookup (optional):** `scripts/snapshot.py --action explain` with
+-     `--kind <Kind[.field.path]> --ledger-path <ledger>`.
++   - **Schema lookup (optional):**
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/snapshot.py --action explain`
++     with `--kind <Kind[.field.path]> --ledger-path <ledger>`.
+    - **If a script fails:** read the error once, follow `next_step`, and
+      continue with available files without retrying in a loop.
+ 
+@@ -369,8 +376,9 @@ bundle files (at most **twice**). Never read the skill's own Python scripts.
+    - In `#### Observations`, wrap a multi-word phrase in backticks **only** when
+      it is a verbatim substring of tool output (synthesised summaries go in
+      plain text).
+-   - Save the draft and run `scripts/validate_report.py` with
+-     `--draft-file <draft.md> --ledger-path <ledger>`. It checks required
++   - Save the draft inside `"$WORK_DIR"` and run
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/validate_report.py`
++     with `--draft-file <draft.md> --ledger-path <ledger>`. It checks required
+      headers, `fabricated_quotes`, `remediation_gaps`,
+      `config_remediation_errors`, `unknown_kubectl_resources`, and
+      `schema_warnings`. If it reports an error, fix it and re-run once.
+diff --git a/references/log-sources.md b/references/log-sources.md
+--- a/references/log-sources.md
++++ b/references/log-sources.md
+@@ -9,11 +9,12 @@ directory:
+ 
+ ```bash
+ # export to a local file first, then point --data-path at the file or dir
+-<read-only export command> > /tmp/kueue-logs/export.json
+-python3 scripts/trace_logs.py \
++WORK_DIR=$(mktemp -d /tmp/kueue-triage.XXXXXX)
++<read-only export command> > "$WORK_DIR/export.json"
++python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py \
+   --mode logs_archive \
+-  --data-path /tmp/kueue-logs \
+-  --ledger-path /tmp/kueue-ledger.json
++  --data-path "$WORK_DIR" \
++  --ledger-path "$WORK_DIR/ledger.json"
+ ```
+ 
+ Export commands run by the caller must be strictly read-only and scoped to the

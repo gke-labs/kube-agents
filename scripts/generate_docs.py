@@ -282,6 +282,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Workloads": [
         "gke-app-onboarding",
         "gke-batch-hpc",
+        "gke-kueue-troubleshooting",
         "gke-workload-scaling",
         "gke-workload-security",
         "gke-workload-troubleshooting",

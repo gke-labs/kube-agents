@@ -1,0 +1,163 @@
+Subject: Adapt schema fetches overflow files and attribution for sandbox
+
+Why: In kube-agents' sandbox, (1) `gcloud` goes through the credential proxy (which forwards no shell env vars) and direct REST egress is blocked, so upstream's mandatory `references/attribution.md` block and file waste a turn on no-op env vars and unreachable `curl` commands (removing both prevents agents from opening the orphaned file); (2) the sandbox has a deny-all-internet NetworkPolicy, so schema fetches to GitHub and `kueue.sigs.k8s.io` stall 8-16s in all modes (including `live` `KueueConfiguration` fetches and `validate_report.py`) unless `--no-remote-schema` is passed on every command (a separate `export` does not persist across Hermes SSH tool calls); and (3) gateway truncated-output overflow paths live on the gateway pod and return `FileNotFoundError` inside the sandbox (`agents/platform/AGENTS.md`), whereas `full_report_file` beside `--ledger-path` is local to the sandbox.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; sandbox NetworkPolicy, credential-proxy attribution, and gateway overflow isolation are this repository's
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -19,12 +19,6 @@ metadata:
+ > Give the user any fix (remediation YAML, commands, or linked documentation
+ > steps) to apply themselves in the final `### Diagnostic Summary`.
+ 
+-## Usage Attribution
+-
+-**MUST READ**: Before executing any `gcloud`, REST API, or MCP command, you
+-MUST read and follow the instructions in
+-[Usage Attribution](references/attribution.md).
+-
+ ## Prerequisites
+ 
+ - **Tools and cluster access**: Python 3.10+ with `PyYAML` (all diagnostic
+@@ -67,13 +61,20 @@ object `apiVersion`s or startup/audit logs, and load the **CRD and
+ or confirm the served CRD version before writing remediation YAML.
+ 
+ **Where the schema comes from** (`schema_source` / `config_schema_source`): in
+-`live` the cluster's served CRDs are used (`live_cluster_crds`, no downloads);
+-in `offline_data` bundled CRD manifests are used if present (`bundled_crds`);
+-otherwise release CRDs are read from `GKE_KUEUE_TROUBLESHOOTING_KUEUE_REPO` or
+-fetched once from GitHub (`github_release:<tag>`) and cached under
++`live` the cluster's served CRDs are used (`live_cluster_crds`, no CRD
++downloads; `KueueConfiguration` still fetches online unless `--no-remote-schema`
++is passed); in `offline_data` bundled CRD manifests are used if present
++(`bundled_crds`); otherwise release CRDs are read from
++`GKE_KUEUE_TROUBLESHOOTING_KUEUE_REPO` or fetched once from GitHub
++(`github_release:<tag>`) and cached under
+ `$XDG_CACHE_HOME/gke-kueue-troubleshooting` (override with
+-`GKE_KUEUE_TROUBLESHOOTING_CACHE_DIR`; `--no-remote-schema` or
+-`GKE_KUEUE_TROUBLESHOOTING_NO_REMOTE_SCHEMA=1` disables downloads).
++`GKE_KUEUE_TROUBLESHOOTING_CACHE_DIR`). **In the kube-agents sandbox
++(deny-all-internet NetworkPolicy), pass `--no-remote-schema` on every
++`snapshot.py`, `trace_logs.py`, and `validate_report.py` invocation across all
++modes (`live`, `offline_data`, and `logs_archive`)** so the scripts skip
++unreachable GitHub / `kueue.sigs.k8s.io` fetches instead of stalling on 8–16s
++network timeouts (do not rely on a separate `export`, which does not persist
++across Hermes tool calls).
+ `KueueConfiguration` is not a CRD; its field tree is parsed from the
+ [KueueConfiguration v1beta2 reference](https://kueue.sigs.k8s.io/docs/reference/kueue-config.v1beta2/)
+ or
+@@ -112,9 +113,10 @@ most-important-first** (`detected_kueue_version`, derived facts,
+ `bulk_object_groups` with counts/names/representative, individual objects/log
+ excerpts, schema reference last) capped at `--max-output-bytes` (48 KB default
+ for snapshot, 24 KB for logs). The complete output is written to
+-`full_report_file` (next to the ledger). If command output is truncated to a
+-saved file, read that saved file once instead of re-running `--action get` or
+-`grep`. If the digest ends with `truncated:`, all tagged and coverage facts are
++`full_report_file` (next to the ledger, inside the sandbox). Never try to read
++gateway-side truncated overflow paths (they live on the gateway pod and are
++unreachable from the sandbox); read `full_report_file` beside `--ledger-path`
++instead. If the digest ends with `truncated:`, all tagged and coverage facts are
+ already above it; to inspect one dropped object, use
+ `--action get --kind <kind> --name <name>` (at most **4** `get` calls, never the
+ same `kind/name` twice) or read a ≤ 200-line slice of `full_report_file` / raw
+@@ -123,22 +125,22 @@ bundle files (at most **twice**). Never read the skill's own Python scripts.
+ 1. **Step 1 — one-shot snapshot or log timeline (schema attached)**
+    - `live` / `offline_data`: run
+      `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/snapshot.py`
+-     with `--mode <mode> --action snapshot --ledger-path <ledger>` (add
++     with `--mode <mode> --action snapshot --ledger-path <ledger> --no-remote-schema` (add
+      `--namespace <ns>` — required in `live` mode; if unknown, discover it first
+      with `kubectl get workloads.kueue.x-k8s.io -A` so `snapshot.py` does not
+      run a cluster-wide `pods`/`events` JSON dump that sandbox `kubectl`
+      admission refuses on large fleets; `--kueue-namespace` if not `kueue-system`;
+      `--ignore-namespaces ns1,ns2` for extra add-on namespaces). If no active
+      `Workload`/`Job` is present or controller/audit history is needed, also run
+-     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode <mode> --ledger-path <ledger>`
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode <mode> --ledger-path <ledger> --no-remote-schema`
+      once (at most 2 log commands total).
+    - `logs_archive`: run
+-     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode logs_archive --ledger-path <ledger>` with
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode logs_archive --ledger-path <ledger> --no-remote-schema` with
+      `--data-path <file-or-dir>` first (add `--workload <name>` to focus).
+      Never call `kubectl` in this mode.
+    - **Schema lookup (optional):**
+      `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/snapshot.py --action explain`
+-     with `--kind <Kind[.field.path]> --ledger-path <ledger>`.
++     with `--kind <Kind[.field.path]> --ledger-path <ledger> --no-remote-schema`.
+    - **If a script fails:** read the error once, follow `next_step`, and
+      continue with available files without retrying in a loop.
+ 
+@@ -380,7 +382,7 @@ bundle files (at most **twice**). Never read the skill's own Python scripts.
+      plain text).
+    - Save the draft inside `"$WORK_DIR"` and run
+      `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/validate_report.py`
+-     with `--draft-file <draft.md> --ledger-path <ledger>`. It checks required
++     with `--draft-file <draft.md> --ledger-path <ledger> --no-remote-schema`. It checks required
+      headers, `fabricated_quotes`, `remediation_gaps`,
+      `config_remediation_errors`, `unknown_kubectl_resources`, and
+      `schema_warnings`. If it reports an error, fix it and re-run once.
+diff --git a/references/attribution.md b/references/attribution.md
+deleted file mode 100644
+--- a/references/attribution.md
++++ /dev/null
+@@ -1,39 +0,0 @@
+-# Usage Attribution
+-
+-**MUST READ**: Before executing any `gcloud`, REST API, or MCP command with
+-this skill, follow these usage attribution instructions. Tag every command you
+-execute directly in the terminal so usage can be attributed. The tag identifies
+-only the skill and its version; it carries no user data.
+-
+--   **`gcloud` CLI Commands**: Prefix every `gcloud` invocation, whatever the
+-    subcommand, with the metrics environment variable. Set it inline on each
+-    command because shell state may not persist between commands:
+-
+-    ```bash
+-    CLOUDSDK_METRICS_REQUEST_ATTRIBUTION="agent-skills/1.0 (skill:gke-kueue-troubleshooting)" \
+-    gcloud <command> [flags]
+-    ```
+-
+-    Do not use `gcloud config set` for this: it would persist beyond the current
+-    task and mislabel unrelated usage.
+-
+--   **Direct HTTP, REST, and MCP Requests**: On direct HTTP calls to Google
+-    Cloud APIs (for example with `curl`) or HTTP requests to a remote MCP
+-    server, include `agent-skills/1.0 (skill:gke-kueue-troubleshooting)` in the
+-    `User-Agent` header. If a `User-Agent` header is already specified, append
+-    this string to the end of it rather than overwriting existing `User-Agent`
+-    data — the collection pipeline parses the `agent-skills/<version>` and
+-    `skill:<name>` tokens, so any rewording breaks attribution:
+-
+-    ```
+-    User-Agent: <existing_user_agent> agent-skills/1.0 (skill:gke-kueue-troubleshooting)
+-    ```
+-
+--   **Constraint for Generated Code**: The tracking prefix is strictly for
+-    commands you execute directly in the terminal. Do NOT include this tracking
+-    prefix in generated scripts, Terraform templates, or code provided to the
+-    user for their own repositories.
+-
+--   **User Opt-Out**: If the user asks to disable or remove tracking or
+-    attribution tags, omit the `CLOUDSDK_METRICS_REQUEST_ATTRIBUTION` variable
+-    and custom `User-Agent` suffix from all commands.
+diff --git a/references/log-sources.md b/references/log-sources.md
+--- a/references/log-sources.md
++++ b/references/log-sources.md
+@@ -14,9 +14,13 @@ WORK_DIR=$(mktemp -d /tmp/kueue-triage.XXXXXX)
+ python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py \
+   --mode logs_archive \
+   --data-path "$WORK_DIR" \
+-  --ledger-path "$WORK_DIR/ledger.json"
++  --ledger-path "$WORK_DIR/ledger.json" \
++  --no-remote-schema
+ ```
+ 
++Always pass `--no-remote-schema` in the kube-agents sandbox so schema loading
++does not stall on unreachable remote fetches.
++
+ Export commands run by the caller must be strictly read-only and scoped to the
+ target cluster, the incident time window, `kueue-system`, Kubernetes Event logs,
+ and Admin Activity audit logs as described below and in
