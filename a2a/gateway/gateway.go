@@ -3406,12 +3406,16 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
 	// which runs session pods and profile tasks, does not read it yet; the
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	// A chat thread's kept reports are forgotten once this turn is on the
+	// bus (below), not here: a publish that fails leaves them for the retry.
+	threadReportsRead := 0
 	if ts.Role == "" {
-		if report, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, n, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
+				threadReportsRead = n
 			}
 		}
 	}
@@ -3582,6 +3586,12 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
+	if threadReportsRead > 0 {
+		// The turn under the thread's newest report is on the bus: the
+		// reports it read are forgotten, so the next turn there is not under
+		// a report it was not about; one kept during the publish stays.
+		g.reports.forgetUpTo(rec.Key, threadReportsRead)
+	}
 
 	// The submission is on the subject now, which is the first moment
 	// anything can be said to have been handed to an executor. An observer
@@ -3738,6 +3748,14 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.log.Error("steer publish failed", "taskId", active.TaskID, "err", err)
 		g.post(rec.Key, noticeSteerNotSent)
 		return
+	}
+	// A message steered into a chat thread's running task is the human
+	// talking in the thread to the session already at work there: the
+	// thread's kept reports are forgotten, so they do not ride a later,
+	// unrelated opening turn (pushedReports). A report kept since that task
+	// opened is not carried either; the executor's own lookup serves it.
+	if lib.ThreadKeyedConversation(rec.Key) {
+		g.reports.forget(rec.Key)
 	}
 	// The steer is on the stream, and what happens next is the route's
 	// contract (spec: gateway-authored posts): a session worker absorbs it at

@@ -435,14 +435,20 @@ arrives with no link to that report, and nothing else attaches it, since the Her
 `incident_context` hook runs on no turn of the `api` executor. Two sources, in order. First the
 gateway's relay: the A2A gateway keeps the text of each report its notify route posts into a
 console conversation (a card's report, marked `report` by the notifier and naming its task; a
-progress note, which shares the thread and the task, is not kept; a Slack or Google Chat
-thread's posts, a relayed scheduled report and an alert's triage report it does not keep, and the
-lookup still serves them; `docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it
-on a reply's submission as a `pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the
-reply names the task the report was on (a console or MCP client's `replyTo`, the chain's root even
-when a delegated child filed the card); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so
-what it kept is what the person read; it holds reports only, and when two reports share one root
-(two cards from one turn) the reply carries the newest. This is how a card filed in a delegated
+progress note, which shares the thread and the task, is not kept) and into a chat thread (a Slack
+or Google Chat thread key, `lib.ThreadKeyedConversation`: the same marked report, kept under the
+thread's key with no task named; a post into a whole space or a thread-less DM, a relayed scheduled report
+and an alert's triage report it does not keep, and the lookup still serves them;
+`docs/designs/spec-chatops-gateway.md`, "Proactive posts") and puts it on a reply's submission as a
+`pushedReport` part (`docs/designs/spec-a2a-payloads.md`) when the reply names the task the report
+was on (a console or MCP client's `replyTo`, the chain's root even when a delegated child filed the
+card) or is the next human turn that opens in a thread the gateway kept a report for (the newest
+one; `taskId` absent; once that turn is on the bus the gateway forgets the reports it read, and a
+message steered into the thread's running task empties them once the steer is on the bus, so the
+turn after falls back to the lookup below, and an alert's triage report is hidden for that one turn
+and no longer); the bridge frames that text and looks nothing up. The relay outranks the store by design: the gateway posted the report, so what it kept is what
+the person read; it holds reports only, and when two reports share one root (two cards from one
+turn) or one thread the reply carries the newest. This is how a card filed in a delegated
 child's turn is answered: its row is in the child's pod's session-kv, which the pod answering the
 reply never reads, and the relay carries the report across. The relay rides a human turn on every
 route; this executor frames it on the platform route (the install's default), and a conversation

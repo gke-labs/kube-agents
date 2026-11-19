@@ -2065,21 +2065,30 @@ and goes when kanban does.
 The gateway keeps each report the route posts into a conversation for the reply under it: a post
 the kanban notifier marks as a card's report (`report`, `a2a notify --report`, set by
 `kanban_progress_lines._with_answer` on the settled card's report post alone, never on a progress
-note, heartbeat, queued or plan line) that names the task it reports on (`reply_to`). The notifier
+note, heartbeat, queued or plan line); a console post also names the task it reports on (`reply_to`). The notifier
 puts `reply_to` on every post into a console thread, and a console card's rolling lines are
 unkeyed posts of their own (the stand-in cannot edit), so `reply_to` and `update` alone cannot tell
-a report from a note; the mark can. Only the console route names the task today, so the cache
-holds console reports. Per conversation key its last eight
+a report from a note; the mark can. A console conversation holds many chains, so its reports are
+kept under the root of the task each reported on; a marked post into a chat thread (a thread-keyed
+conversation, `lib.ThreadKeyedConversation`: a Slack or Google Chat thread key, the prefixes
+`lib.threadKeyedPrefixes` lists, which a backend whose keys are threads joins; never a whole space or
+a thread-less DM) names no task and is kept under the key alone. Per conversation key its last eight
 reports in order (`pushedReportsPerConversation`), each with the text (cut to 64 KiB,
-`lib.PushedReportTextCap`, with a note) and the root of the task it reported on, over at most 1024
+`lib.PushedReportTextCap`, with a note) and, for a console report, the root of the task it reported on, over at most 1024
 conversations (`pushedReportsConversationsMax`) and 32 MiB of text in all
 (`pushedReportsBytesMax`); past either bound the conversation least recently posted a report to is
 forgotten whole, so the cache holds at most 32 MiB or one conversation (the per-conversation bounds
 alone would allow 1024 × 8 × 64 KiB). A human turn, on any route, that names a task (the console
-frame's `replyTo`, read as its chain's root) carries the newest report kept on that root; a turn
-naming none carries nothing, so a Slack or Google Chat thread reply keeps the executor's own
-lookup (the thread relay is a follow-up: the notifier naming the task and marking the report on
-thread posts, and `postConversation` recording the root). The turn's submission gets it as a
+frame's `replyTo`, read as its chain's root) carries the newest report kept on that root, as often
+as a turn names it; a human turn that opens a task in a chat thread names no task and carries the
+newest report kept for the thread's key, and once that turn's submission is on the bus the gateway
+forgets the reports the turn read (one kept during the publish stays for the next turn); a message
+steered into the thread's running task empties the thread's kept reports once the steer is on the
+bus (the session at work there answers it; a report kept since that task opened is not carried
+either), so the next opening turn there is not under a report it was not about (the executor's
+session keeps what that turn was shown, and the next turn is as likely to be about the next report,
+or the alert the thread hangs under, as about this one; the bridge's own lookup serves it, as it did
+before); a turn naming none anywhere else carries nothing. The turn's submission gets it as a
 `pushedReport` part (`spec-a2a-payloads.md`), which the hermes-bridge frames ahead of the words on
 the platform route, the install's default; the a2a-worker, which runs session pods and profile
 tasks, reads text parts only and does not frame it yet. Process memory: a restart forgets every report, and a reply then falls back to the
