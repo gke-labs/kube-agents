@@ -161,6 +161,12 @@ const (
 // EnvStreamSteps sets the bridge's StepStreaming; the --stream-steps flag overrides it.
 const EnvStreamSteps = "KUBE_AGENTS_MCP_STREAM_STEPS"
 
+// maxLoggedCapabilities and maxLoggedClientField bound the initialize log line.
+const (
+	maxLoggedCapabilities = 32
+	maxLoggedClientField  = 128
+)
+
 // ParseStepStreaming reads auto, on or off (any case, surrounding space ignored); empty is auto.
 func ParseStepStreaming(v string) (StepStreaming, error) {
 	switch m := StepStreaming(strings.ToLower(strings.TrimSpace(v))); m {
@@ -971,12 +977,6 @@ func logClient(params json.RawMessage, mode StepStreaming) {
 	slog.Info("mcp client", "name", truncateForLog(info.Name), "version", truncateForLog(info.Version),
 		"capabilities", names, "stepStreaming", string(mode))
 }
-
-// maxLoggedCapabilities and maxLoggedClientField bound the initialize log line.
-const (
-	maxLoggedCapabilities = 32
-	maxLoggedClientField  = 128
-)
 
 func truncateForLog(v string) string {
 	if len(v) <= maxLoggedClientField {

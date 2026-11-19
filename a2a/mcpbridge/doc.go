@@ -56,7 +56,7 @@
 //	                               set the bridge falls back to the github.com
 //	                               entry in ~/.git-credentials, if present
 //
-// RunCLI is the entry point: it accepts --version and --config, and otherwise
+// RunCLI is the entry point: it accepts --version, --config and --stream-steps, and otherwise
 // serves MCP over stdio. Callers pass the ClusterAccess implementation
 // (normally kube.New()); the binary lives in a2a/cmd/kube-agents-mcp.
 package mcpbridge
