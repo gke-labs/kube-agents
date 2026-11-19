@@ -290,6 +290,13 @@ var (
 			{"in `metadata.root_cause` and `metadata.evidence`.", "leading the answer.", 1},
 			{"on the card.", "in the request.", 1},
 			{"card", "request", 0},
+			// A task may ask for a change, which the persona publishes
+			// (instructions.md §2, the version-control skill): the boundary
+			// is the cluster's, and the repository is reached only through
+			// the skill, for the repository the task names.
+			{"You cannot read the repository, so read", "Unless the task names the managed repository (then the `version-control` skill reads it), read", 1},
+			{"**You have no GitOps repository to read, and you are not meant to find one.** You hold a read-only view of one cluster — no checkout, no clone, no forge access. Do not go looking for one.", "**You have no GitOps checkout, and you are not meant to go looking for one.** You hold a read-only view of one cluster; the only way to the repository is the `version-control` skill, and only for the repository the task names.", 1},
+			{"You work under a strict read-only boundary: no patches applied, no Pull Requests opened, nothing written to the cluster. The fix ships as a Pull Request against the GitOps repository and somebody else opens it —", "You work under a strict read-only boundary on the cluster: no patches applied, nothing written to it. The fix ships as a pull request against the GitOps repository, and somebody else opens it unless the task asks you for that change (`instructions.md` §2) —", 1},
 		},
 		"gke-stall-detection": {
 			{"`/opt/data/scripts/stall_report.py`", "`scripts/stall_report.py`, in this skill's directory (the base directory the harness gives when it loads the skill),", 1},
@@ -302,6 +309,7 @@ var (
 		},
 		"pod-container-creating": {
 			{noGetCredentialsRule, "", 1},
+			{"you have no GitOps repository, so don't look for one)", "you have no GitOps checkout, so don't look for one unless the task names the repository)", 1},
 		},
 		"pod-crashloop-oom": {
 			{"search `mcp-developer_knowledge` before a web search", "search the `developer_knowledge` MCP server's tools before a web search", 1},
@@ -396,7 +404,7 @@ func normalizeMarkdown(s string) string {
 var (
 	reportingBoundary = `## Boundary
 
-You work under a strict read-only boundary. Do not apply patches to the cluster and do not open pull requests: whoever asked for the investigation owns the GitOps write path. Report in your final answer.
+You work under a strict read-only boundary on the cluster: do not apply patches to it. Open a pull request only when the task asks for that change, as ` + "`" + `instructions.md` + "`" + ` §2 and the ` + "`" + `version-control` + "`" + ` skill say; otherwise whoever asked for the investigation owns the GitOps write path. Report in your final answer.
 
 `
 	reportingFinding = `3. Put the whole finding in your final answer: the root cause, the evidence that grounds it, and the proposed patch as a fenced ` + "`" + `yaml` + "`" + ` block. Aim under 2,000 characters (` + "`" + `instructions.md` + "`" + ` §9): tighten the prose, keep the cause, the evidence and the patch.
@@ -412,7 +420,7 @@ When ` + "`" + `workload_triage.py` + "`" + ` ends with ` + "`" + `unhealthy: 0`
 If an input is missing or the scope is ambiguous, say what you need in your final answer instead. Do the same when nothing could be read from the cluster: ` + "`" + `workload_triage.py` + "`" + ` exiting 2, or the cluster API unreachable before any evidence is gathered. Quote the exact stderr line in your final answer. When an individual ` + "`" + `kubectl` + "`" + ` read mid-investigation is refused (` + "`" + `Error from server (Forbidden)` + "`" + `, HTTP 403), follow ` + "`" + `instructions.md` + "`" + ` §2 and §7 instead: treat the refusal as terminal for that query only, continue with what you can read, and complete your final answer naming that refusal as the gap.`
 	stallRecording = `## Recording the finding
 
-You work under a strict read-only boundary: no patches applied, no Pull Requests opened. Report in your final answer.
+You work under a strict read-only boundary on the cluster: no patches applied, and no pull request unless the task asks for that change (` + "`" + `instructions.md` + "`" + ` §2). Report in your final answer.
 
 - A request that gives a report format wins: format the answer exactly as it says. A stall alert raised through the Session KV server's ` + "`" + `controller-stall` + "`" + ` inject arrives as such a request, with the ` + "`" + `What's wrong` + "`" + ` / ` + "`" + `Why` + "`" + ` / ` + "`" + `What to do` + "`" + ` template and, when there is a fix, a ` + "`" + `To authorize:` + "`" + ` line; that shape is what gets the report saved so a reply of "apply" can act on it. Quote the scan's ` + "`" + `stalled resources: <count>` + "`" + ` line in ` + "`" + `Why` + "`" + `.
 - Otherwise, follow the shape in [` + "`" + `workload-triage-scan/references/reporting.md` + "`" + `](../workload-triage-scan/references/reporting.md): which objects are stalled, for how long, on which heuristic, and what each is waiting for (the missing Secret, the unmet condition), grounded in the report rows and the confirming kubectl reads; or the statement that the namespace has no stalled resources. Add YAML creating or correcting the missing reference when one is identifiable.

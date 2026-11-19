@@ -1,8 +1,10 @@
 package claudecode
 
 import (
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -370,5 +372,40 @@ func TestTheVersionControlSkillUsesTheNamedRepositoryAndStopsAtARefusal(t *testi
 		if !strings.Contains(text, phrase) {
 			t.Errorf("the version-control skill no longer says %q", phrase)
 		}
+	}
+}
+
+// No cluster persona skill tells the model, unconditionally, that it may not
+// open a pull request or reach the repository: instructions.md §2 lets it
+// publish the change a task asks for, and a skill loaded for the
+// investigation that says otherwise contradicts it with nothing to say which
+// wins.
+func TestNoPersonaSkillForbidsWhatThePersonaAllows(t *testing.T) {
+	absolutes := []string{
+		"no Pull Requests opened",
+		"do not open pull requests",
+		"You cannot read the repository",
+		"no clone, no forge access",
+		"you have no GitOps repository",
+	}
+	root := path.Join(clusterPersonaDir, "skills")
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".md") {
+			return err
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		text := strings.Join(strings.Fields(string(b)), " ")
+		for _, a := range absolutes {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(a)) {
+				t.Errorf("%s says %q, which instructions.md §2 no longer holds", strings.TrimPrefix(p, root+"/"), a)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
