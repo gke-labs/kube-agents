@@ -37,6 +37,12 @@ from dataclasses import dataclass, field
 # dependency on its callers; test_yaml_edit.py holds the two equal.
 MAX_FILE_BYTES = 64 * 1024
 
+# PyYAML and libyaml/go-yaml refuse an implicit key whose ':' is more than 1024
+# characters from its start.
+MAX_KEY_CHARS = 1024
+# go-yaml reads integers outside int64 as floats.
+INT_MIN, INT_MAX = -(2**63), 2**63 - 1
+
 PROTECTED_PATHS = (
     ("apiVersion",),
     ("kind",),
@@ -105,6 +111,9 @@ _DOC_START = re.compile(r"^---(?= |$)")
 _DOC_END = re.compile(r"^\.\.\.(?= |$)")
 _BLOCK_HEADER = re.compile(r"^[|>](?:[1-9][+-]?|[+-][1-9]?)?(?: +#.*)? *$")
 _PLAIN_KEY_COLON = re.compile(r":(?= |$)")
+# The body of a double-quoted scalar whose every backslash starts an escape
+# YAML (and PyYAML, and go-yaml) accepts.
+_VALID_ESCAPES = re.compile(r'(?:[^\\"]|\\(?:[0abtnvfre "/\\N_LP]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*')
 _INDICATORS = set("-?:,[]{}#&*!|>'\"%@`")
 # Scalars YAML 1.1 (PyYAML, and the go-yaml v2 that Kubernetes tooling still
 # embeds) resolves to something other than a string: null, bool, int (including
@@ -259,6 +268,8 @@ class _Parser:
             end = _quoted_end(text, 0)
             if end < 0 or not text[end:].startswith(":") or text[end + 1 : end + 2] not in ("", " "):
                 return None
+            if end > MAX_KEY_CHARS:
+                raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: key longer than {MAX_KEY_CHARS} characters")
             return _unquote(text[:end], lineno), False, text[end + 1 :], col + end + 1
         m = _PLAIN_KEY_COLON.search(text)
         if not m:
@@ -267,6 +278,8 @@ class _Parser:
         if hash_at != -1 and hash_at < m.start():
             return None
         key = text[: m.start()]
+        if len(key) > MAX_KEY_CHARS:
+            raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: key longer than {MAX_KEY_CHARS} characters")
         if text[0] in _INDICATORS or key != key.rstrip(" "):
             raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: key {key!r} is not a simple key")
         if key == "<<":
@@ -316,7 +329,7 @@ class _Parser:
             if body.startswith("- ") or body == "-":
                 raise RefusedEdit("unsupported-syntax", f"line {j + 1}: nested inline sequence")
             item: Node
-            if body and not body.startswith("#") and self.split_key(body, col, j) is not None:
+            if body and body[0] not in "[{#" and self.split_key(body, col, j) is not None:
                 item = self.parse_mapping(col, (col, body, j))
             else:
                 item = self.parse_value(indent, rest, indent + 1, j, mapping_value=False)
@@ -365,7 +378,10 @@ class _Parser:
                     if content_indent < 0:
                         leading_blank = max(leading_blank, len(line))
                     self.i += 1
-                elif self.indent_of(self.i) > parent:
+                elif self.indent_of(self.i) > parent and self.indent_of(self.i) >= max(content_indent, 0):
+                    # A line indented less than the first content line ends the
+                    # scalar, as it does for a full parser; the caller then
+                    # refuses it as unexpected indentation.
                     if content_indent < 0:
                         content_indent = self.indent_of(self.i)
                     self.i += 1
@@ -383,6 +399,8 @@ class _Parser:
                 raise RefusedEdit("multi-line-scalar", f"line {lineno + 1}: quoted scalar spans lines")
             if not _rest_is_comment(body[end:]):
                 raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: text after quoted scalar")
+            if c == '"' and not _VALID_ESCAPES.fullmatch(body[1 : end - 1]):
+                raise RefusedEdit("unsupported-syntax", f"line {lineno + 1}: invalid escape in double-quoted scalar")
             self.no_continuation(parent, lineno)
             return Scalar(lineno, start, start + end, "single" if c == "'" else "double")
         if c in _INDICATORS and not (c in "-?:" and body[1:2] not in ("", " ")):
@@ -542,8 +560,7 @@ def _render(value: Value, style: str) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
-        # go-yaml reads integers outside int64 as floats.
-        if not -(2**63) <= value < 2**63:
+        if not INT_MIN <= value <= INT_MAX:
             raise RefusedEdit("bad-value", "integer outside the signed 64-bit range")
         return str(value)
     if not isinstance(value, str):

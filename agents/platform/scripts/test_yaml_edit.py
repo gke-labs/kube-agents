@@ -383,6 +383,12 @@ class Refusals(unittest.TestCase):
         ("list item name", "apiVersion: v1\nkind: List\nitems:\n- apiVersion: v1\n  kind: ConfigMap\n  metadata:\n    name: a\n", 0, ["items", 0, "metadata", "name"], "b", "protected-path"),
         ("int over int64", PDB, 0, ["spec", "minAvailable"], 2**63, "bad-value"),
         ("huge int", PDB, 0, ["spec", "minAvailable"], -(10**5000), "bad-value"),
+        ("block scalar dedent", "data:\n  c: |\n      key: value\n    bad: 1\n  mode: fast\n", 0, ["data", "mode"], "x", "unsupported-syntax"),
+        ("unknown escape", 'a: "\\s"\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
+        ("windows path escape", 'a: "C:\\Users\\app"\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
+        ("truncated unicode escape", 'a: "\\u12"\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
+        ("long plain key", "k" * 1025 + ": 1\nb: 1\n", 0, ["b"], 2, "unsupported-syntax"),
+        ("long quoted key", '"' + "k" * 1025 + '": 1\nb: 1\n', 0, ["b"], 2, "unsupported-syntax"),
         ("oversized", "a: 1\n# " + "x" * (64 * 1024) + "\n", 0, ["a"], 2, "too-large"),
     ]
 
@@ -400,6 +406,15 @@ class Refusals(unittest.TestCase):
     def test_int64_bounds_accepted(self):
         out = set_scalar(PDB, 0, ["spec", "minAvailable"], 2**63 - 1)
         self.assertEqual(yaml.safe_load(out)["spec"]["minAvailable"], 2**63 - 1)
+
+    def test_flow_collections_as_sequence_items_are_skipped(self):
+        text = 'ports:\n- {name: http, containerPort: 8080}\n- ["a: b"]\nb: 1\n'
+        self.assertEqual(set_scalar(text, 0, ["b"], 2), text.replace("b: 1", "b: 2"))
+
+    def test_valid_escapes_are_accepted(self):
+        text = 'a: "tab\\t nl\\n \\x41 \\u00e9 \\\\ \\" \\/"\nb: 1\n'
+        yaml.safe_load(text)
+        self.assertEqual(set_scalar(text, 0, ["b"], 2), text.replace("b: 1", "b: 2"))
 
     def test_refusal_is_a_value_error(self):
         self.assertTrue(issubclass(RefusedEdit, ValueError))
