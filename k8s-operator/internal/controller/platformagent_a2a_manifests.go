@@ -4617,11 +4617,22 @@ func (r *PlatformAgentReconciler) recordProfileSubmitMaxAge(ctx context.Context,
 	if (have == nil && live == nil) || (have != nil && live != nil && *have == *live) {
 		return
 	}
-	patch := client.MergeFrom(agent.DeepCopy())
-	agent.Status.ProfileSubmitMaxAgeSeconds = live
-	if err := r.Status().Patch(ctx, agent, patch); err != nil {
+	// The patch goes through a copy: its answer, the stored status, would
+	// otherwise replace this pass's in-memory status, everything resolved
+	// and not yet written (the bus's count, a migration's progress). Only
+	// the field and the version the write made are carried back, and only
+	// from a write against the version this pass read: carried from a write
+	// over a status someone changed since (a poller), the version would let
+	// the pass's final full write go over that change instead of conflicting.
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	written := agent.DeepCopy()
+	written.Status.ProfileSubmitMaxAgeSeconds = live
+	if err := r.Status().Patch(ctx, written, patch); err != nil {
 		logf.FromContext(ctx).Error(err, "could not record PROFILE_SUBMITS' live max age; the provision Job's next run reports it again")
+		return
 	}
+	agent.Status.ProfileSubmitMaxAgeSeconds = written.Status.ProfileSubmitMaxAgeSeconds
+	agent.ResourceVersion = written.ResourceVersion
 }
 
 // a2aProvisionReport is the shape of the script's termination message: an
@@ -4888,7 +4899,9 @@ const (
 	// reconcile, each surge-first; the chart's own surges are in its count),
 	// one provisioning Job pod (at install, on any spec change and about daily
 	// after its TTL), the scope publisher's Job pods, and three for the
-	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// gateway's transient overshoot at the cap: a replacing turn's slot while
+	// its old pod is still going, and a gateway older than #6033, whose
+	// count-then-create race could pass a burst together (a2a/gateway/spawn.go,
 	// refuseAtSessionCap).
 	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
 	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
@@ -5317,11 +5330,11 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			if refusal := r.busMigrationStreamsOverCap(ctx, agent); refusal != "" {
 				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationStreamsOverCap,
 					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but no migration starts: %s; the bus keeps %d", want, running, refusal, running))
-			} else {
-				startBusMigration(agent, running, want, metav1.Now())
+			} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
+				return err
 			}
-		} else {
-			startBusMigration(agent, running, want, metav1.Now())
+		} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
+			return err
 		}
 	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
@@ -5385,6 +5398,48 @@ func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, no
 		Deadline:           metav1.NewTime(now.Add(busMigrationRunDeadline)),
 		ObservedGeneration: agent.Generation,
 	}
+}
+
+// startBusMigrationPersisted starts a run (startBusMigration) and writes its
+// record to the API server before the pass goes on, so nothing renders with
+// a run ID that isn't persisted (#6298). The rest of the pass renders the
+// run's work from its ID straight away: the callout's freeze template and
+// identity map, the bus's pins. A record kept only in memory until the
+// pass's final status write was lost whenever that write conflicted, and the
+// next pass, finding no run, started another with a new ID and rolled the
+// callout again, every pass, the callout never becoming ready.
+//
+// The write is a status patch of the record alone, against the
+// resourceVersion this pass read, so it fails on any change since the read.
+// A failed write takes the run back out of the pass and returns the error: a
+// conflict requeues the pass, which re-reads, and finds the run if the write
+// did land after all, or starts it again. Nothing was rendered with the
+// discarded ID, and an ID is minted only while no run is persisted. An echo
+// without the record is the served CRD pruning it: the run is taken back,
+// and noteBusMigrationEcho records the prune, so the next pass refuses to
+// start one, with its Warning Event.
+func (r *PlatformAgentReconciler) startBusMigrationPersisted(ctx context.Context, agent *agentv1alpha1.PlatformAgent, running, want int) error {
+	before := agent.Status.BusMigration
+	startBusMigration(agent, running, want, metav1.Now())
+	if agent.Status.BusMigration == before {
+		return nil // nothing started
+	}
+	base := agent.DeepCopy()
+	base.Status.BusMigration = before
+	written := agent.DeepCopy()
+	if err := r.Status().Patch(ctx, written, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		agent.Status.BusMigration = before
+		return err
+	}
+	// The pass's final status write goes against the version this write
+	// made; the rest of the in-memory status, changed this pass and not yet
+	// written, stays as it is.
+	agent.ResourceVersion = written.ResourceVersion
+	r.noteBusMigrationEcho(written, true)
+	if written.Status.BusMigration == nil {
+		agent.Status.BusMigration = before
+	}
+	return nil
 }
 
 // busMigrationWouldStart reports whether startBusMigration would start a run
@@ -7041,6 +7096,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	// The report reader's token and the broker's address, on every install
+	// (a2a_report_reader.go).
+	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
+	env = append(env, reportEnv...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))
@@ -7121,10 +7180,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), append(injectMounts, reportMounts...)...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), append(injectVolumes, reportVolumes...)...),
 				},
 			},
 		},

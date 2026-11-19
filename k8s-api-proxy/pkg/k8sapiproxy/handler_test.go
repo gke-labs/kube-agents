@@ -2,6 +2,7 @@ package k8sapiproxy
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -56,6 +57,17 @@ func (rt *recordingTransport) RoundTripCluster(_ context.Context, clusterID stri
 		Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[]}`)),
 		Request:    req,
 	}, nil
+}
+
+// The Basic credentials are fake. Tests build their Basic headers at run time with
+// basicAuthHeader, so no literal in this package reads as a credential to a secret scanner.
+const (
+	placeholderBasicUser = "placeholder-user"
+	placeholderBasicPass = "placeholder-pass"
+)
+
+func basicAuthHeader(user, pass string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 }
 
 func newTestHandler(t *testing.T, cfg Config) (http.Handler, *recordingTransport) {

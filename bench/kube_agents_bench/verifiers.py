@@ -3396,10 +3396,9 @@ class DelegatedToVerifier(BaseVerifier):
     ``forbidden_addressees``: Python regular expressions, none of which may
     ``re.fullmatch`` any addressee. At least one of the two lists is set.
 
-    Fails closed: a run that could not say (the api transport, or a door
-    older than the field) is ``status="error"``, never a pass or a fail. A
-    case that relies on this check belongs in
-    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    Fails closed: a run that could not say (the api transport, which no CI
+    lane uses, or a door older than the field) is ``status="error"``, never
+    a pass or a fail.
     """
 
     type: Literal["delegated_to"]
@@ -7524,8 +7523,8 @@ class GitHubWritesVerifier(BaseVerifier):
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
-    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the five first-run audits keep their clock until
+    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): an install that
+    keeps the sweep on has the five first-run audits keep their clock until
     the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
@@ -8587,7 +8586,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
-        "webhook-backend-unreachable",
+        "webhook-backend-unreachable", "serviceentry-host-collision",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -9273,7 +9272,7 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
+def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool = False) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
@@ -9281,7 +9280,9 @@ def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     it has one (absent stays absent), each further top-level
     key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
     and the ids of the findings in its ``document`` (this run's own, never ids it
-    only carried), or the ``error`` that kept it unread. The rest stays in the pod.
+    only carried), or the ``error`` that kept it unread. With ``excerpts``, also
+    each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
+    which ``finish`` takes from the collector. The rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9296,6 +9297,11 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
             entry[{_ENVELOPE_STARTED_KEY!r}] = envelope[{_ENVELOPE_STARTED_KEY!r}]
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
+        if {excerpts!r}:
+            entry["finding_excerpts"] = {{
+                str(f.get("id", "")): str((f.get("evidence") or {{}}).get("excerpt") or "")
+                for f in findings if isinstance(f, dict)
+            }}
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
@@ -9322,10 +9328,10 @@ def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float)
 
 
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = ()
+    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = (), excerpts: bool = False
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit, keys), timeout)
+    reply = shell(report_store_command(audit, keys, excerpts), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -9354,8 +9360,14 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
     the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), and has, for each ``required_finding_phrases`` entry, a finding
-    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it, and has no finding whose id
+    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
+    that plants a look-alike the check must leave alone), and, for each
+    ``required_evidence_phrases`` entry, a finding whose id contains a
+    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
+    it: what the collector observed and ``finish`` published, read where it was
+    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
     also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
@@ -9367,6 +9379,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
+    required_evidence_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
@@ -9377,6 +9391,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
+        if self.required_evidence_phrases and not self.required_finding_phrases:
+            raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
+        return self
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()
@@ -9396,7 +9416,9 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         envelopes: list[dict[str, Any]] = []
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(shell, self.audit, read_timeout, tuple(self.required_envelope))
+            listing = read_report_store(
+                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
+            )
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
@@ -9451,6 +9473,10 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
+            excerpts = envelope.get("finding_excerpts") or {}
+            matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
+            unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
             wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
@@ -9461,6 +9487,10 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
+            elif unevidenced:
+                failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw

@@ -239,6 +239,7 @@ IMAGE_ARGS=()
 GITHUB_MINTER_ARGS=()
 FORGE_ARGS=()
 A2A_OPERATOR_ENV_ARGS=()
+MODE_NEXT_MAX_SESSIONS=6
 {sleep_func}
 """
             proc = subprocess.run(

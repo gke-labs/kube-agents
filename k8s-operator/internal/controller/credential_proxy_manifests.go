@@ -900,14 +900,12 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
 		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
 	}
-	// The A2A gateway pod, while its Google Chat adapter pulls the relay
-	// hosted here. The same condition as allowedBrokerCallers: a peer that
-	// is not a caller is a rule with nobody behind it.
-	if a2aChatArmed(agent) {
-		callers = append(callers, networkingv1.NetworkPolicyPeer{
-			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
-		})
-	}
+	// The A2A gateway pod, on every install: its report reader calls the
+	// store routes, and its Google Chat adapter, when armed, the relay. The
+	// same condition as allowedBrokerCallers.
+	callers = append(callers, networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
+	})
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods, under the cluster-view flag: the same selector
 		// the session fence and the bus fence name, on the credentialed port
@@ -922,6 +920,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	// The scope publisher's pods, while the broker confers the scope role,
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
+	callers = append(callers, a2aCuratorBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},

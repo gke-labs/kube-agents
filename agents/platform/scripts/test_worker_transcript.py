@@ -5,11 +5,16 @@ wrappers and routes; these call the module's public API directly with the
 redactor loaded by path, as the bench's in-pod script loads it.
 """
 
+import ast
 import importlib.util
 import json
+import os
 import shlex
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -47,6 +52,17 @@ class TestScrubStepText(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(worker_transcript.scrub_step_text(None, kind, "x", WITHHELD), WITHHELD)
 
+    # The search for the JSON parser's depth limit tries no document deeper than this: 4 million levels, 8 MB.
+    DEEPEST_DOCUMENT_TRIED = 1 << 22
+
+    @staticmethod
+    def _parses(text):
+        try:
+            json.loads(text)
+        except RecursionError:
+            return False
+        return True
+
     def test_withheld_when_the_walk_exceeds_the_recursion_limit(self):
         class _TooDeep:
             @staticmethod
@@ -56,8 +72,24 @@ class TestScrubStepText(unittest.TestCase):
         for kind in ("tool_call", "tool_result", "reply"):
             with self.subTest(kind=kind):
                 self.assertEqual(worker_transcript.scrub_step_text(_TooDeep, kind, "x", WITHHELD), WITHHELD)
+        # A document that parses and is too deep to walk is withheld.
+        depth = 2 * sys.getrecursionlimit()
+        nested = "[" * depth + "]" * depth
+        with self.subTest(levels=depth):
+            if not self._parses(nested):
+                self.skipTest("the JSON parser refuses %d levels here, so no document of this depth parses" % depth)
+            self.assertEqual(_scrub("tool_result", nested), WITHHELD)
         # A document too deep to parse is scrubbed as text rather than dropped.
-        deep = "[" * 100000 + "]" * 100000
+        # The parser's depth limit is the interpreter's: some thousands of
+        # levels on Python 3.12 and 3.13, and on 3.14 as many as the stack
+        # holds (more than 100,000 with a 16 MB stack). So the test finds a
+        # depth above it and holds no fixed one.
+        deep = nested
+        while self._parses(deep):
+            if 2 * depth > self.DEEPEST_DOCUMENT_TRIED:
+                self.skipTest("the JSON parser of this Python parses %d levels; the search stops there" % depth)
+            depth *= 2
+            deep = "[" * depth + "]" * depth
         self.assertEqual(_scrub("tool_result", deep), deep)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
@@ -690,6 +722,35 @@ class TestScrubStepText(unittest.TestCase):
                 out = _scrub("tool_call", cmd)
                 self.assertLess(time.process_time() - start, 1.0)
                 self.assertNotIn("S3cretValue9", out)
+
+    def test_key_headers_with_no_end_line_scrub_in_linear_time(self):
+        # 170 KB of private key headers with no END line. The redactor's
+        # pattern read to the end of the text from each header, in the
+        # redactor and again here, so the scrub took 6 s of CPU time
+        # (#6072); with the redactor's one-pass mask it takes 0.04 s. The
+        # coverage job in CI runs about 5 times slower than a developer's
+        # machine, which leaves the 1 s bound a margin of about 5.
+        import time
+
+        header = "-----BEGIN PRIVATE KEY-----\n"
+        start = time.process_time()
+        out = _scrub("tool_result", header * 6000)
+        self.assertLess(time.process_time() - start, 1.0)
+        # Only the last header is masked: it is a key that the text cuts short.
+        self.assertEqual(out, header * 5999 + worker_transcript.REDACTED_PRIVATE_KEY_MARKER)
+
+    def test_a_key_block_that_only_the_transcript_rules_decode_is_masked(self):
+        # A JSON string inside a JSON string, with each dash and line end of
+        # the key block written as a `\\u` escape: the redactor's own pass
+        # does not decode it, so the mask in `supplement_redact` is the one
+        # that masks the block.
+        dashes, line_end = "\\u002d" * 5, "\\u000a"
+        inner = '{"pem": "' + dashes + "BEGIN PRIVATE KEY" + dashes + line_end + "MIIE" + line_end + dashes + "END PRIVATE KEY" + dashes + '"}'
+        self.assertEqual(json.loads(inner), {"pem": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"})
+        want = json.dumps({"output": json.dumps({"pem": worker_transcript.REDACTED_PRIVATE_KEY_MARKER})})
+        for kind in ("tool_call", "tool_result", "reply", "thinking"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, json.dumps({"output": inner})), want)
 
     def test_a_value_that_holds_the_next_flag_word_does_not_hide_the_next_value(self):
         # The first value is `abc\ -p` (or `abc\ -u`): its place overlaps
@@ -2501,6 +2562,261 @@ class TestSecretReadDetector(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.command_reads_a_secret(cmd))
 
+    # The rule's second read takes quotes, operators and substitutions from the bench's shell reader (`SHELL_READER`).
+    WITHHELD_BY_THE_SECOND_READ = [
+        # each substitution has a quote state of its own
+        'echo "$(echo "a # b")"; gcloud auth print-access-token',
+        "echo \"$(echo ')'; env)\"",
+        'echo "$(echo \\); env)"',
+        'echo "$(echo "$(echo "$(env)")")"',
+        "echo $(echo `env`)",
+        # a line of many substitutions
+        "echo " + "$(date) " * 40 + '"$(true; env)"',
+        # quotes inside a /proc path
+        'cat /proc/"self"/e*',
+        'cat /proc/se"lf"/environ',
+        # an escaped `;` is a word: it ends the command of find's `-exec`
+        "find . -exec true \\; -exec env \\;",
+        "find . \\( -type f -exec printenv \\; \\)",
+        "find . -exec env \\; -print",
+        "find . -exec sh -c env \\;",
+        "eval \\( env \\)",
+        # a flag of a prefix word, then a subshell
+        "time -p (env)",
+        # ... and the flag may take the next word as its value, as in `time -p ls env`
+        "time -p (ls env)",
+        # a script in double quotes keeps the backslash ahead of its `$(` or backtick, on one line or more
+        'bash -c "\necho \\$(env)\n"',
+        'ssh host "\necho \\`printenv\\`\n"',
+        # a substitution beside a command word can print nothing, and the word then runs
+        "env$(true)",
+        "env`true`",
+        "printenv$(:)",
+        '"$(true)"env',
+        "sudo env`true`",
+        "sh -c 'env$(true)'",
+        'sh -c "env\\$(true)"',
+        "env$(true)$(true)",
+        "true $(a); env$(echo $(a))",
+        # ... also when a quoted copy of the substitution's text stands ahead of it
+        "echo '$(true)'; env$(true)",
+        # ... and a word that is only a substitution is then no word
+        "sudo $(true) env",
+        "env $(true)",
+        "env `true`",
+        # `env` with assignments and no program prints the environment
+        "env NAME=$(date)",
+        "env NAME=value",
+        "env A=$(x) env",
+        "env A=$(x) printenv",
+        # a heredoc body that a shell runs
+        "bash <<'EOF'\nenv\nEOF",
+        "sh <<'EOF'\nprintenv\nEOF",
+        "bash -s <<'EOF'\ngcloud auth print-access-token\nEOF",
+        "cat <<EOF | bash\nenv\nEOF",
+        # a redirect goes off with its descriptor and its target
+        "env 2>/dev/null",
+        "env > out.txt",
+        # a here-string of a shell, and input from a file `environ`
+        "bash <<< env",
+        "cd /proc/self && cat < environ",
+        # a comment hides no command behind its line
+        "echo a # b\nenv",
+        "kubectl get pods \\\n# x\nenv",
+        # an escaped `$` and `(` are text, and the command behind them is read
+        "sh -c 'echo set \\$\\(' ; env",
+    ]
+    SERVED_BY_BOTH_READS = [
+        # an escaped backtick is text
+        "echo \\`env\\`",
+        # quoted text
+        "echo '$(env)'",
+        "echo '`env`'",
+        'echo "(env)"',
+        "echo 'a;env'",
+        'echo "a # b"; echo env',
+        "echo \"$(echo ')'; echo env)\"",
+        "echo env # env",
+        "# x; env",
+        "# first; printenv",
+        "echo env $'('",
+        "grep -n \\$\\( set-env.sh",
+        # Markdown in an argument: a code fence, a list item that starts with a flag-like word, inline code
+        'gh pr comment 7 --body "Run:\n```\nkubectl get pods -n legacy-env\n```"',
+        "cat > notes.md <<'EOF'\n- (env) the variables\nEOF",
+        'gh pr comment 7 --body "The \\`env\\` list is wrong.\nSee the diff."',
+        "cat > x.md <<'EOF'\nThe pod's `env` has `LOG_LEVEL`.\nEOF",
+        # a substitution of more lines makes its word one of more lines, and that word is no script
+        "LOGS=$(gcloud compute ssh gke-node-1 --zone us-central1-a \\\n  --command 'sudo journalctl -u kubelet --no-pager | tail -50')",
+        'git commit -m "$(cat <<\'EOF\'\nfix(installer): reset the lease on exit\n\nThe script printed "lease busy" and left the lock file.\nEOF\n)"',
+        'gh pr create --title "fix: hook" --body "$(cat <<\'EOF\'\n## Summary\n\nThe hook now resets the trap.\n\n```bash\ntrap cleanup EXIT\n```\nEOF\n)"',
+        # find's command with words behind `env`, and a name that is no command
+        "find . -exec echo env \\;",
+        "find . -name env -exec ls {} \\;",
+        "find . -exec env VAR=1 ls {} \\;",
+        "find . -exec printenv HOME \\;",
+        # a substitution beside a word that is no command word, and one with a program behind it
+        "ls x$(date)",
+        "echo env$(date)",
+        "env $(cat vars) python3 app.py",
+        # an empty word is a word: `env` runs it and prints nothing
+        "env '' $(x)",
+        # behind a builtin that takes names, a word that is only a substitution gives the names
+        "export $(cat .env | xargs) && terraform plan -out=tfplan",
+        "set $(date)",
+        # text that holds the shell reader's mark character: the second read does not read it
+        "echo env \x00S0\x00",
+        # known limits. The shell reader ends a substitution at the `)` of a `case` label.
+        'echo "$(case $x in a) env;; esac)"',
+        # A heredoc body that another language runs is not read as that language's code.
+        "python3 - <<'EOF'\nimport os\nprint(os.environ)\nEOF",
+    ]
+    # The second read serves these, for the reason given. The first read withholds them, so the
+    # rule withholds them: nothing that the first read withholds is served.
+    SERVED_BY_THE_SECOND_READ_ALONE = [
+        # an assignment behind `env` holds a substitution, and a program follows
+        'env PROJECT=$(gcloud config get-value project) PYTHONWARNINGS="ignore" python3 scripts/x.py --project-id "$PROJECT"',
+        "env A=$(x) ls",
+        # an escaped operator or `$(` is text
+        "echo a \\; env",
+        "echo a \\| env",
+        "echo \\$(env)",
+        "env \\;",
+        # arithmetic runs no command
+        "echo $((1 + 2)) env",
+    ]
+    # The second read does not read these, and the first read withholds them. They stay
+    # withheld, and each needs a rule of the second read before the first read can go.
+    WITHHELD_BY_THE_FIRST_READ_ALONE = [
+        # text that the shell reader gives no words for: a redirect with no target ...
+        "eval printenv >",
+        "(set > )",
+        "env\necho >",
+        # ... or an unclosed quote
+        "sudo env; echo 'x",
+        "gh auth \\\n  token\necho 'x",
+        'echo "$(env',
+        "cat > f.md <<'EOF'\nRun `env` to see it. Don't do it.\nEOF",
+        # a substitution with no end
+        "echo $(env",
+        "printenv`",
+        # a control operator beside a redirect
+        "true;>&2 printenv",
+        ":;<&0 env",
+        "true;</dev/null env",
+        # a redirect that overwrites, with a descriptor
+        "env 2>|/dev/null",
+        # a form feed ahead of `#` starts no comment
+        "echo \x0c#; env",
+        # `$((` that is no arithmetic, and a substitution inside arithmetic
+        "echo $((env) )",
+        "echo $((printenv) | cat)",
+        "echo $(( $(printenv >&2; echo 1) ))",
+        ": $(($(env>&2)))",
+        # a quoted word of more lines ahead of a line that the reader refuses
+        "bash -c 'cd /tmp\nenv'\ncat <<EOF\nit's\nEOF",
+        "eval '\nenv'\n'",
+        "sh -c ':\nenv'\n(( 5 > (2) ))",
+        # a heredoc body with an apostrophe line and a substitution
+        "cat <<EOF\ndon't\nx '$(env)' y\nEOF",
+        # a backtick pair with a `)` inside a substitution
+        "echo $(echo `echo )`); env",
+        # `env` with assignments and a program word that can be nothing
+        "env A=$() $X",
+        "env A=$(x) sh -c $'env'",
+    ]
+
+    @staticmethod
+    def _read_budget(cmd):
+        return [worker_transcript.MAX_READ_CHARS_FACTOR * len(cmd) + worker_transcript.MAX_READ_CHARS_FLOOR] * worker_transcript.READ_COUNT
+
+    def _first_read(self, cmd):
+        return worker_transcript._first_read_prints(cmd, 0, self._read_budget(cmd))
+
+    def _second_read(self, cmd):
+        return worker_transcript._read_script_prints(cmd, 0, self._read_budget(cmd))
+
+    def test_the_rule_withholds_what_either_read_withholds(self):
+        for cmd in self.WITHHELD_BY_THE_SECOND_READ + self.SERVED_BY_THE_SECOND_READ_ALONE + self.WITHHELD_BY_THE_FIRST_READ_ALONE:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+        for cmd in self.SERVED_BY_BOTH_READS:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(worker_transcript.command_reads_a_secret(cmd))
+
+    def test_the_second_read_by_itself(self):
+        for cmd in self.WITHHELD_BY_THE_SECOND_READ:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self._second_read(cmd))
+        for cmd in self.SERVED_BY_BOTH_READS + self.SERVED_BY_THE_SECOND_READ_ALONE + self.WITHHELD_BY_THE_FIRST_READ_ALONE:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(self._second_read(cmd))
+
+    def test_the_first_read_by_itself(self):
+        for cmd in self.SERVED_BY_THE_SECOND_READ_ALONE + self.WITHHELD_BY_THE_FIRST_READ_ALONE:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self._first_read(cmd))
+        # A call by its own signature makes a budget of one slot, and a script that it hands on is still read.
+        self.assertTrue(worker_transcript._first_read_prints("sh -c 'x; env'", 0))
+        self.assertFalse(worker_transcript._first_read_prints("sh -c 'x; echo env'", 0))
+
+    def test_no_read_can_serve_what_the_other_read_withholds(self):
+        # The construction of the rule: the first read stays callable by itself, and the second read can
+        # only add a withhold. Over every command of this class's lists, the rule withholds each time one
+        # read withholds.
+        corpus = (
+            self.TOKEN_AND_ENVIRONMENT_PRINTS
+            + self.NO_TOKEN_OR_ENVIRONMENT_PRINTS
+            + self.WITHHELD_BY_THE_SECOND_READ
+            + self.SERVED_BY_BOTH_READS
+            + self.SERVED_BY_THE_SECOND_READ_ALONE
+            + self.WITHHELD_BY_THE_FIRST_READ_ALONE
+        )
+        decided_by_the_first = decided_by_the_second = 0
+        for cmd in corpus:
+            with self.subTest(cmd=cmd):
+                first, second = self._first_read(cmd), self._second_read(cmd)
+                decided_by_the_first += first and not second
+                decided_by_the_second += second and not first
+                self.assertEqual(worker_transcript.script_prints_token_or_environment(cmd, 0), first or second)
+        # Each read decides some command of the corpus by itself, so the check above is not empty.
+        self.assertTrue(decided_by_the_first)
+        self.assertTrue(decided_by_the_second)
+
+    def test_the_second_read_has_a_fixed_depth_and_a_budget(self):
+        # Substitutions inside substitutions are read to a fixed depth, and withhold past it.
+        nested = "echo env2 " + "$(echo " * worker_transcript.MAX_SUBSTITUTION_NESTING + "x" + ")" * worker_transcript.MAX_SUBSTITUTION_NESTING
+        self.assertFalse(worker_transcript.command_reads_a_secret(nested))
+        self.assertTrue(worker_transcript.command_reads_a_secret("echo env2 $(echo " + nested + ")"))
+        # Past its read budget the second read withholds: here the innermost substitution is the one read too many.
+        self.assertFalse(self._second_read("echo env2 " + "$(x " * 5 + "y" * 50000 + ")" * 5))
+        self.assertTrue(self._second_read("echo env2 " + "$(x " * 7 + "y" * 50000 + ")" * 7))
+        # Many words that hold a substitution, on a line of many substitutions, count against the budget.
+        self.assertFalse(self._second_read("echo env2 " + " ".join("a$((%d))" % index for index in range(20))))
+        self.assertTrue(self._second_read("echo env2 " + " ".join("a$((%d))" % index for index in range(600))))
+        # The budget of a call is as large as its whole script, also when a script inside it is read first.
+        self.assertFalse(worker_transcript.command_reads_a_secret("sh -c 'echo env2'; " + "echo aaaa; " * 8000))
+        # Long text that the shell reader refuses raises nothing, and the first read decides it.
+        hostile = "x" * 20000 + " " + "`" * 500
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo env2 " + hostile + "'"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sh -c 'echo set " + hostile + "\"'; env"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo env2 " + "x" * 20000 + "$(" * 900))
+
+    def test_the_command_of_a_find_flag_is_read_by_itself_and_the_older_read_stays(self):
+        def walk(*words):
+            return worker_transcript._words_print_token_or_environment(list(words), 0, self._read_budget(" ".join(words)))
+
+        # Read by itself, the command ends at the `;` word.
+        self.assertTrue(walk("find", ".", "-exec", "true", ";", "-exec", "env", ";"))
+        self.assertTrue(walk("find", ".", "-exec", "env", ";", "-print"))
+        self.assertFalse(walk("find", ".", "-exec", "env", "VAR=1", "ls", "{}", ";"))
+        self.assertFalse(walk("find", ".", "-name", "env", "-exec", "ls", "{}", ";"))
+        # The older read, of all the words behind the flag, stays: the change can only withhold more.
+        self.assertTrue(walk("find", ".", "-exec", "sudo", "env"))
+        # (The command `nice -n` by itself prints nothing. The older read takes `;` as the value of `-n`.)
+        self.assertTrue(walk("find", ".", "-exec", "nice", "-n", ";", "env"))
+        self.assertFalse(walk("nice", "-n"))
+
     def test_a_long_line_of_wrappers_is_read_without_recursion(self):
         self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * 1200 + "env"))
         self.assertFalse(worker_transcript.command_reads_a_secret("sudo " * 1200 + "ls"))
@@ -2519,6 +2835,9 @@ class TestSecretReadDetector(unittest.TestCase):
         long_substitution = 'echo "$(echo ' + "x " * worker_transcript.MAX_READ_SUBSTITUTION_CHARS
         self.assertFalse(worker_transcript.command_reads_a_secret(long_substitution + ')"'))
         self.assertTrue(worker_transcript.command_reads_a_secret(long_substitution + '; env)"'))
+        # The commands of find's `-exec` flags that one `;` word ends count against the read budget.
+        self.assertFalse(worker_transcript.command_reads_a_secret("find . " + "-exec sudo " * 3 + "ls token BB;".replace("BB", chr(92))))
+        self.assertTrue(worker_transcript.command_reads_a_secret("find . " + "-exec sudo " * 2000 + "ls token BB;".replace("BB", chr(92))))
         # Text with an unclosed quote: read line by line up to the line limit, then on a dump that starts a line.
         many_lines = "echo 'x" + "\necho env" * (worker_transcript.MAX_READ_LINES - 1)
         self.assertTrue(worker_transcript.command_reads_a_secret(many_lines + "\nsudo env"))
@@ -2591,6 +2910,129 @@ class TestSecretReadDetector(unittest.TestCase):
         self.assertTrue(worker_transcript.is_secret_read_tool_call(cmd))
         self.assertFalse(worker_transcript.is_secret_read_tool_call({"path": cmd}))
         self.assertFalse(worker_transcript.is_secret_read_tool_call(None))
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODULE_SOURCE = "agents/platform/scripts/worker_transcript.py"
+MODULE_FOLDER_SOURCE = "agents/platform/scripts"
+READER_SOURCE = "bench/kube_agents_bench/shell_words.py"
+READER_FILENAME = "shell_words.py"
+# The build stages that ship the module today, as (Dockerfile, stage name). The scan must find these.
+SHIPPING_STAGES = (
+    ("deploy/docker/Dockerfile", "platform"),
+    ("deploy/docker/Dockerfile", "credential-proxy"),
+    ("hack/replay-proxy/Dockerfile", ""),
+)
+
+
+def _load_module_copy(folder):
+    spec = importlib.util.spec_from_file_location("worker_transcript_copy", Path(folder) / "worker_transcript.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _copy_instructions(dockerfile):
+    """Each COPY of a Dockerfile as (stage, sources, destination), with line continuations joined.
+
+    The stage is the name of the last FROM line above the COPY (`FROM x AS name`, or "" with no
+    name): two stages of one file are two images.
+    """
+    lines = [line for line in dockerfile.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#")]
+    copies = []
+    stage = ""
+    for line in "\n".join(lines).replace("\\\n", " ").splitlines():
+        words = line.split()
+        if words and words[0] == "FROM":
+            stage = words[-1] if len(words) > 2 and words[-2].upper() == "AS" else ""
+        if words and words[0] == "COPY":
+            paths = [word for word in words[1:] if not word.startswith("--")]
+            copies.append((stage, paths[:-1], paths[-1]))
+    return copies
+
+
+def _destination_folder(destination):
+    return destination if destination.endswith("/") else os.path.dirname(destination) + "/"
+
+
+class TestShellReader(unittest.TestCase):
+    """The module loads the bench's shell reader, and each image holds that reader beside it."""
+
+    def test_a_checkout_loads_the_reader_of_the_bench(self):
+        self.assertEqual(Path(worker_transcript.SHELL_READER_PATH).resolve(), REPO_ROOT / READER_SOURCE)
+        self.assertEqual(
+            worker_transcript.SHELL_READER._shell_argvs("echo 'a; b' | wc -l; ls $(pwd)"),
+            [["echo", "a; b"], ["wc", "-l"], ["ls", "$(pwd)"], ["pwd"]],
+        )
+
+    def _image_folder(self):
+        # As deep as the image's /opt/defaults/scripts, so the repository's place of the reader is
+        # inside the temporary folder too, and is empty.
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        folder = Path(root.name).resolve() / "opt" / "defaults" / "scripts"
+        folder.mkdir(parents=True)
+        shutil.copy(REPO_ROOT / MODULE_SOURCE, folder)
+        return folder
+
+    def test_the_reader_beside_the_module_is_the_one_it_loads(self):
+        folder = self._image_folder()
+        shutil.copy(REPO_ROOT / READER_SOURCE, folder)
+        # A file at the repository's place too: the folder of the module is the first place to look.
+        second = folder.parents[2] / READER_SOURCE
+        second.parent.mkdir(parents=True)
+        second.write_text("raise RuntimeError('the second place was loaded')\n", encoding="utf-8")
+        copy = _load_module_copy(folder)
+        self.assertEqual(Path(copy.SHELL_READER_PATH), folder / READER_FILENAME)
+        self.assertEqual(copy.SHELL_READER._shell_argvs("a; b"), [["a"], ["b"]])
+
+    def test_a_module_with_no_reader_fails_at_import(self):
+        folder = self._image_folder()
+        with self.assertRaises(ImportError) as raised:
+            _load_module_copy(folder)
+        self.assertIn(str(folder / READER_FILENAME), str(raised.exception))
+
+    def test_the_reader_imports_only_the_standard_library(self):
+        # The images copy this one file, with no package around it and nothing installed for it.
+        tree = ast.parse((REPO_ROOT / READER_SOURCE).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "a relative import at line %d" % node.lineno)
+                names = [node.module]
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            else:
+                continue
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name.split(".")[0], sys.stdlib_module_names)
+
+    def test_each_dockerfile_that_ships_the_module_ships_the_reader_beside_it(self):
+        # Tracked files only: a checkout can hold other checkouts in folders that git ignores.
+        listed = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+        shipping = []
+        for relative in listed.stdout.splitlines():
+            if not os.path.basename(relative).startswith("Dockerfile"):
+                continue
+            copies = _copy_instructions(REPO_ROOT / relative)
+            for stage, sources, destination in copies:
+                plain = [source.rstrip("/") for source in sources]
+                if MODULE_SOURCE not in plain and MODULE_FOLDER_SOURCE not in plain:
+                    continue
+                shipping.append((relative, stage))
+                with self.subTest(dockerfile=relative, stage=stage):
+                    target = _destination_folder(destination) + READER_FILENAME
+                    reader_targets = [
+                        to if not to.endswith("/") else to + READER_FILENAME
+                        for other_stage, froms, to in copies
+                        if other_stage == stage and READER_SOURCE in froms
+                    ]
+                    self.assertIn(target, reader_targets)
+                    # A file of this name in a folder of the same COPY would take the reader's place.
+                    for source in sources:
+                        self.assertFalse((REPO_ROOT / source / READER_FILENAME).exists(), source)
+        for site in SHIPPING_STAGES:
+            self.assertIn(site, shipping)
 
 
 class TestCardToSession(unittest.TestCase):

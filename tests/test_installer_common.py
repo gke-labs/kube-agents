@@ -9,6 +9,7 @@ behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 import base64
 import datetime
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -2397,6 +2398,88 @@ class InstallerCommonTest(unittest.TestCase):
             'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
             env={"API_SERVER_KEY": "k"},
             describe_stub='echo "ERROR: (gcloud) PERMISSION_DENIED: token expired" >&2; exit 1',
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
+    _API_DISABLED_IN = (
+        'echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, '
+        "message=Kubernetes Engine API has not been used in project {project} before or it is disabled. "
+        'Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project={project} then retry." >&2; exit 1'
+    )
+
+    def test_tfvars_reads_a_disabled_gke_api_in_the_target_project_as_absence(self):
+        # A fresh project's first install: the Kubernetes Engine API is off, so
+        # no cluster can exist there, and the apply enables the API before it
+        # creates one. The generator must not refuse this as an unreadable
+        # cluster (the pool's new projects and a fresh standalone project both
+        # stopped here on 2026-11-13 and 2026-11-16).
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="test-project"),
+        )
+        # The harness stubs print_info, so the absence line is not readable
+        # here; the exit code and the missing refusal are the assertion.
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_project_number_as_absence(self):
+        # gcloud names the project by number in the ErrorInfo consumer line.
+        stub = (
+            'echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; '
+            'echo "  consumer: projects/123456789" >&2; exit 1'
+        )
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_a_disabled_gke_api_that_names_no_project(self):
+        # A bare SERVICE_DISABLED with no project named (a quota-project
+        # refusal without its consumer line) says nothing about the target.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub='echo "ERROR: (gcloud.container.clusters.describe) PERMISSION_DENIED: SERVICE_DISABLED" >&2; exit 1',
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_reads_a_disabled_gke_api_named_by_number_in_the_message_as_absence(self):
+        # The message line itself can carry the number rather than the id.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "PROJECT_NUMBER": "123456789"},
+            describe_stub=self._API_DISABLED_IN.format(project="123456789"),
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_resolves_the_project_number_when_the_front_door_did_not_export_it(self):
+        # upgrade.sh, uninstall.sh and the menu reach the generator before
+        # PROJECT_NUMBER is exported; a refusal by number is then resolved
+        # with one `projects describe`, and only for a refusal of that shape.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="123456789"),
+            gcloud_extra_cases='  *"projects describe test-project"*) printf "123456789\\n"; exit 0 ;;\n',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_refuses_when_the_disabled_gke_api_is_another_projects(self):
+        # The refusal names the caller's quota project, not the target: it says
+        # nothing about whether the target holds a cluster, so the generator
+        # keeps refusing to guess.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=self._API_DISABLED_IN.format(project="someone-elses-quota-project"),
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("Could not probe cluster", proc.stderr)
@@ -6645,6 +6728,89 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("values don't meet the specifications", proc.stderr)
         self.assertNotIn("Release footprint", proc.stdout)
 
+    def _failed_step(self, break_step, function="render_footprint_summary"):
+        """Run the render on a copy of the chart with one step of the probe build made to fail.
+
+        `break_step` is shell that runs after the copy exists at $CHECKOUT and before the
+        call. $TMPDIR is a directory of the run's own, listed after the call, so a probe
+        directory that stays behind shows on the `left:` line.
+        """
+        chart = _REPO_ROOT / "charts" / "kube-agents"
+        script = (
+            # C messages: the tests read cp's own error text.
+            'export LC_ALL=C\n'
+            'work="$(mktemp -d)"; CHECKOUT="$work/checkout"; export TMPDIR="$work/tmp"\n'
+            'mkdir -p "$CHECKOUT/charts/kube-agents/templates" "$TMPDIR"\n'
+            f'cp "{chart}/Chart.yaml" "{chart}/values.yaml" "{chart}/values.schema.json" "$CHECKOUT/charts/kube-agents/"\n'
+            f'cp -R "{chart}/files" "$CHECKOUT/charts/kube-agents/files"\n'
+            f'cp "{chart}/templates/_helpers.tpl" "$CHECKOUT/charts/kube-agents/templates/"\n'
+            f"{break_step}\n"
+            f'{function} "$CHECKOUT" "$TFVARS"; echo "rc=$?"\n'
+            'echo "left: $(ls -A "$TMPDIR" | tr "\\n" " ")"\n'
+            'chmod -R u+rwx "$work"; rm -rf "$work"\n'
+        )
+        return self._run(script, helm_script=_ECHO_HELM)
+
+    # The four steps of the probe build that had no handler: each must end the render
+    # with a non-zero status, with the step's own error and no helm call after it, and
+    # leave no probe directory behind.
+    _UNREADABLE_SCHEMA = 'chmod 000 "$CHECKOUT/charts/kube-agents/values.schema.json"'
+    _UNREADABLE_HELPERS = 'chmod 000 "$CHECKOUT/charts/kube-agents/templates/_helpers.tpl"'
+    _FAILING_MKDIR = 'mkdir() { case "$*" in */templates) echo "mkdir: cannot create the templates directory" >&2; return 1 ;; *) command mkdir "$@" ;; esac; }'
+    _FAILING_PROBE_WRITE = (
+        'printf() { case "$1" in "apiVersion: v1"*) echo "printf: write error" >&2; return 1 ;; *) builtin printf "$@" ;; esac; }'
+    )
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_schema(self):
+        proc = self._failed_step(self._UNREADABLE_SCHEMA)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("values.schema.json", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        # The render did not go on without the schema: helm was not called.
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_render_stops_at_an_unreadable_helpers_template(self):
+        proc = self._failed_step(self._UNREADABLE_HELPERS)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("_helpers.tpl", proc.stderr)
+        self.assertIn("Permission denied", proc.stderr)
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_templates_directory_cannot_be_made(self):
+        proc = self._failed_step(self._FAILING_MKDIR)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        # The step's own error and nothing after it: without the handler the next copy
+        # fails into the directory that is not there, and its handler ends the render.
+        self.assertEqual(proc.stderr, "mkdir: cannot create the templates directory\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    def test_render_stops_when_the_probe_template_cannot_be_written(self):
+        proc = self._failed_step(self._FAILING_PROBE_WRITE)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertEqual(proc.stderr, "printf: write error\n")
+        self.assertNotIn("args: ", proc.stdout)
+        self.assertIn("left: \n", proc.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_print_names_the_failed_step_and_nothing_after_it(self):
+        # The warning carries the step's error alone: no summary rendered without the
+        # schema, and no helm error for a template the copy never delivered.
+        for break_step, name in ((self._UNREADABLE_SCHEMA, "values.schema.json"), (self._UNREADABLE_HELPERS, "_helpers.tpl")):
+            with self.subTest(name=name):
+                proc = self._failed_step(break_step, function="print_footprint_summary")
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                warning = next((line for line in proc.stdout.splitlines() if line.startswith("WARN: ")), "")
+                self.assertIn("Could not render the release footprint summary: ", warning)
+                self.assertIn(name, warning)
+                self.assertTrue(warning.rstrip().endswith("Permission denied"), warning)
+                self.assertNotIn("args: ", proc.stdout)
+                self.assertIn("left: \n", proc.stdout)
+
     def test_print_warns_and_goes_on_without_helm(self):
         proc = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', without_helm=True
@@ -6673,7 +6839,7 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_real_render_prints_the_notes_block_for_the_tfvars(self):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn("      Release footprint (standing pod requests, as the quota preflight sums them; the session pods are counted below):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
         # which `make docs-generate` renders from the same chart template with these
@@ -6698,9 +6864,11 @@ class FootprintSummaryTest(unittest.TestCase):
                 self.assertIn("rc=0", output.stdout, output.stderr)
             r = profile["requirements"]
             gib = 1024**3
-            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
-            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
-            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            # The summary prints the standing release; the session pods' share, which the
+            # totals carry, is on its own line.
+            self.assertIn(f"CPU requests:        {(r['requestsCpu'] - r['sessionRequestsCpu']) / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {(r['requestsMemory'] - r['sessionRequestsMemory']) / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods'] - r['sessionPods']}\n", output.stdout, key)
             self.assertIn(
                 f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
                 output.stdout, key,
@@ -6711,7 +6879,7 @@ class FootprintSummaryTest(unittest.TestCase):
             profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the session pods", proc.stdout)
+        self.assertIn("Not in these figures or the cost: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

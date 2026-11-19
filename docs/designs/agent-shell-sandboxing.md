@@ -2785,7 +2785,7 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, when the next stack takes Google Chat, the A2A gateway's, under the
+the same listener, on every install the A2A gateway's, under the
 operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
@@ -2806,7 +2806,10 @@ had and nothing checked. The same table carries a third role, `a2a-chat`, for th
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
 role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
-apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+apart from the legacy chat one. It is bound to its caller as the session role is, below:
+`CREDENTIAL_PROXY_A2A_CHAT_CALLERS` names the A2A gateway's own ServiceAccount, which may present
+only the a2a-chat audience, or the a2a-reports audience when `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names it too, and no other caller may present that audience; with the list empty,
+as from an operator that doesn't render it, the audience alone decides. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and
@@ -2825,7 +2828,17 @@ admits `proposal-view` only, checked on the normalised verb before the body is r
 verb's managed-repository check still applying. It is bound the same way:
 `CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
 the mcp audience, and no other caller may present it; with the list empty, nobody holds the
-role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. Under
+role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. On
+every install, `a2a-reports` is the A2A gateway's audit-report reader: its token is minted for
+`kubeagents-credential-proxy-a2a-reports`, it reaches `/v1/audit-reports` alone, and there only
+`GET /v1/audit-reports/{audit_id}/publish/latest` and `GET .../publish/runs/{ts}` of any audit:
+it sends the reserved word `publish`, and the broker relays it as the install's publish key
+(`no_forge%2Flocal` when there is none). Any real key from it, listing, the run index, writes and
+deletes are refused, and no other role's `publish` is resolved. It
+is bound both ways: `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names the gateway's ServiceAccount, no
+other caller may present the audience, and that account may present only this audience or the
+`a2a-chat` one, whose token the same pod holds ([fleet-audit-report-store.md](fleet-audit-report-store.md)
+§3). Under
 `mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
@@ -2841,7 +2854,10 @@ repository, `publish` only a `platform-agent/` branch, and onto one carrying ope
 only when they are all the install's, and `proposal-create` only from the install's own
 `platform-agent/` branch of this repository, each named by its bare branch name (rule
 `caller.vcs-ownership`). A profile `proposal-update` changes only the title and body; a
-label edit is refused under `caller.vcs-labels`. The shell is held to none of this. No
+label edit is refused under `caller.vcs-labels`. A profile `issue-list` may not widen its
+search past the managed repository: a `query` that is not plain words (a `:`, quote,
+backslash or parenthesis, or `OR`, `AND` or `NOT` as a word), or a quote or backslash in a
+label name, is refused under `caller.vcs-query`. The shell is held to none of this. No
 other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in
