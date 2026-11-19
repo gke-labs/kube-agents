@@ -3267,14 +3267,13 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the command may have run", err.getvalue())
 
     def test_an_object_that_holds_only_its_exit_code_still_runs_as_before(self):
-        """An absent `stdout` or `stderr` is empty, as it was. An integer exit code is the shim's
-        as it stands, also one that no process can exit with: its value is not checked."""
+        """An absent `stdout` or `stderr` is empty, as it was. An exit code from 0 to 255 is the
+        shim's as it stands."""
         answers = (
             ({"exitCode": 3}, 3),
             ({"exitCode": 0, "stdout": "ok\n"}, 0),
             ({"exitCode": 0, "kubeconfig": None}, 0),
-            ({"exitCode": 300}, 300),
-            ({"exitCode": -1}, -1),
+            ({"exitCode": 255}, 255),
         )
         for answer, expected in answers:
             with self.subTest(answer=answer):
@@ -3282,6 +3281,52 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
                 self.assertEqual(expected, code)
                 self.assertEqual(answer.get("stdout", ""), out)
                 self.assertEqual("", err)
+
+    def test_a_negative_exit_code_is_a_signal_death_with_its_output_and_128_plus_the_signal(self):
+        """The broker sends a command's return code, and a command that a signal ended has the
+        signal's negative number. A shell reports that death as 128 plus the number."""
+        cases = ((-9, 137), (-15, 143), (-1, 129), (-127, 255))
+        for exit_code, expected in cases:
+            with self.subTest(exit_code=exit_code):
+                self.sleeps.clear()
+                broker = self.broker([(200, {}, {"stdout": "NAME STATUS\n", "stderr": "Killed\n", "exitCode": exit_code})])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(expected, code)
+                self.assertEqual("NAME STATUS\n", out)
+                self.assertEqual("Killed\n", err)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+
+    def test_an_exit_code_that_no_command_can_have_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
+        """Above 255 no status exists, and `sys.exit` would wrap it: 256 would read as success.
+        Below -127 no signal exists. The line names the field and the range, never the value."""
+        shape = "the response's exitCode is outside -127 to 255"
+        for exit_code in (256, 300, 2147483648, 10**30, -128, -2147483648):
+            with self.subTest(exit_code=exit_code):
+                self.sleeps.clear()
+                answer = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": exit_code}
+                broker = self.broker([(200, {}, answer), (200, {}, OK)])
+                code, out, err = self.run_shim(broker)
+                self.assertEqual(1, code)
+                self.assertEqual("", out)
+                self.assertEqual(1, len(broker.requests))
+                self.assertEqual([], self.sleeps)
+                self.assertEqual(f"credential proxy error (HTTP 200): {shape}; the command may have run\n", err)
+
+    def test_an_exit_code_that_no_command_can_have_is_not_sent_to_the_fallback(self):
+        exec_tier = self.broker([(200, {}, {"stdout": "NAME STATUS\n", "exitCode": 256})])
+        stateful = self.broker([(200, {}, OK)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                exec_tier.endpoint, ["kubectl", "get", "ns"], fallback=stateful.endpoint,
+                sleep_fn=self.sleeps.append, rng=self.rng,
+            )
+        self.assertEqual(1, code)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual(1, len(exec_tier.requests))
+        self.assertEqual([], stateful.requests)
+        self.assertIn("the command may have run", err.getvalue())
 
     def test_a_2xx_body_that_is_not_utf_8_is_the_line_of_a_body_that_is_not_json(self):
         for body in (b"\xff", b'{"stdout": "\xff", "exitCode": 0}'):
