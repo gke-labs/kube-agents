@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,14 +62,32 @@ const (
 	// busMigrationGrow is one server to three, by snapshot and restore,
 	// behind a write freeze.
 	busMigrationGrow busMigrationLeg = "OneToThree"
+	// busMigrationReshape recreates TASKS at the width the CR renders, at
+	// the server count the bus runs, by snapshot and restore behind a write
+	// freeze: JetStream never changes a stream's max_consumers after it is
+	// created. Started only by a person, with the bus-reshape annotation
+	// (busReshapeWanted). Its phases are only names #6479's operator knows
+	// (busReshapePhases), so an operator rolled back to that release holds
+	// the run, with an identity in the frozen map for every pod it has.
+	busMigrationReshape busMigrationLeg = "Reshape"
 )
+
+// busReshapePhases is every phase the Reshape leg may be in: the names the
+// operator that first held unknown legs (#6479) knows, so a rollback to it
+// holds a reshape in any of them. TestTheReshapeLegUsesOnlyPhasesTheHoldKnows
+// holds the step table to it.
+var busReshapePhases = []busMigrationPhase{
+	busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationClearing,
+	busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing,
+	busMigrationDone, busMigrationAbandoned, busMigrationFailed,
+}
 
 // busMigrationLegKnown reports a leg this operator runs. Any other leg is a
 // run a newer operator started (the CRD's enum names legs this one does not
 // run, so a rollback mid-run can find one): it is held, never advanced
 // (holdUnknownBusMigrationLeg).
 func busMigrationLegKnown(leg busMigrationLeg) bool {
-	return leg == busMigrationGrow || leg == busMigrationShrink
+	return leg == busMigrationGrow || leg == busMigrationShrink || leg == busMigrationReshape
 }
 
 // busMigrationPhase is where a run is.
@@ -152,6 +171,34 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 			}
 			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "streams pinned to R1 on server 0 could not be raised back to R3; the bus is three servers with some single-copy streams"}
 		}
+	case busMigrationReshape:
+		// One to three's walk without the conversion: TASKS is cleared and
+		// restored at the count the bus runs. The way back is the same
+		// as one to three's, at that count.
+		if phase == busMigrationClearing && ok && !abandoning {
+			return busMigrationStep{next: busMigrationRestoring}
+		}
+		switch phase {
+		case busMigrationClearing:
+			if ok {
+				return busMigrationStep{next: busMigrationRollingBack, abandoning: true}
+			}
+			if abandoning {
+				return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "deleting the partially restored TASKS before the rollback failed; the bus is write-frozen and the snapshot is kept on the staging volume"}
+			}
+			return busMigrationStep{next: busMigrationFailed, manual: "deleting TASKS before its restore failed; the bus is write-frozen and the snapshot is kept on the staging volume"}
+		case busMigrationRollingBack:
+			if ok {
+				return busMigrationStep{next: busMigrationRollbackRestoring, abandoning: true}
+			}
+			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "the bus did not come back up for the rollback; it is write-frozen and the snapshot is kept on the staging volume: check the a2a-nats pods (docs: bus migration runbook)"}
+		case busMigrationRollbackRestoring:
+			if ok {
+				return busMigrationStep{next: busMigrationReleasing, abandoning: true}
+			}
+			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "restoring TASKS as it was failed; the bus is write-frozen and the snapshot is kept on the staging volume: see the bus migration runbook"}
+		}
+		return nextBusMigrationPhase(busMigrationGrow, phase, abandoning, outcome)
 	case busMigrationGrow:
 		switch phase {
 		case busMigrationFreezing, busMigrationSnapshot, busMigrationHashing:
@@ -464,7 +511,13 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		case err != nil:
 			return busMigrationPending, false, err
 		}
-		if !busNATSRolledOutAt(sts, int32(busMigrationReplicas(leg, phase, run.Abandoning))) { // #nosec G115 -- 1 or 3
+		want := int32(busMigrationReplicas(leg, phase, run.Abandoning)) // #nosec G115 -- 1 or 3
+		if leg == busMigrationReshape {
+			// A reshape never changes the count: the bus is rolled out at
+			// whatever it runs.
+			want = ptr.Deref(sts.Spec.Replicas, 1)
+		}
+		if !busNATSRolledOutAt(sts, want) {
 			return busMigrationPending, false, nil
 		}
 		// On the one to three leg the rollout must also be the right side
@@ -472,7 +525,7 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		// freeze, rendered after the callout confirmed it (a restart before
 		// that, a drain say, is not one), the phases inside it keep it, and
 		// Releasing completes only on a restart out of it.
-		if leg == busMigrationGrow {
+		if leg != busMigrationShrink {
 			want := run.RunID
 			if phase == busMigrationReleasing {
 				want = ""
@@ -655,6 +708,9 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 	if !busMigrationLegKnown(leg) {
 		return unknownLegCondition(agent, run), phase != busMigrationDone
 	}
+	if leg == busMigrationReshape {
+		return reshapeCondition(agent, run), phase != busMigrationDone
+	}
 	from, to := 3, 1
 	if leg == busMigrationGrow {
 		from, to = 1, 3
@@ -791,6 +847,16 @@ func a2aBusMigrationStreams() []string {
 	return append(streams, a2aProfileSubmitStream)
 }
 
+// a2aBusMigrationStreamsFor is the streams a run of leg snapshots, clears
+// and restores: every provisioned stream, or TASKS alone for a reshape,
+// which indexes nothing and is indexed by nothing.
+func a2aBusMigrationStreamsFor(leg busMigrationLeg) []string {
+	if leg == busMigrationReshape {
+		return []string{"TASKS"}
+	}
+	return a2aBusMigrationStreams()
+}
+
 // busMigrationPrincipal is a migration step's bus user, which is also its
 // inbox prefix.
 func busMigrationPrincipal(step, runID string) string {
@@ -893,7 +959,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 // mounted read-only, writing the digests to its termination message for the
 // operator to read. It holds no bus credential at all.
 func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.Pod {
-	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aBusMigrationStreams(), ",")}
+	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg)), ",")}
 	volumes := []corev1.Volume{{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
 		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: true},
 	}}}
@@ -954,7 +1020,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(busMigrationStreamIdentity, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
-		"--streams", strings.Join(a2aBusMigrationStreams(), ","),
+		"--streams", strings.Join(a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg)), ","),
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
@@ -972,7 +1038,18 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		if kind == "rollback" {
 			replicas = "1"
 		}
-		command = append(command, "--run-file", busMigrationRunMount+"/"+busMigrationRunKey, "--replicas", replicas)
+		command = append(command, "--run-file", busMigrationRunMount+"/"+busMigrationRunKey)
+		if busMigrationLeg(run.Leg) == busMigrationReshape {
+			// At the count the bus runs, both ways; the direction is named,
+			// since a one-server reshape restores forward.
+			direction := "forward"
+			if kind == "rollback" {
+				direction = "back"
+			}
+			replicas = strconv.Itoa(busReshapeServers(agent))
+			command = append(command, "--direction", direction)
+		}
+		command = append(command, "--replicas", replicas)
 		volumes = append(volumes, corev1.Volume{Name: "run", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 			SecretName: busMigrationRunSecret(agent, run.RunID), DefaultMode: ptr.To(int32(0o440)),
 		}}})
@@ -1095,7 +1172,7 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 			return err
 		}
 	}
-	if (work.name == "restore" || work.name == "rollback") && !busMigrationClearedAll(run) {
+	if (work.name == "restore" || work.name == "rollback") && !busMigrationClearedAll(run, busMigrationLeg(run.Leg)) {
 		// No restore onto a bus that still holds copies the clear has not
 		// removed: on a converted cluster those are the old server's,
 		// reserving its store twice over, and on the way back the
@@ -1185,7 +1262,7 @@ func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent 
 	if pod == nil {
 		return "the hashing pod is gone", nil
 	}
-	digests, refused := parseBusDigests(terminationMessage(pod))
+	digests, refused := parseBusDigests(terminationMessage(pod), a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg)))
 	if refused != "" {
 		return refused, nil
 	}
@@ -1207,9 +1284,10 @@ func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent 
 	return "", nil
 }
 
-// parseBusDigests reads the hashing pod's report: exactly the provisioned
-// streams, each with a data and a metadata digest of 64 lowercase hex.
-func parseBusDigests(msg string) (map[string]busmigrate.StagedDigest, string) {
+// parseBusDigests reads the hashing pod's report: exactly the run's streams
+// (a2aBusMigrationStreamsFor), each with a data and a metadata digest of 64
+// lowercase hex.
+func parseBusDigests(msg string, streams []string) (map[string]busmigrate.StagedDigest, string) {
 	var digests map[string]busmigrate.StagedDigest
 	if err := json.Unmarshal([]byte(msg), &digests); err != nil {
 		return nil, "it is not a digest report"
@@ -1217,10 +1295,10 @@ func parseBusDigests(msg string) (map[string]busmigrate.StagedDigest, string) {
 	hex64 := func(s string) bool {
 		return len(s) == 64 && strings.Trim(s, "0123456789abcdef") == ""
 	}
-	if len(digests) != len(a2aProvisionedStreams) {
-		return nil, fmt.Sprintf("it names %d streams, not the %d provisioned", len(digests), len(a2aProvisionedStreams))
+	if len(digests) != len(streams) {
+		return nil, fmt.Sprintf("it names %d streams, not the run's %d", len(digests), len(streams))
 	}
-	for _, name := range a2aProvisionedStreams {
+	for _, name := range streams {
 		d, ok := digests[name]
 		if !ok {
 			return nil, "it has no digest for " + name
@@ -1699,7 +1777,7 @@ func (r *PlatformAgentReconciler) busMigrationSnapshotKept(ctx context.Context, 
 		return "the run Secret cannot be read", nil
 	}
 	b, _ := json.Marshal(file.Digests)
-	if _, bad := parseBusDigests(string(b)); bad != "" {
+	if _, bad := parseBusDigests(string(b), a2aBusMigrationStreamsFor(busMigrationLeg(run.Leg))); bad != "" {
 		return "the run Secret's digests: " + bad, nil
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -1716,9 +1794,9 @@ func (r *PlatformAgentReconciler) busMigrationSnapshotKept(ctx context.Context, 
 }
 
 // busMigrationClearedAll reports the current Clearing having deleted every
-// provisioned stream.
-func busMigrationClearedAll(run *agentv1alpha1.BusMigrationStatus) bool {
-	for _, name := range a2aProvisionedStreams {
+// stream a run of leg clears.
+func busMigrationClearedAll(run *agentv1alpha1.BusMigrationStatus, leg busMigrationLeg) bool {
+	for _, name := range a2aBusMigrationStreamsFor(leg) {
 		if !slices.Contains(run.Cleared, name) {
 			return false
 		}
@@ -1761,7 +1839,7 @@ const reasonA2ABusMigrationStreamsOverCap = "A2ABusMigrationStreamsOverCap"
 // a2aBusJszStreamsPath is the monitoring endpoint's JetStream report, with
 // each stream's state (the meta group check reads the summary alone,
 // a2aBusJszPath).
-const a2aBusJszStreamsPath = "/jsz?streams=true"
+const a2aBusJszStreamsPath = "/jsz?streams=true&config=true"
 
 // a2aBusStream is one stream's state as the bus's /jsz reports it: what
 // the restore's rendered-limit check reads from the snapshot.
@@ -1769,6 +1847,9 @@ type a2aBusStream struct {
 	Bytes     int64
 	Msgs      int64
 	FirstTime time.Time
+	// MaxConsumers is the stream's configured max_consumers, read with
+	// config=true; zero when the server did not report a config.
+	MaxConsumers int
 }
 
 // busMigrationStreamsOverCap says why a one to three migration can't start,
@@ -1782,6 +1863,12 @@ type a2aBusStream struct {
 // closed. A stream the policies don't name isn't judged here; the restore's
 // own checks hold it.
 func (r *PlatformAgentReconciler) busMigrationStreamsOverCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+	return r.busMigrationStreamsOverCapIn(ctx, agent, a2aProvisionedStreams)
+}
+
+// busMigrationStreamsOverCapIn is busMigrationStreamsOverCap for the named
+// streams only: a reshape restores TASKS alone.
+func (r *PlatformAgentReconciler) busMigrationStreamsOverCapIn(ctx context.Context, agent *agentv1alpha1.PlatformAgent, names []string) string {
 	live, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
 		return "the bus's stream sizes could not be read (" + err.Error() + "), and a stream over the limits the restore puts on it would fail the run with writes frozen"
@@ -1791,7 +1878,7 @@ func (r *PlatformAgentReconciler) busMigrationStreamsOverCap(ctx context.Context
 	listed := 0
 	for _, p := range a2aStreamPolicies(agent, 1) {
 		st, ok := live[p.Name]
-		if !ok {
+		if !ok || !slices.Contains(names, p.Name) {
 			continue
 		}
 		listed++
@@ -1841,7 +1928,10 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 	var jsz struct {
 		AccountDetails []struct {
 			Streams []struct {
-				Name  string `json:"name"`
+				Name   string `json:"name"`
+				Config struct {
+					MaxConsumers int `json:"max_consumers"`
+				} `json:"config"`
 				State struct {
 					Bytes     int64     `json:"bytes"`
 					Msgs      int64     `json:"messages"`
@@ -1856,7 +1946,7 @@ func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 	streams := map[string]a2aBusStream{}
 	for _, account := range jsz.AccountDetails {
 		for _, stream := range account.Streams {
-			streams[stream.Name] = a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime}
+			streams[stream.Name] = a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime, MaxConsumers: stream.Config.MaxConsumers}
 		}
 	}
 	return streams, nil

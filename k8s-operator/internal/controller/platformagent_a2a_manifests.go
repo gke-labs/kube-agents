@@ -5319,12 +5319,24 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3, or what the last pass recorded
 		return nil
 	}
+	if running != 0 && want == running {
+		// A person's request to recreate TASKS at the width the CR renders
+		// (the bus-reshape annotation): it starts only on a settled bus
+		// whose TASKS is narrower than that (busReshapeRefusal).
+		if err := r.maybeStartBusReshape(ctx, agent, running); err != nil {
+			return err
+		}
+	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
 		// A migration under way decides the count, whatever the field and
 		// the StatefulSet read mid-way.
 		n, err := r.advanceBusMigration(ctx, agent, time.Now())
 		if err != nil {
 			return err
+		}
+		if busMigrationLeg(run.Leg) == busMigrationReshape && running != 0 {
+			// A reshape runs at the count the bus runs and never changes it.
+			n = running
 		}
 		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
 		return nil
@@ -5401,8 +5413,15 @@ func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, no
 // and noteBusMigrationEcho records the prune, so the next pass refuses to
 // start one, with its Warning Event.
 func (r *PlatformAgentReconciler) startBusMigrationPersisted(ctx context.Context, agent *agentv1alpha1.PlatformAgent, running, want int) error {
+	return r.persistBusMigrationStart(ctx, agent, func() { startBusMigration(agent, running, want, metav1.Now()) })
+}
+
+// persistBusMigrationStart runs start, which may record a new run in
+// agent's status, and writes that record before the pass goes on, as
+// startBusMigrationPersisted says.
+func (r *PlatformAgentReconciler) persistBusMigrationStart(ctx context.Context, agent *agentv1alpha1.PlatformAgent, start func()) error {
 	before := agent.Status.BusMigration
-	startBusMigration(agent, running, want, metav1.Now())
+	start()
 	if agent.Status.BusMigration == before {
 		return nil // nothing started
 	}
@@ -5448,7 +5467,9 @@ func busMigrationWouldStart(agent *agentv1alpha1.PlatformAgent, want int) bool {
 	// operator does not run has no target it can read, so any count it is
 	// asked for starts one: reading it as a shrink would ignore a request
 	// for one server, without a word.
-	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+	if leg := busMigrationLeg(run.Leg); !busMigrationLegKnown(leg) || leg == busMigrationReshape {
+		// A reshape doesn't change the count, so it has no target that
+		// another count could be compared with.
 		return true
 	}
 	return want != busMigrationTarget(run) || agent.Annotations[a2aBusMigrationStartAnnotation] == run.RunID

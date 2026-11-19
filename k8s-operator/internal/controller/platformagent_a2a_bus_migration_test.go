@@ -372,7 +372,7 @@ func (m *migrationRig) snapshotKept() {
 	if err := m.cl.Status().Update(ctx, pvc); err != nil {
 		m.t.Fatal(err)
 	}
-	digests, _ := parseBusDigests(validDigests())
+	digests, _ := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(m.agent, 1)})
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}, Data: map[string][]byte{busMigrationRunKey: body}}
 	m.own(sec)
@@ -474,7 +474,7 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	if err := json.Unmarshal(secret.Data[busMigrationRunKey], &run); err != nil {
 		t.Fatal(err)
 	}
-	wantDigests, _ := parseBusDigests(validDigests())
+	wantDigests, _ := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(m.agent, 1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
 		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
 	}
@@ -658,7 +658,7 @@ func TestAFailedRestoreRollsBackNamingItsError(t *testing.T) {
 }
 
 func TestTheHashingReportIsReadStrictly(t *testing.T) {
-	good, refused := parseBusDigests(validDigests())
+	good, refused := parseBusDigests(validDigests(), a2aBusMigrationStreams())
 	if refused != "" || len(good) != len(a2aProvisionedStreams) {
 		t.Fatalf("a valid report refused: %s", refused)
 	}
@@ -690,7 +690,7 @@ func TestTheHashingReportIsReadStrictly(t *testing.T) {
 			c["TASKS"] = busmigrate.StagedDigest{Data: c["TASKS"].Data}
 		}),
 	} {
-		if _, refused := parseBusDigests(msg); refused == "" {
+		if _, refused := parseBusDigests(msg, a2aBusMigrationStreams()); refused == "" {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -2615,7 +2615,7 @@ func TestAClearFailingPartwayIsRetriedToTheEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.pass(busMigrationRollingBack, 1)
-	if !busMigrationClearedAll(m.agent.Status.BusMigration) {
+	if !busMigrationClearedAll(m.agent.Status.BusMigration, busMigrationGrow) {
 		t.Error("the retried clear did not record every stream")
 	}
 }
@@ -2658,7 +2658,7 @@ func TestEachClearingStartsItsOwnRecord(t *testing.T) {
 	m.agent.Status.BusMigration.Cleared = a2aProvisionedStreams // the forward clear's
 	m.finishPod("restore", corev1.PodFailed, `{"error":"boom"}`, "")
 	m.pass(busMigrationClearing, 3)
-	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration) {
+	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration, busMigrationGrow) {
 		t.Errorf("the way back's Clearing starts with %v cleared", m.agent.Status.BusMigration.Cleared)
 	}
 }

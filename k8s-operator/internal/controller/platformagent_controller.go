@@ -544,6 +544,11 @@ type PlatformAgentReconciler struct {
 	// while it is held (holdUnknownBusMigrationLeg). A restart sends it once
 	// more. Keyed by ObjectKey, value "<run>/<phase>".
 	heldBusMigrationWarned sync.Map
+	// busReshapeRefused records, per CR, the bus-reshape request and the
+	// reason this process last reported for not starting it, so the Event
+	// goes once per request and reason, not once per pass. Keyed by
+	// ObjectKey, value "<nonce>/<reason>".
+	busReshapeRefused sync.Map
 	// prunedBusMigrationStatus records, per CR, that a status write carrying
 	// status.busMigration came back without it: the served CRD predates the
 	// field. A run the API server drops is gone by the next pass, which would
