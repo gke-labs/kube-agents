@@ -409,7 +409,7 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   health_at TEXT, health_checked_at TEXT,
   human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT,
   outcome_detail TEXT, reported_at TEXT, followup_state TEXT, followup_attempts INTEGER,
-  followup_detail TEXT
+  followup_detail TEXT, changed_paths TEXT
 );
 ```
 
@@ -437,9 +437,17 @@ schedules the step yet. A merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
 that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
 `post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
-recently read first by `health_checked_at`. For a merged record with a `merge_commit` and a cluster it
+recently read first by `health_checked_at`. A record whose cluster the install's declared scope leaves out, by the fleet audit's own rule
+(`post_merge_scope.py`), or whose scope cannot be judged, is not read: `sync_state` says why
+(`out of scope: ...` or `scope unknown: ...`), and it takes no place in the per-run cap. A scope
+that cannot be read at all stops the run before any cluster is read, with a non-zero exit. For a merged record with a `merge_commit` and a cluster it
 can name, it reads the Argo CD Applications, Flux Kustomizations and Config Sync RepoSyncs on that
-cluster that deliver the repository into the record's namespace, asking the broker
+cluster that deliver the repository into the record's namespace, and the git-sourced RootSyncs of the repository
+whose `spec.git.dir` holds a file the pull request changed that names the record's workload, so a
+RootSync delivering another file of the same pull request never counts (read from its diff only when a RootSync
+or more than one namespace match could change the answer, and kept in `changed_paths` once read; a
+path narrows the namespace matches and never empties them, and a diff it cannot read whole, or one with
+no file naming the workload, is said as `the workload's files unknown` in `sync_state`), asking the broker
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
