@@ -678,7 +678,7 @@ Transition. `platform` remains the default addressee until the session can hand 
 topics on to the platform agent without the user noticing. The route is a deploy-time
 setting, the PlatformAgent's `spec.harness.tuning.defaultRoute` (`session` or `platform`, unset
 meaning `platform` until the default flips), which the operator renders as
-`A2A_DEFAULT_ADDRESSEE` on the gateway and on the platform agent container from one resolver,
+`A2A_DEFAULT_ADDRESSEE` on the gateway and on the platform agent container (which the hermes-bridge sidecar copies) from one resolver,
 so the two cannot disagree. The Delegate flow covers one task; the
 per-conversation opt-in is `/session`: deterministic, resolved before status, stop and steer,
 naming a route rather than a handle. A bare `/session` marks the conversation session-routed

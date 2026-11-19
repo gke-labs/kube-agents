@@ -552,9 +552,14 @@ door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), 
 
 `defaultRoute` is where the A2A gateway sends a plain conversation's first message: `platform` to the
 Platform Agent, `session` to a session pod of the conversation's own. The operator renders it as
-`A2A_DEFAULT_ADDRESSEE` on the gateway and on the Platform Agent container, so changing it rolls both.
-On either route the Platform Agent stays reachable by handle and `delegate:` opens a session pod. A
-later release flips the unset default to `session`.
+`A2A_DEFAULT_ADDRESSEE` on the gateway and on the Platform Agent container, which the hermes-bridge
+sidecar copies. Changing it rolls the gateway and the Platform Agent pod. On either route the Platform
+Agent stays reachable by handle and `delegate:` opens a session pod. A later release flips the unset
+default to `session`.
+
+`session` also widens the `TASKS` consumer budget, because each session counts the replays of its
+task too. On an install whose stream is narrower, the provision Job refuses until `maxSessions` is
+lowered or `TASKS` is recreated. Its message names both.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short

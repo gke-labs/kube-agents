@@ -10162,8 +10162,15 @@ spec:
                             `session`. `platform` stays reachable by handle either way, and a
                             `delegate:` still opens a session pod on either route. The operator
                             renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
-                            on the platform agent container, so a change rolls the gateway and the
-                            platform agent pod.
+                            on the platform agent container (which the hermes-bridge sidecar
+                            copies), so a change rolls the gateway and the platform agent pod.
+
+                            `session` widens the TASKS consumer budget: each session also counts
+                            the replays of its conversation's task, 7 consumers rather than 3, so
+                            40 more at the default 10 sessions. TASKS cannot be widened once it
+                            exists, so on an install whose stream was created narrower the
+                            provision Job refuses until maxSessions is lowered to fit or TASKS is
+                            recreated; its message names both.
                           enum:
                             - session
                             - platform

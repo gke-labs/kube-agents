@@ -20,11 +20,14 @@ package controller
 //
 // The gateway routes a plain conversation's first message by
 // A2A_DEFAULT_ADDRESSEE, and the platform agent container carries the same
-// value so the agent knows which route the gateway takes. Both are rendered
+// value, which the hermes-bridge sidecar copies, so the agent knows which
+// route the gateway takes. Both are rendered
 // from resolveA2ADefaultRoute; these tests fail if either side stops reading it.
 
 import (
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -172,5 +175,85 @@ func TestTheSessionRouteIsAReservedAddressee(t *testing.T) {
 	}
 	if a2aCanDrainAs(routeSession, nil) {
 		t.Errorf("a2aCanDrainAs(%q) = true; a reserved addressee is never a draining profile's name", routeSession)
+	}
+}
+
+// On the session route every conversation's task is a session pod, so the
+// asks on it (an asker's a2aTasksReplayAsk replays, with the tail) are a
+// session's: counted per session, in the multiplier beside the named
+// consumers. On the platform route the multiplier is the named consumers
+// alone, as before the field. The difference between the two budgets is
+// exactly the per-session asks times the cap, so dropping the term, or
+// counting it on the platform route, reds here.
+func TestTheSessionRouteCountsTheAsksPerSession(t *testing.T) {
+	perSessionAsks := a2aTasksReplayTailFactor * a2aTasksReplayAsk
+	for _, sessions := range []int{1, defaultA2AMaxSessions, 11, 10000} {
+		platform := defaultRouteAgent(nil)
+		platform.Spec.Harness.Tuning.MaxSessions = ptr.To(sessions)
+		session := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession))
+		session.Spec.Harness.Tuning.MaxSessions = ptr.To(sessions)
+
+		if got := a2aTasksConsumersPerSession(platform); got != a2aSessionConsumersPerSession {
+			t.Errorf("platform route: per-session consumers %d, want the %d named consumers alone", got, a2aSessionConsumersPerSession)
+		}
+		if got, want := a2aTasksConsumerBudget(platform), sessions*a2aSessionConsumersPerSession+a2aTasksReserve(platform); got != want {
+			t.Errorf("platform route, maxSessions=%d: budget %d, want %d (unchanged by the field)", sessions, got, want)
+		}
+		if got, want := a2aTasksConsumersPerSession(session), a2aSessionConsumersPerSession+perSessionAsks; got != want {
+			t.Errorf("session route: per-session consumers %d, want %d (named consumers plus the asks with their tail)", got, want)
+		}
+		if a2aTasksReserve(session) != a2aTasksReserve(platform) {
+			t.Errorf("maxSessions=%d: the reserve moved with the route (%d vs %d); the bridge's rows stay, since platform is reachable by handle",
+				sessions, a2aTasksReserve(session), a2aTasksReserve(platform))
+		}
+		if got, want := a2aTasksConsumerBudget(session)-a2aTasksConsumerBudget(platform), sessions*perSessionAsks; got != want {
+			t.Errorf("maxSessions=%d: the session route adds %d to the budget, want %d (the asks per session times the cap)", sessions, got, want)
+		}
+		if a2aTasksMaxConsumers(session) < a2aTasksConsumerBudget(session) {
+			t.Errorf("maxSessions=%d: TASKS renders at %d, below the session route's budget %d", sessions, a2aTasksMaxConsumers(session), a2aTasksConsumerBudget(session))
+		}
+	}
+	// Pinned at the defaults, so the arithmetic above cannot drift together
+	// with the constants: 10 sessions at 3+2*2, plus the reserve of 80 at the
+	// rendered bridge's 10 workers; the platform route keeps its 110.
+	def := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession))
+	if got := a2aTasksConsumerBudget(def); got != 150 {
+		t.Errorf("session route at the defaults: budget %d, want 150", got)
+	}
+	if got := a2aTasksMaxConsumers(def); got != 150 {
+		t.Errorf("session route at the defaults: TASKS renders at %d, want 150 (above the floor)", got)
+	}
+	if got := a2aTasksConsumerBudget(defaultRouteAgent(nil)); got != 110 {
+		t.Errorf("platform route at the defaults: budget %d, want 110, the figure before the field", got)
+	}
+}
+
+// The provision script's gate and its refusal read the same per-session
+// figure as the budget, so a session-route install told "lower maxSessions
+// to N" is told an N that fits, and the status message names the route as
+// the input that raised the need.
+func TestTheProvisionRefusalReadsTheSessionRouteShare(t *testing.T) {
+	session := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession))
+	script := a2aProvisionScript(session)
+	per := strconv.Itoa(a2aTasksConsumersPerSession(session))
+	for _, want := range []string{
+		"required_consumers=" + strconv.Itoa(a2aTasksConsumerBudget(session)) + "\n",
+		"fits=$(( (live_consumers - " + strconv.Itoa(a2aTasksReserve(session)) + ") / " + per + " ))",
+		"each session needs " + per + " consumers on TASKS",
+		"the rest going " + per + " to a session",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the session route's provision script lacks %q", want)
+		}
+	}
+	platformScript := a2aProvisionScript(defaultRouteAgent(nil))
+	if want := "each session creates " + strconv.Itoa(a2aSessionConsumersPerSession) + " consumers on TASKS"; !strings.Contains(platformScript, want) {
+		t.Errorf("the platform route's provision script lacks %q; its refusal must read as before", want)
+	}
+	if msg := a2aProvisionRefusalStatus(session); !strings.Contains(msg, "defaultRoute is "+agentv1alpha1.DefaultRouteSession) {
+		t.Errorf("the session route's refusal status does not name the route: %s", msg)
+	}
+	if msg := a2aProvisionRefusalStatus(defaultRouteAgent(nil)); strings.Contains(msg, "defaultRoute") {
+		t.Errorf("the platform route's refusal status names defaultRoute: %s", msg)
 	}
 }

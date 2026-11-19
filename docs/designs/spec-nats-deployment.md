@@ -934,9 +934,12 @@ pod may publish, the consumers it may create over `.in`, and its capability veri
 reply subjects on that name, so a pod named after another addressee would be handed that
 addressee's task subjects. The gateway never mints such a name, but anyone who can create a
 pod under a narrowed ServiceAccount can, so the same check refuses a narrowed pod whose name
-is a fixed-name addressee. Today that is `platform`: the gateway's default addressee, which
-the operator leaves unset so the gateway keeps its own default, and the only addressee the
-bridge's grants name. The operator renders the list into the callout's
+is a fixed-name addressee. Today that is `platform` and `session`. `platform` is the only
+addressee the bridge's grants name, and the gateway's default addressee unless the
+PlatformAgent's `spec.harness.tuning.defaultRoute` says `session`; the operator renders that
+default as `A2A_DEFAULT_ADDRESSEE`. `session` is the gateway's session route: a sentinel it
+routes on rather than an addressee it publishes to, reserved so nothing holds the name. The
+operator renders the list into the callout's
 `A2A_RESERVED_ADDRESSEES` environment variable, from the constant the bridge's grants are
 built from, and an operator test holds it to both defaults in the a2a module. The callout
 refuses to start if the variable is missing, empty, or holds anything but dot-free DNS-1123
