@@ -1,0 +1,340 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
+)
+
+// Every phase the Reshape leg can reach is one the operator that first held
+// unknown legs (#6479) knows, so an operator rolled back to it holds a
+// reshape in any phase, with an identity in its frozen map for every pod.
+// Walks the step table from every phase in the set, both directions, both
+// outcomes, and the run's first phase.
+func TestTheReshapeLegUsesOnlyPhasesTheHoldKnows(t *testing.T) {
+	if !slices.Contains(busReshapePhases, busMigrationFreezing) {
+		t.Fatal("a reshape starts in Freezing, which is not in the set")
+	}
+	for _, phase := range busReshapePhases {
+		for _, abandoning := range []bool{false, true} {
+			for _, outcome := range []busMigrationOutcome{busMigrationSucceeded, busMigrationErred, busMigrationPending} {
+				next := nextBusMigrationPhase(busMigrationReshape, phase, abandoning, outcome).next
+				if !slices.Contains(busReshapePhases, next) {
+					t.Errorf("from %s (abandoning %v, outcome %v) the Reshape leg goes to %s, which #6479's operator does not know", phase, abandoning, outcome, next)
+				}
+			}
+		}
+	}
+	for _, p := range []busMigrationPhase{busMigrationConverting, busMigrationPinning, busMigrationShrinking, busMigrationUnpinning} {
+		if slices.Contains(busReshapePhases, p) {
+			t.Errorf("%s is in the reshape's phases; a reshape never converts or pins", p)
+		}
+	}
+}
+
+// The forward walk skips the conversion: Clearing goes straight to
+// Restoring. A failed restore turns back through the clear and the rollback
+// restore, as one to three does.
+func TestTheReshapeStepTable(t *testing.T) {
+	step := func(phase busMigrationPhase, abandoning, ok bool) busMigrationStep {
+		outcome := busMigrationErred
+		if ok {
+			outcome = busMigrationSucceeded
+		}
+		return nextBusMigrationPhase(busMigrationReshape, phase, abandoning, outcome)
+	}
+	for _, c := range []struct {
+		phase          busMigrationPhase
+		abandoning, ok bool
+		next           busMigrationPhase
+		nextAbandoning bool
+	}{
+		{busMigrationFreezing, false, true, busMigrationSnapshot, false},
+		{busMigrationSnapshot, false, true, busMigrationHashing, false},
+		{busMigrationHashing, false, true, busMigrationClearing, false},
+		{busMigrationClearing, false, true, busMigrationRestoring, false},
+		{busMigrationRestoring, false, true, busMigrationReleasing, false},
+		{busMigrationReleasing, false, true, busMigrationDone, false},
+		{busMigrationFreezing, false, false, busMigrationReleasing, true},
+		{busMigrationHashing, false, false, busMigrationReleasing, true},
+		{busMigrationClearing, false, false, busMigrationFailed, false},
+		{busMigrationRestoring, false, false, busMigrationClearing, true},
+		{busMigrationClearing, true, true, busMigrationRollingBack, true},
+		{busMigrationClearing, true, false, busMigrationFailed, true},
+		{busMigrationRollingBack, true, true, busMigrationRollbackRestoring, true},
+		{busMigrationRollbackRestoring, true, true, busMigrationReleasing, true},
+		{busMigrationRollbackRestoring, true, false, busMigrationFailed, true},
+		{busMigrationReleasing, true, true, busMigrationAbandoned, true},
+	} {
+		got := step(c.phase, c.abandoning, c.ok)
+		if got.next != c.next || got.abandoning != c.nextAbandoning {
+			t.Errorf("%s (abandoning %v, ok %v) -> %s (abandoning %v), want %s (abandoning %v)", c.phase, c.abandoning, c.ok, got.next, got.abandoning, c.next, c.nextAbandoning)
+		}
+	}
+}
+
+// tasksDigests is a hashing pod's report for a reshape: TASKS alone.
+func tasksDigests() string {
+	b, _ := json.Marshal(map[string]busmigrate.StagedDigest{"TASKS": {Data: fmt.Sprintf("%064x", 1), Meta: fmt.Sprintf("%064x", 100)}})
+	return string(b)
+}
+
+// reshapeRig is a migration rig for a reshape at running servers, with the
+// CR asking for that count (a reshape never changes it).
+func reshapeRig(t *testing.T, phase busMigrationPhase, running int32, deadline time.Time) *migrationRig {
+	t.Helper()
+	m := newMigrationRig(t, busMigrationReshape, phase, running, deadline)
+	m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(int(running))
+	return m
+}
+
+// A reshape walks the freeze, the snapshot, the hash, the clear and the
+// restore of TASKS alone, at the count the bus runs, one server or three,
+// and never renders another count. Its restore pod restores forward at that
+// count, named.
+func TestAReshapeRunsAtTheCountTheBusRuns(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	for _, n := range []int32{1, 3} {
+		m := reshapeRig(t, busMigrationFreezing, n, time.Now().Add(time.Hour))
+		m.calloutPods(2, true, true)
+		m.pass(busMigrationFreezing, n)
+		m.rollOut(n)
+		m.pass(busMigrationSnapshot, n)
+		if spec, _, ok := m.workload("snapshot"); !ok || !slices.Contains(spec.Containers[0].Command, "TASKS") || slices.Contains(spec.Containers[0].Command, strings.Join(a2aBusMigrationStreams(), ",")) {
+			t.Fatalf("at %d: snapshot pod %v, want --streams TASKS", n, spec.Containers)
+		}
+		m.finishPod("snapshot", corev1.PodSucceeded, "", "")
+		m.pass(busMigrationHashing, n)
+		m.finishPod("hash", corev1.PodSucceeded, tasksDigests(), "")
+		m.pass(busMigrationClearing, n)
+		m.snapshotKept()
+		b, _ := json.Marshal(busmigrate.Report{Cleared: []string{"TASKS"}})
+		m.finishPod(busMigrationRunWork(m.agent.Status.BusMigration).name, corev1.PodSucceeded, string(b), "")
+		m.pass(busMigrationRestoring, n)
+		spec, _, ok := m.workload("restore")
+		if !ok {
+			t.Fatalf("at %d: no restore pod", n)
+		}
+		cmd := strings.Join(spec.Containers[0].Command, " ")
+		if !strings.Contains(cmd, "--direction forward") || !strings.Contains(cmd, fmt.Sprintf("--replicas %d", n)) || !strings.Contains(cmd, "--streams TASKS") {
+			t.Errorf("at %d: restore command %q, want TASKS forward at %d replicas", n, cmd, n)
+		}
+		m.finishPod("restore", corev1.PodSucceeded, `{}`, "")
+		m.pass(busMigrationReleasing, n)
+		m.rollOut(n)
+		m.pass(busMigrationDone, n)
+	}
+}
+
+// The way back restores TASKS as it was, at the count the bus runs, named
+// back.
+func TestAReshapesRollbackRestoresBackAtTheSameCount(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	for _, n := range []int32{1, 3} {
+		m := reshapeRig(t, busMigrationRollbackRestoring, n, time.Now().Add(time.Hour))
+		m.agent.Status.BusMigration.Abandoning = true
+		m.agent.Status.BusMigration.Cleared = []string{"TASKS"}
+		m.snapshotKept()
+		m.pass(busMigrationRollbackRestoring, n)
+		spec, _, ok := m.workload("rollback")
+		if !ok {
+			t.Fatalf("at %d: no rollback pod", n)
+		}
+		cmd := strings.Join(spec.Containers[0].Command, " ")
+		if !strings.Contains(cmd, "--direction back") || !strings.Contains(cmd, fmt.Sprintf("--replicas %d", n)) {
+			t.Errorf("at %d: rollback command %q, want back at %d replicas", n, cmd, n)
+		}
+	}
+}
+
+// A hashing report for a reshape names TASKS alone; one that names every
+// stream, or misses TASKS, is refused.
+func TestAReshapesDigestsAreTasksAlone(t *testing.T) {
+	streams := a2aBusMigrationStreamsFor(busMigrationReshape)
+	if !slices.Equal(streams, []string{"TASKS"}) {
+		t.Fatalf("reshape streams %v, want [TASKS]", streams)
+	}
+	if _, bad := parseBusDigests(tasksDigests(), streams); bad != "" {
+		t.Errorf("a TASKS-only report refused: %s", bad)
+	}
+	if _, bad := parseBusDigests(validDigests(), streams); bad == "" {
+		t.Error("a report naming every stream was accepted for a reshape")
+	}
+	if _, bad := parseBusDigests(tasksDigests(), a2aBusMigrationStreams()); bad == "" {
+		t.Error("a TASKS-only report was accepted for one to three")
+	}
+}
+
+// reshapeTrigger is a settled, provisioned one-server bus whose live TASKS
+// holds width; the CR renders a2aTasksMaxConsumers.
+func reshapeTrigger(t *testing.T, width int) *migrationRig {
+	t.Helper()
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationDone, 1, time.Now().Add(time.Hour))
+	m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	m.agent.Status.BusMigration = nil
+	meta.SetStatusCondition(&m.agent.Status.Conditions, metav1.Condition{Type: busProvisionedConditionType, Status: metav1.ConditionTrue, Reason: "ProvisionJobComplete"})
+	m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+		return map[string]a2aBusStream{"TASKS": {MaxConsumers: width}}, nil
+	}
+	return m
+}
+
+func (m *migrationRig) reshapeEvents() []string {
+	var out []string
+	for _, e := range drainEvents(m.r.Recorder.(*record.FakeRecorder)) {
+		if strings.Contains(e, reasonA2ABusReshapeNotStarted) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// The annotation starts a reshape on a provisioned bus whose TASKS is
+// narrower than the render, at the count the bus runs, with the request
+// recorded in the run's ID, and the run is persisted before the pass goes
+// on.
+func TestTheReshapeAnnotationStartsAReshape(t *testing.T) {
+	m := reshapeTrigger(t, a2aTasksMaxConsumers(a2aTestAgent())-20)
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "first"}
+	m.pass(busMigrationFreezing, 1)
+	run := m.agent.Status.BusMigration
+	if run.Leg != string(busMigrationReshape) || !strings.HasSuffix(run.RunID, busReshapeRunSuffix("first")) {
+		t.Fatalf("run %+v, want a Reshape whose ID ends %s", run, busReshapeRunSuffix("first"))
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.BusMigration == nil || stored.Status.BusMigration.RunID != run.RunID {
+		t.Errorf("stored run %+v, want the started run persisted", stored.Status.BusMigration)
+	}
+}
+
+// Each guard refuses with a Normal Event naming why, once per request and
+// reason, and starts nothing.
+func TestTheReshapeGuards(t *testing.T) {
+	rendered := a2aTasksMaxConsumers(a2aTestAgent())
+	for _, c := range []struct {
+		name string
+		set  func(m *migrationRig)
+		want string
+	}{
+		{"wide enough", func(m *migrationRig) {
+			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				return map[string]a2aBusStream{"TASKS": {MaxConsumers: rendered}}, nil
+			}
+		}, "already holds max_consumers"},
+		{"no limit", func(m *migrationRig) {
+			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				return map[string]a2aBusStream{"TASKS": {MaxConsumers: -1}}, nil
+			}
+		}, "already holds max_consumers -1"},
+		{"not provisioned", func(m *migrationRig) {
+			meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
+		}, "not provisioned"},
+		{"unreadable", func(m *migrationRig) {
+			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				return nil, errors.New("monitor down")
+			}
+		}, "could not be read (monitor down)"},
+		{"no TASKS", func(m *migrationRig) {
+			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				return map[string]a2aBusStream{"DIRECTORY": {}}, nil
+			}
+		}, "no TASKS stream"},
+		{"over cap", func(m *migrationRig) {
+			m.r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				return map[string]a2aBusStream{"TASKS": {MaxConsumers: rendered - 20, Bytes: a2aTasksMaxBytes + 1}}, nil
+			}
+		}, "TASKS holds"},
+		{"failed run waits", func(m *migrationRig) {
+			m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationFailed), FailedIn: string(busMigrationRollbackRestoring)}
+		}, "waits for a person"},
+		{"no operator image", func(m *migrationRig) {
+			t.Setenv(operatorImageEnvVar, "")
+		}, "without OPERATOR_IMAGE"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := reshapeTrigger(t, rendered-20)
+			m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "n1"}
+			c.set(m)
+			before := m.agent.Status.BusMigration
+			for i := 0; i < 2; i++ {
+				if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if run := m.agent.Status.BusMigration; run != before && (run == nil || run.Leg == string(busMigrationReshape)) {
+				t.Errorf("a reshape started: %+v", run)
+			}
+			events := m.reshapeEvents()
+			if len(events) != 1 || !strings.Contains(events[0], c.want) || !strings.Contains(events[0], "Normal") {
+				t.Errorf("events %q, want one Normal naming %q", events, c.want)
+			}
+		})
+	}
+}
+
+// A request already answered starts nothing, by its record in the run's ID;
+// and one left in place after that record is gone (a later run replaced
+// it) starts nothing either, because TASKS is at the width: the width guard
+// is the primary one.
+func TestAReshapeRequestLeftInPlaceStartsNoSecondReshape(t *testing.T) {
+	rendered := a2aTasksMaxConsumers(a2aTestAgent())
+
+	// Answered, TASKS still narrow (the run was abandoned): the record in
+	// the run's ID stops a second start on the same nonce.
+	m := reshapeTrigger(t, rendered-20)
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "n1"}
+	m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationReshape), RunID: "3" + busReshapeRunSuffix("n1"), Phase: string(busMigrationAbandoned)}
+	m.pass(busMigrationAbandoned, 1)
+	if len(m.reshapeEvents()) != 0 {
+		t.Error("an answered request was reported as refused")
+	}
+	// A new nonce on the same narrow TASKS starts one.
+	m.agent.Annotations[a2aBusReshapeAnnotation] = "n2"
+	m.pass(busMigrationFreezing, 1)
+
+	// Done, then a later run replaced the record: the stale nonce finds
+	// TASKS at the width, and starts nothing.
+	m = reshapeTrigger(t, rendered)
+	m.agent.Annotations = map[string]string{a2aBusReshapeAnnotation: "n1"}
+	m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "9-1", Phase: string(busMigrationDone)}
+	m.pass(busMigrationDone, 1)
+	if ev := m.reshapeEvents(); len(ev) != 1 || !strings.Contains(ev[0], "already holds") {
+		t.Errorf("events %q, want the width guard's", ev)
+	}
+}
+
+// A reshape's server count is the bus's: a terminal reshape gates no later
+// count change, and its condition names TASKS, not a server count.
+func TestAReshapeHasNoTargetCount(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationReshape), RunID: "3-rabc", Phase: string(busMigrationDone)}
+	for _, want := range []int{1, 3} {
+		if !busMigrationWouldStart(agent, want) {
+			t.Errorf("after a reshape, a change to %d starts nothing", want)
+		}
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationRestoring)
+	cond, ok := busMigratingCondition(agent)
+	if !ok || cond.Status != metav1.ConditionTrue || !strings.Contains(cond.Message, "TASKS") || strings.Contains(cond.Message, "NATS servers to") {
+		t.Errorf("condition %+v (%v), want True naming TASKS", cond, ok)
+	}
+}
