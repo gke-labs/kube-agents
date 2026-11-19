@@ -2319,6 +2319,17 @@ class NodeLocalDnsCacheTest(unittest.TestCase):
             entry["limitations"],
         )
 
+    def test_a_cluster_the_declared_scope_excludes_is_not_judged(self):
+        scope = networking_audit.declared_scope
+        with patch.object(scope, "excluded_clusters", {("p1", "us-central1-a", "left-out")}), \
+                patch.object(scope, "dropped", {}):
+            entry = self.collect(**{"clusters list": [
+                self.cluster("left-out", {}), self.cluster("left-out-bare"), self.cluster("kept", {}),
+            ]})
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["Cluster/us-central1-a/kept"])
+        self.assertIn("us-central1-a/left-out-bare", entry["limitations"])
+        self.assertNotIn("us-central1-a/left-out,", entry["limitations"])
+
     def test_the_fleet_run_lists_each_projects_clusters_once(self):
         calls = []
         answers = project_answers(**{"clusters list": [self.cluster("seeded-c", {})]})

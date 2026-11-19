@@ -2064,7 +2064,9 @@ def collect_project_target(
         reads.setdefault(DNS_CACHE_CHECK_SLUG, SlugReads()).add(shlex.join(cmd), json.dumps(clusters), 0.0)
         if partial:
             limitations.append(_partial_limitation(DNS_CACHE_READ, cmd, partial))
-        hits, undecided_clusters = check_nodelocal_dnscache(clusters)
+        # The subnet sweep counts an excluded cluster's addresses; this check judges the
+        # cluster itself, which the operator left out on purpose.
+        hits, undecided_clusters = check_nodelocal_dnscache(declared_scope.drop_excluded(project, clusters))
         candidates.extend(emit(DNS_CACHE_CHECK_SLUG, hit, shlex.join(cmd)) for hit in hits)
         if undecided_clusters:
             limitations.append(
