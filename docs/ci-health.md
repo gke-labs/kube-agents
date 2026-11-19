@@ -1574,7 +1574,7 @@ roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours`
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). One assertion this job never makes: the five `declared-*` roles
+read failed). One assertion this job never makes: the `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
 credential for the pool repositories by design, so the state script leaves
 that assertion out, judges those roles on their cluster assertions (healthy,

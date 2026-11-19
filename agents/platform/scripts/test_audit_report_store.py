@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import http.server
 import json
@@ -37,6 +38,35 @@ BROKER_POD = POD_PREFIX + "7d9f8c6b5-x2k4q"
 STREAM = "/v1/audit-reports/compliance-audit/acme%2Fgitops"
 STAMP_1 = "20261101T010203.000001Z"
 STAMP_2 = "20261102T010203.000001Z"
+# Why a test skips when the search of `nested_past_the_parser` finds no document.
+NO_DOCUMENT_REFUSED = "the JSON parser of this Python parses %d levels, the deepest that this test tries"
+
+
+def nested_past_the_parser(levels, most):
+    """A JSON array nested `levels` deep or deeper that `json.loads` refuses for its
+    depth on this run, or None when one of `most` levels still parses.
+
+    The parser's depth limit is the interpreter's: about 10,000 levels on Python
+    3.12 and 3.13, and on 3.14 as many as the stack holds (more than 100,000
+    with a 16 MB stack). So no fixed depth is past it on every run.
+    """
+    depth = levels
+    while True:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        if depth >= most:
+            return None
+        depth = min(2 * depth, most)
+
+
+def nested_past_the_parser_on_a_thread(levels, most):
+    """`nested_past_the_parser`, searched on a new thread: the server parses on
+    one, and on Python 3.14 the limit is that thread's stack."""
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        return pool.submit(nested_past_the_parser, levels, most).result()
 
 
 def _b64(data: bytes) -> str:
@@ -1020,22 +1050,30 @@ class RoundThreeTests(StoreTestCase):
             os.close(fd)
 
     def test_deeply_nested_json(self) -> None:
-        nested = b"[" * 100000 + b"]" * 100000
-        self.assertEqual(400, self.call("PUT", f"{STREAM}/runs/{STAMP_1}", nested).status_code)
-        self.assertEqual(400, self.call("PUT", f"{STREAM}/latest", nested).status_code)
-        # A nested latest.json is skipped by the listing (the stream is listed
-        # without a finished_at). GET latest hands stored bytes back unparsed.
-        directory = self.root / "compliance-audit" / "acme" / "gitops"
-        (directory / "runs").mkdir(parents=True)
-        (directory / "runs" / f"{STAMP_1}.json").write_text("{}")
-        (directory / "latest.json").write_bytes(nested)
-        listed = self.call("GET", "/v1/audit-reports")
-        self.assertEqual(200, listed.status_code)
-        self.assertEqual(
-            [{"audit_id": "compliance-audit", "key": "acme%2Fgitops", "newest_run": STAMP_1,
-              "latest_finished_at": None}],
-            listed.json(),
-        )
+        # The store refuses a body over REPORT_MAX_BYTES before it parses it.
+        deepest = store.REPORT_MAX_BYTES // 2
+        with self.subTest("a nested report"):
+            found = nested_past_the_parser_on_a_thread(100000, deepest)
+            if found is None:
+                self.skipTest(NO_DOCUMENT_REFUSED % deepest)
+            nested = found.encode()
+            # The parser's refusal, not the answer for a document that is no object.
+            for path in (f"{STREAM}/runs/{STAMP_1}", f"{STREAM}/latest"):
+                refused = self.call("PUT", path, nested)
+                self.assertEqual((400, {"error": "the body is not JSON"}), (refused.status_code, refused.json()))
+            # A nested latest.json is skipped by the listing (the stream is listed
+            # without a finished_at). GET latest hands stored bytes back unparsed.
+            directory = self.root / "compliance-audit" / "acme" / "gitops"
+            (directory / "runs").mkdir(parents=True)
+            (directory / "runs" / f"{STAMP_1}.json").write_text("{}")
+            (directory / "latest.json").write_bytes(nested)
+            listed = self.call("GET", "/v1/audit-reports")
+            self.assertEqual(200, listed.status_code)
+            self.assertEqual(
+                [{"audit_id": "compliance-audit", "key": "acme%2Fgitops", "newest_run": STAMP_1,
+                  "latest_finished_at": None}],
+                listed.json(),
+            )
         # A nested JWT payload is a malformed token.
         header = _b64(json.dumps({"alg": "RS256", "kid": self.key.kid}).encode())
         payload = _b64(b"[" * 5000 + b"]" * 5000)
