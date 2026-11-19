@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -48,16 +49,26 @@ import (
 // platform (resolveA2ADefaultRoute).
 //
 // What a pass that cannot read the width does depends on what it has. With a
-// cap in status it keeps that cap. With none (an upgrade's first pass on an
-// unreadable bus, a fresh install before its bus answers) it renders what the
-// operator before the default's flip rendered, platform routing where the
-// field is unset at the configured cap, holds the provision Job, and says so
-// in the SessionCapFitted condition; the reconcile's requeue for the held Job
-// brings the pass that reads it. "No TASKS stream" counts as a reading only
-// from a successful read of a bus never provisioned: the provision Job will
-// create TASKS at the width maxSessions needs (a2aTasksMaxConsumers). On a
-// provisioned bus a missing TASKS is a server that has not caught up, or a
-// stream deleted for recreation, and the pass treats it as unreadable.
+// cap in status it keeps that cap. On a bus never provisioned (neither a
+// BusProvisioned nor a migration record, a2aBusExisted) it takes maxSessions: the provision Job will create
+// TASKS at the width maxSessions needs (a2aTasksMaxConsumers), so there is
+// nothing to fit, and a fresh install renders the spec's route from its first
+// pass. Only a provisioned bus with no stored cap, an existing install's
+// first pass after the upgrade, waits: it renders what the operator before
+// the default's flip rendered (platform routing where the field is unset, at
+// the configured cap), holds the provision Job, and says so in the
+// SessionCapFitted condition; the reconcile's requeue for the held Job brings
+// the pass that reads it. "No TASKS stream" counts as a reading only on a bus
+// never provisioned. On a provisioned bus a missing TASKS is a server that has
+// not caught up, or a stream deleted for recreation, and the pass treats it as
+// unreadable.
+//
+// A stored cap's reading is reused for a2aSessionCapReadingTTL, so a settled
+// install does not make a blocking GET of the bus on every pass. Under a
+// served CRD that prunes status.effectiveSessionCap the stored cap is always
+// absent; the echo of the write says so (noteSessionCapEcho), and for
+// a2aSessionCapPrunedReprobe the pass keeps the cap it last rendered rather
+// than falling back, and does not write it.
 const (
 	// sessionCapFittedConditionType is written only while the cap is below
 	// maxSessions, the install fell back to platform, or the cap is waiting
@@ -74,13 +85,27 @@ const (
 	// sessionCapWaitingReason: the bus's width has not been read yet, so
 	// the provision Job waits and routing stays as it was.
 	sessionCapWaitingReason = "WaitingOnBusWidth"
+	// sessionCapClusterViewReason: the operator's A2A_SESSION_CLUSTER_VIEW is
+	// on, so the session default does not engage and plain turns stay with
+	// the platform agent (resolveA2ADefaultRoute).
+	sessionCapClusterViewReason = "SessionClusterViewOn"
 
-	// sessionCapRemedy is how TASKS gets wider, which lifts the fit. A one
-	// to three bus migration does not: its restore sends each snapshot's
-	// own config (k8s-operator/internal/busmigrate), max_consumers with it.
-	sessionCapRemedy = "TASKS gets wider through the opt-in TASKS reshape (gke-labs/kube-agents#6466), " +
-		"or by deleting the stream so the provision Job recreates it at the width maxSessions needs, " +
-		"which discards the task history it holds"
+	// sessionCapReadingTTL is how long a reading of the bus's TASKS width is
+	// reused while a cap is stored: the bus stream poller's period. A stream
+	// is widened rarely and by hand, so a pass that sees it a poll late costs
+	// nothing; a GET on every pass costs a blocking round trip each time.
+	sessionCapReadingTTL = busStreamsPollInterval
+	// sessionCapPrunedReprobe is how long a write the served CRD pruned keeps
+	// the cap unwritten before the next attempt, the status.usage cadence.
+	sessionCapPrunedReprobe = usageStatusReprobeInterval
+
+	// sessionCapRemedy is what lifts the fit: a wider TASKS. Nothing widens
+	// it in place today; the planned opt-in reshape is how it will be.
+	sessionCapRemedy = "the cap stays fitted until TASKS is widened, and the planned opt-in TASKS reshape " +
+		"(gke-labs/kube-agents#6466) is how it will be lifted"
+	sessionCapClusterViewMessage = "the operator's " + a2aSessionClusterViewEnvVar + " is on, so the session pods' temporary cluster view is still rendered " +
+		"and the session default is not engaged: plain conversations stay with platform, whatever spec.harness.tuning.defaultRoute says, " +
+		"so the default never widens what a plain turn reaches; the view's retirement is tracked in gke-labs/kube-agents#6483"
 	sessionCapNarrowMessage = "the TASKS stream has room for fewer sessions than spec.harness.tuning.maxSessions on the session route, " +
 		"and a stream's max_consumers cannot change once it exists, so the session cap is fitted to it (status.effectiveSessionCap); " +
 		sessionCapRemedy
@@ -104,14 +129,30 @@ const (
 // cap rather than dialing a monitoring endpoint no test runs.
 var a2aBusStreamStateDefault func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
 
+// a2aTasksWidthReading is one reading of TASKS' width (a2aTasksLiveWidth),
+// kept for reuse (sessionCapReadings).
+type a2aTasksWidthReading struct {
+	width   int
+	present bool
+	at      time.Time
+}
+
 // a2aTasksLiveWidth is TASKS' max_consumers as the bus reports it. known is
 // false when the width can't be trusted from this pass: the read failed, a
 // migration is reshaping the bus, the report carried no config for TASKS,
 // or TASKS is missing from a bus that has been provisioned. present is
-// false on a known reading of a bus with no TASKS yet.
-func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (width int, present, known bool) {
+// false on a known reading of a bus with no TASKS yet. With reuse set (a cap
+// is stored), a known reading younger than sessionCapReadingTTL answers
+// without reading the bus.
+func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reuse bool) (width int, present, known bool) {
 	if busMigrationHoldsProvision(agent) {
 		return 0, false, false
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if v, ok := r.sessionCapReadings.Load(key); ok && reuse {
+		if reading := v.(a2aTasksWidthReading); time.Since(reading.at) < sessionCapReadingTTL {
+			return reading.width, reading.present, true
+		}
 	}
 	streams, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
@@ -119,13 +160,16 @@ func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *
 		return 0, false, false
 	}
 	tasks, ok := streams[a2aTasksStream]
-	if !ok {
-		return 0, false, !busProvisioned(agent)
-	}
-	if tasks.MaxConsumers == nil {
+	switch {
+	case !ok && a2aBusExisted(agent):
 		return 0, false, false
+	case ok && tasks.MaxConsumers == nil:
+		return 0, false, false
+	case ok:
+		width, present = *tasks.MaxConsumers, true
 	}
-	return *tasks.MaxConsumers, true, true
+	r.sessionCapReadings.Store(key, a2aTasksWidthReading{width: width, present: present, at: time.Now()})
+	return width, present, true
 }
 
 // resolveA2ASessionCap writes status.effectiveSessionCap and the
@@ -135,8 +179,11 @@ func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *
 // nothing later in the pass writes a status field the Ready writer does not
 // track. The patch's version and both fields are carried to instance too, so
 // the pass's later status writes neither drop them nor conflict on them.
+// Under a served CRD that prunes the field (sessionCapStatusPruned), the cap
+// is set in memory for the render and not written.
 func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent) {
-	sessionCap, cond, event := r.fitA2ASessionCap(ctx, agent)
+	pruned := r.sessionCapStatusPruned(agent)
+	sessionCap, cond, event := r.fitA2ASessionCap(ctx, agent, pruned)
 	key := client.ObjectKeyFromObject(agent)
 	if event == "" {
 		r.sessionCapWarned.Delete(key)
@@ -144,17 +191,37 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 		r.recordEvent(agent, corev1.EventTypeWarning, sessionCapFittedConditionType, event)
 		r.sessionCapWarned.Store(key, event)
 	}
-	if sessionCapCurrent(agent, sessionCap, cond) {
+	if sessionCap != nil {
+		r.sessionCapLast.Store(key, *sessionCap)
+	} else {
+		r.sessionCapLast.Delete(key)
+	}
+	if sessionCapCurrent(agent, sessionCap, cond, pruned) {
+		if pruned {
+			setSessionCap(agent, sessionCap, cond)
+			if instance != nil {
+				setSessionCap(instance, sessionCap, cond)
+			}
+		}
 		return
 	}
-	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	original := agent.DeepCopy()
+	patch := client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
 	setSessionCap(agent, sessionCap, cond)
 	written := agent.DeepCopy()
+	if pruned {
+		// Not written while the served CRD drops it: the field stays as the
+		// store has it, and only the condition goes out.
+		written.Status.EffectiveSessionCap = original.Status.EffectiveSessionCap
+	}
 	if err := r.Status().Patch(ctx, written, patch); err != nil {
 		// The render still follows this pass's reading; the next pass
 		// writes it.
 		logf.FromContext(ctx).Error(err, "could not record the A2A session cap; the next pass records it")
 		return
+	}
+	if !pruned {
+		r.noteSessionCapEcho(ctx, agent, sessionCap, written.Status.EffectiveSessionCap)
 	}
 	agent.ResourceVersion = written.ResourceVersion
 	if instance != nil {
@@ -163,23 +230,66 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 	}
 }
 
+// noteSessionCapEcho reads status.effectiveSessionCap back after a write, as
+// noteBusReplicasEcho does status.busReplicas: a cap written and absent from
+// the answer is the served CRD pruning it.
+func (r *PlatformAgentReconciler) noteSessionCapEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote, echo *int) {
+	key := client.ObjectKeyFromObject(agent)
+	if wrote == nil || echo != nil {
+		r.sessionCapPruned.Delete(key)
+		return
+	}
+	if _, seen := r.sessionCapPruned.Load(key); !seen {
+		logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveSessionCap; the session cap is kept in memory and not written until the CRD is updated")
+	}
+	r.sessionCapPruned.Store(key, time.Now())
+}
+
+// sessionCapStatusPruned reports a recent echo without the cap
+// (noteSessionCapEcho), reprobed every sessionCapPrunedReprobe.
+func (r *PlatformAgentReconciler) sessionCapStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	at, ok := r.sessionCapPruned.Load(client.ObjectKeyFromObject(agent))
+	return ok && time.Since(at.(time.Time)) < sessionCapPrunedReprobe
+}
+
 // fitA2ASessionCap is resolveA2ASessionCap's decision: the cap to store, the
 // condition to hold (nil for none; keep, from an unreadable pass with a cap,
-// is the stored one), and the Warning's text ("" for none).
-func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*int, *metav1.Condition, string) {
+// is the stored one), and the Warning's text ("" for none). Under a pruning
+// CRD the cap this reconciler last rendered stands in for the stored one.
+func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pruned bool) (*int, *metav1.Condition, string) {
+	if a2aSessionClusterViewEnabled(agent) {
+		// The cluster view holds the session default off (resolveA2ADefaultRoute):
+		// platform routing at maxSessions, and no fit.
+		return nil, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapClusterViewReason, sessionCapClusterViewMessage), ""
+	}
 	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
 		// The opt-out: no fit applies on platform, and the cap is maxSessions.
 		return nil, nil, ""
 	}
 	stored := agent.Status.EffectiveSessionCap
+	if stored == nil && pruned {
+		if last, ok := r.sessionCapLast.Load(client.ObjectKeyFromObject(agent)); ok {
+			v := last.(int)
+			stored = &v
+		}
+	}
 	configured := resolveA2AMaxSessions(agent)
-	width, present, known := r.a2aTasksLiveWidth(ctx, agent)
+	width, present, known := r.a2aTasksLiveWidth(ctx, agent, stored != nil)
 	switch {
-	case !known && stored == nil:
-		return nil, sessionCapCondition(agent, metav1.ConditionUnknown, sessionCapWaitingReason, sessionCapWaitingMessage), ""
-	case !known:
+	case !known && stored != nil:
 		kept := *stored
-		return &kept, meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType), ""
+		var cond *metav1.Condition
+		if existing := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType); existing != nil {
+			c := *existing
+			c.ObservedGeneration = agent.Generation
+			cond = &c
+		}
+		return &kept, cond, ""
+	case !known && !a2aBusExisted(agent):
+		// A bus never provisioned: TASKS will be created at maxSessions' width.
+		return &configured, nil, ""
+	case !known:
+		return nil, sessionCapCondition(agent, metav1.ConditionUnknown, sessionCapWaitingReason, sessionCapWaitingMessage), ""
 	case !present:
 		return &configured, nil, ""
 	}
@@ -211,17 +321,20 @@ func sessionCapCondition(agent *agentv1alpha1.PlatformAgent, status metav1.Condi
 }
 
 // sessionCapCurrent reports whether agent already holds cap and cond, the
-// condition compared on what the writers key on: status, reason, message.
-func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want *int, cond *metav1.Condition) bool {
+// condition compared on what the writers key on (status, reason, message)
+// and on the generation it observed, so a spec edit refreshes it. ignoreCap
+// leaves the cap out, for a CRD that prunes it.
+func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want *int, cond *metav1.Condition, ignoreCap bool) bool {
 	have := agent.Status.EffectiveSessionCap
-	if (have == nil) != (want == nil) || (have != nil && *have != *want) {
+	if !ignoreCap && ((have == nil) != (want == nil) || (have != nil && *have != *want)) {
 		return false
 	}
 	existing := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType)
 	if cond == nil || existing == nil {
 		return cond == nil && existing == nil
 	}
-	return existing.Status == cond.Status && existing.Reason == cond.Reason && existing.Message == cond.Message
+	return existing.Status == cond.Status && existing.Reason == cond.Reason && existing.Message == cond.Message &&
+		existing.ObservedGeneration == cond.ObservedGeneration
 }
 
 func setSessionCap(agent *agentv1alpha1.PlatformAgent, sessionCap *int, cond *metav1.Condition) {
@@ -236,6 +349,15 @@ func setSessionCap(agent *agentv1alpha1.PlatformAgent, sessionCap *int, cond *me
 		return
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, *cond)
+}
+
+// a2aBusExisted reports a bus some operator has provisioned: the
+// BusProvisioned record, or a migration's run record (a migration drops the
+// BusProvisioned record until the Job after it completes, and runs only on a
+// bus that exists). Without either, the bus is a fresh install's, and its
+// TASKS will be created at maxSessions' width.
+func a2aBusExisted(agent *agentv1alpha1.PlatformAgent) bool {
+	return busProvisioned(agent) || agent.Status.BusMigration != nil
 }
 
 // a2aSessionCapWaiting reports a pass whose session cap waits on the bus's

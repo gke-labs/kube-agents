@@ -1142,9 +1142,14 @@ type TuningSpec struct {
 	// max_consumers off the bus and fits the session cap to it
 	// (status.effectiveSessionCap, with the SessionCapFitted condition while
 	// the fit is below maxSessions). A stream with no room for one session
-	// sends plain conversations to `platform` instead. Until the operator
-	// has read the bus's width once, an unset field keeps routing to
-	// `platform` and the provision Job waits. On `platform` no fit applies.
+	// sends plain conversations to `platform` instead. The cap stays fitted
+	// until TASKS is widened; the planned opt-in TASKS reshape is how it
+	// will be lifted. On an existing install, until the operator has read
+	// the bus's width once, an unset field keeps routing to `platform` and
+	// the provision Job waits. On `platform` no fit applies. While the
+	// operator's A2A_SESSION_CLUSTER_VIEW is on, every install routes to
+	// `platform`, `session` here included, so the default never widens what
+	// a plain turn reaches.
 	// +kubebuilder:validation:Enum=session;platform
 	// +optional
 	DefaultRoute *string `json:"defaultRoute,omitempty"`
@@ -3031,9 +3036,10 @@ type AgentStatus struct {
 	// consumer check follow it; the width a new TASKS stream is created at
 	// follows maxSessions. 0 means not one session fits, and plain
 	// conversations go to `platform`. Read off the bus's monitoring
-	// endpoint on each pass; a pass that cannot read it keeps the value
-	// here. Absent on the `platform` route, and before the operator has
-	// read the bus once.
+	// endpoint, at most every five minutes once set; a pass that cannot read
+	// it keeps the value here. Absent on the `platform` route (including
+	// while the operator's A2A_SESSION_CLUSTER_VIEW is on), and on an
+	// existing install before the operator has read the bus once.
 	// +optional
 	EffectiveSessionCap *int `json:"effectiveSessionCap,omitempty"`
 }
