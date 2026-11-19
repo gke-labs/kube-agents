@@ -72,6 +72,7 @@ const (
 	mcpRelayRetryBackoffCap    = 16 * time.Second
 	mcpRelayRetryAfterCap      = 30 * time.Second
 	mcpRelayRetryJitterFloor   = 0.5
+	mcpRelayRetryMaxShift      = 10
 )
 
 var (
@@ -294,7 +295,7 @@ func relayDrainingDelay(attempt int, retryAfterHeader string, randRange func(flo
 		}
 	}
 	if baseSec == 0 {
-		exp := mcpRelayRetryBackoffBase * time.Duration(1<<min(attempt, 10))
+		exp := mcpRelayRetryBackoffBase * time.Duration(1<<min(attempt, mcpRelayRetryMaxShift))
 		if exp > mcpRelayRetryBackoffCap {
 			exp = mcpRelayRetryBackoffCap
 		}
@@ -318,6 +319,10 @@ func relayOneWithRetry(
 		if !errors.As(err, &retryErr) || attempt >= mcpRelayDrainingMaxRetries {
 			return replies, err
 		}
+		// Close idle pooled HTTP/1.1 sockets before retrying so the next attempt
+		// dials a fresh TCP connection through the Service instead of sticking
+		// to the draining broker Pod.
+		client.CloseIdleConnections()
 		delay := relayDrainingDelay(attempt, retryErr.retryAfter, randRange)
 		if sleepErr := sleepFn(ctx, delay); sleepErr != nil {
 			return nil, sleepErr

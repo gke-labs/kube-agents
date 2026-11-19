@@ -81,21 +81,24 @@ platformAgent:
         value: "false"
     credentialProxy:
       # The broker that runs every credentialed command (gcloud, kubectl) in a
-      # pod of its own. It admits at most eight commands at once, a cap the
-      # operator fixes and no values file moves, and budgets each in-flight
-      # command against limits.memory: 128 MiB reserved for the child plus six
-      # copies of the 8 MiB output cap, 176 MiB a slot, after the broker's and
-      # Envoy's own reserves. The 2Gi default already covers all eight slots,
-      # so 8Gi admits nothing more in parallel. It buys headroom for a child
-      # that outgrows its reserve, as a kubectl or gcloud listing of a cluster
-      # with thousands of pods does: close to 1 GiB a slot with all eight in
-      # use (modeled), where the broker restarted under a 29-cluster fleet at
-      # the default. The CPU request is the CPU it runs at on Autopilot without
+      # pod of its own. With sizingProfile unset (the small row), it admits at
+      # most eight commands at once (set sizingProfile to medium for 12, fleet
+      # for 16, or auto to scale), and budgets each in-flight command against
+      # limits.memory: 128 MiB reserved for the child plus six copies of the
+      # 8 MiB output cap, 176 MiB a slot, after the broker's and Envoy's own
+      # reserves. The 2Gi default already covers all eight slots, so 8Gi admits
+      # nothing more in parallel at small. It buys headroom for a child that
+      # outgrows its reserve, as a kubectl or gcloud listing of a cluster with
+      # thousands of pods does: close to 1 GiB a slot with all eight in use
+      # (modeled), where the broker restarted under a 29-cluster fleet at the
+      # default. The CPU request is the CPU it runs at on Autopilot without
       # bursting; on Standard or with bursting it may reach 8 vCPU. On
       # Standard the 4 vCPU request needs a node with more than that
-      # allocatable; the composition's default e2-standard-4 pool has less,
-      # and the proxy Deployment recreates its pod rather than rolling it, so
-      # add a larger pool before passing this file or the proxy stays Pending.
+      # allocatable; the composition's default e2-standard-4 pool has less. The
+      # proxy Deployment rolls via RollingUpdate active-standby handoff, so an
+      # existing active broker pod keeps serving while a new surge pod stays
+      # Pending, but a fresh install with no running pod stays Pending until a
+      # larger pool is added before passing this file.
       # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
       # 10 GiB per-pod ceiling.
       resources:

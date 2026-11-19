@@ -634,7 +634,7 @@ func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamp
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for i := range before {
 		if before[i].container == credentialProxyContainerName {
-			addSurgeStep(&step, before[i].resources, after[i].resources, clamped)
+			addSurgeStep(&step, before[i].resources, after[i].resources, clamped, from != to)
 			continue
 		}
 		addRenderStep(&step, before[i].resources, after[i].resources, clamped)
@@ -650,7 +650,7 @@ func sizingStepSurgeOnly(agent *agentv1alpha1.PlatformAgent, autopilot bool, cla
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for i := range before {
 		if before[i].container == credentialProxyContainerName {
-			addSurgeStep(&step, before[i].resources, after[i].resources, clamped)
+			addSurgeStep(&step, before[i].resources, after[i].resources, clamped, from != to)
 			break
 		}
 	}
@@ -663,7 +663,7 @@ func sizedContainerStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot boo
 	for i := range before {
 		if before[i].container == name {
 			if name == credentialProxyContainerName {
-				addSurgeStep(&step, before[i].resources, after[i].resources, clamped)
+				addSurgeStep(&step, before[i].resources, after[i].resources, clamped, from != to)
 			} else {
 				addRenderStep(&step, before[i].resources, after[i].resources, clamped)
 			}
@@ -672,11 +672,14 @@ func sizedContainerStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot boo
 	return step
 }
 
-func addSurgeStep(step *sizingStep, before, after corev1.ResourceRequirements, clamped bool) {
+// addSurgeStep charges the full replacement surge pod when either its
+// resources change or a tier transition changes CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+// (which changes the pod template hash and still triggers a RollingUpdate surge).
+func addSurgeStep(step *sizingStep, before, after corev1.ResourceRequirements, clamped bool, templateChanged bool) {
 	fromReq, toReq := effectiveRequests(before), effectiveRequests(after)
 	fromLim := clampedLimits(before.Limits, fromReq, clamped)
 	toLim := clampedLimits(after.Limits, toReq, clamped)
-	if equality.Semantic.DeepEqual(fromReq, toReq) && equality.Semantic.DeepEqual(fromLim, toLim) {
+	if !templateChanged && equality.Semantic.DeepEqual(fromReq, toReq) && equality.Semantic.DeepEqual(fromLim, toLim) {
 		return
 	}
 	addResourceFull(step.requests, toReq)
@@ -1578,8 +1581,31 @@ func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, c
 // the condition says; the lower row's pod, refused by a new ReplicaSet,
 // comes with a new message at the lower figure and is stepped back from in
 // turn.
+func proxyContainerSlotCapEnv(pod *corev1.Pod) (string, bool) {
+	liveC := brokerPodContainer(pod)
+	if liveC == nil {
+		return "", false
+	}
+	for _, env := range liveC.Env {
+		if env.Name == credentialProxyMaxConcurrentCommandsEnv {
+			return env.Value, true
+		}
+	}
+	return "", false
+}
+
+func proxyContainerMatchesTierForCluster(pod *corev1.Pod, deployment *agentv1alpha1.DeploymentSpec, autopilot bool, tier sizingTier, clamped bool) bool {
+	wantRes := renderedCredentialProxyResourcesAt(deployment, autopilot, tier)
+	if !proxyContainerMatchesTierResourcesForCluster(pod, wantRes, clamped) {
+		return false
+	}
+	if gotSlots, hasEnv := proxyContainerSlotCapEnv(pod); hasEnv {
+		return gotSlots == credentialProxyTierMaxConcurrentCommands(tier)
+	}
+	return true
+}
+
 func brokerActiveTierFromPods(pods []corev1.Pod, agent *agentv1alpha1.PlatformAgent, autopilot, clamped bool, target sizingTier) (sizingTier, bool) {
-	targetRes := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, target)
 	var order []sizingTier
 	if target > sizingTierSmall {
 		order = append(order, target-1)
@@ -1594,11 +1620,11 @@ func brokerActiveTierFromPods(pods []corev1.Pod, agent *agentv1alpha1.PlatformAg
 		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || brokerPodContainer(pod) == nil {
 			continue
 		}
-		if proxyContainerMatchesTierResourcesForCluster(pod, targetRes, clamped) {
+		if proxyContainerMatchesTierForCluster(pod, agent.Spec.Deployment, autopilot, target, clamped) {
 			continue
 		}
 		for _, candidate := range order {
-			if proxyContainerMatchesTierResourcesForCluster(pod, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, candidate), clamped) {
+			if proxyContainerMatchesTierForCluster(pod, agent.Spec.Deployment, autopilot, candidate, clamped) {
 				return candidate, true
 			}
 		}
@@ -1864,7 +1890,6 @@ func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent 
 	if hasActiveDiff {
 		rollbackTier = activeTier
 	}
-	wantRes := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)
 	var minCreatedAt time.Time
 	if prevStatus := r.previousSizingStatus(agent); prevStatus != nil && prevStatus.LastTransitionTime != nil {
 		minCreatedAt = prevStatus.LastTransitionTime.Time
@@ -1888,7 +1913,7 @@ func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent 
 		if !minCreatedAt.IsZero() && !pod.CreationTimestamp.IsZero() && pod.CreationTimestamp.Time.Before(minCreatedAt) {
 			continue
 		}
-		if brokerPodContainer(pod) != nil && !proxyContainerMatchesTierResourcesForCluster(pod, wantRes, clamped) {
+		if brokerPodContainer(pod) != nil && !proxyContainerMatchesTierForCluster(pod, agent.Spec.Deployment, autopilot, tier, clamped) {
 			continue
 		}
 		since, reason := pendingSurgeStartTime(pod)

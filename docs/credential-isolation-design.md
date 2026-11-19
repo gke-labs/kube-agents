@@ -413,9 +413,9 @@ including:
 - background processes or commands that outlive the request;
 - commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
-  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
-  as fit the child memory budget it derives from its container's memory limit (four at
-  the operator's defaults); a request waits up to 60 seconds for admission and is then
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default, 12 on `medium`, 16 on `fleet`), and within that only as many
+  as fit the child memory budget it derives from its container's memory limit (ten at
+  the operator's 2Gi small default, so the slot cap of eight binds); a request waits up to 60 seconds for admission and is then
   refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
   cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
   caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
@@ -944,8 +944,8 @@ Consequences:
   cut on stderr alone keeps the command's exit code, and the marker says stdout
   is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
-  flight at once (8; the operator sets it, as it sets the output cap, and
-  reserves the name). A slot is held from admission until the response is on
+  flight at once (8 on the default `small` tier, 12 on `medium`, and 16 on `fleet` via `spec.deployment.sizingProfile`; the operator sets it, as it sets the output cap, and
+  reserves the name; the fixed-`2Gi` exec tier stays at 8). A slot is held from admission until the response is on
   the wire, because everything a request costs lives that long: a child
   process plus about six times the output cap of transient copies in the
   broker (the captured streams, their decoded text, the JSON body and its
@@ -957,19 +957,19 @@ Consequences:
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
   absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy.
   At the operator's
-  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits ten
+  defaults (a 2Gi limit on `small`, raised from 1Gi when the kanban slot default rose to six) that admits ten
   requests at once, whatever executable fills them; the slot cap of eight is the upper
-  bound. The container's limit moves through the CR,
+  bound on `small` (4Gi `medium` admits 22, held to 12; 8Gi `fleet` admits 45, held to 16). The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
-  defaults per key; raising it raises the admitted count. The caps stay the
-  operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
+  defaults per key; raising it raises the budget ceiling. The slot cap still follows
+  `spec.deployment.sizingProfile` alone, because an explicit `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` override is reserved by the operator. A limit under which the budget would admit fewer than two
   requests at once (544 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
   it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
-  above the floor, so that the budget engages there too, admitting ten, held to eight by
-  the slot cap; the floor remains for a CR override that sets a smaller request.
+  above the floor, so that the budget engages there too, admitting ten on `small`, held to eight by
+  the tier's slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.

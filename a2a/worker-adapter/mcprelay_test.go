@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -476,5 +477,67 @@ func TestRelayDoesNotRetryUnsafe503(t *testing.T) {
 			}
 			assertRelayError(t, strings.TrimSpace(out.String()), 7, "HTTP 503")
 		})
+	}
+}
+
+func TestRelayRetriesOpensFreshConnectionAfterDraining503(t *testing.T) {
+	type ctxKey struct{}
+	var connCount atomic.Int32
+	var seenConns []int32
+	var mu sync.Mutex
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, ctxKey{}, connCount.Add(1))
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			id := r.Context().Value(ctxKey{}).(int32)
+			mu.Lock()
+			seenConns = append(seenConns, id)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if id == 1 {
+				// First TCP socket stays open (HTTP/1.1 keep-alive) and keeps
+				// answering as the draining old broker Pod until the client
+				// drops its pooled idle connection and redials.
+				w.Header().Set("Retry-After", "4")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"draining","bound":"draining","before_admission":true}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":11,"result":{"redialed":true}}`)
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	baseURL := "http://" + ln.Addr().String()
+	relayEnv(t, baseURL, "a.b.c")
+	var out bytes.Buffer
+	err = serveMCPRelayWith(
+		context.Background(),
+		baseURL+"/v1/mcp/developer_knowledge",
+		strings.NewReader(`{"jsonrpc":"2.0","id":11,"method":"ping"}`+"\n"),
+		&out,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_ context.Context, _ time.Duration) error { return nil },
+		func(lo, _ float64) float64 { return lo },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out.String()) != `{"jsonrpc":"2.0","id":11,"result":{"redialed":true}}` {
+		t.Fatalf("out = %q", out.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenConns) != 2 || seenConns[0] != 1 || seenConns[1] != 2 {
+		t.Fatalf("seen TCP connection IDs = %v, want [1 2] (fresh connection per retry)", seenConns)
 	}
 }

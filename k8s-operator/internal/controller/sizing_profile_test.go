@@ -2880,3 +2880,133 @@ func TestSizingPodFiguresLeavesTheTemplateAlone(t *testing.T) {
 		t.Errorf("unlimited init container's limits after the read = %v, want nil as written", noLimits.Spec.InitContainers[1].Resources.Limits)
 	}
 }
+
+func TestSizingSurgeStepAndRollbackWithEqualizedProxyOverride(t *testing.T) {
+	t.Parallel()
+	// Override both requests and limits to the fleet tier shape so small,
+	// medium, and fleet resolve identical broker ResourceRequirements while
+	// CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS still changes (8 -> 12 -> 16).
+	equalOverride := func(latched string, registered int64) *agentv1alpha1.PlatformAgent {
+		agent := sizingAgent(sizingProfileAuto, latched, ptr.To[int64](registered), nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{
+			Resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("4"),
+					corev1.ResourceMemory: resource.MustParse("8Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("8"),
+					corev1.ResourceMemory: resource.MustParse("8Gi"),
+				},
+			},
+		}
+		return agent
+	}
+
+	// 1. Preflight still charges the +1 surge pod despite unchanged resources.
+	step := sizingStepBetween(equalOverride(sizingProfileSmall, 10), false, false, sizingTierSmall, sizingTierMedium)
+	if step.surgePods != 1 {
+		t.Fatalf("surgePods = %d, want 1 when slot cap changes", step.surgePods)
+	}
+	assertQuantity(t, step.requests, corev1.ResourceCPU, "4")
+	assertQuantity(t, step.requests, corev1.ResourceMemory, "8Gi")
+	// Broker surge (8Gi limit) + sidecar small -> medium (+2Gi limit) = 10Gi.
+	assertQuantity(t, step.limits, corev1.ResourceCPU, "8")
+	assertQuantity(t, step.limits, corev1.ResourceMemory, "10Gi")
+
+	same := sizingStepBetween(equalOverride(sizingProfileSmall, 0), false, false, sizingTierSmall, sizingTierSmall)
+	if same.surgePods != 0 {
+		t.Fatalf("same-tier surgePods = %d, want 0", same.surgePods)
+	}
+	for k, qty := range same.requests {
+		if qty.Sign() != 0 {
+			t.Fatalf("same-tier request %s = %s, want 0", k, qty.String())
+		}
+	}
+	for k, qty := range same.limits {
+		if qty.Sign() != 0 {
+			t.Fatalf("same-tier limit %s = %s, want 0", k, qty.String())
+		}
+	}
+	if sf := sizingQuotaShortfall(equalOverride(sizingProfileSmall, 10), false, false, []corev1.ResourceQuota{*sizingQuotaOn("cpu-cap", corev1.ResourceRequestsCPU, "6", "4")}, nil, sizingTierSmall, sizingTierMedium); sf == nil || sf.key != corev1.ResourceRequestsCPU {
+		t.Fatalf("shortfall = %+v, want requests.cpu refusal on equalized surge", sf)
+	}
+
+	// 2. Active pod with small slots (8) vs latched fleet (16): matches small,
+	// not target fleet or intermediate medium, and rolls back Quota refusal to small.
+	smallActivePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platformagent-credential-proxy-sm",
+			Namespace: "kubeagents-system",
+			Labels:    credentialProxySelector(equalOverride(sizingProfileFleet, 25)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:      credentialProxyContainerName,
+			Resources: renderedCredentialProxyResourcesAt(equalOverride(sizingProfileSmall, 25).Spec.Deployment, false, sizingTierSmall),
+			Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMaxConcurrentCommands}},
+		}}},
+	}
+	if active, ok := brokerActiveTierFromPods([]corev1.Pod{*smallActivePod}, equalOverride(sizingProfileFleet, 25), false, false, sizingTierFleet); !ok || active != sizingTierSmall {
+		t.Fatalf("brokerActiveTierFromPods = (%v, %v), want (small, true)", active, ok)
+	}
+
+	agentRefused := equalOverride(sizingProfileFleet, 25)
+	workloads := sizedWorkloadsAt(agentRefused, sizingTierFleet)
+	refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agentRefused)+"-7d9f8b6c4", "cpu-cap", corev1.ResourceRequestsCPU, "4")
+	objs := append([]client.Object{agentRefused, smallActivePod.DeepCopy()}, workloads...)
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(agentRefused).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	if err := r.resolveSizingTier(context.Background(), agentRefused); err != nil {
+		t.Fatal(err)
+	}
+	if agentRefused.Status.EffectiveSizingTier != sizingProfileSmall {
+		t.Fatalf("status.effectiveSizingTier = %q, want small rollback on equalized-resource ReplicaFailure", agentRefused.Status.EffectiveSizingTier)
+	}
+
+	// 3. Stalled pending fleet surge pod (16 slots) also rolls back directly to active small.
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	agentStall := equalOverride(sizingProfileFleet, 25)
+	agentStall.Status.Sizing = &agentv1alpha1.SizingStatus{
+		ActiveTier:         sizingProfileFleet,
+		DesiredTier:        sizingProfileFleet,
+		Trigger:            sizingTriggerClusterCount,
+		LastTransitionTime: ptr.To(metav1.NewTime(now.Add(-3 * time.Minute))),
+	}
+	pendingFleetPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "platformagent-credential-proxy-flt-pend",
+			Namespace:         "kubeagents-system",
+			Labels:            credentialProxySelector(agentStall),
+			CreationTimestamp: metav1.NewTime(now.Add(-2*time.Minute - 10*time.Second)),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:               corev1.PodScheduled,
+				Status:             corev1.ConditionFalse,
+				Reason:             corev1.PodReasonUnschedulable,
+				Message:            "0/3 nodes are available: Insufficient cpu.",
+				LastTransitionTime: metav1.NewTime(now.Add(-2*time.Minute - 10*time.Second)),
+			}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:      credentialProxyContainerName,
+			Resources: renderedCredentialProxyResourcesAt(agentStall.Spec.Deployment, false, sizingTierFleet),
+			Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyFleetMaxConcurrentCommands}},
+		}}},
+	}
+	stallObjs := append([]client.Object{agentStall, smallActivePod.DeepCopy(), pendingFleetPod}, workloads...)
+	stallCl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(stallObjs...).WithStatusSubresource(agentStall).Build()
+	rStall := &PlatformAgentReconciler{
+		Client: stallCl, APIReader: stallCl, Scheme: setupScheme(),
+		Recorder: record.NewFakeRecorder(8),
+		nowFn:    func() time.Time { return now },
+	}
+	if err := rStall.resolveSizingTier(context.Background(), agentStall); err != nil {
+		t.Fatal(err)
+	}
+	if agentStall.Status.EffectiveSizingTier != sizingProfileSmall {
+		t.Fatalf("status.effectiveSizingTier = %q, want small rollback on stalled equalized-resource surge", agentStall.Status.EffectiveSizingTier)
+	}
+}
