@@ -256,6 +256,7 @@ func promoteExistingRecordInGit(t *testing.T, repoDir, id, prRef string) {
 }
 
 func TestCuratorEndToEndNATSFlow(t *testing.T) {
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "true")
 	natsURL := startEmbeddedJetStream(t)
 	mockHS, hsSrv := newMockHindsightServer(t)
 
@@ -1167,6 +1168,7 @@ spec:
 	}
 
 	// Precedence Rule 3: rejected record on check "pdb-min" IS superseded when active record on check "pdb-min" merges.
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "true")
 	if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
 		Kind:       OutcomeRefused,
 		RecordID:   "DEC-2026-091",
@@ -1244,6 +1246,7 @@ spec:
 }
 
 func TestOutcomeProposedNeverOverwritesActiveOrConflictingProposed(t *testing.T) {
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "true")
 	ctx := context.Background()
 	repoDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(repoDir, "clusters", "prod-eu"), 0o755); err != nil {
@@ -1698,6 +1701,7 @@ func TestCheckChangedFilesResourceScopedPrecedenceMultiDocYAML(t *testing.T) {
 }
 
 func TestLifecycleBuildersMatchFormattedPRRefAndCheckScopedGraduation(t *testing.T) {
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "true")
 	ctx := context.Background()
 
 	// Mock LLM server returning a synthesized guard for check-scoped graduation.
@@ -1943,6 +1947,7 @@ func TestCuratorStartConcurrentWithProcessOutcomeNoRace(t *testing.T) {
 }
 
 func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testing.T) {
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "true")
 	natsURL := startEmbeddedJetStream(t)
 	mockHS, hsSrv := newMockHindsightServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -2540,5 +2545,110 @@ func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 		if !strings.Contains(body2, wantZero) {
 			t.Errorf("cur2 /metrics expected isolated zero %q;\nfull output:\n%s", wantZero, body2)
 		}
+	}
+}
+
+func TestGitopsPRsDefaultDisabledAndRemediationPRInProposed(t *testing.T) {
+	// Ensure DECISION_MEMORY_GITOPS_PRS is truly unset and restored on exit.
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "true")
+	if err := os.Unsetenv("DECISION_MEMORY_GITOPS_PRS"); err != nil {
+		t.Fatal(err)
+	}
+	if !gitopsPRsDisabled() {
+		t.Fatal("expected gitopsPRsDisabled() == true when DECISION_MEMORY_GITOPS_PRS is unset")
+	}
+
+	ctx := context.Background()
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir: t.TempDir(),
+		RepoID:  "acme/infra",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Newly proposed lesson with remediation PR records RemediationPR in pending digest.
+	lesRes, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeProposed,
+		RecordID:   "LES-2026-070",
+		RecordType: RecordTypeLesson,
+		Repo:       "acme/infra",
+		PRNumber:   297,
+		FindingID:  "checkout/Deployment/checkout:OOMKilled",
+		SoakWindow: "24h",
+		Title:      "Raise checkout memory limit",
+		Rule:       "Keep checkout memory >= 512Mi.",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome proposed lesson: %v", err)
+	}
+	if lesRes.Status != StatusProposed {
+		t.Fatalf("expected status=proposed, got %s", lesRes.Status)
+	}
+	var found70 bool
+	for _, rec := range lesRes.Blueprint.Records {
+		if rec.ID == "LES-2026-070" {
+			found70 = true
+			wantPR := "https://github.com/acme/infra/pull/297 (#297)"
+			if rec.RemediationPR != wantPR {
+				t.Fatalf("LES-2026-070 RemediationPR = %q, want %q", rec.RemediationPR, wantPR)
+			}
+		}
+	}
+	if !found70 {
+		t.Fatal("LES-2026-070 missing from blueprint records")
+	}
+
+	// Verify pending query exposes RemediationPR too.
+	pending := cur.HandleQuery(ctx, MemoryQueryRequest{Action: "pending"})
+	if pending.Error != "" || len(pending.Records) != 1 || pending.Records[0].RemediationPR != "https://github.com/acme/infra/pull/297 (#297)" {
+		t.Fatalf("pending query missing RemediationPR: %+v", pending)
+	}
+
+	// 2. Attaching a PR to an already-existing PR-less LES-* record must NOT fabricate RemediationPR.
+	if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeProposed,
+		RecordID:   "LES-2026-071",
+		RecordType: RecordTypeLesson,
+		Repo:       "acme/infra",
+		Title:      "Pre-existing PR-less lesson",
+		Rule:       "Keep replicas >= 2.",
+	}, ""); err != nil {
+		t.Fatalf("ProcessOutcome seed PR-less lesson: %v", err)
+	}
+	attachRes, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:   OutcomeSchema,
+		Kind:     OutcomeProposed,
+		RecordID: "LES-2026-071",
+		Repo:     "acme/infra",
+		PRNumber: 350,
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome attach PR to LES-2026-071: %v", err)
+	}
+	for _, rec := range attachRes.Blueprint.Records {
+		if rec.ID == "LES-2026-071" && rec.RemediationPR != "" {
+			t.Fatalf("attaching PR to existing PR-less LES-2026-071 fabricated RemediationPR=%q", rec.RemediationPR)
+		}
+	}
+
+	// 3. With DECISION_MEMORY_GITOPS_PRS unset, OutcomeResolvedMerged keeps StatusProposed and records RemediationPR.
+	soakRes, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeResolvedMerged,
+		RecordID:   "LES-2026-072",
+		RecordType: RecordTypeLesson,
+		Repo:       "acme/infra",
+		PRNumber:   410,
+		Title:      "Verified OOM fix",
+		Rule:       "Keep worker memory >= 1Gi.",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome resolved-merged unset env: %v", err)
+	}
+	if soakRes.Status != StatusProposed {
+		t.Fatalf("expected StatusProposed with DECISION_MEMORY_GITOPS_PRS unset, got %s", soakRes.Status)
 	}
 }

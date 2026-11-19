@@ -1864,7 +1864,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return _completed(pending_json)
             return _completed("{}")
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -1920,7 +1920,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return _completed(pending_json)
             return _completed("{}")
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -1986,7 +1986,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 ],
             }
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2027,7 +2027,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return _completed(pending_json)
             return _completed("{}")
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2080,6 +2080,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-012-checkout-oom.md",
                     "branch": "platform-agent/memory/LES-2026-012",
                     "pull_request": "https://github.com/acme/infra/pull/297 (#297)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/297 (#297)",
                     "finding_id": "checkout/Deployment/checkout-worker:OOMKilled",
                     "soak_window": "24h",
                 }
@@ -2156,6 +2157,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-013-payment-oom.md",
                     "branch": "platform-agent/memory/LES-2026-013",
                     "pull_request": "https://github.com/acme/infra/pull/298 (#298)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/298 (#298)",
                     "finding_id": "payments/Deployment/payment-worker:OOMKilled",
                     "soak_window": "24h",
                 }
@@ -2282,7 +2284,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 ],
             }
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2338,7 +2340,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 ],
             }
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2381,7 +2383,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return _completed(pending_json)
             return _completed("{}")
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2421,6 +2423,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-030-api-oom.md",
                     "branch": "platform-agent/memory/LES-2026-030",
                     "pull_request": "https://github.com/acme/infra/pull/310 (#310)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/310 (#310)",
                     "finding_id": "api/Deployment/api-worker:OOMKilled",
                     "soak_window": "7d",
                 }
@@ -2533,7 +2536,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 return {"commits": [{"sha": "aaa", "author": "kage-bot"}, {"sha": "bbb", "author": "alice"}]}
             return {}
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2599,7 +2602,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     return {"actor": "alice", "bot": False}
                 return view_payload
 
-            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
                  mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
                  mock.patch("subprocess.run", side_effect=fake_run), \
                  mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2680,7 +2683,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 }
             }
 
-        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/hub-gitops", "acme/app-gitops"]), \
@@ -2735,7 +2738,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
             rec = dict(pending_base)
             prop = {"number": 350, "state": "merged"}
             view_ans = {"proposal": prop, "comments": []}
-            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
                  mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
                  mock.patch("subprocess.run", side_effect=fake_run), \
                  mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -2778,6 +2781,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-051.md",
                     "branch": "platform-agent/memory/LES-2026-051",
                     "pull_request": "https://github.com/acme/infra/pull/205 (#205)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/205 (#205)",
                     "finding_id": "no-pdb.prod.shop.Deployment/checkout",
                     "soak_window": "24h",
                 }
@@ -2838,6 +2842,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-052.md",
                     "branch": "platform-agent/memory/LES-2026-052",
                     "pull_request": "https://github.com/acme/infra/pull/410 (#410)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/410 (#410)",
                     "finding_id": "oom.prod.shop.Deployment/worker",
                     "soak_window": "24h",
                 }
@@ -3007,6 +3012,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-053.md",
                     "branch": "platform-agent/memory/LES-2026-053",
                     "pull_request": "https://github.com/acme/infra/pull/411 (#411)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/411 (#411)",
                     "finding_id": "no-pdb.prod.shop.Deployment/checkout",
                     "soak_window": "24h",
                 }
@@ -3165,6 +3171,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "path": "knowledge/lessons/LES-2026-061.md",
                     "branch": "platform-agent/memory/LES-2026-061",
                     "pull_request": "https://github.com/acme/infra/pull/450 (#450)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/450 (#450)",
                     "soak_window": "7d",
                     "guard_rule": "memory >= 512Mi",
                 }
@@ -3328,7 +3335,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     ],
                 })
                 calls = []
-                with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
                      mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
                      mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
                      mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -3377,7 +3384,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                         "comments": [{"author": "alice", "body": "Do not add this policy."}],
                     }
 
-                with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
                      mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
                      mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
                      mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
@@ -3406,6 +3413,224 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         )
         self.assertEqual(state_ready, "resolved")
         self.assertIn("24h", reason_ready)
+
+    def test_gitops_prs_unset_default_skips_knowledge_pr_creation_but_runs_remediation_soak(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-070",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Unset env must not open GitOps PR",
+                    "path": "knowledge/decisions/DEC-2026-070.md",
+                    "branch": "platform-agent/memory/DEC-2026-070",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-070\nstatus: active\n---\n\nKeep proposed.",
+                },
+                {
+                    "id": "LES-2026-070",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Raise checkout memory limit",
+                    "path": "knowledge/lessons/LES-2026-070.md",
+                    "branch": "platform-agent/memory/LES-2026-070",
+                    "pull_request": "https://github.com/acme/infra/pull/470 (#470)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/470 (#470)",
+                    "finding_id": "checkout/Deployment/checkout:OOMKilled",
+                    "soak_window": "24h",
+                },
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=470,
+                finding_id="checkout/Deployment/checkout:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=0,
+            )
+            env_copy = dict(os.environ)
+            env_copy.pop("DECISION_MEMORY_GITOPS_PRS", None)
+            env_copy["NATS_URL"] = "nats://localhost:4222"
+            env_copy["SESSION_KV_DB_PATH"] = str(db_path)
+            with mock.patch.dict("os.environ", env_copy, clear=True), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call") as forge_call, \
+                 mock.patch.object(forge, "open_memory_proposal_pr") as open_pr:
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                self.assertFalse(gate._gitops_prs_enabled())
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+
+        forge_call.assert_not_called()
+        open_pr.assert_not_called()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("resolved-merged", calls[1])
+        self.assertIn("LES-2026-070", calls[1])
+
+    def test_remediation_soak_rejects_non_remediation_or_junk_pr(self):
+        for rem_pr in ("", "https://github.com/acme/infra/pull/297 (#297)"):
+            for pr_state in ("merged", "closed"):
+                with self.subTest(remediation_pr=rem_pr, state=pr_state):
+                    pending_json = json.dumps({
+                        "repo": "acme/infra",
+                        "records": [
+                            {
+                                "id": "LES-2026-071",
+                                "type": "lesson",
+                                "status": "proposed",
+                                "title": "Bump memory limit",
+                                "path": "knowledge/lessons/LES-2026-071.md",
+                                "branch": "platform-agent/memory/LES-2026-071",
+                                "pull_request": "https://github.com/acme/infra/pull/999 (#999)",
+                                "remediation_pr": rem_pr,
+                                "finding_id": "checkout/Deployment/checkout:OOMKilled",
+                                "soak_window": "24h",
+                            }
+                        ],
+                    })
+                    calls = []
+
+                    def fake_call(verb, payload, repo, **kw):
+                        if verb == "proposal-closer":
+                            return {"actor": "alice", "bot": False}
+                        return {
+                            "proposal": {
+                                "number": 999,
+                                "state": pr_state,
+                                "source": "junk-branch",
+                                "sourceRepo": "acme/infra",
+                                "mergedAt": "2026-11-01T12:00:00Z",
+                                "url": "https://github.com/acme/infra/pull/999",
+                            },
+                            "comments": [{"author": "alice", "body": "Rejecting junk PR."}],
+                        }
+
+                    with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                         mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                         mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+                         mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                         mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                         mock.patch.object(forge, "call", side_effect=fake_call):
+                        bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                        bp_cls.return_value._has_write.return_value = True
+                        gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+
+                    self.assertEqual(len(calls), 1)
+
+    def test_closed_pr_holds_fail_closed_when_viewer_login_unknown(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-072",
+                    "type": "decision",
+                    "status": "proposed",
+                    "branch": "platform-agent/memory/DEC-2026-072",
+                    "pull_request": "https://github.com/acme/infra/pull/720 (#720)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_call(verb, payload, repo, **kw):
+            if verb == "proposal-closer":
+                return {"actor": "kage-bot", "bot": False}
+            return {
+                "proposal": {
+                    "number": 720,
+                    "state": "closed",
+                    "source": "platform-agent/memory/DEC-2026-072",
+                    "sourceRepo": "acme/infra",
+                    "url": "https://github.com/acme/infra/pull/720",
+                },
+                "comments": [{"author": "alice", "body": "Rejecting this policy."}],
+            }
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_call):
+            bp_cls.return_value.viewer_login.side_effect = RuntimeError("viewer lookup failed")
+            bp_cls.return_value._has_write.return_value = True
+            gate.sweep_memory_proposals()
+
+        self.assertEqual(len(calls), 1)
+
+    def test_proposal_list_filters_unmatched_branch_and_fork_before_opening_pr(self):
+        for bad_num, bad_source, bad_source_repo in (
+            (998, "other-branch", "acme/infra"),
+            (999, "platform-agent/memory/DEC-2026-010", "mallory/infra"),
+        ):
+            with self.subTest(bad_num=bad_num, source=bad_source, sourceRepo=bad_source_repo):
+                pending_json = json.dumps({
+                    "repo": "acme/infra",
+                    "records": [
+                        {
+                            "id": "DEC-2026-010",
+                            "type": "decision",
+                            "status": "proposed",
+                            "title": "Require ttl-hours annotation",
+                            "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                            "branch": "platform-agent/memory/DEC-2026-010",
+                            "pr_markdown": "---\ntype: decision\nid: DEC-2026-010\nstatus: active\n---\n\nRequire ttl-hours.",
+                        }
+                    ],
+                })
+                calls = []
+
+                def fake_call(verb, payload, repo, **kw):
+                    if verb == "proposal-list":
+                        return {
+                            "proposals": [
+                                {
+                                    "number": bad_num,
+                                    "state": "open",
+                                    "source": bad_source,
+                                    "sourceRepo": bad_source_repo,
+                                    "url": f"https://github.com/acme/infra/pull/{bad_num}",
+                                }
+                            ]
+                        }
+                    return {}
+
+                with mock.patch.dict(
+                    "os.environ",
+                    {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"},
+                ), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                     mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                     mock.patch.object(forge, "call", side_effect=fake_call), \
+                     mock.patch.object(
+                         forge,
+                         "open_memory_proposal_pr",
+                         return_value={
+                             "url": "https://github.com/acme/infra/pull/295",
+                             "number": 295,
+                             "revision": "deadbeef1234",
+                         },
+                     ) as open_pr:
+                    bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                    gate.sweep_memory_proposals()
+
+                open_pr.assert_called_once()
+                self.assertEqual(len(calls), 2)
+                self.assertIn("https://github.com/acme/infra/pull/295 (#295)", calls[1])
+                self.assertNotIn(f"#{bad_num}", " ".join(calls[1]))
 
 
 if __name__ == "__main__":

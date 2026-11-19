@@ -96,12 +96,13 @@ import vcs_readings
 # Comma-separated sweep names. Unset means all of them.
 SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 
-# Whether proposed decisions and lessons open GitOps pull requests on
-# `platform-agent/memory/<ID>`. Defaults to True; set to "false"/"0"/"no"/"off"/"disabled"
-# on multi-cluster installations that share one GitOps repository or when humans
-# curate `knowledge/` externally and want runtime learnings kept in Hindsight.
+# Whether proposed decisions and lessons open `platform-agent/memory/<ID>` pull
+# requests. Defaults to False until scheduled memory proposals route through
+# the `#3993` confirm-before-publish permit gate. Set to `"true"`, `"1"`,
+# `"yes"`, `"on"`, or `"enabled"` to opt in. Hindsight outcome updates still run
+# by default.
 DECISION_MEMORY_GITOPS_PRS_ENV = "DECISION_MEMORY_GITOPS_PRS"
-_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 
 # Every card this job files goes to the privileged specialist: the Chat Agent's
 # toolsets are stripped to `mcp-router` + `kanban`, so it could not act on one.
@@ -1027,10 +1028,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
 
 
 def _gitops_prs_enabled() -> bool:
-    raw = os.environ.get(DECISION_MEMORY_GITOPS_PRS_ENV, "").strip().lower()
-    if not raw:
-        return True
-    return raw not in _FALSEY_ENV_VALUES
+    return os.environ.get(DECISION_MEMORY_GITOPS_PRS_ENV, "").strip().lower() in _TRUTHY_ENV_VALUES
 
 
 def _resolve_curator_bin() -> str:
@@ -1750,7 +1748,11 @@ def sweep_memory_proposals(
             continue
 
         finding_id = str(rec.get("finding_id") or "").strip()
-        pm_row = None if already_soaked else _read_post_merge_record(repo, pr_num)
+        pm_row = (
+            _read_post_merge_record(repo, pr_num)
+            if (not already_soaked and remediation_pr_num is not None and pr_num == remediation_pr_num)
+            else None
+        )
 
         # When post_merge_check.py already tracks this remediation PR in Session KV's
         # post_merge_records with a definitive non-human-edited check outcome (or a
@@ -1873,7 +1875,7 @@ def sweep_memory_proposals(
         is_knowledge_pr = bool(
             prop.get("knowledge_pr")
             or already_soaked
-            or (prop_source and prop_source == branch and not has_soak_signal)
+            or (prop_source and prop_source == branch)
             or (
                 not has_soak_signal
                 and str(rec.get("type") or "").strip().lower() != "lesson"
@@ -1897,6 +1899,15 @@ def sweep_memory_proposals(
                     f"source {prop_source_repo or '<unknown>'}:{prop_source or '<unknown>'} != {branch}\n"
                 )
                 continue
+        elif is_remediation_soak:
+            if remediation_pr_num is None or pr_num != remediation_pr_num:
+                sys.stderr.write(
+                    f"github_scan_gate: ignoring {repo}#{pr_num} for {rec_id} — "
+                    f"not the recorded remediation PR ({rec.get('remediation_pr') or '<none>'})\n"
+                )
+                continue
+        else:
+            continue
 
         if state == "merged":
             if is_remediation_soak:
@@ -2019,6 +2030,11 @@ def sweep_memory_proposals(
                     emit_args.extend(["--finding-id", finding_id])
             _run_curator_emit(curator_bin, emit_args, rec_id)
         elif state == "closed":
+            if not viewer:
+                sys.stderr.write(
+                    f"github_scan_gate: holding closed {repo}#{pr_num} ({rec_id}) — viewer login unknown\n"
+                )
+                continue
             try:
                 closer_ans = forge.call(
                     "proposal-closer",

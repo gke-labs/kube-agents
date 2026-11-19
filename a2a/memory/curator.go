@@ -638,10 +638,10 @@ func isOutcomeKind(k OutcomeKind) bool {
 
 func gitopsPRsDisabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS"))) {
-	case "0", "false", "no", "off", "disabled":
-		return true
+	case "1", "true", "yes", "on", "enabled":
+		return false
 	}
-	return false
+	return true
 }
 
 func isCrashRootCauseEvidence(ev OutcomeEvent) bool {
@@ -1008,6 +1008,7 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 					// update only missing evidence links without overwriting title, guard, or body.
 					if existing.Meta.Evidence.PullRequest == "" && prRef != "" {
 						existing.Meta.Evidence.PullRequest = prRef
+						existing.Meta.Evidence.RemediationPR = firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
 						existing.Meta.Evidence.BreakingPR = firstNonEmpty(existing.Meta.Evidence.BreakingPR, ev.BreakingPR)
 						existing.Meta.Evidence.Incident = firstNonEmpty(existing.Meta.Evidence.Incident, ev.Incident)
 						existing.Meta.Evidence.Commit = firstNonEmpty(existing.Meta.Evidence.Commit, ev.Commit)
@@ -1169,6 +1170,7 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	if hasExisting && ev.Title == "" && ev.Rule == "" && ev.Summary == "" && ev.RootCause == "" && ev.Fix == "" {
 		prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 		existing.Meta.Evidence.PullRequest = prRef
+		existing.Meta.Evidence.RemediationPR = firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
 		existing.Meta.Evidence.BreakingPR = firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR)
 		existing.Meta.Evidence.Incident = firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident)
 		existing.Meta.Evidence.Commit = firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit)
@@ -1185,6 +1187,10 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	if prRef == "" {
 		prRef = existing.Meta.Evidence.PullRequest
 	}
+	remediationPR := firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
+	if !hasExisting && (rtype == RecordTypeLesson || ev.FindingID != "" || ev.SoakWindow != "") && prRef != "" && !strings.Contains(prRef, proposalBranchPrefix) {
+		remediationPR = firstNonEmpty(ev.RemediationPR, prRef)
+	}
 
 	meta := RecordMeta{
 		Type:   rtype,
@@ -1195,12 +1201,13 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 		Scope:  scope,
 		Guard:  guard,
 		Evidence: RecordEvidence{
-			PullRequest: prRef,
-			BreakingPR:  firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
-			Incident:    firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident),
-			Commit:      firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
-			FindingID:   firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
-			SoakWindow:  firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
+			PullRequest:   prRef,
+			RemediationPR: remediationPR,
+			BreakingPR:    firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
+			Incident:      firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident),
+			Commit:        firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
+			FindingID:     firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
+			SoakWindow:    firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
 		},
 		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
 	}

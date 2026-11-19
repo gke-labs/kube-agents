@@ -39,7 +39,7 @@ Ten fleet audits run enabled, each on its own schedule. Each maintains a single 
 
 Alongside them, `github-repo-watcher` polls the target repo every 10 minutes across three sweeps. An unaddressed open issue goes to `github-issue-resolver`, which triages it within tight guardrails — the machine-owned ledgers, audit ledgers carrying `agent:audit`, the chat-delivery ledger carrying `agent:delivery-watch` and the first-run inventory report carrying `agent:onboarding`, are excluded from the poll. A review request on one of the agent's own pull requests goes to [`pr-conversation`](/kube-agents/concepts/declarative-workflow/#answering-a-reviewer-on-the-pr), which answers in the thread or amends the branch under review. The request is a comment that _begins_ with `/agent` or with an @-mention, from someone with write access, on GitHub or on any other declared forge such as Gitea.
 
-Its third sweep reconciles pending Decision Memory records: it opens `knowledge/` pull requests via `submit-suggestion` and reports merge, soak, and close outcomes to Curator.
+Its third sweep reconciles pending Decision Memory records: it reports merge, soak, and close outcomes to Curator and opens `knowledge/` pull requests via `/v1/vcs/*` when `DECISION_MEMORY_GITOPS_PRS=true`.
 
 The poll itself runs no model: a tick with nothing to do costs an API call and no tokens.
 
