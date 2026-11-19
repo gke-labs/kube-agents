@@ -403,7 +403,10 @@ What the operator renders per profile, as built (amended 10/6):
     refused (`PROFILE_QUERY_QUALIFIER`, rule `caller.vcs-query`): GitHub composes those
     fields into a search ahead of its own `repo:` qualifier, and any of them could add a
     qualifier, swallow that one, or make it an alternative, reaching past the managed
-    repository. `publish`,
+    repository. An `identity` with no `repository` answers the install's managed
+    repositories instead (`{managedRepositories: [host/path, …]}`), the names every verb is
+    held to, with no repository resolved and no forge called, so a task that names none can
+    find the one it may use. `publish`,
     `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
     `vcs:proposal-create`, which the dispatcher mints only when the submission's
     `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
