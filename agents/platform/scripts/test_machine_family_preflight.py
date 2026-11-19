@@ -6,11 +6,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import machine_family_preflight as preflight  # noqa: E402
@@ -51,13 +51,74 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(result.source_family, "n1")
         self.assertEqual(result.target_family, "n4")
 
-        rules = {b.rule for b in result.blockers}
-        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules)
-        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, rules)
-        self.assertIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, rules)
-        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, rules)
-        self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, rules)
-        self.assertIn(preflight.RULE_LSSD_UNSUPPORTED_ON_N4, rules)
+        by_rule = {b.rule: b for b in result.blockers}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, by_rule)
+        self.assertIn(preflight.RULE_SHIELDED_VTPM_DISABLED, by_rule)
+        self.assertIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, by_rule)
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, by_rule)
+        self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, by_rule)
+        self.assertIn(preflight.RULE_LSSD_UNSUPPORTED_ON_N4, by_rule)
+        # Remediation for vTPM must not hallucinate an enableVtpm field in ComputeClass/NodePool YAML.
+        self.assertNotIn(
+            "enableVtpm: true",
+            by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].remediation,
+        )
+        self.assertIn(
+            "does not accept an enableVtpm field",
+            by_rule[preflight.RULE_SHIELDED_VTPM_DISABLED].remediation,
+        )
+
+    def test_proto3_omitted_false_booleans_for_shielded_nodes_and_shielded_instance_config(self):
+        """GKE Proto3 JSON omits false booleans in shieldedNodes and shieldedInstanceConfig."""
+        # Proto3 cluster with disabled Shielded Nodes serializes `"shieldedNodes": {}`,
+        # and a pool with Secure Boot off and Integrity Monitoring on serializes
+        # `"shieldedInstanceConfig": {"enableIntegrityMonitoring": true}`.
+        cluster_proto3 = {
+            "name": "proto3-cluster",
+            "currentMasterVersion": "1.35.3-gke.1290000",
+            "shieldedNodes": {},
+        }
+        pool_no_secure_boot = {
+            "name": "pool-a",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n1-standard-4",
+                "diskType": "hyperdisk-balanced",
+                "shieldedInstanceConfig": {"enableIntegrityMonitoring": True},
+            },
+        }
+        res_a = preflight.evaluate_node_pool_transition(
+            pool_no_secure_boot,
+            "n4",
+            cluster=cluster_proto3,
+        )
+        self.assertFalse(res_a.compatible)
+        rules_a = {b.rule for b in res_a.blockers}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules_a)
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, rules_a)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, rules_a)
+
+        # Empty `"shieldedInstanceConfig": {}` (both Secure Boot and Integrity Monitoring false in Proto3)
+        # and Terraform `"enable_shielded_nodes": False`.
+        cluster_tf = {"name": "tf-cluster", "enable_shielded_nodes": False}
+        pool_both_off = {
+            "name": "pool-b",
+            "config": {
+                "machineType": "n1-standard-4",
+                "diskType": "hyperdisk-balanced",
+                "shieldedInstanceConfig": {},
+            },
+        }
+        res_b = preflight.evaluate_node_pool_transition(
+            pool_both_off,
+            "n4",
+            cluster=cluster_tf,
+        )
+        self.assertFalse(res_b.compatible)
+        rules_b = {b.rule for b in res_b.blockers}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules_b)
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, rules_b)
+        self.assertIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, rules_b)
 
     def test_compatible_n2_to_n4_with_hyperdisk_and_shielded_defaults_passes(self):
         """A clean pool meeting version, disk, and security requirements passes on N4."""
@@ -92,7 +153,7 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(result.warnings, ())
 
     def test_confidential_vm_rejected_on_non_confidential_families_n2_n4_c4(self):
-        """Confidential GKE Nodes are rejected on n2, n4, and c4."""
+        """Confidential GKE Nodes are rejected on n2, n4, and c4, while pool enabled=false overrides cluster."""
         pool = {
             "name": "cvm-pool",
             "version": "1.35.3-gke.1290000",
@@ -112,8 +173,28 @@ class MachineFamilyPreflightTests(unittest.TestCase):
                 rules = {b.rule for b in res.blockers}
                 self.assertIn(preflight.RULE_CVM_UNSUPPORTED_FAMILY, rules)
 
-    def test_confidential_vm_sev_to_tdx_and_tdx_to_sev_mismatches(self):
-        """AMD SEV/SEV_SNP on n2d versus Intel TDX on c3 transitions are flagged."""
+        # A pool explicitly setting confidentialNodes.enabled=false on a CVM cluster is not blocked on n4.
+        cvm_cluster = {
+            "name": "cvm-cluster",
+            "confidentialNodes": {"enabled": True},
+        }
+        non_cvm_pool = {
+            "name": "non-cvm-pool",
+            "config": {
+                "machineType": "n2d-standard-8",
+                "diskType": "hyperdisk-balanced",
+                "confidentialNodes": {"enabled": False},
+            },
+        }
+        override_res = preflight.evaluate_node_pool_transition(
+            non_cvm_pool,
+            "n4",
+            cluster=cvm_cluster,
+        )
+        self.assertTrue(override_res.compatible)
+
+    def test_confidential_vm_sev_to_tdx_and_tdx_to_sev_mismatches_and_inferred_types(self):
+        """AMD SEV/SEV_SNP on n2d versus Intel TDX on c3 transitions and shape constraints are enforced."""
         sev_pool = {
             "name": "amd-sev-pool",
             "version": "1.35.3-gke.1290000",
@@ -133,46 +214,46 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             preflight.RULE_CVM_TECHNOLOGY_MISMATCH,
             {b.rule for b in to_c3.blockers},
         )
+        # SEV_SNP -> c3-highcpu-8 reports both technology mismatch and invalid C3 TDX shape.
+        to_c3_highcpu = preflight.evaluate_node_pool_transition(
+            sev_pool,
+            "c3",
+            target_machine_type="c3-highcpu-8",
+        )
+        self.assertEqual(
+            [
+                b.field
+                for b in to_c3_highcpu.blockers
+                if b.rule == preflight.RULE_CVM_TECHNOLOGY_MISMATCH
+            ],
+            ["config.confidentialNodes.confidentialInstanceType", "machineType"],
+        )
         # SEV_SNP -> n2d passes.
         to_n2d = preflight.evaluate_node_pool_transition(sev_pool, "n2d")
         self.assertTrue(to_n2d.compatible)
 
-        tdx_pool = {
-            "name": "intel-tdx-pool",
+        # A c3 pool with confidentialNodes: {"enabled": true} and omitted confidentialInstanceType
+        # infers TDX: compatible with c3, incompatible with n2d.
+        inferred_tdx_pool = {
+            "name": "c3-cvm-pool",
             "version": "1.35.3-gke.1290000",
             "config": {
                 "machineType": "c3-standard-8",
                 "diskType": "pd-balanced",
-                "confidentialNodes": {
-                    "enabled": True,
-                    "confidentialInstanceType": "TDX",
-                },
+                "confidentialNodes": {"enabled": True},
             },
         }
-        # TDX -> n2d fails with technology mismatch.
-        tdx_to_n2d = preflight.evaluate_node_pool_transition(tdx_pool, "n2d")
-        self.assertFalse(tdx_to_n2d.compatible)
+        self.assertTrue(
+            preflight.evaluate_node_pool_transition(inferred_tdx_pool, "c3").compatible
+        )
+        inferred_tdx_to_n2d = preflight.evaluate_node_pool_transition(
+            inferred_tdx_pool,
+            "n2d",
+        )
+        self.assertFalse(inferred_tdx_to_n2d.compatible)
         self.assertIn(
             preflight.RULE_CVM_TECHNOLOGY_MISMATCH,
-            {b.rule for b in tdx_to_n2d.blockers},
-        )
-        # TDX -> c3-standard-8 passes.
-        tdx_to_c3 = preflight.evaluate_node_pool_transition(
-            tdx_pool,
-            "c3",
-            target_machine_type="c3-standard-8",
-        )
-        self.assertTrue(tdx_to_c3.compatible)
-        # TDX -> c3-highcpu-8 fails because TDX requires c3-standard-* without -lssd.
-        tdx_to_highcpu = preflight.evaluate_node_pool_transition(
-            tdx_pool,
-            "c3",
-            target_machine_type="c3-highcpu-8",
-        )
-        self.assertFalse(tdx_to_highcpu.compatible)
-        self.assertIn(
-            preflight.RULE_CVM_TECHNOLOGY_MISMATCH,
-            {b.rule for b in tdx_to_highcpu.blockers},
+            {b.rule for b in inferred_tdx_to_n2d.blockers},
         )
 
     def test_disk_generation_constraints_across_families(self):
@@ -225,8 +306,8 @@ class MachineFamilyPreflightTests(unittest.TestCase):
                 {b.rule for b in hd_on_gen2.blockers},
             )
 
-    def test_local_ssd_rejected_on_n4_and_non_lssd_c3_c4(self):
-        """All Local SSD configurations fail on n4 and require NVMe -lssd shapes on c3/c4."""
+    def test_local_ssd_rejected_on_n4_and_non_lssd_c3_c4_and_zero_counts_allowed(self):
+        """Active Local SSD configs fail on n4 and require -lssd on c3/c4; explicit zero counts pass."""
         for lssd_config in (
             {"localSsdCount": 2},
             {"ephemeralStorageLocalSsdConfig": {"localSsdCount": 2}},
@@ -251,10 +332,27 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             for target in ("c3", "c4"):
                 without_lssd_shape = preflight.evaluate_node_pool_transition(pool, target)
                 self.assertFalse(without_lssd_shape.compatible)
-                self.assertIn(
-                    preflight.RULE_LSSD_REQUIRES_LSSD_SHAPE,
-                    {b.rule for b in without_lssd_shape.blockers},
-                )
+                target_rules = {b.rule for b in without_lssd_shape.blockers}
+                self.assertIn(preflight.RULE_LSSD_REQUIRES_LSSD_SHAPE, target_rules)
+                if "localSsdCount" in lssd_config:
+                    self.assertIn(
+                        preflight.RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4,
+                        target_rules,
+                    )
+
+        # Explicit zero counts in ephemeralStorageLocalSsdConfig / localNvmeSsdBlockConfig are not active Local SSDs.
+        zero_lssd_pool = {
+            "name": "zero-lssd",
+            "config": {
+                "machineType": "n2-standard-8",
+                "diskType": "hyperdisk-balanced",
+                "ephemeralStorageLocalSsdConfig": {"localSsdCount": 0, "dataCacheCount": 0},
+                "localNvmeSsdBlockConfig": {"localSsdCount": 0},
+            },
+        }
+        self.assertTrue(
+            preflight.evaluate_node_pool_transition(zero_lssd_pool, "n4").compatible
+        )
 
         # On c3/c4 with an explicit -lssd target shape and ephemeralStorageLocalSsdConfig, it passes.
         nvme_pool = {
@@ -288,6 +386,71 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertIn(
             preflight.RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4,
             {b.rule for b in c4_legacy.blockers},
+        )
+
+    def test_gpu_accelerators_rejected_across_gke_kcc_and_terraform_shapes(self):
+        """Attached GPUs under accelerators, guestAccelerator, guestAccelerators, or guest_accelerator are rejected."""
+        for accel_field in (
+            {"accelerators": [{"acceleratorCount": "1", "acceleratorType": "nvidia-tesla-t4"}]},
+            {"guestAccelerator": [{"count": 1, "type": "nvidia-tesla-t4"}]},
+            {"guestAccelerators": [{"acceleratorCount": 2, "acceleratorType": "nvidia-tesla-v100"}]},
+            {"guest_accelerator": [{"count": "1", "type": "nvidia-tesla-t4"}]},
+        ):
+            pool = {
+                "name": "gpu-pool",
+                "config": {
+                    "machineType": "n1-standard-8",
+                    "diskType": "pd-balanced",
+                    **accel_field,
+                },
+            }
+            res = preflight.evaluate_node_pool_transition(pool, "n2")
+            self.assertFalse(res.compatible, accel_field)
+            self.assertIn(
+                preflight.RULE_GPU_UNSUPPORTED_ON_TARGET,
+                {b.rule for b in res.blockers},
+            )
+
+        # Non-numeric or zero accelerator counts do not crash or trigger a false blocker.
+        zero_gpu_pool = {
+            "name": "no-gpu",
+            "config": {
+                "machineType": "n1-standard-8",
+                "diskType": "pd-balanced",
+                "accelerators": [{"acceleratorCount": "0"}, {"acceleratorCount": "invalid"}],
+            },
+        }
+        self.assertTrue(
+            preflight.evaluate_node_pool_transition(zero_gpu_pool, "n2").compatible
+        )
+
+    def test_kcc_container_node_pool_manifest_extracts_name_and_spec_version(self):
+        """A Config Connector ContainerNodePool object reads metadata.name/spec.resourceID and spec.version."""
+        kcc_pool = {
+            "apiVersion": "container.cnrm.cloud.google.com/v1beta1",
+            "kind": "ContainerNodePool",
+            "metadata": {"name": "kcc-legacy-pool"},
+            "spec": {
+                "resourceID": "gke-legacy-pool",
+                "version": "1.28.5-gke.1000000",
+                "nodeConfig": {
+                    "machineType": "n1-standard-4",
+                    "diskType": "hyperdisk-balanced",
+                },
+            },
+        }
+        code, report = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(kcc_pool)],
+            node_pool_names=["gke-legacy-pool"],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code, preflight.EXIT_INCOMPATIBLE)
+        self.assertEqual(len(report["results"]), 1)
+        row = report["results"][0]
+        self.assertEqual(row["node_pool"], "gke-legacy-pool")
+        self.assertIn(
+            preflight.RULE_GKE_NODE_VERSION_FLOOR,
+            {b["rule"] for b in row["blockers"]},
         )
 
     def test_version_floors_and_dynamic_rwo_and_os_images(self):
@@ -426,6 +589,21 @@ class MachineFamilyPreflightTests(unittest.TestCase):
             self.assertFalse(saved["compatible"])
             self.assertEqual(saved["status"], "incompatible")
             self.assertEqual(len(saved["results"]), 2)
+
+    def test_default_runner_sets_shim_no_retry_deadline(self):
+        """_default_runner sets CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS=0 in child env."""
+        completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch("subprocess.run", return_value=completed) as run_mock:
+            runner = preflight._default_runner(timeout=30)
+            rc, out, err = runner(["gcloud", "version"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "{}")
+        self.assertEqual(err, "")
+        passed_env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(
+            passed_env.get(preflight.SHIM_RETRY_DEADLINE_ENV),
+            preflight.SHIM_NO_RETRY_DEADLINE,
+        )
 
     def test_fail_closed_when_gcloud_fails_or_times_out_or_returns_no_pools(self):
         """Failed or timed-out gcloud calls exit non-zero and never declare compatible."""
