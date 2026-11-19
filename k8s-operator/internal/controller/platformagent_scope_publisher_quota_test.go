@@ -117,7 +117,9 @@ func TestTheChartCountsTheScopePublishersJobPod(t *testing.T) {
 	// alone to one entry, gives the Job something to resolve exactly when the
 	// chart lists it. A field that is neither a list nor one of the known
 	// non-list settings fails here, so a new kind of field gets classified.
-	notLists := []string{"maxProjects", "exclude"}
+	// hold pauses clusters' APIs and resolves nothing (scopeHasResolvableMembers
+	// never reads it).
+	notLists := []string{"maxProjects", "exclude", "hold"}
 	scopeType := reflect.TypeOf(agentv1alpha1.ScopeSpec{})
 	seen := 0
 	for i := 0; i < scopeType.NumField(); i++ {
