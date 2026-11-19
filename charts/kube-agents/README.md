@@ -1037,7 +1037,9 @@ has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
-significant digits is refused at render as well: the chart compares quantities as
+significant digits is refused at render as well, and so is one with an exponent
+below -18 (`1e-19`), which the operator decodes only slowly and no resource
+needs: the chart compares quantities as
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
@@ -1100,6 +1102,13 @@ rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent
 wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
 says what is counted and what a held triage does.
+
+`platformAgent.deployment.evalRunTags` is for eval installs that run the replay proxy in front of
+LiteLLM. `true` renders `KUBEAGENTS_EVAL_RUN_TAGS=1` into the CR's `spec.deployment.env`, and the
+agent then names the eval run, case and repetition in HTTP headers on its model requests, which the
+proxy logs and does not forward. `false`, the default, renders nothing. A literal entry with the
+same name in `platformAgent.deployment.env` wins. A `valueFrom` entry with the key `true` fails the
+render, because the operator forwards only literal values and would drop it.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,

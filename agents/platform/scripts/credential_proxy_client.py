@@ -250,6 +250,15 @@ _DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the com
 # a command's output and is never printed.
 _UNREADABLE_ANSWER_LINE = "credential proxy error (HTTP {status}): {what}; the command may have run"
 _NOT_AN_OBJECT_TEXT = "the response is JSON of type {type}, not an object"
+# The fields of that answer that `execute` writes or returns. A field of another
+# type makes the whole answer unreadable: the line names the field and the
+# type, never a value, and nothing of the answer is printed.
+_EXEC_OUTPUT_FIELDS = ("stdout", "stderr")
+_EXEC_KUBECONFIG_FIELD = "kubeconfig"
+_EXEC_EXIT_CODE_FIELD = "exitCode"
+_FIELD_NOT_A_STRING_TEXT = "the response's {field} is of type {type}, not a string"
+_EXIT_CODE_NOT_AN_INTEGER_TEXT = "the response's exitCode is of type {type}, not an integer"
+_NO_EXIT_CODE_TEXT = "the response has no exitCode"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -1810,7 +1819,8 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     exc.shim_payload = None
     try:
         payload = json.load(exc)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: a body nested deeper than the parser goes.
         return None
     except (http.client.HTTPException, OSError):
         # The connection closed while the refusal's body was read.
@@ -1820,6 +1830,29 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
         exc.close()
     exc.shim_payload = payload if isinstance(payload, dict) else None
     return exc.shim_payload
+
+
+def _unusable_exec_answer(payload: dict) -> str | None:
+    """What is wrong with the fields of a 2xx answer from `/v1/exec`, or None.
+
+    `stdout` and `stderr` are strings when present, and `kubeconfig` is a string
+    or null. `exitCode` is an integer and is not optional: without it the
+    command's result is not known. A boolean is not an integer here, and a
+    number in a string is not one either. The value of an integer is not
+    checked.
+    """
+    for field in _EXEC_OUTPUT_FIELDS:
+        if field in payload and not isinstance(payload[field], str):
+            return _FIELD_NOT_A_STRING_TEXT.format(field=field, type=type(payload[field]).__name__)
+    kubeconfig = payload.get(_EXEC_KUBECONFIG_FIELD)
+    if kubeconfig is not None and not isinstance(kubeconfig, str):
+        return _FIELD_NOT_A_STRING_TEXT.format(field=_EXEC_KUBECONFIG_FIELD, type=type(kubeconfig).__name__)
+    if _EXEC_EXIT_CODE_FIELD not in payload:
+        return _NO_EXIT_CODE_TEXT
+    exit_code = payload[_EXEC_EXIT_CODE_FIELD]
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return _EXIT_CODE_NOT_AN_INTEGER_TEXT.format(type=type(exit_code).__name__)
+    return None
 
 
 def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
@@ -2151,11 +2184,12 @@ def execute(
             return 1
         try:
             with open_broker_request(request) as response:
-                # Only the parse is guarded: a read that breaks is a dropped
-                # connection, below.
+                # Only the parse and the answer's shape are guarded: a read
+                # that breaks is a dropped connection, below. RecursionError:
+                # a body nested deeper than the parser goes.
                 try:
                     payload = json.load(response)
-                except ValueError:
+                except (ValueError, RecursionError):
                     print(
                         _UNREADABLE_ANSWER_LINE.format(status=response.status, what=NON_JSON_RESPONSE_TEXT),
                         file=sys.stderr,
@@ -2164,6 +2198,11 @@ def execute(
                 if not isinstance(payload, dict):
                     shape = _NOT_AN_OBJECT_TEXT.format(type=type(payload).__name__)
                     print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=sys.stderr)
+                    return 1
+                # Before anything of the answer is written.
+                unusable = _unusable_exec_answer(payload)
+                if unusable is not None:
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=unusable), file=sys.stderr)
                     return 1
             break
         except urllib.error.HTTPError as exc:
@@ -2245,7 +2284,7 @@ def execute(
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
-    return int(payload.get("exitCode", 1))
+    return payload[_EXEC_EXIT_CODE_FIELD]
 
 
 def _truncated_marker(payload: dict, stdout_cut: bool) -> str:

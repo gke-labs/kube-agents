@@ -516,6 +516,15 @@ readonly PUBSUB_RELAY_BROKER_RULE="rule=gcp.pubsub.subscription-pull"
 # gate's failure dump shows.
 readonly PUBSUB_RELAY_GATEWAY_CONTAINER="platform-agent"
 readonly PUBSUB_RELAY_DIAG_LOG_LINES=200
+# Section 7c: the plugins the agent image ships are on the data volume. The
+# image's copy (DEFAULTS_PLUGINS_DIR in deploy/shared/docker-entrypoint.sh),
+# the home's copy the entrypoint makes of it, the container both are read in,
+# and how often the read is tried before the gate gives up on it.
+readonly SHIPPED_PLUGINS_IMAGE_DIR="/opt/defaults/plugins"
+readonly SHIPPED_PLUGINS_HOME_DIR="/opt/data/plugins"
+readonly SHIPPED_PLUGINS_CONTAINER="${PUBSUB_RELAY_GATEWAY_CONTAINER}"
+readonly SHIPPED_PLUGINS_READ_ATTEMPTS=3
+readonly SHIPPED_PLUGINS_READ_INTERVAL_SECONDS=5
 # The maxSessions section 2b sizes for the rendered bridge's workers goes
 # on step 5's install as platformAgent.harness.tuning.maxSessions, which
 # the chart renders as spec.harness.tuning.maxSessions, so the first render
@@ -926,6 +935,9 @@ if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
   replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
   echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, ${REPLAY_SHADOW_MODE} mode, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
+# Per-request eval run tags ride the proxy: on with it, off without it
+# (eval_run_tags_helm_args), and EVAL_RUN_TAGS=false turns them off alone.
+eval_run_tags_helm_args
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
 # RC_COMMIT_SHA unset is the presubmit and everything this script did before the
@@ -2344,6 +2356,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "webConsole.enabled=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
+    ${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e
@@ -3334,6 +3347,49 @@ if [[ "${pubsub_relay_connected}" != "true" ]]; then
   exit 1
 fi
 echo "✓ Pub/Sub platform adapter pulls through the broker, verified in $((SECONDS - STEP_START))s"
+
+# ─── 7c. The agent has the plugins its image ships ────────────────────────────
+# The entrypoint copies every plugin folder of the image into the home's
+# plugins folder, and reports a copy that fails as a warning, not as a failed
+# start. An agent whose copy failed on a new data volume therefore comes up
+# Ready with none of them: no roster block, no onboarding hook, no chat
+# metrics, no tool call audit. Every check above passes on it, and the cases
+# can then grade an agent a release would not ship. So read the result, not
+# the log: each plugin folder of the image must be in the home's folder. The
+# pod read is the one the deploy hands to the eval: every roll of this script
+# is over by here. An image folder with no plugin folder in it is a failed
+# read, not a pass.
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the agent has the plugins its image ships ==="
+shipped_plugins_read=false
+shipped_plugins_missing=""
+for _ in $(seq "${SHIPPED_PLUGINS_READ_ATTEMPTS}"); do
+  # Prints the name of each image plugin folder the home's folder lacks, and
+  # fails when the image folder holds no plugin folder at all.
+  # shellcheck disable=SC2016 # the script is for the pod's shell, not this one
+  if shipped_plugins_missing="$(kubectl exec -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${SHIPPED_PLUGINS_CONTAINER}" -- \
+    sh -c 'seen=0; for d in "$1"/*/; do [ -d "$d" ] || continue; seen=1; n="$(basename "$d")"; [ -d "$2/$n" ] || echo "$n"; done; [ "$seen" = 1 ]' \
+    sh "${SHIPPED_PLUGINS_IMAGE_DIR}" "${SHIPPED_PLUGINS_HOME_DIR}" 2>/dev/null)"; then
+    shipped_plugins_read=true
+    break
+  fi
+  sleep "${SHIPPED_PLUGINS_READ_INTERVAL_SECONDS}"
+done
+if [[ "${shipped_plugins_read}" != "true" ]]; then
+  echo "ERROR: could not read the agent's plugin folders (${SHIPPED_PLUGINS_READ_ATTEMPTS} tries of kubectl exec in the ${SHIPPED_PLUGINS_CONTAINER} container),"
+  echo "       or ${SHIPPED_PLUGINS_IMAGE_DIR} holds no plugin folder"
+  # The read's own error, which the loop above keeps off the result.
+  kubectl exec -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${SHIPPED_PLUGINS_CONTAINER}" -- ls -ldn "${SHIPPED_PLUGINS_IMAGE_DIR}" "${SHIPPED_PLUGINS_HOME_DIR}" || true
+  kubectl get pods -n "${NAMESPACE}" || true
+  exit 1
+fi
+if [[ -n "${shipped_plugins_missing}" ]]; then
+  echo "ERROR: the agent runs without plugins its image ships: $(echo "${shipped_plugins_missing}" | tr '\n' ' ')"
+  echo "       (each is a folder of ${SHIPPED_PLUGINS_IMAGE_DIR} that ${SHIPPED_PLUGINS_HOME_DIR} lacks; the entrypoint's copy failed)"
+  kubectl exec -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${SHIPPED_PLUGINS_CONTAINER}" -- ls -ldn "${SHIPPED_PLUGINS_HOME_DIR}" 2>/dev/null || true
+  exit 1
+fi
+echo "✓ The agent has the plugins its image ships, verified in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deployment Ready in Namespace: ${NAMESPACE} (Total Duration: ${TOTAL_DURATION}s) ==="

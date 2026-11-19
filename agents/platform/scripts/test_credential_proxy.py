@@ -13900,16 +13900,14 @@ class A2AChatCallerBindingTest(unittest.TestCase):
                     self._authenticator()._principal_from(self._review(caller, self.A2A_CHAT))
 
     def test_the_a2a_gateway_presenting_another_audience_is_refused(self):
-        # The intent the a2a-reports role (#6098) must keep when it lands
-        # beside this: the A2A gateway's ServiceAccount is admitted on the
-        # a2a-chat audience (and, with #6098, a2a-reports) and refused on every
-        # other one. Whichever change merges second widens this binding's
-        # reverse rule to both roles; #6098's "gateway presenting a2a-reports
-        # is admitted" test fails until it does.
+        # The A2A gateway's ServiceAccount is admitted on the a2a-chat
+        # audience and the a2a-reports one (#6098), and refused on every
+        # other one.
         for audience in (self.SHELL, self.CHAT):
             with self.subTest(audience=audience):
                 with self.assertRaisesRegex(
-                    credential_proxy.AuthenticationError, "only the a2a-chat audience"
+                    credential_proxy.AuthenticationError,
+                    "only the a2a-chat or a2a-reports audience",
                 ):
                     self._authenticator()._principal_from(
                         self._review(self.A2A_GATEWAY_SA, audience)

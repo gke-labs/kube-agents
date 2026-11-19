@@ -110,10 +110,10 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, declared-zonal-pool's single zone, and declared-orphan-snap-seeded's retention, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a and the declared-orphan-snap-seeded snapshot carry seven postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -133,6 +133,9 @@ declares:
   - check: single-zone-nodepool
     namespace: ""
     object: NodePool/declared-zonal-pool
+  - check: orphaned-snapshots
+    namespace: ""
+    object: Snapshot/declared-orphan-snap-seeded
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -144,8 +147,10 @@ design: it reads the API server with that identity. Its neighbour `token-sidecar
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
 design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
 `seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
-pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
-waste and capacity audits list the six postures under Declared intent rather than as findings.'
+pool stays empty until a zonal batch needs it. The `declared-orphan-snap-seeded` snapshot is kept
+after its source disk was deleted by design: it is the retained copy of a retired disk, held until
+an operator reviews it. The obtainability, compliance, upgrade readiness, waste, capacity and GCE
+compute audits list the seven postures under Declared intent rather than as findings.'
 # checkout-gateway's declaration, the file the remediation cases propose a
 # PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
 # With no manifest in the repository the agent finds nothing to fix and refuses
