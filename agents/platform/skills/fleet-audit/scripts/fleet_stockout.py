@@ -493,7 +493,7 @@ IMPACT = {
     "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
-    UNBACKED_MANUAL_FALLBACK: "Node pool auto-creation is off, so GKE scales existing node pools only: a priority rule with no manual node pool is a fallback that does not exist, and pods stay Pending when the class's existing node pools cannot grow.",
+    UNBACKED_MANUAL_FALLBACK: "Node pool auto-creation is off, so GKE scales existing node pools only: a priority rule with no manual node pool is a fallback that does not exist, and pods stay Pending when the class has no node pool that can take them.",
     "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
     # Both arms of §3.9 set their own `impact` on the hit -- and a pool
     # matching both gets both sentences -- so this entry is the fallback
@@ -1319,16 +1319,13 @@ def _rule_label(position: int, rule: dict) -> str:
 
 
 def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict | None:
-    """§3.13: a class in `_manual_fallback_class`'s scope that has a node pool
-    on this cluster and a priority rule no node pool backs. GKE creates no
-    pool for that rule, so the fallback the class lists does not exist.
+    """§3.13: a class in `_manual_fallback_class`'s scope with a priority rule
+    no node pool backs. GKE creates no pool for that rule, so the fallback the
+    class lists does not exist.
 
-    A class with no node pool of its own here -- none a rule names, none with
-    the class label -- is not filed: nothing on this cluster falls back on it,
-    and `check_dangling_compute_class` names a workload that selects it. A
-    rule `_rule_has_manual_pool` cannot judge is neither counted as backed nor
-    flagged; the excerpt names it. The cluster default class is not judged
-    here (`_cluster_default_class`).
+    A rule `_rule_has_manual_pool` cannot judge is neither counted as backed
+    nor flagged; the excerpt names it. The cluster default class is not
+    judged here (`_cluster_default_class`).
     """
     if not _manual_fallback_class(cc) or _cluster_default_class(cc):
         return None
@@ -1338,16 +1335,15 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     labels = [_rule_label(position, rule) for position, rule in enumerate(priorities, 1)]
     unbacked = [label for label, verdict in zip(labels, verdicts) if verdict is False]
     backed = [label for label, verdict in zip(labels, verdicts) if verdict is True]
-    own_pools = _class_pools(name, node_pools)
-    if not unbacked or not (backed or own_pools):
+    if not unbacked:
         return None
     unjudged = [label for label, verdict in zip(labels, verdicts) if verdict is None]
     excerpt = f"nodePoolAutoCreation is not enabled and {len(unbacked)} of {len(priorities)} priority rules have no manual node pool: {'; '.join(unbacked)}"
     if backed:
         excerpt += f". Backed: {'; '.join(backed)}"
     else:
-        pools = "; ".join(f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in own_pools)
-        excerpt += f". No rule is backed; the node pools with the class label: {pools}"
+        pools = "; ".join(f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in _class_pools(name, node_pools))
+        excerpt += f". No rule is backed; the node pools with the class label: {pools or 'none'}"
     if unjudged:
         excerpt += f". Not judged, the rule names neither pools nor a machine: {'; '.join(unjudged)}"
     return {"object": f"ComputeClass/{name}", "excerpt": excerpt, "needs_triage": MANUAL_POOL_TRIAGE}

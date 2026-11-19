@@ -4358,12 +4358,13 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         self.assertIn("1 of 2", hit["excerpt"])
         self.assertIn("rule 1 (nodepools gone-pool)", hit["excerpt"])
 
-    def test_a_class_with_no_node_pool_of_its_own_is_not_filed(self):
-        """No pool a rule names and none with the class label: nothing on this
-        cluster falls back on the class, and 3.12 (c) names a workload that
-        selects it."""
-        self.assertIsNone(self.check(FLEET_CLASS_RULES, []))
-        self.assertIsNone(self.check(FLEET_CLASS_RULES, [manual_pool("other", "n4-standard-4"), manual_pool("else", "c3-standard-8", "another-class")]))
+    def test_a_class_with_no_node_pool_of_its_own_is_filed_for_every_rule(self):
+        """The rule as the issue locks it: any rule with no manual node pool
+        files the class, also when no rule has one."""
+        for pools in ([], [manual_pool("other", "n4-standard-4"), manual_pool("else", "c3-standard-8", "another-class")]):
+            hit = self.check(FLEET_CLASS_RULES, pools)
+            self.assertIn("3 of 3 priority rules have no manual node pool", hit["excerpt"])
+            self.assertIn("No rule is backed; the node pools with the class label: none", hit["excerpt"])
 
     def test_a_labelled_pool_that_backs_no_rule_is_filed(self):
         """3.12 (c) passes on the label, so nothing else names this class."""
