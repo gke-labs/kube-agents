@@ -1037,7 +1037,9 @@ has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
-significant digits is refused at render as well: the chart compares quantities as
+significant digits is refused at render as well, and so is one with an exponent
+below -18 (`1e-19`), which the operator decodes only slowly and no resource
+needs: the chart compares quantities as
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a

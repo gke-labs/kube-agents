@@ -150,6 +150,10 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 						"additionalProperties": map[string]any{"type": "string"},
 						"description":          "Optional task parameters for the addressed profile, as string values (for cluster: project, location and cluster). Only with addressee.",
 					},
+					"reply_to": map[string]any{
+						"type":        "string",
+						"description": "When this message answers a card's report, the task the report said it was on (`on task <id>` in its heading); the agent then reads that report before answering (on the platform route, the install's default; a conversation on its own session pod does not read it yet). Omit for a message that answers no report.",
+					},
 				},
 			},
 		},

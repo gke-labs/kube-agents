@@ -132,6 +132,9 @@ RETRYABLE_BUSY_BOUNDS = frozenset(
 # resource watermark gate answers at once past its hard watermark, with the
 # interval to wait in the Retry-After header and the body's `retry_after`.
 BUSY_CODE = "CREDENTIAL_PROXY_BUSY"
+# credential_proxy.BUSY_BEFORE_ADMISSION_KEY: a busy answer the broker gave
+# before admitting the request, when nothing it asked for has run.
+BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 RESOURCE_PRESSURE_CODE = "CREDENTIAL_PROXY_RESOURCE_PRESSURE"
 # Envoy's mark on a 503 it answered itself, under its own overload manager,
 # without forwarding the request. Any other non-JSON 503 may be an upstream
@@ -1965,6 +1968,33 @@ def exec_refusal_retryable(status: int, headers, payload) -> bool:
     return headers is not None and ENVOY_OVERLOADED_HEADER in headers
 
 
+def vcs_refusal_retryable(status: int, headers, payload) -> bool:
+    """Whether a `/v1/vcs/` refusal ran nothing, so `vcs_call` may send it again.
+
+    Stricter than `exec_refusal_retryable`, because a vcs verb can write to a
+    forge and a busy answer can come from inside its route: only a broker
+    admission refusal that says it came before admission
+    (BUSY_BEFORE_ADMISSION_KEY) and is otherwise one the shim retries
+    (`busy_reply_retryable`), or a 503 Envoy answered itself under overload
+    without forwarding. Not a forge's own 429 or 503, which the broker relays
+    after the forge was called, and not a busy answer from an older broker
+    that does not say when it refused.
+    """
+    if payload is None:
+        return (
+            status == http.HTTPStatus.SERVICE_UNAVAILABLE
+            and headers is not None
+            and ENVOY_OVERLOADED_HEADER in headers
+        )
+    if status not in (http.HTTPStatus.TOO_MANY_REQUESTS, http.HTTPStatus.SERVICE_UNAVAILABLE):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get(BUSY_BEFORE_ADMISSION_KEY) is True
+        and busy_reply_retryable(payload)
+    )
+
+
 def refusal_text(payload) -> str:
     """The broker's own words for a refusal, for the stderr line."""
     if isinstance(payload, dict):
@@ -2271,6 +2301,10 @@ class WorkspaceRequestError(RuntimeError):
         )
         self.status = status
         self.payload = payload
+        # What `vcs_call` decides a retry on: the reply's headers (Retry-After,
+        # Envoy's overload mark) and its JSON body, or None when it sent none.
+        self.headers: object = {}
+        self.json_body: object = None
 
 
 def default_caller_label() -> str:
@@ -2290,13 +2324,55 @@ def default_caller_label() -> str:
     return ""
 
 
-def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
-    """One `POST /v1/vcs/<verb>`.
+def vcs_call(
+    endpoint: str,
+    verb: str,
+    payload: dict,
+    *,
+    sleep_fn=time.sleep,
+    clock=time.monotonic,
+    rng=random,
+) -> dict:
+    """One `POST /v1/vcs/<verb>`, sent again after an admission refusal.
 
     Every `/v1/vcs/*` call stands alone and holds nothing across a session.
     Public, because the version-control skill is the caller and it lives
     outside this module.
+
+    A refusal the broker makes before it admits the request -- a 503 at a slot,
+    budget, background or profile cap, or a 429 under memory pressure, each
+    marked as given before admission -- or an Envoy overload 503 ran nothing,
+    so it is sent again on the exec shim's schedule (`vcs_refusal_retryable`,
+    `retry_wait`) with a line on stderr per wait. A refusal after the request
+    reached the forge is never sent again. Without it, a profile worker at its slot
+    share could publish a branch and then fail the `proposal-create` that
+    follows at once, leaving a branch with no proposal (#6247). Every other
+    refusal, and the last admission refusal once the retries are spent, is
+    raised as before.
     """
+    started = clock()
+    deadline = retry_deadline_seconds()
+    attempts_made = 0
+    while True:
+        try:
+            return _vcs_call_once(endpoint, verb, payload)
+        except WorkspaceRequestError as exc:
+            if not vcs_refusal_retryable(exc.status, exc.headers, exc.json_body):
+                raise
+            attempts_made += 1
+            text = refusal_text(exc.payload)
+            delay = retry_wait(
+                attempts_made, started, exc.headers.get(RETRY_AFTER_HEADER), rng, clock, deadline=deadline
+            )
+            if delay is None:
+                report_throttled(exc.status, text, attempts_made)
+                raise
+            report_retry(exc.status, text, attempts_made, delay)
+            sleep_fn(delay)
+
+
+def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
+    """One attempt of `vcs_call`."""
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     # Same credential and same opener as `execute`: these routes spend the
@@ -2336,7 +2412,7 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         except (ValueError, TypeError, RecursionError):  # RecursionError: a body nested too deep to parse
             # The status arrived but the body is not a refusal document. The
             # status is the whole answer.
-            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+            raise _vcs_refusal(exc, {"error": f"HTTP {exc.code}"}, None) from exc
         except (http.client.HTTPException, OSError) as broke:
             # The body ran out mid-read instead: an `IncompleteRead`, or a
             # `RemoteDisconnected`, or a reset socket. None of those is a
@@ -2354,13 +2430,13 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         if not isinstance(answer, dict):
             # Valid JSON, but not an object, so no refusal document either.
             # The status is the whole answer, as above.
-            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+            raise _vcs_refusal(exc, {"error": f"HTTP {exc.code}"}, None) from exc
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
             # asking differently.
             raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
-        raise WorkspaceRequestError(exc.code, answer) from exc
+        raise _vcs_refusal(exc, answer, answer) from exc
     except urllib.error.URLError:
         # Out untouched: the send never landed, and `vcs_client.call` has an
         # arm that says so. Named before the clause below only because
@@ -2369,6 +2445,14 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         raise
     except (http.client.HTTPException, OSError) as exc:
         raise BrokerDisconnected(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _vcs_refusal(exc: urllib.error.HTTPError, payload: dict, json_body: object) -> WorkspaceRequestError:
+    """The error `vcs_call` raises for a refusal, with what its retry reads."""
+    error = WorkspaceRequestError(exc.code, payload)
+    error.headers = exc.headers if exc.headers is not None else {}
+    error.json_body = json_body
+    return error
 
 
 class ApiSession:
