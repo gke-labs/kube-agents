@@ -2013,9 +2013,13 @@ as the console does, with no variable arming it. Each request is one frame on
 the whole `text`, not chunked; a `chat` message's text is its fallback, and the console renders
 text. An `update` key edits the frame it posted, as it edits a chat message elsewhere. A
 request may carry `reply_to`, the gateway task whose turn filed the card (`a2a notify
---reply-to`), which the frame passes on as `replyTo` so a console client can join the report to
-its turn, and echo it as the `replyTo` of a reply under the report ("Transport" below). A
-`reply_to` that is not a task id's shape is dropped and the report still posted.
+--reply-to`), which the frame passes on as `replyTo` so a console client can join the post to
+its turn, and the report mark (`report`, below), which the frame carries as `report: true` on
+the card's report alone, so the console page offers a reply under that post and echoes its
+`replyTo` as the `replyTo` of the reply ("Transport" below; the MCP server does not read the mark
+yet and labels every gathered frame a card's report); a progress note or plan line names its task on
+the frame without the mark, since no report is kept under it to reply to. A `reply_to` that is
+not a task id's shape is dropped and the report still posted.
 The task reaches the card this way. The hermes-bridge records it on a console conversation's
 route (`task_id`). `kanban_event_routing` snapshots it into the card's subscription when the
 card is filed, as `console:<token>#<taskId>` (`#` cannot occur in a console token, which is one
@@ -2975,12 +2979,13 @@ so no `handoff` or `"cardsPending": true` is emitted once the cards settle in tu
 `"cardsPending": true`, no unsettled handoff remains and the client need not wait. Its text is the
 deliverable for a completed task and the gateway's notice
 otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
-carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
-turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
-notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
+carrying the notice; a console client reads the child's answer from TASKS. A kanban card's post into the conversation is a frame too, with `"kind": "notify"`, the
+turn it reports on as `replyTo`, and `"report": true` on the card's report alone ("Proactive posts:
+the chat.notify route", the console's route). A notice carries none of those fields, so a client
+waiting on a turn can tell the three apart. The
 page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
 frame costs it nothing. It shows the notify frames, which it has no other source for; one whose
-frame names its turn gets a reply button under the text, in a pane that can send, and the next
+frame carries the report mark and names its turn gets a reply button under the text, in a pane that can send, and the next
 typed turn after a click carries that `replyTo` on `.in`, so the agent's follow-up opens with the
 report. A card's
 report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
