@@ -802,10 +802,23 @@ _FAKE_URLOPEN = textwrap.dedent(
     import io
     import json
     import os
+    import urllib.error
     import urllib.request
 
 
     def _fake_urlopen(request, timeout=None):
+        if request.full_url.endswith("/rate_limit"):
+            # The budget read that follows a mint. Recorded apart from the
+            # mint so the mint's own request stays what the tests assert.
+            if os.environ.get("MINT_BUDGET_HTTP"):
+                raise urllib.error.HTTPError(
+                    request.full_url, int(os.environ["MINT_BUDGET_HTTP"]), "fake budget failure", {}, None
+                )
+            with open(os.environ["MINT_BUDGET_CAPTURE_FILE"], "w", encoding="utf-8") as fh:
+                json.dump({"auth": request.get_header("Authorization")}, fh)
+            return io.BytesIO(
+                json.dumps({"resources": {"core": {"limit": 5000, "remaining": 4321, "reset": 1795100000}}}).encode()
+            )
         record = {
             "url": request.full_url,
             "method": request.get_method(),
@@ -853,10 +866,13 @@ class LedgerMintRequestTest(unittest.TestCase):
             self.skipTest(f"openssl could not generate a throwaway key: {gen.stderr}")
         (self.tmp / "sitecustomize.py").write_text(_FAKE_URLOPEN, encoding="utf-8")
         self.capture = self.tmp / "request.json"
+        self.budget_capture = self.tmp / "budget-request.json"
+        self.grading_log = self.tmp / "eval-grading.log"
 
-    def _mint(self, call, expect_rc=0, ids=None):
+    def _mint(self, call, expect_rc=0, ids=None, env=None):
         """ids: the EVAL_LEDGER_APP_ID / EVAL_LEDGER_INSTALLATION_ID pair to export,
-        None for the ledger-reader App's, or {} to export neither."""
+        None for the ledger-reader App's, or {} to export neither. env: more
+        for the child (MINT_BUDGET_HTTP makes the fake refuse the budget read)."""
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -869,6 +885,7 @@ class LedgerMintRequestTest(unittest.TestCase):
                 _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$", "LEDGER_RESET_MINT_RETRY_DELAY"),
                 _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
+                _extract(r"^LEDGER_BUDGET_PREFIX=[^\n]*$", "LEDGER_BUDGET_PREFIX"),
                 _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint"),
                 _extract(r"^mint_ledger_token\(\) \{.*?^\}", "mint_ledger_token"),
                 _extract(r"^ledger_reset_token\(\) \{.*?^\}", "ledger_reset_token"),
@@ -889,10 +906,12 @@ class LedgerMintRequestTest(unittest.TestCase):
                 overrides={
                     "PYTHONPATH": str(self.tmp),
                     "MINT_CAPTURE_FILE": str(self.capture),
+                    "MINT_BUDGET_CAPTURE_FILE": str(self.budget_capture),
                     "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
                     "BENCH_GITHUB_TOKEN": "the-mounted-pat",
-                    "EVAL_GRADING_LOG": str(self.tmp / "eval-grading.log"),
+                    "EVAL_GRADING_LOG": str(self.grading_log),
                     **exported,
+                    **(env or {}),
                 },
                 # A shell that has run the harness exports both ids; an id the
                 # caller did not name must be absent, not inherited, or the
@@ -962,6 +981,36 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.assertIn("LEDGER_MINT_BODY is empty; refusing to mint", proc.stderr)
         self.assertFalse(self.capture.exists(), "a bodiless mint reached the faked GitHub")
         self.assertNotEqual(_retryable_rc(), proc.returncode, "an empty body is not a transient fault")
+
+    def test_the_mint_logs_the_installations_remaining_budget(self):
+        """#6240: the budget the installation has left, read with the token
+        just minted (GitHub does not charge /rate_limit) and kept on the
+        mint's own line in the grading log, so a day of runs measures what
+        one run spends of its shard."""
+        _, proc = self._mint('mint_ledger_token "case rep 1"')
+        self.assertTrue(self.budget_capture.exists(), "the budget read never reached the faked GitHub: " + proc.stderr)
+        self.assertEqual("Bearer ghs_minted", json.loads(self.budget_capture.read_text(encoding="utf-8"))["auth"])
+        logged = self.grading_log.read_text(encoding="utf-8")
+        self.assertIn(
+            "Ledger token (case rep 1): minted from App 4739812, installation 157029058, expires 2026-09-23T16:00:00Z; "
+            "budget: 4321 of 5000 requests left this hour on installation 157029058, resets 2026-11-19T14:53:20Z",
+            logged,
+        )
+
+    def test_a_refused_budget_read_costs_the_mint_nothing(self):
+        _, proc = self._mint(
+            'mint_ledger_token "case rep 1"; echo "TOKEN=${BENCH_GITHUB_TOKEN}"', env={"MINT_BUDGET_HTTP": "500"}
+        )
+        self.assertIn("TOKEN=ghs_minted", proc.stdout)
+        logged = self.grading_log.read_text(encoding="utf-8")
+        self.assertIn("Ledger token (case rep 1): minted from App 4739812, installation 157029058, expires 2026-09-23T16:00:00Z\n", logged)
+        self.assertNotIn("budget:", logged)
+
+    def test_the_budget_prefix_is_the_mint_modules(self):
+        line = _extract(r"^LEDGER_BUDGET_PREFIX=[^\n]*$", "LEDGER_BUDGET_PREFIX")
+        module = re.search(r'^LEDGER_BUDGET_PREFIX = "([^"]+)"$', _LEDGER_MINT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(module)
+        self.assertEqual(module.group(1), line.split("=", 1)[1].strip('"'))
 
 
 # A GitHub that refuses the mint: the HTTPError the test names (status,
@@ -1070,6 +1119,197 @@ class LedgerMintRefusalTest(unittest.TestCase):
             line = re.search(r"^%s = .*$" % name, sweeper, re.M)
             self.assertIsNotNone(line, "the sweeper no longer defines %s" % name)
             self.assertIn(line.group(0), mint, "the mint's %s drifted from the sweeper's" % name)
+
+
+class LedgerReaderSelectionTest(unittest.TestCase):
+    """select_ledger_reader in hack/ci-eval-pr.sh: which ledger-reader App a
+    run mints from, by the leased project's number (#6240).
+
+    The pool's repositories are spread over copies of the App, listed in
+    hack/eval/ledger-reader-apps.txt one per row, ten projects per App in
+    number order ((number - 1) // LEDGER_READER_SHARD_SIZE). The rule has to agree with the verifier's
+    (scripts/test_verify_ci_pool_project.py runs this function against it);
+    here it is the shell's own behaviour: the pick, the key that goes with
+    it, a one-line table meaning the single App of before, and the ways the
+    job's mounts can disagree with the table.
+    """
+
+    # Three Apps, with the comments and blank lines the real file carries.
+    _TABLE = textwrap.dedent(
+        """\
+        # shard 0
+        1000 5000 secret-zero
+
+        1001 5001 secret-one   # a trailing comment
+        1002 5002 secret-two
+        """
+    )
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = pathlib.Path(tmp.name)
+        (self.tmp / "eval").mkdir()
+        (self.tmp / "eval" / "ledger-reader-apps.txt").write_text(self._TABLE, encoding="utf-8")
+
+    def _select(self, project, script_dir=None, **env):
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                f'SCRIPT_DIR="{script_dir or self.tmp}"',
+                _extract(r"^readonly EVAL_LEDGER_READER_APPS_FILE=[^\n]*$", "EVAL_LEDGER_READER_APPS_FILE"),
+                _extract(r"^readonly LEDGER_READER_SHARD_SIZE=\d+$", "LEDGER_READER_SHARD_SIZE"),
+                _extract(r"^ledger_reader_shard\(\) \{.*?^\}", "ledger_reader_shard"),
+                _extract(r"^select_ledger_reader\(\) \{.*?^\}", "select_ledger_reader"),
+                f'select_ledger_reader "{project}"',
+                'echo "APP=${EVAL_LEDGER_APP_ID:-} INST=${EVAL_LEDGER_INSTALLATION_ID:-} KEY=${EVAL_LEDGER_APP_KEY_FILE:-}"',
+            ]
+        )
+        names = ("EVAL_LEDGER_APP_ID", "EVAL_LEDGER_INSTALLATION_ID", "EVAL_LEDGER_APP_KEY_FILE", "EVAL_LEDGER_APP_KEY_FILES")
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(overrides=env, absent=[n for n in names if n not in env]),
+        )
+
+    def _picked(self, proc):
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return proc.stdout.strip().splitlines()[-1]
+
+    def test_ten_projects_per_app_in_number_order_picks_the_app_and_its_key(self):
+        keys = {"EVAL_LEDGER_APP_KEY_FILES": "/k/0.pem /k/1.pem /k/2.pem"}
+        for project, shard in (
+            ("kube-agents-evals", 0),
+            ("kube-agents-evals-2", 0),
+            ("kube-agents-evals-10", 0),
+            ("kube-agents-evals-11", 1),
+            ("kube-agents-evals-20", 1),
+            ("kube-agents-evals-21", 2),
+            ("kube-agents-evals-30", 2),
+        ):
+            with self.subTest(project=project):
+                self.assertEqual(
+                    f"APP=100{shard} INST=500{shard} KEY=/k/{shard}.pem",
+                    self._picked(self._select(project, **keys)),
+                )
+
+    def test_a_multi_row_table_with_the_single_key_of_before_reads_through_the_first_app(self):
+        """Merge day: the table has every row and the Prow job still exports
+        EVAL_LEDGER_APP_KEY_FILE alone. A project on a later row reads through
+        the first App, with its key, and a warning; nothing mints with another
+        App's ids against the first App's key."""
+        proc = self._select("kube-agents-evals-23", EVAL_LEDGER_APP_KEY_FILE="/etc/ledger-app-key/key.pem")
+        self.assertEqual("APP=1000 INST=5000 KEY=/etc/ledger-app-key/key.pem", self._picked(proc))
+        self.assertIn("WARNING: Ledger reader: kube-agents-evals-23 is on reader App 3 and the job mounted 1 key file(s)", proc.stderr)
+        first = self._select("kube-agents-evals-7", EVAL_LEDGER_APP_KEY_FILE="/etc/ledger-app-key/key.pem")
+        self.assertEqual("APP=1000 INST=5000 KEY=/etc/ledger-app-key/key.pem", self._picked(first))
+        self.assertNotIn("WARNING", first.stderr)
+
+    def test_a_project_past_the_tables_last_row_reads_through_the_first_app(self):
+        """No row for the shard yet: the first App reads it, with a warning
+        naming the App to register. scripts/test_verify_ci_pool_project.py
+        keeps this a rollout state rather than a merged one."""
+        proc = self._select("kube-agents-evals-31", EVAL_LEDGER_APP_KEY_FILES="/k/0.pem /k/1.pem /k/2.pem")
+        self.assertEqual("APP=1000 INST=5000 KEY=/k/0.pem", self._picked(proc))
+        self.assertIn("WARNING: Ledger reader: kube-agents-evals-31 is on reader App 4", proc.stderr)
+        self.assertIn("has 3 row(s); reading through reader App 1", proc.stderr)
+        self.assertIn("Register App 4 and append its row", proc.stderr)
+
+    def test_the_shipped_table_is_the_single_app_of_before(self):
+        """The first row of hack/eval/ledger-reader-apps.txt is the App of
+        before: the first ten projects map to it, and EVAL_LEDGER_APP_KEY_FILE
+        alone is the key list, so a Prow job that exports nothing new runs as
+        it did on them. The ids are pinned here as literals: the verifier and
+        the mint module's defaults are held to the same file by
+        scripts/test_verify_ci_pool_project.py."""
+        for project in ("kube-agents-evals", "kube-agents-evals-2", "kube-agents-evals-10"):
+            with self.subTest(project=project):
+                self.assertEqual(
+                    "APP=4739812 INST=157029058 KEY=/etc/ledger-app-key/key.pem",
+                    self._picked(self._select(
+                        project,
+                        script_dir=_CI_EVAL_PR.parent,
+                        EVAL_LEDGER_APP_KEY_FILE="/etc/ledger-app-key/key.pem",
+                    )),
+                )
+
+    def test_a_shard_whose_key_is_not_mounted_reads_through_the_first_app(self):
+        """A row merged ahead of its Prow mount: the project on it falls back
+        to the first App, whose installation still holds every repository
+        until the rollout's last step, and the log says what is missing. A
+        project whose key is mounted is untouched by the gap."""
+        keys = {"EVAL_LEDGER_APP_KEY_FILES": "/k/0.pem /k/1.pem"}
+        behind = self._select("kube-agents-evals-23", **keys)
+        self.assertEqual("APP=1000 INST=5000 KEY=/k/0.pem", self._picked(behind))
+        self.assertIn("WARNING: Ledger reader: kube-agents-evals-23 is on reader App 3 and the job mounted 2 key file(s)", behind.stderr)
+        self.assertIn("reading through reader App 1", behind.stderr)
+        covered = self._select("kube-agents-evals-13", **keys)
+        self.assertEqual("APP=1001 INST=5001 KEY=/k/1.pem", self._picked(covered))
+        self.assertNotIn("WARNING", covered.stderr)
+
+    def test_a_tab_or_carriage_return_line_is_not_a_row(self):
+        # An editor that leaves a tab, or a CRLF save, must not turn a blank
+        # line into a shard; the verifier's parse skips such lines too.
+        (self.tmp / "eval" / "ledger-reader-apps.txt").write_text(
+            "1000 5000 secret-zero\n\t\n\r\n1001 5001 secret-one\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            "APP=1001 INST=5001 KEY=/k/1.pem",
+            self._picked(self._select("kube-agents-evals-13", EVAL_LEDGER_APP_KEY_FILES="/k/0.pem /k/1.pem")),
+        )
+
+    def test_ids_from_the_environment_are_exported_for_the_mint(self):
+        # Assigned without export by a shell that sourced the script, the ids
+        # still have to reach the python mint, which reads the environment.
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                f'SCRIPT_DIR="{self.tmp}"',
+                _extract(r"^readonly EVAL_LEDGER_READER_APPS_FILE=[^\n]*$", "EVAL_LEDGER_READER_APPS_FILE"),
+                _extract(r"^readonly LEDGER_READER_SHARD_SIZE=\d+$", "LEDGER_READER_SHARD_SIZE"),
+                _extract(r"^ledger_reader_shard\(\) \{.*?^\}", "ledger_reader_shard"),
+                _extract(r"^select_ledger_reader\(\) \{.*?^\}", "select_ledger_reader"),
+                "EVAL_LEDGER_APP_ID=424242",
+                "EVAL_LEDGER_INSTALLATION_ID=515151",
+                'select_ledger_reader kube-agents-evals-2 >/dev/null',
+                "python3 -c 'import os; print(\"ENV=\" + os.environ.get(\"EVAL_LEDGER_APP_ID\", \"unset\") + \"/\" + os.environ.get(\"EVAL_LEDGER_INSTALLATION_ID\", \"unset\"))'",
+            ]
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"EVAL_LEDGER_APP_KEY_FILE": "/mine/key.pem", "EVAL_LEDGER_APP_KEY_FILES": "/k/0.pem /k/1.pem /k/2.pem"},
+                absent=["EVAL_LEDGER_APP_ID", "EVAL_LEDGER_INSTALLATION_ID"],
+            ),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("ENV=424242/515151", proc.stdout)
+
+    def test_an_empty_table_stops_the_run(self):
+        (self.tmp / "eval" / "ledger-reader-apps.txt").write_text("# nothing yet\n", encoding="utf-8")
+        proc = self._select("kube-agents-evals-3", EVAL_LEDGER_APP_KEY_FILE="/k/0.pem")
+        self.assertEqual(1, proc.returncode)
+        self.assertIn("names no ledger-reader App", proc.stderr)
+
+    def test_without_a_key_the_ids_are_set_and_the_pat_stands(self):
+        # A local run with no App key: the ids still name the shard (the
+        # resets' messages print them) and the key stays unset, which is how
+        # every mint knows to leave BENCH_GITHUB_TOKEN alone.
+        self.assertEqual("APP=1002 INST=5002 KEY=", self._picked(self._select("kube-agents-evals-22")))
+
+    def test_ids_from_the_environment_stand_with_their_key(self):
+        proc = self._select(
+            "kube-agents-evals-2",
+            EVAL_LEDGER_APP_ID="424242",
+            EVAL_LEDGER_INSTALLATION_ID="515151",
+            EVAL_LEDGER_APP_KEY_FILE="/mine/key.pem",
+            EVAL_LEDGER_APP_KEY_FILES="/k/0.pem /k/1.pem /k/2.pem",
+        )
+        self.assertEqual("APP=424242 INST=515151 KEY=/mine/key.pem", self._picked(proc))
+        self.assertIn("from the environment", proc.stdout)
 
 
 class LedgerMintContractTest(unittest.TestCase):
