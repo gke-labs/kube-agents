@@ -30,7 +30,10 @@ findings come from the issue itself, whose title is fleet-audit's
 body has one ``### <Severity> (<n>)`` section per severity, most severe first,
 each finding a ``#### <title> <!-- finding:<id> -->`` heading, with a
 ``<!-- finding-new -->`` line under it when the run measured it as new since
-the last; the collector's held rows under ``## Held by the collector`` are not
+the last; findings that did not fit in full are one-line bullets between
+``<!-- audit-listed:begin -->`` and ``<!-- audit-listed:end -->`` (each with an
+optional ``<!-- finding-new -->`` line beneath it) and are read after the full
+sections; the collector's held rows under ``## Held by the collector`` are not
 this run's findings, and a ``#`` line inside a finding's fenced evidence ends
 no section.
 Nothing in the report's own text can set the counts or pick the link, beyond
@@ -180,6 +183,24 @@ FINDING_HEADING = re.compile(
 #: fleet-audit's ``NEW_MARKER``: the first line under a finding's heading, blank
 #: lines aside, when the run measured the finding as new since the last.
 NEW_MARKER = re.compile(r"\n(?:[ \t]*\n)*[ \t]*<!--[ \t]*finding-new[ \t]*-->[ \t]*$", re.MULTILINE)
+#: fleet-audit's listed-without-detail span and row shape (``LISTED_SECTION_BEGIN`` /
+#: ``LISTED_SECTION_END`` and ``render_listed_finding`` in ``audit_report.py``).
+#: Read only between one begin and one end marker in order, before any held span,
+#: with each group bounded so a hostile line cannot backtrack.
+HELD_SECTION_BEGIN = re.compile(r"\A[ \t]*<!--[ \t]*audit-held:begin")
+LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
+LISTED_SECTION_END = "<!-- audit-listed:end -->"
+LISTED_ROW_PREFIX = "- **"
+LISTED_LINE_MAX = 3000
+LISTED_TRAILING_WHITESPACE = " \t"
+LISTED_ESCAPED_PIPE = r"\|"
+PIPE = "|"
+LISTED_ROW = re.compile(
+    r"\A- \*\*(?P<severity>critical|major|minor)\*\* — (?P<title>[^\n]{1,1000}?) — "
+    r"`[^`\n]{0,400}`(?: / `[^`\n]{0,400}`| / _cluster-scoped_) — "
+    r"`[^`\n]{0,400}` \(`[^`\s]{1,100}`\)(?: — [^`\n]{0,1000})?\Z"
+)
+LISTED_NEW_MARKER = re.compile(r"\A[ \t]*<!--[ \t]*finding-new[ \t]*-->[ \t]*\Z")
 NEW_TAG = " · _new_"
 #: A title's own trailing "new" tag in any spelling (``·  _new_``, ``• *new*``, ``— _NEW_.``),
 #: which only the marker may add; searched for in the last TAG_CLAIM_REACH characters only,
@@ -192,13 +213,14 @@ FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 FENCE_HARD_BREAK = re.compile(r"^####[ \t].*<!--[ \t]*finding:")
 #: Harness-written lines that end a fence the model left open, so one unbalanced
 #: fence cannot swallow every finding after it: a finding heading, the exact
-#: severity heading fleet-audit's renderer writes, or the held marker. Any other
-#: ``### `` line is not one, since evidence output can start with it. A fence
-#: closed before the next finding heading is evidence, and none of these ends it.
+#: severity heading fleet-audit's renderer writes, or the listed or held begin
+#: marker. Any other ``### `` line is not one, since evidence output can start
+#: with it. A fence closed before the next finding heading is evidence, and none
+#: of these ends it.
 FENCE_BREAK = re.compile(
     r"^(?:####[ \t].*<!--[ \t]*finding:"
     r"|###[ \t]+(?:Critical|Major|Minor)[ \t]+\(\d+(?:[ \t]+of[ \t]+\d+)?\)[ \t]*$"
-    r"|<!--[ \t]*audit-held:begin)"
+    r"|<!--[ \t]*audit-(?:listed|held):begin)"
 )
 #: fleet-audit's summary over the findings: the true totals, which the sections
 #: show only as far as the body's budget let them.
@@ -488,8 +510,44 @@ class Finding(NamedTuple):
     new: bool
 
 
+def _listed_findings(body: str) -> list[Finding]:
+    """Every finding listed without detail between fleet-audit's brackets, in body order.
+
+    Read only before any held section and only when the fence-stripped body
+    carries exactly one ``LISTED_SECTION_BEGIN`` and one ``LISTED_SECTION_END``
+    line in order, each alone on its line. Any other shape yields nothing.
+    """
+    lines = body.split("\n")
+    begins = [idx for idx, line in enumerate(lines) if line.strip() == LISTED_SECTION_BEGIN]
+    ends = [idx for idx, line in enumerate(lines) if line.strip() == LISTED_SECTION_END]
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        return []
+    held_idx = next((idx for idx, line in enumerate(lines) if HELD_SECTION_BEGIN.match(line)), len(lines))
+    if ends[0] >= held_idx:
+        return []
+    span = lines[begins[0] + 1 : ends[0]]
+    found: list[Finding] = []
+    for idx, line in enumerate(span):
+        if not line.startswith(LISTED_ROW_PREFIX) or len(line) > LISTED_LINE_MAX:
+            continue
+        match = LISTED_ROW.match(line.rstrip(LISTED_TRAILING_WHITESPACE))
+        if not match:
+            continue
+        title = match.group("title").strip().replace(LISTED_ESCAPED_PIPE, PIPE)
+        if not title:
+            continue
+        is_new = False
+        for nxt in span[idx + 1 :]:
+            if not nxt.strip():
+                continue
+            is_new = bool(LISTED_NEW_MARKER.match(nxt))
+            break
+        found.append(Finding(match.group("severity"), title, is_new))
+    return found
+
+
 def _severity_findings(body: str) -> list[Finding]:
-    """Every finding under a severity section, in body order."""
+    """Every finding under a severity section or listed without detail, in body order."""
     # fleet-audit's own reader does the same: a body edited in the browser is CRLF.
     body = _without_fences(body.replace("\r\n", "\n"))
     found = []
@@ -502,7 +560,7 @@ def _severity_findings(body: str) -> list[Finding]:
             Finding(severity, match.group(1).strip(), bool(NEW_MARKER.match(text, match.end())))
             for match in FINDING_HEADING.finditer(text)
         ]
-    return found
+    return found + _listed_findings(body)
 
 
 def _label_names(labels: object) -> list[str]:
@@ -598,11 +656,11 @@ def _lead_agrees(line: str, totals: dict[str, int]) -> bool:
 
 
 def _totals(body: str, findings: list[Finding], critical: int) -> dict[str, int]:
-    """Findings by severity: the summary's totals, else the sections'; the title's critical count.
+    """Findings by severity: the summary's totals, else what the body lists; the title's critical count.
 
-    Never fewer than the sections list, the title's count included: a title edited on the
-    forge must not leave the card counting fewer critical findings than it lists. The title
-    counts only over a body that lists a critical, which fleet-audit renders first: otherwise
+    Never fewer than the body lists (full sections and listed rows), the title's count included:
+    a title edited on the forge must not leave the card counting fewer critical findings than it lists.
+    The title counts only over a body that lists a critical, which fleet-audit renders first: otherwise
     the card would lead on criticals it has no row for.
     """
     summary = FINDINGS_SUMMARY.search(body)
@@ -800,7 +858,7 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
 
 
 def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict, str] | None:
-    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for ``spec.mode: next``.
+    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for the gateway.
 
     ``(chat, text)``, or None whenever :func:`blocks_from_issue` is. The same
     headline, rows, lines under them, "Look at the first one" and ledger link,
@@ -890,7 +948,7 @@ def blocks_from_summary(report: str) -> tuple[list[dict], str] | None:
 
 
 def chat_from_summary(report: str) -> tuple[dict, str] | None:
-    """:func:`summary_card` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+    """:func:`summary_card` as a ``kube-agents.chat/v1`` message for the gateway: ``(chat, text)``, or None.
 
     ``text`` is :func:`headline_from_summary`'s markdown, the fallback the
     gateway posts when it does not lay the message out.
@@ -942,11 +1000,11 @@ def failed_line(report: str) -> str | None:
 
 
 def failed_chat(report: str) -> tuple[dict, str] | None:
-    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for the gateway: ``(chat, text)``, or None.
 
-    The line is the message, and the whole report folds under it ("why"): under
-    next a reply in the thread reaches the gateway, which cannot replay the
-    report the way ``incident_context`` does under today. ``text`` is the
+    The line is the message, and the whole report folds under it ("why"): a
+    reply in the thread reaches the gateway, which cannot replay the report
+    the way ``incident_context`` did on the Hermes Slack platform. ``text`` is the
     report itself, the fallback the gateway posts when it does not lay the
     message out. None for a report past the fold's cap: the fold would be its only
     Slack copy, so it goes out whole as text rather than clipped.

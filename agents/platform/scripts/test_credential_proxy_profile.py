@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import http.client
+import inspect
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import command_policy
 import credential_proxy
 import task_confinement
 import task_credential
+import vcs_broker
 from credential_proxy import CredentialProxyHandler, Policy
 from credential_proxy_client import ClusterTarget
 from task_confinement import ConfinementRefusal, confine
@@ -1410,13 +1412,60 @@ class ProfileSlotShareTest(unittest.TestCase):
 
 
 class ProfileRouteTableTest(unittest.TestCase):
-    def test_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self):
+    def test_the_profile_role_reaches_exec_mcp_vcs_and_the_audit_reports_alone(self):
         # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
-        # its handler (#3658); every other route stays closed to the role.
-        reached = {"/v1/exec", credential_proxy.mcp_policy.MCP_RELAY_PREFIX}
+        # its handler (#3658), the version-control routes to the reads and the
+        # permit-gated writes (#3993), and the audit-report routes to the
+        # report rules (#5619); every other route stays closed to the role.
+        reached = {
+            "/v1/exec",
+            credential_proxy.mcp_policy.MCP_RELAY_PREFIX,
+            "/v1/vcs/",
+            credential_proxy.AUDIT_REPORTS_PREFIX,
+        }
         for prefix, roles in credential_proxy.ROUTE_ROLES:
             with self.subTest(prefix=prefix):
                 self.assertEqual(prefix in reached, credential_proxy.CALLER_ROLE_PROFILE in roles)
+
+    def test_the_broker_and_the_verifier_name_one_permit(self):
+        self.assertEqual(task_credential.PERMIT_VCS_PROPOSAL_CREATE, credential_proxy.VCS_PROPOSAL_CREATE_PERMIT)
+        self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, task_credential.KNOWN_PERMITS)
+
+    def test_the_profile_vcs_verbs_are_the_reads_and_the_three_gated_writes(self):
+        self.assertEqual(PROFILE_VCS_READS | PROFILE_VCS_WRITES, credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_PROFILE])
+        self.assertEqual(PROFILE_VCS_WRITES, credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS)
+        self.assertEqual(frozenset(), PROFILE_VCS_READS & vcs_broker.WRITE_VERBS)
+
+    def test_an_ungated_profile_write_is_refused_at_import(self):
+        for verb in ("branch-delete", "proposal-comment", "issue-create"):
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, "without the task credential's permit"):
+                credential_proxy._validate_role_vcs_verbs(
+                    {credential_proxy.CALLER_ROLE_PROFILE: frozenset({"proposal-view", verb})}
+                )
+        for verb in ("snapshot", "capabilities"):
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, "does not manage"):
+                credential_proxy._validate_role_vcs_verbs(
+                    {credential_proxy.CALLER_ROLE_PROFILE: frozenset({"proposal-view", verb})}
+                )
+        credential_proxy._validate_role_vcs_verbs(credential_proxy.ROLE_VCS_VERBS)
+
+    def test_a_profile_write_outside_the_ownership_check_is_refused_at_import(self):
+        # A write added to the profile role and to the permit set, but not to
+        # the ownership set, would reach any proposal in a managed repository.
+        table = {
+            credential_proxy.CALLER_ROLE_PROFILE: credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_PROFILE]
+            | {"proposal-close"}
+        }
+        gated = credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS | {"proposal-close"}
+        with self.assertRaisesRegex(ValueError, "without the ownership check"):
+            credential_proxy._validate_role_vcs_verbs(table, gated, credential_proxy.PROFILE_OWNERSHIP_GATED_VCS_VERBS)
+        with self.assertRaisesRegex(ValueError, "without the ownership check"):
+            credential_proxy._validate_role_vcs_verbs(
+                credential_proxy.ROLE_VCS_VERBS,
+                credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS,
+                frozenset({"publish", "proposal-update"}),
+            )
+        credential_proxy._validate_role_vcs_verbs(table, gated, credential_proxy.PROFILE_OWNERSHIP_GATED_VCS_VERBS | {"proposal-close"})
 
     def test_the_shim_and_the_broker_name_one_header(self):
         import credential_proxy_client
@@ -1425,6 +1474,602 @@ class ProfileRouteTableTest(unittest.TestCase):
 
     def test_kubectl_and_gcloud_only(self):
         self.assertEqual(frozenset({"kubectl", "gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_PROFILE])
+
+
+# The install's own forge login, and the repository every ownership case is on.
+AGENT_LOGIN = "kube-agents[bot]"
+OWNED_REPO = "acme/infra"
+
+
+def _proposal(number, source, author=AGENT_LOGIN, source_repo=OWNED_REPO, state="open"):
+    """A proposal as the providers translate one (the neutral shape)."""
+    return {
+        "number": number, "source": source, "sourceRepo": source_repo, "author": author,
+        "state": state, "url": f"https://github.com/{OWNED_REPO}/pull/{number}",
+    }
+
+
+class _OwnershipForge:
+    """The two reads require_agent_proposal makes: proposal-view and proposal-list."""
+
+    verbs = ("proposal-view", "proposal-list")
+
+    def __init__(self, proposals):
+        self.proposals = dict(proposals)
+
+    def proposal_view(self, api, repo, payload):
+        return {"proposal": self.proposals[payload["number"]]}
+
+    def proposal_list(self, api, repo, query):
+        return {
+            "proposals": [
+                item for item in self.proposals.values()
+                if item["source"] == query.get("source") and item["state"] == query.get("state")
+            ]
+        }
+
+
+def _ownership_broker(forge, viewer, repo=OWNED_REPO):
+    """What VcsBroker.require_agent_proposal reads off self: _bind and _viewer."""
+    bound = type("Bound", (), {"forge": forge, "repo": repo, "api": staticmethod(lambda *a, **k: None)})()
+    return type(
+        "OwnershipBroker", (), {"_bind": lambda self, payload: bound, "_viewer": lambda self, b: viewer}
+    )()
+
+
+# The profile role's version-control verbs (#3993), spelled out here rather
+# than read off the broker's table, so a change to either side is a red test.
+PROFILE_VCS_READS = frozenset(
+    {"clone", "proposal-view", "proposal-list", "proposal-commits", "branch-view", "identity", "issue-list", "issue-view"}
+)
+PROFILE_VCS_WRITES = frozenset({"publish", "proposal-create", "proposal-update"})
+PERMIT = CASES["a permit"]
+
+
+class ProfileVcsRouteTest(unittest.TestCase):
+    """POST /v1/vcs/<verb> for a profile caller, end to end over HTTP.
+
+    Real fixture credentials through the real gate: "valid" carries no permit,
+    "a permit" carries vcs:proposal-create, both bound to the same pod. The
+    forge is a stand-in: every verb's route is a recording mock, and the
+    managed list answers what each test says.
+    """
+
+    PAYLOAD = {
+        "repository": "https://github.com/acme/infra", "number": 7, "branch": "platform-agent/fix",
+        "title": "t", "body": "b",
+    }
+
+    setUp_base = ProfileRouteTest.setUp
+    _restore = ProfileRouteTest.__dict__["_restore"]
+    set_gate = ProfileRouteTest.set_gate
+    post = ProfileRouteTest.post
+
+    def setUp(self):
+        self.addCleanup(
+            ProfileRouteTest._restore, "vcs", "vcs" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("vcs"),
+        )
+        self.setUp_base()
+        vcs = mock.Mock()
+        vcs.snapshot_source.side_effect = lambda repository: (repository, None)
+        forge = mock.Mock()
+        forge.name = "github"
+        vcs.registry.resolve.return_value = (forge, "acme/infra")
+        CredentialProxyHandler.vcs = vcs
+        self.vcs = vcs
+        self.routes = {verb: mock.Mock(return_value={"ok": verb}) for verb in vcs_broker.VCS_VERBS}
+        patcher = mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value=self.routes)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The ownership bar runs the real VcsBroker.require_agent_proposal
+        # against a stand-in forge: proposal 7, on platform-agent/fix, is the
+        # install's own.
+        self.forge = _OwnershipForge({7: _proposal(7, "platform-agent/fix")})
+        self.ownership = _ownership_broker(self.forge, viewer=AGENT_LOGIN)
+        vcs.require_agent_proposal = mock.Mock(
+            side_effect=lambda verb, payload: vcs_broker.VcsBroker.require_agent_proposal(self.ownership, verb, payload)
+        )
+        self.managed = mock.Mock(return_value=True)
+        patcher = mock.patch.object(credential_proxy, "repository_is_managed", self.managed)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # proposal-create from a profile task carries only the fields every adapter
+    # reads, so it gets a payload of its own.
+    CREATE_PAYLOAD = {
+        "repository": "https://github.com/acme/infra", "title": "t", "body": "b",
+        "source": "platform-agent/new-change", "target": "main",
+    }
+
+    # proposal-update from a profile task carries only which proposal and its
+    # text.
+    UPDATE_PAYLOAD = {"repository": "https://github.com/acme/infra", "number": 7, "title": "t", "body": "b"}
+
+    def payload_for(self, verb):
+        return {"proposal-create": self.CREATE_PAYLOAD, "proposal-update": self.UPDATE_PAYLOAD}.get(verb, self.PAYLOAD)
+
+    def vcs_post(self, verb, token):
+        return self.post(self.payload_for(verb), token=token, path=f"/v1/vcs/{verb}")
+
+    def assert_ran(self, verb, status, body):
+        self.assertEqual(200, status, body)
+        self.assertEqual({"ok": verb}, body)
+        self.routes[verb].assert_called_once_with(self.payload_for(verb))
+
+    def assert_permit_refused(self, verb, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual("CALLER_PERMIT_REQUIRED", body.get("code"), body)
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_PERMIT, body["rule"])
+        self.routes[verb].assert_not_called()
+        # Refused before the managed list or the forge were asked anything.
+        self.vcs.registry.resolve.assert_not_called()
+        self.managed.assert_not_called()
+
+    def reset(self):
+        for route in self.routes.values():
+            route.reset_mock()
+        self.vcs.registry.resolve.reset_mock()
+        self.managed.reset_mock()
+
+    # -- reads -----------------------------------------------------------------
+
+    def test_every_read_verb_runs_with_a_credential_and_no_permit(self):
+        for verb in sorted(PROFILE_VCS_READS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, VALID["token"])
+                self.assert_ran(verb, status, body)
+
+    def test_a_profile_vcs_request_takes_the_profile_share_and_the_background_class(self):
+        # As on /v1/exec: a profile worker's clone or publish is bounded by
+        # profile_slots and admitted as background work, so it can't spend the
+        # interactive reserve the shell and the session pods keep.
+        sessions, classes = [], []
+
+        def session_slot(handler, role):
+            sessions.append(role)
+            return contextlib.nullcontext()
+
+        def request_slot(handler, klass=credential_proxy.CLASS_INTERACTIVE):
+            classes.append(klass)
+            return contextlib.nullcontext()
+
+        with mock.patch.object(CredentialProxyHandler, "_session_slot", session_slot), \
+                mock.patch.object(CredentialProxyHandler, "_request_slot", request_slot):
+            status, body = self.vcs_post("proposal-list", VALID["token"])
+        self.assert_ran("proposal-list", status, body)
+        self.assertEqual([credential_proxy.CALLER_ROLE_PROFILE], sessions)
+        self.assertEqual([credential_proxy.CLASS_BACKGROUND], classes)
+
+    def test_a_busy_answer_says_whether_it_came_before_admission(self):
+        """vcs_call sends a request again only on a refusal that ran nothing (#6247)."""
+        busy = credential_proxy.CommandSlotUnavailable("at the profile share", bound="profile")
+
+        def refusing_slot(handler, role):
+            raise busy
+
+        with mock.patch.object(CredentialProxyHandler, "_session_slot", refusing_slot):
+            status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(503, status, body)
+        self.assertIs(True, body.get(credential_proxy.BUSY_BEFORE_ADMISSION_KEY), body)
+        self.routes["proposal-create"].assert_not_called()
+
+        # Past admission -- a credential refresh's wait inside the route, after
+        # the forge may have been called -- the answer does not say so.
+        self.reset()
+        self.routes["proposal-create"].side_effect = credential_proxy.CommandSlotUnavailable(
+            "waiting on the refresh", bound="budget"
+        )
+        status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(503, status, body)
+        self.assertNotIn(credential_proxy.BUSY_BEFORE_ADMISSION_KEY, body)
+        import credential_proxy_client
+
+        self.assertEqual(
+            credential_proxy.BUSY_BEFORE_ADMISSION_KEY, credential_proxy_client.BUSY_BEFORE_ADMISSION_KEY
+        )
+
+    def test_every_read_verb_runs_with_the_permit_too(self):
+        for verb in sorted(PROFILE_VCS_READS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assert_ran(verb, status, body)
+
+    def test_a_read_still_meets_the_managed_list(self):
+        self.managed.return_value = False
+        status, body = self.vcs_post("proposal-view", VALID["token"])
+        self.assertEqual(403, status, body)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", body["code"])
+        self.routes["proposal-view"].assert_not_called()
+
+    # -- no credential -----------------------------------------------------------
+
+    def test_no_credential_is_refused_for_every_admitted_verb(self):
+        for verb in sorted(PROFILE_VCS_READS | PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, None)
+                self.assert_permit_refused(verb, status, body)
+                self.assertIn("needs a task credential", body["error"])
+
+    def test_a_refused_credential_is_refused_whole(self):
+        status, body = self.vcs_post("publish", CASES["permits on the nats audience"]["token"])
+        self.assertEqual(403, status, body)
+        self.assertEqual(credential_proxy.RULE_TASK_CREDENTIAL, body["rule"])
+        self.routes["publish"].assert_not_called()
+
+    # -- writes ------------------------------------------------------------------
+
+    def test_every_write_verb_is_refused_without_the_permit(self):
+        for verb in sorted(PROFILE_VCS_WRITES):
+            for spelling in (verb, verb.replace("-", "_")):
+                with self.subTest(spelling=spelling):
+                    self.reset()
+                    status, body = self.vcs_post(spelling, VALID["token"])
+                    self.assert_permit_refused(verb, status, body)
+                    self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, body["error"])
+
+    def test_a_refused_write_with_a_large_body_still_reads_its_403(self):
+        """The refusal comes before the body is read; the broker drains it first,
+        or a caller still sending reads a reset in place of the 403 (#6247)."""
+        payload = json.dumps({**self.PAYLOAD, "bundle": "x" * (3 << 20)}).encode("utf-8")
+        self.assertGreater(len(payload), CredentialProxyHandler.max_request_bytes)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=30)
+        self.addCleanup(connection.close)
+        connection.request(
+            "POST", "/v1/vcs/publish", body=payload,
+            headers={"Content-Type": "application/json", credential_proxy.TASK_CREDENTIAL_HEADER: VALID["token"]},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        self.assert_permit_refused("publish", response.status, body)
+
+    def test_every_answer_before_the_body_is_read_drains_it_first(self):
+        source = inspect.getsource(CredentialProxyHandler._dispatch_vcs_post)
+        before_read = source.split("payload = self._read_json_body", 1)[0]
+        answers = before_read.count("self._json(")
+        self.assertEqual(5, answers, "an answer was added or removed ahead of the body read; drain it")
+        self.assertEqual(answers, before_read.count("self._drain_vcs_body(body_limit)"))
+
+    # -- the issue-list query (#6247) ----------------------------------------
+
+    def test_an_issue_list_query_with_a_qualifier_is_refused(self):
+        fields = [
+            {"query": q}
+            for q in (
+                "repo:other/secret", "org:acme bug", "is:open user:someone", "crash :x",
+                # No colon, yet each would change what GitHub reads after it.
+                '"crash', "crash (", "crash\\", "crash OR", "NOT crash", "a AND b",
+                "crash\x00", "crash\nmore", "x" * 257,
+            )
+        ]
+        fields += [
+            {"labels": ['bug" repo:other/secret "']},
+            {"excludeLabels": ["ok", 'x" org:acme "']},
+            {"labels": ["a\\"]},
+        ]
+        for extra in fields:
+            with self.subTest(extra=extra):
+                self.reset()
+                status, body = self.post(
+                    {**self.PAYLOAD, **extra}, token=VALID["token"], path="/v1/vcs/issue-list"
+                )
+                self.assertEqual(403, status, body)
+                self.assertEqual(credential_proxy.PROFILE_QUERY_QUALIFIER_CODE, body["code"])
+                self.assertEqual(credential_proxy.RULE_CALLER_VCS_QUERY, body["rule"])
+                self.routes["issue-list"].assert_not_called()
+                # Refused before the forge or the managed list were asked.
+                self.vcs.registry.resolve.assert_not_called()
+
+    def test_an_issue_list_query_of_plain_words_runs(self):
+        for extra in (
+            {"query": "node pressure"}, {}, {"query": ""}, {"query": "or and not ORbit it's #42 a-b/c"},
+            {"labels": ["area: networking", "good first issue"], "excludeLabels": ["platform-agent/claimed"]},
+        ):
+            with self.subTest(extra=extra):
+                self.reset()
+                payload = {**self.PAYLOAD, **extra}
+                status, body = self.post(payload, token=VALID["token"], path="/v1/vcs/issue-list")
+                self.assertEqual(200, status, body)
+                self.routes["issue-list"].assert_called_once_with(payload)
+
+    def test_the_query_rule_is_the_profile_roles_alone(self):
+        refusal = credential_proxy.profile_issue_query_refusal
+        self.assertIsNotNone(refusal({"query": "repo:x/y"}))
+        self.assertIsNone(refusal({"query": "plain words"}))
+        self.assertIsNone(refusal({}))
+        self.assertIsNone(refusal({"query": 7}))  # the adapter refuses a non-string
+        self.assertIsNotNone(refusal({"labels": ['x" repo:y/z "']}))
+        self.assertIsNone(refusal({"labels": "not-a-list"}))
+        source = inspect.getsource(CredentialProxyHandler._dispatch_vcs_post)
+        self.assertIn('if role == CALLER_ROLE_PROFILE and verb == "issue-list":', source)
+
+    def test_every_write_verb_runs_with_the_permit(self):
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assert_ran(verb, status, body)
+                self.managed.assert_called_once()
+
+    def test_a_permitted_write_to_an_unmanaged_repository_is_refused(self):
+        # The permit names no repository; the managed list is what bounds
+        # where a permitted write may land.
+        self.managed.return_value = False
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(403, status, body)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", body["code"])
+                self.routes[verb].assert_not_called()
+                self.managed.assert_called_once()
+
+    def test_every_other_verb_is_refused_even_with_the_permit(self):
+        others = sorted(vcs_broker.VCS_VERBS - PROFILE_VCS_READS - PROFILE_VCS_WRITES)
+        self.assertIn("branch-delete", others)
+        self.assertIn("snapshot", others)
+        self.assertIn("capabilities", others)
+        for verb in others:
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(403, status, body)
+                self.assertEqual("CALLER_VERB_FORBIDDEN", body["code"])
+                self.routes[verb].assert_not_called()
+
+    # -- ownership (the permit does not reach a person's proposal) -----------------
+
+    def assert_ownership_refused(self, verb, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual("PROPOSAL_NOT_OURS", body.get("code"), body)
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_OWNERSHIP, body["rule"])
+        self.routes[verb].assert_not_called()
+
+    def post_with(self, verb, **fields):
+        return self.post({**self.payload_for(verb), **fields}, token=PERMIT["token"], path=f"/v1/vcs/{verb}")
+
+    def test_proposal_update_runs_on_the_installs_own_proposal(self):
+        status, body = self.post_with("proposal-update")
+        self.assertEqual(200, status, body)
+        self.routes["proposal-update"].assert_called_once()
+
+    def test_proposal_update_is_refused_on_a_proposal_that_is_not_the_installs(self):
+        cases = {
+            "a person's proposal": _proposal(8, "platform-agent/fix-2", author="alice"),
+            "the install's login, off the branch namespace": _proposal(8, "release-1.2"),
+            # A fork's head ref can read platform-agent/... and its author be
+            # the install's login; its head repository is still the fork.
+            "a fork, with the install's login and a platform-agent/ branch": _proposal(
+                8, "platform-agent/fix", source_repo="kube-agents/infra"
+            ),
+            "a same-name repository under another owner": _proposal(
+                8, "platform-agent/fix", source_repo="other-owner/infra"
+            ),
+            "a deleted fork (no head repository)": _proposal(8, "platform-agent/fix", source_repo=""),
+        }
+        for name, proposal in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.forge.proposals[8] = proposal
+                status, body = self.post_with("proposal-update", number=8)
+                self.assert_ownership_refused("proposal-update", status, body)
+
+    def test_a_dotted_top_level_group_is_still_the_installs_own_repository(self):
+        # The broker's bound repository is the forge's path, with no host. A
+        # GitLab group may carry a dot (my.org/sub/project); taking that for a
+        # host and stripping it would find none of the install's proposals.
+        dotted = "my.org/sub/project"
+        forge = _OwnershipForge({7: _proposal(7, "platform-agent/fix", source_repo=dotted)})
+        broker = _ownership_broker(forge, viewer=AGENT_LOGIN, repo=dotted)
+        vcs_broker.VcsBroker.require_agent_proposal(broker, "proposal-update", {"number": 7})
+        vcs_broker.VcsBroker.require_agent_proposal(
+            broker, "publish", {"branch": "platform-agent/fix"}
+        )
+
+    def test_proposal_update_is_refused_when_the_credential_cannot_name_itself(self):
+        self.ownership = _ownership_broker(self.forge, viewer="")
+        status, body = self.post_with("proposal-update")
+        self.assert_ownership_refused("proposal-update", status, body)
+
+    def test_publish_is_refused_off_the_branch_namespace(self):
+        for branch in ("fix", "main", "release-1.2", "platform-agentx/fix"):
+            with self.subTest(branch=branch):
+                self.reset()
+                status, body = self.post_with("publish", branch=branch)
+                self.assert_ownership_refused("publish", status, body)
+
+    def test_publish_is_refused_for_a_ref_spelling_of_a_namespace_branch(self):
+        # publish pushes refs/heads/<branch> as given: heads/platform-agent/x
+        # would pass a check on its short name and land as
+        # refs/heads/heads/platform-agent/x.
+        for branch in ("heads/platform-agent/x", "refs/heads/platform-agent/x", "refs/heads/platform-agent/fix"):
+            with self.subTest(branch=branch):
+                self.reset()
+                status, body = self.post_with("publish", branch=branch)
+                self.assert_ownership_refused("publish", status, body)
+
+    def test_proposal_update_may_not_edit_labels_even_on_the_installs_own_proposal(self):
+        for fields in (
+            {"labelsRemove": ["do-not-merge/hold"]},
+            {"labelsAdd": ["lgtm"]},
+            {"labelsAdd": ["approved"], "labelsRemove": ["do-not-merge/hold"]},
+            {"labels": ["lgtm"]},
+            {"labelsAdd": []},
+        ):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-update", **fields)
+                self.assertEqual(403, status, body)
+                self.assertEqual("PROFILE_LABELS_FORBIDDEN", body.get("code"), body)
+                self.assertEqual(credential_proxy.RULE_CALLER_VCS_LABELS, body["rule"])
+                self.routes["proposal-update"].assert_not_called()
+
+    def test_proposal_update_carries_only_the_text(self):
+        for fields in ({"target": "main"}, {"state": "closed"}, {"draft": False}):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-update", **fields)
+                self.assert_ownership_refused("proposal-update", status, body)
+        for fields in ({"title": "new title"}, {"body": "new body"}):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-update", **fields)
+                self.assertEqual(200, status, body)
+                self.routes["proposal-update"].assert_called_once()
+
+    def test_publish_runs_under_the_branch_namespace(self):
+        status, body = self.post_with("publish", branch="platform-agent/new-change")
+        self.assertEqual(200, status, body)
+        self.routes["publish"].assert_called_once()
+
+    def test_advance_runs_onto_the_installs_own_proposal_branch(self):
+        status, body = self.post_with("publish", advance=True)
+        self.assertEqual(200, status, body)
+        self.routes["publish"].assert_called_once()
+
+    def test_advance_is_refused_onto_a_branch_whose_proposal_is_not_the_installs(self):
+        cases = {
+            "a person's proposal": _proposal(9, "platform-agent/theirs", author="alice"),
+            "a fork's proposal": _proposal(9, "platform-agent/theirs", source_repo="kube-agents/infra"),
+            "another owner's same-name repository": _proposal(9, "platform-agent/theirs", source_repo="other-owner/infra"),
+        }
+        for name, proposal in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.forge.proposals[9] = proposal
+                status, body = self.post_with("publish", branch="platform-agent/theirs", advance=True)
+                self.assert_ownership_refused("publish", status, body)
+        # And a branch with the install's proposal beside a person's.
+        self.reset()
+        self.forge.proposals[9] = _proposal(9, "platform-agent/fix", author="alice")
+        status, body = self.post_with("publish", advance=True)
+        self.assert_ownership_refused("publish", status, body)
+
+    def test_advance_is_refused_onto_a_branch_with_no_open_proposal(self):
+        status, body = self.post_with("publish", branch="platform-agent/nothing-open", advance=True)
+        self.assert_ownership_refused("publish", status, body)
+
+    def test_publish_without_advance_is_refused_onto_a_branch_carrying_anothers_proposal(self):
+        # A publish without `advance` still fast-forwards an existing remote
+        # branch, so the open proposals on it are checked either way.
+        cases = {
+            "a person's proposal": _proposal(9, "platform-agent/theirs", author="alice"),
+            "a fork's proposal": _proposal(9, "platform-agent/theirs", source_repo="kube-agents/infra"),
+            "another owner's same-name repository": _proposal(9, "platform-agent/theirs", source_repo="other-owner/infra"),
+        }
+        for name, proposal in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.forge.proposals[9] = proposal
+                status, body = self.post_with("publish", branch="platform-agent/theirs")
+                self.assert_ownership_refused("publish", status, body)
+        self.reset()
+        self.forge.proposals[9] = _proposal(9, "platform-agent/fix", author="alice")
+        status, body = self.post_with("publish")
+        self.assert_ownership_refused("publish", status, body)
+
+    def test_publish_without_advance_runs_onto_the_installs_own_proposal_branch(self):
+        status, body = self.post_with("publish")  # platform-agent/fix carries proposal 7, the install's
+        self.assertEqual(200, status, body)
+        self.routes["publish"].assert_called_once()
+
+    def test_publish_is_refused_when_the_open_proposals_fill_a_page(self):
+        for number in range(20, 20 + vcs_broker.OPEN_PROPOSALS_ON_A_BRANCH):
+            self.forge.proposals[number] = _proposal(number, "platform-agent/busy")
+        for advance in (False, True):
+            with self.subTest(advance=advance):
+                self.reset()
+                status, body = self.post_with("publish", branch="platform-agent/busy", advance=advance)
+                self.assert_ownership_refused("publish", status, body)
+
+    def test_proposal_create_runs_from_the_installs_own_branch(self):
+        status, body = self.post_with("proposal-create", source="platform-agent/new-change")
+        self.assertEqual(200, status, body)
+        self.routes["proposal-create"].assert_called_once()
+
+    def test_proposal_create_is_refused_off_the_branch_namespace(self):
+        # The ref spellings too: one spelling of a branch, the bare name.
+        for source in (
+            "fix", "main", "refs/heads/main", "release-1.2", "platform-agentx/fix",
+            "refs/heads/platform-agent/new-change", "heads/platform-agent/new-change",
+        ):
+            with self.subTest(source=source):
+                self.reset()
+                status, body = self.post_with("proposal-create", source=source)
+                self.assert_ownership_refused("proposal-create", status, body)
+
+    def test_proposal_create_is_refused_from_a_fork_or_another_repository(self):
+        # The cross-repository head form, and every field that could name a
+        # source repository on some adapter: none is read today, and none is
+        # left for a later adapter to honour.
+        for fields in (
+            {"source": "kube-agents:platform-agent/fix"},
+            {"source": "other-owner:platform-agent/fix"},
+            {"sourceRepo": "kube-agents/infra"},
+            {"sourceRepo": "other-owner/infra"},
+            {"head": "other-owner:platform-agent/fix"},
+            {"headRepo": "other-owner/infra"},
+            {"head_repo": "other-owner/infra"},
+            {"source_project_id": 42},
+            {"sourceProject": "other-owner/infra"},
+            {"fork": True},
+            {"labels": ["lgtm"]},
+            {"labelsAdd": ["approved"]},
+        ):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-create", **fields)
+                self.assert_ownership_refused("proposal-create", status, body)
+
+    # -- the platform agent is unchanged ------------------------------------------
+
+    def test_the_shell_is_not_held_to_the_ownership_bar(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
+        )
+        self.forge.proposals[8] = _proposal(8, "release-1.2", author="alice")
+        self.forge.proposals[9] = _proposal(9, "platform-agent/theirs", author="alice")
+        for verb, fields in (
+            ("proposal-update", {"number": 8}),
+            ("publish", {"branch": "feature/person"}),
+            ("publish", {"branch": "release-1.2", "advance": True}),
+            ("publish", {"branch": "platform-agent/theirs"}),
+            ("proposal-create", {"source": "feature/person"}),
+            ("proposal-create", {"source": "platform-agent/x", "sourceRepo": "other-owner/infra"}),
+            ("proposal-create", {"source": "platform-agent/x", "labels": ["lgtm"]}),
+            ("proposal-update", {"number": 8, "labelsAdd": ["lgtm"], "labelsRemove": ["do-not-merge/hold"]}),
+            ("proposal-update", {"number": 7, "target": "main"}),
+            ("publish", {"branch": "heads/platform-agent/x"}),
+            ("publish", {"branch": "refs/heads/platform-agent/x"}),
+        ):
+            with self.subTest(verb=verb, fields=fields):
+                self.reset()
+                sent = {**self.payload_for(verb), **fields}
+                status, body = self.post(sent, token=None, path=f"/v1/vcs/{verb}")
+                self.assertEqual(200, status, body)
+                self.routes[verb].assert_called_once_with(sent)
+        CredentialProxyHandler.vcs.require_agent_proposal.assert_not_called()
+
+    def test_the_shell_reaches_every_verb_with_no_task_credential(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
+        )
+        for verb in sorted(vcs_broker.VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, None)
+                if verb == credential_proxy.PROPOSAL_CLAIM_VERB:
+                    # proposal-claim burns a claim token before its route
+                    # runs, and this request presents none, so it stops at
+                    # the verb's own check: past every caller gate, which is
+                    # what this test is about.
+                    self.assertEqual(404, status, body)
+                    self.assertEqual("CLAIM_UNKNOWN", body.get("code"), body)
+                    continue
+                self.assert_ran(verb, status, body)
 
 
 class ProfileAuthenticatorTest(unittest.TestCase):
@@ -1701,8 +2346,9 @@ class ReportCredentialTest(unittest.TestCase):
                 self.assert_report_refused(*self.request(method, path))
 
     def test_a_listed_route_passes_the_gate(self):
-        # No handler serves these yet (#5619 PR 3): past the gate, GET is the
-        # broker's unknown-route answer, not the allowlist's refusal.
+        # Past the gate, the store routes decide (test_audit_report_routes):
+        # here the profile is on no report allowlist, so the answer is theirs,
+        # not the allowlist's refusal.
         for method, path in REPORT_ROUTES:
             if method != "GET":
                 continue

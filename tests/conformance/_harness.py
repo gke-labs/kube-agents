@@ -334,6 +334,20 @@ SOURCES: dict[str, Source] = {
     # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
     # can compare them, and a NetworkPolicy that selects nothing is
     # indistinguishable from one that is working.
+    # The broker's a2a-chat caller binding (#6090): the env name the operator
+    # renders, which the Python broker reads under its own constant. Two
+    # modules, so only this suite can see the two names drift apart.
+    "a2a_chat_callers_env_go": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("credentialProxyA2AChatCallersEnvVar =",),
+    ),
+    # The exec tier's list of the broker env it leaves out (#6090): the A2A
+    # gateway stays an allowed caller there, so its a2a-chat binding must not
+    # be on that list.
+    "exec_tier_env_go": Source(
+        "k8s-operator/internal/controller/credential_proxy_exec_tier.go",
+        ("credentialProxyA2AChatAudienceEnvVar: true,",),
+    ),
     "a2a_session_fence": Source(
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
@@ -423,6 +437,18 @@ SOURCES: dict[str, Source] = {
     "operator_labels": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
+    ),
+    # The audit-report store's operator half (#5619): the env names it
+    # reserves, and the gateway-policy rule.
+    "audit_report_store_operator": Source(
+        "k8s-operator/internal/controller/audit_report_store.go",
+        ("auditReportStoreEnvNames", "auditReportStoreIngressRule("),
+    ),
+    # The listener itself, read as text: the suite does not import it (it
+    # needs FastAPI and cryptography).
+    "audit_report_store_listener": Source(
+        "agents/platform/scripts/audit_report_store.py",
+        ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
     ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",

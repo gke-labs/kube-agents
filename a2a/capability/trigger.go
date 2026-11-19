@@ -24,10 +24,10 @@ type Trigger struct {
 	Stream string `json:"stream,omitempty"`
 	// Script, on a built-in schedule's run, names the profile script the run
 	// executes (#5622): a label, never a path, and only on a schedule's
-	// trigger. The profile allowlist that resolves it to a path is a later
-	// change. Bound in the grant, so the whole-trigger equality the verifier
-	// requires covers it. Empty on every other trigger, and nothing writes it
-	// yet.
+	// trigger. The gateway writes it from the submission's trigger.script;
+	// the dispatcher's profile allowlist (#5953) resolves it to a path
+	// against the profile's spec.scripts. Bound in the grant, so the whole-trigger equality the
+	// verifier requires covers it. Empty on every other trigger.
 	Script string `json:"script,omitempty"`
 }
 

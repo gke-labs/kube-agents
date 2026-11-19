@@ -115,6 +115,13 @@ const (
 	a2aRatingLabel          = "rating"
 	a2aRatingUp             = "up"
 	a2aRatingDown           = "down"
+	// a2aPostFeedbackSeries is the A2A gateway's count of the ratings
+	// verified senders gave the posts it made on its own (alerts and
+	// scheduled or audit reports), by platform, rating and kind: under
+	// a2aRatingUp autonomousPositiveFeedbackTotal, under a2aRatingDown
+	// autonomousNegativeFeedbackTotal, each summed over the family's other
+	// labels and never into the answer counters (a2a/gateway/metrics.go).
+	a2aPostFeedbackSeries = "kubeagents_a2a_gateway_post_feedback_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -363,11 +370,12 @@ var (
 		},
 		"git": {
 			"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
-			"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
-			"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
-			"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
-			"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
+			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "diff-tree",
+			"fetch", "init", "log", "ls-files", "ls-remote", "ls-tree", "merge",
+			"merge-base", "mv", "pull", "push", "rebase", "remote", "reset", "restore",
+			"rev-list", "rev-parse", "revert", "rm", "show", "sparse-checkout", "stash",
+			"status", "submodule", "switch", "symbolic-ref", "tag", "update-ref",
+			"version", "worktree",
 		},
 		"gh": {
 			"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -433,6 +441,10 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return chatFeedbackNegativeSeries, nil
 	case usageCounterPositiveFeedback:
 		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
+	case usageCounterAutonomousNegativeFeedback:
+		return a2aPostFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}
+	case usageCounterAutonomousPositiveFeedback:
+		return a2aPostFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
 	case usageCounterInputTokens:
 		return litellmInputSeries, nil
 	case usageCounterOutputTokens:
@@ -1003,7 +1015,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						continue
 					}
 					if name == kanbanDispatcherStuckSecondsSeries {
-						// Bounded as the age is, for the condition's message.
+						// Bounded as the age is. The condition uses the value only to
+						// pick the board that it names.
 						if len(dispatcher.Stuck) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
 							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 						}

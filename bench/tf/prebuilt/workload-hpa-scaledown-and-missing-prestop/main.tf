@@ -16,9 +16,8 @@
 #
 # It plants a two-replica Deployment whose containers declare no preStop hook
 # and a HorizontalPodAutoscaler on it whose scale-down behavior has no
-# stabilization window and removes every replica a period allows. No
-# obtainability check reads the scale-down behavior today; the case carries
-# expected_fail: true and the planted pair is what a fix would have to name.
+# stabilization window and removes every replica a period allows, which
+# obtainability-audit check 3.25 (`hpa-aggressive-scaledown`) flags.
 #
 # Isolation class: namespace-scoped. The namespace, its labels, the leftover
 # pre-clear and the teardown are the namespaced-plant module's; this file

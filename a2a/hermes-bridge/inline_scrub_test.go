@@ -1,6 +1,7 @@
 package hermesbridge
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -698,5 +699,134 @@ func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
 	kv := "| Key | Value |\n|---|---|\n| db-password | Synth3tic-Pass-0042 |\n"
 	if got := scrubInlineSecrets(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
 		t.Errorf("a key/value table leaked: %q", got)
+	}
+}
+
+// TestScrubInlineSecretsAMarkBeforeTheSeparator: a * or _ that markdown
+// normalising leaves as text between a key and its separator doesn't stop
+// the key matching (#6182). Synthetic values only.
+func TestScrubInlineSecretsAMarkBeforeTheSeparator(t *testing.T) {
+	for _, in := range []string{
+		// #6182's shapes: a stray mark pairs with one of the label's, and
+		// the label's other mark stays before the colon.
+		"Note * *password*: quietpasture",
+		"- *password* * : quietpasture",
+		"1234. * *password*: quietpasture",
+		"a * b *password*: quietpasture",
+		// A mark left before the separator some other way.
+		"password*: quietpasture",
+		"- password*: quietpasture",
+		"*password * : quietpasture",
+		"token _= quietpasture",
+		"password\t*: quietpasture",
+		// A bullet before a label whose own mark stays before the separator.
+		"* password *: quietpasture",
+		"* token *= quietpasture",
+		"- * password *: quietpasture",
+		// Bullet lines wrapped in or ending with marks: redacted whole.
+		"* password: correct quietpasture battery staple *",
+		"* **Passphrase**: *correct quietpasture battery staple*",
+	} {
+		if got := scrubInlineSecrets(in); strings.Contains(got, "quietpasture") {
+			t.Errorf("scrubInlineSecrets(%q) = %q: the value is not redacted", in, got)
+		}
+	}
+	// Shapes the markdown pass handles through its pairing, as at main.
+	for in, want := range map[string]string{
+		"*password*: quietpasture":             "*password*: [redacted]",
+		"* password*: quietpasture":            "* password*: [redacted]",
+		"**Token:** quietpasture":              "**Token:** [redacted]",
+		"Note password: ** quietpasture ** ok": "Note password: ** [redacted] ** ok",
+		"export DB_PASSWORD=* quietpasture *":  "export DB_PASSWORD=* [redacted] *",
+		`{"password": * quietpasture *}`:       `{"password": * [redacted] *}`,
+		`"password": * *quietpasture*`:         `"password": * *[redacted]`,
+		"Note _ _PASSWORD was quietpasture.":   "Note _ _PASSWORD was [redacted].",
+		"password: quietpasture*":              "password: [redacted]",
+		"password: *quietpasture":              "password: [redacted]",
+		"password: quietpasture **":            "password: [redacted]",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The wider separator changes nothing else: a later "key*:" inside a
+	// passphrase doesn't split it, and a mark isn't a blank before "=".
+	for in, want := range map[string]string{
+		"password: correct horse secret*: staple":  "password: [redacted]",
+		"password: correct horse token * : staple": "password: [redacted]",
+		"PASSWORD*= HOST=db.example":               "PASSWORD*= HOST=db.example",
+		// A quoted key ending in _ still matches, as at main.
+		`{"password_": "Synth3tic-Pass-0001"}`:  `{"password_": "[redacted]"}`,
+		`"DB_PASSWORD_": "Synth3tic-Pass-0001"`: `"DB_PASSWORD_": "[redacted]"`,
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestScrubInlineSecretsAMarkLeftAgainstALabel: a * or _ the markdown pass
+// leaves glued to a credential label still reads as a mark, not as part of
+// the label (#6201): a key's trailing _ before its separator, and the same
+// mark after the credential word in prose. Synthetic values only.
+func TestScrubInlineSecretsAMarkLeftAgainstALabel(t *testing.T) {
+	for _, in := range []string{
+		// A key's trailing _ before its separator.
+		"password_: quietpasture",
+		"- password_: quietpasture",
+		"token_= quietpasture",
+		"DB_PASSWORD_: quietpasture",
+		"Note _ _password_: quietpasture",
+		// The same mark after the credential word in prose.
+		"Note * *the password* is quietpasture",
+		"a * b *the token* was quietpasture",
+		"Note _ _password_ is quietpasture",
+	} {
+		if got := scrubInlineSecrets(in); strings.Contains(got, "quietpasture") {
+			t.Errorf("scrubInlineSecrets(%q) = %q: the value is not redacted", in, got)
+		}
+	}
+	for in, want := range map[string]string{
+		// Unchanged from main: quoted keys ending in _, spaced marks around
+		// a value, and an emphasised label.
+		`{"password_": "Synth3tic-Pass-0001"}`:  `{"password_": "[redacted]"}`,
+		`"DB_PASSWORD_": "Synth3tic-Pass-0001"`: `"DB_PASSWORD_": "[redacted]"`,
+		"export DB_PASSWORD=* quietpasture *":   "export DB_PASSWORD=* [redacted] *",
+		"Note password: ** quietpasture ** ok":  "Note password: ** [redacted] ** ok",
+		"**Token:** quietpasture":               "**Token:** [redacted]",
+		"password: quietpasture*":               "password: [redacted]",
+		// A non-secret key ending in _ stays a non-secret key.
+		"host_: db.example": "host_: db.example",
+		// As at main: an assignment with a marked credential word is the
+		// key/value rule's, value whole; a key that only ends in
+		// "authorization", and a --flag, keep the auth-scheme rule.
+		"password* = quiet.pasture.0001":                   "password* = [redacted]",
+		"user = bob, password* = Synth3tic.Pass, host = h": "user = bob, password* = [redacted], host = h",
+		"preauthorization*: Bearer Synth3tic-Pass-0001":    "preauthorization*: Bearer [redacted]",
+		"--Authorization _=Bearer Synth3tic-Pass-0001":     "--Authorization [redacted] [redacted]",
+		"--Authorization *:Bearer Synth3tic-Pass-0001":     "--Authorization [redacted] [redacted]",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestScrubProseSecretsAMarkedNounStillNamesTheSecret: a prose value whose
+// credential word keeps a mark is still reported to the sink as named, so
+// the seen-values pool catches a later bare repeat of it (#6201).
+func TestScrubProseSecretsAMarkedNounStillNamesTheSecret(t *testing.T) {
+	for _, in := range []string{
+		"Note _ _password_ is quietpasture",
+		"Note * *the password* is quietpasture",
+	} {
+		var seen []string
+		got := scrubProseSecrets(in, func(v string) { seen = append(seen, v) })
+		if strings.Contains(got, "quietpasture") {
+			t.Errorf("scrubProseSecrets(%q) = %q: the value is not redacted", in, got)
+		}
+		if !slices.Contains(seen, "quietpasture") {
+			t.Errorf("scrubProseSecrets(%q) reported %q to the sink; want the value", in, seen)
+		}
 	}
 }

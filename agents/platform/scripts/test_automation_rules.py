@@ -355,12 +355,12 @@ class TestWithDeny(unittest.TestCase):
                 before = ar.parse(text)
                 self.assertEqual(before.status, ar.LOADED, before.error)
                 try:
-                    out = ar.with_deny(text, "no-pdb", "prod")
+                    out = ar.with_deny(text, "no-pdb", "dev")
                 except ar.RulesError:
                     continue
                 after = ar.parse(out)
                 self.assertEqual(after.allow, before.allow)
-                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", ("prod",)),))
+                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", ("dev",)),))
 
 
 class TestWithAllow(unittest.TestCase):

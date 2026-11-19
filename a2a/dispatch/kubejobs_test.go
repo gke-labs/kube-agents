@@ -33,7 +33,8 @@ import (
 // the Job carries it untouched.
 func kubeJobsTemplate() corev1.PodTemplateSpec {
 	return corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/component": "profile-worker"}},
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/component": "profile-worker",
+			lib.ProfileNameLabel: "inv", lib.ProfileTierLabel: "unattended"}},
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
 			ServiceAccountName: "agentprofile-inv-unattended",
@@ -66,11 +67,11 @@ func TestTheKubeJobIsTheTemplateAsRendered(t *testing.T) {
 	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
 	ctx := context.Background()
 	for range 2 {
-		if _, err := k.Launch(ctx, "inv", "unattended", "task-1"); err != nil {
+		if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	job, err := kube.BatchV1().Jobs("ns-profiles").Get(ctx, JobName("inv", "unattended", "task-1"), metav1.GetOptions{})
+	job, err := kube.BatchV1().Jobs("ns-profiles").Get(ctx, JobName("inv", "unattended", lib.SubmitKindTop, "task-1"), metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +98,7 @@ func TestTheKubeJobIsTheTemplateAsRendered(t *testing.T) {
 	if job.Annotations[jobTaskAnnotation] != "task-1" {
 		t.Errorf("annotations %v", job.Annotations)
 	}
-	if JobName("inv", "unattended", "task-1") == JobName("inv", "unattended", "task-2") || len(JobName("a", "b", "c")) > 63 {
+	if JobName("inv", "unattended", lib.SubmitKindTop, "task-1") == JobName("inv", "unattended", lib.SubmitKindTop, "task-2") || len(JobName("a", "b", lib.SubmitKindTop, "c")) > 63 {
 		t.Error("Job names must differ per task and fit a label value")
 	}
 }
@@ -107,7 +108,7 @@ func TestAKubeJobNeedsATemplate(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	cfg.Profiles[0].JobTemplate = nil
 	kube := fake.NewClientset()
-	if _, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", "task-1"); err == nil {
+	if _, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1"); err == nil {
 		t.Fatal("launched a Job for a profile with no template")
 	}
 	if jobs, _ := kube.BatchV1().Jobs("ns-profiles").List(context.Background(), metav1.ListOptions{}); len(jobs.Items) != 0 {
@@ -124,9 +125,13 @@ func TestAKubeJobNeedsATemplate(t *testing.T) {
 func TestAKubeJobIsFoundAgainWithItsCreation(t *testing.T) {
 	cfg := kubeJobsConfig(t)
 	created := metav1.NewTime(time.Now().Add(-time.Hour).Truncate(time.Second))
-	kube := fake.NewClientset(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "ns-profiles",
-		Name: JobName("inv", "unattended", "task-1"), CreationTimestamp: created}})
-	got, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", "task-1")
+	existing, err := buildJob(cfg, &cfg.Profiles[0], cfg.Profiles[0].JobTemplate, "unattended", lib.SubmitKindTop, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.CreationTimestamp = created
+	kube := fake.NewClientset(existing)
+	got, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,11 +145,11 @@ func TestKubeJobsFindsTheJobsPod(t *testing.T) {
 	kube := fake.NewClientset()
 	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
 	ctx := context.Background()
-	name := JobName("inv", "unattended", "task-1")
-	if _, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); err != nil || !failed {
+	name := JobName("inv", "unattended", lib.SubmitKindTop, "task-1")
+	if _, failed, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil || !failed {
 		t.Errorf("no Job: failed %v err %v, want failed", failed, err)
 	}
-	if _, err := k.Launch(ctx, "inv", "unattended", "task-1"); err != nil {
+	if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 		t.Fatal(err)
 	}
 	job, _ := kube.BatchV1().Jobs("ns-profiles").Get(ctx, name, metav1.GetOptions{})
@@ -154,7 +159,7 @@ func TestKubeJobsFindsTheJobsPod(t *testing.T) {
 	}
 	pod := func(n string, owner *batchv1.Job, ready bool, phase corev1.PodPhase) *corev1.Pod {
 		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: "ns-profiles", Labels: map[string]string{jobNameLabel: name}},
-			Status: corev1.PodStatus{Phase: phase}}
+			Spec: corev1.PodSpec{ServiceAccountName: "agentprofile-inv-unattended"}, Status: corev1.PodStatus{Phase: phase}}
 		if owner != nil {
 			p.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(owner, batchv1.SchemeGroupVersion.WithKind("Job"))}
 		}
@@ -166,24 +171,24 @@ func TestKubeJobsFindsTheJobsPod(t *testing.T) {
 	if _, err := kube.CoreV1().Pods("ns-profiles").Create(ctx, pod("impostor", nil, true, corev1.PodRunning), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if p, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); p != "" || failed || err != nil {
+	if p, failed, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); p != "" || failed || err != nil {
 		t.Errorf("only a pod the Job doesn't control: %q %v %v, want none yet", p, failed, err)
 	}
 	if _, err := kube.CoreV1().Pods("ns-profiles").Create(ctx, pod("job-pod", job, true, corev1.PodRunning), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if p, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); p != "job-pod" || failed || err != nil {
+	if p, failed, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); p != "job-pod" || failed || err != nil {
 		t.Errorf("Pod = %q %v %v, want job-pod", p, failed, err)
 	}
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}
 	if _, err := kube.BatchV1().Jobs("ns-profiles").Update(ctx, job, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, failed, _ := k.Pod(ctx, "inv", "unattended", "task-1"); !failed {
+	if _, failed, _ := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !failed {
 		t.Error("a failed Job isn't failed")
 	}
 	for range 2 {
-		if err := k.Delete(ctx, "inv", "unattended", "task-1"); err != nil {
+		if err := k.Delete(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -198,10 +203,10 @@ func TestAFailedKubeJobPodIsFailed(t *testing.T) {
 	kube := fake.NewClientset()
 	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
 	ctx := context.Background()
-	if _, err := k.Launch(ctx, "inv", "unattended", "task-1"); err != nil {
+	if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 		t.Fatal(err)
 	}
-	name := JobName("inv", "unattended", "task-1")
+	name := JobName("inv", "unattended", lib.SubmitKindTop, "task-1")
 	job, _ := kube.BatchV1().Jobs("ns-profiles").Get(ctx, name, metav1.GetOptions{})
 	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "job-pod", Namespace: "ns-profiles", Labels: map[string]string{jobNameLabel: name},
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: name, UID: job.UID, Controller: ptr.To(true)}}},
@@ -209,7 +214,7 @@ func TestAFailedKubeJobPodIsFailed(t *testing.T) {
 	if _, err := kube.CoreV1().Pods("ns-profiles").Create(ctx, p, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); !failed || err != nil {
+	if _, failed, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !failed || err != nil {
 		t.Errorf("failed %v err %v, want failed", failed, err)
 	}
 }
@@ -318,15 +323,15 @@ func TestAFinishedKubeJobIsFailed(t *testing.T) {
 			kube := fake.NewClientset()
 			k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
 			ctx := context.Background()
-			if _, err := k.Launch(ctx, "inv", "unattended", "task-1"); err != nil {
+			if _, err := k.Launch(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 				t.Fatal(err)
 			}
-			job, err := kube.BatchV1().Jobs("ns-profiles").Get(ctx, JobName("inv", "unattended", "task-1"), metav1.GetOptions{})
+			job, err := kube.BatchV1().Jobs("ns-profiles").Get(ctx, JobName("inv", "unattended", lib.SubmitKindTop, "task-1"), metav1.GetOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			finish(t, kube, job)
-			if _, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); !failed || err != nil {
+			if _, failed, err := k.Pod(ctx, "inv", "unattended", lib.SubmitKindTop, "task-1"); !failed || err != nil {
 				t.Errorf("failed %v err %v, want failed", failed, err)
 			}
 		})
@@ -349,7 +354,7 @@ func TestAPolicyRefusalIsTold(t *testing.T) {
 			kube.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
 				return true, nil, apierrors.NewForbidden(batchv1.Resource("jobs"), "x", errors.New(c.msg))
 			})
-			_, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", "task-1")
+			_, err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", lib.SubmitKindTop, "task-1")
 			if err == nil || errors.Is(err, ErrJobRefusedByPolicy) != c.want {
 				t.Errorf("err %v: refused-by-policy %v, want %v", err, errors.Is(err, ErrJobRefusedByPolicy), c.want)
 			}
@@ -374,10 +379,10 @@ func renderedFixtureJob(t *testing.T, cfg lib.DispatchConfig) (*batchv1.Job, err
 		}
 		return param, nil
 	}
-	if _, err := k.Launch(context.Background(), "tse", "unattended", "task-1"); err != nil {
+	if _, err := k.Launch(context.Background(), "tse", "unattended", lib.SubmitKindTop, "task-1"); err != nil {
 		return nil, err
 	}
-	return kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(context.Background(), JobName("tse", "unattended", "task-1"), metav1.GetOptions{})
+	return kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(context.Background(), JobName("tse", "unattended", lib.SubmitKindTop, "task-1"), metav1.GetOptions{})
 }
 
 // A config that names a template reads it from the param only while the
@@ -414,7 +419,7 @@ func TestTheJobTemplateIsReadOnlyWhenItIsTheConfigsRendering(t *testing.T) {
 			if c.name == "another profile's" {
 				prof.Name = "other"
 			}
-			tmpl, err := k.jobTemplate(context.Background(), "ns", prof)
+			tmpl, err := k.jobTemplate(context.Background(), "ns", prof, "unattended")
 			if c.current {
 				if err != nil || len(tmpl) == 0 {
 					t.Fatalf("template %s, err %v: want the param's", tmpl, err)
@@ -431,7 +436,7 @@ func TestTheJobTemplateIsReadOnlyWhenItIsTheConfigsRendering(t *testing.T) {
 		t.Fatal("an inline template was looked up")
 		return nil, nil
 	}}
-	if tmpl, err := k.jobTemplate(context.Background(), "ns", &lib.DispatchProfile{Name: "tse", JobTemplate: inline}); err != nil || string(tmpl) != string(inline) {
+	if tmpl, err := k.jobTemplate(context.Background(), "ns", &lib.DispatchProfile{Name: "tse", JobTemplate: inline}, "unattended"); err != nil || string(tmpl) != string(inline) {
 		t.Fatalf("inline template %s, err %v: want it as sent", tmpl, err)
 	}
 }

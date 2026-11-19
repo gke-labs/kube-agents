@@ -21,10 +21,17 @@ Name why one pod cannot be placed, quote the scheduler's message, and propose th
    kubectl get events -n <namespace> --field-selector involvedObject.name=<pod> -o custom-columns=LAST:.lastTimestamp,REASON:.reason,COUNT:.count,MESSAGE:.message
    ```
 
-3. Read the nodes' pools, taints and allocatable capacity, only if the message names resources, taints or affinity:
+3. Read the nodes' pools, taints and allocatable capacity, only if the message names resources, taints or affinity, or if a `NotTriggerScaleUp` event gives no reason:
 
    ```bash
    kubectl get nodes -o custom-columns='NAME:.metadata.name,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool,CLASS:.metadata.labels.cloud\.google\.com/compute-class,TAINTS:.spec.taints[*].key,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory'
+   ```
+
+   When a `NotTriggerScaleUp` event gives no reason, also read the namespace's labels, and the cluster's version and node pools:
+
+   ```bash
+   kubectl get namespace <namespace> -o jsonpath='{.metadata.labels}{"\n"}'
+   gcloud container clusters describe <cluster_name> --location <cluster_location> --project <project_id> --format="json(currentMasterVersion,nodePools[].name,nodePools[].locations,nodePools[].config.labels,nodePools[].autoscaling)"
    ```
 
 4. Read quota or claims only if the message names them:
@@ -46,8 +53,23 @@ Name why one pod cannot be placed, quote the scheduler's message, and propose th
 | `exceeded quota`                                      | Namespace ResourceQuota reached               | Raise the quota or lower requests                                        |
 | `pod triggered scale-up`, `TriggeredScaleUp`          | Cluster autoscaler or Autopilot adding a node | None: report the pod as initializing                                     |
 | `max node group size reached`, `ScaleUpFailed`        | Node pool at its autoscaling ceiling          | Raise the pool's max nodes, or lower requests                            |
+| `Pod didn't trigger scale-up:` and no reason after it | Likely a ComputeClass pre-filter skip         | Name the class in the pod template (see the note below); no larger pool  |
 
 On Autopilot, a ComputeClass the pod selects that cannot be provisioned shows in the events; quote that event.
+
+A repeated `NotTriggerScaleUp` event with the message `Pod didn't trigger scale-up:` and no reason after the colon can be a ComputeClass pre-filter skip: the Cluster Autoscaler does not scale up a pool that has a `cloud.google.com/compute-class` label for a pod that does not name that class. Rule it out before you stop at `Insufficient cpu` or propose a larger pool. It is the likely cause when all of these are true:
+
+- The pod names no ComputeClass: `cloud.google.com/compute-class` is not in its `nodeSelector` and not in a required `nodeAffinity` term. Both count as naming the class.
+- A default class on the namespace (the label `cloud.google.com/default-compute-class` or `cloud.google.com/default-compute-class-non-daemonset`) counts only when the pod's `nodeSelector` shows the class: GKE adds it to pods that are created after the label. A label that was set after the pod was created does not rule the skip out.
+- Each node pool with autoscaling on has the class label in `config.labels`, and has room to grow. `autoscaling.maxNodeCount` is for each zone: compare the pool's node count with `autoscaling.totalMaxNodeCount` when it is set, else with `maxNodeCount` times the number of the pool's zones (`locations`).
+- The event is repeated. One event with no reason is not enough: the autoscaler can write one before it gives a reason, such as `1 max node group size reached`.
+
+Then:
+
+- State the version (`currentMasterVersion`). The skip was seen on GKE 1.35.8 and was not seen on GKE 1.36.4. On another version, say that it is not confirmed there.
+- Report the cause as likely. These steps do not read the autoscaler's visibility log or a cluster default class (a ComputeClass with the name `default`): name both as the reads that confirm it.
+- Give `cloud.google.com/compute-class: <name>` in the pod template's `nodeSelector` as the patch. A namespace default-class label is the other way; it applies to new pods only, so pods that were Pending before the label must be created again.
+- Do not call it a capacity shortage, and do not propose a larger pool or lower requests.
 
 # Rules
 

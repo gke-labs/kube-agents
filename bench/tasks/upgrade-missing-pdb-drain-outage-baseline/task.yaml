@@ -7,7 +7,7 @@
 id: upgrade-missing-pdb-drain-outage-baseline
 name: "Multi-Replica Deployment With No PodDisruptionBudget Before a Node Upgrade Drain (no-pdb)"
 domain: reliability
-suite: certification
+suite: validated-capabilities
 audit_streams:
   - obtainability-audit
 fixtures: []

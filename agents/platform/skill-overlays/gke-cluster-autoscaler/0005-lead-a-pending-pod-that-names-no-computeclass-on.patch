@@ -1,0 +1,50 @@
+Subject: Lead a pending Pod that names no ComputeClass on a labelled pool to its cause and its namespace fix
+
+Why: A question about Pending Pods and no scale-up starts in this skill, and its checklist had no item for a pool that carries a compute-class label while the Pods name no class. With an empty `NotTriggerScaleUp` reason the agent then looks for a constraint on the Pod and puts the fix in the controller's code. The new item leads to the cause (details stay in gke-compute-classes, Symptom 13), and a short section gives the fix for workloads with generated names: the default class label on the namespace, which applies to new Pods only (tested on GKE 1.35.8-gke.1796000).
+Local-Issue: #2528
+Eval-Case: autoscaler-pending-generated-workloads-probe
+Upstream-Issue: none filed yet
+Retire-When: upstream's pending pod checklist names this case and the namespace fix
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -36,7 +36,7 @@ description: >-
+ - **Pool Fragmentation:** Avoid pool limits (>200 pools degrades performance) by using intent-based sizing (`machineFamily: n4`) instead of SKU-pinned ComputeClasses.
+ - **CUDs vs Reservations:** CUDs are auto-consumed by matched machine families (no config). Reservations are NOT auto-consumed; target them explicitly via ComputeClass `reservations` block or Node Pool API. **New reservations lag Cluster Autoscaler's cache:** wait **≥30 min** after creating a reservation before driving scale-up against it — targeting it sooner makes Cluster Autoscaler back off that reservation and stall.
+ - **CapacityBuffer (pre-warm / instant nodes / provisioning lag):** When nodes take too long to appear on traffic spikes and `--min-nodes` is unwanted, use the CapacityBuffer CRD — placeholder pods hold warm idle nodes, evicted instantly by real workloads. Size via `replicas: N` (fixed) or `percentage: 20` (dynamic). Example: `assets/capacity-buffer-serving.yaml`.
+-- **Scale-up blockers:** Spot/GCE stockout (`scale.up.error.out.of.resources` = capacity exhausted in that zone/region; fix by adding an On-Demand fallback to the ComputeClass priorities — defer to `gke-compute-classes` for that YAML — and/or `locationPolicy: ANY` to try other zones), GCE Quota (`scale.up.error.quota.exceeded`), Pod IP exhaustion (`scale.up.error.ip.space.exhausted`), `--max-nodes` pool limits, or GKE version/machine family mismatch. Quota/capacity errors trigger exponential backoff.
++- **Scale-up blockers:** Spot/GCE stockout (`scale.up.error.out.of.resources` = capacity exhausted in that zone/region; fix by adding an On-Demand fallback to the ComputeClass priorities — defer to `gke-compute-classes` for that YAML — and/or `locationPolicy: ANY` to try other zones), GCE Quota (`scale.up.error.quota.exceeded`), Pod IP exhaustion (`scale.up.error.ip.space.exhausted`), `--max-nodes` pool limits, or GKE version/machine family mismatch. Quota/capacity errors trigger exponential backoff. **No error and an empty `NotTriggerScaleUp` reason** while the pool is below its maximum is not a stockout: check for a pool that carries a compute-class label while the Pods name no class (`references/ca-debug.md`, Pending Pod Checklist).
+ - **Zonal stockout cooldown cascade (excess fallback to a lower tier):** A hard GCE stockout error (`out_of_resources` / `ZONE_RESOURCE_POOL_EXHAUSTED`) puts the **affected priority tier on a ~5-min cooldown whose scope depends on the GKE version**: before `1.36.3-gke.1244000` the whole tier cools down across ALL zones; from `1.36.3-gke.1244000` only the stocked-out zone does, and the healthy zones keep provisioning the preferred tier (quota errors stay regional; see `gke-compute-classes`). Check the cluster's version before diagnosing. During a cross-zone cooldown all pending pods — even unconstrained ones — skip that tier and route to the next obtainable priority across ALL zones, so the fleet drains toward the lowest tier. The trigger is a **constrained** pod (zonal PV / zonal `nodeSelector`/affinity) that FORCES a scale-up in the stocked-out zone; unconstrained pods alone never trip it (`BALANCED` just skews them to healthy zones — see Location Policy). Fixes (defer YAML to `gke-compute-classes`): (1) insert an **intermediate-family priority tier** between the preferred and bottom families so a cooldown falls one rung, not straight to the cheapest tier; (2) **isolate zonal-PV/stateful workloads** (own ComputeClass/namespace) so their forced stockouts don't cascade the stateless fleet; (3) pod `topologySpreadConstraints` with `DoNotSchedule`.
+ - **Scale-down blockers:** See the CRITICAL `SCALE-DOWN BLOCKERS` rule above for the full enumeration to walk.
+ - **GCE Autoscaler Conflict:** Disable GCE Autoscaler on Managed Instance Groups (MIGs) used by GKE node pools to prevent aggressive node oscillation and thrashing.
+diff --git a/references/ca-debug.md b/references/ca-debug.md
+--- a/references/ca-debug.md
++++ b/references/ca-debug.md
+@@ -17,10 +17,11 @@
+ 2. **Hit `--max-nodes`?** Check pool limits.
+ 3. **Selector Conflict?** Pod Pins `gke-spot=true` while ComputeClass is On-Demand.
+ 4. **node pool auto-creation Enabled?** Check `nodePoolAutoCreation.enabled: true`.
+-5. **Visibility Logs:** Read `noDecisionStatus.noScaleUp` for exact rejection reason.
++5. **Visibility Logs:** Read `noDecisionStatus.noScaleUp` for exact rejection reason. No reason at all (Pods under `unhandledPodGroups`, no `rejectedMigs`, no `skippedMigs`) is a finding too: see **Pool labelled for a ComputeClass** below.
+ 6. **EKS to GKE Selector Translation:** If migrating from EKS/Karpenter, ensure the user translates AWS-style or generic selectors (`machine-family`) to GKE-native ones (`cloud.google.com/machine-family`). A common cause of `scale.up.no.scale.up` is a Pod asking for `machine-family: c3` while GKE only recognizes `cloud.google.com/machine-family: c3`.
+ 7. **Machine Series Support:** If node pool auto-creation fails to provision nodes for a specific `machineFamily` or `instance-type` (e.g., N4, C3A), verify the GKE version supports that series for node pool auto-creation / Autopilot. Old GKE versions will ignore unsupported series. Check GKE release notes or node pool auto-creation docs for version requirements.
+ 8. **Brand-new reservation?** A reservation created in the last ~30 min may not be in Cluster Autoscaler's cache yet. Targeting it before the cache catches up makes Cluster Autoscaler back off that reservation and stall. Wait **≥30 min** after creating the reservation before driving scale-up against it (see `ca-optimization.md`).
++9. **Pool labelled for a ComputeClass, Pod names no class?** Compare the Pod's `nodeSelector` / required `nodeAffinity` on `cloud.google.com/compute-class` against the node pools' `cloud.google.com/compute-class` labels (`kubectl get nodes -L cloud.google.com/compute-class`). A namespace default class (the label `cloud.google.com/default-compute-class` or `cloud.google.com/default-compute-class-non-daemonset`) counts only when it shows in the Pod spec as a `nodeSelector` that GKE added: a label set after the Pod was created does not reach it. Check also that no cluster default class is on. If every pool that could grow carries the label with no taint and the Pod names no class, the Pods can stay `Pending` with an **empty** `NotTriggerScaleUp` reason while the pool is below its maximum (`autoscaling.maxNodeCount` is for each zone: compare the pool's node count with `autoscaling.totalMaxNodeCount` when it is set, else with `autoscaling.maxNodeCount` times the number of zones in the pool's `locations`). No scale-up was tried, so this is **not** a stockout. Seen on GKE 1.35.8-gke.1796000, not on 1.36.4-gke.2377000; other versions were not tested. Sign, checks and fix: Symptom 13 in `skills/gke-compute-classes/references/compute-class-debug.md` (the `gke-compute-classes` skill). For workloads with generated names: **Workloads With Generated Names** below.
+ 
+ ## Finding Scale-down Blockers
+ 
+@@ -38,6 +39,13 @@
+ - **Pool Count:** Beyond ~200 pools, autoscaling slows down. Consolidate near-duplicate ComputeClasses.
+ - **Spot Grace Period:** Default is 30s. Extend to 120s (GKE 1.35+) via `shutdownGracePeriodSeconds` in `kubeletConfig`.
+ 
++## Workloads With Generated Names
++Symptom: a controller creates Deployments such as `<app>-<uuid>` through the Kubernetes API, and their Pods name no ComputeClass (checklist item **Pool labelled for a ComputeClass**). No manifest in Git describes them, so a pull request per Deployment cannot fix them.
++**Fix:** Name the class once, on the namespace. The ComputeClass must exist and name the pool.
++1. Propose the label `cloud.google.com/default-compute-class: <name>` on the `Namespace` manifest as a pull request (`cloud.google.com/default-compute-class-non-daemonset` also worked for these Pods).
++2. GKE then adds the class `nodeSelector` and toleration to each **new** Pod in the namespace, and the pool grows for them. Pods that are already `Pending` get neither: their owner must recreate them (a rollout restart) after the label is set. Tested on GKE 1.35.8-gke.1796000 (one small zonal cluster, one try per case).
++3. Optional, not tested here: for bursts that cannot wait for a new node, propose a `CapacityBuffer` whose Pod template names the class (`ca-capacity-buffers.md`).
++
+ ## Segregating System Pods (Expert Pattern)
+ Symptom: `kube-system` pods (metrics-server, coredns) land on expensive nodes and pin them.
+ **Fix:** Segregate via namespace default ComputeClass.
