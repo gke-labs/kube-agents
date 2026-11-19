@@ -117,8 +117,8 @@ const credentialProxyPDBMaxUnavailable = 1
 // agents/platform/scripts/credential_proxy.py), ends the commands still
 // running and waits up to 5s for their answers, then hands its Chat receipts
 // back; the entrypoint waits up to 40s for that (BROKER_RUNTIME_DRAIN_SECONDS
-// the entries in flight end with it. On operator-coordinated cutovers, /control/drain
-// drains gracefully first while active-standby RollingUpdate keeps serving; on
+// in docker/agent-entrypoint.sh) so the entries in flight end with it. On
+// operator-coordinated cutovers, /control/drain drains gracefully first while active-standby RollingUpdate keeps serving; on
 // abrupt SIGTERM it falls back to the 30s drain above. An idle broker exits after
 // its 3s settle window (SHUTDOWN_SETTLE_SECONDS), as before, so this lengthens
 // nothing when there is no work in flight.
@@ -727,7 +727,8 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 		Env:             envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
-			// The runtime's metrics-only listener, for the chart's PodMonitoring
+			// Port 8766 serves /metrics for PodMonitoring and operator-only
+			// bearer-authenticated /control/* endpoints for active-standby cutover
 			// (see credentialProxyMetricsPort).
 			{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
 			// Envoy's health listener, for the readinessProbe alone (see

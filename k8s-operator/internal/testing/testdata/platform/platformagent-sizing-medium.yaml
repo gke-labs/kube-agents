@@ -55,12 +55,13 @@ spec:
     # nothing else. Diff the expected output against platformagent-tagged.yaml's
     # and the whole of what the field renders is the credential-proxy
     # container's requests and limits (1 CPU and 4Gi requests, 2 CPU and 4Gi
-    # limits, the 8Gi ephemeral-storage limit kept) on the proxy Deployment and
-    # the agent-api-auth sidecar's 4Gi memory limit on the gateway pod: the
-    # shell container has no medium row and keeps the small one, no override
-    # is set, and nothing else in the render moves. The auto profile's latch
-    # and quota gate are not part of a golden render; sizing_profile_test.go
-    # covers them.
+    # limits, the 8Gi ephemeral-storage limit kept, and
+    # CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS raised from 8 to 12) on the proxy
+    # Deployment and the agent-api-auth sidecar's 4Gi memory limit on the
+    # gateway pod: the shell container has no medium row and keeps the small one,
+    # no override is set, and nothing else in the render moves. The auto
+    # profile's latch and quota gate are not part of a golden render;
+    # sizing_profile_test.go covers them.
     sizingProfile: medium
   security:
     serviceAccountName: "kubeagents-platform-agent"

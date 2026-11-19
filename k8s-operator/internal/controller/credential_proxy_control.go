@@ -36,7 +36,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -368,26 +367,8 @@ func matchesProxyPodTemplate(pod *corev1.Pod, dep *appsv1.Deployment) bool {
 		pod.Annotations[kubectlRestartedAtAnnotation] != wantRestart {
 		return false
 	}
-	if wantHash := dep.Spec.Template.Annotations[credentialProxyTemplateHashAnnotation]; wantHash != "" {
-		return pod.Annotations[credentialProxyTemplateHashAnnotation] == wantHash
-	}
-	if wantPolicy := dep.Spec.Template.Annotations[credentialProxyPolicyHashAnnotation]; wantPolicy != "" &&
-		pod.Annotations[credentialProxyPolicyHashAnnotation] != wantPolicy {
-		return false
-	}
-	if wantSecret := dep.Spec.Template.Annotations[secretEnvHashAnnotation]; wantSecret != "" &&
-		pod.Annotations[secretEnvHashAnnotation] != wantSecret {
-		return false
-	}
-	liveC := brokerPodContainer(pod)
-	wantC := sizedContainer(dep.Spec.Template, credentialProxyContainerName)
-	if liveC == nil || wantC == nil {
-		return false
-	}
-	if liveC.Image != wantC.Image || !equality.Semantic.DeepEqual(liveC.Env, wantC.Env) {
-		return false
-	}
-	return proxyContainerMatchesTierResources(pod, wantC.Resources)
+	wantHash := dep.Spec.Template.Annotations[credentialProxyTemplateHashAnnotation]
+	return wantHash != "" && pod.Annotations[credentialProxyTemplateHashAnnotation] == wantHash
 }
 
 func isPodReady(pod *corev1.Pod) bool {
@@ -604,6 +585,30 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 		}
 		log.Info("activated credential-proxy pod after standby warmup", "pod", target.pod.Name, "namespace", agent.Namespace)
 		return credentialProxyControlRequeueInterval, nil
+	}
+	hasReadyActive := target.snap != nil && target.snap.State == credentialProxyStateActive && isPodReady(target.pod)
+	if !hasReadyActive {
+		for _, p := range probed {
+			if p.snap != nil && p.snap.State == credentialProxyStateActive && isPodReady(p.pod) {
+				hasReadyActive = true
+				break
+			}
+		}
+	}
+	if hasReadyActive {
+		deletedDrained := false
+		for _, p := range probed {
+			if p.pod.DeletionTimestamp == nil && p.snap != nil && p.snap.State == credentialProxyStateDrained {
+				if delErr := r.Delete(ctx, p.pod); client.IgnoreNotFound(delErr) != nil {
+					return 0, delErr
+				}
+				log.Info("deleting drained credential-proxy pod after active replacement is ready", "pod", p.pod.Name, "namespace", agent.Namespace)
+				deletedDrained = true
+			}
+		}
+		if deletedDrained {
+			return credentialProxyControlRequeueInterval, nil
+		}
 	}
 	if hasPendingOrWarming || len(probed) > 1 || len(deletingPods) > 0 {
 		return credentialProxyControlRequeueInterval, nil

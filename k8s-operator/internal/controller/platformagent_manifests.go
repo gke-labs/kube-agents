@@ -4848,10 +4848,11 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
-		// The most brokered commands that run at once; the child memory budget
-		// decides how many of them the limit admits. The broker's own default
-		// is the same figure; setting it here is what makes it the operator's.
-		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
+		// The most brokered commands that run at once per sizing tier (8 small,
+		// 12 medium, 16 fleet); the child memory budget further caps admission
+		// if a custom override lowers memory. Setting it here pins it as the
+		// operator's value rather than an overridable spec.deployment.env key.
+		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyTierMaxConcurrentCommands(renderedSizingTier(agent))},
 		// The container's own memory limit, for the broker's child memory
 		// budget. See credentialProxyMemoryLimitEnv for why it is a
 		// resourceFieldRef and why it is reserved.

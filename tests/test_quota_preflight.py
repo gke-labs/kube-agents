@@ -148,9 +148,6 @@ _DASHBOARD_REQUEST_MILLIS = 256
 _DASHBOARD_LIMIT_MILLIS = 1000
 # One agent pod (base + dashboard + hermes-bridge) as requested.
 _AGENT_POD_REQUEST_MILLIS = 1756
-# The agent pod's ephemeral-storage request, the only one among the operator-rendered
-# workloads that ever sizes a surge.
-_AGENT_POD_EPHEMERAL_REQUEST_BYTES = 3 * 1024**3
 # The replica count at which the operator switches the gateway Deployment from Recreate to
 # RollingUpdate (resolveDeploymentReplicasAndStrategy), and so the first one whose rollout
 # creates a surge Pod.

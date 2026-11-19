@@ -625,5 +625,28 @@ func TestCredentialProxyHandoffZeroGapActiveToStandbyAndLegacy(t *testing.T) {
 		if newSrv.currentState() != credentialProxyStateActive {
 			t.Fatalf("newSrv state = %q after rollback pass before replacement pod exists, want active", newSrv.currentState())
 		}
+
+		// Once an active replacement pod is Ready, any stale non-terminating drained
+		// pod is explicitly deleted so fast rollbacks cannot leave a drained pod Ready.
+		var latestNew corev1.Pod
+		if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: newPod.Name}, &latestNew); err != nil {
+			t.Fatal(err)
+		}
+		latestNew.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		if err := cl.Status().Update(context.Background(), &latestNew); err != nil {
+			t.Fatal(err)
+		}
+		reqCleanup, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, newDep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reqCleanup != credentialProxyControlRequeueInterval {
+			t.Fatalf("cleanup requeue = %v, want %v", reqCleanup, credentialProxyControlRequeueInterval)
+		}
+		var drainedCheck corev1.Pod
+		err = cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: oldPod.Name}, &drainedCheck)
+		if err == nil && drainedCheck.DeletionTimestamp == nil {
+			t.Fatalf("expected stale drained pod %s to be deleted once active pod is Ready", oldPod.Name)
+		}
 	})
 }

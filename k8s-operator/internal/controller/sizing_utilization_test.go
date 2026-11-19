@@ -52,6 +52,8 @@ func idleSample(at time.Time) SizingUtilizationSample {
 		BrokerMemoryBytes:      200 << 20,
 		BrokerMemoryObserved:   true,
 		BrokerChildMemObserved: true,
+		BrokerSlotsObserved:    true,
+		BrokerSlotCap:          8,
 		SidecarMemoryBytes:     100 << 20,
 		SidecarMemoryObserved:  true,
 		ShellMemoryBytes:       100 << 20,
@@ -63,12 +65,13 @@ func TestSizingUtilizationStepUpDimensions(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name      string
-		autopilot bool
-		clamped   bool
-		startTier string
-		mutate    func(*SizingUtilizationSample)
-		wantTier  string
+		name        string
+		autopilot   bool
+		clamped     bool
+		override1Gi bool
+		startTier   string
+		mutate      func(*SizingUtilizationSample)
+		wantTier    string
 	}{
 		{
 			name:      "standard broker cpu 75 pct promotes small to medium",
@@ -150,23 +153,45 @@ func TestSizingUtilizationStepUpDimensions(t *testing.T) {
 			wantTier: sizingProfileSmall,
 		},
 		{
-			name:      "memory-constrained slots 75 pct promotes small to medium",
-			startTier: sizingProfileSmall,
-			mutate: func(s *SizingUtilizationSample) {
-				s.BrokerSlotsInUse = 3
-				s.BrokerSlotCap = 4
-				s.BrokerSlotsObserved = true
-			},
-			wantTier: sizingProfileMedium,
-		},
-		{
-			name:      "broker static 8 slots at default 2Gi does not cascade",
+			name:      "broker slots 75 pct (6 of 8) promotes small to medium (12 slots)",
 			startTier: sizingProfileSmall,
 			mutate: func(s *SizingUtilizationSample) {
 				s.BrokerSlotsInUse = 6
 				s.BrokerSlotCap = 8
 				s.BrokerSlotsObserved = true
 			},
+			wantTier: sizingProfileMedium,
+		},
+		{
+			name:      "broker slots 75 pct (9 of 12) promotes medium to fleet (16 slots)",
+			startTier: sizingProfileMedium,
+			mutate: func(s *SizingUtilizationSample) {
+				s.BrokerSlotsInUse = 9
+				s.BrokerSlotCap = 12
+				s.BrokerSlotsObserved = true
+			},
+			wantTier: sizingProfileFleet,
+		},
+		{
+			name:      "broker slots 75 pct (12 of 16) at fleet holds fleet",
+			startTier: sizingProfileFleet,
+			mutate: func(s *SizingUtilizationSample) {
+				s.BrokerSlotsInUse = 12
+				s.BrokerSlotCap = 16
+				s.BrokerSlotsObserved = true
+			},
+			wantTier: sizingProfileFleet,
+		},
+		{
+			name:        "memory-pinned slots (3 of 4 with 1Gi override) does not trigger futile bump",
+			override1Gi: true,
+			startTier:   sizingProfileSmall,
+			mutate: func(s *SizingUtilizationSample) {
+				s.BrokerSlotsInUse = 3
+				s.BrokerSlotCap = 4
+				s.BrokerSlotsObserved = true
+			},
+			// Overridden 1Gi proxy memory limit keeps child budget at 4 slots on all tiers.
 			wantTier: sizingProfileSmall,
 		},
 		{
@@ -206,6 +231,13 @@ func TestSizingUtilizationStepUpDimensions(t *testing.T) {
 			t.Parallel()
 			now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
 			agent := sizingAgent(sizingProfileAuto, tc.startTier, ptr.To[int64](3), nil)
+			if tc.override1Gi {
+				agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{
+					Resources: &corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+					},
+				}
+			}
 			scheme := setupScheme()
 			objs := sizedWorkloadsOn(agent, func() sizingTier {
 				tier, _ := parseSizingTier(tc.startTier)
@@ -557,6 +589,155 @@ func TestSizingUtilizationStepDownCooldownDeadbandAndFloor(t *testing.T) {
 		}
 		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
 			t.Fatalf("tier = %q with missing broker child memory metric, want fleet", agent.Status.EffectiveSizingTier)
+		}
+	})
+
+	t.Run("missing broker slots metric blocks step down when slot cap shrinks", func(t *testing.T) {
+		t.Parallel()
+		t0 := time.Date(2026, 11, 18, 17, 20, 0, 0, time.UTC)
+		now := t0.Add(time.Hour)
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](2), nil)
+		lastTrans := metav1.NewTime(t0)
+		agent.Status.Sizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:         sizingProfileMedium,
+			DesiredTier:        sizingProfileMedium,
+			Trigger:            sizingTriggerUtilization,
+			LastTransitionTime: &lastTrans,
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{
+			Client:    cl,
+			APIReader: cl,
+			Scheme:    scheme,
+			nowFn:     func() time.Time { return now },
+			UtilizationReader: func(context.Context, *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error) {
+				s := idleSample(now)
+				s.BrokerSlotsObserved = false
+				return s, nil
+			},
+		}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(45 * time.Minute)
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("tier = %q with missing broker slots metric, want medium", agent.Status.EffectiveSizingTier)
+		}
+	})
+
+	t.Run("broker slots above 55 pct of lower tier blocks step down", func(t *testing.T) {
+		t.Parallel()
+		t0 := time.Date(2026, 11, 18, 17, 25, 0, 0, time.UTC)
+		now := t0.Add(time.Hour)
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](2), nil)
+		lastTrans := metav1.NewTime(t0)
+		agent.Status.Sizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:         sizingProfileMedium,
+			DesiredTier:        sizingProfileMedium,
+			Trigger:            sizingTriggerUtilization,
+			LastTransitionTime: &lastTrans,
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{
+			Client:    cl,
+			APIReader: cl,
+			Scheme:    scheme,
+			nowFn:     func() time.Time { return now },
+			UtilizationReader: func(context.Context, *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error) {
+				s := idleSample(now)
+				// 6/12 is 50% of medium, but 6/8 is 75% (>55%) of small.
+				s.BrokerSlotsInUse = 6
+				s.BrokerSlotCap = 12
+				return s, nil
+			},
+		}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(45 * time.Minute)
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("tier = %q with 6 active slots (>55%% of 8), want medium", agent.Status.EffectiveSizingTier)
+		}
+	})
+
+	t.Run("scaleToZero skips missing sidecar memory while non-scaled gateway stays fail-closed", func(t *testing.T) {
+		t.Parallel()
+		t0 := time.Date(2026, 11, 18, 17, 30, 0, 0, time.UTC)
+		now := t0.Add(time.Hour)
+		agentPaused := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](2), nil)
+		agentPaused.Spec.Deployment.ScaleToZero = ptr.To(true)
+		lastTrans := metav1.NewTime(t0)
+		agentPaused.Status.Sizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:         sizingProfileMedium,
+			DesiredTier:        sizingProfileMedium,
+			Trigger:            sizingTriggerUtilization,
+			LastTransitionTime: &lastTrans,
+		}
+		scheme := setupScheme()
+		clPaused := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agentPaused).WithStatusSubresource(agentPaused).Build()
+		rPaused := &PlatformAgentReconciler{
+			Client:    clPaused,
+			APIReader: clPaused,
+			Scheme:    scheme,
+			Recorder:  record.NewFakeRecorder(8),
+			nowFn:     func() time.Time { return now },
+			UtilizationReader: func(context.Context, *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error) {
+				s := idleSample(now)
+				s.SidecarMemoryBytes = 0
+				s.SidecarMemoryObserved = false
+				return s, nil
+			},
+		}
+		if err := rPaused.resolveSizingTier(context.Background(), agentPaused); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(sizingStepDownSoakDuration)
+		if err := rPaused.resolveSizingTier(context.Background(), agentPaused); err != nil {
+			t.Fatal(err)
+		}
+		if agentPaused.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("scaleToZero tier = %q without sidecar metrics, want small", agentPaused.Status.EffectiveSizingTier)
+		}
+
+		// Without scaleToZero, missing sidecar memory must remain fail-closed.
+		nowActive := t0.Add(time.Hour)
+		agentActive := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](2), nil)
+		agentActive.Status.Sizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:         sizingProfileMedium,
+			DesiredTier:        sizingProfileMedium,
+			Trigger:            sizingTriggerUtilization,
+			LastTransitionTime: &lastTrans,
+		}
+		clActive := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agentActive).WithStatusSubresource(agentActive).Build()
+		rActive := &PlatformAgentReconciler{
+			Client:    clActive,
+			APIReader: clActive,
+			Scheme:    scheme,
+			nowFn:     func() time.Time { return nowActive },
+			UtilizationReader: func(context.Context, *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error) {
+				s := idleSample(nowActive)
+				s.SidecarMemoryBytes = 0
+				s.SidecarMemoryObserved = false
+				return s, nil
+			},
+		}
+		if err := rActive.resolveSizingTier(context.Background(), agentActive); err != nil {
+			t.Fatal(err)
+		}
+		nowActive = nowActive.Add(45 * time.Minute)
+		if err := rActive.resolveSizingTier(context.Background(), agentActive); err != nil {
+			t.Fatal(err)
+		}
+		if agentActive.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("active gateway tier = %q with missing sidecar metric, want medium", agentActive.Status.EffectiveSizingTier)
 		}
 	})
 }
@@ -1230,8 +1411,8 @@ func TestCollectLiveUtilizationPodMetricsAndScrape(t *testing.T) {
 		fmt.Sprintf("# TYPE %s gauge", brokerMetricChildMemBudget),
 		fmt.Sprintf("%s %d", brokerMetricChildMemBudget, 1856<<20),
 		fmt.Sprintf("# TYPE %s gauge", brokerMetricCgroupMemory),
-		fmt.Sprintf(`%s{kind="usage"} %d`, brokerMetricCgroupMemory, 1500<<20),
-		fmt.Sprintf(`%s{kind="high"} %d`, brokerMetricCgroupMemory, 2000<<20),
+		fmt.Sprintf(`%s{kind="current"} %d`, brokerMetricCgroupMemory, 1500<<20),
+		fmt.Sprintf(`%s{kind="peak"} %d`, brokerMetricCgroupMemory, 2000<<20),
 		fmt.Sprintf(`%s{kind="limit"} %d`, brokerMetricCgroupMemory, 2<<30),
 		fmt.Sprintf("# TYPE %s gauge", brokerMetricWatermarkRatio),
 		fmt.Sprintf(`%s{resource="memory"} 0.78`, brokerMetricWatermarkRatio),

@@ -187,16 +187,22 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         self.assertEqual((200, credential_proxy.HEALTHZ_PAYLOAD), _request(proxy_port, "GET", "/healthz"))
         self.assertEqual((200, credential_proxy.HEALTHZ_PAYLOAD), _request(health_port, "GET", "/healthz"))
 
-        # Idle drain immediately moves to drained, stops intake, fails /healthz, and rejects re-activation.
+        # Idle drain immediately moves to drained, stops intake, rejects re-activation,
+        # and keeps /healthz 200 until SIGTERM sets shutting_down (preventing empty
+        # Service Endpoints before the replacement pod is activated and Ready).
         status, drain_resp = _request(metrics_port, "POST", "/control/drain", auth)
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(BROKER_STATE_DRAINED, drain_resp["state"])
         fake_slack.stop_intake.assert_called_once_with()
         fake_sweep.stop.assert_called_once_with()
-        self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(proxy_port, "GET", "/healthz"))
-        self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(health_port, "GET", "/healthz"))
+        self.assertEqual((200, credential_proxy.HEALTHZ_PAYLOAD), _request(proxy_port, "GET", "/healthz"))
+        self.assertEqual((200, credential_proxy.HEALTHZ_PAYLOAD), _request(health_port, "GET", "/healthz"))
         conflict_status, _ = _request(metrics_port, "POST", "/control/activate", auth)
         self.assertEqual(HTTPStatus.CONFLICT, conflict_status)
+
+        CredentialProxyHandler.shutting_down.set()
+        self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(proxy_port, "GET", "/healthz"))
+        self.assertEqual((503, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), _request(health_port, "GET", "/healthz"))
 
     def test_drain_waits_for_in_flight_and_unsettled_chat_before_marking_drained(self) -> None:
         fake_relay = _FakeRelay(unsettled=2)
@@ -230,6 +236,8 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(BROKER_STATE_DRAINED, lifecycle.state)
         self.assertEqual(2, fake_relay.released)
+        self.assertEqual((HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD), credential_proxy.healthz_response())
+        CredentialProxyHandler.shutting_down.set()
         self.assertEqual((HTTPStatus.SERVICE_UNAVAILABLE, credential_proxy.HEALTHZ_DRAINING_PAYLOAD), credential_proxy.healthz_response())
 
     def test_drain_waits_for_undelivered_in_memory_relays_and_sigterm_releases_late_chat_receipts(self) -> None:

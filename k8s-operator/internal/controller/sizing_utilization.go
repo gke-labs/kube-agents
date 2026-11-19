@@ -89,7 +89,7 @@ const (
 	brokerMetricWatermarkRatio   = "kubeagents_credential_proxy_resource_watermark_ratio"
 
 	brokerMetricLabelKind      = "kind"
-	brokerMetricKindUsage      = "usage"
+	brokerMetricKindCurrent    = "current"
 	brokerMetricKindLimit      = "limit"
 	brokerMetricLabelResource  = "resource"
 	brokerMetricResourceMemory = "memory"
@@ -344,7 +344,7 @@ func parseBrokerMetricsPayload(body []byte, sample *SizingUtilizationSample) boo
 		}
 	}
 	if fam := families[brokerMetricCgroupMemory]; fam != nil {
-		if v, ok := labelledGaugeValue(fam, brokerMetricLabelKind, brokerMetricKindUsage); ok {
+		if v, ok := labelledGaugeValue(fam, brokerMetricLabelKind, brokerMetricKindCurrent); ok {
 			sample.BrokerCgroupUsageBytes = int64(math.Round(v))
 			sample.BrokerCgroupObserved = true
 		}
@@ -512,6 +512,7 @@ type tierContainerCapacities struct {
 	proxyCPUMilli    int64
 	proxyMemBytes    int64
 	proxyChildBudget int64
+	proxySlotCap     int64
 	sidecarMemBytes  int64
 	shellMemBytes    int64
 }
@@ -525,6 +526,7 @@ func capacitiesAtTier(agent *agentv1alpha1.PlatformAgent, autopilot, clamped boo
 			out.proxyCPUMilli = effectiveCPUCapacityMilli(r.resources)
 			out.proxyMemBytes = effectiveMemoryCapacityBytes(r.resources, clamped)
 			out.proxyChildBudget = childMemoryBudgetForLimit(out.proxyMemBytes)
+			out.proxySlotCap = effectiveBrokerSlotCapAtTier(out.proxyMemBytes, credentialProxyTierSlotCap(tier))
 		case agentAPIAuthContainerName:
 			out.sidecarMemBytes = effectiveMemoryCapacityBytes(r.resources, clamped)
 		case shellSandboxContainerName:
@@ -600,7 +602,6 @@ func lowestRelievingTier(
 		return target
 	}
 	curCaps := capacitiesAtTier(agent, autopilot, clamped, current)
-	configuredSlotCap, _ := strconv.ParseInt(credentialProxyMaxConcurrentCommands, 10, 64)
 
 	consider := func(relieving func(candCaps tierContainerCapacities) bool) {
 		for cand := current + 1; cand <= sizingTierFleet; cand++ {
@@ -645,10 +646,11 @@ func lowestRelievingTier(
 		}
 	}
 	if sample.BrokerSlotsObserved && sample.BrokerSlotCap > 0 && ratioAtLeastPct(sample.BrokerSlotsInUse, sample.BrokerSlotCap, sizingStepUpThresholdPct) {
-		// Slots only trigger a step-up if the candidate tier's memory limit unlocks
-		// strictly more concurrent admitted requests than the running slot cap.
+		// Slots trigger a step-up whenever the candidate tier's effective slot
+		// cap (min of tier concurrency cap and child memory budget) exceeds the
+		// running broker's slot cap.
 		consider(func(c tierContainerCapacities) bool {
-			return effectiveBrokerSlotCapAtTier(c.proxyMemBytes, configuredSlotCap) > sample.BrokerSlotCap
+			return c.proxySlotCap > sample.BrokerSlotCap
 		})
 	}
 	if sample.SidecarMemoryObserved && ratioAtLeastPct(sample.SidecarMemoryBytes, curCaps.sidecarMemBytes, sizingStepUpThresholdPct) {
@@ -706,7 +708,17 @@ func allShrinkingDimensionsBelow(
 			return false
 		}
 	}
-	if lowCaps.sidecarMemBytes < runCaps.sidecarMemBytes {
+	if lowCaps.proxySlotCap < runCaps.proxySlotCap {
+		if !sample.BrokerSlotsObserved || !ratioAtMostPct(sample.BrokerSlotsInUse, lowCaps.proxySlotCap, sizingStepDownThresholdPct) {
+			return false
+		}
+	}
+	// Under scaleToZero: true the gateway Deployment scales to 0 replicas, so no
+	// agent-api-auth pod exists to emit PodMetrics; treat absent sidecar metrics
+	// as 0 usage there rather than wedging step-down forever, while still
+	// checking any still-terminating pod metrics or non-zero gateway installs.
+	scaleToZero := scaleToZeroRequested(agent.Spec.Deployment)
+	if lowCaps.sidecarMemBytes < runCaps.sidecarMemBytes && !(scaleToZero && !sample.SidecarMemoryObserved) {
 		if !sample.SidecarMemoryObserved || !ratioAtMostPct(sample.SidecarMemoryBytes, lowCaps.sidecarMemBytes, sizingStepDownThresholdPct) {
 			return false
 		}

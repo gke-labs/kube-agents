@@ -1138,10 +1138,11 @@ HEALTHZ_PAYLOAD = {"status": "ok"}
 # and at one replica a caller fails to connect and falls back to the stateful
 # broker rather than reading `draining` for the whole drain. The requests
 # already in flight are not touched: readiness steers only new connections.
-# On active-standby handoff (/control/drain), /healthz stays 200 while
-# BROKER_STATE_DRAINING so Service Endpoints remain routed to the draining pod
-# for DRAIN_OPEN_ROUTES and DRAIN_OPEN_REPLY_ROUTES, then flips to 503
-# HEALTHZ_DRAINING_PAYLOAD once BROKER_STATE_DRAINED (or on SIGTERM).
+# On active-standby handoff (/control/drain), /healthz stays 200 across both
+# BROKER_STATE_DRAINING and BROKER_STATE_DRAINED until SIGTERM sets
+# shutting_down: new requests still routed here are refused with retryable 503
+# bound="draining" while Service Endpoints retains at least one endpoint until
+# the replacement pod activates and passes kubelet readiness.
 HEALTHZ_DRAINING_PAYLOAD = {"status": "draining"}
 HEALTHZ_STANDBY_PAYLOAD = {"status": "standby"}
 STANDBY_MODE_ENV = "CREDENTIAL_PROXY_STANDBY"
@@ -14305,12 +14306,12 @@ def healthz_response() -> tuple[HTTPStatus, dict[str, Any]]:
         return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
     if lifecycle is not None:
         state = lifecycle.state
-        if state == BROKER_STATE_DRAINED:
-            return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
-        # Keep /healthz 200 during operator-initiated BROKER_STATE_DRAINING so Service
-        # Endpoints stay routed to this pod for DRAIN_OPEN_ROUTES / DRAIN_OPEN_REPLY_ROUTES
-        # until the async drain reaches BROKER_STATE_DRAINED.
-        if state == BROKER_STATE_DRAINING:
+        # Keep /healthz 200 across both BROKER_STATE_DRAINING and BROKER_STATE_DRAINED
+        # until SIGTERM sets shutting_down: Service Endpoints retain this pod (which
+        # rejects new commands with retryable 503 bound="draining", keeping open/reply
+        # routes reachable) so endpoints never drop to zero before the standby activates
+        # and passes readiness.
+        if state in (BROKER_STATE_DRAINING, BROKER_STATE_DRAINED):
             return HTTPStatus.OK, HEALTHZ_PAYLOAD
         if lifecycle.enabled and state == BROKER_STATE_STANDBY:
             return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_STANDBY_PAYLOAD

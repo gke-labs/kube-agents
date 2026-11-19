@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,21 +71,23 @@ const (
 	// CPU, because Autopilot without bursting runs the pod at its requests
 	// and a step up that lowered the broker's CPU there would be a step down.
 	// The memory limit sizes the broker's child memory budget
-	// (credentialProxyAdmittedRequests): 4Gi admits the eight-command slot
-	// cap with listings of a few hundred Mi each. The sidecar's memory limit
-	// doubles to 4Gi for the event watcher's informers; its requests, CPU
-	// limit and ephemeral-storage limit keep the small row's figures, and
-	// the shell keeps the small row entirely.
-	credentialProxyMediumCPURequest          = "1"
-	credentialProxyMediumMemoryRequest       = "4Gi"
-	credentialProxyMediumAutopilotCPURequest = "2"
-	credentialProxyMediumCPULimit            = "2"
-	credentialProxyMediumMemoryLimit         = "4Gi"
-	agentAPIAuthMediumMemoryLimit            = "4Gi"
+	// (credentialProxyAdmittedRequests): 4Gi admits 22 requests in memory, so
+	// medium raises the slot cap from 8 to 12 with ~1.84 GiB headroom. The
+	// sidecar's memory limit doubles to 4Gi for the event watcher's informers;
+	// its requests, CPU limit and ephemeral-storage limit keep the small row's
+	// figures, and the shell keeps the small row entirely.
+	credentialProxyMediumCPURequest            = "1"
+	credentialProxyMediumMemoryRequest         = "4Gi"
+	credentialProxyMediumAutopilotCPURequest   = "2"
+	credentialProxyMediumCPULimit              = "2"
+	credentialProxyMediumMemoryLimit           = "4Gi"
+	credentialProxyMediumMaxConcurrentCommands = "12"
+	agentAPIAuthMediumMemoryLimit              = "4Gi"
 
 	// The fleet row. The broker gets 4 CPU and 8Gi of requests on both
 	// cluster types (2 GiB per vCPU, inside the band Autopilot admits
-	// unchanged), 8 CPU and 8Gi of limits, and keeps the 8Gi
+	// unchanged), 8 CPU and 8Gi of limits, raises the slot cap to 16 (leaving
+	// ~500 MiB/slot even on heavy listings), and keeps the 8Gi
 	// ephemeral-storage limit, which already holds its two emptyDir caps and
 	// is the most Autopilot admits per pod with headroom. The sidecar's memory
 	// limit goes to 8Gi and the shell's to 4Gi, for the fan-out of a fleet
@@ -94,6 +97,7 @@ const (
 	credentialProxyFleetCPULimit              = "8"
 	credentialProxyFleetMemoryLimit           = "8Gi"
 	credentialProxyFleetEphemeralStorageLimit = "8Gi"
+	credentialProxyFleetMaxConcurrentCommands = "16"
 	agentAPIAuthFleetMemoryLimit              = "8Gi"
 	shellSandboxFleetMemoryLimit              = "4Gi"
 
@@ -337,11 +341,13 @@ type sizedRender struct {
 	resources corev1.ResourceRequirements
 }
 
-// sizingQuotaDimensions are the ResourceQuota hard keys the step-up check
-// reads, each with the container resource it counts and the side of the step
-// it is compared with. The bare names count requests, as the API server reads
-// them. Any other hard key (pods, count/*, storage) is not moved by a tier
-// change and is not read.
+// sizingQuotaDimensions are the compute/ephemeral ResourceQuota hard keys
+// the step check reads, each with the container resource it counts and the
+// side of the step it is compared with. The bare names count requests, as the
+// API server reads them. `pods` and `count/pods` are read alongside these by
+// sizingQuotaReadsAStep and sizingQuotaShortfall for credential-proxy's
+// active-standby surge pod; storage and other `count/*` keys are not moved by
+// a tier change and are not read.
 var sizingQuotaDimensions = []struct {
 	key      corev1.ResourceName
 	resource corev1.ResourceName
@@ -488,6 +494,22 @@ func credentialProxyTierResources(tier sizingTier, autopilot bool) corev1.Resour
 			corev1.ResourceEphemeralStorage: resource.MustParse(ephemeralLimit),
 		},
 	}
+}
+
+func credentialProxyTierMaxConcurrentCommands(tier sizingTier) string {
+	switch tier {
+	case sizingTierMedium:
+		return credentialProxyMediumMaxConcurrentCommands
+	case sizingTierFleet:
+		return credentialProxyFleetMaxConcurrentCommands
+	default:
+		return credentialProxyMaxConcurrentCommands
+	}
+}
+
+func credentialProxyTierSlotCap(tier sizingTier) int64 {
+	v, _ := strconv.ParseInt(credentialProxyTierMaxConcurrentCommands(tier), 10, 64)
+	return v
 }
 
 // agentAPIAuthTierResources is the agent-api-auth sidecar's row before the
@@ -1219,10 +1241,10 @@ func (r *PlatformAgentReconciler) sizingQuotas(ctx context.Context, agent *agent
 }
 
 // sizingQuotaReadsAStep reports whether a ResourceQuota constrains a key the
-// step-up check reads (sizingQuotaDimensions). A quota whose hard keys are
-// pods, count/* or storage alone is not moved by a tier change
-// (sizingQuotaShortfall reads none of its keys), so it can neither refuse a
-// step nor cap the tier, whatever its scopes select.
+// step-up check reads (sizingQuotaDimensions plus pods/count/pods for
+// credential-proxy active-standby surge headroom). A quota whose hard keys are
+// other count/* or storage keys alone is not moved by a tier change, so it can
+// neither refuse a step nor cap the tier, whatever its scopes select.
 func sizingQuotaReadsAStep(quota *corev1.ResourceQuota) bool {
 	for _, dim := range sizingQuotaDimensions {
 		if _, constrained := quota.Spec.Hard[dim.key]; constrained {
@@ -1240,14 +1262,13 @@ func sizingQuotaReadsAStep(quota *corev1.ResourceQuota) bool {
 // sizingQuotaPriorityClasses is the one-element set of the class admission
 // gives the sized pods (sizingAdmittedPriorityClass) when a quota in quotas
 // has a PriorityClass scope, the one scope whose answer needs admission asked,
-// and constrains a key the step moves (sizingQuotaReadsAStep); nil without
-// asking otherwise. A PriorityClass-scoped quota on pods or count/* alone,
-// the usual per-class shape, is read by nothing the class decides, and the
-// dry run it would force can be refused by an object the step never trips
-// (a pods quota at its cap, a webhook declining dry runs), which would hold
-// the step on every pass for a quota that cannot refuse it. The second value
-// is false when admission was asked and gave no answer; the caller then
-// measures no step.
+// and constrains a key the step moves (sizingQuotaReadsAStep, including pods
+// and count/pods for active-standby surge headroom); nil without asking
+// otherwise. A PriorityClass-scoped quota on storage or other count/* keys
+// alone is read by nothing the class decides, and the dry run it would force
+// can be refused by an unrelated admission check. The second value is false
+// when admission was asked and gave no answer; the caller then measures no
+// step.
 func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, quotas []corev1.ResourceQuota) ([]string, bool) {
 	for i := range quotas {
 		if sizingQuotaScopesPriorityClass(&quotas[i]) && sizingQuotaReadsAStep(&quotas[i]) {
@@ -1528,26 +1549,25 @@ func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, c
 
 // sizingRefusedStep is the ResourceQuota refusal the latched tier's pods
 // met at admission, or nil. The gate measures a step against the quotas'
-// used totals once and writes the latch before the proxy Deployment, a
-// Recreate, has drained its old pod and asked admission for the new one; a
-// pod the namespace admits in that window (a session pod, an A2A job, a
-// sibling agent's step) takes the room the gate found, the ReplicaSet's
-// create is refused with "exceeded quota", and the Deployment carries
-// ReplicaFailure True with admission's message. Nothing in the gate reads
-// that: the latch names the tier, the proxy never settles, and the broker
-// is down until a person names a lower tier. This reads it. The proxy
-// Deployment and the gateway's, when it is a Deployment, are read for a
-// ReplicaFailure condition whose message names a quota
-// (resourceQuotaNamedIn) and is the latched tier's step being refused
-// (sizingRefusalIsTheSteps: a key the step up to the tier moved on that
-// pod, asked for at that tier's figure and not the row above's); the first
-// found is returned, and the caller steps the latch back one tier and
-// writes the cap with admission's message. A refusal on a key no row moves
-// (a pods count at its cap, a requests.memory quota refusing the gateway's
-// pod, whose sidecar's request every row keeps) is not the step's and is
-// left to the settled hold, which logs the workload that cannot settle;
-// stepping back would recreate the broker at a lower row the refusal does
-// not care about. The StatefulSets (the shell, the gateway under
+// used totals once and writes the latch before the proxy Deployment
+// (RollingUpdate maxSurge: 1, maxUnavailable: 0) or gateway Deployment asks
+// admission for its new pod; a pod the namespace admits in that window (a
+// session pod, an A2A job, a sibling agent's step) takes the room the gate
+// found, the ReplicaSet's create is refused with "exceeded quota", and the
+// Deployment carries ReplicaFailure True with admission's message. This reads
+// it. Both the proxy Deployment and the gateway's, when it is a Deployment, are
+// read for a ReplicaFailure condition whose message names a quota
+// (resourceQuotaNamedIn) and is the target tier's step being refused
+// (sizingRefusalIsTheSteps: a key the step moved on that pod — including
+// `pods`/`count/pods` for credential-proxy surge headroom — asked for at that
+// tier's figure and not the running tier's); the first found is returned, and
+// the caller steps back (to tier - 1 on step-up or activeTier on step-down)
+// and writes the cap with admission's message. A refusal on a key the step
+// does not move (other `count/*` or storage keys, a requests.memory quota
+// refusing the gateway's pod, whose sidecar's request every row keeps) is not
+// the step's and is left to the settled hold, which logs the workload that
+// cannot settle; stepping back would recreate the broker at a lower row the
+// refusal does not care about. The StatefulSets (the shell, the gateway under
 // useStatefulSet) carry no such condition and are not read: their refused
 // pod shows as the hold the settled wait logs. Nil at small, where there is
 // no tier to step back to, and for a refusal the condition on the CR

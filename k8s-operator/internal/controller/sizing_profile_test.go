@@ -842,21 +842,32 @@ func TestSizedContainersFollowTheRenderedTier(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name, profile, latched               string
-		proxyLimit, sidecarLimit, shellLimit string
+		proxyLimit, sidecarLimit, shellLimit, wantSlots string
 	}{
-		{"auto with no latch yet renders the small row", sizingProfileAuto, "", credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit},
-		{"auto latched at medium renders the medium row", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
-		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit},
-		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
-		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit},
-		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
-		{"an explicit small profile renders the small row over a fleet latch", sizingProfileSmall, sizingProfileFleet, credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit},
+		{"auto with no latch yet renders the small row", sizingProfileAuto, "", credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"auto latched at medium renders the medium row", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
+		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyFleetMaxConcurrentCommands},
+		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
+		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyFleetMaxConcurrentCommands},
+		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
+		{"an explicit small profile renders the small row over a fleet latch", sizingProfileSmall, sizingProfileFleet, credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			agent := sizingAgent(tc.profile, tc.latched, nil, nil)
 			proxy := buildCredentialProxyDeployment(agent, "hash")
-			assertQuantity(t, sizedContainerNamed(t, proxy.Spec.Template.Spec.Containers, credentialProxyContainerName).Resources.Limits, corev1.ResourceMemory, tc.proxyLimit)
+			proxyContainer := sizedContainerNamed(t, proxy.Spec.Template.Spec.Containers, credentialProxyContainerName)
+			assertQuantity(t, proxyContainer.Resources.Limits, corev1.ResourceMemory, tc.proxyLimit)
+			var gotSlots string
+			for _, e := range proxyContainer.Env {
+				if e.Name == "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS" {
+					gotSlots = e.Value
+					break
+				}
+			}
+			if gotSlots != tc.wantSlots {
+				t.Fatalf("CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS = %q, want %q", gotSlots, tc.wantSlots)
+			}
 			gateway := buildDeployment(agent, "", "", "", "", nil, renderOptions{})
 			assertQuantity(t, sizedContainerNamed(t, gateway.Spec.Template.Spec.InitContainers, agentAPIAuthContainerName).Resources.Limits, corev1.ResourceMemory, tc.sidecarLimit)
 			assertQuantity(t, shellContainerOf(t, agent).Resources.Limits, corev1.ResourceMemory, tc.shellLimit)
