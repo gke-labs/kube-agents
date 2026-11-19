@@ -413,8 +413,9 @@ The concrete code delta that enforces [03](03-security-model.md):
   `STATE_OF_BEING.md` and `README.md` at the `knowledge/` root) carry no `type`, entry files carry valid
   YAML frontmatter with a non-reserved `type`, present recommended fields (`sources`, `generated`,
   `verified`, `status`, `stale_after`, plus tolerated legacy `timestamp`) match their expected shape and
-  per-type `status` vocabulary, and relative markdown links resolve. (A richer OKF _visualizer_ is
-  optional tooling to build later, not a gate.)
+  per-type `status` vocabulary, and relative markdown links resolve. Today the script covers this
+  repository's example tree (`examples/gitops-repo/knowledge/`), and operator GitOps repositories have
+  no OKF check yet. (A richer OKF _visualizer_ is optional tooling to build later, not a gate.)
 - **Review-gate:** the security-review suite runs on the trigger paths and **blocks** a PR with an
   unmitigated high/critical finding.
 - **ChatOps routing (§2b):** a slash command (`/cluster-<c>`) and a direct handle (`@cluster-<c>`)
