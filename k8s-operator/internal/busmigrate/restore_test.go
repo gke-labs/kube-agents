@@ -285,3 +285,20 @@ func TestASnapshotConfigOutsideThePolicySendsNothing(t *testing.T) {
 		t.Fatalf("the snapshot's own config, inside the policy: %v", err)
 	}
 }
+
+// A restored stream keeps its max_msg_size: withRenderedLimits starts from the
+// snapshot's own config and replaces only the limits a StreamPolicy renders
+// (max_bytes, max_age, max_consumers). The gateway's KV buckets cap a value
+// with --max-value-size (SCHEDULED_REPORTS at 256KiB, #5618), and StreamPolicy
+// has no field for it, so a migration must carry it over from the snapshot.
+func TestARestoredBucketKeepsItsValueCap(t *testing.T) {
+	snapshot := nats.StreamConfig{Name: "KV_SCHEDULED_REPORTS", MaxMsgSize: 262144, MaxBytes: 1, MaxAge: time.Hour}
+	policy := StreamPolicy{Name: "KV_SCHEDULED_REPORTS", MaxBytes: 268435456, MaxAge: 90 * 24 * time.Hour}
+	got := withRenderedLimits(snapshot, policy)
+	if got.MaxMsgSize != 262144 {
+		t.Fatalf("restored max_msg_size %d, want the snapshot's 262144", got.MaxMsgSize)
+	}
+	if got.MaxBytes != policy.MaxBytes || got.MaxAge != policy.MaxAge {
+		t.Fatalf("restored limits %d/%s, want the policy's %d/%s", got.MaxBytes, got.MaxAge, policy.MaxBytes, policy.MaxAge)
+	}
+}
