@@ -128,13 +128,18 @@ readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|cred
 # the platform's operators took out of reach (scope_exclude.py, the proxy's
 # hold.go and exclude.go): check 5 reports these as what they are, not as an
 # unreachable cluster, and offers neither re-scaffolding nor the endpoint remedy.
-readonly SCOPE_HOLD_REFUSAL_RE='scope\.held-cluster|scope\.hold-unreadable'
-readonly SCOPE_EXCLUDE_REFUSAL_RE='scope\.excluded-cluster|scope\.exclude-unreadable'
-# The operator's reason in a hold refusal: "... on hold (spec.scope.hold): <reason>.
+readonly SCOPE_HOLD_REFUSAL_RE='scope\.held-cluster'
+readonly SCOPE_EXCLUDE_REFUSAL_RE='scope\.excluded-cluster'
+# The unreadable forms are not an operator's decision: the proxy or the broker
+# can't read the file it was given and refuses every cluster (fail-closed).
+readonly SCOPE_UNREADABLE_REFUSAL_RE='scope\.hold-unreadable|scope\.exclude-unreadable'
+# The operator's reason in a hold refusal: "... on hold (spec.hold): <reason>.
 # An operator paused ...", the `.all` form included.
-readonly SCOPE_HOLD_REASON_SED='s/.*on hold (spec\.scope\.hold[.a-z]*): \(.*\)\. An operator paused.*/\1/p'
+readonly SCOPE_HOLD_REASON_SED='s/.*on hold (spec\.hold[.a-z]*): \(.*\)\. An operator paused.*/\1/p'
 readonly SCOPE_HOLD_REASON_MAX_CHARS=256
-readonly SCOPE_HOLD_REMEDIATION="Report the hold to the user and stop; do not retry, re-scaffold, or work around it. An operator lifts it by removing the cluster from spec.scope.hold."
+readonly SCOPE_HOLD_REMEDIATION="Report the hold to the user and stop; do not retry, re-scaffold, or work around it. An operator lifts it by removing the cluster from spec.hold."
+readonly SCOPE_UNREADABLE_REASON="The credential broker or Kubernetes API proxy cannot read its scope/hold file, so it refuses every cluster (fail-closed). This is a platform fault, not a hold."
+readonly SCOPE_UNREADABLE_REMEDIATION="Report it to the platform team (check the <agent>-hold / <agent>-config ConfigMap and the pods' mounts); do not retry or re-scaffold."
 readonly SCOPE_EXCLUDE_REMEDIATION="Report the exclusion to the user and stop; do not retry, re-scaffold, or work around it. An operator lets the agents back in by removing the cluster from spec.scope.exclude.clusters."
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
@@ -488,8 +493,11 @@ if [ "$STATUS" = "ok" ]; then
         fi
         # A hold or an exclusion is the platform's operators keeping the agents
         # out, not a cluster that can't be reached: say so, and nothing else.
-        if printf '%s' "$ERR" | grep -Eq "$SCOPE_HOLD_REFUSAL_RE"; then
-            REASON_5="The target cluster is on hold by the platform's operators (spec.scope.hold): kube-proxy and the credential broker refuse its API to every agent."
+        if printf '%s' "$ERR" | grep -Eq "$SCOPE_UNREADABLE_REFUSAL_RE"; then
+            REASON_5="$SCOPE_UNREADABLE_REASON"
+            REMEDIATION_5="$SCOPE_UNREADABLE_REMEDIATION"
+        elif printf '%s' "$ERR" | grep -Eq "$SCOPE_HOLD_REFUSAL_RE"; then
+            REASON_5="The target cluster is on hold by the platform's operators (spec.hold): kube-proxy and the credential broker refuse its API to every agent."
             HOLD_REASON="$(printf '%s' "$ERR_ONE" | sed -n "$SCOPE_HOLD_REASON_SED" | head -n 1 | cut -c1-"$SCOPE_HOLD_REASON_MAX_CHARS")"
             [ -n "$HOLD_REASON" ] && REASON_5="$REASON_5 Reason given: $HOLD_REASON."
             REMEDIATION_5="$SCOPE_HOLD_REMEDIATION"

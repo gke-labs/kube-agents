@@ -21,8 +21,8 @@ Fail-closed: when the broker is told where the file is and can't read or parse
 it, every cluster target is refused until it can. The variable unset is a broker
 started outside the operator, and excludes nothing.
 
-`spec.scope.hold` is refused the same way, from a file of its own
-(`CREDENTIAL_PROXY_HOLD_FILE`, the `<agent>-scope-hold` ConfigMap's `hold.json`)
+`spec.hold` is refused the same way, from a file of its own
+(`CREDENTIAL_PROXY_HOLD_FILE`, the `<agent>-hold` ConfigMap's `hold.json`)
 that no pod-template hash covers, so an operator's hold applies, and lifts,
 without a restart. A held cluster keeps its Cluster Agent profile and its place in
 fleet audits; only its Kubernetes API is refused, under `scope.held-cluster`, with the hold's
@@ -55,7 +55,7 @@ EXCLUDE_KEY = "exclude"
 CLUSTERS_KEY = "clusters"
 HOLD_ALL_KEY = "all"
 HOLD_REASON_KEY = "reason"
-# The CRD caps spec.scope.hold.reason at 256; the broker holds it to that too.
+# The CRD caps spec.hold.reason at 256; the broker holds it to that too.
 HOLD_REASON_MAX_LENGTH = 256
 HOLD_STOP_NOTICE = (
     "An operator paused agent access to it; report this and stop, do not retry or work around it"
@@ -75,7 +75,7 @@ class ExcludedCluster(Exception):
 
 
 class HeldCluster(ExcludedCluster):
-    """A cluster target an operator's spec.scope.hold pauses, or one it can't vouch for.
+    """A cluster target an operator's spec.hold pauses, or one it can't vouch for.
 
     An ExcludedCluster, so every route that answers an exclusion answers a hold.
     """
@@ -160,7 +160,7 @@ def parse_holds(document: object) -> HoldState:
 
 
 class Holds:
-    """The broker's view of spec.scope.hold, re-read when the file changes.
+    """The broker's view of spec.hold, re-read when the file changes.
 
     The same identity check as Exclusions: the ConfigMap directory mount swaps
     the file in place, and the parse is redone only when it moves. Fail-closed
@@ -201,7 +201,7 @@ class Holds:
         if state.held_all:
             raise HeldCluster(
                 RULE_HELD_CLUSTER,
-                f"every cluster is on hold (spec.scope.hold.all){state.reason_suffix()}. {HOLD_STOP_NOTICE}",
+                f"every cluster is on hold (spec.hold.all){state.reason_suffix()}. {HOLD_STOP_NOTICE}",
             )
         if state.triples:
             raise HeldCluster(
@@ -222,12 +222,12 @@ class Holds:
         if state.held_all:
             raise HeldCluster(
                 RULE_HELD_CLUSTER,
-                f"every cluster is on hold (spec.scope.hold.all){state.reason_suffix()}. {HOLD_STOP_NOTICE}",
+                f"every cluster is on hold (spec.hold.all){state.reason_suffix()}. {HOLD_STOP_NOTICE}",
             )
         if _matches(state.triples, project, location, cluster):
             raise HeldCluster(
                 RULE_HELD_CLUSTER,
-                f"cluster {cluster} ({project}, {location}) is on hold (spec.scope.hold)"
+                f"cluster {cluster} ({project}, {location}) is on hold (spec.hold)"
                 f"{state.reason_suffix()}. {HOLD_STOP_NOTICE}",
             )
         if state.triples and PROJECT_NUMBER.match(project):

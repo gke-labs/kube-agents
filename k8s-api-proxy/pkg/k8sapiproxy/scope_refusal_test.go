@@ -34,7 +34,7 @@ func TestAScopeRefusalOnADiscoveryPathIsPlainText(t *testing.T) {
 			t.Errorf("%s: no nosniff header", p)
 		}
 		body := rec.Body.String()
-		for _, want := range []string{policyPrefix, "on hold (spec.scope.hold)", "INC-42 rollback", "policy rule: scope.held-cluster"} {
+		for _, want := range []string{policyPrefix, "on hold (spec.hold)", "INC-42 rollback", "policy rule: scope.held-cluster"} {
 			if !strings.Contains(body, want) {
 				t.Errorf("%s: body %q does not contain %q", p, body, want)
 			}
@@ -81,7 +81,7 @@ func TestTheDiscoveryClientShowsTheHold(t *testing.T) {
 	if err == nil {
 		t.Fatal("ServerGroups succeeded against a held cluster")
 	}
-	for _, want := range []string{"on hold (spec.scope.hold)", "INC-42 rollback", "scope.held-cluster"} {
+	for _, want := range []string{"on hold (spec.hold)", "INC-42 rollback", "scope.held-cluster"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("discovery error %q does not contain %q", err, want)
 		}

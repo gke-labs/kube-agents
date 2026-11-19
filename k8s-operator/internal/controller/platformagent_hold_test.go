@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -30,65 +29,49 @@ func heldCluster(project, location, name string) agentv1alpha1.ScopeClusterRef {
 	return agentv1alpha1.ScopeClusterRef{ProjectID: project, Location: location, ClusterName: name}
 }
 
-func TestTheScopeHoldRendersItsOwnFile(t *testing.T) {
+func TestTheHoldRendersItsOwnFile(t *testing.T) {
 	agent := newTestPlatformAgent()
-	if got := buildScopeHoldConfigMap(agent).Data[scopeHoldKey]; got != "{}\n" {
-		t.Errorf("no scope block: hold.json = %q, want {}", got)
+	if got := buildHoldConfigMap(agent).Data[holdKey]; got != "{}\n" {
+		t.Errorf("no hold: hold.json = %q, want {}", got)
 	}
-	agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Hold: &agentv1alpha1.ScopeHoldSpec{
+	agent.Spec.Hold = &agentv1alpha1.HoldSpec{
 		Clusters: []agentv1alpha1.ScopeClusterRef{heldCluster("p2", "us-east1", "b"), heldCluster("p1", "us-east1", "a")},
 		Reason:   "INC-123",
-	}}
-	cm := buildScopeHoldConfigMap(agent)
-	if cm.Name != agent.Name+"-scope-hold" {
+	}
+	cm := buildHoldConfigMap(agent)
+	if cm.Name != agent.Name+"-hold" {
 		t.Errorf("ConfigMap name = %q", cm.Name)
 	}
 	want := `{"clusters":[{"projectId":"p1","location":"us-east1","clusterName":"a"},{"projectId":"p2","location":"us-east1","clusterName":"b"}],"reason":"INC-123"}` + "\n"
-	if got := cm.Data[scopeHoldKey]; got != want {
+	if got := cm.Data[holdKey]; got != want {
 		t.Errorf("hold.json = %q, want %q", got, want)
 	}
-	agent.Spec.Scope.Hold = &agentv1alpha1.ScopeHoldSpec{All: true}
-	if got := buildScopeHoldConfigMap(agent).Data[scopeHoldKey]; got != `{"all":true}`+"\n" {
+	agent.Spec.Hold = &agentv1alpha1.HoldSpec{All: true}
+	if got := buildHoldConfigMap(agent).Data[holdKey]; got != `{"all":true}`+"\n" {
 		t.Errorf("hold all: hold.json = %q", got)
 	}
 }
 
-// A hold is not part of scope.json: it would move the agent pod's
-// config-hash and roll it. A hold patched onto a CR with no scope block
-// (where the API server also defaults maxProjects) stays "no declaration".
-func TestTheScopeHoldIsNotInTheScopeDeclaration(t *testing.T) {
-	hold := &agentv1alpha1.ScopeHoldSpec{All: true, Reason: "incident"}
+// A hold is not part of the config ConfigMap, which the agent pod's config-hash
+// covers, nor of scope.json.
+func TestTheHoldIsNotInTheConfigMap(t *testing.T) {
 	for name, scope := range map[string]*agentv1alpha1.ScopeSpec{
-		"no block, the cap defaulted": nil,
-		"projects":                    {Projects: []string{"payments-prod"}},
-		"exclusions":                  {Exclude: &agentv1alpha1.ScopeExcludeSpec{Projects: []string{}, Clusters: []agentv1alpha1.ScopeClusterRef{}}},
-		"a cap off the default":       {MaxProjects: ptr.To(int32(250))},
-		"the installer's render":      {Projects: []string{}, Exclude: &agentv1alpha1.ScopeExcludeSpec{}},
+		"no scope block": nil,
+		"a scope":        {Projects: []string{"payments-prod"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			without := newTestPlatformAgent()
 			without.Spec.Scope = scope.DeepCopy()
-			held := newTestPlatformAgent()
-			if scope == nil {
-				held.Spec.Scope = &agentv1alpha1.ScopeSpec{MaxProjects: ptr.To(defaultScopeMaxProjects)}
-			} else {
-				held.Spec.Scope = scope.DeepCopy()
-			}
-			held.Spec.Scope.Hold = hold.DeepCopy()
-			if got, want := renderScopeJSON(held), renderScopeJSON(without); got != want {
-				t.Errorf("scope.json with a hold:\n%s\nwithout:\n%s", got, want)
-			}
+			held := without.DeepCopy()
+			held.Spec.Hold = &agentv1alpha1.HoldSpec{All: true, Reason: "incident"}
 			if got, want := buildConfigMap(held, nil).Data, buildConfigMap(without, nil).Data; !reflect.DeepEqual(got, want) {
-				t.Error("the config ConfigMap, which the agent pod's config-hash covers, changes with a hold")
-			}
-			if (scopeForDeclaration(held) == nil) != (scope == nil) {
-				t.Errorf("declared = %v, want %v", scopeForDeclaration(held) != nil, scope != nil)
+				t.Error("the config ConfigMap changes with a hold")
 			}
 		})
 	}
 }
 
-func TestKubeProxyAndTheBrokerReadTheScopeHold(t *testing.T) {
+func TestKubeProxyAndTheBrokerReadTheHold(t *testing.T) {
 	agent := scopePublisherAgent()
 	check := func(t *testing.T, who string, env []corev1.EnvVar, envName string, mounts []corev1.VolumeMount, volumes []corev1.Volume) {
 		t.Helper()
@@ -97,10 +80,10 @@ func TestKubeProxyAndTheBrokerReadTheScopeHold(t *testing.T) {
 		}
 		mounted, volume := false, false
 		for _, m := range mounts {
-			mounted = mounted || (m.Name == scopeHoldVolumeName && m.MountPath == "/etc/kube-agents/hold" && m.ReadOnly && m.SubPath == "")
+			mounted = mounted || (m.Name == holdVolumeName && m.MountPath == "/etc/kube-agents/hold" && m.ReadOnly && m.SubPath == "")
 		}
 		for _, v := range volumes {
-			volume = volume || (v.Name == scopeHoldVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == agent.Name+"-scope-hold" &&
+			volume = volume || (v.Name == holdVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == agent.Name+"-hold" &&
 				v.ConfigMap.Optional != nil && *v.ConfigMap.Optional)
 		}
 		if !mounted || !volume {
@@ -117,10 +100,10 @@ func TestKubeProxyAndTheBrokerReadTheScopeHold(t *testing.T) {
 
 // Setting, changing or lifting a hold changes neither kube-proxy's nor the
 // broker's pod template.
-func TestTheScopeHoldLeavesTheProxyTemplates(t *testing.T) {
+func TestTheHoldLeavesTheProxyTemplates(t *testing.T) {
 	without := scopePublisherAgent()
-	held := scopePublisherAgent()
-	held.Spec.Scope.Hold = &agentv1alpha1.ScopeHoldSpec{Clusters: []agentv1alpha1.ScopeClusterRef{heldCluster("p1", "us-east1", "a")}, Reason: "INC-1"}
+	held := without.DeepCopy()
+	held.Spec.Hold = &agentv1alpha1.HoldSpec{Clusters: []agentv1alpha1.ScopeClusterRef{heldCluster("p1", "us-east1", "a")}, Reason: "INC-1"}
 	if !reflect.DeepEqual(buildKubeProxyDeployment(held, "", true, "h").Spec.Template, buildKubeProxyDeployment(without, "", true, "h").Spec.Template) {
 		t.Error("kube-proxy's pod template changes with a hold")
 	}
@@ -135,16 +118,5 @@ func TestTheReservedListNamesTheHoldFile(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_HOLD_FILE", Value: "/dev/null"}})
 	if _, count := envValueCount(merged, "CREDENTIAL_PROXY_HOLD_FILE"); count != 0 {
 		t.Error("CREDENTIAL_PROXY_HOLD_FILE survived the merge from spec.deployment.env")
-	}
-}
-
-// The shell sandbox's collectors read a hold-only block as no declaration too.
-func TestTheShellSandboxReadsAHoldOnlyBlockAsUndeclared(t *testing.T) {
-	agent := shellSandboxTestAgent()
-	agent.Spec.Scope = &agentv1alpha1.ScopeSpec{MaxProjects: ptr.To(defaultScopeMaxProjects), Hold: &agentv1alpha1.ScopeHoldSpec{All: true}}
-	for _, env := range buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash").Spec.Template.Spec.Containers[0].Env {
-		if env.Name == envScopeDeclared && env.Value != "false" {
-			t.Errorf("%s = %q for a block that holds nothing but a hold, want false", envScopeDeclared, env.Value)
-		}
 	}
 }

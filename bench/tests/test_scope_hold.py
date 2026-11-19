@@ -31,7 +31,7 @@ CRD_WITH_HOLD = {
             {
                 "name": "v1alpha1",
                 "served": True,
-                "schema": {"openAPIV3Schema": {"properties": {"spec": {"properties": {"scope": {"properties": {"exclude": {}, "hold": {}}}}}}}},
+                "schema": {"openAPIV3Schema": {"properties": {"spec": {"properties": {"scope": {"properties": {"exclude": {}}}, "hold": {}}}}}},
             }
         ]
     }
@@ -72,7 +72,7 @@ def _merge(target, patch):
 class FakeCluster:
     """kubectl against one CR, its CRD and the operator's ConfigMap.
 
-    `prune` drops spec.scope.hold from every patch, as a server whose schema
+    `prune` drops spec.hold from every patch, as a server whose schema
     lacks the field does; `render` is what the operator writes into the
     ConfigMap after a patch (None: it writes nothing).
     """
@@ -99,7 +99,7 @@ class FakeCluster:
             self.patches.append(body)
             self.cr = _merge(self.cr, body)
             if self.prune:
-                (self.cr.get("spec", {}).get("scope") or {}).pop("hold", None)
+                self.cr.get("spec", {}).pop("hold", None)
             if self.render is not None:
                 self.configmap = self.render(self.cr)
             return subprocess.CompletedProcess(args, 0, "patched", "")
@@ -107,7 +107,7 @@ class FakeCluster:
 
 
 def _render_json(cr):
-    hold = (cr.get("spec", {}).get("scope") or {}).get("hold")
+    hold = cr.get("spec", {}).get("hold")
     return {"data": {"hold.json": json.dumps(hold or {})}}
 
 
@@ -199,51 +199,57 @@ def test_a_context_that_names_no_gke_cluster_is_refused(context):
 # -- the patches --
 
 
-def test_the_patch_saves_a_missing_scope_block_and_the_restore_removes_it():
+def test_the_patch_sets_spec_hold_alone_and_the_restore_clears_it():
     cr = {"metadata": {"name": "platform-agent"}, "spec": {"mode": "next"}}
     patched = _merge(cr, scope_hold.patch_body(cr, HOST_HOLD))
-    assert patched["spec"]["scope"] == {"hold": HOST_HOLD}
-    assert json.loads(patched["metadata"]["annotations"][ANNOTATION]) == {"hold": None, "scope": False}
+    assert patched["spec"] == {"mode": "next", "hold": HOST_HOLD}
+    assert json.loads(patched["metadata"]["annotations"][ANNOTATION]) == {"hold": None}
     restored = _merge(patched, scope_hold.restore_body(patched))
     assert restored == {"metadata": {"name": "platform-agent", "annotations": {}}, "spec": {"mode": "next"}}
 
 
-def test_the_restore_keeps_a_block_the_case_did_not_create():
-    cr = {"metadata": {}, "spec": {"scope": {"exclude": {"clusters": []}}}}
-    patched = _merge(cr, scope_hold.patch_body(cr, HOST_HOLD))
-    restored = _merge(patched, scope_hold.restore_body(patched))
-    assert restored["spec"] == {"scope": {"exclude": {"clusters": []}}}
-    assert ANNOTATION not in restored["metadata"]["annotations"]
+def test_the_patch_and_restore_leave_a_scope_block_alone():
+    # The bug spec.hold fixes: under spec.scope, a hold patched onto a CR with no
+    # scope block left a defaulted {maxProjects: 100} behind after the restore,
+    # which the reconcile reads as the declaration that drops projects.
+    for spec in ({}, {"scope": {"maxProjects": 100, "exclude": {"clusters": []}}}):
+        cr = {"metadata": {}, "spec": json.loads(json.dumps(spec))}
+        patched = _merge(cr, scope_hold.patch_body(cr, HOST_HOLD))
+        assert patched["spec"].get("scope") == spec.get("scope")
+        restored = _merge(patched, scope_hold.restore_body(patched))
+        assert restored["spec"] == spec
+        assert ANNOTATION not in restored["metadata"]["annotations"]
 
 
 def test_an_earlier_hold_is_replaced_whole_and_put_back():
     earlier = {"all": True, "reason": "freeze"}
-    cr = {"metadata": {}, "spec": {"scope": {"hold": earlier}}}
+    cr = {"metadata": {}, "spec": {"hold": earlier}}
     patched = _merge(cr, scope_hold.patch_body(cr, HOST_HOLD))
     # `all` is nulled, not left beside the new clusters.
-    assert patched["spec"]["scope"]["hold"] == HOST_HOLD
+    assert patched["spec"]["hold"] == HOST_HOLD
+    assert json.loads(patched["metadata"]["annotations"][ANNOTATION]) == {"hold": earlier}
     restored = _merge(patched, scope_hold.restore_body(patched))
-    assert restored["spec"]["scope"]["hold"] == earlier
+    assert restored["spec"]["hold"] == earlier
 
 
 def test_a_patch_over_a_leftover_starts_from_the_saved_hold():
     cr = {"metadata": {}, "spec": {}}
     leftover = _merge(cr, scope_hold.patch_body(cr, {"all": True, "reason": "old run"}))
     again = _merge(leftover, scope_hold.patch_body(leftover, HOST_HOLD))
-    assert json.loads(again["metadata"]["annotations"][ANNOTATION]) == {"hold": None, "scope": False}
+    assert json.loads(again["metadata"]["annotations"][ANNOTATION]) == {"hold": None}
     assert _merge(again, scope_hold.restore_body(again))["spec"] == {}
 
 
 def test_nothing_is_restored_without_a_saved_hold():
-    assert scope_hold.restore_body({"metadata": {}, "spec": {"scope": {"hold": HOST_HOLD}}}) is None
+    assert scope_hold.restore_body({"metadata": {}, "spec": {"hold": HOST_HOLD}}) is None
 
 
-def test_the_restore_on_a_server_that_pruned_the_hold_drops_the_empty_block_it_left():
-    cr = {"metadata": {"annotations": {ANNOTATION: json.dumps({"scope": False, "hold": None})}}, "spec": {"scope": {}}}
-    assert scope_hold.restore_body(cr) == {"metadata": {"annotations": {ANNOTATION: None}}, "spec": {"scope": None}}
+def test_the_restore_on_a_server_that_pruned_the_hold_only_drops_the_annotation():
+    cr = {"metadata": {"annotations": {ANNOTATION: json.dumps({"hold": None})}}, "spec": {}}
+    assert scope_hold.restore_body(cr) == {"metadata": {"annotations": {ANNOTATION: None}}}
 
 
-@pytest.mark.parametrize("value", ["{", "[]", '{"scope": "no", "hold": null}', '{"scope": true, "hold": 3}'])
+@pytest.mark.parametrize("value", ["{", "[]", "{}", '{"hold": 3}', '{"hold": "x"}'])
 def test_an_annotation_the_runner_did_not_write_is_named(value):
     with pytest.raises(scope_hold.ScopeHoldError, match="annotation"):
         scope_hold.restore_body({"metadata": {"annotations": {ANNOTATION: value}}, "spec": {}})
@@ -260,16 +266,9 @@ def test_the_crd_schema_tells_whether_the_field_exists():
     assert not scope_hold.crd_declares_hold(unserved)
 
 
-@pytest.mark.parametrize(
-    "data",
-    [
-        {"hold.json": json.dumps(HOST_HOLD)},
-        {"scope-hold": json.dumps({"hold": {"all": False, "clusters": [HOST]}})},
-        {"clusters": f"- {CONTEXT}\n"},
-    ],
-)
-def test_the_configmap_is_read_whatever_its_layout(data):
-    assert scope_hold.held_in_configmap({"data": data}, HOST_HOLD)
+def test_the_configmap_is_read_from_hold_json():
+    assert scope_hold.held_in_configmap({"data": {"hold.json": json.dumps(HOST_HOLD) + "\n"}}, HOST_HOLD)
+    assert scope_hold.held_in_configmap({"data": {"hold.json": json.dumps({"all": True})}}, {"all": True, "reason": "r"})
 
 
 def test_a_configmap_without_the_cluster_or_all_does_not_hold():
@@ -277,7 +276,11 @@ def test_a_configmap_without_the_cluster_or_all_does_not_hold():
     other = {**HOST, "clusterName": "seeded-a"}
     assert not scope_hold.held_in_configmap({"data": {"hold.json": json.dumps({"clusters": [other]})}}, HOST_HOLD)
     assert not scope_hold.held_in_configmap({"data": {"hold.json": json.dumps({"all": False})}}, {"all": True, "reason": "r"})
-    assert scope_hold.held_in_configmap({"data": {"hold.yaml": "all: true\n"}}, {"all": True, "reason": "r"})
+    # Only hold.json counts: another key, or a body that is not a JSON object, holds nothing.
+    assert not scope_hold.held_in_configmap({"data": {"scope-hold": json.dumps(HOST_HOLD)}}, HOST_HOLD)
+    assert not scope_hold.held_in_configmap({"data": {"hold.json": "all: true\n"}}, {"all": True, "reason": "r"})
+    assert not scope_hold.held_in_configmap({"data": {"hold.json": "[]"}}, {"all": True, "reason": "r"})
+    assert not scope_hold.held_in_configmap({}, HOST_HOLD)
 
 
 # -- apply and restore against kubectl --
@@ -288,7 +291,7 @@ def test_apply_patches_waits_for_the_configmap_then_the_pods():
     rc, slept = _apply(cluster)
     assert rc == 0
     assert len(cluster.patches) == 1
-    assert cluster.cr["spec"]["scope"]["hold"] == HOST_HOLD
+    assert cluster.cr["spec"]["hold"] == HOST_HOLD
     assert slept == [scope_hold.PROPAGATION_SECONDS]
 
 
@@ -333,7 +336,7 @@ def test_main_reads_the_hold_from_the_task_and_resolves_the_context(tmp_path, mo
     monkeypatch.setattr(scope_hold.time, "sleep", lambda _s: None)
     argv = ["apply", "--task", str(task), "--context", CONTEXT, "--namespace", "kubeagents-system", "--name", "platform-agent"]
     assert scope_hold.main(argv, kubectl=cluster) == 0
-    assert cluster.cr["spec"]["scope"]["hold"] == HOST_HOLD
+    assert cluster.cr["spec"]["hold"] == HOST_HOLD
 
 
 def test_main_reports_a_failed_apply_as_exit_1(capsys, monkeypatch):

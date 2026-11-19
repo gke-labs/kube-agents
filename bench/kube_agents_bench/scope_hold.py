@@ -20,11 +20,11 @@ cluster, so the case needs no seeded fleet) or ``scope_hold: {all: true,
 reason: <text>}`` (every cluster); both flags may be set. The runner runs such a
 case alone, after every other unit, because a hold refuses every Kubernetes API
 request the agent makes to the held cluster: it sets the PlatformAgent's
-``spec.scope.hold`` for the case's repetitions, then puts the previous hold back.
+``spec.hold`` for the case's repetitions, then puts the previous hold back.
 
 A hold restarts no pod and prunes no profile, so there is no reconcile to wait
 for. ``apply`` patches the CR, reads it back, waits until the operator has
-written the hold into the ``<agent>-scope-hold`` ConfigMap (SETTLE_SECONDS), then
+written the hold into the ``<agent>-hold`` ConfigMap (SETTLE_SECONDS), then
 waits PROPAGATION_SECONDS more: the proxy and the broker read the ConfigMap as a
 mounted file, which the kubelet refreshes on its own clock (its sync period plus
 its ConfigMap cache, about a minute each by default), and nothing the runner can
@@ -32,7 +32,7 @@ read tells it when a given pod's copy changed. A probe through the proxy would
 tell, but it would need the shell sandbox's kubeconfig, which only the sandbox
 user owns.
 
-An install whose PlatformAgent API has no ``spec.scope.hold`` (current main
+An install whose PlatformAgent API has no ``spec.hold`` (current main
 before the field lands) is told apart before anything is patched, from the CRD's
 schema: ``apply`` patches nothing and exits EXIT_UNSUPPORTED, and the runner runs
 the case on the install as it is. That run is graded, not recorded as
@@ -45,9 +45,8 @@ hold the operator never writes into the ConfigMap is a failed precondition
 The hold the patch replaced is saved on the CR itself, in ANNOTATION, so the
 restore needs nothing from the run that patched it: the EXIT trap and the next
 lease's preflight both restore from the CR alone, and a patch over a leftover
-starts from the saved hold rather than from the leftover. A CR that had no
-``spec.scope`` block gets it removed again on restore, since a present block
-changes what the Cluster Agent reconcile reads.
+starts from the saved hold rather than from the leftover. ``spec.hold`` is its
+own top-level field, so setting and clearing it touches nothing else on the CR.
 
 Subcommands, each exiting 1 with the reason on stderr:
 
@@ -55,7 +54,7 @@ Subcommands, each exiting 1 with the reason on stderr:
     ``<case> <hold as one line of JSON>`` for each task that declares the key.
 ``apply (--task <task.yaml> | --hold <json>) --context <ctx> --namespace <ns> --name <cr>``
     Apply the hold and wait until it is in effect; exit EXIT_UNSUPPORTED, having
-    patched nothing, when the install's API has no ``spec.scope.hold``.
+    patched nothing, when the install's API has no ``spec.hold``.
 ``restore --context <ctx> --namespace <ns> --name <cr> [--wait]``
     Put the saved hold back, or do nothing when none is saved; ``--wait`` also
     waits PROPAGATION_SECONDS after a restore, for the lifted hold to reach the
@@ -92,27 +91,23 @@ FLAG_KEYS = (ALL_KEY, AGENT_CLUSTER_KEY)
 # Long enough for a sentence, short enough to sit in one log line and one
 # refusal message.
 MAX_REASON_CHARS = 256
-# The CR's spec.scope block and its hold, as spec.scope.hold takes it.
-SPEC_SCOPE = "scope"
-SCOPE_HOLD = "hold"
+# The CR's spec.hold, and its keys.
+SPEC_HOLD = "hold"
 HOLD_ALL = "all"
 HOLD_CLUSTERS = "clusters"
 HOLD_REASON = "reason"
 CLUSTER_KEYS = ("projectId", "location", "clusterName")
-# An `all: true` in a ConfigMap value that is not JSON (YAML, or JSON in prose).
-ALL_TRUE_TEXT = re.compile(r'"?all"?\s*:\s*true')
 # A GKE kubeconfig context, gke_<project>_<location>_<cluster>: how the agent's
 # own cluster is named without the seeded fleet.
 GKE_CONTEXT = re.compile(r"\Agke_([a-z0-9-]+)_([a-z0-9-]+)_([a-z0-9-]+)\Z")
-GKE_CONTEXT_FORMAT = "gke_{projectId}_{location}_{clusterName}"
-# The hold the patch replaced: {"scope": <the CR had a spec.scope block>,
-# "hold": <its spec.scope.hold, or null>}, as JSON.
+# The hold the patch replaced: {"hold": <the CR's spec.hold, or null>}, as JSON.
 ANNOTATION = "bench.kubeagents.x-k8s.io/scope-hold-before"
-SAVED_SCOPE = "scope"
 SAVED_HOLD = "hold"
 CRD_NAME = "platformagents.kubeagents.x-k8s.io"
-# The ConfigMap the operator renders the hold into, beside the CR's name.
-CONFIGMAP_SUFFIX = "-scope-hold"
+# The ConfigMap the operator renders the hold into, beside the CR's name, and
+# its one key.
+CONFIGMAP_SUFFIX = "-hold"
+CONFIGMAP_KEY = "hold.json"
 # How long the operator may take to write the hold into the ConfigMap, and how
 # often it is read; then how long the kubelet may take to refresh the mounted
 # copy in the proxy and broker pods (see the module docstring).
@@ -122,7 +117,7 @@ PROPAGATION_SECONDS = 120
 # Every kubectl call's own bound, and the process's, a little longer.
 REQUEST_TIMEOUT = "30s"
 PROCESS_TIMEOUT_SECONDS = 60
-# `apply` on an install whose PlatformAgent API has no spec.scope.hold: nothing
+# `apply` on an install whose PlatformAgent API has no spec.hold: nothing
 # was patched, and the case runs on the install as it is (the module docstring
 # says why that is graded).
 EXIT_UNSUPPORTED = 3
@@ -174,7 +169,7 @@ def declared_hold(task_yaml: Path) -> dict[str, Any] | None:
 
 
 def agent_cluster(context: str) -> dict[str, str]:
-    """The install's host cluster, as spec.scope.hold.clusters takes it."""
+    """The install's host cluster, as spec.hold.clusters takes it."""
     match = GKE_CONTEXT.match(context)
     if not match:
         raise ScopeHoldError(f"context {context!r} is not gke_<project>_<location>_<cluster>")
@@ -182,7 +177,7 @@ def agent_cluster(context: str) -> dict[str, str]:
 
 
 def resolved_hold(declared: dict[str, Any], context: str) -> dict[str, Any]:
-    """The CR's spec.scope.hold for a declared hold."""
+    """The CR's spec.hold for a declared hold."""
     hold: dict[str, Any] = {}
     if declared.get(ALL_KEY):
         hold[HOLD_ALL] = True
@@ -193,14 +188,13 @@ def resolved_hold(declared: dict[str, Any], context: str) -> dict[str, Any]:
 
 
 def crd_declares_hold(crd: dict[str, Any]) -> bool:
-    """Whether a served version of the PlatformAgent CRD has spec.scope.hold."""
+    """Whether a served version of the PlatformAgent CRD has spec.hold."""
     for version in (crd.get("spec") or {}).get("versions") or []:
         if not version.get("served"):
             continue
         props = ((version.get("schema") or {}).get("openAPIV3Schema") or {}).get("properties") or {}
         spec = (props.get("spec") or {}).get("properties") or {}
-        scope = (spec.get(SPEC_SCOPE) or {}).get("properties") or {}
-        if SCOPE_HOLD in scope:
+        if SPEC_HOLD in spec:
             return True
     return False
 
@@ -213,8 +207,8 @@ def _saved(cr: dict[str, Any]) -> dict[str, Any] | None:
         saved = json.loads(annotations[ANNOTATION])
     except ValueError as exc:
         raise ScopeHoldError(f"annotation {ANNOTATION} is not JSON: {exc}") from exc
-    if not isinstance(saved, dict) or not isinstance(saved.get(SAVED_SCOPE), bool) or not (
-        saved.get(SAVED_HOLD) is None or isinstance(saved.get(SAVED_HOLD), dict)
+    if not isinstance(saved, dict) or SAVED_HOLD not in saved or not (
+        saved[SAVED_HOLD] is None or isinstance(saved[SAVED_HOLD], dict)
     ):
         raise ScopeHoldError(f"annotation {ANNOTATION} holds {saved!r}, not a saved hold; delete it by hand")
     return saved
@@ -231,12 +225,12 @@ def _replacement(current: Any, new: dict[str, Any]) -> dict[str, Any]:
 def patch_body(cr: dict[str, Any], hold: dict[str, Any]) -> dict[str, Any]:
     """The merge patch that sets `hold`, saving the hold the CR had before any."""
     saved = _saved(cr)
-    scope = (cr.get("spec") or {}).get(SPEC_SCOPE)
+    current = (cr.get("spec") or {}).get(SPEC_HOLD)
     if saved is None:
-        saved = {SAVED_SCOPE: isinstance(scope, dict), SAVED_HOLD: (scope or {}).get(SCOPE_HOLD)}
+        saved = {SAVED_HOLD: current if isinstance(current, dict) else None}
     return {
         "metadata": {"annotations": {ANNOTATION: json.dumps(saved, sort_keys=True)}},
-        "spec": {SPEC_SCOPE: {SCOPE_HOLD: _replacement((scope or {}).get(SCOPE_HOLD), hold)}},
+        "spec": {SPEC_HOLD: _replacement(current, hold)},
     }
 
 
@@ -246,72 +240,40 @@ def restore_body(cr: dict[str, Any]) -> dict[str, Any] | None:
     if saved is None:
         return None
     body: dict[str, Any] = {"metadata": {"annotations": {ANNOTATION: None}}}
-    scope = (cr.get("spec") or {}).get(SPEC_SCOPE)
-    current = scope.get(SCOPE_HOLD) if isinstance(scope, dict) else None
-    if not saved[SAVED_SCOPE]:
-        # A block the patch created: removed when the hold is all it holds, so
-        # the reconcile reads an absent block again.
-        if isinstance(scope, dict) and set(scope) <= {SCOPE_HOLD}:
-            body["spec"] = {SPEC_SCOPE: None}
-        elif current is not None:
-            body["spec"] = {SPEC_SCOPE: {SCOPE_HOLD: None}}
-    elif saved[SAVED_HOLD] is None:
+    current = (cr.get("spec") or {}).get(SPEC_HOLD)
+    if saved[SAVED_HOLD] is None:
         if current is not None:
-            body["spec"] = {SPEC_SCOPE: {SCOPE_HOLD: None}}
+            body["spec"] = {SPEC_HOLD: None}
     else:
-        body["spec"] = {SPEC_SCOPE: {SCOPE_HOLD: _replacement(current, saved[SAVED_HOLD])}}
+        body["spec"] = {SPEC_HOLD: _replacement(current, saved[SAVED_HOLD])}
     return body
 
 
 def hold_in_effect_on_cr(cr: dict[str, Any], hold: dict[str, Any]) -> bool:
     """Whether the CR keeps every key of `hold` as written (the server may default others)."""
-    current = ((cr.get("spec") or {}).get(SPEC_SCOPE) or {}).get(SCOPE_HOLD)
+    current = (cr.get("spec") or {}).get(SPEC_HOLD)
     return isinstance(current, dict) and all(current.get(k) == v for k, v in hold.items())
 
 
-def _mentions(node: Any) -> tuple[bool, list[dict[str, str]]]:
-    """(an `all: true` found, the clusters found) anywhere in a parsed document."""
-    found_all, found = False, []
-    if isinstance(node, dict):
-        if node.get(HOLD_ALL) is True:
-            found_all = True
-        if all(isinstance(node.get(k), str) for k in CLUSTER_KEYS):
-            found.append({k: node[k] for k in CLUSTER_KEYS})
-        children = list(node.values())
-    elif isinstance(node, list):
-        children = node
-    else:
-        children = []
-    for child in children:
-        child_all, child_found = _mentions(child)
-        found_all = found_all or child_all
-        found += child_found
-    return found_all, found
-
-
 def held_in_configmap(configmap: dict[str, Any], hold: dict[str, Any]) -> bool:
-    """Whether the operator's ConfigMap carries `hold`: an `all: true` when the hold
-    is on all, and each held cluster, by its triple or its GKE context name.
-
-    The ConfigMap's layout is the operator's; this reads any key, as JSON when
-    it parses and as text otherwise, so a renamed key does not fail the wait.
-    """
-    texts = [v for v in ((configmap.get("data") or {}).values()) if isinstance(v, str)]
-    found_all, found, raw = False, [], "\n".join(texts)
-    for text in texts:
-        try:
-            doc = json.loads(text)
-        except ValueError:
-            continue
-        doc_all, doc_found = _mentions(doc)
-        found_all = found_all or doc_all
-        found += doc_found
-    if hold.get(HOLD_ALL) and not (found_all or ALL_TRUE_TEXT.search(raw)):
+    """Whether the operator's ConfigMap carries `hold` in its hold.json: `all: true`
+    when the hold is on all, and each held cluster by its triple."""
+    text = (configmap.get("data") or {}).get(CONFIGMAP_KEY)
+    if not isinstance(text, str):
         return False
-    for cluster in hold.get(HOLD_CLUSTERS) or []:
-        if cluster not in found and GKE_CONTEXT_FORMAT.format(**cluster) not in raw:
-            return False
-    return True
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    if hold.get(HOLD_ALL) and doc.get(HOLD_ALL) is not True:
+        return False
+    rendered = doc.get(HOLD_CLUSTERS) or []
+    found = [
+        {k: c.get(k) for k in CLUSTER_KEYS} for c in rendered if isinstance(c, dict)
+    ] if isinstance(rendered, list) else []
+    return all(cluster in found for cluster in hold.get(HOLD_CLUSTERS) or [])
 
 
 def kubectl_runner(context: str, namespace: str) -> Kubectl:
@@ -359,7 +321,7 @@ def apply(
     clock = clock or time.monotonic
     if not crd_declares_hold(_get_json(kubectl, "crd", CRD_NAME)):
         log(
-            f"Scope hold: {CRD_NAME} declares no spec.scope.hold, so platformagent/{name} cannot be held; "
+            f"Scope hold: {CRD_NAME} declares no spec.hold, so platformagent/{name} cannot be held; "
             "nothing was patched and the case runs on the install as it is"
         )
         return EXIT_UNSUPPORTED

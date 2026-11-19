@@ -800,9 +800,9 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The scope declaration in every mode: spec.scope.exclude.clusters is
 	// refused at the broker for every caller (scope_exclude.py).
 	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
-	// spec.scope.hold, refused the same way from its own ConfigMap
-	// (buildScopeHoldConfigMap), which a hold edit changes without a roll.
-	mounts = append(mounts, scopeHoldMount())
+	// spec.hold, refused the same way from its own ConfigMap
+	// (buildHoldConfigMap), which a hold edit changes without a roll.
+	mounts = append(mounts, holdMount())
 	// The token for the audit-report store and nothing else
 	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
 	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
@@ -1021,7 +1021,7 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	// The scope declaration, in every mode (CREDENTIAL_PROXY_SCOPE_FILE): the
 	// broker refuses an excluded cluster for every caller from it, and under
 	// mode next the scope role reads it to bound its arguments.
-	volumes = append(volumes, scopeConfigVolume(agent), scopeHoldVolume(agent))
+	volumes = append(volumes, scopeConfigVolume(agent), holdVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	// The token the broker presents to the audit-report store.
 	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)

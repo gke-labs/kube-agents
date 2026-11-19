@@ -30,42 +30,42 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// spec.scope.hold rides in a ConfigMap of its own, never in <agent>-config:
+// spec.hold rides in a ConfigMap of its own, never in <agent>-config:
 // that one is in the agent pod's config-hash, and a hold must take effect
 // without rolling anything. No pod template hashes this ConfigMap; kube-proxy
 // and the credential broker mount it as a directory (no subPath, so the
 // kubelet swaps the file in place) and stat it on every request.
 const (
-	scopeHoldConfigMapSuffix = "-scope-hold"
-	scopeHoldKey             = "hold.json"
-	scopeHoldVolumeName      = "platform-agent-scope-hold-vol"
-	// scopeHoldDir sits beside brokerScopeDir, not inside it: the runtime
+	holdConfigMapSuffix = "-hold"
+	holdKey             = "hold.json"
+	holdVolumeName      = "platform-agent-hold-vol"
+	// holdDir sits beside brokerScopeDir, not inside it: the runtime
 	// cannot create a mount point inside a read-only ConfigMap volume.
-	scopeHoldDir = "/etc/kube-agents/hold"
+	holdDir = "/etc/kube-agents/hold"
 
 	kubeProxyHoldFileEnvVar       = "KUBE_PROXY_HOLD_FILE"
 	credentialProxyHoldFileEnvVar = "CREDENTIAL_PROXY_HOLD_FILE" // #nosec G101 -- Environment variable name, not a credential
 
-	scopeHoldFileMode int32 = 0444
+	holdFileMode int32 = 0444
 )
 
-// scopeHoldDeclaration is hold.json: the CRD's own keys, so kube-proxy and
+// holdDeclaration is hold.json: the CRD's own keys, so kube-proxy and
 // the broker read the field as an operator wrote it. An empty hold renders
 // "{}".
-type scopeHoldDeclaration struct {
+type holdDeclaration struct {
 	All      bool                            `json:"all,omitempty"`
 	Clusters []agentv1alpha1.ScopeClusterRef `json:"clusters,omitempty"`
 	Reason   string                          `json:"reason,omitempty"`
 }
 
-// renderScopeHoldJSON renders spec.scope.hold, clusters sorted so an
+// renderHoldJSON renders spec.hold, clusters sorted so an
 // unchanged hold renders the same bytes.
-func renderScopeHoldJSON(agent *agentv1alpha1.PlatformAgent) string {
-	decl := scopeHoldDeclaration{}
-	if scope := agent.Spec.Scope; scope != nil && scope.Hold != nil {
-		decl.All = scope.Hold.All
-		decl.Reason = scope.Hold.Reason
-		decl.Clusters = append(decl.Clusters, scope.Hold.Clusters...)
+func renderHoldJSON(agent *agentv1alpha1.PlatformAgent) string {
+	decl := holdDeclaration{}
+	if hold := agent.Spec.Hold; hold != nil {
+		decl.All = hold.All
+		decl.Reason = hold.Reason
+		decl.Clusters = append(decl.Clusters, hold.Clusters...)
 	}
 	sort.Slice(decl.Clusters, func(i, j int) bool {
 		a, b := decl.Clusters[i], decl.Clusters[j]
@@ -82,80 +82,58 @@ func renderScopeHoldJSON(agent *agentv1alpha1.PlatformAgent) string {
 		// A bool, a string and a list of string triples cannot fail to
 		// marshal. If they ever do, an unparseable file is the safe render:
 		// both readers refuse every cluster on it (fail-closed).
-		manifestsLog.Error(err, "rendering spec.scope.hold failed; rendering an unreadable hold")
+		manifestsLog.Error(err, "rendering spec.hold failed; rendering an unreadable hold")
 		return ""
 	}
 	return string(out) + "\n"
 }
 
-func scopeHoldConfigMapName(agent *agentv1alpha1.PlatformAgent) string {
-	return agent.Name + scopeHoldConfigMapSuffix
+func holdConfigMapName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + holdConfigMapSuffix
 }
 
-// buildScopeHoldConfigMap is rendered on every install, "{}" when nothing is
+// buildHoldConfigMap is rendered on every install, "{}" when nothing is
 // held, so the readers never meet a missing file on an operator that knows
 // the field.
-func buildScopeHoldConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+func buildHoldConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      scopeHoldConfigMapName(agent),
+			Name:      holdConfigMapName(agent),
 			Namespace: agent.Namespace,
 		},
-		Data: map[string]string{scopeHoldKey: renderScopeHoldJSON(agent)},
+		Data: map[string]string{holdKey: renderHoldJSON(agent)},
 	}
 }
 
-func (r *PlatformAgentReconciler) reconcileScopeHoldConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	cm := buildScopeHoldConfigMap(agent)
+func (r *PlatformAgentReconciler) reconcileHoldConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildHoldConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return err
 	}
 	return r.applyManaged(ctx, agent, cm)
 }
 
-// scopeHoldVolume projects hold.json at scopeHoldDir. Optional, so a pod
+// holdVolume projects hold.json at holdDir. Optional, so a pod
 // that starts before the operator first writes the ConfigMap mounts an empty
 // directory; the readers refuse every cluster on a configured file they
 // cannot read until the kubelet fills it in.
-func scopeHoldVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+func holdVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 	return corev1.Volume{
-		Name: scopeHoldVolumeName,
+		Name: holdVolumeName,
 		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-			LocalObjectReference: corev1.LocalObjectReference{Name: scopeHoldConfigMapName(agent)},
-			Items:                []corev1.KeyToPath{{Key: scopeHoldKey, Path: scopeHoldKey}},
+			LocalObjectReference: corev1.LocalObjectReference{Name: holdConfigMapName(agent)},
+			Items:                []corev1.KeyToPath{{Key: holdKey, Path: holdKey}},
 			Optional:             ptr.To(true),
-			DefaultMode:          ptr.To(scopeHoldFileMode),
+			DefaultMode:          ptr.To(holdFileMode),
 		}},
 	}
 }
 
-func scopeHoldMount() corev1.VolumeMount {
-	return corev1.VolumeMount{Name: scopeHoldVolumeName, MountPath: scopeHoldDir, ReadOnly: true}
+func holdMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: holdVolumeName, MountPath: holdDir, ReadOnly: true}
 }
 
-func scopeHoldFilePath() string {
-	return path.Join(scopeHoldDir, scopeHoldKey)
-}
-
-// scopeForDeclaration is spec.scope as scope.json and the shell sandbox see
-// it: without the hold, and nil for a block that carries nothing but a hold
-// (and the cap the API server defaults onto every present block). A hold
-// patched onto a CR with no scope block must not turn "no declaration" into
-// "an empty declaration", which the reconcile reads as the one that drops
-// projects, nor move the agent pod's config-hash.
-func scopeForDeclaration(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ScopeSpec {
-	scope := agent.Spec.Scope
-	if scope == nil || scope.Hold == nil {
-		return scope
-	}
-	rest := scope.DeepCopy()
-	rest.Hold = nil
-	holdOnly := len(rest.Projects)+len(rest.Folders)+len(rest.Organizations)+len(rest.SharedVpcHosts)+len(rest.MetricsScopes) == 0 &&
-		rest.Exclude == nil &&
-		(rest.MaxProjects == nil || *rest.MaxProjects == defaultScopeMaxProjects)
-	if holdOnly {
-		return nil
-	}
-	return rest
+func holdFilePath() string {
+	return path.Join(holdDir, holdKey)
 }

@@ -271,8 +271,8 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 	// cluster's API from the same scope.json the credential broker reads, and checks
 	// in-cluster as the cluster the harness names (kubeProxyHostClusterID).
 	envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_SCOPE_FILE", Value: path.Join(brokerScopeDir, scopeFileName)})
-	// spec.scope.hold: the same refusal from a file that changes without a roll.
-	envVars = append(envVars, corev1.EnvVar{Name: kubeProxyHoldFileEnvVar, Value: scopeHoldFilePath()})
+	// spec.hold: the same refusal from a file that changes without a roll.
+	envVars = append(envVars, corev1.EnvVar{Name: kubeProxyHoldFileEnvVar, Value: holdFilePath()})
 	if host := kubeProxyHostClusterID(agent); host != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", Value: host})
 	}
@@ -287,12 +287,12 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
 		{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
 		scopeConfigMount(brokerScopeDir),
-		scopeHoldMount(),
+		holdMount(),
 	}
 
 	volumes := []corev1.Volume{
 		scopeConfigVolume(agent),
-		scopeHoldVolume(agent),
+		holdVolume(agent),
 		{
 			Name: kubeProxyTLSVolumeName,
 			VolumeSource: corev1.VolumeSource{

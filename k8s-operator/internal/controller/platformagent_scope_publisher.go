@@ -785,7 +785,7 @@ func (r *PlatformAgentReconciler) scopePublisherIdentityOwned(ctx context.Contex
 func scopeBrokerEnv(agent *agentv1alpha1.PlatformAgent, owned bool) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)},
-		{Name: credentialProxyHoldFileEnvVar, Value: scopeHoldFilePath()},
+		{Name: credentialProxyHoldFileEnvVar, Value: holdFilePath()},
 	}
 	if scopePublisherMayRun(agent, owned) {
 		env = append(env,

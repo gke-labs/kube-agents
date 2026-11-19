@@ -428,7 +428,7 @@ class ClusterPreflightTest(unittest.TestCase):
     HOLD_ERR = (
         "E1119 10:00:00.000000 memcache.go:265] couldn't get current server API group list: "
         "kube-proxy policy blocked this cluster: cluster prod-1 (payments-prod, us-central1) is on hold "
-        "(spec.scope.hold): INC-42 rollback in progress. An operator paused agent access to it; report this "
+        "(spec.hold): INC-42 rollback in progress. An operator paused agent access to it; report this "
         "and stop, do not retry or work around it. This is a permission boundary, not an error to work around.\n"
         "policy rule: scope.held-cluster"
     )
@@ -437,32 +437,45 @@ class ClusterPreflightTest(unittest.TestCase):
         self.with_endpoint_bullets()
         result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=self.HOLD_ERR)
         self.assertEqual("5", result["check"])
-        self.assertIn("on hold by the platform's operators (spec.scope.hold)", result["reason"])
+        self.assertIn("on hold by the platform's operators (spec.hold)", result["reason"])
         self.assertIn("Reason given: INC-42 rollback in progress.", result["reason"])
         self.assertNotIn("Cannot reach", result["reason"])
         self.assertTrue(result["remediation"].startswith("Report the hold to the user and stop"), result["remediation"])
-        self.assertIn("spec.scope.hold", result["remediation"])
+        self.assertIn("spec.hold", result["remediation"])
         self.assertNotIn("authorized networks", result["remediation"])
         self.assertNotIn("re-scaffold if needed", result["remediation"])
         self.assertIn("scope.held-cluster", result["evidence"])
 
-    def test_check_5_names_a_hold_on_every_cluster_and_an_unreadable_hold(self):
+    def test_check_5_names_a_hold_on_every_cluster(self):
         all_err = self.HOLD_ERR.replace(
-            "cluster prod-1 (payments-prod, us-central1) is on hold (spec.scope.hold): INC-42 rollback in progress",
-            "every cluster is on hold (spec.scope.hold.all): change freeze")
+            "cluster prod-1 (payments-prod, us-central1) is on hold (spec.hold): INC-42 rollback in progress",
+            "every cluster is on hold (spec.hold.all): change freeze")
         result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=all_err)
+        self.assertIn("on hold by the platform's operators (spec.hold)", result["reason"])
         self.assertIn("Reason given: change freeze.", result["reason"])
-        unreadable = ("kube-proxy policy blocked this cluster: the install's hold file can't be read, so kube-proxy "
-                      "can't tell whether this cluster is on hold and reaches no cluster until it can.\n"
-                      "policy rule: scope.hold-unreadable")
-        result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=unreadable)
-        self.assertIn("on hold by the platform's operators", result["reason"])
-        self.assertNotIn("Reason given", result["reason"])
-        self.assertTrue(result["remediation"].startswith("Report the hold to the user and stop"), result["remediation"])
+
+    def test_check_5_names_an_unreadable_scope_or_hold_file_as_a_platform_fault(self):
+        # The proxy or broker can't read its mounted file: an infrastructure
+        # fault, not an operator's decision, so neither a hold nor an exclusion.
+        self.with_endpoint_bullets()
+        for rule, what in (("scope.hold-unreadable", "hold"), ("scope.exclude-unreadable", "scope")):
+            with self.subTest(rule=rule):
+                result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=(
+                    f"kube-proxy policy blocked this cluster: the install's {what} file can't be read, so kube-proxy "
+                    f"can't tell whether this cluster is on hold and reaches no cluster until it can.\n"
+                    f"policy rule: {rule}"))
+                self.assertEqual("5", result["check"])
+                self.assertIn("cannot read its scope/hold file", result["reason"])
+                self.assertIn("platform fault, not a hold", result["reason"])
+                self.assertNotIn("on hold by the platform's operators", result["reason"])
+                self.assertNotIn("excluded from", result["reason"])
+                self.assertTrue(result["remediation"].startswith("Report it to the platform team"), result["remediation"])
+                self.assertIn("do not retry or re-scaffold", result["remediation"])
+                self.assertNotIn("authorized networks", result["remediation"])
 
     def test_check_5_names_an_exclusion_instead_of_unreachable(self):
         self.with_endpoint_bullets()
-        for rule in ("scope.excluded-cluster", "scope.exclude-unreadable"):
+        for rule in ("scope.excluded-cluster",):
             with self.subTest(rule=rule):
                 result = self.run_preflight(FAKE_CLUSTER_INFO_ERR=(
                     "couldn't get current server API group list: kube-proxy policy blocked this cluster: "

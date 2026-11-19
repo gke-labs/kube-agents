@@ -1,4 +1,25 @@
 apiVersion: v1
+data:
+  hold.json: |
+    {}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-hold
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   labels:
@@ -617,27 +638,6 @@ metadata:
       name: platformagent
       uid: ""
 ---
-apiVersion: v1
-data:
-  hold.json: |
-    {}
-kind: ConfigMap
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: kube-agents
-  name: platformagent-scope-hold
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -880,7 +880,7 @@ spec:
               name: platform-agent-scope-vol
               readOnly: true
             - mountPath: /etc/kube-agents/hold
-              name: platform-agent-scope-hold-vol
+              name: platform-agent-hold-vol
               readOnly: true
       dnsConfig:
         options:
@@ -917,9 +917,9 @@ spec:
             items:
               - key: hold.json
                 path: hold.json
-            name: platformagent-scope-hold
+            name: platformagent-hold
             optional: true
-          name: platform-agent-scope-hold-vol
+          name: platform-agent-hold-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1607,7 +1607,7 @@ spec:
               name: platform-agent-scope-vol
               readOnly: true
             - mountPath: /etc/kube-agents/hold
-              name: platform-agent-scope-hold-vol
+              name: platform-agent-hold-vol
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
@@ -1688,9 +1688,9 @@ spec:
             items:
               - key: hold.json
                 path: hold.json
-            name: platformagent-scope-hold
+            name: platformagent-hold
             optional: true
-          name: platform-agent-scope-hold-vol
+          name: platform-agent-hold-vol
         - name: audit-report-store-ksa
           projected:
             defaultMode: 256

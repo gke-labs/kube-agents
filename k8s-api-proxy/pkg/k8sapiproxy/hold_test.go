@@ -38,7 +38,7 @@ func TestAHeldClusterIsRefusedWithTheHoldAndItsReason(t *testing.T) {
 	assertExcluded(t, h, upstream, excludedID, ReasonHeldCluster)
 	rec := serve(h, get(excludedID))
 	msg := decodeStatus(t, rec).Message
-	for _, want := range []string{"spec.scope.hold", "INC-42 rollback in progress", "report this and stop", "scratch (payments-staging, us-central1)"} {
+	for _, want := range []string{"spec.hold", "INC-42 rollback in progress", "report this and stop", "scratch (payments-staging, us-central1)"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message %q does not contain %q", msg, want)
 		}
@@ -134,5 +134,28 @@ func TestAHeldClusterRefusalIsCountedUnderItsReason(t *testing.T) {
 	assertExcluded(t, h, upstream, excludedID, ReasonHeldCluster)
 	if exposition := scrapeMetricsText(t, metrics); !strings.Contains(exposition, `reason="scope.held-cluster"`) {
 		t.Errorf("no rejected-requests sample under reason scope.held-cluster:\n%s", exposition)
+	}
+}
+
+// The reason is the operator's text: kept to one printable line of at most 256 runes,
+// so it can't break the message's last line ("policy rule: ...") a client reads.
+func TestTheHoldReasonIsPrintableAndCapped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hold.json")
+	writeScope(t, path, `{"all":true,"reason":"line one\nline two\u001b[31m `+strings.Repeat("é", 400)+`"}`)
+	state, err := parseHolds(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(state.reason, "\n\x1b") {
+		t.Errorf("reason %q keeps a control character", state.reason)
+	}
+	if !strings.HasPrefix(state.reason, "line oneline two[31m ") {
+		t.Errorf("reason = %q", state.reason)
+	}
+	if n := len([]rune(state.reason)); n != holdReasonMaxRunes {
+		t.Errorf("reason is %d runes, want %d", n, holdReasonMaxRunes)
+	}
+	if normaliseHoldReason("  INC-1  ") != "INC-1" {
+		t.Error("surrounding space is not trimmed")
 	}
 }

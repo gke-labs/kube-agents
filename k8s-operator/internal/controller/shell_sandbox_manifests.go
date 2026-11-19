@@ -593,7 +593,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
 	}
 
-	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(scopeForDeclaration(agent) != nil)})
+	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
 	// Normalised to the two words the script reads, so the bytes on the pod
 	// are the operator's, as every other forwarded variable's are: a valueFrom
 	// could name a credential this pod must never hold, and a literal with a
