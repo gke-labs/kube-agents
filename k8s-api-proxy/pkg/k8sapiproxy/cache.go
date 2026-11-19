@@ -361,7 +361,7 @@ type cacheRequestMeta struct {
 type inflightCall struct {
 	done   chan struct{}
 	cancel context.CancelFunc
-	// epoch is responseCache.epoch when the flight started.
+	// epoch is responseCache.epochFor the flight's partition when the flight started.
 	epoch uint64
 
 	val *sfResult
@@ -391,7 +391,10 @@ type responseCache struct {
 	// invalidations of its partition alone (a 401 or 403).
 	epoch atomic.Uint64
 	// partitionEpochs counts, per partition, invalidations that reached that partition
-	// alone: an auth failure says the caller's own access changed, not the data.
+	// alone: an auth failure says the caller's own access changed, not the data. Entries
+	// are never removed: one per partition that saw an auth failure, bounded by the number
+	// of credentials. Resetting one to zero could bring epochFor back to a value an older
+	// flight still holds, which would let a request join it or let it store.
 	partitionEpochMu sync.Mutex
 	partitionEpochs  map[string]uint64
 
@@ -506,8 +509,13 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 
 	if info != nil && info.IsResourceRequest && !ev.DryRun && mutatingVerbs.Has(info.Verb) {
 		resp, err := next(req)
-		if err == nil && resp != nil && shouldInvalidateOnMutation(resp.StatusCode) {
-			c.invalidateResourceScope(req.Context(), clusterID, info)
+		if err == nil && resp != nil {
+			switch {
+			case isAuthFailureStatus(resp.StatusCode):
+				c.invalidatePartitionScope(req.Context(), clusterID, info)
+			case shouldInvalidateOnMutation(resp.StatusCode):
+				c.invalidateResourceScope(req.Context(), clusterID, info)
+			}
 		}
 		return resp, err
 	}

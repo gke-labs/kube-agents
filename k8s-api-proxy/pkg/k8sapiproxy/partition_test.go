@@ -299,13 +299,11 @@ func TestHandlerAuthFailureInvalidatesItsOwnPartitionOnly(t *testing.T) {
 	serve(h, tenantRequest("b"))
 
 	upstream.set("a", true)
-	if rec := serve(h, tenantRequest("a")); rec.Code == http.StatusOK && rec.Header().Get(headerCacheStatus) == cacheStatusHit {
-		// Still fresh for a: force a's 403 through a bypass so it reaches the upstream.
-		req := tenantRequest("a")
-		req.Header.Set("Cache-Control", "no-cache")
-		if rec := serve(h, req); rec.Code != http.StatusForbidden {
-			t.Fatalf("tenant a after losing access: code %d, want 403", rec.Code)
-		}
+	// a's entry is still fresh, so no-cache sends a's request upstream, where it gets 403.
+	req := tenantRequest("a")
+	req.Header.Set("Cache-Control", "no-cache")
+	if rec := serve(h, req); rec.Code != http.StatusForbidden {
+		t.Fatalf("tenant a after losing access: code %d, want 403", rec.Code)
 	}
 
 	rec := serve(h, tenantRequest("b"))
@@ -369,5 +367,32 @@ func TestHandlerAuthFailureWithoutPartitionsInvalidatesEveryone(t *testing.T) {
 	upstream.set("", false)
 	if got := serve(h, tenantRequest("a")).Header().Get(headerCacheStatus); got == cacheStatusHit {
 		t.Errorf("after a 403 with no partitions: served from cache, want a fresh fetch")
+	}
+}
+
+// A write refused with 403 is an auth failure too: it evicts the caller's partition, not
+// the others, whose cached responses the refused write did not change.
+func TestHandlerRefusedWriteInvalidatesItsOwnPartitionOnly(t *testing.T) {
+	upstream := &forbiddingUpstream{forbid: map[string]bool{}, calls: map[string]int{}}
+	h, _ := newTestHandler(t, Config{
+		Authenticator:   tenantAuthenticator{},
+		Upstream:        upstream,
+		Policy:          Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Cache:           &CacheConfig{DefaultResourceTTL: testPartitionTTL},
+		CallerPartition: partitionByTenant,
+	})
+	serve(h, tenantRequest("a"))
+	serve(h, tenantRequest("b"))
+
+	upstream.set("a", true)
+	patch := newClusterRequest(http.MethodPatch, testPodsPath+"/web-0", strings.NewReader(`{}`))
+	patch.Header.Set(testTenantHeader, "a")
+	patch.Header.Set(headerContentType, "application/merge-patch+json")
+	if rec := serve(h, patch); rec.Code != http.StatusForbidden {
+		t.Fatalf("tenant a's write: code %d, want 403", rec.Code)
+	}
+
+	if got := serve(h, tenantRequest("b")).Header().Get(headerCacheStatus); got != cacheStatusHit {
+		t.Errorf("tenant b after tenant a's refused write: Cache-Status %q, want %q", got, cacheStatusHit)
 	}
 }
