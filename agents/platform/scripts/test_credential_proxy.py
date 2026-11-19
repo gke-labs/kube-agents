@@ -12389,8 +12389,8 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-reviews", "proposal-claim", "issue-list", "issue-view", "branch-view",
-             "revision-contains"},
+             "proposal-commits", "proposal-reviews", "proposal-closer", "proposal-claim",
+             "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -22850,6 +22850,253 @@ class ExcludedClusterPathTest(unittest.TestCase):
         result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
                                    f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
         self.assertEqual(0, result.exit_code, result.stderr)
+
+
+class DecisionMemoryChecksMetricTest(unittest.TestCase):
+    """`build_vcs_broker(..., metrics=...)` records Stage B OKF verdicts only for repos with knowledge."""
+
+    REPOSITORY = "https://local.test/acme/infra"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        self.bare = self.base / "remotes" / "acme" / "infra"
+        self.bare.parent.mkdir(parents=True, exist_ok=True)
+        self._git(self.base, "init", "--bare", "--initial-branch=main", str(self.bare))
+        self.seed = self.base / "seed"
+        self._git(self.base, "clone", "--quiet", str(self.bare), str(self.seed))
+        self._git(self.seed, "checkout", "-B", "main")
+        (self.seed / "README.md").write_text("seed\n", encoding="utf-8")
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "initial commit")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+    def _git(self, cwd: Path, *args: str, env_override: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env = {**self.git_env, **(env_override or {})}
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+
+    def _make_broker(self, metrics: credential_proxy.ProxyMetrics, *, pinned_bases=None):
+        state_dir = self.base / f"state-{len(pinned_bases or {})}"
+        executor = CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=1 << 20,
+            state_dir=str(state_dir),
+        )
+        executor.environment["GIT_ALLOW_PROTOCOL"] = "https:file"
+        with mock.patch.object(credential_proxy, "warn_on_credential_reach"):
+            broker = credential_proxy.build_vcs_broker(
+                executor,
+                pinned_bases=pinned_bases,
+                metrics=metrics,
+            )
+
+        class _LocalForge(providers.Forge):
+            name = "local"
+            hosts = ("local.test",)
+
+            def __init__(self, remote_root: Path):
+                super().__init__()
+                self.remote_root = remote_root
+                self.credential = mock.Mock()
+                self.credential.git_config.return_value = ()
+                self.credential.headers.return_value = {}
+
+            @classmethod
+            def for_config(cls, config):
+                return ()
+
+            def parse(self, url: str) -> str:
+                return "/".join(providers.repo_segments(url, self.hosts))
+
+            def clone_url(self, repo: str) -> str:
+                return str(self.remote_root / repo)
+
+        broker.registry.hosts["local.test"] = _LocalForge(self.base / "remotes")
+        return broker
+
+    def _bundle_change(self, broker, name: str, branch: str, files: dict[str, str], *, commit_email: str = "kube-agents@users.noreply.invalid"):
+        cloned = broker.clone({"repository": self.REPOSITORY})
+        work = self.base / name
+        bundle_in = self.base / f"{name}-in.bundle"
+        bundle_in.write_bytes(base64.b64decode(cloned["bundleBase64"]))
+        self._git(self.base, "clone", "--quiet", "--branch", cloned["branch"], str(bundle_in), str(work))
+        self._git(work, "checkout", "--quiet", "-b", branch)
+        for rel, content in files.items():
+            dest = work / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        self._git(work, "add", "-A")
+        self._git(
+            work,
+            "commit",
+            "--quiet",
+            "-m",
+            f"change {name}",
+            env_override={"GIT_AUTHOR_EMAIL": commit_email, "GIT_COMMITTER_EMAIL": commit_email},
+        )
+        out_bundle = self.base / f"{name}-out.bundle"
+        self._git(work, "bundle", "create", str(out_bundle), f"{cloned['revision']}..refs/heads/{branch}")
+        return {
+            "repository": self.REPOSITORY,
+            "branch": branch,
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": base64.b64encode(out_bundle.read_bytes()).decode("ascii"),
+        }
+
+    def _post_publish(self, broker, metrics: credential_proxy.ProxyMetrics, payload: dict):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/publish"
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:shell", uid="u", groups=(), role=credential_proxy.CALLER_ROLE_SHELL
+        )
+        handler.metrics = metrics
+        handler.max_request_bytes = 1 << 20
+        handler.replies = []
+        handler._json = lambda status, body: handler.replies.append((status, body))
+        handler._request_slot = contextlib.nullcontext
+        handler._repository_is_permitted = lambda repository, forge: True
+        handler.vcs = broker
+        encoded = json.dumps(payload).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        with mock.patch.object(vcs_broker, "write_mode", return_value=("propose", "propose")):
+            handler._handle_vcs_post()
+        return handler.replies[0]
+
+    def test_publish_records_allow_warn_block_and_error_verdicts_only_when_knowledge_exists(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+
+        # 0. Repo without knowledge/ or .kube-agents/intent.yaml -> allow stays 0.
+        payload_nok = self._bundle_change(broker, "nok", "platform-agent/nok", {"docs.txt": "plain\n"})
+        status0, body0 = self._post_publish(broker, metrics, payload_nok)
+        self.assertEqual(status0, HTTPStatus.OK, body0)
+        self.assertNotIn(f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{', metrics.render())
+
+        # Seed knowledge/ decisions (active block + proposed warn) on main.
+        dec_dir = self.seed / "knowledge" / "decisions"
+        dec_dir.mkdir(parents=True, exist_ok=True)
+        (dec_dir / "DEC-2026-001.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-001\n"
+            "title: Keep checkout memory >= 1Gi\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/prod/*.yaml\n"
+            "guard:\n  rule: memory >= 1Gi\n  severity: block\n  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: \">=\"\n"
+            "    value: 1Gi\n"
+            "---\n\nKeep memory >= 1Gi.\n",
+            encoding="utf-8",
+        )
+        (dec_dir / "DEC-2026-002.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-002\n"
+            "title: Keep staging replicas >= 2\n"
+            "status: proposed\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/staging/*.yaml\n"
+            "guard:\n  rule: replicas >= 2\n  severity: warn\n  expect:\n"
+            "    file: clusters/staging/*.yaml\n"
+            "    path: spec.replicas\n"
+            "    op: \">=\"\n"
+            "    value: 2\n"
+            "---\n\nKeep staging replicas >= 2.\n",
+            encoding="utf-8",
+        )
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "seed knowledge rules")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+        # 1. Clean publish on repo with knowledge/ -> allow
+        payload_allow = self._bundle_change(broker, "allow", "platform-agent/allow", {"notes.txt": "ok\n"})
+        status1, _ = self._post_publish(broker, metrics, payload_allow)
+        self.assertEqual(status1, HTTPStatus.OK)
+
+        # 2. Proposed rule warning -> warn
+        payload_warn = self._bundle_change(
+            broker,
+            "warn",
+            "platform-agent/warn",
+            {"clusters/staging/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 1\n"},
+        )
+        status2, body2 = self._post_publish(broker, metrics, payload_warn)
+        self.assertEqual(status2, HTTPStatus.OK)
+        self.assertIn("DEC-2026-002", body2.get("decisionMemoryMarkdown", ""))
+
+        # 3. Active block rule -> block (409)
+        payload_block = self._bundle_change(
+            broker,
+            "block",
+            "platform-agent/block",
+            {
+                "clusters/prod/checkout.yaml": (
+                    "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n"
+                    "      containers:\n      - name: checkout\n        resources:\n          requests:\n            memory: 256Mi\n"
+                )
+            },
+        )
+        status3, body3 = self._post_publish(broker, metrics, payload_block)
+        self.assertEqual(status3, HTTPStatus.CONFLICT)
+        self.assertEqual(body3.get("code"), vcs_broker.DECISION_MEMORY_BLOCKED)
+
+        # 4. Unresolvable base branch for Decision Memory guard -> error (502)
+        payload_err = self._bundle_change(broker, "err", "platform-agent/err", {"notes2.txt": "err\n"})
+        bad_broker = self._make_broker(metrics)
+        bad_broker._default_branch_of_remote = lambda *_a, **_kw: ""
+        status4, body4 = self._post_publish(bad_broker, metrics, payload_err)
+        self.assertEqual(status4, HTTPStatus.BAD_GATEWAY, body4)
+        self.assertEqual(body4.get("code"), vcs_broker.DECISION_MEMORY_CHECK_FAILED)
+
+        # 5. Non-DM error (NOT_FAST_FORWARD) -> does not change counters
+        bad_ff = dict(payload_allow, baseRevision="0" * 40)
+        status5, body5 = self._post_publish(broker, metrics, bad_ff)
+        self.assertEqual(status5, HTTPStatus.CONFLICT)
+        self.assertEqual(body5.get("code"), "NOT_FAST_FORWARD")
+
+        rendered = metrics.render()
+        for verdict in ("allow", "warn", "block", "error"):
+            self.assertIn(
+                f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{verdict="{verdict}"}} 1',
+                rendered,
+            )
+
+    def test_build_vcs_broker_refuses_spoofed_commit_email_over_http(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+        spoofed = self._bundle_change(
+            broker,
+            "spoof",
+            "platform-agent/spoof",
+            {"notes.txt": "spoofed\n"},
+            commit_email="reviewer@company.com",
+        )
+        status, body = self._post_publish(broker, metrics, spoofed)
+        self.assertEqual(status, HTTPStatus.FORBIDDEN, body)
+        self.assertEqual(body.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
+        self.assertIn("reviewer@company.com", body.get("error", ""))
 
 
 if __name__ == "__main__":
