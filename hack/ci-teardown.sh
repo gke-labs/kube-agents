@@ -27,7 +27,9 @@
 #
 # One step is conditional. The CRD delete runs when a release record outlives
 # Step 2, which needs its CRDs or the next lease can neither uninstall nor
-# upgrade over it (#1172). The agent's leftover pull requests are not this
+# upgrade over it (#1172). A CRD delete that times out is held by CRs whose
+# finalizers no operator is left to clear; Step 3 releases them and deletes
+# the CRDs again (#6458). The agent's leftover pull requests are not this
 # script's to close: that takes a write credential, and a presubmit runs the
 # pull request's own code, so the sweep runs from a periodic that executes only
 # main (hack/ci_sweep_agent_pulls.py, #1755). Project-level plants of killed
@@ -57,12 +59,30 @@ readonly SECRET_NAME_PREFIX_RE='^secret/'
 # The chart's CRDs, and a bound on waiting for them to go. `kubectl delete`
 # defaults to waiting forever, and deleting a CRD blocks on
 # customresourcecleanup.apiextensions.k8s.io until every CR of that kind is
-# gone — which a PlatformAgent finalizer no live operator can clear never is.
+# gone — which a PlatformAgent finalizer no live operator can clear never is,
+# until Step 3 releases it below.
 # Unbounded, that hangs teardown until Prow's job timeout and Steps 4 to 6
 # never run, leaving exactly the orphans they exist to sweep. Five minutes is
 # well clear of the 206s a healthy-but-slow delete has been observed to take.
 readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 readonly CRD_DELETE_TIMEOUT="5m"
+# What Step 3 does when that delete times out (#6458, #3764). The CRs
+# holding it carry finalizers only the operator clears, and the operator is
+# gone by then: Step 2 removed it, after the chart's pre-delete hook gave up
+# waiting on the same finalizers. Left so, the CRDs sat Terminating under the
+# next lease's install, which the API server refuses to create CRs into. So
+# Step 3 lists the CRs of every kind the chart's crds/ declare, releases
+# their finalizers with this patch, deletes them, and deletes the CRDs again.
+# The release skips the operator's own deletion cleanup, most of which
+# Steps 4 to 6 sweep by label and name (not the A2A callout
+# ClusterRoleBinding, labelled part-of=a2a-next, which stays as it did
+# before); it runs only after the timed-out delete gave a live operator its
+# chance. The columns read each CR's namespace and name;
+# every chart CRD is Namespaced (tests/test_ci_teardown_release_record.py
+# pins it, so a cluster-scoped one fails there and not here).
+readonly CR_FINALIZERS_RELEASE_PATCH='{"metadata":{"finalizers":null}}'
+readonly CRD_RESOURCE_NAME_PREFIX='customresourcedefinition.apiextensions.k8s.io/'
+readonly CR_NAMESPACE_NAME_COLUMNS='NS:.metadata.namespace,NAME:.metadata.name'
 # The bench plant sweep Step 1 runs, relative to the checkout like
 # CHART_CRD_DIR. The override exists for the lifted-step tests, which run the
 # steps under stub kubectl and helm on the developer's PATH: pointed at a
@@ -292,6 +312,34 @@ if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "$
 fi
 finish_step "Release uninstall" "${UNINSTALL_STATUS}"
 
+# Step 3's orphan release (#6458): the CRs holding a timed-out CRD delete, of
+# every kind the chart's crds/ declare, read from the files so a CRD added to
+# the chart is covered with no list here to drift. Reads and patches are
+# allowed on a Terminating CRD; only creates are refused. The patch first, so
+# a CR the CRD's cleanup already marked for deletion goes at once; then a
+# delete for one it has not reached (--wait=false: with no finalizers left it
+# goes on its own). Counts the CRs released for the step's log line. kubectl
+# reports its own failures and none is fatal, under the file's exit-code rule.
+ORPHANED_CRS_RELEASED=0
+release_orphaned_crs() {
+  local crd resource ns name
+  while IFS= read -r crd; do
+    resource="${crd#"${CRD_RESOURCE_NAME_PREFIX}"}"
+    while read -r ns name; do
+      [ -n "${name}" ] || continue
+      if kubectl patch "${resource}" -n "${ns}" "${name}" --type=merge \
+        -p "${CR_FINALIZERS_RELEASE_PATCH}" --request-timeout="${KUBECTL_REQUEST_TIMEOUT}"; then
+        ORPHANED_CRS_RELEASED=$((ORPHANED_CRS_RELEASED + 1))
+      fi
+      kubectl delete "${resource}" -n "${ns}" "${name}" --ignore-not-found --wait=false \
+        --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" || true
+    done < <(kubectl get "${resource}" --all-namespaces --no-headers \
+      -o custom-columns="${CR_NAMESPACE_NAME_COLUMNS}" \
+      --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" || true)
+  done < <(kubectl get -f "${CHART_CRD_DIR}" --ignore-not-found -o name \
+    --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" || true)
+}
+
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Deleting CRDs ==="
 # Helm leaves crds/ objects behind by design; a PR evaluation cluster should
@@ -305,9 +353,16 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Deleting CRDs ==="
 # a run killed mid-install) is still swept. Unreadable counts as "may survive":
 # keeping a CRD costs one lease's tidiness, deleting one costs the project.
 CRD_STEP_RESULT="deleted"
-# 0 for the outcomes the design intends (deleted, or kept on purpose under a
-# surviving record); 1 for the ones it does not (a timed-out delete, an
-# unreadable record probe), so finish_step counts them into the summary.
+# 0 for the outcomes the design intends (deleted, deleted after releasing
+# the CRs that held the first delete, or kept on purpose under a surviving
+# record); 1 for the ones it does not (a delete that fails or times out even
+# after the release, an unreadable record probe), so finish_step counts them into the
+# summary. A release is traced by its WARNING line and the step's result
+# text, not by the count: the CRDs are gone and the next lease installs, and
+# a ✗ would read as a teardown that left them. What the operator's own
+# deletion handler would have reaped and no sweep here reaches (the A2A
+# callout ClusterRoleBinding, labelled part-of=a2a-next) stays either way:
+# it stayed before this release existed too, with the operator equally gone.
 CRD_STEP_STATUS=0
 PROBE_ERROR_LOG="$(mktemp)"
 if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
@@ -319,12 +374,23 @@ if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
     --request-timeout="${KUBECTL_REQUEST_TIMEOUT}"; then
     CRD_STEP_RESULT="deleted"
   else
-    # Bounded rather than hung: the CRDs may be left Terminating, which the
-    # next lease's fresh install can still collide with, but Steps 4 to 6
-    # now run and the log says which happened.
-    echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT}; continuing so the sweeps still run (#1172)"
-    CRD_STEP_RESULT="delete timed out or failed after ${CRD_DELETE_TIMEOUT}"
-    CRD_STEP_STATUS=1
+    # A delete that does not finish is held by CRs whose finalizers nothing
+    # will clear now the operator is gone (#6458, #3764): release them and
+    # delete again. Bounded rather than hung either way: should the second
+    # delete time out too, the CRDs are left Terminating, which the next
+    # lease's deploy refuses to install into (hack/ci-deploy.sh 5b′), but
+    # Steps 4 to 6 run and the log says which happened.
+    echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT}; releasing the finalizers of the CRs holding it, which no operator is left to clear (#6458)"
+    release_orphaned_crs
+    echo "Released ${ORPHANED_CRS_RELEASED} orphaned CR(s); deleting the CRDs again"
+    if kubectl delete -f "${CHART_CRD_DIR}" --ignore-not-found --timeout "${CRD_DELETE_TIMEOUT}" \
+      --request-timeout="${KUBECTL_REQUEST_TIMEOUT}"; then
+      CRD_STEP_RESULT="deleted after releasing ${ORPHANED_CRS_RELEASED} orphaned CR(s)"
+    else
+      echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT} after releasing ${ORPHANED_CRS_RELEASED} orphaned CR(s); continuing so the sweeps still run (#1172)"
+      CRD_STEP_RESULT="delete timed out or failed after ${CRD_DELETE_TIMEOUT}, ${ORPHANED_CRS_RELEASED} orphaned CR(s) released"
+      CRD_STEP_STATUS=1
+    fi
   fi
 else
   # The reason matters and used to go to /dev/null: a missing namespace is a
