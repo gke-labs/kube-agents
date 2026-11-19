@@ -158,8 +158,8 @@ func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkStat
 // already carries a mark keeps it, and a task with no ask message draws
 // nothing. Every route's asks get it, the session route's and a profile's
 // included. The executor's marks (the hermes-bridge's and the worker
-// adapter's progress, a wake's excepted) and the terminal take over from
-// there. It reports whether anything was
+// adapter's progress) and the terminal take over from there. It reports
+// whether anything was
 // drawn, and whether the reaction landed (its call succeeded); the caller
 // holds the session lock.
 func (g *Gateway) drawArrivalMark(rec *SessionRecord, taskID, text string) (drawn, landed bool) {
