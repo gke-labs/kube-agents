@@ -364,20 +364,26 @@ class SeveralAnswersTest(SlotCacheCase):
         served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(4)]
         self.assertEqual((served.count(names[0]), served.count(names[1])), (3, 1))
 
-    def test_a_refused_answer_passes_to_the_next_in_weighted_order(self):
+    def served_with_one_refused(self, weights, refused, turns):
+        """What `turns` lookups serve when the key's answers weigh `weights` and answer `refused` is always refused."""
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
         self.recorded(self.BODY, self.ON_IT)
         self.recorded(self.BODY, self.DONE)
         names = [name for name, _ in self.saved(fingerprint)]
-        weights = {names[0]: 1, names[1]: 1, names[2]: 8}
-        replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, weights)
-        # The cycle for 1, 1, 8 is 2 2 2 0 2 2 1 2 2 2; with the heavy answer
-        # refused, each turn takes the next distinct answer the cycle reaches.
-        heavy = dict(self.saved(fingerprint))[names[2]]["answer"]["content"]
-        self.break_answer(fingerprint, heavy)
+        replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, dict(zip(names, weights)))
+        self.break_answer(fingerprint, dict(self.saved(fingerprint))[names[refused]]["answer"]["content"])
         replay = self.proxy()
-        served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(10)]
-        self.assertEqual(served, [names[i] for i in (0, 0, 0, 0, 1, 1, 1, 0, 0, 0)])
+        served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(turns)]
+        return names, served
+
+    def test_a_refused_answers_turns_are_shared_by_the_remaining_weights(self):
+        names, served = self.served_with_one_refused((1, 1, 8), 2, 10)
+        self.assertEqual((served.count(names[0]), served.count(names[1])), (5, 5), "1:1, not by cycle position")
+        self.assertEqual(served, [names[i] for i in (0, 1, 0, 0, 1, 0, 1, 1, 0, 1)], "in a fixed order")
+
+    def test_a_refused_answers_turns_follow_uneven_remaining_weights(self):
+        names, served = self.served_with_one_refused((3, 1, 6), 2, 40)
+        self.assertEqual((served.count(names[0]), served.count(names[1])), (30, 10))
 
     def test_the_older_layout_weighs_one(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]

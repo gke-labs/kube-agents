@@ -605,22 +605,30 @@ def weighted_cycle(weights: Tuple[int, ...]) -> Tuple[int, ...]:
 
 
 def weighted_order(weights: Tuple[int, ...], turn: int) -> List[int]:
-    """The answers a lookup at `turn` tries, in order: the cycle's from that turn on, each once.
+    """The answers a lookup at `turn` tries, in order, each once.
 
-    The first is the one the weighted rotation serves; a refused answer passes
-    to the next distinct one the cycle reaches, so every answer is tried
-    before the request goes live.
+    The first is the weighted rotation's answer at this turn. If it is
+    refused, the next is the rotation over the answers left, by their own
+    weights, at the turn that counts how many earlier turns the first
+    rotation gave the refused answer: the n-th turn of a refused answer goes
+    to the n-th turn of the rest's rotation, and so on down. An answer that
+    is always refused thus has its turns shared among the others exactly in
+    proportion to their weights (1, 1, 8 with the 8 refused splits 1:1),
+    every answer is tried before the request goes live, and the order
+    depends on the weights and the turn alone.
     """
-    divisor = math.gcd(*weights)
-    cycle = weighted_cycle(tuple(w // divisor for w in weights))
+    left = list(range(len(weights)))
     order: List[int] = []
-    for step in range(len(cycle)):
-        index = cycle[(turn + step) % len(cycle)]
-        if index not in order:
-            order.append(index)
-            if len(order) == len(weights):
-                break
+    while left:
+        rest = tuple(weights[i] for i in left)
+        divisor = math.gcd(*rest)
+        cycle = weighted_cycle(tuple(w // divisor for w in rest))
+        position = cycle[turn % len(cycle)]
+        # Earlier turns this rotation gave the answer it gives now: the rest's turn.
+        turn = (turn // len(cycle)) * cycle.count(position) + cycle[:turn % len(cycle)].count(position)
+        order.append(left.pop(position))
     return order
+
 
 # Tells the analysis worker to stop.
 _STOP = object()
@@ -704,7 +712,8 @@ class ShadowProxy:
         A key with several saved answers hands them out in turn (next_turn),
         each in proportion to how often passing runs produced it (its weight,
         replay_cache.AnswerCache.weights; 1 when the cache gives none) by
-        weighted_order: a refused answer passes to the next one in that order,
+        weighted_order: a refused answer passes to the next one in that order
+        (the rotation over the answers left, by their own weights),
         so a request is served whichever of them its guards allow and goes
         live only when they refuse every one. `keyed` is the
         request's normalization and fingerprint (keyed()), when the caller has
