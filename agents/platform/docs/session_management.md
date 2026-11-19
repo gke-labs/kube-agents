@@ -417,7 +417,7 @@ One row per fix pull request the post-merge check follows, the first record of a
 `pr_opened` plugin writes it when it claims a proposal whose record names the finding it fixes (the
 fleet audit sets it for a one-workload `no-pdb` fix) and the install's `KUBEAGENTS_POST_MERGE_CHECK`
 switch is not `off`; with the switch off nothing is written. The server derives `kind` from the
-finding id's first segment (`POST_MERGE_KINDS` in `session_kv_server.py`, mirrored in the plugin)
+finding id's first segment (the kinds in `scripts/fix_recipes/`, which the server and the plugin both read)
 and ignores any kind the caller sends; `project` and `location` come from the Cluster Agent profile
 whose `cluster_identity` names that cluster (all three parts must match for the audit's qualified
 `<project>/<location>/<name>`), empty when none names it or the profiles that do disagree. The finding itself is

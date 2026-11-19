@@ -45,6 +45,7 @@ from typing import Any
 
 import clean_merges
 import kubeagents_switches
+from fix_recipes import registry
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,8 @@ LEVELS = (LEVEL_EXPLAIN, LEVEL_PROPOSE, LEVEL_AUTOMERGE)
 LEVEL_TITLES = {LEVEL_EXPLAIN: "Explain", LEVEL_PROPOSE: "Propose fixes", LEVEL_AUTOMERGE: "Auto-merge proven fixes"}
 DEFAULT_LEVEL = LEVEL_PROPOSE
 
-#: ``(kind, title, environment)`` for each kind of fix the dial lists.
-FIX_KINDS = (("no-pdb", "Disruption budgets", "dev"),)
+#: ``(kind, title, environment)`` for each kind of fix the dial lists (``fix_recipes/registry.py``).
+FIX_KINDS = tuple((recipe.kind, recipe.title, recipe.dial_environment) for recipe in registry.recipes())
 
 ACTION_LEVEL = "dial.level"
 ACTION_REQUEST = "dial.request"
