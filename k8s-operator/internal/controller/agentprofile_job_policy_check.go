@@ -82,7 +82,7 @@ const (
 
 // jobModeOffConsequence is what Job mode being off means for tasks, the tail
 // of every False message and of the DispatcherJobPolicyMissing Event.
-const jobModeOffConsequence = "so unattended profile tasks have no worker and are refused no-worker at admission"
+const jobModeOffConsequence = "so unattended profile tasks have no worker and are refused no-worker at admission, and confirmed changes, which run only in a Job of their own, are refused change-needs-job"
 
 // jobModeTornDown is the verdict of a pass that tore Job mode down, or found
 // nothing of it left to tear down: removeA2ADispatcher with the dispatcher

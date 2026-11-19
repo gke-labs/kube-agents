@@ -196,6 +196,35 @@ its own, separate from the gateway's; without it, the gateway pod's `platform-ag
 in-flight notes `start` leaves in `/opt/data/scratch` are on the same pod. `make fleet-audit-view`
 probes the agent pods for both containers and reads the sandbox first.
 
+A profile worker runs in a pod with no PVC, so the store is also served over the
+network, to the credential broker and to nothing else (#5619). `audit_report_store.py` listens on
+port 8700 in the gateway pod's `agent-api-auth` container, over the same root on the gateway's data
+volume. It is a process of its own rather than more routes on Session KV's 8699, so it serves the
+store routes and nothing else. Each request carries the broker's projected ServiceAccount token,
+bound to the audience `kubeagents-audit-report-store`. The listener verifies that token offline
+against the cluster's JWKS, which it reads with the pod's own API-audience token: the default
+`system:service-account-issuer-discovery` binding allows that, so the listener needs no new RBAC.
+It checks the issuer, the audience, the expiry, that the subject is the broker's ServiceAccount and
+that the token is bound to a pod of the broker's Deployment (the ServiceAccount is shared with the
+exec tier). A failed check is 401, a wrong subject or pod 403, and a JWKS it cannot read 503, never
+an accept. The API server, the token it reads the JWKS with and the store's root are fixed in the
+listener, not read from the environment, which `spec.deployment.env` reaches.
+A rule in the gateway policy `<agent>-gateway-netpol` admits only the broker's pods to the port.
+It is a rule there rather than a policy of its own, so an operator rollback, which renders that
+policy without it, drops it and leaves nothing isolating the pod. With
+`spec.networkPolicy.enabled: false` it goes with the gateway policy, and the token check is the
+whole control. A rollback leaves the `<agent>-report-store` Service behind, which is inert:
+nothing listens on 8700 without this listener. The routes take the store key as one path
+segment, the repository directory with its `/` escaped as `%2F`, and refuse any key that decodes to
+an empty, `.` or `..` part, a control character or a path outside the root. Every file and
+directory step is relative to an open directory and refuses a symlink (409), because the
+`platform-agent` container writes the same volume as the same user; a read opens non-blocking and
+takes regular files of at most 1 MiB alone, and a write holds a lock on its store directory. A ring write prunes to 14, and
+`latest` must be a byte-identical copy of a ring entry. All of this renders with the A2A stack, on
+every install.
+
+The broker serves the same seven routes under `/v1/audit-reports` and relays each to the listener with its own token, read fresh from `AUDIT_REPORT_STORE_TOKEN_FILE` on every call; the listener's status and body come back, its 401 or 403 (the broker's own store credential refused, which the broker's log says) as a 502. The broker decides who may read and write, which the listener doesn't: a profile task whose profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` reads, and writes only its own builtin schedule's stream, to the repository `finish` publishes to (or `no_forge%2Flocal` when that rule yields none); the platform agent's shell reads every stream and writes that key or any repository `managed_repos` registers; every other caller is refused ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4). It caps a body at the listener's 1 MiB, answers 503 with no store configured, answers 504 when the listener doesn't answer whole within 15 seconds, and logs the method, path, caller and status of each request, never a token or a body. One known window: the broker reads `managed_repos` through its 30-second managed-repository cache and `gitops_repo` fresh, so for up to that long after a ConfigMap edit a write can be checked against a key neither the old nor the new state alone gives. The key is still one a state registers, or `no_forge%2Flocal`. The exec tier doesn't serve these routes.
+
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
 creates to the owner of the nearest directory that already existed. Mode alone would not do: the

@@ -188,6 +188,97 @@ func TestATriggerSubmissionStartsATaskWithTheTriggerBound(t *testing.T) {
 	}
 }
 
+// A submission naming a profile script carries it into both the grant and
+// the authority the envelope claims, which is what the dispatcher checks
+// against the profile's allowlist and the worker against its credential
+// (#5622).
+func TestATriggerSubmissionsScriptIsMintedIntoTheGrantAndTheAuthority(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Trigger.Script = "compliance-audit"
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil || reply.TaskID == "" {
+		t.Fatalf("reply = %+v", reply)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var env lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &env); err != nil {
+		t.Fatal(err)
+	}
+	want := capability.Trigger{Name: s.Trigger.Name, Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}
+	claimed, err := capability.TriggerFromAuthority(env.Authority)
+	if err != nil || claimed == nil || *claimed != want {
+		t.Fatalf("authority trigger = %+v, %v; want %+v", claimed, err, want)
+	}
+	ref, present, err := capability.RefFromAuthority(env.Authority)
+	if err != nil || !present {
+		t.Fatalf("authority grant: %+v, %v, %v", ref, present, err)
+	}
+	if entry := readCapEntry(t, tr.url, ref); entry.Trigger == nil || *entry.Trigger != want {
+		t.Errorf("grant trigger = %+v, want %+v", entry.Trigger, want)
+	}
+}
+
+// A pending run published again carries the trigger its grant was minted
+// with, not the retry's: a retry naming another script (spec.script edited,
+// or an operator rolled back) would otherwise claim a trigger the grant
+// doesn't bind, and the verifier would refuse the task the gateway answered.
+func TestAPendingTriggerRunIsPublishedWithItsMintedTrigger(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Trigger.Script = "compliance-audit"
+	first := tr.submit(t, "schedule", s)
+	if first.Refused != nil {
+		t.Fatalf("refused: %+v", first.Refused)
+	}
+	ctx := context.Background()
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	rec, err := tr.g.reg.Get(ctx, key)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v", err)
+	}
+	rec.TriggerRuns[0].Published = false
+	if err := tr.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	retry := s
+	retry.Trigger.Script = ""
+	again := tr.submit(t, "schedule", retry)
+	if again.Refused != nil || again.TaskID != first.TaskID {
+		t.Fatalf("the pending run's repeat = %+v, want task %s", again, first.TaskID)
+	}
+	waitFor(t, "the run published again", func() bool { return len(tr.submissions()) == 2 })
+	var env lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[1].Data, &env); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := capability.TriggerFromAuthority(env.Authority)
+	if err != nil || claimed == nil || claimed.Script != "compliance-audit" {
+		t.Fatalf("the republished authority trigger = %+v, %v; want the minted script", claimed, err)
+	}
+	ref, _, err := capability.RefFromAuthority(env.Authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry := readCapEntry(t, tr.url, ref); entry.Trigger == nil || *entry.Trigger != *claimed {
+		t.Errorf("grant trigger %+v, authority %+v: they must be equal", entry.Trigger, *claimed)
+	}
+}
+
+// A script that is a path, not a name, is refused before anything is minted.
+func TestATriggerSubmissionWithAScriptPathIsRefused(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	s := goodScheduleSubmit()
+	s.Trigger.Script = "/opt/kube-agents/scripts/compliance_audit.py"
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused == nil || reply.Refused.Reason != lib.TriggerRefusedInvalid || reply.TaskID != "" {
+		t.Fatalf("reply = %+v, want refused %s", reply, lib.TriggerRefusedInvalid)
+	}
+	if n := len(tr.submissions()); n != 0 {
+		t.Errorf("%d submission(s) published for a refused trigger", n)
+	}
+}
+
 // TestARepeatedTriggerSubmissionIsTheSameRun: the same idempotency key
 // answers with the same task and starts nothing, and spends no rate budget;
 // a new key is a new run.

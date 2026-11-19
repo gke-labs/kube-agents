@@ -36,6 +36,7 @@ REP = {
     "e": {"result": "fail", "reason": EMPTY},
     "i": {"result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE"},
     "g": {"result": "infra", "reason": "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"},
+    "b": {"result": "fail", "reason": "KUBE_AGENTS_FORGE_SAFEGUARD: checks errored rather than ran: ['writes'] -- writes: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied the pull-request list"},
     "c": {"result": "infra", "reason": "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result"},
 }
 
@@ -248,6 +249,21 @@ class Shapes(Harness):
         self.assertIn("· [Incident brief →]", box)
         self.assertNotIn("Reason", self.gh.bodies()[0])
 
+    def test_a_run_every_case_of_which_the_safeguard_blocked_is_still_commented_on(self):
+        # Nothing graded, but the rung-2 blocks red the run and the suite marks it red, not not-evaluated.
+        tasks = [task(name, "bbb") for name in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        self.assertIn("hard failure", self.gh.bodies()[0].split("\n")[1])
+
+    def test_a_run_of_infra_forge_repetitions_only_gets_no_comment(self):
+        # No verdict line recorded (no eval_outcome), nothing graded, nothing blocked: not a red.
+        tasks = [task(name, "ggg") for name in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [])
+
     def test_hard_failure(self):
         # FAILURE with every gate case passing: an absolute check tripped.
         tasks = [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HELD_OUT, "fff")]
@@ -260,6 +276,30 @@ class Shapes(Harness):
         self.assertIn("Held-out cases also failed; held-out cases do not block.", lines[3])
         self.assertNotIn(HELD_OUT, body)
         self.assertNotIn("cases passed", body)
+
+    def test_a_hard_failure_during_a_forge_outage_names_it(self):
+        tasks = [task(name, "ppp") for name in sorted(ADMITTED)] + [task(HELD_OUT, "ggg")]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        outage = {"state": "DEGRADED", "condition": "forge_outage", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [],
+                  "cause": "forge outage: grading's GitHub reads failed on 2 PRs 13:15–14:25 UTC",
+                  "incident": {"prs": [1, 2], "runs": 4, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+        self.tick(data(mine, *green_others()), outage)
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> 🔴 **The run failed without a gate case collapsing.**"), box)
+        self.assertIn("🟡 **Gate degraded** since Tue 9:00 AM ET. grading could not read GitHub on 2 PRs 9:15 AM–10:25 AM ET", box)
+        self.assertNotIn("rep", box)
+        # Any other incident, or a hard failure with no forge repetition (a
+        # real trip), leaves the hard box as it was.
+        self.tick(data(dict(mine, build_id="101", pr=1301), *green_others()), dict(outage, condition="storm"))
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+        tripped = run(102, 1302, NOW - timedelta(minutes=5), tasks=tasks[:-1], result="FAILURE")
+        self.tick(data(tripped, *green_others()), outage)
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
+        # Below the signature (fewer than one case's three forge reps) is not the outage's either.
+        thin = run(103, 1303, NOW - timedelta(minutes=5), tasks=tasks[:-1] + [task(HELD_OUT, "gpp")], result="FAILURE")
+        tripped = thin
+        self.tick(data(tripped, *green_others()), outage)
+        self.assertNotIn("Gate degraded", self.gh.bodies()[-1].split("\n")[3])
 
     def test_degraded_storm_match(self):
         names = sorted(ADMITTED)

@@ -148,6 +148,127 @@ def test_an_unreadable_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert status == "error" and "could not be read" in reason
 
 
+# --- the plant's record (#5925) -----------------------------------------------
+
+
+def _check_with(
+    monkeypatch: pytest.MonkeyPatch, live: dict[str, str], record: Any, record_name: str | None = "rec"
+) -> tuple[str, str, Any]:
+    monkeypatch.setattr(triage_starts, "read_planted_pods", lambda ns, t: live)
+    monkeypatch.setattr(triage_starts, "read_planted_record", lambda ns, name, t: record)
+    monkeypatch.setattr(triage_starts, "agent_shell", _local_shell)
+    v = TriageStartsVerifier(type="triage_starts", namespace=NAMESPACE, min_alerts=4, planted_record=record_name)
+    return v._check(30)
+
+
+def test_a_pod_deleted_mid_run_is_graded_from_the_record(
+    stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The red #5925 was: a bare pod gone by the check left 19 of 20 and the check could not run."""
+    planted = _plant(*stores, 4, session=4, turn=4)
+    live = {u: n for u, n in planted.items() if n != "pod-2"}
+    status, reason, raw = _check_with(monkeypatch, live, planted)
+    assert status == "pass", reason
+    assert "1 planted pod(s) were gone" in reason and "pod-2" in reason
+    assert raw["pods"] == 4 and raw["pods_gone"] == ["pod-2"]
+
+
+def test_a_gone_pods_lost_start_still_fails(stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    planted = _plant(*stores, 4, session=4, turn=3)
+    live = {u: n for u, n in planted.items() if n != "pod-3"}
+    status, reason, raw = _check_with(monkeypatch, live, planted)
+    assert status == "fail", reason
+    assert raw["lost"] == ["k8s-evt-3"] and "pod-3" in reason
+
+
+def test_a_record_that_leaves_out_a_live_pod_is_an_error(
+    stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record can't drop a pod that is still there, so it can't hide that pod's lost start."""
+    planted = _plant(*stores, 5, session=5, turn=4)
+    record = {u: n for u, n in planted.items() if n != "pod-4"}
+    status, reason, _ = _check_with(monkeypatch, planted, record)
+    assert status == "error"
+    assert "not in the plant's record" in reason and "pod-4" in reason
+
+
+def test_no_record_falls_back_to_the_live_pods(stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    planted = _plant(*stores, 4, session=4, turn=4)
+    status, reason, _ = _check_with(monkeypatch, planted, triage_starts.RECORD_ABSENT)
+    assert status == "pass", reason
+    live = {u: n for u, n in planted.items() if n != "pod-0"}
+    status, reason, _ = _check_with(monkeypatch, live, triage_starts.RECORD_ABSENT)
+    assert status == "error" and "fewer than min_alerts" in reason
+
+
+def test_an_unreadable_record_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    status, reason, _ = _check_with(monkeypatch, {"uid-0": "pod-0"}, None)
+    assert status == "error" and "could not be read or is malformed" in reason
+
+
+def test_without_planted_record_the_record_is_not_read(
+    stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planted = _plant(*stores, 4, session=4, turn=4)
+
+    def boom(*_: Any) -> None:
+        raise AssertionError("read the record")
+
+    monkeypatch.setattr(triage_starts, "read_planted_pods", lambda ns, t: planted)
+    monkeypatch.setattr(triage_starts, "read_planted_record", boom)
+    monkeypatch.setattr(triage_starts, "agent_shell", _local_shell)
+    status, reason, _ = TriageStartsVerifier(type="triage_starts", namespace=NAMESPACE, min_alerts=4)._check(30)
+    assert status == "pass", reason
+
+
+class _Proc:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+@pytest.mark.parametrize(
+    ("proc", "want"),
+    [
+        (_Proc(0, '{"data": {"pods": "u1 pod-1\\nu2 pod-2\\n"}}'), {"u1": "pod-1", "u2": "pod-2"}),
+        (_Proc(1, stderr='Error from server (NotFound): configmaps "rec" not found'), triage_starts.RECORD_ABSENT),
+        (_Proc(1, stderr="Error from server (Forbidden)"), None),
+        (_Proc(0, '{"data": {"pods": "u1 pod-1 extra"}}'), None),
+        (_Proc(0, '{"data": {}}'), None),
+        (_Proc(0, '{"data": {"pods": ""}}'), None),
+        (_Proc(0, '{"data": {"pods": "\\n \\n"}}'), None),
+        (_Proc(0, '{"data": {"pods": "u1 pod-1\\nu1 pod-2"}}'), None),
+        (_Proc(0, "not json"), None),
+        (None, None),
+    ],
+)
+def test_read_planted_record_parses_the_configmap(
+    monkeypatch: pytest.MonkeyPatch, proc: _Proc | None, want: Any
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake(args: list[str], timeout: float) -> _Proc | None:
+        seen.append(args)
+        return proc
+
+    monkeypatch.setattr(triage_starts, "_kubectl", fake)
+    assert triage_starts.read_planted_record(NAMESPACE, "rec", 5) == want
+    assert seen == [["kubectl", "get", "configmap", "-o", "json", "rec", "-n", NAMESPACE]]
+
+
+def test_the_case_reads_the_record_the_stack_writes() -> None:
+    """The check's planted_record, the case's stack variable and the stack's default agree."""
+    task = yaml.safe_load(TASK.read_text())
+    check = next(e["check"] for e in task["verification_spec"] if e["check"]["type"] == "triage_starts")
+    name = check["planted_record"]
+    assert task["infrastructure"]["variables"]["planted_record"] == name
+    stack = (REPO / "bench" / "tf" / "prebuilt" / "triage-start-burst").resolve()
+    variables = (stack / "variables.tf").read_text()
+    assert f'default     = "{name}"' in variables.split('variable "planted_record"', 1)[1].split("}", 1)[0]
+    main = (stack / "main.tf").read_text()
+    assert 'create configmap "${var.planted_record}" --from-literal=pods=' in main
+    assert '"immutable":true' in main
+
+
 # --- registration ---------------------------------------------------------
 
 

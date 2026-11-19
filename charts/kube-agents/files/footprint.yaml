@@ -262,3 +262,20 @@ operatorRenderedPerReplica:
     ephemeralStorageBytesRequest: 2147483648
     ephemeralStorageBytesLimit: 2147483648
     pods: 1
+  sessionPod:
+    requests:
+      cpu: 150m
+      memory: 320Mi
+      ephemeral-storage: 1088Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 1088Mi
+    cpuMillisRequest: 150
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 335544320
+    memoryBytesLimit: 2147483648
+    ephemeralStorageBytesRequest: 1140850688
+    ephemeralStorageBytesLimit: 1140850688
+    pods: 1
+    maxSessionsDefault: 10

@@ -439,13 +439,17 @@ is reported like any other grant, and repeated daily like one.
 The `topology-drift` skill reads a `leeway report` on request and attributes
 the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
 "chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
---parallelism 2 --clusters <project>/<location>/<cluster>,…` in `agent-sandbox`
-across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
+--parallelism 2 --timeout <n>s --clusters <project>/<location>/<cluster>,…` in
+`agent-sandbox` across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
 `LEEWAY_WATCH_PROJECTS` or the management project plus every project a Cluster
 Agent profile's identity names; a project with no Cluster Agent profiles is
 enumerated with `gcloud container clusters list` first, since the sandbox
 relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
+`--timeout` is leeway's per-cluster deadline: each call's sandbox timeout (15
+minutes, less when the tick budget is nearly spent), less 30 seconds, split
+across the call's waves of two clusters, at most five minutes so one stuck
+cluster can't spend the tick, and never below leeway's own one-minute default.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
 balanced odd-replica workloads do not page, while `selector_confined` (`info`)
@@ -603,7 +607,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack and Google Chat, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -615,12 +619,10 @@ them, through session-kv's `POST /v1/board/actions`, which touches only a card
 and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
-press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
-allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
-where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
-is never an agent turn. Google Chat under today, and a run that also reports
-the board's other findings, get the text.
+press: the Home tab's admission rule on Slack, and the allowed-users list (`resolvePrincipal`) on Google Chat, where
+the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap is
+never an agent turn. A run that also reports the board's other findings gets
+the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -899,7 +901,7 @@ repositories posts each finished repository's report, then a line naming any it
 did not finish. A failed run posts the scheduler's failure line in plain words,
 once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
-that it did not finish. On Slack, and on Google Chat under `spec.mode: next`, the report is then replaced by a headline linking its
+that it did not finish. On Slack and Google Chat, the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
 with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the

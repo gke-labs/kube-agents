@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,9 +21,62 @@ import watcher_policy
 import wif_credentials
 
 CUSTOM_UNIVERSE = "universe.example.test"
+# A variable no code reads: what the restore test sets and expects to be gone.
+LEAKED_VARIABLE = "TEST_UNIVERSE_DOMAIN_LEAKED_VARIABLE"
 
 
-class ClientUniverseDomainTest(unittest.TestCase):
+class EnvironmentRestoredTestCase(unittest.TestCase):
+    """A test case that gets the process environment back as it found it.
+
+    Code under test here writes `os.environ`: the broker's metadata cache
+    exports a probed universe domain as `GOOGLE_CLOUD_UNIVERSE_DOMAIN`, and
+    the Pub/Sub adapter sets `PUBSUB_HOME_CHANNEL` when it is imported. A
+    variable a test leaves behind is read by every test after it in the
+    process (#6096), so each test runs on the environment it started with.
+    Every test case of this module is one of these and has no `setUp` of its
+    own, so this one always runs; a step a test needs goes into the test, with
+    `addCleanup` for its undo.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+
+class EveryTestCaseRestoresTheEnvironmentTest(EnvironmentRestoredTestCase):
+    def test_every_test_case_of_this_module_restores_the_environment(self) -> None:
+        module = sys.modules[__name__]
+        cases = [
+            value
+            for value in vars(module).values()
+            if isinstance(value, type)
+            and issubclass(value, unittest.TestCase)
+            and value.__module__ == __name__
+            and value not in (EnvironmentRestoredTestCase, type(self))
+        ]
+        self.assertTrue(cases)
+        for case in cases:
+            with self.subTest(case=case.__name__):
+                self.assertTrue(issubclass(case, EnvironmentRestoredTestCase))
+                self.assertIs(case.setUp, EnvironmentRestoredTestCase.setUp)
+
+    def test_a_variable_a_test_sets_is_gone_after_it(self) -> None:
+        class Leaks(EnvironmentRestoredTestCase):
+            def test_sets_a_variable(self) -> None:
+                os.environ[LEAKED_VARIABLE] = CUSTOM_UNIVERSE
+
+        # `os.environ.get`, not `assertNotIn`: a failure must not print the environment into the log.
+        self.assertIsNone(os.environ.get(LEAKED_VARIABLE))
+        result = unittest.TestResult()
+        Leaks("test_sets_a_variable").run(result)
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(result.testsRun, 1)
+        self.assertIsNone(os.environ.get(LEAKED_VARIABLE))
+
+
+class ClientUniverseDomainTest(EnvironmentRestoredTestCase):
     def test_normalize_and_env_precedence(self) -> None:
         self.assertEqual(credential_proxy_client.normalize_universe_domain(""), "googleapis.com")
         self.assertEqual(
@@ -56,6 +111,61 @@ class ClientUniverseDomainTest(unittest.TestCase):
             ),
             CUSTOM_UNIVERSE,
         )
+
+    def test_a_universe_domain_under_googleapis_com_is_refused(self) -> None:
+        # `<service>.mtls.googleapis.com` is a host of the commercial universe,
+        # so a value under googleapis.com names no other universe.
+        for under in ("mtls.googleapis.com", " MTLS.GoogleAPIs.com. ", "a.b.googleapis.com"):
+            with self.subTest(under=under):
+                with self.assertRaises(ValueError):
+                    credential_proxy_client.normalize_universe_domain(under)
+                with self.assertRaises(ValueError):
+                    credential_proxy_client.google_universe_domain(
+                        {"GOOGLE_CLOUD_UNIVERSE_DOMAIN": under}
+                    )
+                # What the broker's `serve` calls before it starts a listener.
+                with self.assertRaises(ValueError):
+                    credential_proxy.resolve_universe_domain(
+                        environ={"GOOGLE_CLOUD_UNIVERSE_DOMAIN": under}
+                    )
+        # The issue's request: the relay has no routed host in such a value.
+        decision = api_policy.evaluate(
+            "GET", "monitoring.mtls.googleapis.com", "v3/projects/sample-project/timeSeries", "",
+            universe_domain="mtls.googleapis.com",
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.rule_id, api_policy.RULE_HOST)
+        # The commercial domain itself, and domains that only look like it, are as before.
+        for accepted, normalized in (
+            ("googleapis.com", "googleapis.com"),
+            (" GoogleAPIs.com. ", "googleapis.com"),
+            ("notgoogleapis.com", "notgoogleapis.com"),
+            ("googleapis.com.example", "googleapis.com.example"),
+            (CUSTOM_UNIVERSE, CUSTOM_UNIVERSE),
+        ):
+            with self.subTest(accepted=accepted):
+                self.assertEqual(normalized, credential_proxy_client.normalize_universe_domain(accepted))
+
+    def test_the_broker_does_not_start_with_a_universe_domain_under_googleapis_com(self) -> None:
+        # The real entry point in a new interpreter, as the pod starts it: the
+        # value is refused before a listener exists.
+        with tempfile.TemporaryDirectory() as temp:
+            policy = Path(temp) / "policy.json"
+            policy.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+            listener = Path(temp) / "broker.sock"
+            environment = {
+                name: value for name, value in os.environ.items() if not name.startswith("CREDENTIAL_PROXY_")
+            }
+            environment["GOOGLE_CLOUD_UNIVERSE_DOMAIN"] = "mtls.googleapis.com"
+            completed = subprocess.run(
+                [sys.executable, credential_proxy.__file__, "--policy", str(policy), "--unix-socket", str(listener)],
+                env=environment, capture_output=True, text=True, timeout=60, check=False,
+            )
+            self.assertFalse(listener.exists())
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stderr)
+        last = json.loads(completed.stdout.splitlines()[-1])
+        self.assertEqual("credential proxy failed to start type=ValueError", last["message"])
+        self.assertIn("mtls.googleapis.com", last["exception"])
 
     def test_api_session_rewrites_googleapis_host_in_custom_universe(self) -> None:
         fake_http = mock.MagicMock()
@@ -99,7 +209,7 @@ class ClientUniverseDomainTest(unittest.TestCase):
             )
 
 
-class PolicyUniverseIsolationTest(unittest.TestCase):
+class PolicyUniverseIsolationTest(EnvironmentRestoredTestCase):
     def test_api_policy_admits_custom_universe_and_refuses_commercial_googleapis(self) -> None:
         path = "v3/projects/sample-project/timeSeries"
         allowed = api_policy.evaluate(
@@ -158,7 +268,7 @@ class PolicyUniverseIsolationTest(unittest.TestCase):
         self.assertEqual(refused_pubsub.rule_id, watcher_policy.RULE_PUBSUB_ROUTE)
 
 
-class WifAndExecutorUniverseTest(unittest.TestCase):
+class WifAndExecutorUniverseTest(EnvironmentRestoredTestCase):
     def test_wif_document_and_id_token_use_custom_universe(self) -> None:
         aud = f"//iam.{CUSTOM_UNIVERSE}/projects/12345/locations/global/workloadIdentityPools/p/providers/pr"
         sa = "kubeagents@sample-project.iam.gserviceaccount.com"
@@ -265,6 +375,8 @@ class WifAndExecutorUniverseTest(unittest.TestCase):
 
     def test_transient_metadata_probe_is_not_cached_while_404_and_200_are(self) -> None:
         credential_proxy._CACHED_METADATA_UNIVERSE_DOMAIN = None
+        # Also when an assertion below fails: the cache must not keep the fake universe for later tests.
+        self.addCleanup(setattr, credential_proxy, "_CACHED_METADATA_UNIVERSE_DOMAIN", None)
         responses = [
             OSError("connection timed out"),
             (CUSTOM_UNIVERSE, True),

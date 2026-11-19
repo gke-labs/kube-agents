@@ -44,6 +44,11 @@ func TestAWellFormedTriggerSubmitPasses(t *testing.T) {
 	if err := ValidateTriggerSubmit(TriggerSourceSchedule, runNow); err != nil {
 		t.Fatalf("run-now key: %v", err)
 	}
+	scripted := goodTriggerSubmit()
+	scripted.Trigger.Script = "compliance-audit"
+	if err := ValidateTriggerSubmit(TriggerSourceSchedule, scripted); err != nil {
+		t.Fatalf("a script-run trigger (#5622): %v", err)
+	}
 }
 
 func TestAMalformedTriggerSubmitIsRefused(t *testing.T) {
@@ -69,6 +74,8 @@ func TestAMalformedTriggerSubmitIsRefused(t *testing.T) {
 		"a short deadline": func(s *TriggerSubmit) { s.ActiveDeadlineSeconds = 30 },
 		"too many turns":   func(s *TriggerSubmit) { s.MaxTurns = TriggerSubmitMaxTurnsMax + 1 },
 		"a bad delivery":   func(s *TriggerSubmit) { s.Delivery.Mode = "" },
+		"a script path":    func(s *TriggerSubmit) { s.Trigger.Script = "/opt/kube-agents/scripts/x.py" },
+		"a dotted script":  func(s *TriggerSubmit) { s.Trigger.Script = "audit.py" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := goodTriggerSubmit()
