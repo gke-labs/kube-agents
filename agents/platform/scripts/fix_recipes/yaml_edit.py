@@ -33,9 +33,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# Mirrors automation_rules.MAX_FILE_BYTES (agents/platform/scripts/). Not
-# imported: this package is loaded by the broker and the audit, which put
-# different directories on sys.path. test_yaml_edit.py holds the two equal.
+# Mirrors automation_rules.MAX_FILE_BYTES. Not imported, so this module has no
+# dependency on its callers; test_yaml_edit.py holds the two equal.
 MAX_FILE_BYTES = 64 * 1024
 
 PROTECTED_PATHS = (

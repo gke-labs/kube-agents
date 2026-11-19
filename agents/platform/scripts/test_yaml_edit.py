@@ -16,8 +16,9 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import yaml_edit
-from yaml_edit import RefusedEdit, set_scalar
+import automation_rules  # noqa: E402
+from fix_recipes import yaml_edit  # noqa: E402
+from fix_recipes.yaml_edit import RefusedEdit, set_scalar  # noqa: E402
 
 PDB = """\
 # Budget for the web tier. Keep minAvailable below replicas.
@@ -404,11 +405,6 @@ class Refusals(unittest.TestCase):
         self.assertTrue(issubclass(RefusedEdit, ValueError))
 
     def test_size_cap_matches_rules_file(self):
-        sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
-        try:
-            import automation_rules
-        finally:
-            sys.path.pop(0)
         self.assertEqual(yaml_edit.MAX_FILE_BYTES, automation_rules.MAX_FILE_BYTES)
 
     def test_exactly_at_cap_is_accepted(self):
