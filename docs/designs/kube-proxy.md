@@ -250,7 +250,7 @@ Every request names its cluster in the path: `/clusters/{clusterID}/{k8s-path...
 
 Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path contains `.` or `..` segments, empty internal segments (`//`), or percent-encoded slashes (`%2f`, `%2F`) with `400 Bad Request`. This guarantees that `RequestInfoFactory` and the upstream `kube-apiserver` interpret the URL path identically.
 
-Once the cluster is known, and before policy, cache or upstream, two install-wide refusals apply, each answered as a `403` `Status` whose message ends in its `policy rule:` line and counted under that reason:
+Once the cluster is known, and before policy, cache or upstream, two install-wide refusals apply, each answered as a `403` whose message ends in its `policy rule:` line and counted under that reason. A resource request gets the usual `Status`. A discovery path (`/api`, `/api/<v>`, `/apis`, `/apis/<g>`, `/apis/<g>/<v>`, `/version`, `/openapi/...`) gets the same message as `text/plain`, because client-go's discovery client can't decode a `Status` there and reports it as `unknown`, so `kubectl cluster-info` would hide the refusal; a text body becomes its error message:
 
 | Rule                       | When                                                                                                                                                        |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -339,7 +339,7 @@ When `Mode == ModeReadOnlyWithDryRun` and `info.Verb` is `create`, `update`, or 
 - It admits the request only when `dryRun` has exactly one value and that value is `All`. It does not rewrite the outbound query: the query that passed the check is the query that `kube-apiserver` receives.
 
 **Native Kubernetes refusal responses**:
-When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body:
+When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with a standard `metav1.Status` JSON body (a scope refusal on a discovery path is the exception: plain text, section 3):
 
 ```json
 {
