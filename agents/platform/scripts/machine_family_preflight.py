@@ -134,6 +134,8 @@ C3_TDX_ALLOWED_SHAPE_PREFIX = "c3-standard-"
 
 # GKE / Config Connector / Terraform field names.
 FIELD_NAME = "name"
+FIELD_API_VERSION = "apiVersion"
+FIELD_KIND = "kind"
 FIELD_METADATA = "metadata"
 FIELD_SPEC = "spec"
 FIELD_RESOURCE_ID = "resourceID"
@@ -372,7 +374,7 @@ def extract_machine_family(machine_type: str | None) -> str:
     """Extract the lowercase machine family prefix from a machine type or family."""
     raw = (machine_type or "").strip().lower()
     if not raw:
-        return FAMILY_E2
+        return ""
     return raw.split(MACHINE_TYPE_SEPARATOR, 1)[0]
 
 
@@ -461,25 +463,130 @@ def _extract_pool_version(node_pool: dict[str, Any]) -> str:
     return ""
 
 
+def _as_dict(value: Any) -> dict[str, Any] | None:
+    """Return `value` if it is a dict, or its single element if a 1-element list of dict."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+        return value[0]
+    return None
+
+
+def _is_cluster_wrapper(doc: dict[str, Any]) -> bool:
+    """Return True when `doc` is a cluster wrapper carrying `nodePools` / `node_pools`."""
+    return FIELD_NODE_POOLS in doc or FIELD_NODE_POOLS_SNAKE in doc
+
+
+def _extract_source_machine_type(config: dict[str, Any]) -> str:
+    """Extract the source machine type from a node config dict, or `""` when missing."""
+    raw_machine_type = _first_present(
+        config,
+        FIELD_MACHINE_TYPE,
+        FIELD_MACHINE_TYPE_SNAKE,
+    )
+    if isinstance(raw_machine_type, str) and raw_machine_type.strip():
+        return raw_machine_type.strip()
+    return ""
+
+
+def _is_gke_proto3_shielded_schema(
+    node_pool: dict[str, Any] | None,
+    config: dict[str, Any],
+    shielded_cfg: dict[str, Any],
+    *,
+    from_cluster: bool = False,
+    cluster: dict[str, Any] | None = None,
+) -> bool:
+    """Return True when `shielded_cfg` comes from GKE Proto3 JSON rather than KCC or Terraform.
+
+    GKE's Proto3 JSON serializer omits `false` boolean fields from
+    `shieldedInstanceConfig`, whereas Config Connector (`ContainerNodePool`) and
+    Terraform (`google_container_node_pool`) are declarative manifests where an
+    omitted `enableIntegrityMonitoring` uses the platform default (`true`).
+    """
+    if any(
+        key in shielded_cfg
+        for key in (
+            FIELD_ENABLE_SECURE_BOOT_SNAKE,
+            FIELD_ENABLE_INTEGRITY_SNAKE,
+            FIELD_ENABLE_VTPM_SNAKE,
+        )
+    ):
+        return False
+    if from_cluster and isinstance(cluster, dict):
+        if any(
+            key in cluster
+            for key in (
+                FIELD_SPEC,
+                FIELD_API_VERSION,
+                FIELD_KIND,
+                FIELD_NODE_CONFIG_SNAKE,
+                FIELD_ENABLE_SHIELDED_NODES_SNAKE,
+            )
+        ):
+            return False
+        if isinstance(cluster.get(FIELD_NODE_CONFIG), list):
+            return False
+        cluster_node_cfg = _as_dict(
+            _first_present(cluster, FIELD_NODE_CONFIG, FIELD_NODE_CONFIG_SNAKE)
+        )
+        if isinstance(cluster_node_cfg, dict) and (
+            FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE in cluster_node_cfg
+            or isinstance(cluster_node_cfg.get(FIELD_SHIELDED_INSTANCE_CONFIG), list)
+        ):
+            return False
+        return True
+    if isinstance(node_pool, dict):
+        if any(
+            key in node_pool
+            for key in (
+                FIELD_SPEC,
+                FIELD_API_VERSION,
+                FIELD_KIND,
+                FIELD_NODE_CONFIG,
+                FIELD_NODE_CONFIG_SNAKE,
+            )
+        ):
+            return False
+        if isinstance(node_pool.get(FIELD_CONFIG), list):
+            return False
+    if any(
+        key in config
+        for key in (
+            FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+            FIELD_MACHINE_TYPE_SNAKE,
+            FIELD_DISK_TYPE_SNAKE,
+        )
+    ):
+        return False
+    if isinstance(config.get(FIELD_SHIELDED_INSTANCE_CONFIG), list):
+        return False
+    return True
+
+
 def _node_config_of(node_pool: dict[str, Any]) -> dict[str, Any]:
     """Return the node configuration dict from a GKE, KCC, or Terraform pool object."""
-    nested = _first_present(
-        node_pool,
-        FIELD_CONFIG,
-        FIELD_NODE_CONFIG,
-        FIELD_NODE_CONFIG_SNAKE,
-    )
-    if isinstance(nested, dict):
-        return nested
-    spec = node_pool.get(FIELD_SPEC)
-    if isinstance(spec, dict):
-        spec_config = _first_present(
-            spec,
+    nested = _as_dict(
+        _first_present(
+            node_pool,
             FIELD_CONFIG,
             FIELD_NODE_CONFIG,
             FIELD_NODE_CONFIG_SNAKE,
         )
-        if isinstance(spec_config, dict):
+    )
+    if nested is not None:
+        return nested
+    spec = _as_dict(node_pool.get(FIELD_SPEC))
+    if spec is not None:
+        spec_config = _as_dict(
+            _first_present(
+                spec,
+                FIELD_CONFIG,
+                FIELD_NODE_CONFIG,
+                FIELD_NODE_CONFIG_SNAKE,
+            )
+        )
+        if spec_config is not None:
             return spec_config
     return node_pool
 
@@ -494,7 +601,7 @@ def _extract_boot_disk_type(config: dict[str, Any]) -> str:
     )
     if isinstance(direct, str) and direct.strip():
         return direct.strip().lower()
-    boot_disk = _first_present(config, FIELD_BOOT_DISK, FIELD_BOOT_DISK_SNAKE)
+    boot_disk = _as_dict(_first_present(config, FIELD_BOOT_DISK, FIELD_BOOT_DISK_SNAKE))
     if isinstance(boot_disk, dict):
         nested = _first_present(
             boot_disk,
@@ -504,7 +611,7 @@ def _extract_boot_disk_type(config: dict[str, Any]) -> str:
         )
         if isinstance(nested, str) and nested.strip():
             return nested.strip().lower()
-    storage = config.get(FIELD_STORAGE)
+    storage = _as_dict(config.get(FIELD_STORAGE))
     if isinstance(storage, dict):
         nested_storage = _first_present(
             storage,
@@ -571,16 +678,17 @@ def _extract_cvm_state(
             if is_pool_level:
                 return False, "", ""
             continue
-        if not isinstance(block, dict):
+        block_dict = _as_dict(block)
+        if not isinstance(block_dict, dict):
             continue
         enabled_flag = _first_present(
-            block,
+            block_dict,
             FIELD_ENABLED,
             FIELD_ENABLE_CVM,
             FIELD_ENABLE_CVM_SNAKE,
         )
         raw_kind = _first_present(
-            block,
+            block_dict,
             FIELD_CVM_TYPE,
             FIELD_CVM_TYPE_SNAKE,
             FIELD_CVM_NODE_TYPE,
@@ -620,10 +728,12 @@ def _extract_local_ssd_configs(
         details.append(f"{FIELD_LOCAL_SSD_COUNT}={legacy_count}")
         has_legacy_count = True
 
-    ephemeral_lssd = _first_present(
-        config,
-        FIELD_EPHEMERAL_LOCAL_SSD,
-        FIELD_EPHEMERAL_LOCAL_SSD_SNAKE,
+    ephemeral_lssd = _as_dict(
+        _first_present(
+            config,
+            FIELD_EPHEMERAL_LOCAL_SSD,
+            FIELD_EPHEMERAL_LOCAL_SSD_SNAKE,
+        )
     )
     if isinstance(ephemeral_lssd, dict):
         count_keys = (FIELD_LOCAL_SSD_COUNT, FIELD_LOCAL_SSD_COUNT_SNAKE)
@@ -642,10 +752,12 @@ def _extract_local_ssd_configs(
         if not has_any_count_key and ephemeral_lssd:
             details.append(FIELD_EPHEMERAL_LOCAL_SSD)
 
-    nvme_block = _first_present(
-        config,
-        FIELD_NVME_SSD_BLOCK,
-        FIELD_NVME_SSD_BLOCK_SNAKE,
+    nvme_block = _as_dict(
+        _first_present(
+            config,
+            FIELD_NVME_SSD_BLOCK,
+            FIELD_NVME_SSD_BLOCK_SNAKE,
+        )
     )
     if isinstance(nvme_block, dict):
         count_keys = (FIELD_LOCAL_SSD_COUNT, FIELD_LOCAL_SSD_COUNT_SNAKE)
@@ -656,10 +768,12 @@ def _extract_local_ssd_configs(
         elif not has_count_key and nvme_block:
             details.append(FIELD_NVME_SSD_BLOCK)
 
-    ephemeral_storage = _first_present(
-        config,
-        FIELD_EPHEMERAL_STORAGE,
-        FIELD_EPHEMERAL_STORAGE_SNAKE,
+    ephemeral_storage = _as_dict(
+        _first_present(
+            config,
+            FIELD_EPHEMERAL_STORAGE,
+            FIELD_EPHEMERAL_STORAGE_SNAKE,
+        )
     )
     if isinstance(ephemeral_storage, dict):
         count = _safe_positive_int(
@@ -684,6 +798,8 @@ def _evaluate_security(
     source_family: str,
     target_family: str,
     target_machine_type: str,
+    *,
+    node_pool: dict[str, Any] | None = None,
 ) -> list[Finding]:
     """Check Shielded VM, Secure Boot, vTPM, integrity monitoring, and Confidential VM."""
     blockers: list[Finding] = []
@@ -694,11 +810,12 @@ def _evaluate_security(
                 FIELD_SHIELDED_NODES in cluster
                 or FIELD_SHIELDED_NODES_SNAKE in cluster
             )
-            shielded_nodes = _first_present(
+            raw_shielded_nodes = _first_present(
                 cluster,
                 FIELD_SHIELDED_NODES,
                 FIELD_SHIELDED_NODES_SNAKE,
             )
+            shielded_nodes_dict = _as_dict(raw_shielded_nodes)
             flat_shielded = _first_present(
                 cluster,
                 FIELD_ENABLE_SHIELDED_NODES,
@@ -709,10 +826,10 @@ def _evaluate_security(
             shielded_disabled = (
                 (
                     has_shielded_block
-                    and isinstance(shielded_nodes, dict)
-                    and shielded_nodes.get(FIELD_ENABLED) is not True
+                    and isinstance(shielded_nodes_dict, dict)
+                    and shielded_nodes_dict.get(FIELD_ENABLED) is not True
                 )
-                or shielded_nodes is False
+                or raw_shielded_nodes is False
                 or flat_shielded is False
             )
             if shielded_disabled:
@@ -733,25 +850,41 @@ def _evaluate_security(
                     )
                 )
 
-        shielded_cfg = _first_present(
-            config,
-            FIELD_SHIELDED_INSTANCE_CONFIG,
-            FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+        shielded_from_cluster = False
+        shielded_cfg = _as_dict(
+            _first_present(
+                config,
+                FIELD_SHIELDED_INSTANCE_CONFIG,
+                FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+            )
         )
         if not isinstance(shielded_cfg, dict) and isinstance(cluster, dict):
-            cluster_node_cfg = _first_present(
-                cluster,
-                FIELD_NODE_CONFIG,
-                FIELD_NODE_CONFIG_SNAKE,
+            cluster_node_cfg = _as_dict(
+                _first_present(
+                    cluster,
+                    FIELD_NODE_CONFIG,
+                    FIELD_NODE_CONFIG_SNAKE,
+                )
             )
             if isinstance(cluster_node_cfg, dict):
-                shielded_cfg = _first_present(
-                    cluster_node_cfg,
-                    FIELD_SHIELDED_INSTANCE_CONFIG,
-                    FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+                shielded_cfg = _as_dict(
+                    _first_present(
+                        cluster_node_cfg,
+                        FIELD_SHIELDED_INSTANCE_CONFIG,
+                        FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+                    )
                 )
+                if isinstance(shielded_cfg, dict):
+                    shielded_from_cluster = True
 
         if isinstance(shielded_cfg, dict):
+            is_gke_proto3 = _is_gke_proto3_shielded_schema(
+                node_pool,
+                config,
+                shielded_cfg,
+                from_cluster=shielded_from_cluster,
+                cluster=cluster,
+            )
             vtpm = _first_present(
                 shielded_cfg,
                 FIELD_ENABLE_VTPM,
@@ -785,10 +918,10 @@ def _evaluate_security(
                 FIELD_ENABLE_INTEGRITY,
                 FIELD_ENABLE_INTEGRITY_SNAKE,
             )
-            # In GKE's ShieldedInstanceConfig Proto3 JSON (which carries only
-            # enableSecureBoot and enableIntegrityMonitoring, no enableVtpm), a
-            # false boolean is omitted from the serialized object.
-            if integrity is False or (integrity is None and vtpm is None):
+            # In GKE's ShieldedInstanceConfig Proto3 JSON, a false boolean is
+            # omitted from the serialized object; in KCC and Terraform manifests,
+            # an omitted enableIntegrityMonitoring defaults to true.
+            if integrity is False or (integrity is None and is_gke_proto3):
                 blockers.append(
                     Finding(
                         rule=RULE_SHIELDED_INTEGRITY_DISABLED,
@@ -813,7 +946,7 @@ def _evaluate_security(
                 FIELD_ENABLE_SECURE_BOOT,
                 FIELD_ENABLE_SECURE_BOOT_SNAKE,
             )
-            if secure_boot is False or (secure_boot is None and vtpm is None):
+            if secure_boot is False or (secure_boot is None and is_gke_proto3):
                 blockers.append(
                     Finding(
                         rule=RULE_SHIELDED_SECURE_BOOT_DISABLED,
@@ -1385,16 +1518,11 @@ def evaluate_node_pool_transition(
 
     config = _node_config_of(node_pool)
     pool_name = _extract_pool_name(node_pool) or UNNAMED_POOL
-    raw_machine_type = _first_present(
-        config,
-        FIELD_MACHINE_TYPE,
-        FIELD_MACHINE_TYPE_SNAKE,
-    )
-    source_machine_type = (
-        str(raw_machine_type).strip()
-        if isinstance(raw_machine_type, str) and raw_machine_type.strip()
-        else DEFAULT_SOURCE_MACHINE_TYPE
-    )
+    source_machine_type = _extract_source_machine_type(config)
+    if not source_machine_type:
+        raise ValueError(
+            f"node pool {pool_name!r} is missing required {FIELD_MACHINE_TYPE} / {FIELD_MACHINE_TYPE_SNAKE}"
+        )
     source_family = extract_machine_family(source_machine_type)
 
     blockers: list[Finding] = []
@@ -1405,6 +1533,7 @@ def evaluate_node_pool_transition(
             source_family,
             parsed_family,
             effective_target_shape,
+            node_pool=node_pool,
         )
     )
     blockers.extend(
@@ -1687,22 +1816,52 @@ def run_preflight(
     cluster_doc: dict[str, Any] | None = None
     pools_to_check: list[dict[str, Any]] = []
 
-    raw_targets = target_specs or list(SUPPORTED_TARGET_FAMILIES)
+    explicit_shape = ""
+    explicit_shape_family = ""
+    if target_machine_type and target_machine_type.strip():
+        explicit_shape_family, explicit_shape = parse_target_spec(target_machine_type)
+        if not explicit_shape:
+            raise ValueError(
+                f"--target-machine-type {target_machine_type!r} must be a concrete machine "
+                "shape (for example 'c3-standard-8-lssd')"
+            )
+
     expanded_targets: list[str] = []
-    for item in raw_targets:
+    for item in target_specs or []:
         for piece in item.split(COMMA_SEPARATOR):
             if piece.strip():
                 expanded_targets.append(piece.strip())
 
     normalized_targets: list[tuple[str, str]] = []
-    for spec in expanded_targets:
-        parsed_family, parsed_shape = parse_target_spec(spec)
-        shape = (target_machine_type or parsed_shape).strip().lower()
-        if shape and extract_machine_family(shape) != parsed_family:
-            raise ValueError(
-                f"--target-machine-type {shape!r} does not belong to target family {parsed_family!r}"
-            )
-        normalized_targets.append((parsed_family, shape))
+    if not expanded_targets:
+        if explicit_shape:
+            normalized_targets.append((explicit_shape_family, explicit_shape))
+        else:
+            for fam in SUPPORTED_TARGET_FAMILIES:
+                normalized_targets.append((fam, ""))
+    else:
+        parsed_entries = [parse_target_spec(spec) for spec in expanded_targets]
+        if explicit_shape:
+            if not any(fam == explicit_shape_family for fam, _ in parsed_entries):
+                families_str = ", ".join(fam for fam, _ in parsed_entries)
+                raise ValueError(
+                    f"--target-machine-type {explicit_shape!r} does not belong to target "
+                    f"family {families_str!r}"
+                )
+            for parsed_family, parsed_shape in parsed_entries:
+                if parsed_shape and parsed_shape != explicit_shape:
+                    raise ValueError(
+                        f"--target-machine-type {explicit_shape!r} conflicts with concrete "
+                        f"--target-family shape {parsed_shape!r}"
+                    )
+                shape = (
+                    explicit_shape
+                    if parsed_family == explicit_shape_family
+                    else parsed_shape
+                )
+                normalized_targets.append((parsed_family, shape))
+        else:
+            normalized_targets.extend(parsed_entries)
 
     if cluster_json_source:
         loaded_cluster, err = _load_json_input(cluster_json_source, "--cluster-json")
@@ -1723,7 +1882,30 @@ def run_preflight(
         if err:
             errors.append({"target": f"--node-pool-json ({pool_source})", "message": err})
         elif isinstance(loaded_pool, dict):
-            pools_to_check.append(loaded_pool)
+            if _is_cluster_wrapper(loaded_pool):
+                if cluster_doc is None:
+                    cluster_doc = loaded_pool
+                raw_wrapper_pools = _first_present(
+                    loaded_pool,
+                    FIELD_NODE_POOLS,
+                    FIELD_NODE_POOLS_SNAKE,
+                )
+                if isinstance(raw_wrapper_pools, list) and all(
+                    isinstance(p, dict) for p in raw_wrapper_pools
+                ):
+                    pools_to_check.extend(raw_wrapper_pools)
+                else:
+                    errors.append(
+                        {
+                            "target": f"--node-pool-json ({pool_source})",
+                            "message": (
+                                "cluster object in --node-pool-json must contain a "
+                                f"{FIELD_NODE_POOLS} array of node-pool objects"
+                            ),
+                        }
+                    )
+            else:
+                pools_to_check.append(loaded_pool)
         elif isinstance(loaded_pool, list) and all(isinstance(p, dict) for p in loaded_pool):
             pools_to_check.extend(loaded_pool)
         else:
@@ -1734,8 +1916,28 @@ def run_preflight(
                 }
             )
 
-    if not cluster_json_source and not (node_pool_json_sources or []):
-        if not cluster_name or not location:
+    if not cluster_json_source:
+        if cluster_name and location:
+            if cluster_doc is None:
+                cluster_doc, err = _describe_cluster_live(
+                    resolved_project,
+                    location,
+                    cluster_name,
+                    runner,
+                )
+                if err:
+                    errors.append({"target": f"cluster/{cluster_name}", "message": err})
+        elif cluster_name or location:
+            errors.append(
+                {
+                    "target": "cli",
+                    "message": (
+                        "both --cluster and --location are required when specifying live "
+                        "cluster flags without --cluster-json"
+                    ),
+                }
+            )
+        elif not (node_pool_json_sources or []):
             errors.append(
                 {
                     "target": "cli",
@@ -1746,15 +1948,6 @@ def run_preflight(
                     ),
                 }
             )
-        else:
-            cluster_doc, err = _describe_cluster_live(
-                resolved_project,
-                location,
-                cluster_name,
-                runner,
-            )
-            if err:
-                errors.append({"target": f"cluster/{cluster_name}", "message": err})
 
     if cluster_doc is not None and not pools_to_check:
         raw_cluster_pools = _first_present(
@@ -1834,6 +2027,21 @@ def run_preflight(
                 "message": "no node pools found to evaluate (fail-closed)",
             }
         )
+
+    if not errors:
+        for pool_doc in pools_to_check:
+            pool_cfg = _node_config_of(pool_doc)
+            if not _extract_source_machine_type(pool_cfg):
+                pool_label = _extract_pool_name(pool_doc) or UNNAMED_POOL
+                errors.append(
+                    {
+                        "target": f"node-pool/{pool_label}",
+                        "message": (
+                            f"node pool {pool_label!r} is missing required "
+                            f"{FIELD_MACHINE_TYPE} / {FIELD_MACHINE_TYPE_SNAKE} (fail-closed)"
+                        ),
+                    }
+                )
 
     transitions: list[TransitionResult] = []
     if not errors:
@@ -1954,13 +2162,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="target_families",
         help=(
             "Target machine family in n2, n2d, n4, c3, c4 (repeatable or comma-separated; "
-            "also accepts a full machine type such as c3-standard-8-lssd; defaults to all five)."
+            "also accepts a full machine type such as c3-standard-8-lssd; defaults to the "
+            "family of --target-machine-type when set, or all five families otherwise)."
         ),
     )
     parser.add_argument(
         "--target-machine-type",
         default="",
-        help="Optional concrete target machine shape (for example c3-standard-8-lssd or n4-standard-8).",
+        help=(
+            "Optional concrete target machine shape (for example c3-standard-8-lssd or "
+            "n4-standard-8); narrows the default target family to the shape's family when "
+            "--target-family is omitted."
+        ),
     )
     parser.add_argument(
         "--cluster-version",
