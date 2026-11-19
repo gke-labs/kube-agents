@@ -265,7 +265,7 @@ const restoreRetries = 30
 var restoreSettleTimeout = 5 * time.Minute
 
 // restoreAssignTimeout bounds, per stream, the wait before its raise for the
-// server to assign the consumers it restored (WaitAssigned), which takes
+// server to assign the consumers it restored (AssignedDurables), which takes
 // about a second. A var so tests can shorten it.
 var restoreAssignTimeout = time.Minute
 
