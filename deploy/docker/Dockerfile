@@ -1880,6 +1880,15 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # kanban_scheduling repair never releases such a follow-up early.
 # See the module docstring in deploy/docker/patches/kanban_self_copy.py.
 #
+# kanban_unknown_assignee: kanban_create refuses a card whose assignee is not
+# a profile the dispatcher can run. No worker claims a card for a name that is
+# no profile, so it waits in `ready` and the card that created it waits for
+# it: on a dev install a platform card composed a Cluster Agent's name, and
+# the run waited out the 1,800 s delegation timeout (#3786). A Cluster Agent
+# profile whose scaffold did not finish is refused too: its worker stops at
+# its preflight. The refusal lists the profiles that can take a card.
+# See the module docstring in deploy/docker/patches/kanban_unknown_assignee.py.
+#
 # credential-redaction: a kanban worker that pasted a GCP access token into a
 # curl left it in plaintext on the PVC (#603). Upstream already redacts
 # agent.log and the terminal-output spill; the two sinks it did not cover are
@@ -1959,6 +1968,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_self_copy.py \
      deploy/docker/patches/apply_kanban_self_copy.py \
      deploy/docker/patches/verify_kanban_self_copy.py \
+     deploy/docker/patches/kanban_unknown_assignee.py \
+     deploy/docker/patches/apply_kanban_unknown_assignee.py \
+     deploy/docker/patches/verify_kanban_unknown_assignee.py \
      deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
@@ -2071,6 +2083,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     cp /tmp/latency-patches/kanban_self_copy.py /opt/hermes/tools/kanban_self_copy.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_self_copy.py /opt/hermes && \
     test "$(grep -c '_kanban_refuse_self_copy(self_task, assignee, parents)' /opt/hermes/tools/kanban_tools.py)" = "1" && \
+    cp /tmp/latency-patches/kanban_unknown_assignee.py /opt/hermes/tools/kanban_unknown_assignee.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_unknown_assignee.py /opt/hermes && \
+    test "$(grep -c '_kanban_refuse_unknown_assignee(assignee)' /opt/hermes/tools/kanban_tools.py)" = "1" && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_credential_redaction.py /opt/hermes && \
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
@@ -2104,6 +2119,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_eval_run_tag.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_unknown_assignee.py && \
     KUBE_AGENTS_REDACTOR_MODULE=/tmp/latency-patches/redactor.py \
       /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
