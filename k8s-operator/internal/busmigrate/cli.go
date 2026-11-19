@@ -93,6 +93,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	replicas := fs.Int("replicas", 3, "unpin, restore: the replica count each stream ends at")
 	dir := fs.String("dir", "", "snapshot, restore: the staging directory")
 	runFile := fs.String("run-file", "", "restore: the operator's digests and policies (RunFile JSON)")
+	direction := fs.String("direction", "", "restore: forward (the rendered limits) or back (each stream as it was); empty is forward into more than one server, back into one")
 	report := fs.String("termination-log", DefaultTerminationLog, "restore, clear: where its report is written")
 	settle := fs.Duration("settle", 2*time.Second, "pin: the wait after each step-down or update")
 	if err := fs.Parse(args); err != nil {
@@ -116,6 +117,13 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	case leg == "restore" && (*dir == "" || *runFile == ""):
 		fmt.Fprintln(stderr, "restore: --dir and --run-file are required")
 		return 2
+	case *direction != "" && *direction != "forward" && *direction != "back":
+		fmt.Fprintf(stderr, "restore: --direction %q is neither forward nor back\n", *direction)
+		return 2
+	}
+	forward := *replicas > 1
+	if *direction != "" {
+		forward = *direction == "forward"
 	}
 	var run RunFile
 	if leg == "restore" {
@@ -143,7 +151,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 		err = snapshotAll(ctx, nc, streams, *dir)
 	case "restore":
 		var warnings []string
-		warnings, err = restoreAll(ctx, nc, streams, *dir, run, *replicas)
+		warnings, err = restoreAllDirected(ctx, nc, streams, *dir, run, *replicas, forward)
 		r := Report{Warnings: warnings}
 		if err != nil {
 			r.Error = err.Error()
@@ -260,8 +268,19 @@ var restoreLog io.Writer = os.Stderr
 
 // restoreAll restores every named stream from dir, checking each staged
 // metadata file against the operator's digest before reading it, then
-// raises each to replicas. It returns the warnings found on the way.
+// raises each to replicas. It returns the warnings found on the way. Into
+// more than one server it is the forward restore, into one the way back
+// (restoreAllDirected names the direction).
 func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string, run RunFile, replicas int) ([]string, error) {
+	return restoreAllDirected(ctx, nc, streams, dir, run, replicas, replicas > 1)
+}
+
+// restoreAllDirected is restoreAll in a named direction: forward restores
+// at the rendered limits (RestoreVerified), back restores each stream as
+// the snapshot recorded it (RestoreAsItWas), at either server count. A
+// reshape, which restores into the bus at the count it runs, can be one
+// server going forward.
+func restoreAllDirected(ctx context.Context, nc *nats.Conn, streams []string, dir string, run RunFile, replicas int, forward bool) ([]string, error) {
 	fresh, err := LoadFreshStreams()
 	if err != nil {
 		return nil, err
@@ -295,7 +314,7 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		// forward, the snapshot's own on the way back (RestoreAsItWas).
 		built := policy
 		built.MaxConsumers = widenedMaxConsumers(meta.Config.MaxConsumers, policy.MaxConsumers)
-		if replicas <= 1 {
+		if !forward {
 			built.MaxBytes, built.MaxAge, built.MaxConsumers = meta.Config.MaxBytes, meta.Config.MaxAge, meta.Config.MaxConsumers
 		}
 		for attempt := 1; ; attempt++ {
@@ -307,10 +326,9 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 				err = nil
 				break
 			}
-			// Into three servers, the forward restore: the rendered limits,
-			// and a snapshot that does not fit them refused. Into one, the
-			// way back: the stream as it was.
-			if replicas > 1 {
+			// Forward: the rendered limits, and a snapshot that does not fit
+			// them refused. Back: the stream as it was.
+			if forward {
 				err = RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, open, want.Data, policy)
 			} else {
 				err = RestoreAsItWas(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
