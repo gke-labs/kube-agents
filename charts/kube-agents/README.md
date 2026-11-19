@@ -48,7 +48,13 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. The sandbox is always on — `harness.experimental.shellSandbox.enabled`
+  itself. With `create=false`, the template reads `SANDBOX_SSH_PUBLIC_KEY` via
+  Helm `lookup`, so offline `helm template` renders (such as Argo CD) omit
+  `<platformAgent.name>-shell-authorized-keys` and you must provision that
+  Secret alongside `platform-agent-secrets`; see
+  [Deploying kube-agents via Argo CD without Helm lookup](../../docs/site/src/content/docs/deploy/gitops-argocd.md#deploying-kube-agents-via-argo-cd-without-helm-lookup)
+  for the `ExternalSecret` layout and SSH keypair rotation procedure. The sandbox
+  is always on — `harness.experimental.shellSandbox.enabled`
   is not a toggle, the operator refuses `false`, and this chart fails at template
   time — so without the pair the agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
