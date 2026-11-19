@@ -665,6 +665,27 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+data:
+  hold.json: |
+    {}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-scope-hold
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -854,6 +875,8 @@ spec:
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
             - name: KUBE_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
               value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
@@ -902,6 +925,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-scope-hold-vol
+              readOnly: true
       dnsConfig:
         options:
           - name: ndots
@@ -932,6 +958,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-scope-hold
+            optional: true
+          name: platform-agent-scope-hold-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1530,6 +1564,8 @@ spec:
               value: kubeagents-credential-proxy-a2a-reports
             - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
               value: system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
+            - name: CREDENTIAL_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1624,6 +1660,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-scope-hold-vol
+              readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
               readOnly: true
@@ -1698,6 +1737,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-scope-hold
+            optional: true
+          name: platform-agent-scope-hold-vol
         - name: audit-report-store-ksa
           projected:
             defaultMode: 256

@@ -257,6 +257,17 @@ Every request names its cluster in the path: `/clusters/{clusterID}/{k8s-path...
 
 Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path contains `.` or `..` segments, empty internal segments (`//`), or percent-encoded slashes (`%2f`, `%2F`) with `400 Bad Request`. This guarantees that `RequestInfoFactory` and the upstream `kube-apiserver` interpret the URL path identically.
 
+Once the cluster is known, and before policy, cache or upstream, two install-wide refusals apply, each answered as a `403` `Status` whose message ends in its `policy rule:` line and counted under that reason:
+
+| Rule                       | When                                                                                                                                                        |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scope.excluded-cluster`   | `spec.scope.exclude.clusters` names the cluster (`--scope-file`, `KUBE_PROXY_SCOPE_FILE`, the `scope.json` key of `<agent>-config`).                        |
+| `scope.exclude-unreadable` | The configured scope file can't be read or parsed; every cluster is refused until it can.                                                                   |
+| `scope.held-cluster`       | `spec.scope.hold` names the cluster, or sets `all` (`--hold-file`, `KUBE_PROXY_HOLD_FILE`, the `hold.json` key of `<agent>-scope-hold`). Quotes the reason. |
+| `scope.hold-unreadable`    | The configured hold file can't be read or parsed; every cluster is refused until it can.                                                                    |
+
+Both files are ConfigMap directory mounts the proxy stats on every request and re-parses when they change, so an edit applies without a restart. An empty path refuses nothing. `in-cluster` is checked as `--exclude-host-cluster-id`. The credential broker refuses the same clusters under the same rule names (`scope_exclude.py`).
+
 ### 4. Sandbox `kubectl` and `kubeconfig` setup
 
 In [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile):

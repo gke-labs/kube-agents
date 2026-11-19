@@ -1314,6 +1314,44 @@ spec:
   IAM: the agent's read roles still reach the cluster. Only a project where the agent holds no
   roles, bound there or inherited from a folder or organization, fences the service account off.
 
+### `spec.scope.hold`
+
+An operator's pause for one cluster, several, or all of them. The credential broker and
+`kube-proxy` refuse every route to a held cluster's Kubernetes API, for every caller, on the same
+routes as `exclude.clusters`, within about a minute of the edit and without restarting any pod.
+Unlike `exclude.clusters`, a held cluster keeps its Cluster Agent profile and its place in fleet
+answers and audits; those runs meet the same refusal. Reads of the GKE control plane stay allowed.
+
+- `clusters` — single clusters by `projectId`, `location` and `clusterName`, matched as
+  `exclude.clusters` entries are.
+- `all` — `true` holds every cluster, the one the harness runs in included.
+- `reason` — up to 256 characters, quoted in every refusal.
+
+A held cluster is refused as `scope.held-cluster`, with a message that names the hold and its reason
+and tells the agent to report it and stop. A broker or `kube-proxy` that can't read the hold file it
+was given reaches no cluster until it can (`scope.hold-unreadable`).
+
+The operator renders the hold into the `<agent>-scope-hold` ConfigMap (`hold.json`), apart from
+`scope.json`, so the edit rolls nothing: the kubelet updates the mounted file and both components
+read it again on their next request. `install.env` has no key for it and an upgrade leaves it on the
+CR. Set it with a patch, and lift it by removing the entry or the block:
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p \
+  '{"spec":{"scope":{"hold":{"clusters":[{"projectId":"payments-prod","location":"us-central1","clusterName":"prod-1"}],"reason":"INC-1234: rollback in progress"}}}}'
+
+# Every cluster:
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p \
+  '{"spec":{"scope":{"hold":{"all":true,"reason":"change freeze"}}}}'
+
+# Lift:
+kubectl patch platformagent platform-agent -n kubeagents-system --type json -p \
+  '[{"op":"remove","path":"/spec/scope/hold"}]'
+```
+
+On a CR with no `spec.scope` block, a block that holds nothing but `hold` still reads as no
+declaration to the reconcile.
+
 ### Project outcomes
 
 Each project the reconcile resolves reads one outcome in the run's snapshot:

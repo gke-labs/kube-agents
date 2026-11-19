@@ -257,6 +257,47 @@ type ScopeSpec struct {
 	// contributed.
 	// +optional
 	Exclude *ScopeExcludeSpec `json:"exclude,omitempty"`
+
+	// Hold pauses the agents' access to clusters without taking them out of
+	// scope: an operator's lever for an incident, set with kubectl patch and
+	// lifted by removing the entry (or the whole block). The credential broker
+	// and kube-proxy refuse every route to a held cluster's Kubernetes API, for
+	// every caller, as they do for spec.scope.exclude.clusters, and the
+	// refusal names the hold and its reason so the agent reports it and stops
+	// rather than working around it. Unlike exclude, a held cluster keeps its
+	// Cluster Agent profile and its place in fleet answers and audits, and
+	// nothing restarts: the operator renders the hold into a ConfigMap of its
+	// own that no pod-template hash covers, the kubelet syncs the mounted
+	// file (usually within a minute), and both components re-read it on the
+	// next request. Reads of the GKE control plane stay allowed, as with
+	// exclude. The installer does not carry it: an upgrade keeps the live
+	// value.
+	// +optional
+	Hold *ScopeHoldSpec `json:"hold,omitempty"`
+}
+
+// ScopeHoldSpec names the clusters whose Kubernetes API the agents must not
+// reach until an operator lifts the hold.
+type ScopeHoldSpec struct {
+	// All holds every cluster, the one the harness runs in included.
+	// +optional
+	All bool `json:"all,omitempty"`
+
+	// Clusters holds single clusters by the full triple, matched as
+	// spec.scope.exclude.clusters entries are.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	Clusters []ScopeClusterRef `json:"clusters,omitempty"`
+
+	// Reason is shown in every refusal, so the agent can tell its user why
+	// the cluster is paused (an incident link, a change window).
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // ScopeExcludeSpec names what the scope must never manage or read.

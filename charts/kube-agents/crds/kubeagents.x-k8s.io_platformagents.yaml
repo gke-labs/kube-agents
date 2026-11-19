@@ -11601,6 +11601,71 @@ spec:
                       maxItems: 100
                       type: array
                       x-kubernetes-list-type: set
+                    hold:
+                      description: |-
+                        Hold pauses the agents' access to clusters without taking them out of
+                        scope: an operator's lever for an incident, set with kubectl patch and
+                        lifted by removing the entry (or the whole block). The credential broker
+                        and kube-proxy refuse every route to a held cluster's Kubernetes API, for
+                        every caller, as they do for spec.scope.exclude.clusters, and the
+                        refusal names the hold and its reason so the agent reports it and stops
+                        rather than working around it. Unlike exclude, a held cluster keeps its
+                        Cluster Agent profile and its place in fleet answers and audits, and
+                        nothing restarts: the operator renders the hold into a ConfigMap of its
+                        own that no pod-template hash covers, the kubelet syncs the mounted
+                        file (usually within a minute), and both components re-read it on the
+                        next request. Reads of the GKE control plane stay allowed, as with
+                        exclude. The installer does not carry it: an upgrade keeps the live
+                        value.
+                      properties:
+                        all:
+                          description:
+                            All holds every cluster, the one the harness
+                            runs in included.
+                          type: boolean
+                        clusters:
+                          description: |-
+                            Clusters holds single clusters by the full triple, matched as
+                            spec.scope.exclude.clusters entries are.
+                          items:
+                            description: ScopeClusterRef identifies one GKE cluster.
+                            properties:
+                              clusterName:
+                                description: ClusterName is the GKE cluster's name.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                              location:
+                                description: Location is the cluster's region or zone.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                              projectId:
+                                description:
+                                  ProjectID is the project the cluster lives
+                                  in.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                            required:
+                              - clusterName
+                              - location
+                              - projectId
+                            type: object
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - projectId
+                            - location
+                            - clusterName
+                          x-kubernetes-list-type: map
+                        reason:
+                          description: |-
+                            Reason is shown in every refusal, so the agent can tell its user why
+                            the cluster is paused (an incident link, a change window).
+                          maxLength: 256
+                          type: string
+                      type: object
                     maxProjects:
                       default: 100
                       description: |-
