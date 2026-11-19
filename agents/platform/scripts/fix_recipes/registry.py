@@ -4,8 +4,11 @@ Each kind is a directory beside this file holding a `recipe.yaml`, named after
 the fleet-audit check that finds the problem (`no-pdb/recipe.yaml`). The
 rules file's known kinds (`automation_rules.KNOWN_FIX_TYPES`), the dial's rows
 (`dial_state.FIX_KINDS`) and the kinds the post-merge check records
-(`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this,
-so a kind is added in one place.
+(`session_kv_server.POST_MERGE_KINDS`, the `pr_opened` plugin) all read this.
+Those are the lists; the code that handles one kind's fix is still per kind
+(`automerge_eligibility.FIX_TYPE`, `post_merge_check.DIRECT_OBJECTS`,
+`audit_report.GENERATED_FIX_CHECK`, `recheck.RECHECKS`), so a recipe alone
+gets a dial row and post-merge records but no broker label.
 
 Stdlib only, because the credential proxy and the shell sandbox import it
 through `automation_rules`, and neither may depend on PyYAML being there. So
@@ -38,6 +41,9 @@ OPTIONAL = ("owner", "eval_case")
 KIND_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 ENVIRONMENT_RE = re.compile(r"[a-z0-9]([-_a-z0-9]{0,61}[a-z0-9])?")
 _LINE_RE = re.compile(r"([a-z_]+):[ \t]+(.*)")
+# Plain values YAML reads as something other than a string: refused rather
+# than kept as text a YAML reader would disagree with.
+_NOT_A_STRING_RE = re.compile(r"(?i:null|~|true|false|yes|no|on|off|[-+]?(\d[\d_]*)?\.?\d+([eE][-+]?\d+)?)")
 
 
 class RecipeError(ValueError):
@@ -64,9 +70,16 @@ def _value(raw: str, where: str) -> str:
         if not isinstance(value, str) or (rest and not rest.startswith("#")):
             raise RecipeError(f"{where}: unreadable quoted value")
         return value
-    value = raw.split(" #", 1)[0].strip()
-    if not value or value[0] in "'[{&*!|>%@`-" or ": " in value or value.endswith(":"):
-        raise RecipeError(f"{where}: only plain or double-quoted values are read")
+    value = re.split(r"[ \t]#", raw, maxsplit=1)[0].strip()
+    if (
+        not value
+        or value[0] in "#'[{&*!|>%@`-?,"
+        or ": " in value
+        or ":\t" in value
+        or value.endswith(":")
+        or _NOT_A_STRING_RE.fullmatch(value)
+    ):
+        raise RecipeError(f"{where}: only plain or double-quoted string values are read")
     return value
 
 

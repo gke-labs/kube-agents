@@ -9,6 +9,6 @@ name: disruption-budget fixes
 title: Disruption budgets
 dial_environment: dev
 owner: platform
-# The end-to-end case that grades the fix on the cluster after it merges. None
-# is on main yet (gke-labs/kube-agents#6343).
+# The end-to-end case that grades the fix on the cluster after it merges; empty
+# until that case exists.
 eval_case: ""

@@ -25,7 +25,7 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(recipe, registry.Recipe("no-pdb", "disruption-budget fixes", "Disruption budgets", "dev"))
 
     def test_comments_quotes_and_the_optional_fields(self):
-        text = '# about it\n' + GOOD + 'owner: platform  # who answers\neval_case: ""\n'
+        text = '# about it\n' + GOOD + 'owner: platform\t# who answers\neval_case: ""\n'
         recipe = registry.parse(text)
         self.assertEqual((recipe.owner, recipe.eval_case), ("platform", ""))
 
@@ -45,6 +45,10 @@ class ParseTest(unittest.TestCase):
             "an environment that is not a label value": GOOD.replace("dial_environment: dev", "dial_environment: Dev!"),
             "an unterminated quote": GOOD + 'owner: "platform\n',
             "text after a quote": GOOD + 'owner: "a" b\n',
+            "a comment where the value goes": GOOD + "owner: # todo\n",
+            "a value YAML reads as null": GOOD + "owner: null\n",
+            "a value YAML reads as a bool": GOOD + "owner: true\n",
+            "a value YAML reads as a number": GOOD + "owner: 12\n",
             "oversize": GOOD + "# " + "x" * registry.MAX_RECIPE_BYTES + "\n",
         }
         for why, text in refused.items():

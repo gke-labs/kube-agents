@@ -304,6 +304,10 @@ def local_imports(path: Path, universe: set[str]) -> set[str]:
     body, and `from github_token_refresh import refresh_git_credentials` and
     `import gitops_workspace` are different nodes.
     """
+    if path.is_dir():
+        # A package: what its modules import, so a sibling import inside it is
+        # held to the allowlist like a top-level script's.
+        return set().union(*(local_imports(p, universe) for p in sorted(path.glob("*.py"))))
     if path.suffix != ".py":
         return set()
     found = set()
