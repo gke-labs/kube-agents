@@ -343,7 +343,7 @@ A press of a Stop button, Slack's or Google Chat's, from such a sender gets no n
 
 #### On Slack
 
-The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own.
+The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own. The exception is a task the agent delegates to an AgentProfile: it gets a status line of its own, `⏳ submitted… (delegated to <profile>)`, which moves to `⚙️ working` with the profile's progress and closes to `✅ (delegated to <profile>)` when the profile is done, since nothing else in the thread shows a profile's progress.
 
 #### On Google Chat and the A2A console
 

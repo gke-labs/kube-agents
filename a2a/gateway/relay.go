@@ -1018,7 +1018,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
+			// On a backend that shows task status itself, the only line is a
+			// delegated profile child's (childKeepsLine): done, it closes to
+			// the bare mark, as a line that took its answer does, rather than
+			// leaving a "completed" header above the answer for good.
+			onLine := doneLine != "" || g.showsTaskStatus(rec.Key)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		if !active.Detached && rec.fanOutPending(taskID) {

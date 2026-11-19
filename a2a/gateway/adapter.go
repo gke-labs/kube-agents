@@ -246,7 +246,9 @@ type VerifiedObserver interface {
 // adapter does, with Agent Sessions' Working… status, the ask's reaction and
 // the plan rows, as the today path shows no receipt either. With it true the
 // gateway posts no placeholder for a task, so the relay has no line to edit
-// and every line edit is skipped; the notices that stand on their own (the
+// and every line edit is skipped, except for a session turn's child
+// delegated to an AgentProfile, whose progress nothing else shows
+// (childKeepsLine, #6532); the notices that stand on their own (the
 // queue notice, a publish failure, a failed or canceled task) still post.
 // Asked per conversation, so a wrapper (the mux, the side door) answers for
 // the backend that owns it.

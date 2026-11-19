@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -197,6 +198,50 @@ func TestAProfileChildKeepsItsLineOnAStatusShowingBackend(t *testing.T) {
 		}
 		return false
 	})
+	// Done, the line closes to the bare mark, not a "completed" header left
+	// above the answer for good.
+	if err := cexec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "prod is fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cexec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	closed := withLineNote(lineDoneMark, "(delegated to prod-east)")
+	waitFor(t, "the child's line closed to the bare mark", func() bool {
+		return slices.Contains(r.adapter.editTexts(), closed)
+	})
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "completed") {
+			t.Fatalf("edits = %q, want the line closed to %q", r.adapter.editTexts(), closed)
+		}
+	}
+}
+
+// Only a single child a session turn delegates to a profile keeps a line
+// where the backend shows task status itself: a child of a profile task
+// would put a second live line beside its parent's.
+func TestOnlyASessionTurnsProfileChildKeepsALine(t *testing.T) {
+	t.Parallel()
+	rec := &SessionRecord{Tasks: []TaskRef{{ID: "t-session"}, {ID: "t-profile", Tier: "read"}}}
+	route := &profileRoute{Profile: "prod-east"}
+	for _, tc := range []struct {
+		name string
+		ts   taskStart
+		want bool
+	}{
+		{"a session turn's profile child", taskStart{Role: taskRoleChild, ParentTaskID: "t-session", Route: route}, true},
+		{"a profile task's profile child", taskStart{Role: taskRoleChild, ParentTaskID: "t-profile", Route: route}, false},
+		{"a child to platform", taskStart{Role: taskRoleChild, ParentTaskID: "t-session"}, false},
+		{"a batch child", taskStart{Role: taskRoleChild, ParentTaskID: "t-session", Route: route, KeepActive: true}, false},
+		{"a human turn", taskStart{Route: route}, false},
+		{"a wake", taskStart{Role: taskRoleWake, ParentTaskID: "t-session"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := childKeepsLine(rec, tc.ts); got != tc.want {
+				t.Fatalf("childKeepsLine = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // A child delegated to platform keeps the backend's own status, as a
