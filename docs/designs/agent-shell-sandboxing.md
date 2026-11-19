@@ -2857,7 +2857,8 @@ only when they are all the install's, and `proposal-create` only from the instal
 label edit is refused under `caller.vcs-labels`. A profile `issue-list` may not widen its
 search past the managed repository: a `query` that is not plain words (a `:`, quote,
 backslash or parenthesis, or `OR`, `AND` or `NOT` as a word), or a quote or backslash in a
-label name, is refused under `caller.vcs-query`. The shell is held to none of this. No
+label name, is refused under `caller.vcs-query`. A profile `identity` with no repository answers the
+managed repositories' names, read-only, and nothing else. The shell is held to none of this. No
 other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in

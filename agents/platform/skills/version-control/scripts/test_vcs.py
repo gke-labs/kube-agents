@@ -224,6 +224,47 @@ class VcsTestCase(unittest.TestCase):
         return Path(vcs_client.all_sessions()[0]["path"])
 
 
+class IdentityWithNoRepositoryTest(VcsTestCase):
+    """`identity` with nothing named and nothing cloned asks with no repository (#6389).
+
+    A profile worker's broker answers that with the install's managed
+    repositories; a named repository or a working copy keeps the old resolution.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A profile worker: the dispatcher's task credential file is named.
+        patch = mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_TASK_TOKEN_FILE": "/var/run/task/token"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_nothing_named_and_nothing_cloned_sends_no_repository(self):
+        code, _ = self.run_vcs("identity")
+        self.assertEqual(code, 0)
+        self.assertNotIn("repository", self.broker.payload("identity"))
+
+    def test_off_a_profile_worker_the_clone_hint_stands(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CREDENTIAL_PROXY_TASK_TOKEN_FILE", None)
+            with redirect_stderr(io.StringIO()):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = vcs.main(["identity"])
+        self.assertNotEqual(code, 0)
+        self.assertFalse(any(name == "identity" for name, _ in self.broker.calls))
+
+    def test_a_named_repository_is_sent(self):
+        code, _ = self.run_vcs("identity", "--repo", "local.test/acme/infra")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("identity")["repository"], "local.test/acme/infra")
+
+    def test_a_working_copy_still_names_its_repository(self):
+        self.clone()
+        code, _ = self.run_vcs("identity")
+        self.assertEqual(code, 0)
+        self.assertIn("repository", self.broker.payload("identity"))
+
+
 # ---------------------------------------------------------------------------
 # clone
 # ---------------------------------------------------------------------------

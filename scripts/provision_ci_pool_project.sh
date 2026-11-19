@@ -32,10 +32,48 @@ PROJECT_ID=""
 REGION="us-central1"
 APP_ID="4675512"
 # The read half, and not settable by flag: verify_ci_pool_project.py fails a
-# project whose ledger issues this exact installation cannot read, so a
-# different one here would only mis-address the warning in step 1.4.
-LEDGER_APP_ID="4739812"
-LEDGER_INSTALLATION_ID="157029058"
+# project whose ledger issues its shard's installation cannot read, so a
+# different one here would only mis-address the warning in step 1.4. Which
+# App is the project's shard in this file (LEDGER_READER_SHARD_SIZE projects
+# per App in number order, the rule hack/ci-eval-pr.sh and the verifier
+# apply; a test holds the three sizes equal); step 1.4 reads it
+# (ledger_reader_for_project) once PROJECT_ID is known.
+LEDGER_READER_APPS_FILE="${SCRIPT_DIR}/../hack/eval/ledger-reader-apps.txt"
+LEDGER_READER_SHARD_SIZE=10
+LEDGER_APP_ID=""
+LEDGER_INSTALLATION_ID=""
+LEDGER_SHARD=""
+LEDGER_SHARD_COUNT=""
+LEDGER_READER_NUMBER=""
+# Sets the four above for <project id>: (its number - 1) / the shard size
+# picks the row (the N of kube-agents-evals-N, 1 for the bare name), the
+# rule hack/ci-eval-pr.sh (ledger_reader_shard) and
+# verify_ci_pool_project.py (ledger_reader_for) apply. A project past the
+# last row's ten has no App of its own yet: the eval reads it through the
+# first App until the row exists, and so does the warning here.
+ledger_reader_for_project() {
+  local -a apps=() fields=()
+  local line ordinal=1
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    [[ "${line}" =~ [^[:space:]] ]] && apps+=("${line}")
+  done < "${LEDGER_READER_APPS_FILE}"
+  if [ "${#apps[@]}" -eq 0 ]; then
+    echo "ERROR: ${LEDGER_READER_APPS_FILE} names no ledger-reader App." >&2
+    return 1
+  fi
+  if [[ "$1" =~ -([0-9]+)$ ]]; then ordinal="${BASH_REMATCH[1]}"; fi
+  LEDGER_SHARD_COUNT="${#apps[@]}"
+  LEDGER_SHARD=$(( (10#${ordinal} - 1) / LEDGER_READER_SHARD_SIZE ))
+  LEDGER_READER_NUMBER=$((LEDGER_SHARD + 1))
+  if [ "${LEDGER_SHARD}" -ge "${LEDGER_SHARD_COUNT}" ]; then
+    echo "WARNING: ${1} is on reader App ${LEDGER_READER_NUMBER} (${LEDGER_READER_SHARD_SIZE} projects per App, in number order) and ${LEDGER_READER_APPS_FILE} has ${LEDGER_SHARD_COUNT} row(s), so the eval would read it through reader App 1. Register App ${LEDGER_READER_NUMBER}, install it, and append its row before registering this project (docs/ci-pool-projects.md 5.4); step 1.4 below names reader App 1 meanwhile." >&2
+    LEDGER_SHARD=0
+  fi
+  read -r -a fields <<< "${apps[${LEDGER_SHARD}]}"
+  LEDGER_APP_ID="${fields[0]}"
+  LEDGER_INSTALLATION_ID="${fields[1]}"
+}
 # The identity the pool's pull-request sweep runs as (hack/ci_sweep_agent_pulls.py,
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
@@ -270,6 +308,7 @@ if [ -z "${PROJECT_ID}" ]; then
   echo "ERROR: --project-id is required." >&2
   usage
 fi
+ledger_reader_for_project "${PROJECT_ID}"
 
 if [ -n "${PEM_FILE}" ]; then
   if [ ! -f "${PEM_FILE}" ]; then
@@ -701,7 +740,12 @@ fi
 # above writes the GitOps repo, and this one reads back the ledger issue the
 # bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
 # step 5's Ledger Read Credential check fails the project until it is done.
-echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
+# Which reader App: the project's shard (LEDGER_READER_APPS_FILE, #6240), and
+# the check reads through that shard alone, so the repository on another
+# shard's App is the same 404 as on none.
+echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation"
+echo "  (reader App ${LEDGER_READER_NUMBER} of ${LEDGER_SHARD_COUNT}: ${LEDGER_READER_SHARD_SIZE} projects per App in number order; no other App will do,"
+echo "  except that until the Prow job mounts this App's key the eval reads through reader App 1, so keep the repository on that installation too)."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 

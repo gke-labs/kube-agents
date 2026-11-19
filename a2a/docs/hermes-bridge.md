@@ -216,7 +216,9 @@ platform-agent image that same build produced, by the tag it just pushed and nev
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
 `A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
 eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
-"The inject door on every lane"). Either way the sidecar and the agent
+"The inject door on every lane"). `scripts/dev/dev_rebuild_agent.sh` builds a dev install's own,
+`FROM` the agent image it just built, and the root Makefile's `docker-build-hermes-bridge` builds a
+local one `FROM` the platform-agent image of the same `make` run. In each case the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the
