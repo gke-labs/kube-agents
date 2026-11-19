@@ -161,6 +161,15 @@ MUTATIONS: list[Mutation] = [
         "as the shell does with no per-task identity",
     ),
     Mutation(
+        "A3-profile-update-not-owned",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                        self.vcs.require_agent_proposal(verb, payload)\n",
+         "                        pass\n"),
+        "test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals",
+        "drop the ownership read on a profile worker's permitted write, trusting "
+        "the permit, which names no proposal, to keep it off a person's",
+    ),
+    Mutation(
         "A3-report-credential-any-route",
         "agents/platform/scripts/credential_proxy.py",
         ("        if task is not None and getattr(task, \"report_only\", False) and not report_credential_permits(self.command, self.path):\n",
@@ -1658,6 +1667,16 @@ Mutation(
         "keep commercial googleapis.com hosts in routed_hosts alongside the "
         "custom universe's hosts for convenience, letting custom-universe "
         "credentials cross a universe boundary when route_host also matches",
+    ),
+    Mutation(
+        "C2-universe-domain-under-googleapis",
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("    if cleaned.endswith(_GOOGLE_API_SUFFIX):\n",
+         "    if False and cleaned.endswith(_GOOGLE_API_SUFFIX):\n"),
+        "test_C2_a_universe_domain_under_googleapis_com_is_refused",
+        "accept every well-formed domain as the universe domain again, so "
+        "mtls.googleapis.com passes as a custom universe and its hosts, "
+        "which are commercial hosts, are relayed",
     ),
     Mutation(
         "C3-policy-reads-a-file",

@@ -27,6 +27,9 @@ func (s *fakeSpawner) setLiveErr(err error) {
 	s.liveErr = err
 }
 
+// SessionPods (gateway_test.go) pads its list with keyless pods up to live,
+// so a test that sets only a count still drives the cap, whose count is the
+// list's length. A keyless pod is never an eviction candidate.
 func (s *fakeSpawner) LiveSessions(context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

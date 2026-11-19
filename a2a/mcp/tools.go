@@ -65,6 +65,9 @@ type sendMessageArgs struct {
 	ConversationToken string `json:"conversation_token"`
 	WaitSeconds       int    `json:"wait_seconds"`
 	StreamSteps       *bool  `json:"stream_steps,omitempty"`
+	// ReplyTo is the tool's spelling of TurnAddress.ReplyTo; it shadows the
+	// embedded field's frame spelling (replyTo) on the way in.
+	ReplyTo string `json:"reply_to"`
 	TurnAddress
 }
 
@@ -74,6 +77,11 @@ type sendMessageArgs struct {
 type TurnAddress struct {
 	Addressee  string            `json:"addressee,omitempty"`
 	Parameters map[string]string `json:"parameters,omitempty"`
+	// ReplyTo names the task a notify frame reported on, when the turn
+	// answers that report (gateway.ConsoleInFrame's replyTo); the gateway
+	// carries it to the agent, which starts the turn with the report in
+	// front of it. The tool argument is reply_to (sendMessageArgs).
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
 // check refuses what the gateway would drop without a word or could never
@@ -133,6 +141,7 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 					"conversation_token": map[string]any{"type": "string", "description": "Continue a conversation by the token a previous answer reported, instead of by name."},
 					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("How long to wait for the answer, %d at most. Default %d.", maxWaitSeconds, defaultWaitSeconds)},
 					"stream_steps":       map[string]any{"type": "boolean", "description": "When true, return a custom step envelope after the next step so the caller can stream progress step-by-step with task_control get."},
+					"reply_to":           map[string]any{"type": "string", "description": "When this message answers a card's report, the task the report said it was on (`on task <id>` in its heading); the agent then reads that report before answering (on the platform route, the install's default; a conversation on its own session pod does not read it yet). Omit for a message that answers no report."},
 					"addressee": map[string]any{"type": "string", "description": "The AgentProfile to send the turn to, by name (for example cluster), as a new task for it. " +
 						"Default: the conversation's agent. " +
 						"Refused on a stop word, a bare /feedback or /feedback summary, and on any /session text, a message after it included: an addressed turn is a new task for the profile, not a session."},
@@ -154,10 +163,15 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			if err := a.TurnAddress.check(); err != nil {
 				return "", err
 			}
-			if shouldStreamSteps(ctx, a.StreamSteps) {
-				return sendAndStreamStep(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, a.TurnAddress, waitFor(a.WaitSeconds))
+			if a.ReplyTo != "" && !lib.ValidSubjectToken(a.ReplyTo) {
+				return "", fmt.Errorf("reply_to %q is not a task id: pass the id a report's heading gave as `on task`", a.ReplyTo)
 			}
-			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, a.TurnAddress, waitFor(a.WaitSeconds))
+			to := a.TurnAddress
+			to.ReplyTo = a.ReplyTo
+			if shouldStreamSteps(ctx, a.StreamSteps) {
+				return sendAndStreamStep(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, to, waitFor(a.WaitSeconds))
+			}
+			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, to, waitFor(a.WaitSeconds))
 		},
 	}
 }

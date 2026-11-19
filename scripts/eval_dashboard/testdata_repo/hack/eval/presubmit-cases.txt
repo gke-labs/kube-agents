@@ -1,0 +1,3 @@
+# Synthetic presubmit registration for scripts/test_eval_dashboard_collect.py.
+./tasks/case-02/task.yaml
+./tasks/case-09/task.yaml
