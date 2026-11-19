@@ -413,6 +413,28 @@ conversation a Vertex `session_id` so a new conversation's first turn can read
 a prompt another conversation warmed:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
 
+To supply a custom Vertex AI endpoint or `GOOGLE_CLOUD_UNIVERSE_DOMAIN` through
+`litellm.envFromSecret` ([below](#a-credentials-secret-for-the-gateway-litellmenvfromsecret)),
+pair the Secret with `litellm.vertex.projectId` (or `litellm.vertex.projectSecretRef`)
+and `litellm.vertex.location`:
+
+```bash
+--set litellm.modelProvider=vertex_ai \
+--set litellm.modelDefaultName=gemini-3.8-flash \
+--set litellm.vertex.projectId=my-serving-project \
+--set litellm.vertex.location=us-east4 \
+--set litellm.envFromSecret=vertex-endpoint
+```
+
+Kubernetes resolves explicit container `env` entries after `envFrom`, so
+`VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` rendered by the chart always override
+those keys in `litellm.envFromSecret`. When `platformAgent.harness.universeDomain`
+is set to a domain other than `googleapis.com`, the chart also sets
+`GOOGLE_CLOUD_UNIVERSE_DOMAIN` in container `env` (overriding `envFromSecret`)
+and renders `api_base` on each `model_list` entry in `config.yaml` as
+`https://aiplatform.<universeDomain>` when `litellm.vertex.location` is `global`
+or `https://<location>-aiplatform.<universeDomain>` for a regional location.
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -496,10 +518,16 @@ key in the credentials Secret get theirs:
   in the Secret, the chart ships a pre-call hook that fetches the bearer token,
   caches it and renews it before expiry
   ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
+- **Vertex AI custom endpoint variables (`litellm.modelProvider=vertex_ai`).**
+  Pair the Secret with `litellm.vertex.projectId` (or `projectSecretRef`) and
+  `litellm.vertex.location` ([above](#vertex-ai-litellmmodelprovidervertex_ai)).
 
-A variable the chart also sets from the credentials Secret (`GEMINI_API_KEY`,
-`HOSTED_VLLM_API_KEY`, ...) wins over the same name in this Secret. Rotating
-the Secret does not roll the pods: `kubectl rollout restart deployment/litellm`.
+A variable the chart sets directly in container `env` — keys from the
+credentials Secret (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY`, ...), plus
+`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GOOGLE_CLOUD_UNIVERSE_DOMAIN`
+(when `platformAgent.harness.universeDomain` is non-default) on `vertex_ai` —
+wins over the same name in this Secret. Rotating the Secret does not roll the
+pods: `kubectl rollout restart deployment/litellm`.
 
 ```bash
 kubectl create secret generic sap-aicore -n kubeagents-system \
