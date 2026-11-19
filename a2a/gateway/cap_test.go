@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -30,11 +31,6 @@ func (s *fakeSpawner) setLiveErr(err error) {
 // SessionPods (gateway_test.go) pads its list with keyless pods up to live,
 // so a test that sets only a count still drives the cap, whose count is the
 // list's length. A keyless pod is never an eviction candidate.
-func (s *fakeSpawner) LiveSessions(context.Context) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.live, s.liveErr
-}
 
 // TestDelegateRefusedAtSessionCap: "Delegate:" makes pod creation
 // user-triggerable and threads are free, so the cap is the gateway's
@@ -159,11 +155,11 @@ func TestSessionCapCountErrorRefusesHonestly(t *testing.T) {
 	}
 }
 
-// TestPodSpawnerLiveSessionsCountsNonTerminal: the denominator is what the
-// k8s API holds - session-labeled pods in this namespace that are not yet
-// terminal. Succeeded/Failed pods are sweep's inventory, not load; other
-// workloads and other namespaces are not ours to count.
-func TestPodSpawnerLiveSessionsCountsNonTerminal(t *testing.T) {
+// TestPodSpawnerSessionPodsListsOnlyThisNamespacesLiveSessionPods: the cap's
+// count is what the k8s API holds - session-labeled pods in this namespace
+// that are not yet terminal. Succeeded/Failed pods are sweep's inventory,
+// not load; other workloads and other namespaces are not ours to count.
+func TestPodSpawnerSessionPodsListsOnlyThisNamespacesLiveSessionPods(t *testing.T) {
 	mk := func(name, ns string, phase corev1.PodPhase, sessionLabels bool) *corev1.Pod {
 		labels := map[string]string{}
 		if sessionLabels {
@@ -183,12 +179,17 @@ func TestPodSpawnerLiveSessionsCountsNonTerminal(t *testing.T) {
 		mk("elsewhere", "other-ns", corev1.PodRunning, true),
 	)
 	s := &podSpawner{cfg: &Config{Namespace: "test-ns"}, client: cs, log: slog.Default()}
-	n, err := s.LiveSessions(context.Background())
+	pods, err := s.SessionPods(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Fatalf("LiveSessions = %d, want 2 (running + pending)", n)
+	var got []string
+	for _, p := range pods {
+		got = append(got, p.PodName)
+	}
+	slices.Sort(got)
+	if want := []string{"pending", "running"}; !slices.Equal(got, want) {
+		t.Fatalf("SessionPods = %v, want %v (running + pending)", got, want)
 	}
 }
 

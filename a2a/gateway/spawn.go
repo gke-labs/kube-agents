@@ -228,10 +228,6 @@ type spawner interface {
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
 	// their annotations carry (sweep's scan).
 	TerminalOrphans(ctx context.Context) ([]orphanPod, error)
-	// LiveSessions counts session pods not yet in a terminal phase and not
-	// being deleted - the session cap's denominator, over the same pods
-	// SessionPods offers the cap's eviction.
-	LiveSessions(ctx context.Context) (int, error)
 	// Reusable reports whether a pod can take its conversation's next task:
 	// spawned for reuse, running, not being deleted, its worker not exited,
 	// and with room left in its lifetime for a whole task. A pod that is
@@ -655,35 +651,6 @@ func (s *podSpawner) Delete(ctx context.Context, podName string) error {
 	return err
 }
 
-// LiveSessions counts through the k8s API rather than the gateway's own
-// registry: the API is authoritative, survives a gateway restart, and sees
-// orphans the registry has forgotten. Terminal pods are sweep's inventory,
-// not load, so they don't count - matching what a `pods` ResourceQuota
-// counts, which is the layer that backstops this number.
-//
-// A pod being deleted does not count either, though the quota still does
-// until it is gone: its slot is already freeing, and the cap's eviction
-// cannot choose it (SessionPods skips it too), so counting it would evict
-// some other conversation's live pod for a slot nobody needs. The count and
-// the candidates agree, and the overlap while it terminates is the same one
-// a successful eviction already leaves, which the quota headroom absorbs.
-func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
-	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
-	})
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
-			continue
-		}
-		n++
-	}
-	return n, nil
-}
-
 // reusePod reports whether a pod spawned for rec serves every turn of its
 // conversation: reuse is on and the conversation is on the session route.
 // A one-shot Delegate from a fixed-route conversation is not: the next plain
@@ -845,7 +812,7 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 // never silently queued, never dropped. replacing marks a turn that retires its previous incarnation in
 // the same breath: the doomed pod is usually still live at count time, so
 // it hands its slot to its successor rather than double-counting - and if
-// it already went terminal or is already being deleted (LiveSessions counts
+// it already went terminal or is already being deleted (SessionPods lists
 // neither), the extra slot is a transient overshoot the quota headroom
 // absorbs.
 //
@@ -853,7 +820,7 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 // so every turn in flight inside the count-to-create window used to pass this
 // check together. A burst of 10 on top of 9 live pods left 19 against a cap
 // of 10 (#6033, measured for #2371), well past the quota's few pods of
-// margin. So the check is serialized (capMu), and a slot granted here counts
+// margin. So the check is serialized (capCheck), and a slot granted here counts
 // as live until ensureSessionPod's spawn returns (capHolds), or for at most
 // sessionCapHoldTTL. Only the leader replica takes turns, so one process's
 // lock is enough. The namespace ResourceQuota stays the hard bound against a

@@ -6154,7 +6154,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // and nobody legitimate ever sees the admission failure.
 //
 // `pods` (not count/pods) is deliberate: it counts non-terminal pods only,
-// matching the gateway's LiveSessions denominator, so a finished worker
+// matching the gateway's session count (SessionPods), so a finished worker
 // awaiting sweep does not hold a slot. It is also the only key - a
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
