@@ -536,6 +536,13 @@ const (
 	// the single switch exists to make unreachable.
 	a2aCapabilityRequiredEnvVar = "A2A_CAPABILITY_REQUIRED"
 
+	// a2aDefaultAddresseeEnvVar carries spec.harness.tuning.defaultRoute,
+	// resolved by resolveA2ADefaultRoute, onto the gateway (which routes a
+	// plain conversation's first message by it) and onto the platform agent
+	// container, which the hermes-bridge sidecar copies, so all three read
+	// the one value.
+	a2aDefaultAddresseeEnvVar = "A2A_DEFAULT_ADDRESSEE"
+
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
 	// the key name so moving a credential from one user to another is still a
@@ -1097,21 +1104,33 @@ const (
 	// a chat backend's, whose turn runs under the session lock and replays
 	// twice back to back, or the inject door's, whose read takes no lock and
 	// replays before and after its wait -- one asker, two replays, either
-	// way. The operator leaves the gateway's A2A_DEFAULT_ADDRESSEE at its
-	// default, "platform", so a plain conversation's task is a bridge run
-	// and a session pod is spawned only for a Delegate or a session-routed
-	// record; the conversations being asked about while their task runs are
-	// therefore the bridge's Concurrency runs. A conversation with a queued
-	// bridge task, or with a session pod, can be asked about too; that is a
-	// person or a harness at one conversation, once per ask, and the tail
-	// factor is the allowance for it. It is not a per-session term today,
-	// because maxSessions counts pods and a conversation's task is not one;
-	// put in the multiplier it would size the reserve by the wrong number.
-	// The day A2A_DEFAULT_ADDRESSEE flips to the session route (the
-	// RouteSession sentinel in a2a/gateway; gke-labs#2033 is the open design
-	// change that plans it), every conversation's task IS a pod, the asks row
-	// becomes per-session, and it moves into the multiplier beside
-	// a2aSessionConsumersPerSession.
+	// way. The operator renders the gateway's A2A_DEFAULT_ADDRESSEE from
+	// spec.harness.tuning.defaultRoute, "platform" unless the field says
+	// otherwise (resolveA2ADefaultRoute), so on that default a plain
+	// conversation's task is a bridge run and a session pod is spawned only
+	// for a Delegate or a session-routed record; the conversations being
+	// asked about while their task runs are therefore the bridge's
+	// Concurrency runs. A conversation with a queued bridge task, or with a
+	// session pod, can be asked about too; that is a person or a harness at
+	// one conversation, once per ask, and the tail factor is the allowance
+	// for it. On that route it is not a per-session term, because
+	// maxSessions counts pods and a conversation's task is not one; put in
+	// the multiplier it would size the reserve by the wrong number.
+	//
+	// On an install whose defaultRoute is `session` (the RouteSession
+	// sentinel in a2a/gateway; gke-labs#2033 is the open design change that
+	// plans the default's flip), every conversation's task IS a pod, so the
+	// conversations being asked about are the session pods, up to
+	// maxSessions of them. There the asks are counted per session,
+	// a2aTasksReplaySessionAsks (an asker's a2aTasksReplayAsk with its
+	// tail), in the multiplier beside a2aSessionConsumersPerSession
+	// (a2aTasksConsumersPerSession). The bridge's asks row stays in the
+	// reserve as it is: `platform` is still reachable by handle, so the
+	// bridge's workers can still be running conversations, and keeping the
+	// row only widens. The provision script's per-session arithmetic (the
+	// maxSessions that fits, one session's need) reads the same
+	// per-session figure, so the refusal and the budget agree on either
+	// route.
 	//
 	// Two more things the three bridge rows rest on, both settable on the
 	// CR. BRIDGE_CONCURRENCY is read. The sidecar is declared in
@@ -1249,6 +1268,11 @@ const (
 	// read's probeConversation before and after its wait.
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
+	// a2aTasksReplaySessionAsks is the asks term one session pod adds on
+	// the session route: its conversation's asker, a2aTasksReplayAsk
+	// replays, held a2aTasksReplayTailFactor times like every
+	// trigger-paced source in the table (a2aTasksConsumersPerSession).
+	a2aTasksReplaySessionAsks = a2aTasksReplayTailFactor * a2aTasksReplayAsk
 	// a2aTasksReplayLookAhead is the pre-spawn look-ahead replays one bridge
 	// worker holds: lib.TaskInReplay at most once per dequeue, and at most
 	// Concurrency of them in hand across the bridge at once, which the bridge
@@ -3670,10 +3694,19 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// count is a render-time fact the script cannot recompute.
 	reserveN := a2aTasksReserve(agent)
 	reserve := strconv.Itoa(reserveN)
-	oneSession := strconv.Itoa(a2aSessionConsumersPerSession + reserveN)
+	perSessionN := a2aTasksConsumersPerSession(agent)
+	oneSession := strconv.Itoa(perSessionN + reserveN)
 	maxSessionsN := resolveA2AMaxSessions(agent)
 	maxSessions := strconv.Itoa(maxSessionsN)
-	perSession := strconv.Itoa(a2aSessionConsumersPerSession)
+	perSession := strconv.Itoa(perSessionN)
+	// What a session's share is, said as the refusal says it: the named
+	// consumers it creates, and on the session route the replays of its
+	// conversation's task too.
+	perSessionWhat := `creates ` + perSession + ` consumers on TASKS`
+	if perSessionN != a2aSessionConsumersPerSession {
+		perSessionWhat = `needs ` + perSession + ` consumers on TASKS (` + strconv.Itoa(a2aSessionConsumersPerSession) +
+			` it creates, ` + strconv.Itoa(a2aTasksReplaySessionAsks) + ` for replays of its task on the session route)`
+	}
 	bridgeWorkersN, bridgeWorkersCapped, bridgeWorkersDefaulted := a2aBridgeWorkers(agent)
 	bridgeWorkers := strconv.Itoa(bridgeWorkersN)
 	bridgeWorkersNoun := "workers"
@@ -3690,8 +3723,8 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	// its asks and its look-ahead, each with a tail.
 	fixedReserve := strconv.Itoa(a2aTasksReservedConsumersFor(0))
 	perWorker := strconv.Itoa(a2aTasksReplayTailFactor * (a2aTasksReplayAsk + a2aTasksReplayLookAhead))
-	oneWorker := strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
-	oneAndOne := strconv.Itoa(a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
+	oneWorker := strconv.Itoa(maxSessionsN*perSessionN + a2aTasksReservedConsumersFor(1))
+	oneAndOne := strconv.Itoa(perSessionN + a2aTasksReservedConsumersFor(1))
 	bridgeAboveDefault := bridgeWorkersN > a2aBridgeDefaultConcurrency
 
 	// The parenthetical under the reserve: where the worker count came from,
@@ -3775,7 +3808,7 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
   fi
 `
 	if bridgeAboveDefault {
-		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
+		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*perSessionN) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
 `
 		oneSessionAt = ` at ` + bridgeWorkers + ` bridge workers`
 		thatLeaves = ""
@@ -4205,7 +4238,7 @@ if [ -z "${live_consumers}" ]; then
 fi
 if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
-  echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session creates ` + perSession + ` consumers on TASKS," >&2
+  echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session ` + perSessionWhat + `," >&2
   echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
 ` + bridgeNote + `  echo "Provisioning does not change this limit on an existing stream, and it could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
@@ -5142,6 +5175,28 @@ func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name core
 	return q.String()
 }
 
+// resolveA2ADefaultRoute is spec.harness.tuning.defaultRoute, or
+// DefaultRoutePlatform when it is unset: the gateway's own default, so an
+// install that sets nothing routes as it did before the field existed. The
+// gateway's A2A_DEFAULT_ADDRESSEE and the platform agent container's (which
+// the hermes-bridge sidecar copies) all come from here, so the two cannot disagree. Only the CRD's two values are
+// routes: anything else that reaches here (a CR written past the schema)
+// falls through to DefaultRoutePlatform rather than naming an addressee no
+// executor owns.
+func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
+	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil &&
+		*limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
+		return agentv1alpha1.DefaultRouteSession
+	}
+	return agentv1alpha1.DefaultRoutePlatform
+}
+
+// a2aDefaultAddresseeEnv is the A2A_DEFAULT_ADDRESSEE entry both containers
+// carry.
+func a2aDefaultAddresseeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
+	return corev1.EnvVar{Name: a2aDefaultAddresseeEnvVar, Value: resolveA2ADefaultRoute(agent)}
+}
+
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
 		return *limits.MaxSessions
@@ -6054,7 +6109,21 @@ func a2aTasksReserve(agent *agentv1alpha1.PlatformAgent) int {
 // stream sized at the floor holds a default install fine, and failing it for
 // being below a floor it was never going to be below is a false alarm.
 func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
-	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReserve(agent)
+	return resolveA2AMaxSessions(agent)*a2aTasksConsumersPerSession(agent) + a2aTasksReserve(agent)
+}
+
+// a2aTasksConsumersPerSession is the multiplier the session cap takes in the
+// budget: the a2aSessionConsumersPerSession named consumers every session
+// pod creates and, when the default route is the session route, the asks on
+// its conversation (a2aTasksReplaySessionAsks), which on that route are a
+// session's rather than a bridge worker's. On the platform route the asks
+// stay in the reserve's bridge row and the multiplier is the named
+// consumers alone, as it always was.
+func a2aTasksConsumersPerSession(agent *agentv1alpha1.PlatformAgent) int {
+	if resolveA2ADefaultRoute(agent) == agentv1alpha1.DefaultRouteSession {
+		return a2aSessionConsumersPerSession + a2aTasksReplaySessionAsks
+	}
+	return a2aSessionConsumersPerSession
 }
 
 // a2aProfileDurablesAllowed is PROFILE_SUBMITS's max_consumers: one durable
@@ -6140,6 +6209,14 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		if capped {
 			need += fmt.Sprintf(". %s more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", countIs, a2aBridgeConcurrencyMax)
 		}
+	}
+	// On the session route a session's share carries its conversation's
+	// replays too (a2aTasksConsumersPerSession), so the need says so: the
+	// route is the input that raised it, and setting it back to platform is
+	// the edit that lowers it.
+	if per := a2aTasksConsumersPerSession(agent); per != a2aSessionConsumersPerSession {
+		need += fmt.Sprintf(", each session counted at %d (%d consumers and %d for replays of its task, because spec.harness.tuning.defaultRoute is %s; %s counts %d)",
+			per, a2aSessionConsumersPerSession, a2aTasksReplaySessionAsks, agentv1alpha1.DefaultRouteSession, agentv1alpha1.DefaultRoutePlatform, a2aSessionConsumersPerSession)
 	}
 	if workers > a2aBridgeDefaultConcurrency {
 		ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower %s, or none for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
@@ -6990,6 +7067,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// it are in this same change, so the flag flips
 		// where all three become true together.
 		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+		// Where a plain conversation's first message goes:
+		// spec.harness.tuning.defaultRoute, `platform` when
+		// unset (resolveA2ADefaultRoute). Rendered explicitly
+		// at that default, like A2A_MAX_SESSIONS above, so
+		// the flip to the session route is an edit to a value
+		// already in the live Deployment. The session route
+		// needs the spawner the line above arms.
+		a2aDefaultAddresseeEnv(agent),
 		// The image those sessions run. Rendered even
 		// when it matches the gateway's own default, so
 		// the operator-side override reaches it.
