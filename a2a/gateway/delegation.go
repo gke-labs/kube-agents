@@ -1082,11 +1082,16 @@ func (g *Gateway) liveChild(ctx context.Context, rec *SessionRecord) string {
 }
 
 // setParentLine records (or, given "", clears) the delegating turn's
-// rolling-line message on its history entry.
+// rolling-line message on its history entry, and backfills LineNote from
+// the active task if missing on the entry.
 func setParentLine(rec *SessionRecord, taskID, statusMsgID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].StatusMsgID = statusMsgID
+			if statusMsgID != "" && rec.ActiveTask != nil && rec.ActiveTask.TaskID == taskID &&
+				rec.ActiveTask.LineNote != "" && rec.Tasks[i].LineNote == "" {
+				rec.Tasks[i].LineNote = rec.ActiveTask.LineNote
+			}
 		}
 	}
 }
