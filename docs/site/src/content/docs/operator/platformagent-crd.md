@@ -99,6 +99,12 @@ A failed way back stops for a person, and so does a failure with no way back (be
 
 A rollback that failed keeps the write freeze, the staging claim and the operator's digests until then, so a retry restores the same snapshot. Before retrying, check the `<agent>-a2a-nats-0` pod, and the restore pod's termination message (`kubectl get pod <agent>-bus-rollback-<run> -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'`), which names the stream and the check that failed.
 
+#### A run this operator does not run
+
+A later release may run a migration of a kind this one doesn't, and a rollback can find one under way. `status.busMigration.leg` then names a leg this operator does not run (`Reshape` is reserved for one). Such a run is held, in whatever phase it is in. Nothing advances and no pod or Job is made. The run's deadline does not apply. The bus keeps its server count and the write freeze, and the provision Job waits. The `A2ABusMigrating` condition reads `LegUnknown`, and one `A2ABusMigrationLegUnknown` Warning Event names the leg.
+
+There are two ways out. Either upgrade back to the operator that started the run, which carries it on where it is, or give it up with `kubeagents.x-k8s.io/bus-migration-abandon=<run>`. Giving up works as it does for a `Failed` run: the freeze lifts, and the provision Job recreates, empty, every stream the run did not put back. It is never retried, since only the operator that started it knows its way back.
+
 A run that failed in `Shrinking` (server 0 did not come up on its own) or in `Releasing` (the servers did not come back with their static users) has no way back to retry. The bus stays at the count it reached. Fix the `<agent>-a2a-nats` pods, then give the run up to allow the next migration.
 
 #### Recovering a given-up run's staging claim

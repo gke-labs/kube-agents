@@ -144,21 +144,41 @@ func TestAHeldUnknownLegIsGivenUpByTheAbandonAnnotation(t *testing.T) {
 		t.Error("the provisioned record stands, so the provision Job would not recreate what the run did not put back")
 	}
 	cond, _ := busMigratingCondition(m.agent)
-	if cond.Reason != "Failed" || strings.Contains(cond.Message, "To retry") || !strings.Contains(cond.Message, "recreated empty") {
-		t.Errorf("condition %+v, want Failed, no retry, streams recreated", cond)
+	if cond.Reason != "Failed" || strings.Contains(cond.Message, "To retry") || !strings.Contains(cond.Message, "recreated empty") || !strings.Contains(cond.Message, busMigrationStageClaim(m.agent, "3-1")) {
+		t.Errorf("condition %+v, want Failed, no retry, streams recreated, and the staging claim kept as their only copy", cond)
 	}
 }
 
-// A Failed run of an unknown leg offers and takes no retry.
+// A Failed run of an unknown leg offers and takes no retry, even from a
+// phase a known leg retries from; the same run on the known leg does, so
+// the test can tell.
 func TestAFailedUnknownLegTakesNoRetry(t *testing.T) {
-	m := newMigrationRig(t, "Reshape", busMigrationFailed, 3, time.Now().Add(time.Hour))
-	run := m.agent.Status.BusMigration
-	run.FailedIn = string(busMigrationRestoring)
-	m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: busMigrationRetryValue(run)}
-	if busMigrationActOnFailed(m.agent, metav1.Now()) || run.Phase != string(busMigrationFailed) || len(run.Retries) != 0 {
-		t.Errorf("phase %s, retries %d: the retry ran", run.Phase, len(run.Retries))
+	for _, failedIn := range []busMigrationPhase{busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationClearing, busMigrationUnpinning} {
+		for _, leg := range []busMigrationLeg{busMigrationGrow, "Reshape"} {
+			m := newMigrationRig(t, leg, busMigrationFailed, 3, time.Now().Add(time.Hour))
+			run := m.agent.Status.BusMigration
+			run.FailedIn = string(failedIn)
+			m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: busMigrationRetryValue(run)}
+			offered := strings.Contains(busMigrationFailedActions(m.agent), "To retry")
+			busMigrationActOnFailed(m.agent, metav1.Now())
+			retried := run.Phase != string(busMigrationFailed)
+			if want := leg == busMigrationGrow; offered != want || retried != want {
+				t.Errorf("%s failed in %s: retry offered %v, ran %v; want %v", leg, failedIn, offered, retried, want)
+			}
+		}
 	}
-	if strings.Contains(busMigrationFailedActions(m.agent), "To retry") {
-		t.Error("the condition offers a retry")
+}
+
+// A held run given up before it cleared anything says its streams are
+// recreated empty where missing, as one to three does, not three to one's
+// "keep their data".
+func TestAnUnknownLegGivenUpEarlySaysStreamsAreRecreated(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, "Reshape", busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	m.pass(busMigrationFailed, 1)
+	m.pass(busMigrationFailed, 1)
+	if got := busMigrationFailedActions(m.agent); !strings.Contains(got, "recreated empty") || strings.Contains(got, "keep their data") {
+		t.Errorf("given-up actions %q, want streams recreated empty", got)
 	}
 }

@@ -77,6 +77,11 @@ another `busReplicas` change while one runs.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.
+- **A run of a leg this operator does not run** (one a later release started, found after a
+  rollback) is held where it is: nothing advances, the freeze and the provision hold stay, and
+  the bus keeps its count, until the operator that started it is back or a person gives it up
+  with the same abandon annotation. It is never retried. `Reshape` is reserved in the leg enum
+  for such a leg (amended 11/19).
 
 **Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
 The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
