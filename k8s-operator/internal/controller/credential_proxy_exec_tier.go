@@ -177,10 +177,14 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	credentialProxyStandbyEnv:            true,
 	credentialProxyControlFileEnv:        true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
-	// allowed callers, the A2A gateway among them while Chat is armed, and
+	// allowed callers, the A2A gateway among them on every install, and
 	// the binding is what holds that account to the a2a-chat audience. The
 	// exec tier confers no a2a-chat role, so there it is refused every
 	// audience. The value changes only when the allowed callers do (#6090).
+	// The A2A report reader's audience: the store routes are the stateful
+	// broker's, so an exec pod confers no a2a-reports role. Its callers
+	// binding stays, holding the gateway's account to its own audiences.
+	credentialProxyA2AReportsAudienceEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

@@ -4207,7 +4207,8 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicyWithFQDN(ctx context.Con
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
 	if skipFQDNReconcile {
-		// On a cold-start metadata timeout with no prior resolved universe, leave
+		// On a cold-start metadata timeout with no prior resolved universe, or
+		// with a prior value the validators refuse, leave
 		// any existing FQDNNetworkPolicy untouched rather than rendering default
 		// commercial domains or deleting a previously applied sovereign policy.
 		// Probe CRD presence via List (not Get, because isCRDNotInstalledError treats

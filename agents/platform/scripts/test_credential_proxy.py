@@ -13909,16 +13909,14 @@ class A2AChatCallerBindingTest(unittest.TestCase):
                     self._authenticator()._principal_from(self._review(caller, self.A2A_CHAT))
 
     def test_the_a2a_gateway_presenting_another_audience_is_refused(self):
-        # The intent the a2a-reports role (#6098) must keep when it lands
-        # beside this: the A2A gateway's ServiceAccount is admitted on the
-        # a2a-chat audience (and, with #6098, a2a-reports) and refused on every
-        # other one. Whichever change merges second widens this binding's
-        # reverse rule to both roles; #6098's "gateway presenting a2a-reports
-        # is admitted" test fails until it does.
+        # The A2A gateway's ServiceAccount is admitted on the a2a-chat
+        # audience and the a2a-reports one (#6098), and refused on every
+        # other one.
         for audience in (self.SHELL, self.CHAT):
             with self.subTest(audience=audience):
                 with self.assertRaisesRegex(
-                    credential_proxy.AuthenticationError, "only the a2a-chat audience"
+                    credential_proxy.AuthenticationError,
+                    "only the a2a-chat or a2a-reports audience",
                 ):
                     self._authenticator()._principal_from(
                         self._review(self.A2A_GATEWAY_SA, audience)
@@ -21249,6 +21247,42 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertTrue(relay.settle(receipt, acknowledge=True))
         # Settle again is False because receipt is deleted
         self.assertFalse(relay.settle(receipt, acknowledge=True))
+
+    def test_teams_pull_failure_is_counted_and_answers_503(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/chat/teams/events"
+        handler._authenticated = lambda: object()
+        handler.metrics = mock.Mock()
+        captured = {}
+        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        def pull():
+            raise RuntimeError("queue gone")
+
+        handler.teams_relay = types.SimpleNamespace(pull=pull)
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            handler.do_GET()
+
+        self.assertEqual(captured["status"], HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(captured["payload"], {"error": "Teams event pull failed"})
+        handler.metrics.record_failure.assert_called_once_with(
+            credential_proxy.BROKER_FAILURE_CHAT_PULL_FAILED
+        )
+
+    def test_teams_upstream_error_reads_a_json_null_as_absent(self):
+        import io
+
+        def converted(status, answer):
+            body = json.dumps(answer).encode("utf-8")
+            err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/", status, "x", {}, io.BytesIO(body))
+            return credential_proxy._teams_upstream_error(err)
+
+        bot = converted(400, {"error": {"code": None, "message": "boom"}})
+        self.assertEqual(str(bot), "HTTP 400: boom")
+        self.assertEqual(bot.fields, {"status": 400, "code": "", "message": "boom"})
+        entra = converted(401, {"error": "invalid_client", "error_description": None})
+        self.assertEqual(str(entra), "HTTP 401: invalid_client")
+        self.assertEqual(entra.fields["message"], "")
 
     def test_teams_relay_token_acquisition_and_caching(self):
         relay = TeamsRelay(

@@ -445,6 +445,27 @@ class ReplayLaneResolveTest(unittest.TestCase):
         self.assertIn("EVAL_REPLAY_LANE=true", err)
 
 
+class EvalRunTagsHelmArgsTest(unittest.TestCase):
+    """eval_run_tags_helm_args: the tag switch rides the proxy, and EVAL_RUN_TAGS=false turns it off alone."""
+
+    def _args(self, **env):
+        script = ("set -euo pipefail\n" + _lifted("eval_run_tags_helm_args", constants=False)
+                  + "eval_run_tags_helm_args\n"
+                  + 'for a in ${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
+        proc = subprocess.run([shutil.which("bash"), "-c", script], env={"PATH": os.environ.get("PATH", ""), **env},
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line.split("=", 1)[1] for line in proc.stdout.splitlines()]
+
+    def test_on_with_the_proxy(self):
+        self.assertEqual(self._args(REPLAY_SHADOW_ACTIVE="true"), ["--set", "platformAgent.deployment.evalRunTags=true"])
+
+    def test_off_without_the_proxy_or_when_turned_off(self):
+        for env in ({}, {"REPLAY_SHADOW_ACTIVE": "false"}, {"REPLAY_SHADOW_ACTIVE": "true", "EVAL_RUN_TAGS": "false"}):
+            with self.subTest(**env):
+                self.assertEqual(self._args(**env), [])
+
+
 class HelmArgsTest(unittest.TestCase):
     def _args(self, **overrides):
         script = ("set -euo pipefail\n" + _lifted(*_RESOLVE, "replay_shadow_helm_args")
@@ -523,6 +544,9 @@ class DeployWiringTest(unittest.TestCase):
         install = self.text[self.text.index('helm upgrade --install "${HELM_RELEASE_NAME}"'):]
         install = install[: install.index("--wait --timeout 15m")]
         self.assertIn('${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}', install)
+        self.assertIn('${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}', install)
+        self.assertLess(self.text.index('  replay_shadow_helm_args "${AR_REPO}'),
+                        self.text.index("\neval_run_tags_helm_args\n"))
         # No later upgrade, so nothing can drop the values.
         self.assertEqual(len(re.findall(r"^\s*[^#\n]*\bhelm upgrade\b", self.text, re.MULTILINE)), 1)
 

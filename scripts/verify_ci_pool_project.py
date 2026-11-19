@@ -604,6 +604,7 @@ GITOPS_INTENT_NOTE_CASES = (
     "patch-declared-intent-no-finding",
     "cost-declared-intent-no-finding",
     "stockout-declared-intent-no-finding",
+    "compute-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
@@ -612,6 +613,7 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
     ("stockout-prevention", {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/declared-zonal-pool"}),
+    ("gce-compute-fleet-audit", {"check": "orphaned-snapshots", "namespace": "", "object": "Snapshot/declared-orphan-snap-seeded"}),
 )
 # The key the audit's index (collect.py workload_declarations) must hold for
 # the seeded file: cluster off the path's second segment, then kind, namespace

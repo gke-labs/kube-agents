@@ -217,7 +217,7 @@ SCHEMA_SOURCE = SchemaSource(
     module="agents/platform/scripts/session_kv_server.py",
     db_path_attr="SESSION_KV_DB_PATH",
     init_function="init_db",
-    extra_ddl_attrs=("KANBAN_TASK_ORIGINS_SCHEMA",),
+    extra_ddl_attrs=("KANBAN_TASK_ORIGINS_SCHEMA", "SESSION_EVAL_RUNS_SCHEMA"),
 )
 SCHEMA_DB_FILENAME = "schema.db"
 

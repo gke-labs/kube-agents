@@ -1600,7 +1600,9 @@ class FleetTreeTest(unittest.TestCase):
         # A new file kind tofu would read (a tfvars file, a templatefile
         # source) belongs in the inputs and in the postsubmit's trigger: a
         # stranger here is a decision to make, so its arrival is red.
-        bystanders = {"README.md", "fixtures.json"}
+        # config_sync.py: a writer script no stack resource runs yet, so it is
+        # not an input and a change to it reaches no project.
+        bystanders = {"README.md", "fixtures.json", "config_sync.py"}
         # -z, as the script's ls-tree: an unquoted name per entry, so a
         # non-ASCII or space-bearing input is read as the input it is.
         # The scrub nulls the config scopes git reads safe.directory from, and
