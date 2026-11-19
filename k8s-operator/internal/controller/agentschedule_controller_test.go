@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -386,6 +387,56 @@ func TestAgentScheduleARateLimitedSlotIsCountedNotRetried(t *testing.T) {
 	s := f.get(t)
 	if s.Status.SkipCounts.RateLimited != 1 || s.Status.PendingSlot != nil || res.RequeueAfter == agentScheduleRetry {
 		t.Fatalf("status = %+v, requeue = %s", s.Status, res.RequeueAfter)
+	}
+}
+
+// A refusal of the submission itself (here tier_not_allowed) drops the slot
+// at once, without retrying it inside the starting deadline or counting it as
+// an outage, and says so on the Submitted condition. The next slot tries
+// again, and a run the gateway takes sets the condition back to True.
+func TestAgentScheduleARefusedSubmissionIsShownNotRetried(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.gw.err = fmt.Errorf("%w (tier_not_allowed): the profile does not allow unattended", errTriggerRefused)
+	f.at(t, hourAt(0, 45))
+	res := f.at(t, hourAt(1, 0))
+	s := f.get(t)
+	if len(f.gw.sends) != 1 || s.Status.PendingSlot != nil || res.RequeueAfter == agentScheduleRetry {
+		t.Fatalf("sends = %v, status = %+v, requeue = %s", f.gw.sends, s.Status, res.RequeueAfter)
+	}
+	if s.Status.SkipCounts.GatewayUnavailable != 0 || !s.Status.NextScheduleTime.UTC().Equal(hourAt(2, 0)) {
+		t.Fatalf("a refusal was counted as an outage or held the slot: %+v", s.Status)
+	}
+	c := meta.FindStatusCondition(s.Status.Conditions, agentv1alpha1.AgentScheduleConditionSubmitted)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonGatewayRefused || !strings.Contains(c.Message, "tier_not_allowed") {
+		t.Fatalf("Submitted = %+v", c)
+	}
+	f.at(t, hourAt(1, 10))
+	if len(f.gw.sends) != 1 {
+		t.Fatalf("the refused slot was sent again: %v", f.gw.sends)
+	}
+	f.gw.err = nil
+	f.at(t, hourAt(2, 0))
+	s = f.get(t)
+	c = meta.FindStatusCondition(s.Status.Conditions, agentv1alpha1.AgentScheduleConditionSubmitted)
+	if len(f.gw.sends) != 2 || s.Status.ActiveTaskID == "" || c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("the next slot: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+}
+
+// A name the run's trigger can't carry (a dot, or past 63 characters) reads
+// Accepted=False and fires nothing, rather than being refused at every slot.
+func TestAgentScheduleANameTheTriggerCantCarryIsNotAccepted(t *testing.T) {
+	for _, name := range []string{"team.a.nightly", strings.Repeat("a", 64)} {
+		f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Name = name })
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		if len(f.gw.sends) != 0 {
+			t.Fatalf("%s: submitted %v", name, f.gw.sends)
+		}
+		c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonInvalidName {
+			t.Fatalf("%s: Accepted = %+v", name, c)
+		}
 	}
 }
 

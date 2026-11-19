@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -417,9 +416,9 @@ const (
 )
 
 // a2aAgentSchedulesEnabled reports whether the operator runs the
-// AgentSchedule reconciler (A2A_AGENT_SCHEDULES=true, the check cmd/main.go
+// AgentSchedule reconciler (AgentSchedulesEnabled, the check cmd/main.go
 // registers it on), and so holds the schedule source's trigger grants.
-func a2aAgentSchedulesEnabled() bool { return os.Getenv(AgentSchedulesEnvVar) == "true" }
+func a2aAgentSchedulesEnabled() bool { return AgentSchedulesEnabled() }
 
 // a2aProfileSupervisorPrefix and a2aProfileSupervisorSuffix spell a profile's
 // supervisor subjects, a2a.tasks.<profile>.*.supervisor: where the dispatcher
@@ -499,13 +498,6 @@ func operatorIdentity() (a2aIdentity, bool) {
 		},
 		subscribe: []string{"_INBOX." + a2aOperatorBusUser + ".>"},
 	}
-	// With a dispatcher, the operator also makes and removes the profiles'
-	// shared durables on PROFILE_SUBMITS (agentprofile_durables.go), and it
-	// is the only principal that can: nothing else holds a consumer verb on
-	// that stream, so no one else can pull a profile's submissions or edit
-	// its durable. Create carries the durable's filter in its subject, so it
-	// is held to submission subjects. INFO and DELETE carry only the name;
-	// the operator deletes only consumers carrying its held-delivery mark.
 	// With schedules on (A2A_AGENT_SCHEDULES, the switch that registers the
 	// AgentSchedule reconciler), the operator is the schedule source on
 	// attested trigger ingress (#5617): it submits a due run and asks
@@ -515,6 +507,13 @@ func operatorIdentity() (a2aIdentity, bool) {
 		id.publish = append(id.publish, a2aTriggerScheduleSubmit, a2aTriggerScheduleStatus)
 		id.subscribe = append(id.subscribe, a2aTriggerScheduleReplies)
 	}
+	// With a dispatcher, the operator also makes and removes the profiles'
+	// shared durables on PROFILE_SUBMITS (agentprofile_durables.go), and it
+	// is the only principal that can: nothing else holds a consumer verb on
+	// that stream, so no one else can pull a profile's submissions or edit
+	// its durable. Create carries the durable's filter in its subject, so it
+	// is held to submission subjects. INFO and DELETE carry only the name;
+	// the operator deletes only consumers carrying its held-delivery mark.
 	if a2aDispatcherEnabled() {
 		id.publish = append(id.publish,
 			"$JS.API.CONSUMER.CREATE."+a2aProfileSubmitStream+".*."+a2aProfileSubmitPrefix+"*.*.*.*",

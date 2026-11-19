@@ -689,7 +689,7 @@ func AgentScheduleAccessDenied(c *RBACChecker) []string {
 	}
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
-		if (tuple.resource == "agentschedules" || tuple.resource == "agentschedules/status") && slices.Contains(denied, tuple.label) {
+		if tuple.resource == "agentschedules" && slices.Contains(denied, tuple.label) {
 			out = append(out, tuple.label)
 		}
 	}

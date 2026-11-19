@@ -37,6 +37,10 @@ const (
 	// AgentScheduleConditionAccepted reports whether the schedule parses and
 	// its profile allows the unattended tier.
 	AgentScheduleConditionAccepted = "Accepted"
+	// AgentScheduleConditionSubmitted reports how the gateway answered the
+	// schedule's last submission: True once it took a run, False when it
+	// refused one (the reason and the gateway's detail in the message).
+	AgentScheduleConditionSubmitted = "Submitted"
 
 	// AgentScheduleConcurrencyForbid is the one concurrency policy: a run
 	// never starts while the last one is still going.

@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -68,6 +69,17 @@ const (
 	// #5635): which identity the gateway resolves a creator's tier from is
 	// open, so none fires, and the gateway refuses origin user anyway.
 	agentScheduleReasonUserDeferred = "UserSchedulesDeferred"
+	// agentScheduleReasonInvalidName: a name the run's trigger can't carry.
+	// The trigger name is schedule/<name>, and the gateway holds <name> to a
+	// dot-free DNS-1123 label, so any other name would be refused at every
+	// slot.
+	agentScheduleReasonInvalidName = "InvalidName"
+)
+
+// The Submitted condition's reasons.
+const (
+	agentScheduleReasonSubmitted      = "RunSubmitted"
+	agentScheduleReasonGatewayRefused = "GatewayRefused"
 )
 
 const (
@@ -141,6 +153,7 @@ const (
 	agentScheduleSkipMissedWindow       = "missed_window"
 	agentScheduleSkipGatewayUnavailable = "gateway_unavailable"
 	agentScheduleSkipRateLimited        = "rate_limited"
+	agentScheduleSkipRefused            = "refused"
 	agentScheduleRunSubmitted           = "submitted"
 )
 
@@ -312,6 +325,12 @@ func (r *AgentScheduleReconciler) accept(ctx context.Context, sched *agentv1alph
 	if perr != nil {
 		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonInvalidSchedule
 		cond.Message = fmt.Sprintf("schedule %q does not parse: %v", sched.Spec.Schedule, perr)
+		meta.SetStatusCondition(&sched.Status.Conditions, cond)
+		return nil, nil, false, nil
+	}
+	if errs := validation.IsDNS1123Label(sched.Name); len(errs) > 0 {
+		cond.Status, cond.Reason = metav1.ConditionFalse, agentScheduleReasonInvalidName
+		cond.Message = fmt.Sprintf("the name must be a dot-free DNS-1123 label, since the run's trigger is schedule/<name>: %s", strings.Join(errs, "; "))
 		meta.SetStatusCondition(&sched.Status.Conditions, cond)
 		return nil, nil, false, nil
 	}
@@ -602,10 +621,27 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 			st.NextScheduleTime = ptrTime(cronSched.Next(now))
 		}
 		pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, agentScheduleRunSubmitted))
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+			Type: agentv1alpha1.AgentScheduleConditionSubmitted, Status: metav1.ConditionTrue,
+			Reason: agentScheduleReasonSubmitted, Message: "the gateway took the last run", ObservedGeneration: sched.Generation,
+		})
 		st.PendingSlot = nil
 		return false, nil
 	case errors.Is(err, ErrScheduleRateLimited):
 		r.skip(pass, sched, agentScheduleSkipRateLimited, &st.SkipCounts.RateLimited)
+		r.dropPending(sched, cronSched, now)
+		return false, nil
+	case errors.Is(err, errTriggerRefused):
+		// The gateway refused the submission itself (invalid,
+		// profile_unknown, tier_not_allowed): sending it again won't help, so
+		// the slot is dropped at once and the refusal is shown. The next slot
+		// tries again, since a profile still being published can clear.
+		logf.FromContext(ctx).Error(err, "the gateway refused a scheduled run", "schedule", sched.Name, "key", p.IdempotencyKey)
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+			Type: agentv1alpha1.AgentScheduleConditionSubmitted, Status: metav1.ConditionFalse,
+			Reason: agentScheduleReasonGatewayRefused, Message: agentScheduleRefusalMessage(err), ObservedGeneration: sched.Generation,
+		})
+		pass.count(agentScheduleSkipsTotal.WithLabelValues(sched.Name, agentScheduleSkipRefused))
 		r.dropPending(sched, cronSched, now)
 		return false, nil
 	default:
@@ -628,6 +664,21 @@ func (r *AgentScheduleReconciler) submitPending(ctx context.Context, sched *agen
 		}
 		return true, nil
 	}
+}
+
+// agentScheduleRefusalMaxRunes bounds the refusal shown on the Submitted
+// condition: the gateway's detail is its own text, and a condition message
+// has to fit the API server's limit.
+const agentScheduleRefusalMaxRunes = 1024
+
+// agentScheduleRefusalMessage is a refusal as the Submitted condition shows
+// it.
+func agentScheduleRefusalMessage(err error) string {
+	msg := []rune(err.Error())
+	if len(msg) > agentScheduleRefusalMaxRunes {
+		return string(msg[:agentScheduleRefusalMaxRunes]) + "…"
+	}
+	return string(msg)
 }
 
 // dropPending abandons the claimed slot: a run-now token is marked handled,

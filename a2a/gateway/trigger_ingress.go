@@ -31,8 +31,8 @@ import (
 // the trigger's own conversation, publishes the submission on the profile's
 // unattended intake, and answers with the task's id or a refusal.
 //
-// It ships dark: until the callout grants a source publish on the subject
-// (#5617's second pull request), nothing can reach it.
+// Only a source the callout grants publish on the subject can reach it: the
+// operator, as the schedule source, while A2A_AGENT_SCHEDULES is on (#5617).
 
 const (
 	// triggerSubmitWildcard is every source's submission subject.

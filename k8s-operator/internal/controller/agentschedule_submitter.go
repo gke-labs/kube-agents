@@ -269,8 +269,8 @@ func scheduleDeliveryFor(sched *agentv1alpha1.AgentSchedule) scheduleDeliveryWir
 // cut to 63 characters, with no hyphen left at either end.
 func foldToLabel(name string) string {
 	s := strings.ReplaceAll(strings.ToLower(name), ".", "-")
-	if len(s) > 63 {
-		s = s[:63]
+	if len(s) > maxLabelValueLength {
+		s = s[:maxLabelValueLength]
 	}
 	return strings.Trim(s, "-")
 }
