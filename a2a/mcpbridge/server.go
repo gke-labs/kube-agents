@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -134,6 +135,65 @@ type CallMeta struct {
 	ConversationID string
 	ArtifactsDir   string
 	Raw            map[string]any
+	// StepStreaming is the bridge's step-streaming setting, which the tools/call handler copies
+	// in. It is never read from the host's _meta.
+	StepStreaming StepStreaming
+}
+
+// StepStreaming says whether the bridge asks the install for step windows (stream_steps) on
+// send_message and task_control, and wraps their results in the _custom_tool_result envelope.
+// Only a host that follows the window's continuation (call task_control get until the task
+// ends) can use them; any other host sees a running task and never its answer.
+type StepStreaming string
+
+const (
+	// StepStreamingAuto streams for a host that sends _meta.conversation_id, which the
+	// Antigravity editor does, and wraps results for a host that sends conversation_id or a
+	// progress token. It is the default.
+	StepStreamingAuto StepStreaming = "auto"
+	// StepStreamingOn streams and wraps results for every host.
+	StepStreamingOn StepStreaming = "on"
+	// StepStreamingOff never streams: send_message and task_control carry stream_steps false
+	// and return one plain answer, even when the host sends conversation_id.
+	StepStreamingOff StepStreaming = "off"
+)
+
+// EnvStreamSteps sets the bridge's StepStreaming; the --stream-steps flag overrides it.
+const EnvStreamSteps = "KUBE_AGENTS_MCP_STREAM_STEPS"
+
+// ParseStepStreaming reads auto, on or off (any case, surrounding space ignored); empty is auto.
+func ParseStepStreaming(v string) (StepStreaming, error) {
+	switch m := StepStreaming(strings.ToLower(strings.TrimSpace(v))); m {
+	case "":
+		return StepStreamingAuto, nil
+	case StepStreamingAuto, StepStreamingOn, StepStreamingOff:
+		return m, nil
+	}
+	return "", fmt.Errorf("step streaming %q: want auto, on or off", v)
+}
+
+// streamSteps returns the stream_steps value the bridge adds to a send_message or task_control
+// call that names none, and false when it adds none.
+func (m CallMeta) streamSteps() (value, inject bool) {
+	switch m.StepStreaming {
+	case StepStreamingOn:
+		return true, true
+	case StepStreamingOff:
+		return false, true
+	}
+	return true, m.ConversationID != ""
+}
+
+// wrapsResults reports whether a titled result goes back to the host in the
+// _custom_tool_result envelope rather than as plain text.
+func (m CallMeta) wrapsResults() bool {
+	switch m.StepStreaming {
+	case StepStreamingOn:
+		return true
+	case StepStreamingOff:
+		return false
+	}
+	return m.ConversationID != "" || m.ProgressToken != nil
 }
 
 // UnmarshalJSON decodes _meta fields from standard and vendor-namespaced keys.
@@ -185,6 +245,8 @@ type ServerOptions struct {
 	Runner     CommandRunner
 	APIBaseURL string
 	Host       HostIntegration
+	// StepStreaming is the bridge's step-streaming setting; empty is StepStreamingAuto.
+	StepStreaming StepStreaming
 }
 
 type gatewayBridgeSession struct {
@@ -397,10 +459,10 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	} else if onProgress != nil {
 		metaMap["progressToken"] = "bridge-progress"
 	}
-	if meta.ConversationID != "" && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
+	if value, inject := meta.streamSteps(); inject && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
 		if m, ok := argsAny.(map[string]any); ok {
 			if _, has := m["stream_steps"]; !has {
-				m["stream_steps"] = true
+				m["stream_steps"] = value
 			}
 		}
 	}
@@ -565,6 +627,8 @@ type Server struct {
 	runner     CommandRunner
 	apiBaseURL string
 	host       HostIntegration
+	// stepStreaming is never empty: NewServer turns an empty setting into StepStreamingAuto.
+	stepStreaming StepStreaming
 
 	mu        sync.Mutex
 	connectMu sync.Mutex
@@ -648,7 +712,12 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if cluster == nil {
 		cluster = noClusterAccess{}
 	}
+	stepStreaming, err := ParseStepStreaming(string(opts.StepStreaming))
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
+		stepStreaming:        stepStreaming,
 		store:                store,
 		cluster:              cluster,
 		runner:               opts.Runner,
@@ -876,12 +945,20 @@ func RunCLIWithOptions(args []string, opts ServerOptions) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to persistent MCP configuration file (default: ~/.config/kube-agents/mcp-config.json)")
 	versionMode := fs.Bool("version", false, "print kube-agents-mcp version and exit")
+	streamSteps := fs.String("stream-steps", os.Getenv(EnvStreamSteps), "step streaming: auto (stream for hosts that send _meta.conversation_id), on, or off (one plain answer per call); default $"+EnvStreamSteps+" or auto")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *versionMode || (fs.NArg() > 0 && fs.Arg(0) == "version") {
 		fmt.Printf("%s %s\n", mcpServerName, mcpServerVersion)
 		return nil
+	}
+	if opts.StepStreaming == "" {
+		mode, err := ParseStepStreaming(*streamSteps)
+		if err != nil {
+			return err
+		}
+		opts.StepStreaming = mode
 	}
 	if opts.Store == nil {
 		store, err := NewConfigStore(*configPath)
@@ -1012,8 +1089,20 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 		protoVer := defaultMCPProtocolVersion
 		var initParams struct {
 			ProtocolVersion string `json:"protocolVersion"`
+			ClientInfo      struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"clientInfo"`
+			Capabilities map[string]json.RawMessage `json:"capabilities"`
 		}
-		if len(req.Params) > 0 && json.Unmarshal(req.Params, &initParams) == nil && initParams.ProtocolVersion != "" {
+		parsed := len(req.Params) > 0 && json.Unmarshal(req.Params, &initParams) == nil
+		if parsed {
+			// One line per session naming the host, so a host that needs its own step-streaming
+			// default can be told apart from the others it currently looks like.
+			slog.Info("mcp client", "name", initParams.ClientInfo.Name, "version", initParams.ClientInfo.Version,
+				"capabilities", slices.Sorted(maps.Keys(initParams.Capabilities)), "stepStreaming", string(s.stepStreaming))
+		}
+		if parsed && initParams.ProtocolVersion != "" {
 			supported := mcpproto.SupportedProtocolVersions()
 			if slices.Contains(supported, initParams.ProtocolVersion) {
 				protoVer = initParams.ProtocolVersion
@@ -1047,6 +1136,7 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 		if err := json.Unmarshal(req.Params, &callParams); err != nil || callParams.Name == "" {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, "tools/call requires tool name")
 		}
+		callParams.Meta.StepStreaming = s.stepStreaming
 		if s.host != nil {
 			s.host.OnBeforeToolCall(ctx, s, callParams.Name, callParams.Arguments, callParams.Meta)
 		}
@@ -1058,7 +1148,7 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 			})
 		}
 		res := s.CallTool(callCtx, callParams.Name, callParams.Arguments)
-		if !res.IsError && len(res.Content) > 0 && (res.CustomTitle != "" || res.CustomMarkdown != "") && (callParams.Meta.ConversationID != "" || callParams.Meta.ProgressToken != nil) {
+		if !res.IsError && len(res.Content) > 0 && (res.CustomTitle != "" || res.CustomMarkdown != "") && callParams.Meta.wrapsResults() {
 			txt := res.Content[0].Text
 			md := txt
 			if res.CustomMarkdown != "" {
