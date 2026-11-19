@@ -18,12 +18,16 @@ server directly; the operator picks them. A review that fails is a 503 rather th
 
 `jwtauth.NewAuthenticator` (`pkg/jwtauth`) is for an embedder whose platform mints a signed token
 per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
-JWT that names its key (`kid`), verifies against the issuer's JSON Web Key Set (RS256 or ES256;
-never a symmetric algorithm), and carries the configured issuer, one of the configured audiences,
-and an expiry it has not passed. The username and groups come from configurable claims (`sub` by
-default), and an optional `Allow` func can refuse a caller. The key set is cached for an hour and
-fetched again, at most every ten seconds, when a token names a key it lacks, so a rotated key
-works without a restart. A key set that cannot be fetched for an unknown key is a 503.
+JWT that names its key (`kid`), verifies against the issuer's JSON Web Key Set fetched over HTTPS
+(RS\*, PS\* or ES\*; never a symmetric algorithm), and carries the configured issuer, one of the
+configured audiences, and an expiry it has not passed by more than a minute of clock skew. The
+username and groups come from configurable claims (`sub` by default). An optional `Allow` func
+can refuse a caller; without one, every token the issuer mints for that audience is admitted. The
+key set is cached for an hour and fetched again when a token names a key it lacks, at most every
+ten seconds whether or not the fetch succeeds, so a rotated key works without a restart. Keys the
+library cannot use (an unsupported type, an encryption key) are skipped. A key set that cannot be
+fetched is a 503, except that a key already cached keeps verifying for up to six hours past the
+set's expiry.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other

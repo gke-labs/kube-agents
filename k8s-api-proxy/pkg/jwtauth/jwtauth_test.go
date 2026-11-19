@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -43,6 +44,7 @@ type issuer struct {
 	mu     sync.Mutex
 	keys   map[string]any // kid -> private key
 	public jose.JSONWebKeySet
+	extra  []json.RawMessage // published as they are, after the public keys
 	down   atomic.Bool
 	served atomic.Int32
 	srv    *httptest.Server
@@ -51,7 +53,7 @@ type issuer struct {
 func newIssuer(t *testing.T) *issuer {
 	t.Helper()
 	is := &issuer{t: t, keys: map[string]any{}}
-	is.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	is.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		is.served.Add(1)
 		if is.down.Load() {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -59,8 +61,18 @@ func newIssuer(t *testing.T) *issuer {
 		}
 		is.mu.Lock()
 		defer is.mu.Unlock()
+		keys := make([]json.RawMessage, 0, len(is.public.Keys)+len(is.extra))
+		for _, k := range is.public.Keys {
+			b, err := json.Marshal(k)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			keys = append(keys, b)
+		}
+		keys = append(keys, is.extra...)
 		w.Header().Set("Content-Type", contentJSON)
-		_ = json.NewEncoder(w).Encode(is.public)
+		_ = json.NewEncoder(w).Encode(map[string][]json.RawMessage{"keys": keys})
 	}))
 	t.Cleanup(is.srv.Close)
 	is.addRSA(testKeyID)
@@ -90,6 +102,13 @@ func (is *issuer) add(kid string, private, public any, alg jose.SignatureAlgorit
 	defer is.mu.Unlock()
 	is.keys[kid] = private
 	is.public.Keys = append(is.public.Keys, jose.JSONWebKey{Key: public, KeyID: kid, Algorithm: string(alg), Use: "sig"})
+}
+
+// publishRaw adds a key set entry exactly as given, such as one the library cannot parse.
+func (is *issuer) publishRaw(entry string) {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	is.extra = append(is.extra, json.RawMessage(entry))
 }
 
 // sign returns a token signed with kid's key and naming kid; mutate edits the claims first.
@@ -131,10 +150,11 @@ func (is *issuer) signWith(kid string, nameKid bool, alg jose.SignatureAlgorithm
 
 func (is *issuer) config() Config {
 	return Config{
-		Issuer:    testIssuer,
-		KeySetURL: is.srv.URL,
-		Audiences: []string{testAudience},
-		Now:       func() time.Time { return testNow },
+		Issuer:     testIssuer,
+		KeySetURL:  is.srv.URL,
+		Audiences:  []string{testAudience},
+		HTTPClient: is.srv.Client(),
+		Now:        func() time.Time { return testNow },
 	}
 }
 
@@ -247,13 +267,16 @@ func TestAuthenticatorRefusesAnInvalidToken(t *testing.T) {
 	}
 }
 
-// A token signed with an HMAC key over the public key's bytes (the classic algorithm
-// confusion attack) is refused, because HS256 is never an accepted algorithm.
-func TestAuthenticatorRefusesASymmetricToken(t *testing.T) {
+// An issuer that also publishes a symmetric (oct) key cannot be used for an HMAC token
+// signed with it: HS256 is never an accepted algorithm, and symmetric keys are dropped from
+// the key set.
+func TestAuthenticatorRefusesAnHMACToken(t *testing.T) {
 	is := newIssuer(t)
+	secret := []byte("shared-secret-of-sufficient-length!")
+	is.publishRaw(`{"kty":"oct","kid":"hmac","k":"` + base64.RawURLEncoding.EncodeToString(secret) + `"}`)
 	a := newAuth(t, is.config())
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: []byte("shared-secret-of-sufficient-length!")},
-		(&jose.SignerOptions{}).WithHeader(jose.HeaderKey("kid"), testKeyID))
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: secret},
+		(&jose.SignerOptions{}).WithHeader(jose.HeaderKey("kid"), "hmac"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,6 +289,35 @@ func TestAuthenticatorRefusesASymmetricToken(t *testing.T) {
 	}
 	if id, err := a.AuthenticateRequest(bearer(token)); err == nil {
 		t.Fatalf("HS256 token accepted as %+v", id)
+	}
+}
+
+// A key set entry the library cannot parse, or one meant for encryption, is skipped; the
+// rest of the set still verifies tokens.
+func TestAuthenticatorSkipsUnusableKeys(t *testing.T) {
+	is := newIssuer(t)
+	is.publishRaw(`{"kty":"AKP","kid":"pq-1","alg":"ML-DSA-44","pub":"AAAA"}`)
+	is.publishRaw(`{"kty":"OKP","crv":"X25519","kid":"enc-1","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)
+	a := newAuth(t, is.config())
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatalf("valid token with unusable keys in the set: %v", err)
+	}
+}
+
+// Among keys published under one kid, the one fit for the token's algorithm and for
+// signing verifies it; an encryption key under the same kid is passed over.
+func TestAuthenticatorPicksTheSigningKeyUnderASharedKid(t *testing.T) {
+	is := newIssuer(t)
+	enc, err := rsa.GenerateKey(rand.Reader, testRSABits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	is.mu.Lock()
+	is.public.Keys = append([]jose.JSONWebKey{{Key: &enc.PublicKey, KeyID: testKeyID, Use: "enc"}}, is.public.Keys...)
+	is.mu.Unlock()
+	a := newAuth(t, is.config())
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Errorf("token signed by the signing key under a shared kid: %v", err)
 	}
 }
 
@@ -329,7 +381,7 @@ func TestAuthenticatorFetchesARotatedKey(t *testing.T) {
 	}
 
 	is.addEC("key-2")
-	clock = clock.Add(minKeySetRefetchInterval)
+	clock = clock.Add(minKeySetFetchInterval)
 	if _, err := a.AuthenticateRequest(bearer(is.sign("key-2", jose.ES256, func(c *jwt.Claims, _ map[string]any) {
 		c.IssuedAt = jwt.NewNumericDate(clock)
 	}))); err != nil {
@@ -341,7 +393,7 @@ func TestAuthenticatorFetchesARotatedKey(t *testing.T) {
 }
 
 // Tokens naming unknown keys cannot make the authenticator fetch the key set more than once
-// per minKeySetRefetchInterval.
+// per minKeySetFetchInterval.
 func TestAuthenticatorBoundsKeySetFetches(t *testing.T) {
 	is := newIssuer(t)
 	a := newAuth(t, is.config())
@@ -387,6 +439,73 @@ func TestAuthenticatorReportsAnUnreachableIssuer(t *testing.T) {
 		c.Expiry = jwt.NewNumericDate(clock.Add(testTokenTTL))
 	}))); err != nil {
 		t.Errorf("known key with the issuer down: %v", err)
+	}
+}
+
+// With the issuer down and nothing cached, a burst of tokens makes one fetch, not one each:
+// the rest are answered unavailable until the fetch interval passes.
+func TestAuthenticatorBoundsFetchesWhileTheIssuerIsDown(t *testing.T) {
+	is := newIssuer(t)
+	is.down.Store(true)
+	a := newAuth(t, is.config())
+	for range 20 {
+		_, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil)))
+		if !errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+			t.Fatalf("err = %v, want ErrAuthenticationUnavailable", err)
+		}
+	}
+	if got := is.served.Load(); got != 1 {
+		t.Errorf("key set fetched %d times for 20 tokens with the issuer down, want 1", got)
+	}
+}
+
+// A redirect off https is refused, so the key set cannot be fetched from a plain-text URL.
+func TestAuthenticatorRefusesAnInsecureRedirect(t *testing.T) {
+	is := newIssuer(t)
+	redirect := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://"+strings.TrimPrefix(is.srv.URL, "https://"), http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	cfg := is.config()
+	cfg.KeySetURL = redirect.URL
+	cfg.HTTPClient = redirect.Client()
+	a := newAuth(t, cfg)
+	_, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil)))
+	if !errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+		t.Errorf("err = %v, want ErrAuthenticationUnavailable after a redirect to http", err)
+	}
+	if got := is.served.Load(); got != 0 {
+		t.Errorf("issuer served %d plain-text fetches, want 0", got)
+	}
+}
+
+// A known key keeps verifying while the issuer is down, but not beyond maxStaleKeySet past
+// the set's TTL, so a key the issuer has removed stops working within a bounded time.
+func TestAuthenticatorBoundsAStaleKeySet(t *testing.T) {
+	is := newIssuer(t)
+	clock := testNow
+	cfg := is.config()
+	cfg.KeySetTTL = time.Minute
+	cfg.Now = func() time.Time { return clock }
+	a := newAuth(t, cfg)
+	tokenAt := func(at time.Time) string {
+		return is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) {
+			c.IssuedAt = jwt.NewNumericDate(at)
+			c.Expiry = jwt.NewNumericDate(at.Add(testTokenTTL))
+		})
+	}
+	if _, err := a.AuthenticateRequest(bearer(tokenAt(clock))); err != nil {
+		t.Fatalf("issuer up: %v", err)
+	}
+	is.down.Store(true)
+	clock = clock.Add(time.Minute + maxStaleKeySet - time.Minute)
+	if _, err := a.AuthenticateRequest(bearer(tokenAt(clock))); err != nil {
+		t.Errorf("known key within the stale bound: %v", err)
+	}
+	clock = clock.Add(2 * time.Minute)
+	_, err := a.AuthenticateRequest(bearer(tokenAt(clock)))
+	if !errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+		t.Errorf("past the stale bound: err = %v, want ErrAuthenticationUnavailable", err)
 	}
 }
 
