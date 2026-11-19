@@ -982,9 +982,9 @@ resource "google_compute_disk" "orphan_pd" {
 # `sourceDisk` names no live disk, that no snapshot schedule took, and that is
 # more than 90 full days old. Its own exclusion names a legal hold or a
 # compliance retention the collector cannot read, which is why the check is
-# proposed as the stream's one declarable posture: once it is, the pool
-# project's GitOps knowledge/ note declares `declared-orphan-snap-<prefix>`
-# on purpose and the audit lists it under Declared intent, while
+# the stream's one declarable posture: the pool project's GitOps knowledge/
+# note declares `declared-orphan-snap-<prefix>` on purpose and the audit
+# lists it under Declared intent, while
 # `orphan-snap-<prefix>`, undeclared, stays a finding beside it (the control
 # that shows a declaration moved one snapshot and not the check). Catalogue
 # roles: declared-orphan-snapshot and orphan-snapshot.

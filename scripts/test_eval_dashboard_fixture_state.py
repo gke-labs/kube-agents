@@ -62,7 +62,7 @@ _verifier = importlib.util.module_from_spec(_verifier_spec)
 _verifier_spec.loader.exec_module(_verifier)
 NOTE_PATH = _verifier.GITOPS_INTENT_NOTE_PATH
 SEEDED_NOTE_SHA = _verifier.gitops_seeded_blob_sha(NOTE_PATH)
-NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering"}
+NOTE_ROLES = {"declared-no-pdb-workload", "declared-token-workload", "declared-overrequest-workload", "declared-single-zone-pool", "declared-mtu-peering", "declared-orphan-snapshot"}
 
 
 def pool_repo(project: str) -> str:
