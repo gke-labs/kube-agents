@@ -34,9 +34,10 @@
 # declared-overrequest-workload) plus the repository declaration above.
 # Both objectives read the cost LEDGER, and a run whose only candidate is
 # the declared one is a clean run that writes no ledger body: some other
-# cost finding has to be in the same run. On a pool project the idle pool
-# (day 7) and the orphan disks (day 30) supply it, so on a fleet younger
-# than seven days the case cannot pass; that is the fleet's age, not a red.
+# cost finding has to be in the same run. On a pool project the
+# generated-name family in seeded-family supplies it from its first hour
+# (check 3.1 reads a pod that is older than one hour), and the idle pool
+# (day 7) and the orphan disks (day 30) after it.
 # Isolation class: read-only.
 # Eligible tier: presubmit once admitted; nightly from registration.
 id: cost-declared-intent-no-finding

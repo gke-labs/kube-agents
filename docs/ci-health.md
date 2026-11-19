@@ -195,8 +195,8 @@ harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
 not as the bot's guess), a forge outage (6+ forge repetitions,
 below, across 2+ pull requests among the runs that finished in the last 2
-hours: the evals repositories share one GitHub App installation and its
-hourly REST budget, so a second pull request already shows the fleet's
+hours: the evals repositories share one GitHub App installation per shard of ten projects (`hack/eval/ledger-reader-apps.txt`) and its
+hourly REST budget, so a second pull request already shows a shard's
 budget rather than one branch; it ranks below the storm and the ceiling,
 which lose the agent's run rather than its grading), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
@@ -1574,7 +1574,7 @@ roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours`
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). One assertion this job never makes: the five `declared-*` roles
+read failed). One assertion this job never makes: the `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
 credential for the pool repositories by design, so the state script leaves
 that assertion out, judges those roles on their cluster assertions (healthy,

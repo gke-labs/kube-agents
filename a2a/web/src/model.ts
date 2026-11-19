@@ -195,6 +195,14 @@ export interface ChatEntry {
   text: string;
   correlationId: string;
   taskId?: string;
+  /**
+   * On a notice relaying a card's report: the root task whose turn filed the
+   * card, which a reply under the report names (`ConsoleInFrame.replyTo`).
+   * Not `taskId`: that marks what a task produced, and the session view
+   * claims every entry carrying it for the task's executor; this line is the
+   * gateway's.
+   */
+  replyTo?: string;
   /** A sentence about the entry's delivery, shown under it. */
   note?: string;
   /** An answer's footer: the usage part the turn published ahead of it. */
@@ -1010,6 +1018,7 @@ export function reduce(state: UiState, event: BusEvent): UiState {
             session: GATEWAY_SESSION,
             text: event.frame.text,
             correlationId: event.conversation,
+            ...(event.frame.replyTo !== undefined ? { replyTo: event.frame.replyTo } : {}),
           },
         ],
       };

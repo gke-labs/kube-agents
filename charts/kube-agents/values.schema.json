@@ -1711,6 +1711,9 @@
               "minimum": 0,
               "maximum": 86400
             },
+            "evalRunTags": {
+              "type": "boolean"
+            },
             "credentialProxy": {
               "type": "object",
               "additionalProperties": false,

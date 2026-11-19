@@ -5406,7 +5406,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		// record and the provision Job that earned it still stand. Both go:
 		// the Job runs again now and recreates what is missing, empty, and
 		// Ready and the rendered bridge wait for it.
-		if busMigrationLeg(agent.Status.BusMigration.Leg) == busMigrationGrow {
+		if busMigrationLeg(agent.Status.BusMigration.Leg) != busMigrationShrink {
 			meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
 			if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
 				return err
@@ -5458,6 +5458,16 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		} else if err := r.startBusMigrationPersisted(ctx, agent, running, want); err != nil {
 			return err
 		}
+	}
+	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) && !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		// A run of a leg this operator does not run is held: the bus keeps
+		// the count it runs, and nothing advances.
+		r.holdUnknownBusMigrationLeg(agent)
+		if running == 0 {
+			running = int(agent.Status.BusReplicas)
+		}
+		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3, or what the last pass recorded
+		return nil
 	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
 		// A migration under way decides the count, whatever the field and
@@ -5584,7 +5594,13 @@ func busMigrationWouldStart(agent *agentv1alpha1.PlatformAgent, want int) bool {
 	// the count was asked back). A new one starts only when the field asks
 	// for a count other than the last run's target, or a person asks for
 	// another try at the same one by naming the last run: an edit to
-	// anything else, or a GitOps sync, starts nothing.
+	// anything else, or a GitOps sync, starts nothing. A run of a leg this
+	// operator does not run has no target it can read, so any count it is
+	// asked for starts one: reading it as a shrink would ignore a request
+	// for one server, without a word.
+	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		return true
+	}
 	return want != busMigrationTarget(run) || agent.Annotations[a2aBusMigrationStartAnnotation] == run.RunID
 }
 
@@ -6368,7 +6384,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // and nobody legitimate ever sees the admission failure.
 //
 // `pods` (not count/pods) is deliberate: it counts non-terminal pods only,
-// matching the gateway's LiveSessions denominator, so a finished worker
+// matching the gateway's session count (SessionPods), so a finished worker
 // awaiting sweep does not hold a slot. It is also the only key - a
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
@@ -7288,6 +7304,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	// The report reader's token and the broker's address, on every install
+	// (a2a_report_reader.go).
+	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
+	env = append(env, reportEnv...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))
@@ -7368,10 +7388,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), append(injectMounts, reportMounts...)...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), append(injectVolumes, reportVolumes...)...),
 				},
 			},
 		},

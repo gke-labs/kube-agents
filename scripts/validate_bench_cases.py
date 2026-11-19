@@ -527,6 +527,19 @@ FIXTURE_NOT_READY = {
         "read fails for a reason that is not the case's, and the blocked path is "
         "graded by the rule's unit tests on a recorded list"
     ),
+    # Needs the two orphaned-snapshot roles past their age gate: the GCE
+    # compute audit's 2.5 flags a snapshot only when
+    # (now - creationTimestamp).days > 90, and the timestamp is server-set,
+    # so the pool's snapshots of 2026-11-18 are invisible to the check until
+    # 2027-02-17. The entry goes in the pull request that moves the case to
+    # the nightly file on that date, once the fixture-state scan reads both
+    # roles ready on every pool project.
+    "compute-declared-intent-no-finding": (
+        "#1408: needs the declared-orphan-snapshot and orphan-snapshot roles past their "
+        "91-day age gate (bench/tf/fleet/fixtures.json ready_after_hours); the pool's "
+        "snapshots date from 2026-11-18, so the compute audit first sees them on "
+        "2027-02-17 and the case cannot be red or green before then"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in

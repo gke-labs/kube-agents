@@ -1140,9 +1140,57 @@ How `principal` gets established depends on the backend, and the three are not e
   otherwise the principal is the member id itself, `slack:<user_id>`, as Chat's is the
   email Google asserts. Never `profile.email` - whether that field is IdP-asserted or
   user-editable depends on workspace config we don't control.
-- **Discord:** a checked-in test mapping table from Discord user id to a test principal.
+- **Discord:** a hand-made test mapping table, mounted as a ConfigMap, from Discord user id to a test principal.
   Test-only, by construction: a Discord identity never maps to a real cloud principal,
   full stop.
+
+**The contract every ingress meets (stated once, 11/18).** Every ingress that takes a turn
+from a caller, the chat backends, the console and the doors, meets four conditions before
+the turn exists; the trigger ingress (`scheduling-on-profiles.md` §3) is an unattended
+source with a rule of its own, not a turn. The three bullets above, the door sections and
+each adapter section are instances of this rule:
+
+1. The sender is named by something the backend authenticated, never by the message:
+   Google's asserted email arriving over a topic only its Chat service may publish to;
+   Slack's immutable `user_id` on the bot's own Socket Mode connection; Discord's snowflake;
+   the console's NATS grant; the email Google's tokeninfo answers for the A2A door's
+   signed-in class. A field a sender can type or edit (a display name, a profile email the
+   workspace lets the user change, the `author` or `caller` a door request names) is not an
+   identity. A backend whose only sender field is one of those is the two doors' bearer
+   class, the inject door and the A2A door's static token: the token admits the call, the
+   door's own map at a prefixed key is the whole of verification, and its values are fenced
+   to `eval:` identities for that reason. Neither is an ingress for people.
+2. That subject resolves to exactly one principal by a rule the operator or the install
+   admin owns and the agent cannot write: the identity function where the subject already
+   is the principal (Google Chat, the A2A door's signed-in class); the member id, or the IdP
+   identity a mapping table joins it to (Slack); a hand-made test table mounted as a
+   ConfigMap (Discord); a map of the door's own at a prefixed key (the bearer class); a
+   constant (the console). The rule lives outside the agent's reach: environment or a map
+   the operator renders, or an admin-owned Secret or ConfigMap it mounts (the Slack adapter
+   section says who writes it); the A2A door's `A2A_DOOR_ALLOWED_USERS` is set by hand today.
+3. The gate is applied at ingress, to the subject the backend authenticated, before a task
+   is minted or a placeholder posted: an allowlist of subjects (Google Chat, Slack, the A2A
+   door's signed-in class) or the presence of a map entry (Discord, the bearer class). On
+   the chat backends an unlisted sender gets the once-per-sender notice and no turn, and an
+   empty list means what the CR's rule says, rendered as an explicit allow-all variable
+   beside it (`A2A_GCHAT_ALLOW_ALL_USERS`, `A2A_SLACK_ALLOW_ALL_USERS`) rather than inferred
+   at the gateway. An unmapped sender at a bearer door gets the same notice and a refusal on
+   every request. The A2A door's signed-in class has a list with no allow-all: empty admits
+   nobody, and the door answers an unlisted account 403 before any turn.
+4. The resolution rides the envelope, pseudonymized, for audit: `authority.requester`
+   carries `principal` and `subject`, HMAC-hashed under the install salt as the roster is,
+   beside the plaintext `backend` and `verifiedBy` names of the ingress and the mechanism
+   that checked it. One consumer reads it, the interim exception the authority header in
+   `a2a/gateway/authority.go` names: the hermes-bridge scopes personal memory by
+   `principal` and turns it off for the shared-credential backends it knows by `backend`
+   and `verifiedBy` (`hasSharedPrincipal` in `a2a/hermes-bridge/route.go`), so a new
+   backend whose credential is shared names itself there. No consumer authorizes a cluster
+   or GitHub action on it (next paragraph).
+
+"Can I bring my own chat platform" is answered by this list. An adapter supplies the
+backend-authenticated subject, the resolution rule and who owns it, the gate the operator
+configures for it, and the `verifiedBy` name; the gateway does the rest. A backend that
+cannot supply the first can only be a fenced door.
 
 **What advisory means, stated plainly:** the gateway verifies the requester at ingress,
 but nothing stops another bus client from publishing an envelope with an invented
@@ -2895,9 +2943,9 @@ the one every other writer here has.
 **Transport.** Core NATS, no stream. The browser publishes a frame -
 `{"messageId","text","kind"}`, `kind` defaulting to `text`, with an optional `addressee` and
 `parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles"), and an optional
-`replyTo`, the task a notify frame reported on, when the turn answers that report (sent by a
-console client such as the MCP server; the page sends none; the gateway puts it on the submission
-as a `replyTo` part, `spec-a2a-payloads.md`) - to
+`replyTo`, the task a notify frame reported on, when the turn answers that report (sent by the MCP
+server's `send_message(reply_to=)` and by the page's reply button; the gateway puts it on the
+submission as a `replyTo` part, `spec-a2a-payloads.md`, and the relayed report ahead of the turn) - to
 `chat.console.<token>.in`;
 the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
@@ -2929,7 +2977,10 @@ carrying the notice; a console client reads the child's answer from TASKS. A kan
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
 notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
 page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
-frame costs it nothing. It shows the notify frames, which it has no other source for. A card's
+frame costs it nothing. It shows the notify frames, which it has no other source for; one whose
+frame names its turn gets a reply button under the text, in a pane that can send, and the next
+typed turn after a click carries that `replyTo` on `.in`, so the agent's follow-up opens with the
+report. A card's
 report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
 subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
 keeps nothing, and the notifier answers the card as posted. This is a known limit of the

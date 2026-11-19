@@ -17,6 +17,13 @@ rather than a decoration:
 * a failing kubectl neither stops the sweep at the first kind nor changes
   the teardown's exit code.
 
+#6458 added a second cluster-scoped sweep under the A2A stack's label,
+part-of=a2a-next, for the auth callout's ClusterRoleBinding: the one
+cluster-scoped object the operator builds under that label, reaped by its
+deletion handler alone, which a CR whose finalizer the teardown released, or a
+run killed mid-install, never runs. The tests pin that it is swept, by that
+label, and that no other kind is swept under it.
+
 #1172 added the same sweep one scope down. Nothing else deletes a namespaced
 object the release stops accounting for: teardown never deletes the namespace,
 and owner-reference GC stops resolving owners once the PlatformAgent CRD goes.
@@ -96,6 +103,10 @@ _SWEPT_NAMESPACED_KINDS = (
 
 _NAMESPACE = "kubeagents-system"
 _SELECTOR = "app.kubernetes.io/part-of=kube-agents"
+# The A2A stack's label (a2aLabels in the operator), and the one cluster-scoped
+# kind it builds under it. Repeated here on purpose, as above.
+_A2A_SELECTOR = "app.kubernetes.io/part-of=a2a-next"
+_A2A_SWEPT_KINDS = ("clusterrolebindings.rbac.authorization.k8s.io",)
 # Step 2's fallback selects release records by Helm's own labels. Named here so
 # the sweep test can assert the two selectors never converge.
 _RECORD_SELECTOR = "owner=helm,name=kube-agents"
@@ -189,13 +200,28 @@ class CiTeardownSweepTest(unittest.TestCase):
         sweeps = self._sweep_calls(calls)
         for kind in _SWEPT_KINDS:
             with self.subTest(kind=kind):
-                matching = [c for c in sweeps if kind in c.split()]
+                matching = [c for c in sweeps if kind in c.split() and _SELECTOR in c.split()]
                 self.assertEqual(
-                    len(matching), 1, f"expected exactly one sweep of {kind}: {sweeps}"
+                    len(matching), 1, f"expected exactly one sweep of {kind} by {_SELECTOR}: {sweeps}"
                 )
-                argv = matching[0].split()
-                self.assertIn(_SELECTOR, argv)
-                self.assertIn("--ignore-not-found", argv)
+                self.assertIn("--ignore-not-found", matching[0].split())
+
+    def test_the_a2a_callout_binding_is_swept_under_its_own_label(self):
+        """#6458: the callout's ClusterRoleBinding carries part-of=a2a-next,
+        so the first sweep misses it, and nothing else reaps it once the
+        operator is gone. Swept by that label, with --ignore-not-found, and
+        no other kind under it: the label also marks the bus's namespaced
+        objects, which go with the PlatformAgent, and a wider a2a-next sweep
+        would be a second audit this test does not pin."""
+        rc, calls, err = self._run_steps()
+        self.assertEqual(rc, 0, err)
+        a2a_sweeps = [c for c in self._sweep_calls(calls) if _A2A_SELECTOR in c.split()]
+        self.assertEqual(
+            sorted(c.split()[2] for c in a2a_sweeps), sorted(_A2A_SWEPT_KINDS), a2a_sweeps
+        )
+        for call in a2a_sweeps:
+            self.assertIn("--ignore-not-found", call.split(), call)
+            self.assertNotIn("-n", call.split(), call)
 
     def test_the_sweep_selects_by_label_never_by_bare_kind(self):
         """A delete of a whole cluster-scoped kind with no selector would take
@@ -206,7 +232,7 @@ class CiTeardownSweepTest(unittest.TestCase):
             for call in [c for c in calls if kind in c.split()]:
                 argv = call.split()
                 self.assertIn("-l", argv, f"unselectored delete of {kind}: {call}")
-                self.assertIn(_SELECTOR, argv)
+                self.assertIn(argv[argv.index("-l") + 1], (_SELECTOR, _A2A_SELECTOR), call)
 
     # --- (a') the bench plant sweep runs first, armed, whatever follows ------
 

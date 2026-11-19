@@ -601,3 +601,30 @@ func TestOnlyAConsoleOrA2ADoorTurnWaitsForItsCardsInTurn(t *testing.T) {
 		t.Error("waitsForCardsInTurn(nil) = true, want false")
 	}
 }
+
+// The eval run tag rides only an inject-door conversation, whose key the eval
+// harness mints as <run>/<case>/<rep>; every other conversation, and a key
+// that is not that shape, sends no header.
+func TestAPIEvalRunTag_OnlyAnInjectConversationCarriesOne(t *testing.T) {
+	for _, tc := range []struct {
+		authority string
+		want      string
+	}{
+		{`{"audience":{"conversation":"inject:devops-bench-0123456789ab/some-case/2"}}`, "devops-bench-0123456789ab/some-case/2"},
+		{`{"audience":{"conversation":"slack:T1/C1/171.1"}}`, ""},
+		{`{"audience":{"conversation":"console:devops-bench-0123456789ab/some-case/2"}}`, ""},
+		{`{"audience":{"conversation":"inject:not a tag"}}`, ""},
+		{`{"audience":{"conversation":"inject:a/b/c"}}`, ""},
+		{`{"audience":{"conversation":"inject:a/b/1\r\nX-Other: 1"}}`, ""},
+		{``, ""},
+		{`not json`, ""},
+	} {
+		env := &lib.Envelope{Authority: json.RawMessage(tc.authority)}
+		if got := apiEvalRunTag(env); got != tc.want {
+			t.Errorf("apiEvalRunTag(%s) = %q, want %q", tc.authority, got, tc.want)
+		}
+	}
+	if got := apiEvalRunTag(nil); got != "" {
+		t.Errorf("apiEvalRunTag(nil) = %q, want none", got)
+	}
+}

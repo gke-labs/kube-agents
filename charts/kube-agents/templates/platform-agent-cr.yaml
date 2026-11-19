@@ -527,6 +527,19 @@ spec:
     {{- end }}
     {{- end }}
     {{- /*
+      deployment.evalRunTags renders KUBEAGENTS_EVAL_RUN_TAGS=1 when true, and
+      nothing when false, so a default render is unchanged. A name that
+      deployment.env also lists is skipped, and a valueFrom entry with the key
+      true fails the render, as for the keys above.
+    */}}
+    {{- $evalRunTagsName := "KUBEAGENTS_EVAL_RUN_TAGS" }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (hasKey $userValueFromNames $evalRunTagsName) }}
+    {{- fail (printf "platformAgent.deployment.evalRunTags is true, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and tagging stays off. Remove the valueFrom entry or the key." $evalRunTagsName) }}
+    {{- end }}
+    {{- if and .Values.platformAgent.deployment.evalRunTags (not (hasKey $userEnvNames $evalRunTagsName)) }}
+    {{- $env = append $env (dict "name" $evalRunTagsName "value" "1") }}
+    {{- end }}
+    {{- /*
       The event watcher's settings in deployment.eventWatcher come next, as
       WATCHER_<NAME>. A name that deployment.env also lists is skipped, so the
       explicit entry wins, a valueFrom entry included: the operator forwards
