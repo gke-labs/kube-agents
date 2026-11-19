@@ -18,7 +18,7 @@ Unset the flag and all of it is removed, the token included.
 
 ## Connect a client
 
-For a step-by-step setup of the workstation bridge in Antigravity, which reads the token and opens the port-forward itself, see [Using kube-agents from Antigravity](../../docs/site/src/content/docs/install/antigravity-mcp.md).
+For a step-by-step setup of the workstation bridge in Claude Code, the Antigravity CLI or the Antigravity editor, which reads the token and opens the port-forward itself, see [Using kube-agents over MCP](../../docs/site/src/content/docs/install/mcp.md).
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
