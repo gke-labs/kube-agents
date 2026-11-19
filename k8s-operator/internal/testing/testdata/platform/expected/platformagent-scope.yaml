@@ -2006,6 +2006,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -2281,6 +2283,8 @@ spec:
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
+            - name: A2A_DEFAULT_ADDRESSEE
+              value: platform
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: NATS_URL
@@ -3524,7 +3528,7 @@ spec:
             - name: A2A_RESERVED_PRINCIPALS
               value: callout,gateway,bridge,seed,web,console,console-mcp,sys
             - name: A2A_RESERVED_ADDRESSEES
-              value: platform
+              value: platform,session
             - name: A2A_TASK_SIGNING_PUBLIC_KEYS
               value: <GENERATED_FOR_TESTS>
             - name: A2A_ISSUER_SEED

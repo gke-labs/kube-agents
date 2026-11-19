@@ -1084,11 +1084,11 @@ func bridgeIdentity() a2aIdentity {
 
 	// The capability path, and the reason this static principal has one.
 	//
-	// The operator renders A2A_SPAWN_SESSIONS=true and renders no
-	// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default and every
-	// turn in a stock `mode: next` install is addressed to
-	// a2aBridgeAddressee and executed by the sidecar this principal
-	// belongs to. A session pod is reached only by an explicit `delegate:`.
+	// The operator renders A2A_SPAWN_SESSIONS=true and renders
+	// A2A_DEFAULT_ADDRESSEE as `platform` unless spec.harness.tuning.defaultRoute
+	// says `session` (resolveA2ADefaultRoute), so every turn in a stock install
+	// is addressed to a2aBridgeAddressee and executed by the sidecar this
+	// principal belongs to. A session pod is reached only by an explicit `delegate:`.
 	// Without these two subjects the capability the gateway mints for those
 	// tasks is read by nobody: minted, referenced, and never checked.
 	//

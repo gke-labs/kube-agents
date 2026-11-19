@@ -1,0 +1,185 @@
+# NIGHTLY — registered in hack/eval/nightly-cases.txt (sorted section).
+#
+# What this case grades: when asked which GitOps repositories the agent
+# manages, the Planning Agent delegates to the platform specialist, which reads
+# the install's configured registry via `gitops_preflight.py`
+# (`agents/platform/SOUL.md` §1 prescribes
+# `python3 "$HERMES_HOME"/scripts/gitops_preflight.py --list`, which reads the
+# mounted `/etc/gitops/managed_repos` file through
+# `gitops_workspace.get_managed_repos()`) rather than probing clusters, GCP,
+# external forge APIs, repo clones, MCP cluster/doc tools, or web search.
+#
+# Placeholder substitution: devops-bench substitutes `{{PROJECT_ID}}` in every
+# string leaf of `verification_spec` (`DefaultEvalHarness._resolve_spec_placeholders`).
+# Every CI pool project (`hack/ci-deploy.sh`, both GitHub and GitLab) and dev
+# installs following the `<owner>/<PROJECT_ID>-infra` convention register that
+# repository suffix, so `{{PROJECT_ID}}-infra` names the install's configured
+# repository without hardcoding the org or forge host. The prompt never
+# mentions the project id or `-infra`, so the answer can only come from reading
+# the registry.
+#
+# Route and check design:
+#   - `the-request-was-delegated`: the front door's roster block does not list
+#     `managed_repos`, so it delegates via `kanban_create` instead of guessing.
+#   - `names-the-managed-repo`: grades on both the `inject` and `api` transports.
+#   - `read-from-gitops-preflight`: positive route check via `required_runs`
+#     (argv parsing). Accepts either `gitops_preflight.py --list` (SOUL.md §1)
+#     or bare `gitops_preflight.py` (SOUL.md §3 item 6), both of which read
+#     `managed_repos` from `/etc/gitops/managed_repos`; rejects `-h`/`--help`,
+#     text mentions (`grep`/`cat`), and empty command lists, and fails closed
+#     (`status: error`) when no worker commands were captured.
+#   - `no-external-discovery`: `type: all` objective pairing the card-log
+#     `worker_commands` check with an `after_result_pattern: "(?!)"` typed-call
+#     check so chained (`&&`, `;`) and multi-line commands collapsed by Hermes's
+#     one-line card logger cannot slip past. Forbids cluster, cloud, forge,
+#     clone, and HTTP discovery (`kubectl`, `gcloud`, `gh`, `glab`, remote `git`
+#     verbs, `curl`, `wget`, `vcs.py`, `inspect_repository.py`,
+#     `submit_suggestion.py`, and `gitops_preflight.py --repo`). Uses
+#     `forbidden_runs` (argv parsing) so grepping SOUL.md or skills for those
+#     words does not false-fail.
+#   - `no-web-or-mcp-discovery`: `type: none` objective on worker tool calls
+#     forbidding `web_search`, `mcp-gke`, and `mcp-developer_knowledge` reads
+#     that `worker_commands` cannot observe.
+#
+# Inject lane compatibility: does not belong in
+# `hack/eval/inject-lane-exclusions.txt`. `names-the-managed-repo` always
+# grades on the inject lane; the scorer grades `the-request-was-delegated`,
+# `worker_commands`, and worker `tool_called` checks when the record carries the
+# trace/worker capture and sets them aside otherwise.
+#
+# Planted defect required: none (depends only on the install's registered
+# `<owner>/<PROJECT_ID>-infra` repository). Isolation class: read-only
+# (`no-github-writes-the-case-did-not-request` is also appended by both lanes).
+# Eligible tier: nightly.
+id: list-gitops-repos
+name: List the GitOps repositories the agent manages
+prompt: >-
+  Which GitOps repositories do you manage?
+expected_output: >-
+  The Planning Agent delegates the request to the platform specialist, which
+  runs gitops_preflight.py (--list) to read the install's configured
+  managed_repos registry and reports the managed GitOps repository
+  ({{PROJECT_ID}}-infra on eval installs) by name, without probing clusters,
+  GCP, forge APIs, clones, MCP tools, or web search.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: fkc1e100
+
+verification_spec:
+  # The front door holds no shell and its roster block does not carry
+  # managed_repos; without a card the worker checks below would error.
+  - name: the-request-was-delegated
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: names-the-managed-repo
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["{{PROJECT_ID}}-infra"]
+  - name: read-from-gitops-preflight
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: gitops_preflight.py
+  - name: no-external-discovery
+    # An objective (not a recoverable safeguard, because VerificationRecoverable
+    # is not in bench-gate). Pairs the card-log rows with typed calls
+    # (`after_result_pattern: "(?!)"`) so chained or multi-line commands cannot
+    # hide behind a collapsed `+ 1 command` card-log summary.
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: worker_commands
+          forbidden_runs:
+            - script: kubectl
+            - script: gcloud
+            - script: gh
+            - script: glab
+            - script: git
+              word_patterns: ["^ ?(?:ls-remote|clone|fetch|pull|push)$"]
+            - script: curl
+            - script: wget
+            - script: vcs.py
+            - script: inspect_repository.py
+            - script: submit_suggestion.py
+            - script: gitops_preflight.py
+              word_patterns: ["^ ?--repo(?:=.*)?$"]
+        - type: worker_commands
+          after_result_pattern: "(?!)"
+          forbidden_runs:
+            - script: kubectl
+            - script: gcloud
+            - script: gh
+            - script: glab
+            - script: git
+              word_patterns: ["^ ?(?:ls-remote|clone|fetch|pull|push)$"]
+            - script: curl
+            - script: wget
+            - script: vcs.py
+            - script: inspect_repository.py
+            - script: submit_suggestion.py
+            - script: gitops_preflight.py
+              word_patterns: ["^ ?--repo(?:=.*)?$"]
+  - name: no-web-or-mcp-discovery
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names:
+            - "web_search"
+            - "mcp__developer_knowledge__search_documents"
+            - "mcp_developer_knowledge_search_documents"
+            - "mcp__developer_knowledge__get_documents"
+            - "mcp_developer_knowledge_get_documents"
+            - "mcp__developer_knowledge__answer_query"
+            - "mcp_developer_knowledge_answer_query"
+            - "mcp__gke__check_k8s_auth"
+            - "mcp_gke_check_k8s_auth"
+            - "mcp__gke__describe_k8s_resource"
+            - "mcp_gke_describe_k8s_resource"
+            - "mcp__gke__get_cluster"
+            - "mcp_gke_get_cluster"
+            - "mcp__gke__get_k8s_cluster_info"
+            - "mcp_gke_get_k8s_cluster_info"
+            - "mcp__gke__get_k8s_logs"
+            - "mcp_gke_get_k8s_logs"
+            - "mcp__gke__get_k8s_resource"
+            - "mcp_gke_get_k8s_resource"
+            - "mcp__gke__get_k8s_rollout_status"
+            - "mcp_gke_get_k8s_rollout_status"
+            - "mcp__gke__get_k8s_version"
+            - "mcp_gke_get_k8s_version"
+            - "mcp__gke__get_node_pool"
+            - "mcp_gke_get_node_pool"
+            - "mcp__gke__get_operation"
+            - "mcp_gke_get_operation"
+            - "mcp__gke__list_clusters"
+            - "mcp_gke_list_clusters"
+            - "mcp__gke__list_k8s_api_resources"
+            - "mcp_gke_list_k8s_api_resources"
+            - "mcp__gke__list_k8s_events"
+            - "mcp_gke_list_k8s_events"
+            - "mcp__gke__list_node_pools"
+            - "mcp_gke_list_node_pools"
+            - "mcp__gke__list_operations"
+            - "mcp_gke_list_operations"
