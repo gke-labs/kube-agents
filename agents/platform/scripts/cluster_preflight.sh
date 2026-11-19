@@ -124,6 +124,18 @@ readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceede
 # answered, which "Error from server" fronts: a degraded etcd's "request timed
 # out" was reached, and the list cannot help.
 readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:|credential proxy throttled|Error from server'
+# The install-wide refusals kube-proxy and the credential broker give a cluster
+# the platform's operators took out of reach (scope_exclude.py, the proxy's
+# hold.go and exclude.go): check 5 reports these as what they are, not as an
+# unreachable cluster, and offers neither re-scaffolding nor the endpoint remedy.
+readonly SCOPE_HOLD_REFUSAL_RE='scope\.held-cluster|scope\.hold-unreadable'
+readonly SCOPE_EXCLUDE_REFUSAL_RE='scope\.excluded-cluster|scope\.exclude-unreadable'
+# The operator's reason in a hold refusal: "... on hold (spec.scope.hold): <reason>.
+# An operator paused ...", the `.all` form included.
+readonly SCOPE_HOLD_REASON_SED='s/.*on hold (spec\.scope\.hold[.a-z]*): \(.*\)\. An operator paused.*/\1/p'
+readonly SCOPE_HOLD_REASON_MAX_CHARS=256
+readonly SCOPE_HOLD_REMEDIATION="Report the hold to the user and stop; do not retry, re-scaffold, or work around it. An operator lifts it by removing the cluster from spec.scope.hold."
+readonly SCOPE_EXCLUDE_REMEDIATION="Report the exclusion to the user and stop; do not retry, re-scaffold, or work around it. An operator lets the agents back in by removing the cluster from spec.scope.exclude.clusters."
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
@@ -473,6 +485,17 @@ if [ "$STATUS" = "ok" ]; then
                     && ! printf '%s' "$ERR" | grep -Eiq "$NOT_A_CONNECTION_FAILURE_RE"; then
                 REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
             fi
+        fi
+        # A hold or an exclusion is the platform's operators keeping the agents
+        # out, not a cluster that can't be reached: say so, and nothing else.
+        if printf '%s' "$ERR" | grep -Eq "$SCOPE_HOLD_REFUSAL_RE"; then
+            REASON_5="The target cluster is on hold by the platform's operators (spec.scope.hold): kube-proxy and the credential broker refuse its API to every agent."
+            HOLD_REASON="$(printf '%s' "$ERR_ONE" | sed -n "$SCOPE_HOLD_REASON_SED" | head -n 1 | cut -c1-"$SCOPE_HOLD_REASON_MAX_CHARS")"
+            [ -n "$HOLD_REASON" ] && REASON_5="$REASON_5 Reason given: $HOLD_REASON."
+            REMEDIATION_5="$SCOPE_HOLD_REMEDIATION"
+        elif printf '%s' "$ERR" | grep -Eq "$SCOPE_EXCLUDE_REFUSAL_RE"; then
+            REASON_5="The target cluster is excluded from this install's scope (spec.scope.exclude.clusters): kube-proxy and the credential broker refuse its API to every agent."
+            REMEDIATION_5="$SCOPE_EXCLUDE_REMEDIATION"
         fi
         fail "5" "$REASON_5" "$REMEDIATION_5" "kubectl cluster-info: $ERR_ONE"
     fi

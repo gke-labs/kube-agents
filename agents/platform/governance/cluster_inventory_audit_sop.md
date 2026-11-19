@@ -33,6 +33,10 @@ catches it.
 Check `5`, "Cannot reach the target cluster's API server", is the exception: your identity is
 established and the cluster is simply unreachable, so record it in `gaps` and complete like any
 other data-cost failure.
+A check `5` whose reason says the cluster is on hold (`spec.scope.hold`) or excluded
+(`spec.scope.exclude.clusters`) is the same exception, but it is the operators' decision, not an
+outage: record it in `gaps` as the hold or the exclusion, with the script's reason verbatim, never
+as "unreachable", and do not retry.
 
 ---
 
