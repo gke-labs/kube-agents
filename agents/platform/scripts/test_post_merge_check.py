@@ -957,6 +957,9 @@ class ReconcilersForTest(unittest.TestCase):
     def test_diff_paths_unquotes_escapes_beside_raw_utf8(self):
         diff = 'diff --git "a/caf\u00e9/\\"q\\".yaml" "b/caf\u00e9/\\"q\\".yaml"\n--- "a/caf\u00e9/\\"q\\".yaml"\n'
         self.assertEqual(post_merge_check.diff_paths(diff), ['caf\u00e9/"q".yaml'])
+        # Raw Latin-1-range text that happens to spell valid UTF-8 is kept, never decoded a second time.
+        mojibake = 'diff --git "a/\u00c3\u00a9/\\"q\\".yaml" "b/\u00c3\u00a9/\\"q\\".yaml"\n--- "a/\u00c3\u00a9/\\"q\\".yaml"\n'
+        self.assertEqual(post_merge_check.diff_paths(mojibake), ['\u00c3\u00a9/"q".yaml'])
 
     def test_diff_paths_with_a_name_keeps_only_the_files_that_name_it(self):
         diff = ("diff --git a/platform/x.yaml b/platform/x.yaml\n--- a/platform/x.yaml\n+++ b/platform/x.yaml\n"
@@ -975,13 +978,14 @@ class ReconcilersForTest(unittest.TestCase):
                 "+x\rdiff --git a/clusters/prod/p.yaml b/clusters/prod/p.yaml\n+y\u2028diff --git a/c/q b/c/q\n")
         self.assertEqual(post_merge_check.diff_paths(diff), ["a.yaml"])
 
-    def test_forge_paths_reads_an_undecodable_escape_as_unknown(self):
+    def test_an_escape_that_names_no_byte_is_kept_as_text_never_a_crash(self):
         from unittest import mock
 
         diff = 'diff --git "a/\\400/p.yaml" "b/\\400/p.yaml"\n--- "a/\\400/p.yaml"\n'
         forge = mock.Mock(call=lambda *a, **k: {"diff": diff})
-        with mock.patch.dict(sys.modules, {"forge": forge}), self.assertLogs("post_merge_check", level="WARNING"):
-            self.assertIsNone(post_merge_check.forge_paths(REPO, 7))
+        with mock.patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(post_merge_check.forge_paths(REPO, 7), ["\\400/p.yaml"])
+        self.assertEqual(post_merge_check._unquote("\\\u20acx"), "\\\u20acx")
 
     def test_diff_paths_reads_renames_and_binary_files(self):
         diff = ("diff --git a/old/pdb.yaml b/clusters/dev/pdb.yaml\nsimilarity index 100%\n"

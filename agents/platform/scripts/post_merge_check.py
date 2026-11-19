@@ -285,20 +285,18 @@ C_QUOTED_RE = re.compile(r"\\([0-7]{3}|.)")
 
 
 def _unquote(text: str) -> str:
-    """git's C-quoted path body as text: octal escapes are bytes, and raw UTF-8 is left as it is."""
-    def byte(match: re.Match) -> str:
+    """git's C-quoted path body as text: each escape is one byte (or its own text when it names none),
+    and everything else, raw UTF-8 included, is kept as it is."""
+    out = bytearray()
+    position = 0
+    for match in C_QUOTED_RE.finditer(text):
+        out += text[position:match.start()].encode("utf-8")
         code = match.group(1)
         value = int(code, 8) if len(code) == 3 else C_ESCAPES.get(code)
-        return match.group(0) if value is None else chr(value)
-
-    try:
-        return C_QUOTED_RE.sub(byte, text).encode("latin-1").decode("utf-8")
-    except UnicodeError:
-        # Raw UTF-8 beside the escapes: decode the escapes as bytes one run at a time.
-        out = bytearray()
-        for part in re.split(r"((?:\\(?:[0-7]{3}|.))+)", text):
-            out += C_QUOTED_RE.sub(byte, part).encode("latin-1") if part.startswith("\\") else part.encode("utf-8")
-        return out.decode("utf-8", "replace")
+        out += bytes([value]) if value is not None and value <= 0xFF else match.group(0).encode("utf-8")
+        position = match.end()
+    out += text[position:].encode("utf-8")
+    return out.decode("utf-8", "replace")
 
 
 def _names(text: str, name: str) -> bool:
