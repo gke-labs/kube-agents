@@ -22,12 +22,12 @@ only — anything that renames, removes or re-types a field bumps
       "finished": "<iso8601>",
       "result": "SUCCESS|FAILURE|ABORTED",
       "eval_verdict": "GREEN|RED|null",
-      "duration_s": 5793,
+      "duration_s": 4105,
       "tasks": [
         {
-          "name": "reliability-pdb-probe",
+          "name": "case-02",
           "result": "pass|fail|infra",
-          "duration_s": 182,
+          "duration_s": 177,
           "outcome_validity": 1.0
         }
       ]
@@ -42,7 +42,7 @@ only — anything that renames, removes or re-types a field bumps
       "runs_on_record": 4,
       "pass_rate": 1.0,
       "last3": ["pass", "pass", "pass"],
-      "durations": { "min": 145, "med": 165, "max": 182 },
+      "durations": { "min": 152, "med": 165, "max": 177 },
       "ov_history": [{ "build_id": "...", "value": 1.0 }],
       "nightly": { "runs_on_record": 1, "pass_rate": 1.0, "last3": ["pass"] }
     }
@@ -530,7 +530,7 @@ Additive, optional, and safe to omit — consumers must default them.
   "duration_s": 15006,
   "project": "kube-agents-evals-10",
   "artifacts_url": "https://oss.gprow.dev/view/gs/... | https://console.cloud.google.com/storage/browser/...",
-  "pass_rate": 0.9,
+  "pass_rate": 0.88,
   "baseline_rate": null,
   "margin": null,
   "tasks": []
