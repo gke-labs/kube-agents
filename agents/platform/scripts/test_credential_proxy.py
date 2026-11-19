@@ -7799,6 +7799,16 @@ class CurrentContextTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertIsNone(read_current_context(document))
 
+    def test_returns_none_for_text_that_the_yaml_reader_refuses_with_a_value_error(self):
+        # PyYAML builds some scalars with int() and datetime, which raise a plain
+        # ValueError and not a yaml.YAMLError.
+        for label, document in (
+            ("a date that does not exist", "current-context: gke_p_l_c\na: 2001-13-45\n"),
+            ("an int tag on text", "current-context: gke_p_l_c\na: !!int x\n"),
+        ):
+            with self.subTest(label):
+                self.assertIsNone(read_current_context(document))
+
     def test_survives_a_document_built_to_kill_the_parser(self):
         # Both shapes are reachable: the caller's kubeconfig is agent-authored
         # and only bounded by MAX_KUBECONFIG_BYTES. Deep nesting is why the

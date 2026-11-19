@@ -828,13 +828,15 @@ def read_current_context(text: str) -> str | None:
 
     Anything else — a syntax error, several documents, a top level that is not a
     mapping, a non-string `current-context` — reads as absent, and the caller
-    turns that into a rejection.
+    turns that into a rejection. So does a scalar that PyYAML cannot build: it
+    raises a plain `ValueError` for a date that does not exist or an `!!int` tag
+    on text, not a `yaml.YAMLError`.
     """
     import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
 
     try:
         document = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
+    except (yaml.YAMLError, ValueError, RecursionError):
         return None
     if not isinstance(document, dict):
         return None

@@ -637,7 +637,10 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   answers one when the upstream reset after the request was forwarded. Nor is a dropped
   connection (`BrokerDisconnected`), because the command may have run, nor a `2xx` answer that the
   shim cannot use (not JSON, not an object, or a field that is missing or of the wrong type), for the same reason; that
-  one is not sent to the stateful broker either. `CREDENTIAL_PROXY_BUSY` is
+  one is not sent to the stateful broker either. The shim has no guard for a `stdout`, `stderr` or
+  `kubeconfig` string with a lone surrogate, which would end its write in a `UnicodeEncodeError`:
+  the broker decodes a command's output as UTF-8 with replacement, so its answer holds none.
+  `CREDENTIAL_PROXY_BUSY` is
   raised only at admission, before the command starts, so a retry never runs a command twice.
 - The retry skips a refusal at the session cap, which uses the same code so that the model
   reports it and does not retry [code, `credential_proxy.py`, `SessionSlots`]. The busy reply
