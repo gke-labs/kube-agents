@@ -1,0 +1,450 @@
+package jwtauth
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
+
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
+)
+
+const (
+	testIssuer   = "https://issuer.test"
+	testAudience = "kube-proxy"
+	testSubject  = "actor/space-a/session-1"
+	testKeyID    = "key-1"
+	testRSABits  = 2048
+	testTokenTTL = 5 * time.Minute
+	testPodsPath = "/clusters/" + k8sapiproxy.InClusterID + "/api/v1/pods"
+	contentJSON  = "application/json"
+)
+
+var testNow = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+
+// issuer signs tokens and serves its key set; served counts key set fetches.
+type issuer struct {
+	t      *testing.T
+	mu     sync.Mutex
+	keys   map[string]any // kid -> private key
+	public jose.JSONWebKeySet
+	down   atomic.Bool
+	served atomic.Int32
+	srv    *httptest.Server
+}
+
+func newIssuer(t *testing.T) *issuer {
+	t.Helper()
+	is := &issuer{t: t, keys: map[string]any{}}
+	is.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		is.served.Add(1)
+		if is.down.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		is.mu.Lock()
+		defer is.mu.Unlock()
+		w.Header().Set("Content-Type", contentJSON)
+		_ = json.NewEncoder(w).Encode(is.public)
+	}))
+	t.Cleanup(is.srv.Close)
+	is.addRSA(testKeyID)
+	return is
+}
+
+func (is *issuer) addRSA(kid string) {
+	is.t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, testRSABits)
+	if err != nil {
+		is.t.Fatal(err)
+	}
+	is.add(kid, key, &key.PublicKey, jose.RS256)
+}
+
+func (is *issuer) addEC(kid string) {
+	is.t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		is.t.Fatal(err)
+	}
+	is.add(kid, key, &key.PublicKey, jose.ES256)
+}
+
+func (is *issuer) add(kid string, private, public any, alg jose.SignatureAlgorithm) {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	is.keys[kid] = private
+	is.public.Keys = append(is.public.Keys, jose.JSONWebKey{Key: public, KeyID: kid, Algorithm: string(alg), Use: "sig"})
+}
+
+// sign returns a token signed with kid's key and naming kid; mutate edits the claims first.
+func (is *issuer) sign(kid string, alg jose.SignatureAlgorithm, mutate func(c *jwt.Claims, extra map[string]any)) string {
+	is.t.Helper()
+	return is.signWith(kid, true, alg, mutate)
+}
+
+func (is *issuer) signWith(kid string, nameKid bool, alg jose.SignatureAlgorithm, mutate func(c *jwt.Claims, extra map[string]any)) string {
+	is.t.Helper()
+	is.mu.Lock()
+	key := is.keys[kid]
+	is.mu.Unlock()
+	opts := (&jose.SignerOptions{}).WithType("JWT")
+	if nameKid {
+		opts = opts.WithHeader(jose.HeaderKey("kid"), kid)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: key}, opts)
+	if err != nil {
+		is.t.Fatal(err)
+	}
+	c := jwt.Claims{
+		Issuer:   testIssuer,
+		Subject:  testSubject,
+		Audience: jwt.Audience{testAudience},
+		IssuedAt: jwt.NewNumericDate(testNow),
+		Expiry:   jwt.NewNumericDate(testNow.Add(testTokenTTL)),
+	}
+	extra := map[string]any{}
+	if mutate != nil {
+		mutate(&c, extra)
+	}
+	raw, err := jwt.Signed(signer).Claims(c).Claims(extra).Serialize()
+	if err != nil {
+		is.t.Fatal(err)
+	}
+	return raw
+}
+
+func (is *issuer) config() Config {
+	return Config{
+		Issuer:    testIssuer,
+		KeySetURL: is.srv.URL,
+		Audiences: []string{testAudience},
+		Now:       func() time.Time { return testNow },
+	}
+}
+
+func newAuth(t *testing.T, cfg Config) k8sapiproxy.CallerAuthenticator {
+	t.Helper()
+	a, err := NewAuthenticator(cfg)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	return a
+}
+
+func bearer(token string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, testPodsPath, nil)
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	return r
+}
+
+func TestNewAuthenticatorValidatesConfig(t *testing.T) {
+	ok := Config{Issuer: testIssuer, KeySetURL: "https://issuer.test/keys", Audiences: []string{testAudience}}
+	if _, err := NewAuthenticator(ok); err != nil {
+		t.Fatalf("valid config: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"no issuer":      func(c *Config) { c.Issuer = "" },
+		"no key set URL": func(c *Config) { c.KeySetURL = "" },
+		"non-http URL":   func(c *Config) { c.KeySetURL = "file:///etc/keys" },
+		"no audience":    func(c *Config) { c.Audiences = nil },
+		"blank audience": func(c *Config) { c.Audiences = []string{" "} },
+		"symmetric alg":  func(c *Config) { c.SignatureAlgorithms = []jose.SignatureAlgorithm{jose.HS256} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ok
+			mutate(&cfg)
+			if _, err := NewAuthenticator(cfg); err == nil {
+				t.Error("NewAuthenticator accepted an invalid config")
+			}
+		})
+	}
+}
+
+func TestAuthenticatorAcceptsAValidToken(t *testing.T) {
+	is := newIssuer(t)
+	is.addEC("ec-1")
+	cfg := is.config()
+	cfg.GroupsClaim = "groups"
+	a := newAuth(t, cfg)
+
+	for _, tc := range []struct {
+		name string
+		kid  string
+		alg  jose.SignatureAlgorithm
+	}{
+		{"RS256", testKeyID, jose.RS256},
+		{"ES256", "ec-1", jose.ES256},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := is.sign(tc.kid, tc.alg, func(_ *jwt.Claims, extra map[string]any) {
+				extra["groups"] = []string{"tenant:space-a", "agents"}
+			})
+			id, err := a.AuthenticateRequest(bearer(token))
+			if err != nil {
+				t.Fatalf("AuthenticateRequest: %v", err)
+			}
+			if id.Username != testSubject || id.UID != testSubject {
+				t.Errorf("identity = %+v, want username and UID %q", id, testSubject)
+			}
+			if strings.Join(id.Groups, ",") != "tenant:space-a,agents" {
+				t.Errorf("groups = %v", id.Groups)
+			}
+		})
+	}
+}
+
+func TestAuthenticatorRefusesAnInvalidToken(t *testing.T) {
+	is := newIssuer(t)
+	other := newIssuer(t) // a key the issuer never published, under the same kid
+	a := newAuth(t, is.config())
+
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"no token", ""},
+		{"not a JWT", "not-a-jwt"},
+		{"wrong issuer", is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) { c.Issuer = "https://other.test" })},
+		{"wrong audience", is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) { c.Audience = jwt.Audience{"kube-apiserver"} })},
+		{"expired", is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) {
+			c.Expiry = jwt.NewNumericDate(testNow.Add(-2 * clockLeeway))
+		})},
+		{"not yet valid", is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) {
+			c.NotBefore = jwt.NewNumericDate(testNow.Add(2 * clockLeeway))
+		})},
+		{"no expiry", is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) { c.Expiry = nil })},
+		{"no kid", is.signWith(testKeyID, false, jose.RS256, nil)},
+		{"signed by another key", other.sign(testKeyID, jose.RS256, nil)},
+		{"no username claim", is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) { c.Subject = "" })},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := a.AuthenticateRequest(bearer(tc.token))
+			if err == nil {
+				t.Fatalf("accepted as %+v", id)
+			}
+			if errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+				t.Errorf("err = %v, want a refusal, not unavailable", err)
+			}
+		})
+	}
+}
+
+// A token signed with an HMAC key over the public key's bytes (the classic algorithm
+// confusion attack) is refused, because HS256 is never an accepted algorithm.
+func TestAuthenticatorRefusesASymmetricToken(t *testing.T) {
+	is := newIssuer(t)
+	a := newAuth(t, is.config())
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: []byte("shared-secret-of-sufficient-length!")},
+		(&jose.SignerOptions{}).WithHeader(jose.HeaderKey("kid"), testKeyID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Issuer: testIssuer, Subject: testSubject, Audience: jwt.Audience{testAudience},
+		Expiry: jwt.NewNumericDate(testNow.Add(testTokenTTL)),
+	}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := a.AuthenticateRequest(bearer(token)); err == nil {
+		t.Fatalf("HS256 token accepted as %+v", id)
+	}
+}
+
+func TestAuthenticatorUsesConfiguredClaims(t *testing.T) {
+	is := newIssuer(t)
+	cfg := is.config()
+	cfg.UsernameClaim = "actor"
+	cfg.GroupsClaim = "tenant"
+	a := newAuth(t, cfg)
+
+	id, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, func(_ *jwt.Claims, extra map[string]any) {
+		extra["actor"] = "session-1"
+		extra["tenant"] = "space-a"
+	})))
+	if err != nil {
+		t.Fatalf("AuthenticateRequest: %v", err)
+	}
+	if id.Username != "session-1" || len(id.Groups) != 1 || id.Groups[0] != "space-a" {
+		t.Errorf("identity = %+v, want username session-1 and group space-a", id)
+	}
+
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, func(_ *jwt.Claims, extra map[string]any) {
+		extra["actor"] = "session-1"
+		extra["tenant"] = 7
+	}))); err == nil {
+		t.Error("a groups claim that is not a string or list of strings was accepted")
+	}
+}
+
+func TestAuthenticatorAllowDecides(t *testing.T) {
+	is := newIssuer(t)
+	cfg := is.config()
+	cfg.Allow = func(id *k8sapiproxy.CallerIdentity) error {
+		if !strings.HasPrefix(id.Username, "actor/space-a/") {
+			return errors.New("not in space-a")
+		}
+		return nil
+	}
+	a := newAuth(t, cfg)
+
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Errorf("allowed caller refused: %v", err)
+	}
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) {
+		c.Subject = "actor/space-b/session-9"
+	}))); err == nil {
+		t.Error("caller Allow refused was accepted")
+	}
+}
+
+// A key the issuer rotates in is picked up on the first token that names it, once the
+// refetch interval has passed since the last fetch.
+func TestAuthenticatorFetchesARotatedKey(t *testing.T) {
+	is := newIssuer(t)
+	clock := testNow
+	cfg := is.config()
+	cfg.Now = func() time.Time { return clock }
+	a := newAuth(t, cfg)
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatalf("first key: %v", err)
+	}
+
+	is.addEC("key-2")
+	clock = clock.Add(minKeySetRefetchInterval)
+	if _, err := a.AuthenticateRequest(bearer(is.sign("key-2", jose.ES256, func(c *jwt.Claims, _ map[string]any) {
+		c.IssuedAt = jwt.NewNumericDate(clock)
+	}))); err != nil {
+		t.Errorf("rotated key: %v", err)
+	}
+	if got := is.served.Load(); got != 2 {
+		t.Errorf("key set fetched %d times, want 2 (initial and rotation)", got)
+	}
+}
+
+// Tokens naming unknown keys cannot make the authenticator fetch the key set more than once
+// per minKeySetRefetchInterval.
+func TestAuthenticatorBoundsKeySetFetches(t *testing.T) {
+	is := newIssuer(t)
+	a := newAuth(t, is.config())
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatal(err)
+	}
+	before := is.served.Load()
+	other := newIssuer(t)
+	for i := range 20 {
+		kid := "unknown-" + string(rune('a'+i))
+		other.addEC(kid)
+		_, _ = a.AuthenticateRequest(bearer(other.sign(kid, jose.ES256, nil)))
+	}
+	if got := is.served.Load() - before; got > 1 {
+		t.Errorf("key set fetched %d times for 20 unknown-key tokens within the interval, want at most 1", got)
+	}
+}
+
+// When the key set cannot be fetched and no cached key matches, the authenticator cannot
+// decide: ErrAuthenticationUnavailable, so the handler answers 503. A known key keeps working.
+func TestAuthenticatorReportsAnUnreachableIssuer(t *testing.T) {
+	is := newIssuer(t)
+	is.down.Store(true)
+	a := newAuth(t, is.config())
+	_, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil)))
+	if !errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+		t.Fatalf("err = %v, want ErrAuthenticationUnavailable", err)
+	}
+
+	is.down.Store(false)
+	clock := testNow
+	cfg := is.config()
+	cfg.KeySetTTL = time.Minute
+	cfg.Now = func() time.Time { return clock }
+	a = newAuth(t, cfg)
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatalf("issuer up: %v", err)
+	}
+	is.down.Store(true)
+	clock = clock.Add(2 * time.Minute) // past the TTL, so the next token triggers a fetch
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) {
+		c.IssuedAt = jwt.NewNumericDate(clock)
+		c.Expiry = jwt.NewNumericDate(clock.Add(testTokenTTL))
+	}))); err != nil {
+		t.Errorf("known key with the issuer down: %v", err)
+	}
+}
+
+// recordingUpstream answers every forwarded request with an empty PodList.
+type recordingUpstream struct{ calls atomic.Int32 }
+
+func (u *recordingUpstream) RoundTripCluster(_ context.Context, _ string, req *http.Request) (*http.Response, error) {
+	u.calls.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{contentJSON}},
+		Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[]}`)),
+		Request:    req,
+	}, nil
+}
+
+// Through the handler: a valid token is forwarded, a bad one is 401, and an unreachable
+// issuer is 503.
+func TestHandlerWithJWTAuthenticator(t *testing.T) {
+	is := newIssuer(t)
+	upstream := &recordingUpstream{}
+	h, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+		Authenticator: newAuth(t, is.config()),
+		Upstream:      upstream,
+		Policy:        k8sapiproxy.Policy{Mode: k8sapiproxy.ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve := func(r *http.Request) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+
+	if code := serve(bearer(is.sign(testKeyID, jose.RS256, nil))); code != http.StatusOK {
+		t.Errorf("valid token: code %d, want 200", code)
+	}
+	if code := serve(bearer(is.sign(testKeyID, jose.RS256, func(c *jwt.Claims, _ map[string]any) { c.Audience = jwt.Audience{"other"} }))); code != http.StatusUnauthorized {
+		t.Errorf("wrong audience: code %d, want 401", code)
+	}
+
+	down := newIssuer(t)
+	down.down.Store(true)
+	h, err = k8sapiproxy.NewHandler(k8sapiproxy.Config{
+		Authenticator: newAuth(t, down.config()),
+		Upstream:      upstream,
+		Policy:        k8sapiproxy.Policy{Mode: k8sapiproxy.ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := serve(bearer(down.sign(testKeyID, jose.RS256, nil))); code != http.StatusServiceUnavailable {
+		t.Errorf("unreachable issuer: code %d, want 503", code)
+	}
+	if got := upstream.calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (only the valid token)", got)
+	}
+}

@@ -16,6 +16,15 @@ that a TokenReview on the host cluster finds valid for any configured audience (
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
+`jwtauth.NewAuthenticator` (`pkg/jwtauth`) is for an embedder whose platform mints a signed token
+per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
+JWT that names its key (`kid`), verifies against the issuer's JSON Web Key Set (RS256 or ES256;
+never a symmetric algorithm), and carries the configured issuer, one of the configured audiences,
+and an expiry it has not passed. The username and groups come from configurable claims (`sub` by
+default), and an optional `Allow` func can refuse a caller. The key set is cached for an hour and
+fetched again, at most every ten seconds, when a token names a key it lacks, so a rotated key
+works without a restart. A key set that cannot be fetched for an unknown key is a 503.
+
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
