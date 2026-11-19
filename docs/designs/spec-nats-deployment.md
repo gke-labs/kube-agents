@@ -69,12 +69,13 @@ another `busReplicas` change while one runs.
   and web logins drop, and the gateway and bridge cannot publish), the operator's pods
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
   snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
-  stream, checked against the operator's policy for it before and after, and raises it to
-  three replicas. Each stream comes back at the rendered `max_bytes` and `max_age`, and its
-  `max_consumers` is widened to the render's but never narrowed: JetStream fixes it when a
-  stream is created, so the restore is the one moment it can grow, and a wider stream's
-  consumers must still fit (amended 11/18). The way back restores each stream as the snapshot
-  recorded it, its width included.
+  stream, checked against the operator's policy for it before and after, raises it to
+  three replicas, and waits (up to 5 minutes for all streams) until every replica is
+  current and every restored durable consumer answers from its leader. Each stream comes back
+  at the rendered `max_bytes` and `max_age`, and its `max_consumers` is widened to the render's
+  but never narrowed: JetStream fixes it when a stream is created, so the restore is the one
+  moment it can grow, and a wider stream's consumers must still fit (amended 11/18). The way
+  back restores each stream as the snapshot recorded it, its width included.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
   restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
