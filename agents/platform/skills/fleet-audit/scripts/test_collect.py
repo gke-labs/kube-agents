@@ -13753,6 +13753,53 @@ class TestServiceEntryHostCollision(unittest.TestCase):
         self.assertIn("10.0.0.1", hits[0]["excerpt"])
         self.assertIn("10.0.0.2", hits[0]["excerpt"])
 
+    def test_the_excerpt_names_only_the_differing_fields_in_plain_words(self):
+        hits = self.hits(
+            service_entry("payments", "team-a", [self.HOST], addresses=["10.0.0.1"]),
+            service_entry("payments", "team-b", [self.HOST], addresses=["10.0.0.2"]),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("They differ in addresses 10.0.0.1 in team-a/payments, 10.0.0.2 in team-b/payments.", excerpt)
+        self.assertNotIn("{", excerpt)
+        self.assertNotIn("resolution", excerpt)
+        self.assertNotIn("ports", excerpt)
+        self.assertIn('set exportTo: ["."] on team-a/payments, team-b/payments', excerpt)
+        self.assertIn("if no namespace that declares none of them needs the host", excerpt)
+
+    def test_the_fix_survives_publication_and_a_long_value_is_cut(self):
+        endpoints = tuple(f"10.1.{i}.1" for i in range(60))
+        hits = self.hits(
+            service_entry("a", "team-a", [self.HOST], endpoints=endpoints),
+            service_entry("b", "team-b", [self.HOST], endpoints=endpoints[1:]),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertLess(excerpt.index("First fix to consider"), excerpt.index("They differ"))
+        self.assertLess(excerpt.index("First fix to consider"), audit_report.MAX_EXCERPT_CHARS)
+        self.assertIn("…", excerpt)
+        self.assertLess(len(excerpt), TestServiceEntryHostCollision.BOUNDED_EXCERPT_CHARS)
+
+    def test_a_renamed_port_differs_because_endpoint_ports_are_keyed_by_name(self):
+        a = service_entry("a", "team-a", [self.HOST])
+        b = service_entry("b", "team-b", [self.HOST])
+        b["spec"]["ports"][0]["name"] = "https-renamed"
+        hits = self.hits(a, b)
+        self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+        self.assertIn("https-renamed", hits[0]["excerpt"])
+
+    def test_workload_selector_endpoint_labels_and_weights_each_count(self):
+        """Each is on the SOP's routing list; dropping any one from the comparison
+        must turn a real conflict into `minor`, and these catch it."""
+        for change in (
+            lambda spec: spec.__setitem__("workloadSelector", {"labels": {"app": "pay"}}),
+            lambda spec: spec["endpoints"][0].__setitem__("labels", {"version": "v2"}),
+            lambda spec: spec["endpoints"][0].__setitem__("weight", 10),
+        ):
+            with self.subTest(change=change):
+                a = service_entry("a", "team-a", [self.HOST], endpoints=("10.0.0.1",))
+                b = service_entry("b", "team-b", [self.HOST], endpoints=("10.0.0.1",))
+                change(b["spec"])
+                self.assertEqual(self.hits(a, b)[0]["severity"], collect.SERVICEENTRY_SEVERITY_CONFLICTING)
+
     def test_identical_copies_are_minor(self):
         hits = self.hits(service_entry("a", "team-a", [self.HOST]), service_entry("b", "team-b", [self.HOST]))
         self.assertEqual(hits[0]["severity"], collect.SERVICEENTRY_SEVERITY_IDENTICAL)
