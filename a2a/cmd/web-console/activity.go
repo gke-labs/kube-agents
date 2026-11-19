@@ -672,6 +672,7 @@ var knownPlatformSkills = []string{
 	"pod-pending-scheduling",
 	"service-connectivity",
 	"workload-triage-scan",
+	"decision-memory",
 }
 
 var (

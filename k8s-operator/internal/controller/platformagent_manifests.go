@@ -4954,6 +4954,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
 	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
 	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
+	envVars = append(envVars, a2aCuratorBrokerEnv(agent)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
 	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
@@ -5164,6 +5165,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		credentialProxyCuratorAudienceEnvVar,
+		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// The profile role's four, by name because each is rendered only
@@ -5520,6 +5523,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// the roster run, by moving their next_run_at in the profile's own
 		// store, and adds no job, path, destination or credential.
 		"CRON_CATCH_UP_STAGGER_MINUTES": {},
+
+		// The post-merge check's per-step cap on the records one run reads
+		// from the forge and the clusters (READS_PER_TICK_ENV in
+		// post_merge_check.py; default 20). Parsed as a whole number from 1
+		// to 25, and anything else means the default, so it bounds how much
+		// one run reads and adds no job, path, destination or credential.
+		"POST_MERGE_READS_PER_TICK": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

@@ -104,11 +104,8 @@ A release-candidate run does not append either, and it is the case the sentence
 above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
-places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
-lane deploys `next` and rolls it back to `today` before its
-matrix, so its key reads `today`, but a rolled-back install is not the fresh
-`today` install that window measures. A run at a named reasoning effort
-(`EVAL_REASONING_EFFORT` set) is the fifth, enforced in both as well: the key
+places. A run at a named reasoning effort
+(`EVAL_REASONING_EFFORT` set) is the fourth, enforced in both as well: the key
 carries no effort, so its lines would pool with the default-effort window.
 The third has to be enforced twice,
 because the mistake is not correctable afterwards:
@@ -117,18 +114,15 @@ versions and the mode, and nothing about which build produced a sample, so a
 candidate's record and `main`'s are the same record once written — and the
 candidate would then be judged non-inferior to a window it had just moved.
 
-A next-mode run on `main` does append. The main nightly
+A run on `main` does append. The main nightly
 (`ci-kube-agents-eval-nightly`, its `-main-b` to `-main-e` shards and its three writers thirds) is a periodic with no
-`PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
-reads as the key's `next` mode, so its lines file under a key of their own and
-never reach today's window. No job appends today's window now: the
-rollback check is the today lane, which the fourth condition keeps out, and
-today's lines are the ones already in the store. At a
-`next` key a repetition graded with a check set
-aside as not applicable on the inject transport is recorded, because every
-next-mode run, on `main` or on a pull request, is graded under the same set-aside
-rule; at a `today` key the case is skipped. The key includes the agent model, so
-the main nightly's lines are a window only for a next-mode run at its model,
+`PULL_NUMBER` whose matrix runs through the inject door, and its lines file
+under the key's `next` mode, never under the legacy `today` key the lines
+recorded before every install ran the A2A stack carry. A repetition graded
+with a check set aside as not applicable on the inject transport is
+recorded, because every run, on `main` or on a pull request, is graded under
+the same set-aside rule. The key includes the agent model, so
+the main nightly's lines are a window only for a run at its model,
 which is the presubmit's.
 
 A store that will not parse is an **error**, never an empty store. Empty means
@@ -233,26 +227,22 @@ they cannot go stale:
 | `judge_model`     | `$JUDGE_MODEL`                 | The judge, pinned independently of the agent |
 | `fleet`           | `VERSIONS.json`                | The `bench/tf/fleet` state a task audits     |
 | `verifiers`       | `VERSIONS.json`                | `kube_agents_bench/verifiers.py` behaviour   |
-| `mode`            | run, `$AGENT_TRANSPORT`        | The `spec.mode` graded: `inject` is next     |
+| `mode`            | constant                       | `next`: the stack every install runs         |
 
-`mode` is `today` or `next`. `setupId` names the same agent model and harness
-under either, so without it a next-mode run would be compared with today's
-history, which is what redded the inject lane on rung 6 before the component
-existed. It is read off the transport rather than off `EVAL_MODE_NEXT`, because
-the today lane deploys under that flag and grades a rolled-back install over
-the api transport: `next` when any repetition's record carries the inject
-transport's task marker (`inject.task` in its trajectory), else when
-`AGENT_TRANSPORT=inject` is set, which `hack/ci-eval-pr.sh` exports exactly when
-it grades a next install. `today` is the default and is never written: a
-key with no `mode` reads as `today`, so every line recorded before the component
-existed still matches today's key, and on GCS a `next` key's last directory
-segment gains a `-next` suffix while every `today` directory stays as it was.
-Rung 6 and admission therefore read only same-mode history; a `next` key with
-nothing recorded at it is the empty window (rung 6 quiet, nothing admitted by
-the record), and a partial one is compared like any other `collecting` window.
-The suite aggregate is the one exception: for a case graded at a `next` key with
-nothing recorded there, main's side uses the case's `today` lines at the same
-key otherwise, and the verdict names those cases in a note.
+`mode` is `next` on every key a run writes: every install runs the A2A stack
+and every CI lane grades it through the inject door. `today` is the legacy
+reading of a key with no `mode`: the lines recorded before the component
+existed, and the retired today-mode nightly's, carry it, and `setupId` names
+the same agent model and harness under either stack, so without the component
+a run would be compared with that history, which is what redded the inject
+lane on rung 6 before it existed. `today` is never written: a key with no
+`mode` reads as `today`, so every legacy line keeps matching its own key, and on
+GCS a `next` key's last directory segment carries a `-next` suffix while every
+`today` directory stays as it was. Rung 6, admission and the suite aggregate
+read only same-mode history; a `next` key with nothing recorded at it is the
+empty window (rung 6 quiet, nothing admitted by the record, nothing on main's
+side of the aggregate), and a partial one is compared like any other
+`collecting` window.
 
 The judge model is a component of its own, and is pinned independently of the
 agent model, because a judge that tracks whatever the agent is running cannot

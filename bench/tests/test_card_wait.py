@@ -418,7 +418,6 @@ def test_the_scorers_door_entry_name_agrees_with_the_harness():
     from kube_agents_bench import scoring
 
     assert scoring.A2A_DOOR_SEND_EVENT == harness._A2A_DOOR_SEND_ENTRY
-    assert scoring.is_next_lane_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
     assert not scoring.is_inject_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
 
 
