@@ -2872,9 +2872,10 @@ print("true" if ((values.get("githubMinter") or {}).get("enabled") is True) else
 # absent): a live true the key does not record would be disarmed by the apply,
 # its members destroyed and the broker put on the ambient credential, so it
 # weighs like a cap off the default, an armed pool alone included. The members
-# list is derived from the scope and is not compared, and neither is
-# spec.scope.hold: an operator's pause, which no install.env key carries and
-# the chart never renders, so Helm's three-way patch leaves it on the CR.
+# list is derived from the scope and is not compared. spec.hold, an operator's
+# pause, sits outside spec.scope and is not read here: no install.env key
+# carries it, the chart never renders it, and Helm's three-way patch leaves it
+# on the CR.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a

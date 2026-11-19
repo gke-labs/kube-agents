@@ -19207,7 +19207,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(1, len(self.upstream_requests))
 
     def test_the_get_credentials_check_is_refused_for_a_held_cluster(self):
-        # spec.scope.hold answers on the same route, under its own rule, and
+        # spec.hold answers on the same route, under its own rule, and
         # the cluster's describe without the header stays a control-plane read.
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
@@ -22910,7 +22910,7 @@ class ExcludedClusterPathTest(unittest.TestCase):
                 self.assertNotIn("ExcludedCluster", result.stderr)
 
     def hold(self, document):
-        """Rewrite hold.json, as an edit to spec.scope.hold lands in its ConfigMap mount."""
+        """Rewrite hold.json, as an edit to spec.hold lands in its ConfigMap mount."""
         text = json.dumps(document)
         self.hold_file.write_text(text, encoding="utf-8")
         stamp = time.time_ns() + 1_000_000 * len(text)

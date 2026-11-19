@@ -57,7 +57,7 @@ type Config struct {
 	// Exclusions refuses every request to a cluster spec.scope.exclude.clusters names,
 	// before policy, cache or upstream; nil excludes nothing.
 	Exclusions *Exclusions
-	// Holds refuses every request to a cluster spec.scope.hold names, at the same point;
+	// Holds refuses every request to a cluster spec.hold names, at the same point;
 	// nil holds nothing.
 	Holds *Holds
 	// CallerPartition names the upstream credential an authenticated caller's requests use,

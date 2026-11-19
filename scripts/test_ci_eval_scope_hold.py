@@ -81,7 +81,7 @@ class ApplyRestoreTest(unittest.TestCase):
     def test_an_install_without_the_field_runs_the_case_unheld(self):
         result, _ = self.run_functions(3, "scope_hold_apply case-x '{}'; echo rc=$?")
         self.assertIn("rc=0", result.stdout, result.stderr)
-        self.assertIn("has no spec.scope.hold", result.stdout)
+        self.assertIn("has no spec.hold", result.stdout)
 
     def test_a_hold_that_did_not_take_effect_stops_the_case(self):
         result, _ = self.run_functions(1, "scope_hold_apply case-x '{}'; echo rc=$?")

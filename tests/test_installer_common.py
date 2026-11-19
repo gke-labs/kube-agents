@@ -4624,10 +4624,10 @@ class PreApplyScopeCheckTest(unittest.TestCase):
             ("no PlatformAgent", '{"items":[]}'),
             ("a CR without a scope block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{}}]}'),
             ("a present but empty block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{}}}]}'),
-            # spec.scope.hold is an operator's pause the chart never renders and
-            # Helm's patch leaves alone: not a declaration the apply would replace.
-            ("a hold alone", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":'
-                             '{"maxProjects":100,"hold":{"all":true,"reason":"INC-1"}}}}]}'),
+            # spec.hold is an operator's pause outside spec.scope that the chart
+            # never renders and Helm's patch leaves alone: not part of the declaration.
+            ("a hold alone", '{"items":[{"metadata":{"name":"platform-agent"},"spec":'
+                             '{"hold":{"all":true,"reason":"INC-1"}}}]}'),
         ):
             with self.subTest(case=label):
                 proc = self._run(cr, "norelease")
@@ -4761,8 +4761,8 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         for keys in ({}, {"SCOPE_PROJECTS": "p2-project"}, {"SCOPE_PROJECTS": "p2-project p3-project p4-project"}):
             with self.subTest(keys=keys):
                 self._assert_rc(self._run(_LIVE_SCOPE_CR, record, keys=keys), 0)
-        held = _LIVE_SCOPE_CR.replace('"spec":{"scope":{', '"spec":{"scope":{"hold":{"clusters":[{"projectId":"p2-project",'
-                                      '"location":"us-central1","clusterName":"c2"}]},')
+        held = _LIVE_SCOPE_CR.replace('"spec":{"scope":{', '"spec":{"hold":{"clusters":[{"projectId":"p2-project",'
+                                      '"location":"us-central1","clusterName":"c2"}]},"scope":{')
         self.assertNotEqual(held, _LIVE_SCOPE_CR)
         self._assert_rc(self._run(held, record), 0)
 

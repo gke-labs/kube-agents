@@ -63,6 +63,27 @@ type PlatformAgentSpec struct {
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 
+	// Hold pauses the agents' access to clusters' Kubernetes APIs without taking
+	// them out of scope: an operator's lever for an incident, set with kubectl
+	// patch and lifted by removing it. The credential broker and kube-proxy
+	// refuse a held cluster's API to every caller, on the routes
+	// spec.scope.exclude.clusters is refused on, and the refusal names the hold
+	// and its reason so the agent reports it and stops rather than working
+	// around it. A Cluster Agent task that targets a held cluster is refused for
+	// every command, metadata reads included; the Platform Agent's own reads of
+	// the GKE control plane for it (the project's cluster list, a describe) stay
+	// allowed. Unlike an exclusion, a held cluster keeps its Cluster Agent
+	// profile and its place in fleet answers and audits, and nothing restarts:
+	// the operator renders the hold into the <name>-hold ConfigMap, which no
+	// pod-template hash covers, the kubelet syncs the mounted file (usually
+	// within a minute or two), and both components re-read it on the next
+	// request. Like an exclusion it is checked when a request starts: a watch, a
+	// followed log, or an exec, attach or port-forward stream opened before the
+	// hold reached them keeps running until it ends. The installer does not
+	// carry it: an upgrade keeps the live value.
+	// +optional
+	Hold *HoldSpec `json:"hold,omitempty"`
+
 	// Storage sizes the agent's /opt/data volume and the shell sandbox's data
 	// volume.
 	// +optional
@@ -116,6 +137,30 @@ type TierMember struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +required
 	Tier string `json:"tier"`
+}
+
+// HoldSpec names the clusters whose Kubernetes API the agents must not reach
+// until an operator lifts the hold.
+type HoldSpec struct {
+	// All holds every cluster, the one the harness runs in included.
+	// +optional
+	All bool `json:"all,omitempty"`
+
+	// Clusters holds single clusters by the full triple, matched as
+	// spec.scope.exclude.clusters entries are.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	Clusters []ScopeClusterRef `json:"clusters,omitempty"`
+
+	// Reason is shown in every refusal, so the agent can tell its user why
+	// the cluster is paused (an incident link, a change window).
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // PlatformAgentStorageSpec sizes the agent's persistent data volumes.
@@ -255,47 +300,6 @@ type ScopeSpec struct {
 	// contributed.
 	// +optional
 	Exclude *ScopeExcludeSpec `json:"exclude,omitempty"`
-
-	// Hold pauses the agents' access to clusters without taking them out of
-	// scope: an operator's lever for an incident, set with kubectl patch and
-	// lifted by removing the entry (or the whole block). The credential broker
-	// and kube-proxy refuse every route to a held cluster's Kubernetes API, for
-	// every caller, as they do for spec.scope.exclude.clusters, and the
-	// refusal names the hold and its reason so the agent reports it and stops
-	// rather than working around it. Unlike exclude, a held cluster keeps its
-	// Cluster Agent profile and its place in fleet answers and audits, and
-	// nothing restarts: the operator renders the hold into a ConfigMap of its
-	// own that no pod-template hash covers, the kubelet syncs the mounted
-	// file (usually within a minute), and both components re-read it on the
-	// next request. Reads of the GKE control plane stay allowed, as with
-	// exclude. The installer does not carry it: an upgrade keeps the live
-	// value.
-	// +optional
-	Hold *ScopeHoldSpec `json:"hold,omitempty"`
-}
-
-// ScopeHoldSpec names the clusters whose Kubernetes API the agents must not
-// reach until an operator lifts the hold.
-type ScopeHoldSpec struct {
-	// All holds every cluster, the one the harness runs in included.
-	// +optional
-	All bool `json:"all,omitempty"`
-
-	// Clusters holds single clusters by the full triple, matched as
-	// spec.scope.exclude.clusters entries are.
-	// +kubebuilder:validation:MaxItems=100
-	// +listType=map
-	// +listMapKey=projectId
-	// +listMapKey=location
-	// +listMapKey=clusterName
-	// +optional
-	Clusters []ScopeClusterRef `json:"clusters,omitempty"`
-
-	// Reason is shown in every refusal, so the agent can tell its user why
-	// the cluster is paused (an incident link, a change window).
-	// +kubebuilder:validation:MaxLength=256
-	// +optional
-	Reason string `json:"reason,omitempty"`
 }
 
 // ScopeExcludeSpec names what the scope must never manage or read.

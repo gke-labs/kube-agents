@@ -395,7 +395,7 @@ readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
 readonly EVAL_SCOPE_READ_ATTEMPTS=3
 # scope_hold_apply (the per-case cluster hold): the exit of
 # kube_agents_bench.scope_hold apply (EXIT_UNSUPPORTED there) for an install
-# whose PlatformAgent API has no spec.scope.hold, which patched nothing.
+# whose PlatformAgent API has no spec.hold, which patched nothing.
 readonly EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run: 600 s, plus the
@@ -2932,15 +2932,15 @@ scope_exclude_restore() { # <label> [settle|repair]
 }
 
 # The per-case cluster hold. A case that declares `scope_hold:` grades an install
-# whose spec.scope.hold holds the agent's own cluster or every cluster, which
+# whose spec.hold holds the agent's own cluster or every cluster, which
 # refuses every Kubernetes API request to it, so the fan-out runs its repetitions
 # alone, after every other unit (unit_phase 2). bench/kube_agents_bench/scope_hold.py
 # does the work: it patches the CR, saving the hold it replaced on the CR for
 # the EXIT trap's and the next lease's restore, and waits until the operator's
-# <agent>-scope-hold ConfigMap carries the hold and the kubelet has had time to
+# <agent>-hold ConfigMap carries the hold and the kubelet has had time to
 # refresh the pods' copies. A hold restarts nothing, so no settle runs. It
 # exits EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED, having patched nothing, on an install
-# whose CRD has no spec.scope.hold; the case then runs on the install as it is
+# whose CRD has no spec.hold; the case then runs on the install as it is
 # and goes red for the behaviour it lacks rather than being recorded as
 # infrastructure. Pinned to AGENT_CLUSTER_CONTEXT as the scope exclusion is.
 
@@ -2960,7 +2960,7 @@ scope_hold_apply() { # <case> <hold-json>
   case "${rc}" in
     0) return 0 ;;
     "${EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED}")
-      echo "Scope hold (${name}): the install's PlatformAgent API has no spec.scope.hold; the case runs on the install as it is and is graded"
+      echo "Scope hold (${name}): the install's PlatformAgent API has no spec.hold; the case runs on the install as it is and is graded"
       return 0 ;;
   esac
   echo "WARNING: Scope hold (${name}): the hold ${hold} did not take effect on platformagent/${AGENT_SERVICE_NAME}" >&2

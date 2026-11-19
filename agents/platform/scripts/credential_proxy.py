@@ -15790,6 +15790,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
             # A task whose target the install excludes is refused outright,
             # metadata reads included: the gateway should never have granted it.
+            # A task whose target an operator holds (spec.hold) is refused the
+            # same way, every command, through the same check.
             if principal.task_target is not None:
                 try:
                     target = principal.task_target
@@ -16378,7 +16380,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self.exclusions.check(segments[2], segments[4], segments[6])
             except scope_exclude.ExcludedCluster as exc:
                 LOGGER.warning(
-                    "api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule,
+                    "api scope refusal request_id=%s rule=%s", request_id, exc.rule,
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
                 )
                 self._json(
@@ -17057,7 +17059,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         try:
             self.exclusions.check(target["project"], target["location"], target["cluster"])
         except scope_exclude.ExcludedCluster as exc:
-            LOGGER.warning("watcher k8s excluded cluster request_id=%s rule=%s", request_id, exc.rule)
+            LOGGER.warning("watcher k8s scope refusal request_id=%s rule=%s", request_id, exc.rule)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -18482,15 +18484,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _refuse_excluded_cluster(
         self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,
     ) -> None:
-        """Answer a request whose cluster the install's scope excludes (scope_exclude).
+        """Answer a request whose cluster the install excludes or an operator holds
+        (scope_exclude: spec.scope.exclude.clusters, spec.hold).
 
-        Its own rule id, like the pool's refusal, so the agent can say the
-        cluster is out of scope rather than that a policy blocked it. The
-        message names only the target's three name parts, each already held to
-        the GKE context grammar, and the cap bounds the line regardless.
+        Its own rule id (exc.rule: scope.excluded-cluster, scope.held-cluster, or
+        their -unreadable forms), like the pool's refusal, so the agent can say
+        the cluster is out of scope or on hold rather than that a policy blocked
+        it; the log line is labelled by that rule. The message names only the
+        target's three name parts, each already held to the GKE context grammar,
+        and a hold's reason, which the operator wrote and scope_exclude keeps to
+        one printable line; the cap bounds the line regardless.
         """
         LOGGER.warning(
-            "excluded cluster refused request_id=%s rule=%s reason=%s",
+            "scope refusal request_id=%s rule=%s reason=%s",
             request_id,
             exc.rule,
             _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),

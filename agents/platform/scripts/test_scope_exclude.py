@@ -130,7 +130,7 @@ class ExclusionsTest(unittest.TestCase):
 
 
 class HoldsTest(unittest.TestCase):
-    """spec.scope.hold: hold.json, refused through Exclusions like an exclusion."""
+    """spec.hold: hold.json, refused through Exclusions like an exclusion."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -159,7 +159,7 @@ class HoldsTest(unittest.TestCase):
         exc = self.refused(exclusions, "payments-staging", "us-central1", "scratch")
         self.assertIsInstance(exc, ExcludedCluster)
         self.assertEqual(RULE_HELD_CLUSTER, exc.rule)
-        for phrase in ("spec.scope.hold", "INC-42 rollback", "report this and stop", "scratch (payments-staging, us-central1)"):
+        for phrase in ("spec.hold", "INC-42 rollback", "report this and stop", "scratch (payments-staging, us-central1)"):
             self.assertIn(phrase, str(exc))
         exclusions.check("payments-staging", "us-central1", "other")
         exclusions.check("payments-staging", "us-central1-a", "scratch")

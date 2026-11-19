@@ -226,22 +226,24 @@ reconcile prunes nothing for them. The validator refuses a slot the catalogue do
 excludes every slot. devops-bench ignores the key.
 
 `scope_hold` is for a case whose precondition is an install that holds a cluster
-(`spec.scope.hold`): `scope_hold: {agent_cluster: true, reason: <text>}` holds the install's own
+(`spec.hold`): `scope_hold: {agent_cluster: true, reason: <text>}` holds the install's own
 host cluster, read from `AGENT_CLUSTER_CONTEXT`, so the case needs no seeded fleet, and
 `all: true` holds every cluster; at least one of the two is a bare `true`, and the reason is one
 line of at most `MAX_REASON_CHARS` (`bench/kube_agents_bench/scope_hold.py`). The runner
 (`hack/ci-eval-pr.sh`, `scope_hold_apply`) runs the case's repetitions alone, after every other
 unit and after the `scope_exclude` cases, because a hold refuses every Kubernetes API request to
 the held cluster. A hold restarts nothing, so there is no reconcile to wait for: the helper patches
-the CR, waits until the operator's `<agent>-scope-hold` ConfigMap carries the hold, then waits
+the CR, waits until the operator's `<agent>-hold` ConfigMap carries the hold, then waits
 `PROPAGATION_SECONDS` for the kubelet to refresh the copy the proxy and broker read. The hold it
 replaced is saved on the CR, so the EXIT trap and the next lease restore it after a run that died
 first. A hold that does not take effect is recorded as infrastructure. On an install whose
-PlatformAgent CRD has no `spec.scope.hold` the helper patches nothing and the case runs on the
+PlatformAgent CRD has no `spec.hold` the helper patches nothing and the case runs on the
 install as it is, graded: the behaviour is missing, which is the case's red, not an
 infrastructure failure. For a local run, `python -m kube_agents_bench.scope_hold apply --task
 tasks/<id>/task.yaml --context <ctx> --namespace <ns> --name <cr>` before devops-bench and
-`restore` with the same flags after. The validator refuses a malformed value and a case that
+`python -m kube_agents_bench.scope_hold restore --context <ctx> --namespace <ns> --name <cr> [--wait]`
+after (restore takes no `--task`; `--wait` also waits `PROPAGATION_SECONDS` for the lift to reach
+the pods). The validator refuses a malformed value and a case that
 declares both `scope_hold` and `scope_exclude`. devops-bench ignores the key.
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
@@ -701,7 +703,7 @@ compares a known boolean field such as `spec.suspend` to the string `"true"` or 
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
 descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters and an optional `absent` from 1 to `MAX_ABSENT`, names a slot
-`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a `scope_hold:` that is not `{agent_cluster: true, all: true, reason: ...}` with one flag true and a one-line reason, or sits beside a `scope_exclude:`, a case that is registered nowhere, and a file that writes one key twice in
+`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a `scope_hold:` that is not `{agent_cluster: true, all: true, reason: ...}` with at least one flag a bare true and a one-line reason, or sits beside a `scope_exclude:`, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`

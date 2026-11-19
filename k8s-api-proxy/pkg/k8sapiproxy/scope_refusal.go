@@ -10,7 +10,7 @@ import "net/http"
 const contentTypeTextPlain = "text/plain; charset=utf-8"
 
 // scopeRefusalReasons are the install-wide cluster refusals answered before the request
-// is classified (spec.scope.exclude.clusters and spec.scope.hold).
+// is classified (spec.scope.exclude.clusters and spec.hold).
 var scopeRefusalReasons = map[RejectionReason]bool{
 	ReasonExcludedCluster:   true,
 	ReasonExcludeUnreadable: true,

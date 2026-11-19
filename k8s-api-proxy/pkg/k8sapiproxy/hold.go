@@ -7,9 +7,10 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"unicode"
 )
 
-// Rejection reasons for spec.scope.hold, named as the credential broker names its rules
+// Rejection reasons for spec.hold, named as the credential broker names its rules
 // (scope_exclude.py), so one install's refusals read the same on both.
 const (
 	ReasonHeldCluster    RejectionReason = "scope.held-cluster"
@@ -17,6 +18,9 @@ const (
 )
 
 const (
+	// holdReasonMaxRunes is the CRD's cap on spec.hold.reason; the proxy holds the
+	// reason it quotes to it too, as the broker does (scope_exclude.py).
+	holdReasonMaxRunes  = 256
 	holdUndecidedNotice = ", so kube-proxy can't tell whether this cluster is on hold and reaches no cluster until it can."
 	holdStopNotice      = " An operator paused agent access to it; report this and stop, do not retry or work around it."
 )
@@ -26,7 +30,7 @@ var (
 	errHoldUnparsed   = errors.New("the install's hold file can't be parsed")
 )
 
-// Holds is the proxy's view of spec.scope.hold, read from the hold.json the operator
+// Holds is the proxy's view of spec.hold, read from the hold.json the operator
 // mounts from a ConfigMap of its own and re-read when the file changes, so a hold applies
 // without restarting anything. A held cluster is refused exactly as an excluded one is
 // (Exclusions): matching is exact on project, location and cluster, in-cluster is checked
@@ -100,7 +104,7 @@ func parseHolds(path string) (holdState, error) {
 		state.all = *doc.All
 	}
 	if doc.Reason != nil {
-		state.reason = strings.TrimSpace(*doc.Reason)
+		state.reason = normaliseHoldReason(*doc.Reason)
 	}
 	return state, nil
 }
@@ -112,7 +116,7 @@ func (h *Holds) check(clusterID string) *PolicyError {
 		return excludeRefusal(ReasonHoldUnreadable, err.Error()+holdUndecidedNotice)
 	}
 	if state.all {
-		return excludeRefusal(ReasonHeldCluster, "every cluster is on hold (spec.scope.hold.all)"+state.reasonSuffix()+"."+holdStopNotice)
+		return excludeRefusal(ReasonHeldCluster, "every cluster is on hold (spec.hold.all)"+state.reasonSuffix()+"."+holdStopNotice)
 	}
 	if len(state.refs) == 0 {
 		return nil
@@ -132,7 +136,7 @@ func (h *Holds) check(clusterID string) *PolicyError {
 	ref := clusterRef{m[1], m[2], m[3]}
 	switch {
 	case state.refs[ref], state.numbered[[2]string{ref.location, ref.cluster}]:
-		return excludeRefusal(ReasonHeldCluster, fmt.Sprintf("cluster %s (%s, %s) is on hold (spec.scope.hold)%s.%s",
+		return excludeRefusal(ReasonHeldCluster, fmt.Sprintf("cluster %s (%s, %s) is on hold (spec.hold)%s.%s",
 			ref.cluster, ref.project, ref.location, state.reasonSuffix(), holdStopNotice))
 	case excludeProjectNumber.MatchString(ref.project):
 		return excludeRefusal(ReasonHeldCluster, fmt.Sprintf(
@@ -147,4 +151,21 @@ func (s holdState) reasonSuffix() string {
 		return ""
 	}
 	return ": " + s.reason
+}
+
+// normaliseHoldReason keeps the operator's reason to one printable line in a refusal:
+// control characters (newlines included) dropped, surrounding space trimmed, and at
+// most holdReasonMaxRunes runes, as the broker's parse_holds does.
+func normaliseHoldReason(reason string) string {
+	kept := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, reason)
+	runes := []rune(strings.TrimSpace(kept))
+	if len(runes) > holdReasonMaxRunes {
+		runes = runes[:holdReasonMaxRunes]
+	}
+	return string(runes)
 }

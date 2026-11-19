@@ -1894,9 +1894,9 @@ platformAgent:
   # The credential broker and kube-proxy refuse every route to an excluded
   # cluster's Kubernetes API; the project's cluster list and a cluster's
   # describe stay readable. Spell the project by its ID.
-  # spec.scope.hold, an operator's pause on clusters, is not a value here: set
-  # it on the PlatformAgent with kubectl patch; the chart never renders it, so
-  # an upgrade leaves it in place.
+  # spec.hold, an operator's pause on clusters, is not a chart value: set it on
+  # the PlatformAgent with kubectl patch; the chart never renders it, so an
+  # upgrade leaves it in place.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the

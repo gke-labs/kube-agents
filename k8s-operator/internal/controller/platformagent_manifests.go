@@ -581,17 +581,13 @@ type scopeExcludeDeclaration struct {
 // `present` flag tells a CR with no block (false) from one whose block is present
 // but empty (true): an empty block and a block whose every list is empty render the
 // same bytes, and a missing block renders differently by that one field.
-//
-// spec.scope.hold is not rendered here (scopeForDeclaration): it rides in its own
-// ConfigMap (buildScopeHoldConfigMap), so that holding a cluster rolls no pod.
 func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
-	declared := scopeForDeclaration(agent)
-	scope := declared
+	scope := agent.Spec.Scope
 	if scope == nil {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
-		Present:        declared != nil,
+		Present:        agent.Spec.Scope != nil,
 		Projects:       append([]string{}, scope.Projects...),
 		Folders:        append([]string{}, scope.Folders...),
 		Organizations:  append([]string{}, scope.Organizations...),
