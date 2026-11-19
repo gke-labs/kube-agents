@@ -421,10 +421,39 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # One file per test file, not one for the sweep, so a test that writes a
 # context into its KUBECONFIG cannot hand it to a file running beside it.
 #
+# Each file also runs with a stand-in gcloud first on PATH, in a folder of its
+# own. A test that runs gcloud with no stub of its own gets the stand-in: it
+# appends its arguments as one line to `calls` in that folder, says so on
+# stderr and fails with the code tests/testing/no_live_gcloud.py uses. A record
+# that is not empty fails the file, also when its tests passed, because a test
+# that tolerates the failure here runs the real gcloud, with the developer's
+# login, on a machine that has one. The file's block shows the count and the
+# first calls only: an argument can hold a project id or an account name. The
+# two files and the folder are removed after the file's run, on a failure too.
+# Not seen: a test that builds a PATH of its own without this folder, one that
+# names gcloud by an absolute path, and a `python3 -m unittest` run outside make.
+# A test's own gcloud ahead on PATH, or a mock, never reaches the stand-in.
+#
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
 # a single quote. It also must not contain a comma: $(call) splits arguments on
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
 # arrive silently truncated at the comma. Both callers avoid each.
+
+# How many recorded gcloud calls a file's block shows.
+PYTHON_TEST_GCLOUD_SHOWN := 5
+# The stand-in's exit code: STAND_IN_EXIT_CODE of tests/testing/no_live_gcloud.py.
+PYTHON_TEST_GCLOUD_EXIT := 97
+# The line in a file's block above the calls the stand-in recorded.
+PYTHON_TEST_GCLOUD_HEADER := gcloud ran with no stub of its own in this file
+# The stand-in, as a printf format for the worker below, which sits inside
+# single quotes and then inside double quotes: \043 is the hash sign, \042 a
+# double quote, \044 a dollar sign, %% a percent sign. It writes:
+#   #!/bin/sh
+#   printf "%s\n" "$*" >>"${0%/*}/calls"
+#   echo "gcloud is not available in the test sweep: stub it in the test" >&2
+#   exit 97
+PYTHON_TEST_GCLOUD_STAND_IN := \043!/bin/sh\nprintf \042%%s\\\\n\042 \042\044*\042 >>\042\044{0%%/*}/calls\042\necho \042gcloud is not available in the test sweep: stub it in the test\042 >&2\nexit $(PYTHON_TEST_GCLOUD_EXIT)\n
+
 define sweep_python_test_files
 work=$$(mktemp -d); \
 trap 'rm -rf "$$work"' EXIT INT TERM; \
@@ -439,11 +468,22 @@ xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
 	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
 	     : >"$$stem.kubeconfig" && export KUBECONFIG="$$stem.kubeconfig" && \
+	     mkdir "$$stem.gcloud" && \
+	     printf "$(PYTHON_TEST_GCLOUD_STAND_IN)" >"$$stem.gcloud/gcloud" && \
+	     chmod +x "$$stem.gcloud/gcloud" && export PATH="$$stem.gcloud:$$PATH" && \
 	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
-		rc=0; printf "    ok  %s\n" "$$file"; \
+		rc=0; \
 	else \
-		rc=1; printf "  FAIL  %s\n" "$$file"; \
+		rc=1; \
 	fi; \
+	if [ -s "$$stem.gcloud/calls" ]; then \
+		rc=1; \
+		{ echo "$(PYTHON_TEST_GCLOUD_HEADER): $$(wc -l <"$$stem.gcloud/calls" | tr -d " ") call(s). The first $(PYTHON_TEST_GCLOUD_SHOWN) at most:"; \
+		  head -n $(PYTHON_TEST_GCLOUD_SHOWN) "$$stem.gcloud/calls" | sed "s/^/  gcloud /"; } >>"$$stem.log"; \
+	fi; \
+	rm -f "$$stem.gcloud/gcloud" "$$stem.gcloud/calls"; \
+	rmdir "$$stem.gcloud" 2>/dev/null; \
+	if [ "$$rc" = "0" ]; then printf "    ok  %s\n" "$$file"; else printf "  FAIL  %s\n" "$$file"; fi; \
 	echo "$$rc" >"$$stem.rc" \
 ' _ {} <"$$work/shard.list"; \
 echo; \
