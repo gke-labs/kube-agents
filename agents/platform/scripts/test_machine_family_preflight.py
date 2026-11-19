@@ -651,6 +651,200 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(rc2, preflight.EXIT_READ_ERROR)
         self.assertIn("VERDICT: ERROR", stdout_buf2.getvalue())
 
+    def test_node_pool_json_cluster_wrapper_empty_object_and_terraform_list_node_config(self):
+        """--node-pool-json fails closed on {}, unwraps cluster nodePools, and unwraps 1-element list node_config."""
+        # 1. Empty object or missing machineType fails closed (EXIT_READ_ERROR = 2) instead of defaulting to e2-medium.
+        code_empty, report_empty = preflight.run_preflight(
+            node_pool_json_sources=["{}"],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_empty, preflight.EXIT_READ_ERROR)
+        self.assertFalse(report_empty["compatible"])
+        self.assertEqual(report_empty["status"], "error")
+        self.assertTrue(report_empty["errors"])
+
+        # 2. A cluster describe object passed to --node-pool-json routes through cluster_doc and nodePools.
+        cluster_wrapper = {
+            "name": "wrapped-cluster",
+            "currentMasterVersion": "1.35.3-gke.1290000",
+            "shieldedNodes": {"enabled": False},
+            "nodePools": [
+                {
+                    "name": "wrapped-pool",
+                    "version": "1.35.3-gke.1290000",
+                    "config": {
+                        "machineType": "n1-standard-4",
+                        "diskType": "pd-standard",
+                    },
+                }
+            ],
+        }
+        code_wrap, report_wrap = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(cluster_wrapper)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_wrap, preflight.EXIT_INCOMPATIBLE)
+        self.assertEqual(report_wrap["cluster"], "wrapped-cluster")
+        wrap_rules = {b["rule"] for b in report_wrap["results"][0]["blockers"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, wrap_rules)
+        self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, wrap_rules)
+
+        # 3. Terraform state / .tf.json node pool with 1-element list node_config and shielded_instance_config.
+        tf_pool = {
+            "name": "tf-list-pool",
+            "version": "1.35.3-gke.1290000",
+            "node_config": [
+                {
+                    "machine_type": "n1-standard-8",
+                    "disk_type": "pd-standard",
+                    "local_ssd_count": 2,
+                    "shielded_instance_config": [
+                        {
+                            "enable_secure_boot": False,
+                            "enable_integrity_monitoring": True,
+                        }
+                    ],
+                }
+            ],
+        }
+        code_tf, report_tf = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(tf_pool)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_tf, preflight.EXIT_INCOMPATIBLE)
+        tf_row = report_tf["results"][0]
+        self.assertEqual(tf_row["source_machine_type"], "n1-standard-8")
+        tf_rules = {b["rule"] for b in tf_row["blockers"]}
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, tf_rules)
+        self.assertIn(preflight.RULE_DISK_PD_ON_HYPERDISK_ONLY, tf_rules)
+        self.assertIn(preflight.RULE_LSSD_UNSUPPORTED_ON_N4, tf_rules)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, tf_rules)
+
+    def test_shielded_instance_config_schema_distinction_kcc_terraform_vs_gke_proto3(self):
+        """KCC and Terraform manifests default omitted enableIntegrityMonitoring to true; GKE Proto3 flags omitted false even with enableVtpm."""
+        # Hand-written KCC ContainerNodePool with enableSecureBoot: true and omitted enableIntegrityMonitoring.
+        kcc_pool = {
+            "spec": {
+                "nodeConfig": {
+                    "machineType": "n1-standard-8",
+                    "diskType": "hyperdisk-balanced",
+                    "shieldedInstanceConfig": {"enableSecureBoot": True},
+                }
+            }
+        }
+        kcc_res = preflight.evaluate_node_pool_transition(kcc_pool, "n4")
+        self.assertTrue(kcc_res.compatible)
+        self.assertEqual(kcc_res.blockers, ())
+
+        # GKE describe pool carrying enableVtpm: true and enableIntegrityMonitoring: true but omitting enableSecureBoot.
+        gke_pool_with_vtpm = {
+            "name": "gke-pool",
+            "config": {
+                "machineType": "n1-standard-8",
+                "diskType": "hyperdisk-balanced",
+                "shieldedInstanceConfig": {
+                    "enableVtpm": True,
+                    "enableIntegrityMonitoring": True,
+                },
+            },
+        }
+        gke_res = preflight.evaluate_node_pool_transition(gke_pool_with_vtpm, "n4")
+        self.assertFalse(gke_res.compatible)
+        gke_rules = {b.rule for b in gke_res.blockers}
+        self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, gke_rules)
+        self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, gke_rules)
+
+    def test_node_pool_json_combined_with_live_cluster_and_location_describes_cluster(self):
+        """Combining --node-pool-json with --cluster and --location calls _describe_cluster_live for cluster checks."""
+        live_cluster_payload = {
+            "name": "live-cluster",
+            "location": "us-central1",
+            "currentMasterVersion": "1.28.5-gke.1000000",
+            "shieldedNodes": {"enabled": False},
+        }
+        candidate_pool = {
+            "name": "candidate-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n2-standard-4",
+                "diskType": "hyperdisk-balanced",
+            },
+        }
+        calls: list[list[str]] = []
+
+        def fake_runner(argv: list[str]) -> tuple[int, str, str]:
+            calls.append(argv)
+            return 0, json.dumps(live_cluster_payload), ""
+
+        code, report = preflight.run_preflight(
+            project="demo-proj",
+            location="us-central1",
+            cluster_name="live-cluster",
+            node_pool_json_sources=[json.dumps(candidate_pool)],
+            target_specs=["n4"],
+            run=fake_runner,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(code, preflight.EXIT_INCOMPATIBLE)
+        self.assertEqual(report["control_plane_version"], "1.28.5-gke.1000000")
+        rules = {b["rule"] for b in report["results"][0]["blockers"]}
+        self.assertIn(preflight.RULE_SHIELDED_NODES_DISABLED, rules)
+        self.assertIn(preflight.RULE_GKE_MASTER_VERSION_FLOOR, rules)
+
+        # Partial live flags (--cluster without --location) alongside --node-pool-json fail closed.
+        code_partial, report_partial = preflight.run_preflight(
+            cluster_name="live-cluster",
+            node_pool_json_sources=[json.dumps(candidate_pool)],
+            target_specs=["n4"],
+            run=fake_runner,
+        )
+        self.assertEqual(code_partial, preflight.EXIT_READ_ERROR)
+        self.assertTrue(report_partial["errors"])
+
+    def test_target_machine_type_without_target_family_or_with_multiple_families(self):
+        """--target-machine-type narrows the default family when --target-family is omitted and rejects conflicts."""
+        pool = {
+            "name": "lssd-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n2-standard-8",
+                "diskType": "hyperdisk-balanced",
+                "ephemeralStorageLocalSsdConfig": {"localSsdCount": 2},
+            },
+        }
+        # 1. --target-machine-type alone narrows target_families to ['c3'] with shape 'c3-standard-8-lssd'.
+        code_alone, report_alone = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(pool)],
+            target_machine_type="c3-standard-8-lssd",
+        )
+        self.assertEqual(code_alone, preflight.EXIT_OK)
+        self.assertEqual(report_alone["target_families"], ["c3"])
+        self.assertEqual(
+            report_alone["results"][0]["target_machine_type"],
+            "c3-standard-8-lssd",
+        )
+
+        # 2. --target-family c3,c4 --target-machine-type c3-standard-8-lssd applies the shape to c3 and keeps c4.
+        code_multi, report_multi = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(pool)],
+            target_specs=["c3,c4"],
+            target_machine_type="c3-standard-8-lssd",
+        )
+        self.assertEqual(code_multi, preflight.EXIT_INCOMPATIBLE)
+        by_fam = {r["target_family"]: r for r in report_multi["results"]}
+        self.assertTrue(by_fam["c3"]["compatible"])
+        self.assertEqual(by_fam["c3"]["target_machine_type"], "c3-standard-8-lssd")
+        self.assertFalse(by_fam["c4"]["compatible"])
+        self.assertEqual(by_fam["c4"]["target_machine_type"], "")
+
+        # 3. Conflicting concrete shapes between --target-family and --target-machine-type raise ValueError.
+        with self.assertRaises(ValueError):
+            preflight.run_preflight(
+                node_pool_json_sources=[json.dumps(pool)],
+                target_specs=["c3-standard-8,c3-standard-8-lssd"],
+                target_machine_type="c3-highcpu-8",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
