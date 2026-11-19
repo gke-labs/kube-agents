@@ -172,9 +172,30 @@ Replace the paths with your own. As in every host, the entry carries no token: t
 
 ### Antigravity CLI
 
-<!-- AGY: pending -->
+Add the bridge with `agy mcp add`. Flags come before the server's name:
+
+```bash
+agy mcp add -e PATH="$HOME/google-cloud-sdk/bin:/usr/local/bin:/usr/bin:/bin" \
+  kube-agents "$(command -v kube-agents-mcp)"
+agy mcp list
+```
+
+`agy mcp list` should show `kube-agents` as an enabled stdio server. The `PATH` advice is the same as for [Claude Code](#claude-code); add `KUBECONFIG` or `KUBE_AGENTS_MCP_CONFIG` with further `-e` flags.
+
+A run in print mode (`agy --print`) cannot ask you to approve a tool, so it denies every kube-agents call unless an allow rule names it. Pass the rules for the session with `--settings`, one `mcp(<server>/<tool>)` entry per tool:
+
+```bash
+agy --print "Call the kube-agents connection_status tool." \
+  --settings '{"permissions":{"allow":["mcp(kube-agents/connection_status)","mcp(kube-agents/send_message)","mcp(kube-agents/task_control)","mcp(kube-agents/poll_events)"]}}'
+```
+
+:::caution
+With `agy` 1.5.12, `connection_status` returns, but `send_message`, `task_control` and `poll_events` calls do not return their results to `agy`, although the install completes the turn. Until that is fixed, read a turn's answer from another host, such as Claude Code, with `task_control` and the task the call reported.
+:::
 
 ### Antigravity editor
+
+This configuration has not yet been checked against a live install from the editor; the bridge side is the same as for the other hosts.
 
 Antigravity reads MCP servers from an `mcp_config.json` file: `~/.gemini/config/mcp_config.json` for every project, or `.agents/mcp_config.json` in a workspace for that workspace alone. In the editor, the agent panel's menu opens it under **Manage MCP Servers**, then **View raw config**. Add a `kube-agents` entry to its `mcpServers` object:
 
