@@ -359,6 +359,24 @@ one), this server for a watcher session on its first inject (`drift` or `event`)
 session with no `origin` resolves as `other`. `GET /v1/sessions/{id}/origin` follows compression
 parents, so a rotated session id keeps its parent's origin.
 
+#### `session_eval_runs`
+
+```sql
+CREATE TABLE session_eval_runs(     -- PUT/GET /v1/sessions/{id}/eval-run
+  session_id TEXT PRIMARY KEY,
+  eval_run TEXT NOT NULL,           -- <run>/<case>/<rep>
+  recorded_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The eval run, case and repetition an API turn's session belongs to, as the harness sent it in
+`X-Kube-Agents-Eval-Run`. The API server writes it only while the install has
+`KUBEAGENTS_EVAL_RUN_TAGS` on (`deploy/docker/patches/eval_run_tag.py`). The first write wins:
+`PUT` answers the tag the session keeps. `GET` follows compression parents, as the origin route
+does, and answers 404 when the session has none. The table is created on the first write and
+`session_metadata` is not touched. The tag of each card is in `kanban.db`, in the side table
+`kanban_task_eval_runs` beside `kanban_task_origins`.
+
 #### Work-origin tables
 
 Three tables hold the origin of work that is not a session. `cleanup_old_records` leaves the first
