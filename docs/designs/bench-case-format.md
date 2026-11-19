@@ -143,7 +143,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `gateway_plugins_as_shipped`, `findings_item_state`, `oobe_audits_started`, `oobe_audits_ended`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -431,7 +431,13 @@ holds a name for) against the gateway's platform profile copy, the one `skill_ma
 authored under a new name) are reported, not failed, and no lane sets either target aside. A stack that runs Python in the sandbox does it as
 root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
 no `__pycache__` in the reference tree for this check to read as an edit. The check
-still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
+still flags a cache file that appears anyway, since a `.pyc` is code. `gateway_plugins_as_shipped` execs into the
+same agent container and requires each plugin directory the image ships under `/opt/defaults/plugins` to be on the
+agent's data volume at `/opt/data/plugins`, a real directory owned by the agent's user and (outside the pinned
+`hermes_otel`, whose directory carries its own state) matching the image; a missing, symlinked, differing or
+foreign-owned plugin fails (an entry beside the image's that the image does not ship is reported, not failed: the
+entrypoint copies without pruning, so an image change leaves one on an older volume), and the script's own count of
+the image's plugin directories must match the units it read. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
