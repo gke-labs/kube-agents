@@ -856,6 +856,13 @@ GCHAT_SUB = {
     "thread_id": "spaces/H/threads/T",
     "delivery_mode": "notify+wake",
 }
+CONSOLE_SUB = {
+    "task_id": "t_e0c1",
+    "platform": "console",
+    "chat_id": "a2a-ctx-1",
+    "thread_id": "console:tab-1#task-7",
+    "delivery_mode": "notify+wake",
+}
 
 
 class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
@@ -1042,6 +1049,7 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
             chat_route=lambda adapter: callable(getattr(adapter, "send_chat", None)),
             CHAT_METADATA_KEY="kage_chat",
             ANSWER_METADATA_KEY="kage_answer",
+            REPORT_METADATA_KEY="kage_report",
         )
         gateway = sys.modules["gateway"]
         gateway.kanban_chat_notify = notify
@@ -1055,6 +1063,19 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         self.assertEqual(adapter.sent[-1][1], "Both pods are up. Seeded-a runs two.")
         self.assertEqual(adapter.metadata[-1]["kage_chat"],
                          {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
+
+    async def test_the_report_post_alone_is_marked_as_the_report(self):
+        # The console stand-in cannot edit, so every progress note is a post of
+        # its own naming the same task; the gateway keeps only the marked one.
+        for sub in (CONSOLE_SUB, SLACK_SUB):
+            adapter = _ChatNotifyStandIn()
+            await self._run(adapter, sub, "completed", "Both pods are up. Seeded-a runs two.")
+            self.assertIs((adapter.metadata[-1] or {}).get("kage_report"), True, sub["platform"])
+            for earlier in adapter.metadata[:-1]:
+                self.assertNotIn("kage_report", earlier or {}, sub["platform"])
+        adapter = _ChatNotifyStandIn()
+        await self._run(adapter, CONSOLE_SUB, "gave_up", "The card gave up.")
+        self.assertNotIn("kage_report", adapter.metadata[-1] or {})
 
     async def test_a_google_chat_card_under_next_carries_its_answer_too(self):
         # The gateway lays the answer out on Google Chat under next; under today

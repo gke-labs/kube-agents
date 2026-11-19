@@ -82,6 +82,10 @@ const (
 	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
 	usageCounterNegativeFeedback      = "negativeFeedbackTotal"
 	usageCounterPositiveFeedback      = "positiveFeedbackTotal"
+	// The two ratings of the posts the agent made on its own (alerts and
+	// scheduled or audit reports), kept apart from the answer ratings above.
+	usageCounterAutonomousNegativeFeedback = "autonomousNegativeFeedbackTotal"
+	usageCounterAutonomousPositiveFeedback = "autonomousPositiveFeedbackTotal"
 	// The three inference totals, read from the LiteLLM pods: the tokens in
 	// and out, and the spend in micro-dollars (usageSpendMicrosPerUSD).
 	usageCounterInputTokens  = "inputTokensTotal"
@@ -124,14 +128,14 @@ var (
 	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
 	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
 	// usageA2AChatCounters are the counters the A2A gateway's body feeds: the
-	// chat counter, the chat sessions, the errored turns and the two answer
-	// ratings through its own families, and not the board's gave_up cards,
-	// which the chat_metrics listener alone serves; asking would seed an idle
-	// entry per A2A pod and name the field in that pod's Warning. The
-	// thumbs-ups are the A2A gateway's alone: the Hermes gateway's reaction
-	// hook counts thumbs-downs only, so usageChatCounters does not ask for
-	// them.
-	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterNegativeFeedback, usageCounterPositiveFeedback}
+	// chat counter, the chat sessions, the errored turns, the two answer
+	// ratings and the two post ratings through its own families, and not the
+	// board's gave_up cards, which the chat_metrics listener alone serves;
+	// asking would seed an idle entry per A2A pod and name the field in that
+	// pod's Warning. The thumbs-ups and the post ratings are the A2A
+	// gateway's alone: the Hermes gateway's reaction hook counts thumbs-downs
+	// on answers only, so usageChatCounters does not ask for them.
+	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterNegativeFeedback, usageCounterPositiveFeedback, usageCounterAutonomousNegativeFeedback, usageCounterAutonomousPositiveFeedback}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageExecTierCounters are the broker counters the exec tier's pods move:
 	// the commands they run, refuse or fail. The version-control counters are
@@ -142,7 +146,7 @@ var (
 	// (usageNewerFieldInference), since they arrived in one release.
 	usageLiteLLMCounters = []string{usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterPositiveFeedback, usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterPositiveFeedback, usageCounterAutonomousNegativeFeedback, usageCounterAutonomousPositiveFeedback, usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
 	// usageRetiredCounters are the counters an earlier release kept and this
 	// one does not: migrateUsageDocument drops them from a document.
 	usageRetiredCounters = []string{usageCounterRemediationsMerged, usageCounterRemediationsClosedUnmerged}
@@ -151,13 +155,15 @@ var (
 	// an unreachable fleet cluster through the relay produces every poll on
 	// an install nobody is using; the failed turns, each a failure whose
 	// message already moved the time; and a background card giving up, a
-	// failure, not the agent at work; and a rating either way, a person's
-	// verdict on a message that already moved it; and the three inference
+	// failure, not the agent at work; and a rating either way, of an answer
+	// or of a post the agent made on its own, a person's verdict on a
+	// message, not the agent at work; and the three inference
 	// totals, which memory consolidation and the scheduled jobs move through
 	// LiteLLM with nobody asking, where the turn or command that billed them
 	// has already moved the time when it was activity.
 	usageQuietCounters = map[string]bool{
 		usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true, usageCounterPositiveFeedback: true,
+		usageCounterAutonomousNegativeFeedback: true, usageCounterAutonomousPositiveFeedback: true,
 		usageCounterInputTokens: true, usageCounterOutputTokens: true, usageCounterSpendMicros: true,
 	}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.

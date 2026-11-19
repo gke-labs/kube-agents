@@ -899,7 +899,17 @@ A2A_OPERATOR_ENV_ARGS=()
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
 # budget is sized for one install per GitHub App installation, and every eval
 # project shares one, so concurrent lanes drained its quota and the cases' own
-# forge calls failed with FORGE_RATE_LIMITED (#4611).
+# forge calls failed with FORGE_RATE_LIMITED (#4611). env[5], also on every
+# install, turns the post-merge check on in silent mode: the pr_opened plugin
+# records each fix and the check stores outcomes for the case that grades it
+# (gke-labs/kube-agents#6343), and nothing is posted, so no case meets a GitHub
+# write it did not ask for. env[6] caps each post-merge step at five records a
+# run: the cron ticks every five minutes on every install and reads the forge
+# for each waiting record (none when there are none) on the GitHub App
+# installation every eval project shares (#4611, #6105), so about 60 reads an
+# hour an install. The cap takes effect with #6308, which adds reads_per_tick()
+# and the operator's allowlist entry; before it the name is dropped and each
+# step reads up to its default of 20.
 
 # The shadow-mode replay proxy (on by default; resolved above): the
 # image step 4 builds (cloudbuild-ci.yaml's replay-shadow-proxy step) and the
@@ -2319,6 +2329,10 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[3].value=off" \
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE" \
     --set-string "platformAgent.deployment.env[4].value=false" \
+    --set-string "platformAgent.deployment.env[5].name=KUBEAGENTS_POST_MERGE_CHECK" \
+    --set-string "platformAgent.deployment.env[5].value=silent" \
+    --set-string "platformAgent.deployment.env[6].name=POST_MERGE_READS_PER_TICK" \
+    --set-string "platformAgent.deployment.env[6].value=5" \
     --set "profiles.cluster.enabled=true" \
     --set "profiles.tse.enabled=true" \
     --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \

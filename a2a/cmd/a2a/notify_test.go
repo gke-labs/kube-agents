@@ -440,11 +440,11 @@ func TestNotifyCarriesReplyToOnAConsoleConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := run([]string{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1",
-		"--reply-to", "task-7", "the report"}); err != nil {
+		"--reply-to", "task-7", "--report", "the report"}); err != nil {
 		t.Fatalf("notify: %v", err)
 	}
-	if req := <-got; req.ReplyTo != "task-7" || req.Conversation != "console:tab-1" {
-		t.Errorf("request = %+v, want reply_to task-7 into console:tab-1", req)
+	if req := <-got; req.ReplyTo != "task-7" || req.Conversation != "console:tab-1" || !req.Report {
+		t.Errorf("request = %+v, want reply_to task-7 and report into console:tab-1", req)
 	}
 	for _, args := range [][]string{
 		{"notify", "--platform", "console", "--reply-to", "task-7", "x"},
@@ -453,5 +453,8 @@ func TestNotifyCarriesReplyToOnAConsoleConversation(t *testing.T) {
 		if err := run(args); err == nil || !strings.Contains(err.Error(), "--reply-to") {
 			t.Errorf("%v: err = %v, want a --reply-to refusal", args, err)
 		}
+	}
+	if err := run([]string{"notify", "--platform", "console", "--report", "x"}); err == nil || !strings.Contains(err.Error(), "--report") {
+		t.Errorf("--report without --conversation: err = %v, want a refusal", err)
 	}
 }

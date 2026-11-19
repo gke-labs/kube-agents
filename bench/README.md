@@ -26,6 +26,7 @@ Load and sizing measurements of the harness at fleet scale, as opposed to answer
 - `kube_agents_bench/onboarding.py` — reads the onboarding prioritization stage's `INVENTORY.items.json` off the shell sandbox pod for the `bootstrap_findings` verifier, the raw file's findings block and the hand-off's board state for `bootstrap_handoff`, for `bootstrap_report_read` the archived report there and the delivery job's marker on the agent pod, for `bootstrap_report_criticals` the report and the worker's scores there, for `bootstrap_report_posture` the report there, and for `bootstrap_delivered` the delivery job's run record on the agent pod, through its own exec into each pod.
 - `kube_agents_bench/findings.py` — reads the install's findings queue for the `findings_item_state` verifier: one `kubectl exec` into the agent container that calls the Session KV server's `GET /v1/findings` on the pod's loopback.
 - `kube_agents_bench/incidents.py` — the `workload_incident_folded` verifier, published the same way: reads one workload's rows from the Session KV server's event ledger (`GET /v1/intercepted-events`) on the agent pod.
+- `kube_agents_bench/post_merge.py` — the `post_merge_outcome` verifier, published the same way: merges the agent's fix, applies it, drives the post-merge check's ticks in the agent pod and reads its record and report.
 - `kube_agents_bench/relay.py` — the `relay_posted_as_written` verifier, in its own module and published the same way: reads what the Session KV server stored for a relayed report's threads on the agent pod, against the report the `relay-report` stack posted.
 - `kube_agents_bench/audit_chat_report.py` — the `audit_chat_report_posted` verifier, published the same way: reads what the Session KV server stored for a fired audit job's threads on the agent pod, against the chat report the run's `finish` left on the shell sandbox.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
@@ -178,7 +179,7 @@ own lane and no roster file: a validated-capabilities case is an ordinary case u
 whose `task.yaml` carries the bare line `suite: validated-capabilities`, and that line is its registration.
 `EVAL_TIER=validated-capabilities` in `hack/ci-eval-pr.sh` runs every such case and nothing else, in case-id
 order (a section other than 1 is the bare line `suite_part: N`; `EVAL_VALIDATED_CAPABILITIES_PART=N`
-runs one section, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
+runs one section, one Prow periodic per section, on a Saturday and Sunday cron and on Rerun from Deck),
 and no pull request and no nightly runs a case carrying the line. The lane greps for the two lines,
 so `scripts/validate_bench_cases.py` refuses any other spelling of them (a quoted value, a trailing
 comment), a suite case that a roster file also names, and a parked case (`FIXTURE_NOT_READY`,
