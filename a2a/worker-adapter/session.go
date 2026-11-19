@@ -341,6 +341,26 @@ func (w *taskWatcher) unreadable(subject, what string, cause error) error {
 // No authority block at all is an older gateway's or a hand-run task's, and
 // is no wake. One that does not parse is treated as a wake: the tool is the
 // thing to withhold when the submission cannot be read.
+// isWakeFor reports whether origin is a wake on session: the gateway sets
+// `via.session` on a wake to the session it wakes (gateway/delegation.go,
+// wakeSession), and on a delegated child to the session that delegated, which
+// is never the child's own. A wake's text is the gateway's report of what the
+// delegation came back with, so it says nothing about the ask's kind (#6536).
+func isWakeFor(origin *lib.Envelope, session string) bool {
+	if session == "" || len(origin.Authority) == 0 {
+		return false
+	}
+	var block struct {
+		Via *struct {
+			Session string `json:"session"`
+		} `json:"via"`
+	}
+	if err := json.Unmarshal(origin.Authority, &block); err != nil || block.Via == nil {
+		return false
+	}
+	return block.Via.Session == session
+}
+
 func delegateOffForTask(origin *lib.Envelope) bool {
 	if len(origin.Authority) == 0 {
 		return false

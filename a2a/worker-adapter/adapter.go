@@ -765,8 +765,13 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return done(Result{State: state}, err)
 	}
 	// The kind is the ask's words, as the bridge reads them: the message's
-	// own text, before any primer.
-	a.askKind = askkind.Kind(prompt)
+	// own text, before any primer. A wake marks nothing: its text is the
+	// gateway's report of a delegation (wakeText), whose fixed wording would
+	// read as a kind ("If it failed" is investigate) and redraw the user's
+	// ask with it; the ask keeps the mark it has.
+	if !isWakeFor(origin, cfg.Session) {
+		a.askKind = askkind.Kind(prompt)
+	}
 	prompt = withPrimer(plan.primer, prompt)
 
 	// The live in-subject consumer opens positioned just after the
