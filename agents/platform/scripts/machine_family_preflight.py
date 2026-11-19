@@ -109,7 +109,7 @@ MIN_GKE_VERSIONS = {
 }
 MIN_GKE_VERSION_CVM_TDX = "1.28.6-gke.1317000"
 MIN_GKE_VERSION_DYNAMIC_RWO = "1.35.3-gke.1290000"
-VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
+VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+)(?:-gke\.(\d+))?)?$")
 
 PD_DISK_PREFIX = "pd-"
 HYPERDISK_PREFIX = "hyperdisk-"
@@ -247,6 +247,7 @@ RULE_LSSD_REQUIRES_LSSD_SHAPE = "local-ssd-requires-lssd-shape"
 RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4 = "local-ssd-legacy-count-unsupported"
 RULE_GKE_MASTER_VERSION_FLOOR = "gke-control-plane-version-below-floor"
 RULE_GKE_NODE_VERSION_FLOOR = "gke-node-pool-version-below-floor"
+RULE_GKE_VERSION_UNPARSEABLE = "gke-version-unparseable"
 RULE_GKE_CVM_TDX_VERSION_FLOOR = "gke-version-below-confidential-tdx-floor"
 RULE_DYNAMIC_RWO_VERSION_FLOOR = "dynamic-rwo-version-floor"
 RULE_OS_IMAGE_LEGACY_DOCKER = "os-image-legacy-docker"
@@ -341,14 +342,19 @@ class TransitionResult:
 
 
 def parse_version(text: str | None) -> tuple[int, int, int, int] | None:
-    """Parse a GKE version `MAJOR.MINOR.PATCH[-gke.BUILD]` into a 4-tuple."""
+    """Parse a GKE version `MAJOR.MINOR[.PATCH[-gke.BUILD]]` into a 4-tuple."""
     if not text or not isinstance(text, str):
         return None
     match = VERSION_RE.match(text.strip())
     if not match:
         return None
     major, minor, patch, build = match.groups()
-    return (int(major), int(minor), int(patch), int(build) if build is not None else 0)
+    return (
+        int(major),
+        int(minor),
+        int(patch) if patch is not None else 0,
+        int(build) if build is not None else 0,
+    )
 
 
 def _version_below_floor(version_text: str, floor_text: str) -> bool:
@@ -800,6 +806,7 @@ def _evaluate_security(
     target_machine_type: str,
     *,
     node_pool: dict[str, Any] | None = None,
+    source_machine_type: str = "",
 ) -> list[Finding]:
     """Check Shielded VM, Secure Boot, vTPM, integrity monitoring, and Confidential VM."""
     blockers: list[Finding] = []
@@ -946,7 +953,10 @@ def _evaluate_security(
                 FIELD_ENABLE_SECURE_BOOT,
                 FIELD_ENABLE_SECURE_BOOT_SNAKE,
             )
-            if secure_boot is False or (secure_boot is None and is_gke_proto3):
+            # Unlike enableIntegrityMonitoring (which defaults to true in KCC and
+            # Terraform), enableSecureBoot defaults to false in GKE, KCC, and
+            # Terraform whenever omitted from shieldedInstanceConfig.
+            if secure_boot is not True:
                 blockers.append(
                     Finding(
                         rule=RULE_SHIELDED_SECURE_BOOT_DISABLED,
@@ -1012,7 +1022,31 @@ def _evaluate_security(
                         ),
                     )
                 )
-            if target_machine_type and (
+            lssd_details, _ = _extract_local_ssd_configs(
+                config,
+                source_machine_type,
+            )
+            if lssd_details:
+                joined_lssd = ", ".join(lssd_details)
+                blockers.append(
+                    Finding(
+                        rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                        category=CATEGORY_SECURITY,
+                        field=FIELD_MACHINE_TYPE,
+                        message=(
+                            f"Source Confidential VM pool also configures Local SSDs "
+                            f"({joined_lssd}), which cannot be combined on target family c3 "
+                            "(Intel TDX is supported only on c3-standard-* shapes without "
+                            "Local SSDs, whereas Local SSDs on c3 require c3-*-lssd shapes)."
+                        ),
+                        remediation=(
+                            "Remove Local SSD configurations to use Confidential VM with "
+                            "Intel TDX on a c3-standard-* shape, or target n2d (AMD "
+                            "SEV/SEV_SNP) if both Confidential VM and Local SSDs are required."
+                        ),
+                    )
+                )
+            elif target_machine_type and (
                 not target_machine_type.startswith(C3_TDX_ALLOWED_SHAPE_PREFIX)
                 or target_machine_type.endswith(LSSD_MACHINE_SUFFIX)
             ):
@@ -1313,7 +1347,30 @@ def _evaluate_versions_and_os_image(
     node_version = _extract_pool_version(node_pool)
 
     family_floor = MIN_GKE_VERSIONS[target_family]
-    if control_plane_version and _version_below_floor(control_plane_version, family_floor):
+    control_plane_parsed = (
+        parse_version(control_plane_version) if control_plane_version else None
+    )
+    node_version_parsed = parse_version(node_version) if node_version else None
+
+    if control_plane_version and control_plane_parsed is None:
+        blockers.append(
+            Finding(
+                rule=RULE_GKE_VERSION_UNPARSEABLE,
+                category=CATEGORY_VERSION,
+                field=FIELD_MASTER_VERSION,
+                message=(
+                    f"Cluster control-plane version '{control_plane_version}' is not a "
+                    "pinned numeric GKE version (MAJOR.MINOR or MAJOR.MINOR.PATCH[-gke.BUILD]), "
+                    f"so minimum version floor '{family_floor}' for target family "
+                    f"{target_family} cannot be verified."
+                ),
+                remediation=(
+                    f"Pin an explicit numeric GKE control-plane version at or above "
+                    f"{family_floor} (or pass a concrete numeric version via --cluster-version)."
+                ),
+            )
+        )
+    elif control_plane_version and _version_below_floor(control_plane_version, family_floor):
         blockers.append(
             Finding(
                 rule=RULE_GKE_MASTER_VERSION_FLOOR,
@@ -1331,7 +1388,25 @@ def _evaluate_versions_and_os_image(
             )
         )
 
-    if node_version and _version_below_floor(node_version, family_floor):
+    if node_version and node_version_parsed is None:
+        blockers.append(
+            Finding(
+                rule=RULE_GKE_VERSION_UNPARSEABLE,
+                category=CATEGORY_VERSION,
+                field=FIELD_VERSION,
+                message=(
+                    f"Source node pool version '{node_version}' is not a pinned numeric "
+                    "GKE version (MAJOR.MINOR or MAJOR.MINOR.PATCH[-gke.BUILD]), so "
+                    f"minimum version floor '{family_floor}' for target family "
+                    f"{target_family} cannot be verified."
+                ),
+                remediation=(
+                    f"Pin an explicit numeric GKE node-pool version at or above "
+                    f"{family_floor} (matching a control plane at or above {family_floor})."
+                ),
+            )
+        )
+    elif node_version and _version_below_floor(node_version, family_floor):
         blockers.append(
             Finding(
                 rule=RULE_GKE_NODE_VERSION_FLOOR,
@@ -1355,11 +1430,15 @@ def _evaluate_versions_and_os_image(
         source_family=source_family,
     )
     if target_family == FAMILY_C3 and (cvm_enabled or cvm_type == CVM_TYPE_TDX):
-        for ver_label, field_name, ver_value in (
-            ("control-plane", FIELD_MASTER_VERSION, control_plane_version),
-            ("node-pool", FIELD_VERSION, node_version),
+        for ver_label, field_name, ver_value, parsed_ver in (
+            ("control-plane", FIELD_MASTER_VERSION, control_plane_version, control_plane_parsed),
+            ("node-pool", FIELD_VERSION, node_version, node_version_parsed),
         ):
-            if ver_value and _version_below_floor(ver_value, MIN_GKE_VERSION_CVM_TDX):
+            if (
+                ver_value
+                and parsed_ver is not None
+                and _version_below_floor(ver_value, MIN_GKE_VERSION_CVM_TDX)
+            ):
                 blockers.append(
                     Finding(
                         rule=RULE_GKE_CVM_TDX_VERSION_FLOOR,
@@ -1389,11 +1468,15 @@ def _evaluate_versions_and_os_image(
         )
     )
     if crosses_disk_gen or require_dynamic_rwo:
-        for ver_label, field_name, ver_value in (
-            ("control-plane", FIELD_MASTER_VERSION, control_plane_version),
-            ("node-pool", FIELD_VERSION, node_version),
+        for ver_label, field_name, ver_value, parsed_ver in (
+            ("control-plane", FIELD_MASTER_VERSION, control_plane_version, control_plane_parsed),
+            ("node-pool", FIELD_VERSION, node_version, node_version_parsed),
         ):
-            if ver_value and _version_below_floor(ver_value, MIN_GKE_VERSION_DYNAMIC_RWO):
+            if (
+                ver_value
+                and parsed_ver is not None
+                and _version_below_floor(ver_value, MIN_GKE_VERSION_DYNAMIC_RWO)
+            ):
                 finding = Finding(
                     rule=RULE_DYNAMIC_RWO_VERSION_FLOOR,
                     category=CATEGORY_VERSION,
@@ -1534,6 +1617,7 @@ def evaluate_node_pool_transition(
             parsed_family,
             effective_target_shape,
             node_pool=node_pool,
+            source_machine_type=source_machine_type,
         )
     )
     blockers.extend(
@@ -1816,6 +1900,13 @@ def run_preflight(
     cluster_doc: dict[str, Any] | None = None
     pools_to_check: list[dict[str, Any]] = []
 
+    if cluster_version_override and cluster_version_override.strip():
+        if parse_version(cluster_version_override.strip()) is None:
+            raise ValueError(
+                f"--cluster-version {cluster_version_override!r} must be a numeric GKE "
+                "version (MAJOR.MINOR or MAJOR.MINOR.PATCH[-gke.BUILD])"
+            )
+
     explicit_shape = ""
     explicit_shape_family = ""
     if target_machine_type and target_machine_type.strip():
@@ -1828,9 +1919,14 @@ def run_preflight(
 
     expanded_targets: list[str] = []
     for item in target_specs or []:
-        for piece in item.split(COMMA_SEPARATOR):
-            if piece.strip():
-                expanded_targets.append(piece.strip())
+        pieces = [
+            piece.strip()
+            for piece in item.split(COMMA_SEPARATOR)
+            if piece.strip()
+        ]
+        if not pieces:
+            raise ValueError("empty target machine family")
+        expanded_targets.extend(pieces)
 
     normalized_targets: list[tuple[str, str]] = []
     if not expanded_targets:
@@ -1849,7 +1945,11 @@ def run_preflight(
                     f"family {families_str!r}"
                 )
             for parsed_family, parsed_shape in parsed_entries:
-                if parsed_shape and parsed_shape != explicit_shape:
+                if (
+                    parsed_family == explicit_shape_family
+                    and parsed_shape
+                    and parsed_shape != explicit_shape
+                ):
                     raise ValueError(
                         f"--target-machine-type {explicit_shape!r} conflicts with concrete "
                         f"--target-family shape {parsed_shape!r}"
@@ -1877,14 +1977,31 @@ def run_preflight(
         else:
             cluster_doc = loaded_cluster
 
+    has_explicit_cluster_source = bool(
+        cluster_json_source or cluster_name or location
+    )
+    wrapper_cluster_count = 0
+
     for pool_source in node_pool_json_sources or []:
         loaded_pool, err = _load_json_input(pool_source, "--node-pool-json")
         if err:
             errors.append({"target": f"--node-pool-json ({pool_source})", "message": err})
         elif isinstance(loaded_pool, dict):
             if _is_cluster_wrapper(loaded_pool):
-                if cluster_doc is None:
-                    cluster_doc = loaded_pool
+                wrapper_cluster_count += 1
+                if has_explicit_cluster_source or wrapper_cluster_count > 1:
+                    errors.append(
+                        {
+                            "target": f"--node-pool-json ({pool_source})",
+                            "message": (
+                                "cluster wrapper in --node-pool-json cannot be combined "
+                                "with --cluster-json, live --cluster/--location, or "
+                                "another cluster wrapper (fail-closed)"
+                            ),
+                        }
+                    )
+                    continue
+                cluster_doc = loaded_pool
                 raw_wrapper_pools = _first_present(
                     loaded_pool,
                     FIELD_NODE_POOLS,
@@ -1907,7 +2024,18 @@ def run_preflight(
             else:
                 pools_to_check.append(loaded_pool)
         elif isinstance(loaded_pool, list) and all(isinstance(p, dict) for p in loaded_pool):
-            pools_to_check.extend(loaded_pool)
+            if any(_is_cluster_wrapper(p) for p in loaded_pool):
+                errors.append(
+                    {
+                        "target": f"--node-pool-json ({pool_source})",
+                        "message": (
+                            "--node-pool-json array must contain node-pool objects, "
+                            "not cluster wrapper objects (fail-closed)"
+                        ),
+                    }
+                )
+            else:
+                pools_to_check.extend(loaded_pool)
         else:
             errors.append(
                 {

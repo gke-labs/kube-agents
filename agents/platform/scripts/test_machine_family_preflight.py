@@ -754,6 +754,50 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertIn(preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED, gke_rules)
         self.assertNotIn(preflight.RULE_SHIELDED_INTEGRITY_DISABLED, gke_rules)
 
+        # KCC and Terraform manifests that declare shieldedInstanceConfig but omit enableSecureBoot
+        # (which defaults to false in KCC and Terraform) must trigger shielded-secure-boot-disabled
+        # without triggering shielded-integrity-monitoring-disabled.
+        kcc_omitted_secure_boot = {
+            "spec": {
+                "nodeConfig": {
+                    "machineType": "n1-standard-8",
+                    "diskType": "hyperdisk-balanced",
+                    "shieldedInstanceConfig": {"enableIntegrityMonitoring": True},
+                }
+            }
+        }
+        kcc_no_sb_res = preflight.evaluate_node_pool_transition(
+            kcc_omitted_secure_boot,
+            "n4",
+        )
+        self.assertFalse(kcc_no_sb_res.compatible)
+        self.assertEqual(
+            {b.rule for b in kcc_no_sb_res.blockers},
+            {preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED},
+        )
+
+        tf_omitted_secure_boot = {
+            "name": "tf-pool-no-sb",
+            "node_config": [
+                {
+                    "machine_type": "n1-standard-8",
+                    "disk_type": "hyperdisk-balanced",
+                    "shielded_instance_config": [
+                        {"enable_integrity_monitoring": True}
+                    ],
+                }
+            ],
+        }
+        tf_no_sb_res = preflight.evaluate_node_pool_transition(
+            tf_omitted_secure_boot,
+            "n4",
+        )
+        self.assertFalse(tf_no_sb_res.compatible)
+        self.assertEqual(
+            {b.rule for b in tf_no_sb_res.blockers},
+            {preflight.RULE_SHIELDED_SECURE_BOOT_DISABLED},
+        )
+
     def test_node_pool_json_combined_with_live_cluster_and_location_describes_cluster(self):
         """Combining --node-pool-json with --cluster and --location calls _describe_cluster_live for cluster checks."""
         live_cluster_payload = {
@@ -844,6 +888,154 @@ class MachineFamilyPreflightTests(unittest.TestCase):
                 target_specs=["c3-standard-8,c3-standard-8-lssd"],
                 target_machine_type="c3-highcpu-8",
             )
+
+        # 4. A concrete shape in --target-family for a different family (c4-standard-8-lssd) does not
+        # conflict with --target-machine-type c3-standard-8-lssd.
+        code_cross, report_cross = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(pool)],
+            target_specs=["c3,c4-standard-8-lssd"],
+            target_machine_type="c3-standard-8-lssd",
+        )
+        self.assertEqual(code_cross, preflight.EXIT_OK)
+        by_fam_cross = {r["target_family"]: r for r in report_cross["results"]}
+        self.assertEqual(
+            by_fam_cross["c3"]["target_machine_type"],
+            "c3-standard-8-lssd",
+        )
+        self.assertEqual(
+            by_fam_cross["c4"]["target_machine_type"],
+            "c4-standard-8-lssd",
+        )
+
+        # 5. Empty, whitespace, or comma-only --target-family raises ValueError instead of evaluating all 5 defaults.
+        for bad_target in ("", " ", ","):
+            with self.subTest(bad_target=bad_target):
+                with self.assertRaises(ValueError):
+                    preflight.run_preflight(
+                        node_pool_json_sources=[json.dumps(pool)],
+                        target_specs=[bad_target],
+                    )
+
+    def test_two_component_minor_versions_and_unparseable_versions_and_cluster_version_validation(self):
+        """Two-component MAJOR.MINOR versions parse cleanly; unparseable versions emit gke-version-unparseable or fail closed on CLI."""
+        kcc_minor_pool = {
+            "spec": {
+                "resourceID": "minor-pool",
+                "version": "1.35",
+                "nodeConfig": {
+                    "machineType": "n1-standard-4",
+                    "diskType": "hyperdisk-balanced",
+                },
+            }
+        }
+        code_ok, report_ok = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(kcc_minor_pool)],
+            target_specs=["n4"],
+            cluster_version_override="1.35",
+        )
+        self.assertEqual(code_ok, preflight.EXIT_OK)
+        self.assertTrue(report_ok["compatible"])
+
+        # Non-numeric version in a manifest ('latest') emits gke-version-unparseable rather than a false below-floor message.
+        latest_pool = {
+            "name": "latest-pool",
+            "version": "latest",
+            "config": {
+                "machineType": "n1-standard-4",
+                "diskType": "pd-balanced",
+            },
+        }
+        res_latest = preflight.evaluate_node_pool_transition(latest_pool, "n2")
+        self.assertFalse(res_latest.compatible)
+        self.assertEqual(
+            {b.rule for b in res_latest.blockers},
+            {preflight.RULE_GKE_VERSION_UNPARSEABLE},
+        )
+
+        # Unparseable --cluster-version raises ValueError in run_preflight.
+        with self.assertRaises(ValueError):
+            preflight.run_preflight(
+                node_pool_json_sources=[json.dumps(kcc_minor_pool)],
+                target_specs=["n4"],
+                cluster_version_override="latest",
+            )
+
+    def test_multiple_cluster_wrappers_or_mixed_cluster_sources_fail_closed(self):
+        """Combining a cluster wrapper in --node-pool-json with another wrapper, --cluster-json, or live flags fails closed."""
+        wrapper_a = {
+            "name": "cluster-a",
+            "shieldedNodes": {"enabled": True},
+            "nodePools": [
+                {
+                    "name": "pool-a",
+                    "config": {
+                        "machineType": "n2-standard-4",
+                        "diskType": "hyperdisk-balanced",
+                    },
+                }
+            ],
+        }
+        wrapper_b = {
+            "name": "cluster-b",
+            "shieldedNodes": {"enabled": False},
+            "nodePools": [
+                {
+                    "name": "pool-b",
+                    "config": {
+                        "machineType": "n2-standard-4",
+                        "diskType": "hyperdisk-balanced",
+                    },
+                }
+            ],
+        }
+        code_two_wrappers, report_two_wrappers = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(wrapper_a), json.dumps(wrapper_b)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_two_wrappers, preflight.EXIT_READ_ERROR)
+        self.assertFalse(report_two_wrappers["compatible"])
+        self.assertTrue(report_two_wrappers["errors"])
+
+        code_cluster_and_wrapper, _ = preflight.run_preflight(
+            cluster_json_source=json.dumps(wrapper_a),
+            node_pool_json_sources=[json.dumps(wrapper_b)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_cluster_and_wrapper, preflight.EXIT_READ_ERROR)
+
+        code_live_and_wrapper, _ = preflight.run_preflight(
+            cluster_name="live-cluster",
+            location="us-central1",
+            node_pool_json_sources=[json.dumps(wrapper_b)],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_live_and_wrapper, preflight.EXIT_READ_ERROR)
+
+    def test_cvm_pool_with_local_ssd_targeting_c3_reports_combined_conflict(self):
+        """A Confidential VM pool that also configures Local SSDs targeting c3 reports that TDX and Local SSDs cannot be combined."""
+        cvm_lssd_pool = {
+            "name": "cvm-lssd-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n2d-standard-8",
+                "diskType": "pd-balanced",
+                "localNvmeSsdBlockConfig": {"localSsdCount": 2},
+                "confidentialNodes": {
+                    "enabled": True,
+                    "confidentialInstanceType": "SEV",
+                },
+            },
+        }
+        res_c3 = preflight.evaluate_node_pool_transition(cvm_lssd_pool, "c3")
+        self.assertFalse(res_c3.compatible)
+        machine_type_cvm_blockers = [
+            b
+            for b in res_c3.blockers
+            if b.rule == preflight.RULE_CVM_TECHNOLOGY_MISMATCH
+            and b.field == preflight.FIELD_MACHINE_TYPE
+        ]
+        self.assertEqual(len(machine_type_cvm_blockers), 1)
+        self.assertIn("cannot be combined on target family c3", machine_type_cvm_blockers[0].message)
 
 
 if __name__ == "__main__":
