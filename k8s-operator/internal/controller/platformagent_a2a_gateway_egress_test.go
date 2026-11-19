@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -141,6 +142,8 @@ func gatewayEgressAdmitted(agent *agentv1alpha1.PlatformAgent, apiServer string)
 	return []egressDestination{
 		{name: "kube-dns over UDP", namespace: "kube-system", podLabels: map[string]string{"k8s-app": "kube-dns"}, port: 53, protocol: corev1.ProtocolUDP},
 		{name: "kube-dns over TCP", namespace: "kube-system", podLabels: map[string]string{"k8s-app": "kube-dns"}, port: 53},
+		{name: "NodeLocal DNSCache", address: strings.TrimSuffix(nodeLocalDNSCacheIP, "/32"), port: 53, protocol: corev1.ProtocolUDP},
+		{name: "the Cloud DNS resolver", address: metadataLinkLocalIP, port: 53, protocol: corev1.ProtocolUDP},
 		{name: "the NATS bus", namespace: agent.Namespace, podLabels: nats, port: a2aNATSClientPort},
 		{name: "the credential broker", namespace: agent.Namespace, podLabels: credentialProxySelector(agent), port: credentialProxyPort},
 		{name: "the API server on 443", address: apiServer, port: apiServerHTTPSPort},
@@ -304,5 +307,35 @@ func TestBothGatewayPoliciesShareThePublicHTTPSRule(t *testing.T) {
 		return false
 	}() {
 		t.Error("the agent gateway policy keeps the HTTPS rule with an FQDN policy in its place")
+	}
+}
+
+// TestTheA2AGatewayEgressPolicyTakesTheCustomEgressCIDRs: the install's
+// custom egress CIDRs reach the gateway's policy on the API server's ports, as
+// they reach the agent gateway's, so a private endpoint named there is not
+// denied to the A2A gateway alone.
+func TestTheA2AGatewayEgressPolicyTakesTheCustomEgressCIDRs(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	agent := a2aTestAgent()
+	if agent.Annotations == nil {
+		agent.Annotations = map[string]string{}
+	}
+	agent.Annotations[AnnotationCustomEgressCIDRs] = "10.200.0.5/32"
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	np := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, a2aGatewayEgressKey(agent), np); err != nil {
+		t.Fatalf("no egress policy rendered: %v", err)
+	}
+	if !egressAdmits(t, np, egressDestination{address: "10.200.0.5", port: apiServerHTTPSPort}) {
+		t.Error("the custom egress CIDR is denied on 443")
+	}
+	if egressAdmits(t, np, egressDestination{address: "10.200.0.5", port: 80}) {
+		t.Error("the custom egress CIDR is admitted on a port the API server rule does not name")
 	}
 }

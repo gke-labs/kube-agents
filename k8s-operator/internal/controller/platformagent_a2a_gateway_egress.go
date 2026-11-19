@@ -23,7 +23,11 @@ import (
 //   - the credential broker's pods, on its port: the Google Chat adapter's
 //     relay and the report reader both go through it;
 //   - the Kubernetes API server, for the session spawner, the replica lease
-//     and the ConfigMaps the gateway reads and records into;
+//     and the ConfigMaps the gateway reads and records into, together with the
+//     install's custom egress CIDRs (AnnotationCustomEgressCIDRs), on the same
+//     ports, as the agent gateway's policy takes them: the documented place
+//     for a private endpoint (a Private Service Connect address, say) that an
+//     install's pods reach in place of a public one;
 //   - TCP 443 outside the private, link-local and shared ranges, for the chat
 //     platforms the gateway dials directly (Slack, Discord) and the A2A door's
 //     token check. A NetworkPolicy cannot name a host, so the platforms are an
@@ -42,8 +46,8 @@ import (
 //
 // Its addresses are the reconcile's: the DNS ladder ungated, as the session
 // fence resolves it (a2aSessionDNSClusterIPs), and the API server's targets
-// (apiServerEgressTargets), with the same defaults the scope publisher's
-// policy falls back to.
+// (apiServerEgressTargets, with the custom egress CIDRs), with the same
+// defaults the scope publisher's policy falls back to.
 
 // a2aGatewayEgressComponent labels the policy among the A2A objects.
 const a2aGatewayEgressComponent = "gateway-egress"
@@ -131,7 +135,7 @@ func buildA2AGatewayEgressPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs, d
 // a2aGatewayEgressPolicy is the gateway's egress policy with this reconcile's
 // addresses resolved.
 func (r *PlatformAgentReconciler) a2aGatewayEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsIPs []string) *networkingv1.NetworkPolicy {
-	return buildA2AGatewayEgressPolicy(agent, r.apiServerEgressTargets(ctx, agent, false), dnsIPs)
+	return buildA2AGatewayEgressPolicy(agent, r.apiServerEgressTargets(ctx, agent, true), dnsIPs)
 }
 
 // applyA2AGatewayEgress applies the gateway's egress policy, owned by agent.
