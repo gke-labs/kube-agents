@@ -4602,6 +4602,29 @@ def test_a_profile_directive_addresses_the_opening_turn_to_that_profile(
     assert opening["text"] == "what's failing in kube-system"
 
 
+def test_a_profile_directive_with_intent_confirm_submits_a_structured_confirm(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """intent=confirm goes on the opening submit as the door's intent, and is
+    neither a parameter nor text the agent reads."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("[bench:profile name=cluster intent=confirm project=p1] open the pull request")
+
+    opening = stub_gateway.submissions[0]
+    assert opening["intent"] == inject.INTENT_CONFIRM
+    assert opening["parameters"] == {"project": "p1"}
+    assert opening["text"] == "open the pull request"
+
+
+def test_a_profile_directive_without_intent_sends_no_intent(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    KubeAgentsHarness().run("[bench:profile name=cluster project=p1] look at it")
+
+    assert "intent" not in stub_gateway.submissions[0]
+
+
 def test_a_prompt_without_the_directive_sends_no_profile(stub_gateway: _StubGatewayServer) -> None:
     stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
 
@@ -4609,6 +4632,7 @@ def test_a_prompt_without_the_directive_sends_no_profile(stub_gateway: _StubGate
 
     assert "profile" not in stub_gateway.submissions[0]
     assert "parameters" not in stub_gateway.submissions[0]
+    assert "intent" not in stub_gateway.submissions[0]
 
 
 def test_a_malformed_profile_directive_errors_and_sends_nothing(stub_gateway: _StubGatewayServer) -> None:
@@ -4624,3 +4648,62 @@ def test_the_api_transport_refuses_a_profile_ask(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("AGENT_TRANSPORT", harness.TRANSPORT_API)
     result = KubeAgentsHarness().run("[bench:profile name=cluster project=p1 location=l cluster=c] ask")
     assert result.errors and "needs AGENT_TRANSPORT=inject" in result.errors[0]
+
+
+# ------------------------------------------------ the submit's intent
+
+
+def _captured_payloads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any] | None]]:
+    sent: list[tuple[str, dict[str, Any] | None]] = []
+
+    def request(url: str, timeout: float, token: str, payload: dict[str, Any] | None = None, *a: Any, **k: Any) -> Any:
+        sent.append((url, payload))
+        return {"taskId": "t-1", "conversation": "inject:c"}
+
+    monkeypatch.setattr(inject, "_request", request)
+    return sent
+
+
+def test_the_submit_carries_no_intent_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _captured_payloads(monkeypatch)
+    inject.InjectTask(base_url="http://door", conversation="c", prompt="hi", token="tok").submit()
+    (url, payload), = sent
+    assert url.endswith(inject.INJECT_PATH)
+    assert payload is not None and "intent" not in payload
+
+
+def test_the_submit_carries_the_confirm_intent_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _captured_payloads(monkeypatch)
+    task = inject.InjectTask(
+        base_url="http://door", conversation="c", prompt="open the PR", token="tok",
+        profile="cluster", parameters={"project": "p1"}, intent=inject.INTENT_CONFIRM,
+    )
+    task.submit()
+    (_, payload), = sent
+    assert payload == {
+        "conversation": "c", "author": inject.DEFAULT_AUTHOR, "text": "open the PR",
+        "profile": "cluster", "parameters": {"project": "p1"}, "intent": "confirm",
+    }
+
+
+@pytest.mark.parametrize("intent", ["cancel", "Confirm", "confirm ", "yes"])
+def test_an_intent_the_door_does_not_take_is_refused_before_anything_is_sent(
+    monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    sent = _captured_payloads(monkeypatch)
+    with pytest.raises(ValueError, match="inject intent"):
+        inject.InjectTask(base_url="http://door", conversation="c", prompt="hi", token="tok", intent=intent)
+    assert sent == []
+
+
+def test_a_confirmed_tasks_cancel_carries_no_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The intent is the opening submit's alone: the cancel a stray run gets is
+    not a confirm."""
+    sent = _captured_payloads(monkeypatch)
+    task = inject.InjectTask(
+        base_url="http://door", conversation="c", prompt="open the PR", token="tok", intent=inject.INTENT_CONFIRM
+    )
+    task.submit()
+    task.cancel(settle=0)
+    cancels = [p for url, p in sent if url.endswith(inject.CANCEL_SUFFIX)]
+    assert cancels and all(p is not None and "intent" not in p for p in cancels)

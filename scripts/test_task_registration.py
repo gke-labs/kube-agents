@@ -1036,6 +1036,14 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("no closing", prompt="[bench:profile name=cluster what is failing")
         self._only("must open the prompt", prompt="what is failing [bench:profile name=cluster] here")
 
+    def test_a_profile_directives_intent_is_confirm_or_absent(self):
+        # The door takes intent "confirm" alone and answers 400 to anything
+        # else, after the lease; the lint refuses it before.
+        good = "[bench:profile name=cluster intent=confirm project=p1 location=us-east1 cluster=prod] open the PR"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("intent=cancel is not one", prompt="[bench:profile name=cluster intent=cancel] open the PR")
+        self._only("intent=CONFIRM is not one", prompt="[bench:profile name=cluster intent=CONFIRM] open the PR")
+
     def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
         # world-open-ingress is in the catalogue with cluster_slot: null: the
         # runner records no cluster for it, so every run would fail.

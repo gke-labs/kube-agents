@@ -373,7 +373,10 @@ agent's own cluster, from `AGENT_CLUSTER_CONTEXT`. `{{FLEET_CLUSTER_PROJECT:<rol
 cluster that carries a fixture role, from the context `hack/fleet-kubeconfigs.sh` writes; the role
 must be in the case's `fixtures:`, which `scripts/validate_bench_cases.py` checks. A placeholder the
 harness can't resolve is recorded as an infrastructure failure, never the model's. A single-cluster
-agent profile has to be told its target, which is what these are for.
+agent profile has to be told its target, which is what these are for. `{{BENCH_GITOPS_REPO}}` is the
+job's GitOps repository, from `BENCH_GITOPS_REPO` (the repository the forge checks read), for a
+prompt that has to name it: a profile's version-control skill writes only to the repository its task
+names.
 
 ### 4. Write the verification spec
 

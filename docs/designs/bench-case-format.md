@@ -54,8 +54,8 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner, and the
-harness fills in the cluster placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
-`{{FLEET_CLUSTER_*:<role>}}`).
+harness fills in the placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
+`{{FLEET_CLUSTER_*:<role>}}`, `{{BENCH_GITOPS_REPO}}`).
 A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
@@ -95,6 +95,12 @@ schedule a stopped ask or a replay read only a prompt's first line, so a combine
 the wrong phase; combining one is a later change.
 It runs only over the inject transport (the door's `profile` and `parameters`), which every CI
 lane uses; the api transport errors on it.
+One field is not a parameter: `intent=confirm` submits the ask as a structured confirm, the door's
+`"intent":"confirm"`, so the gateway sets the task's `changeRequested`, which a profile's write path
+(the `cluster` persona's version-control skill) needs. `confirm` is its only value, and the lint
+refuses any other; a directive without it sends a typed message. The door takes the confirm only
+where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
+which is infrastructure, since the agent never saw the ask.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
