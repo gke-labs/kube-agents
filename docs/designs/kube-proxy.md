@@ -142,6 +142,8 @@ k8s-api-proxy/
     │   └── transport.go          # CallerAuthenticator and UpstreamTransport interfaces, ErrAuthenticationUnavailable
     ├── tokenreview/
     │   └── tokenreview.go        # TokenReview CallerAuthenticator with TTL cache (the binary's)
+    ├── jwtauth/
+    │   └── jwtauth.go            # Signed-JWT CallerAuthenticator against an issuer's JSON Web Key Set
     └── upstream/
         ├── upstream.go           # GKE HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
         └── gke.go                # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com

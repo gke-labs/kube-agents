@@ -43,6 +43,8 @@ const (
 	keySetFetchTimeout     = 10 * time.Second
 	// maxKeySetBytes caps the key set response read into memory.
 	maxKeySetBytes = 1 << 20
+	// maxKeySetRedirects is net/http's default limit, which a custom redirect policy replaces.
+	maxKeySetRedirects = 10
 	// clockLeeway tolerates clock skew between the issuer and the proxy on exp, nbf and iat.
 	clockLeeway = jwt.DefaultLeeway
 
@@ -144,7 +146,7 @@ func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 		copied := *cfg.HTTPClient
 		client = &copied
 	}
-	client.CheckRedirect = refuseInsecureRedirect
+	client.CheckRedirect = secureRedirectPolicy(client.CheckRedirect)
 	ttl := cfg.KeySetTTL
 	if ttl <= 0 {
 		ttl = defaultKeySetTTL
@@ -165,12 +167,22 @@ func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 	}, nil
 }
 
-// refuseInsecureRedirect keeps a key set fetch on https across redirects.
-func refuseInsecureRedirect(req *http.Request, _ []*http.Request) error {
-	if req.URL.Scheme != schemeHTTPS {
-		return fmt.Errorf("key set redirect to %s refused: not https", req.URL.Scheme)
+// secureRedirectPolicy keeps a key set fetch on https across redirects, stops after
+// maxKeySetRedirects as net/http's default policy does, and then applies the caller's own
+// policy, if any.
+func secureRedirectPolicy(next func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != schemeHTTPS {
+			return fmt.Errorf("key set redirect to %s refused: not https", req.URL.Scheme)
+		}
+		if len(via) >= maxKeySetRedirects {
+			return fmt.Errorf("key set fetch stopped after %d redirects", maxKeySetRedirects)
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
 	}
-	return nil
 }
 
 func isAsymmetric(alg jose.SignatureAlgorithm) bool {
@@ -196,11 +208,12 @@ func (a *authenticator) AuthenticateRequest(r *http.Request) (*k8sapiproxy.Calle
 	}
 	header := tok.Headers[0]
 
-	set, err := a.keys.get(r.Context(), header.KeyID)
+	alg := jose.SignatureAlgorithm(header.Algorithm)
+	set, err := a.keys.get(r.Context(), header.KeyID, alg)
 	if err != nil {
 		return nil, err
 	}
-	key := signingKey(set, header.KeyID, jose.SignatureAlgorithm(header.Algorithm))
+	key := signingKey(set, header.KeyID, alg)
 	if key == nil {
 		return nil, errNotAuthenticated
 	}
@@ -306,14 +319,16 @@ type keySet struct {
 	lastErr     error
 }
 
-// get returns a key set to verify a token signed with kid. When the key set must be fetched
-// and cannot be, and no usable cached set holds kid, the error wraps
+// get returns a key set to verify a token signed by kid with alg. When the key set must be
+// fetched and cannot be, and no usable cached set holds such a key, the error wraps
 // k8sapiproxy.ErrAuthenticationUnavailable.
-func (k *keySet) get(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
+func (k *keySet) get(ctx context.Context, kid string, alg jose.SignatureAlgorithm) (*jose.JSONWebKeySet, error) {
 	k.mu.Lock()
 	now := k.now()
 	cached, fetchedAt, lastErr := k.set, k.fetchedAt, k.lastErr
-	hasKid := cached != nil && len(cached.Key(kid)) > 0
+	// The cache holds the key only if one under kid can verify alg; a key of another type
+	// under the same kid does not count, so a newly published one is fetched.
+	hasKid := cached != nil && signingKey(cached, kid, alg) != nil
 	fresh := cached != nil && now.Sub(fetchedAt) < k.ttl
 	usableStale := hasKid && now.Sub(fetchedAt) < k.ttl+maxStaleKeySet
 	recentlyTried := !k.attemptedAt.IsZero() && now.Sub(k.attemptedAt) < minKeySetFetchInterval
@@ -327,13 +342,13 @@ func (k *keySet) get(ctx context.Context, kid string) (*jose.JSONWebKeySet, erro
 	}
 
 	ch := k.flight.DoChan(k.url, func() (any, error) {
-		k.mu.Lock()
-		k.attemptedAt = k.now()
-		k.mu.Unlock()
 		// The fetch outlives a caller that leaves, so the requests sharing it still get keys.
 		set, err := k.fetch(context.WithoutCancel(ctx))
 		k.mu.Lock()
 		defer k.mu.Unlock()
+		// Recorded when the fetch ends, not when it starts: a request arriving while it runs
+		// joins it instead of reading "tried a moment ago" and answering without its result.
+		k.attemptedAt = k.now()
 		k.lastErr = err
 		if err == nil {
 			k.set, k.fetchedAt = set, k.now()

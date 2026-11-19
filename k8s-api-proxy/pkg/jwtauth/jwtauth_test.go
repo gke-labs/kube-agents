@@ -34,6 +34,9 @@ const (
 	testTokenTTL = 5 * time.Minute
 	testPodsPath = "/clusters/" + k8sapiproxy.InClusterID + "/api/v1/pods"
 	contentJSON  = "application/json"
+	// testWaitLimit bounds a wait for a goroutine; testSettle lets others reach a held fetch.
+	testWaitLimit = 5 * time.Second
+	testSettle    = 50 * time.Millisecond
 )
 
 var testNow = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
@@ -46,6 +49,7 @@ type issuer struct {
 	public jose.JSONWebKeySet
 	extra  []json.RawMessage // published as they are, after the public keys
 	down   atomic.Bool
+	gate   atomic.Pointer[chan struct{}] // when set, a fetch waits for the channel to close
 	served atomic.Int32
 	srv    *httptest.Server
 }
@@ -55,6 +59,9 @@ func newIssuer(t *testing.T) *issuer {
 	is := &issuer{t: t, keys: map[string]any{}}
 	is.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		is.served.Add(1)
+		if g := is.gate.Load(); g != nil {
+			<-*g
+		}
 		if is.down.Load() {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			return
@@ -142,6 +149,29 @@ func (is *issuer) signWith(kid string, nameKid bool, alg jose.SignatureAlgorithm
 		mutate(&c, extra)
 	}
 	raw, err := jwt.Signed(signer).Claims(c).Claims(extra).Serialize()
+	if err != nil {
+		is.t.Fatal(err)
+	}
+	return raw
+}
+
+// signWithKey signs a default token with a key the issuer holds outside its kid map.
+func (is *issuer) signWithKey(key any, kid string, alg jose.SignatureAlgorithm) string {
+	is.t.Helper()
+	return is.signWithKeyAt(key, kid, alg, testNow)
+}
+
+func (is *issuer) signWithKeyAt(key any, kid string, alg jose.SignatureAlgorithm, at time.Time) string {
+	is.t.Helper()
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader(jose.HeaderKey("kid"), kid))
+	if err != nil {
+		is.t.Fatal(err)
+	}
+	raw, err := jwt.Signed(signer).Claims(jwt.Claims{
+		Issuer: testIssuer, Subject: testSubject, Audience: jwt.Audience{testAudience},
+		IssuedAt: jwt.NewNumericDate(at), Expiry: jwt.NewNumericDate(at.Add(testTokenTTL)),
+	}).Serialize()
 	if err != nil {
 		is.t.Fatal(err)
 	}
@@ -304,20 +334,86 @@ func TestAuthenticatorSkipsUnusableKeys(t *testing.T) {
 	}
 }
 
-// Among keys published under one kid, the one fit for the token's algorithm and for
-// signing verifies it; an encryption key under the same kid is passed over.
+// Among keys published under one kid, the one fit for the token's algorithm verifies it:
+// an ECDSA key listed first under the same kid is passed over for an RS256 token, and the
+// RSA key under it is passed over for an ES256 one.
 func TestAuthenticatorPicksTheSigningKeyUnderASharedKid(t *testing.T) {
 	is := newIssuer(t)
-	enc, err := rsa.GenerateKey(rand.Reader, testRSABits)
+	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	is.mu.Lock()
-	is.public.Keys = append([]jose.JSONWebKey{{Key: &enc.PublicKey, KeyID: testKeyID, Use: "enc"}}, is.public.Keys...)
+	is.keys["ec-shared"] = ec
+	is.public.Keys = append([]jose.JSONWebKey{{Key: &ec.PublicKey, KeyID: testKeyID, Algorithm: string(jose.ES256), Use: "sig"}}, is.public.Keys...)
 	is.mu.Unlock()
 	a := newAuth(t, is.config())
+
 	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
-		t.Errorf("token signed by the signing key under a shared kid: %v", err)
+		t.Errorf("RS256 token under a kid whose first key is ECDSA: %v", err)
+	}
+	ecToken := is.signWithKey(ec, testKeyID, jose.ES256)
+	if _, err := a.AuthenticateRequest(bearer(ecToken)); err != nil {
+		t.Errorf("ES256 token under a kid whose other key is RSA: %v", err)
+	}
+}
+
+// A key of a new type published under a kid the cache already holds is fetched: the cache
+// counts only keys that can verify the token's algorithm.
+func TestAuthenticatorFetchesANewKeyTypeUnderAKnownKid(t *testing.T) {
+	is := newIssuer(t)
+	clock := testNow
+	cfg := is.config()
+	cfg.Now = func() time.Time { return clock }
+	a := newAuth(t, cfg)
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatalf("RSA key: %v", err)
+	}
+
+	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	is.mu.Lock()
+	is.public.Keys = append(is.public.Keys, jose.JSONWebKey{Key: &ec.PublicKey, KeyID: testKeyID, Algorithm: string(jose.ES256), Use: "sig"})
+	is.mu.Unlock()
+	clock = clock.Add(minKeySetFetchInterval)
+	if _, err := a.AuthenticateRequest(bearer(is.signWithKeyAt(ec, testKeyID, jose.ES256, clock))); err != nil {
+		t.Errorf("ES256 key newly published under a cached kid: %v", err)
+	}
+}
+
+// Requests that arrive while the first key set fetch runs wait for it rather than being
+// answered unavailable, and they share it.
+func TestAuthenticatorRequestsDuringAFetchShareIt(t *testing.T) {
+	is := newIssuer(t)
+	release := make(chan struct{})
+	is.gate.Store(&release)
+	a := newAuth(t, is.config())
+	token := is.sign(testKeyID, jose.RS256, nil)
+
+	const callers = 5
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			_, err := a.AuthenticateRequest(bearer(token))
+			errs <- err
+		}()
+	}
+	deadline := time.Now().Add(testWaitLimit)
+	for is.served.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	// Give the other callers time to reach the shared fetch while it is held open.
+	time.Sleep(testSettle)
+	close(release)
+	for range callers {
+		if err := <-errs; err != nil {
+			t.Errorf("caller during the fetch: %v", err)
+		}
+	}
+	if got := is.served.Load(); got != 1 {
+		t.Errorf("key set fetched %d times, want 1 shared fetch", got)
 	}
 }
 
@@ -476,6 +572,30 @@ func TestAuthenticatorRefusesAnInsecureRedirect(t *testing.T) {
 	}
 	if got := is.served.Load(); got != 0 {
 		t.Errorf("issuer served %d plain-text fetches, want 0", got)
+	}
+}
+
+// An https redirect loop stops at the redirect limit instead of running until the fetch
+// timeout.
+func TestAuthenticatorStopsARedirectLoop(t *testing.T) {
+	is := newIssuer(t)
+	var hops atomic.Int32
+	var loop *httptest.Server
+	loop = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hops.Add(1)
+		http.Redirect(w, r, loop.URL, http.StatusFound)
+	}))
+	t.Cleanup(loop.Close)
+	cfg := is.config()
+	cfg.KeySetURL = loop.URL
+	cfg.HTTPClient = loop.Client()
+	a := newAuth(t, cfg)
+	_, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil)))
+	if !errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+		t.Errorf("err = %v, want ErrAuthenticationUnavailable", err)
+	}
+	if got := hops.Load(); got > maxKeySetRedirects+1 {
+		t.Errorf("followed %d hops, want at most %d", got, maxKeySetRedirects+1)
 	}
 }
 
