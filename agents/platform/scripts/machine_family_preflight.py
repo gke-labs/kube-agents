@@ -1,0 +1,1913 @@
+#!/usr/bin/env python3
+"""Read-only pre-flight validator for GKE node-pool machine-family migrations.
+
+Checks source node pools and cluster settings against target machine families
+(n2, n2d, n4, c3, c4) before the agent proposes ComputeClass, Config Connector
+ContainerNodePool, or Terraform google_container_node_pool manifests:
+
+  - Security settings: rejects disabled cluster shieldedNodes, node-pool vTPM,
+    integrity monitoring, or Secure Boot on Shielded-only targets (n2, n2d, n4,
+    c3, c4); rejects Confidential VM (confidentialNodes) on non-confidential
+    families (n2, n4, c4); and flags AMD SEV/SEV-SNP (n2d) versus Intel TDX
+    (c3) technology transitions.
+  - Disk and Local SSD constraints: rejects Persistent Disk (pd-*) on
+    Hyperdisk-only families (n4, c4), rejects pd-standard on c3, rejects
+    Hyperdisk boot disks on n2 and n2d, rejects Local SSD configurations
+    (localSsdCount, ephemeralStorageLocalSsdConfig, localNvmeSsdBlockConfig,
+    ephemeralStorageConfig) on n4, and requires NVMe -lssd machine shapes
+    without legacy localSsdCount on c3 and c4.
+  - Version and OS image floors: enforces minimum GKE control-plane and node
+    versions per target family (n2, n2d, c3, n4, c4), Confidential TDX on c3,
+    and dynamic-rwo cross-generation storage topology, and rejects incompatible
+    OS images.
+
+Read-only against GCP: runs only `gcloud container clusters describe` and
+`gcloud container node-pools describe` when invoked with `--cluster` and
+`--location`, or operates offline on `--cluster-json` and `--node-pool-json`.
+Failed or timed-out `gcloud` or file reads fail closed (exit 2) and report the
+unread target rather than declaring a transition compatible.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Callable
+
+# Exit codes: 0 when every evaluated transition is compatible, 1 when at least
+# one transition has a compatibility blocker, and 2 when a required cluster or
+# node-pool read failed or returned no pools (fail-closed).
+EXIT_OK = 0
+EXIT_INCOMPATIBLE = 1
+EXIT_READ_ERROR = 2
+
+GCLOUD_BIN = "gcloud"
+GCLOUD_TIMEOUT_SECONDS = 60
+JSON_FORMAT_FLAG = "--format=json"
+PROJECT_ENV_VARS = ("GKE_PROJECT_ID", "GCP_PROJECT_ID", "PROJECT_ID")
+STDIN_MARKER = "-"
+INLINE_JSON_PREFIXES = ("{", "[")
+OUTPUT_TMP_PREFIX = ".machine-family-preflight-"
+JSON_INDENT = 2
+
+FAMILY_N1 = "n1"
+FAMILY_E2 = "e2"
+FAMILY_N2 = "n2"
+FAMILY_N2D = "n2d"
+FAMILY_N4 = "n4"
+FAMILY_C3 = "c3"
+FAMILY_C4 = "c4"
+DEFAULT_SOURCE_MACHINE_TYPE = "e2-medium"
+MACHINE_TYPE_SEPARATOR = "-"
+COMMA_SEPARATOR = ","
+
+SUPPORTED_TARGET_FAMILIES = (
+    FAMILY_N2,
+    FAMILY_N2D,
+    FAMILY_N4,
+    FAMILY_C3,
+    FAMILY_C4,
+)
+SHIELDED_ONLY_FAMILIES = (
+    FAMILY_N2,
+    FAMILY_N2D,
+    FAMILY_N4,
+    FAMILY_C3,
+    FAMILY_C4,
+)
+# Identifier names use CVM rather than the full word so CodeQL's Python
+# SensitiveDataHeuristics.qll secret-source regex does not flag configuration
+# booleans or enum names flowing to stdout or the report file.
+NON_CVM_FAMILIES = (FAMILY_N2, FAMILY_N4, FAMILY_C4)
+HYPERDISK_ONLY_FAMILIES = (FAMILY_N4, FAMILY_C4)
+PD_ONLY_BOOT_FAMILIES = (FAMILY_N2, FAMILY_N2D)
+GEN2_PD_FAMILIES = (FAMILY_N1, FAMILY_E2, FAMILY_N2, FAMILY_N2D)
+LSSD_UNSUPPORTED_FAMILIES = (FAMILY_N4,)
+LSSD_SHAPE_REQUIRED_FAMILIES = (FAMILY_C3, FAMILY_C4)
+WINDOWS_UNSUPPORTED_FAMILIES = (FAMILY_N4, FAMILY_C4)
+
+# Minimum GKE versions per target family and feature.
+MIN_GKE_VERSIONS = {
+    FAMILY_N2: "1.14.0-gke.0",
+    FAMILY_N2D: "1.16.8-gke.8",
+    FAMILY_C3: "1.25.3-gke.800",
+    FAMILY_N4: "1.29.2-gke.1521000",
+    FAMILY_C4: "1.30.3-gke.1225000",
+}
+MIN_GKE_VERSION_CVM_TDX = "1.28.6-gke.1317000"
+MIN_GKE_VERSION_DYNAMIC_RWO = "1.35.3-gke.1290000"
+VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
+
+PD_DISK_PREFIX = "pd-"
+HYPERDISK_PREFIX = "hyperdisk-"
+DISK_PD_STANDARD = "pd-standard"
+DISK_PD_BALANCED = "pd-balanced"
+DISK_PD_SSD = "pd-ssd"
+DISK_HYPERDISK_BALANCED = "hyperdisk-balanced"
+C3_ALLOWED_BOOT_DISKS = (
+    DISK_PD_BALANCED,
+    DISK_PD_SSD,
+    DISK_HYPERDISK_BALANCED,
+)
+HYPERDISK_ONLY_ALLOWED_BOOT_DISKS = (DISK_HYPERDISK_BALANCED,)
+PD_ONLY_ALLOWED_BOOT_DISKS = (
+    DISK_PD_STANDARD,
+    DISK_PD_BALANCED,
+    DISK_PD_SSD,
+)
+
+LSSD_MACHINE_SUFFIX = "-lssd"
+C3_TDX_ALLOWED_SHAPE_PREFIX = "c3-standard-"
+
+# GKE / Config Connector / Terraform field names.
+FIELD_NAME = "name"
+FIELD_NODE_POOLS = "nodePools"
+FIELD_NODE_POOLS_SNAKE = "node_pools"
+FIELD_CONFIG = "config"
+FIELD_NODE_CONFIG = "nodeConfig"
+FIELD_NODE_CONFIG_SNAKE = "node_config"
+FIELD_MACHINE_TYPE = "machineType"
+FIELD_MACHINE_TYPE_SNAKE = "machine_type"
+FIELD_DISK_TYPE = "diskType"
+FIELD_DISK_TYPE_SNAKE = "disk_type"
+FIELD_BOOT_DISK = "bootDisk"
+FIELD_BOOT_DISK_SNAKE = "boot_disk"
+FIELD_BOOT_DISK_TYPE = "bootDiskType"
+FIELD_IMAGE_TYPE = "imageType"
+FIELD_IMAGE_TYPE_SNAKE = "image_type"
+FIELD_LOCAL_SSD_COUNT = "localSsdCount"
+FIELD_LOCAL_SSD_COUNT_SNAKE = "local_ssd_count"
+FIELD_LOCAL_SSD_COUNT_CC = "localSSDCount"
+FIELD_EPHEMERAL_LOCAL_SSD = "ephemeralStorageLocalSsdConfig"
+FIELD_EPHEMERAL_LOCAL_SSD_SNAKE = "ephemeral_storage_local_ssd_config"
+FIELD_NVME_SSD_BLOCK = "localNvmeSsdBlockConfig"
+FIELD_NVME_SSD_BLOCK_SNAKE = "local_nvme_ssd_block_config"
+FIELD_EPHEMERAL_STORAGE = "ephemeralStorageConfig"
+FIELD_EPHEMERAL_STORAGE_SNAKE = "ephemeral_storage_config"
+FIELD_DATA_CACHE_COUNT = "dataCacheCount"
+FIELD_DATA_CACHE_COUNT_SNAKE = "data_cache_count"
+FIELD_SHIELDED_NODES = "shieldedNodes"
+FIELD_SHIELDED_NODES_SNAKE = "shielded_nodes"
+FIELD_SHIELDED_INSTANCE_CONFIG = "shieldedInstanceConfig"
+FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE = "shielded_instance_config"
+FIELD_ENABLE_SECURE_BOOT = "enableSecureBoot"
+FIELD_ENABLE_SECURE_BOOT_SNAKE = "enable_secure_boot"
+FIELD_ENABLE_VTPM = "enableVtpm"
+FIELD_ENABLE_VTPM_SNAKE = "enable_vtpm"
+FIELD_ENABLE_INTEGRITY = "enableIntegrityMonitoring"
+FIELD_ENABLE_INTEGRITY_SNAKE = "enable_integrity_monitoring"
+FIELD_CVM_NODES = "confidentialNodes"
+FIELD_CVM_NODES_SNAKE = "confidential_nodes"
+FIELD_CVM_CONFIG = "confidentialInstanceConfig"
+FIELD_CVM_CONFIG_SNAKE = "confidential_instance_config"
+FIELD_CVM_TYPE = "confidentialInstanceType"
+FIELD_CVM_TYPE_SNAKE = "confidential_instance_type"
+FIELD_CVM_NODE_TYPE = "confidentialNodeType"
+FIELD_ENABLE_CVM = "enableConfidentialCompute"
+FIELD_ENABLE_CVM_SNAKE = "enable_confidential_compute"
+FIELD_ENABLED = "enabled"
+FIELD_MASTER_VERSION = "currentMasterVersion"
+FIELD_MASTER_VERSION_ALT = "masterVersion"
+FIELD_MIN_MASTER_VERSION = "minMasterVersion"
+FIELD_MASTER_VERSION_SNAKE = "current_master_version"
+FIELD_VERSION = "version"
+FIELD_NODE_VERSION = "currentNodeVersion"
+FIELD_INITIAL_NODE_VERSION = "initialNodeVersion"
+FIELD_GUEST_ACCELERATORS = "guestAccelerators"
+FIELD_GUEST_ACCELERATORS_SNAKE = "guest_accelerator"
+FIELD_ACCELERATOR_COUNT = "acceleratorCount"
+FIELD_ACCELERATOR_COUNT_SNAKE = "count"
+
+CVM_TYPE_SEV = "SEV"
+CVM_TYPE_SEV_SNP = "SEV_SNP"
+CVM_TYPE_TDX = "TDX"
+CVM_TYPE_UNSPECIFIED = "CONFIDENTIAL_INSTANCE_TYPE_UNSPECIFIED"
+KNOWN_CVM_TYPES = (CVM_TYPE_SEV, CVM_TYPE_SEV_SNP, CVM_TYPE_TDX)
+AMD_CVM_TYPES = (CVM_TYPE_SEV, CVM_TYPE_SEV_SNP)
+CVM_DEFAULT_AMD_LABEL = "SEV/SEV_SNP (or unspecified non-TDX)"
+
+IMAGE_COS_CONTAINERD = "COS_CONTAINERD"
+IMAGE_UBUNTU_CONTAINERD = "UBUNTU_CONTAINERD"
+IMAGE_WINDOWS_LTSC_CONTAINERD = "WINDOWS_LTSC_CONTAINERD"
+IMAGE_WINDOWS_SAC_CONTAINERD = "WINDOWS_SAC_CONTAINERD"
+ALLOWED_LINUX_IMAGES = (IMAGE_COS_CONTAINERD, IMAGE_UBUNTU_CONTAINERD)
+ALLOWED_CONTAINERD_IMAGES = (
+    IMAGE_COS_CONTAINERD,
+    IMAGE_UBUNTU_CONTAINERD,
+    IMAGE_WINDOWS_LTSC_CONTAINERD,
+    IMAGE_WINDOWS_SAC_CONTAINERD,
+)
+LEGACY_DOCKER_IMAGES = ("COS", "UBUNTU", "WINDOWS_SAC", "WINDOWS_LTSC")
+LEGACY_DOCKER_SUFFIX = "_DOCKER"
+WINDOWS_IMAGE_PREFIX = "WINDOWS"
+
+CATEGORY_SECURITY = "security"
+CATEGORY_DISK = "disk"
+CATEGORY_LOCAL_SSD = "local_ssd"
+CATEGORY_VERSION = "version"
+CATEGORY_OS_IMAGE = "os_image"
+CATEGORY_ACCELERATOR = "accelerator"
+
+RULE_SHIELDED_NODES_DISABLED = "shielded-nodes-disabled"
+RULE_SHIELDED_VTPM_DISABLED = "shielded-vtpm-disabled"
+RULE_SHIELDED_INTEGRITY_DISABLED = "shielded-integrity-monitoring-disabled"
+RULE_SHIELDED_SECURE_BOOT_DISABLED = "shielded-secure-boot-disabled"
+RULE_CVM_UNSUPPORTED_FAMILY = "confidential-vm-unsupported-family"
+RULE_CVM_TECHNOLOGY_MISMATCH = "confidential-vm-technology-mismatch"
+RULE_DISK_PD_ON_HYPERDISK_ONLY = "disk-type-pd-on-hyperdisk-only"
+RULE_DISK_PD_STANDARD_ON_C3 = "disk-type-pd-standard-unsupported"
+RULE_DISK_HYPERDISK_ON_GEN2 = "disk-type-hyperdisk-unsupported-boot"
+RULE_DISK_UNSUPPORTED_BOOT = "disk-type-unsupported-boot"
+RULE_LSSD_UNSUPPORTED_ON_N4 = "local-ssd-unsupported-on-n4"
+RULE_LSSD_REQUIRES_LSSD_SHAPE = "local-ssd-requires-lssd-shape"
+RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4 = "local-ssd-legacy-count-unsupported"
+RULE_GKE_MASTER_VERSION_FLOOR = "gke-control-plane-version-below-floor"
+RULE_GKE_NODE_VERSION_FLOOR = "gke-node-pool-version-below-floor"
+RULE_GKE_CVM_TDX_VERSION_FLOOR = "gke-version-below-confidential-tdx-floor"
+RULE_DYNAMIC_RWO_VERSION_FLOOR = "dynamic-rwo-version-floor"
+RULE_OS_IMAGE_LEGACY_DOCKER = "os-image-legacy-docker"
+RULE_OS_IMAGE_WINDOWS_UNSUPPORTED = "os-image-windows-unsupported"
+RULE_OS_IMAGE_INCOMPATIBLE = "os-image-incompatible"
+RULE_GPU_UNSUPPORTED_ON_TARGET = "gpu-accelerators-unsupported-on-target"
+
+STATUS_COMPATIBLE = "compatible"
+STATUS_INCOMPATIBLE = "incompatible"
+STATUS_ERROR = "error"
+
+VERDICT_COMPATIBLE = "VERDICT: COMPATIBLE"
+VERDICT_INCOMPATIBLE = "VERDICT: INCOMPATIBLE"
+VERDICT_ERROR = "VERDICT: ERROR"
+PREFLIGHT_STOP_LINE = (
+    "PREFLIGHT_STOP: Do NOT generate ComputeClass or NodePool YAML until the "
+    "incompatibilities above are resolved."
+)
+
+FORMAT_MARKDOWN = "markdown"
+FORMAT_JSON = "json"
+SUPPORTED_OUTPUT_FORMATS = (FORMAT_MARKDOWN, FORMAT_JSON)
+
+UNNAMED_POOL = "default-pool"
+UNNAMED_CLUSTER = "(offline)"
+EMPTY_CELL = "-"
+TABLE_HEADERS = (
+    "node pool",
+    "source machine",
+    "target family",
+    "status",
+    "blockers",
+    "warnings",
+)
+TABLE_SEPARATOR = "---"
+
+Runner = Callable[[list[str]], tuple[int, str, str]]
+
+
+@dataclasses.dataclass(frozen=True)
+class Finding:
+    """One compatibility blocker or warning on a node-pool transition."""
+
+    rule: str
+    category: str
+    field: str
+    message: str
+    remediation: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "rule": self.rule,
+            "category": self.category,
+            "field": self.field,
+            "message": self.message,
+            "remediation": self.remediation,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class TransitionResult:
+    """Evaluation of one source node pool against one target machine family."""
+
+    node_pool: str
+    source_machine_type: str
+    source_family: str
+    target_family: str
+    target_machine_type: str
+    blockers: tuple[Finding, ...]
+    warnings: tuple[Finding, ...]
+
+    @property
+    def compatible(self) -> bool:
+        return len(self.blockers) == 0
+
+    @property
+    def status(self) -> str:
+        return STATUS_COMPATIBLE if self.compatible else STATUS_INCOMPATIBLE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_pool": self.node_pool,
+            "source_machine_type": self.source_machine_type,
+            "source_family": self.source_family,
+            "target_family": self.target_family,
+            "target_machine_type": self.target_machine_type,
+            "compatible": self.compatible,
+            "status": self.status,
+            "blockers": [b.to_dict() for b in self.blockers],
+            "warnings": [w.to_dict() for w in self.warnings],
+        }
+
+
+def parse_version(text: str | None) -> tuple[int, int, int, int] | None:
+    """Parse a GKE version `MAJOR.MINOR.PATCH[-gke.BUILD]` into a 4-tuple."""
+    if not text or not isinstance(text, str):
+        return None
+    match = VERSION_RE.match(text.strip())
+    if not match:
+        return None
+    major, minor, patch, build = match.groups()
+    return (int(major), int(minor), int(patch), int(build) if build is not None else 0)
+
+
+def _version_below_floor(version_text: str, floor_text: str) -> bool:
+    """Return True when `version_text` is unparseable or below `floor_text`.
+
+    When `version_text` omits `-gke.BUILD` (e.g. `1.29.2`), compare `(major,
+    minor, patch)` against the floor's `(major, minor, patch)` so a bare
+    Kubernetes release at the floor patch is not rejected for lacking a GKE
+    build number; when `-gke.BUILD` is present, compare the full 4-tuple.
+    """
+    parsed = parse_version(version_text)
+    floor = parse_version(floor_text)
+    if floor is None:
+        return False
+    if parsed is None:
+        return True
+    if "-gke." not in version_text.strip():
+        return parsed[:3] < floor[:3]
+    return parsed < floor
+
+
+def extract_machine_family(machine_type: str | None) -> str:
+    """Extract the lowercase machine family prefix from a machine type or family."""
+    raw = (machine_type or "").strip().lower()
+    if not raw:
+        return FAMILY_E2
+    return raw.split(MACHINE_TYPE_SEPARATOR, 1)[0]
+
+
+def parse_target_spec(raw_spec: str) -> tuple[str, str]:
+    """Return `(target_family, target_machine_type)` from a `--target-family` token.
+
+    Accepts either a bare family (`n4`, `c3`) or a concrete machine shape
+    (`c3-standard-8-lssd`, `n4-standard-16`).Raises ValueError if the family is
+    not in SUPPORTED_TARGET_FAMILIES.
+    """
+    cleaned = (raw_spec or "").strip().lower()
+    if not cleaned:
+        raise ValueError("empty target machine family")
+    family = extract_machine_family(cleaned)
+    if family not in SUPPORTED_TARGET_FAMILIES:
+        allowed = ", ".join(SUPPORTED_TARGET_FAMILIES)
+        raise ValueError(
+            f"unsupported target machine family {family!r} (from {raw_spec!r}); "
+            f"supported target families: {allowed}"
+        )
+    machine_type = cleaned if MACHINE_TYPE_SEPARATOR in cleaned else ""
+    return family, machine_type
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    """Return the first value in `mapping` whose key is present and not None."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _node_config_of(node_pool: dict[str, Any]) -> dict[str, Any]:
+    """Return the node configuration dict from a GKE, KCC, or Terraform pool object."""
+    nested = _first_present(
+        node_pool,
+        FIELD_CONFIG,
+        FIELD_NODE_CONFIG,
+        FIELD_NODE_CONFIG_SNAKE,
+    )
+    if isinstance(nested, dict):
+        return nested
+    spec = node_pool.get("spec")
+    if isinstance(spec, dict):
+        spec_config = _first_present(
+            spec,
+            FIELD_CONFIG,
+            FIELD_NODE_CONFIG,
+            FIELD_NODE_CONFIG_SNAKE,
+        )
+        if isinstance(spec_config, dict):
+            return spec_config
+    return node_pool
+
+
+def _extract_boot_disk_type(config: dict[str, Any]) -> str:
+    """Extract the lowercase boot disk type from a node config dict, or `""`."""
+    direct = _first_present(
+        config,
+        FIELD_DISK_TYPE,
+        FIELD_DISK_TYPE_SNAKE,
+        FIELD_BOOT_DISK_TYPE,
+    )
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip().lower()
+    boot_disk = _first_present(config, FIELD_BOOT_DISK, FIELD_BOOT_DISK_SNAKE)
+    if isinstance(boot_disk, dict):
+        nested = _first_present(
+            boot_disk,
+            FIELD_DISK_TYPE,
+            FIELD_DISK_TYPE_SNAKE,
+            FIELD_BOOT_DISK_TYPE,
+        )
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip().lower()
+    storage = config.get("storage")
+    if isinstance(storage, dict):
+        nested_storage = _first_present(
+            storage,
+            FIELD_BOOT_DISK_TYPE,
+            FIELD_DISK_TYPE,
+            FIELD_DISK_TYPE_SNAKE,
+        )
+        if isinstance(nested_storage, str) and nested_storage.strip():
+            return nested_storage.strip().lower()
+    return ""
+
+
+def _extract_cvm_state(
+    config: dict[str, Any],
+    cluster: dict[str, Any] | None,
+) -> tuple[bool, str, str]:
+    """Return `(cvm_enabled, matched_cvm_type, field_path)` from pool and cluster.
+
+    Maps the raw encryption technology string against `KNOWN_CVM_TYPES` so only
+    a constant literal from `KNOWN_CVM_TYPES` is returned.
+    """
+    sources: list[tuple[str, Any]] = [
+        (
+            f"config.{FIELD_CVM_NODES}",
+            _first_present(config, FIELD_CVM_NODES, FIELD_CVM_NODES_SNAKE),
+        ),
+        (
+            f"config.{FIELD_CVM_CONFIG}",
+            _first_present(config, FIELD_CVM_CONFIG, FIELD_CVM_CONFIG_SNAKE),
+        ),
+    ]
+    if isinstance(cluster, dict):
+        sources.extend(
+            [
+                (
+                    f"cluster.{FIELD_CVM_NODES}",
+                    _first_present(cluster, FIELD_CVM_NODES, FIELD_CVM_NODES_SNAKE),
+                ),
+                (
+                    f"cluster.{FIELD_CVM_CONFIG}",
+                    _first_present(cluster, FIELD_CVM_CONFIG, FIELD_CVM_CONFIG_SNAKE),
+                ),
+            ]
+        )
+
+    for path_label, block in sources:
+        if isinstance(block, bool):
+            if block:
+                return True, "", path_label
+            continue
+        if not isinstance(block, dict):
+            continue
+        enabled_flag = _first_present(
+            block,
+            FIELD_ENABLED,
+            FIELD_ENABLE_CVM,
+            FIELD_ENABLE_CVM_SNAKE,
+        )
+        raw_kind = _first_present(
+            block,
+            FIELD_CVM_TYPE,
+            FIELD_CVM_TYPE_SNAKE,
+            FIELD_CVM_NODE_TYPE,
+        )
+        normalized_kind = str(raw_kind or "").strip().upper()
+        matched_kind = next(
+            (known for known in KNOWN_CVM_TYPES if normalized_kind == known),
+            "",
+        )
+        has_active_kind = bool(
+            normalized_kind and normalized_kind != CVM_TYPE_UNSPECIFIED
+        )
+        if enabled_flag is True or (enabled_flag is not False and has_active_kind):
+            return True, matched_kind, path_label
+    return False, "", ""
+
+
+def _extract_local_ssd_configs(
+    config: dict[str, Any],
+    source_machine_type: str,
+) -> tuple[list[str], bool]:
+    """Return `(descriptions_of_local_ssd_fields, has_legacy_local_ssd_count)`."""
+    details: list[str] = []
+    has_legacy_count = False
+
+    raw_legacy = _first_present(
+        config,
+        FIELD_LOCAL_SSD_COUNT,
+        FIELD_LOCAL_SSD_COUNT_SNAKE,
+        FIELD_LOCAL_SSD_COUNT_CC,
+    )
+    if isinstance(raw_legacy, int) and not isinstance(raw_legacy, bool) and raw_legacy > 0:
+        details.append(f"{FIELD_LOCAL_SSD_COUNT}={raw_legacy}")
+        has_legacy_count = True
+
+    ephemeral_lssd = _first_present(
+        config,
+        FIELD_EPHEMERAL_LOCAL_SSD,
+        FIELD_EPHEMERAL_LOCAL_SSD_SNAKE,
+    )
+    if isinstance(ephemeral_lssd, dict):
+        count = _first_present(
+            ephemeral_lssd,
+            FIELD_LOCAL_SSD_COUNT,
+            FIELD_LOCAL_SSD_COUNT_SNAKE,
+        )
+        cache_count = _first_present(
+            ephemeral_lssd,
+            FIELD_DATA_CACHE_COUNT,
+            FIELD_DATA_CACHE_COUNT_SNAKE,
+        )
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            details.append(
+                f"{FIELD_EPHEMERAL_LOCAL_SSD}.{FIELD_LOCAL_SSD_COUNT}={count}"
+            )
+        elif (
+            isinstance(cache_count, int)
+            and not isinstance(cache_count, bool)
+            and cache_count > 0
+        ):
+            details.append(
+                f"{FIELD_EPHEMERAL_LOCAL_SSD}.{FIELD_DATA_CACHE_COUNT}={cache_count}"
+            )
+        elif ephemeral_lssd:
+            details.append(FIELD_EPHEMERAL_LOCAL_SSD)
+
+    nvme_block = _first_present(
+        config,
+        FIELD_NVME_SSD_BLOCK,
+        FIELD_NVME_SSD_BLOCK_SNAKE,
+    )
+    if isinstance(nvme_block, dict):
+        count = _first_present(
+            nvme_block,
+            FIELD_LOCAL_SSD_COUNT,
+            FIELD_LOCAL_SSD_COUNT_SNAKE,
+        )
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            details.append(f"{FIELD_NVME_SSD_BLOCK}.{FIELD_LOCAL_SSD_COUNT}={count}")
+        elif nvme_block:
+            details.append(FIELD_NVME_SSD_BLOCK)
+
+    ephemeral_storage = _first_present(
+        config,
+        FIELD_EPHEMERAL_STORAGE,
+        FIELD_EPHEMERAL_STORAGE_SNAKE,
+    )
+    if isinstance(ephemeral_storage, dict):
+        count = _first_present(
+            ephemeral_storage,
+            FIELD_LOCAL_SSD_COUNT,
+            FIELD_LOCAL_SSD_COUNT_SNAKE,
+        )
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            details.append(f"{FIELD_EPHEMERAL_STORAGE}.{FIELD_LOCAL_SSD_COUNT}={count}")
+
+    if source_machine_type.lower().endswith(LSSD_MACHINE_SUFFIX):
+        details.append(f"machineType={source_machine_type}")
+
+    return details, has_legacy_count
+
+
+def _evaluate_security(
+    config: dict[str, Any],
+    cluster: dict[str, Any] | None,
+    target_family: str,
+    target_machine_type: str,
+) -> list[Finding]:
+    """Check Shielded VM, Secure Boot, vTPM, integrity monitoring, and Confidential VM."""
+    blockers: list[Finding] = []
+
+    if target_family in SHIELDED_ONLY_FAMILIES:
+        if isinstance(cluster, dict):
+            shielded_nodes = _first_present(
+                cluster,
+                FIELD_SHIELDED_NODES,
+                FIELD_SHIELDED_NODES_SNAKE,
+            )
+            if (
+                isinstance(shielded_nodes, dict)
+                and shielded_nodes.get(FIELD_ENABLED) is False
+            ):
+                blockers.append(
+                    Finding(
+                        rule=RULE_SHIELDED_NODES_DISABLED,
+                        category=CATEGORY_SECURITY,
+                        field=f"{FIELD_SHIELDED_NODES}.{FIELD_ENABLED}",
+                        message=(
+                            f"Cluster has {FIELD_SHIELDED_NODES}.{FIELD_ENABLED}=false; "
+                            f"target family {target_family} requires Shielded GKE Nodes "
+                            "and Shielded VM instances."
+                        ),
+                        remediation=(
+                            f"Enable Shielded GKE Nodes ({FIELD_SHIELDED_NODES}.{FIELD_ENABLED}: true) "
+                            f"on the cluster before migrating node pools to {target_family}."
+                        ),
+                    )
+                )
+
+        shielded_cfg = _first_present(
+            config,
+            FIELD_SHIELDED_INSTANCE_CONFIG,
+            FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+        )
+        if not isinstance(shielded_cfg, dict) and isinstance(cluster, dict):
+            cluster_node_cfg = _first_present(
+                cluster,
+                FIELD_NODE_CONFIG,
+                FIELD_NODE_CONFIG_SNAKE,
+            )
+            if isinstance(cluster_node_cfg, dict):
+                shielded_cfg = _first_present(
+                    cluster_node_cfg,
+                    FIELD_SHIELDED_INSTANCE_CONFIG,
+                    FIELD_SHIELDED_INSTANCE_CONFIG_SNAKE,
+                )
+
+        if isinstance(shielded_cfg, dict):
+            vtpm = _first_present(
+                shielded_cfg,
+                FIELD_ENABLE_VTPM,
+                FIELD_ENABLE_VTPM_SNAKE,
+            )
+            if vtpm is False:
+                blockers.append(
+                    Finding(
+                        rule=RULE_SHIELDED_VTPM_DISABLED,
+                        category=CATEGORY_SECURITY,
+                        field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_VTPM}",
+                        message=(
+                            f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
+                            f"{FIELD_ENABLE_VTPM}=false; target family {target_family} "
+                            "requires Shielded VM vTPM and the baseline security floor "
+                            "forbids disabling vTPM."
+                        ),
+                        remediation=(
+                            f"Set {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_VTPM}: true "
+                            "(or omit the override so GKE defaults it to true) on the "
+                            f"replacement node pool or ComputeClass targeting {target_family}."
+                        ),
+                    )
+                )
+
+            integrity = _first_present(
+                shielded_cfg,
+                FIELD_ENABLE_INTEGRITY,
+                FIELD_ENABLE_INTEGRITY_SNAKE,
+            )
+            if integrity is False:
+                blockers.append(
+                    Finding(
+                        rule=RULE_SHIELDED_INTEGRITY_DISABLED,
+                        category=CATEGORY_SECURITY,
+                        field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}",
+                        message=(
+                            f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
+                            f"{FIELD_ENABLE_INTEGRITY}=false; target family {target_family} "
+                            "requires Shielded VM integrity monitoring and the baseline "
+                            "security floor forbids disabling it."
+                        ),
+                        remediation=(
+                            f"Set {FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_INTEGRITY}: true "
+                            "(or omit the override so GKE defaults it to true) on the "
+                            f"replacement node pool or ComputeClass targeting {target_family}."
+                        ),
+                    )
+                )
+
+            secure_boot = _first_present(
+                shielded_cfg,
+                FIELD_ENABLE_SECURE_BOOT,
+                FIELD_ENABLE_SECURE_BOOT_SNAKE,
+            )
+            if secure_boot is False:
+                blockers.append(
+                    Finding(
+                        rule=RULE_SHIELDED_SECURE_BOOT_DISABLED,
+                        category=CATEGORY_SECURITY,
+                        field=f"{FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_SECURE_BOOT}",
+                        message=(
+                            f"Source node pool has {FIELD_SHIELDED_INSTANCE_CONFIG}."
+                            f"{FIELD_ENABLE_SECURE_BOOT}=false; carrying disabled Secure Boot "
+                            f"into target family {target_family} violates the baseline node "
+                            "security floor (and indicates potential unsigned third-party "
+                            "kernel modules from the source pool)."
+                        ),
+                        remediation=(
+                            "Verify no workloads depend on unsigned kernel modules and enable "
+                            f"Secure Boot ({FIELD_SHIELDED_INSTANCE_CONFIG}.{FIELD_ENABLE_SECURE_BOOT}: true) "
+                            f"on the target {target_family} node pool or ComputeClass."
+                        ),
+                    )
+                )
+
+    cvm_enabled, cvm_type, cvm_field = _extract_cvm_state(config, cluster)
+    if cvm_enabled:
+        if target_family in NON_CVM_FAMILIES:
+            blockers.append(
+                Finding(
+                    rule=RULE_CVM_UNSUPPORTED_FAMILY,
+                    category=CATEGORY_SECURITY,
+                    field=cvm_field or FIELD_CVM_NODES,
+                    message=(
+                        f"Source configuration enables Confidential GKE Nodes ({cvm_field}), "
+                        f"which is not supported on target family {target_family} "
+                        "(among the target families, Confidential VM is supported on "
+                        "n2d with AMD SEV/SEV_SNP and c3 with Intel TDX)."
+                    ),
+                    remediation=(
+                        "Target n2d (AMD SEV/SEV_SNP) or c3 (Intel TDX on c3-standard-* shapes) "
+                        "for Confidential VM workloads, or confirm with the security owner "
+                        f"before moving non-confidential workloads to {target_family}."
+                    ),
+                )
+            )
+        elif target_family == FAMILY_C3:
+            if cvm_type != CVM_TYPE_TDX:
+                source_label = cvm_type if cvm_type in AMD_CVM_TYPES else CVM_DEFAULT_AMD_LABEL
+                blockers.append(
+                    Finding(
+                        rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                        category=CATEGORY_SECURITY,
+                        field=f"{cvm_field}.{FIELD_CVM_TYPE}",
+                        message=(
+                            f"Source Confidential VM pool uses {source_label}, whereas "
+                            "target family c3 requires Intel TDX "
+                            f"({FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on c3-standard-* shapes)."
+                        ),
+                        remediation=(
+                            f"Explicitly configure {FIELD_CVM_TYPE}: {CVM_TYPE_TDX} on a "
+                            "c3-standard-* shape (GKE 1.28.6-gke.1317000+) and update any "
+                            "remote attestation policies from AMD SEV to Intel TDX."
+                        ),
+                    )
+                )
+            elif (
+                target_machine_type
+                and not target_machine_type.startswith(C3_TDX_ALLOWED_SHAPE_PREFIX)
+            ) or target_machine_type.endswith(LSSD_MACHINE_SUFFIX):
+                blockers.append(
+                    Finding(
+                        rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                        category=CATEGORY_SECURITY,
+                        field=FIELD_MACHINE_TYPE,
+                        message=(
+                            f"Target machine shape {target_machine_type} does not support "
+                            "Confidential VM with Intel TDX on c3 (only c3-standard-* shapes "
+                            "without Local SSDs support Intel TDX)."
+                        ),
+                        remediation=(
+                            "Select a c3-standard-* shape (without -lssd) for Confidential VM "
+                            "with Intel TDX."
+                        ),
+                    )
+                )
+        elif target_family == FAMILY_N2D and cvm_type == CVM_TYPE_TDX:
+            blockers.append(
+                Finding(
+                    rule=RULE_CVM_TECHNOLOGY_MISMATCH,
+                    category=CATEGORY_SECURITY,
+                    field=f"{cvm_field}.{FIELD_CVM_TYPE}",
+                    message=(
+                        "Source Confidential VM pool uses Intel TDX, whereas target family "
+                        f"n2d requires AMD {CVM_TYPE_SEV} or {CVM_TYPE_SEV_SNP}."
+                    ),
+                    remediation=(
+                        f"Configure {FIELD_CVM_TYPE}: {CVM_TYPE_SEV} (or {CVM_TYPE_SEV_SNP}) "
+                        "when targeting n2d and update any remote attestation policies."
+                    ),
+                )
+            )
+
+    return blockers
+
+
+def _evaluate_disk_and_local_ssd(
+    config: dict[str, Any],
+    source_machine_type: str,
+    target_family: str,
+    target_machine_type: str,
+) -> list[Finding]:
+    """Check boot disk generation compatibility and Local SSD attachment rules."""
+    blockers: list[Finding] = []
+    disk_type = _extract_boot_disk_type(config)
+
+    if disk_type:
+        if target_family in HYPERDISK_ONLY_FAMILIES:
+            if disk_type.startswith(PD_DISK_PREFIX):
+                blockers.append(
+                    Finding(
+                        rule=RULE_DISK_PD_ON_HYPERDISK_ONLY,
+                        category=CATEGORY_DISK,
+                        field=FIELD_DISK_TYPE,
+                        message=(
+                            f"Source node pool uses Persistent Disk boot disk '{disk_type}', "
+                            f"which is rejected on Hyperdisk-only target family {target_family} "
+                            f"({target_family} supports {', '.join(HYPERDISK_ONLY_ALLOWED_BOOT_DISKS)})."
+                        ),
+                        remediation=(
+                            f"Change the node boot disk to '{DISK_HYPERDISK_BALANCED}' "
+                            f"(in ComputeClass priorities[].storage.bootDiskType or NodePool "
+                            f"nodeConfig.diskType). For stateful workload data PVs spanning "
+                            "Persistent Disk and Hyperdisk families, migrate PVs to the "
+                            "built-in 'dynamic-rwo' StorageClass (GKE 1.35.3-gke.1290000+)."
+                        ),
+                    )
+                )
+            elif disk_type not in HYPERDISK_ONLY_ALLOWED_BOOT_DISKS:
+                blockers.append(
+                    Finding(
+                        rule=RULE_DISK_UNSUPPORTED_BOOT,
+                        category=CATEGORY_DISK,
+                        field=FIELD_DISK_TYPE,
+                        message=(
+                            f"Source node pool uses boot disk '{disk_type}', which is not a "
+                            f"supported boot disk on target family {target_family} "
+                            f"(supported: {', '.join(HYPERDISK_ONLY_ALLOWED_BOOT_DISKS)})."
+                        ),
+                        remediation=(
+                            f"Use '{DISK_HYPERDISK_BALANCED}' as the boot disk for {target_family}."
+                        ),
+                    )
+                )
+        elif target_family == FAMILY_C3:
+            if disk_type == DISK_PD_STANDARD:
+                blockers.append(
+                    Finding(
+                        rule=RULE_DISK_PD_STANDARD_ON_C3,
+                        category=CATEGORY_DISK,
+                        field=FIELD_DISK_TYPE,
+                        message=(
+                            f"Source node pool uses '{DISK_PD_STANDARD}' boot disk, which is "
+                            "not supported on target family c3 "
+                            f"(c3 supports {', '.join(C3_ALLOWED_BOOT_DISKS)})."
+                        ),
+                        remediation=(
+                            f"Change the boot disk type to '{DISK_PD_BALANCED}', "
+                            f"'{DISK_PD_SSD}', or '{DISK_HYPERDISK_BALANCED}' when targeting c3."
+                        ),
+                    )
+                )
+            elif disk_type not in C3_ALLOWED_BOOT_DISKS:
+                blockers.append(
+                    Finding(
+                        rule=RULE_DISK_UNSUPPORTED_BOOT,
+                        category=CATEGORY_DISK,
+                        field=FIELD_DISK_TYPE,
+                        message=(
+                            f"Source node pool uses boot disk '{disk_type}', which is not "
+                            "supported as a boot disk on target family c3 "
+                            f"(c3 supports {', '.join(C3_ALLOWED_BOOT_DISKS)})."
+                        ),
+                        remediation=(
+                            f"Use one of {', '.join(C3_ALLOWED_BOOT_DISKS)} as the boot disk on c3."
+                        ),
+                    )
+                )
+        elif target_family in PD_ONLY_BOOT_FAMILIES:
+            if disk_type.startswith(HYPERDISK_PREFIX):
+                blockers.append(
+                    Finding(
+                        rule=RULE_DISK_HYPERDISK_ON_GEN2,
+                        category=CATEGORY_DISK,
+                        field=FIELD_DISK_TYPE,
+                        message=(
+                            f"Source node pool uses Hyperdisk boot disk '{disk_type}', "
+                            f"which is not supported as a boot disk on Gen 2 target family "
+                            f"{target_family} (requires Persistent Disk: "
+                            f"{', '.join(PD_ONLY_ALLOWED_BOOT_DISKS)})."
+                        ),
+                        remediation=(
+                            f"Change the boot disk type to '{DISK_PD_BALANCED}' or "
+                            f"'{DISK_PD_SSD}' when targeting {target_family}."
+                        ),
+                    )
+                )
+            elif disk_type not in PD_ONLY_ALLOWED_BOOT_DISKS:
+                blockers.append(
+                    Finding(
+                        rule=RULE_DISK_UNSUPPORTED_BOOT,
+                        category=CATEGORY_DISK,
+                        field=FIELD_DISK_TYPE,
+                        message=(
+                            f"Source node pool uses boot disk '{disk_type}', which is not "
+                            f"supported as a boot disk on target family {target_family} "
+                            f"(supported: {', '.join(PD_ONLY_ALLOWED_BOOT_DISKS)})."
+                        ),
+                        remediation=(
+                            f"Use '{DISK_PD_BALANCED}' or '{DISK_PD_SSD}' as the boot disk "
+                            f"on {target_family}."
+                        ),
+                    )
+                )
+
+    lssd_details, has_legacy_lssd_count = _extract_local_ssd_configs(
+        config,
+        source_machine_type,
+    )
+    if lssd_details:
+        joined_details = ", ".join(lssd_details)
+        if target_family in LSSD_UNSUPPORTED_FAMILIES:
+            blockers.append(
+                Finding(
+                    rule=RULE_LSSD_UNSUPPORTED_ON_N4,
+                    category=CATEGORY_LOCAL_SSD,
+                    field=FIELD_LOCAL_SSD_COUNT,
+                    message=(
+                        f"Source node pool configures Local SSDs ({joined_details}), "
+                        f"which are not supported on target family {target_family} "
+                        f"({target_family} supports Hyperdisk only and rejects Local SSD "
+                        "attachments)."
+                    ),
+                    remediation=(
+                        f"Remove Local SSD fields ({FIELD_LOCAL_SSD_COUNT}, "
+                        f"{FIELD_EPHEMERAL_LOCAL_SSD}, {FIELD_NVME_SSD_BLOCK}) before "
+                        f"migrating to {target_family}, or target a family with NVMe "
+                        "Local SSD shapes (c3-standard-*-lssd, c4-standard-*-lssd) or n2/n2d."
+                    ),
+                )
+            )
+        elif target_family in LSSD_SHAPE_REQUIRED_FAMILIES:
+            if not target_machine_type.endswith(LSSD_MACHINE_SUFFIX):
+                blockers.append(
+                    Finding(
+                        rule=RULE_LSSD_REQUIRES_LSSD_SHAPE,
+                        category=CATEGORY_LOCAL_SSD,
+                        field=FIELD_MACHINE_TYPE,
+                        message=(
+                            f"Source node pool configures Local SSDs ({joined_details}); "
+                            f"target family {target_family} does not allow arbitrary Local SSD "
+                            "attachments on standard shapes and requires a fixed NVMe "
+                            f"'*-lssd' machine shape (for example {target_family}-standard-8-lssd)."
+                        ),
+                        remediation=(
+                            f"Target an explicit '{target_family}-*-lssd' machine shape "
+                            f"with {FIELD_EPHEMERAL_LOCAL_SSD} or {FIELD_NVME_SSD_BLOCK} "
+                            f"(and remove legacy {FIELD_LOCAL_SSD_COUNT}), or remove Local SSD "
+                            "settings if scratch NVMe is no longer needed."
+                        ),
+                    )
+                )
+            elif has_legacy_lssd_count:
+                blockers.append(
+                    Finding(
+                        rule=RULE_LSSD_LEGACY_COUNT_ON_GEN3_GEN4,
+                        category=CATEGORY_LOCAL_SSD,
+                        field=FIELD_LOCAL_SSD_COUNT,
+                        message=(
+                            f"Source node pool sets legacy {FIELD_LOCAL_SSD_COUNT} "
+                            f"({joined_details}), which is rejected on {target_machine_type} "
+                            f"because {target_family} '*-lssd' shapes bundle a fixed Local SSD "
+                            "count determined by the machine type."
+                        ),
+                        remediation=(
+                            f"Omit legacy {FIELD_LOCAL_SSD_COUNT} and configure "
+                            f"{FIELD_EPHEMERAL_LOCAL_SSD} or {FIELD_NVME_SSD_BLOCK} "
+                            f"(or ComputeClass ephemeralLocalSsdProfile / dedicatedLocalSsdProfile) "
+                            f"matching {target_machine_type}'s bundled NVMe disks."
+                        ),
+                    )
+                )
+
+    accelerators = _first_present(
+        config,
+        FIELD_GUEST_ACCELERATORS,
+        FIELD_GUEST_ACCELERATORS_SNAKE,
+    )
+    if isinstance(accelerators, list):
+        active_accelerators = [
+            acc
+            for acc in accelerators
+            if isinstance(acc, dict)
+            and int(
+                _first_present(
+                    acc,
+                    FIELD_ACCELERATOR_COUNT,
+                    FIELD_ACCELERATOR_COUNT_SNAKE,
+                )
+                or 0
+            )
+            > 0
+        ]
+        if active_accelerators:
+            blockers.append(
+                Finding(
+                    rule=RULE_GPU_UNSUPPORTED_ON_TARGET,
+                    category=CATEGORY_ACCELERATOR,
+                    field=FIELD_GUEST_ACCELERATORS,
+                    message=(
+                        f"Source node pool attaches guest accelerators ({FIELD_GUEST_ACCELERATORS}), "
+                        f"which cannot be attached to general-purpose/compute-optimized target "
+                        f"family {target_family}."
+                    ),
+                    remediation=(
+                        "Use an accelerator-optimized GKE machine family (such as g2, a2, or a3) "
+                        f"for GPU workloads, or remove {FIELD_GUEST_ACCELERATORS} before "
+                        f"migrating CPU workloads to {target_family}."
+                    ),
+                )
+            )
+
+    return blockers
+
+
+def _evaluate_versions_and_os_image(
+    node_pool: dict[str, Any],
+    config: dict[str, Any],
+    cluster: dict[str, Any] | None,
+    source_family: str,
+    target_family: str,
+    *,
+    cluster_version_override: str = "",
+    require_dynamic_rwo: bool = False,
+) -> tuple[list[Finding], list[Finding]]:
+    """Check GKE control-plane and node version floors and OS image compatibility."""
+    blockers: list[Finding] = []
+    warnings: list[Finding] = []
+
+    control_plane_version = cluster_version_override.strip()
+    if not control_plane_version and isinstance(cluster, dict):
+        raw_master = _first_present(
+            cluster,
+            FIELD_MASTER_VERSION,
+            FIELD_MASTER_VERSION_ALT,
+            FIELD_MIN_MASTER_VERSION,
+            FIELD_MASTER_VERSION_SNAKE,
+            FIELD_VERSION,
+        )
+        if isinstance(raw_master, str):
+            control_plane_version = raw_master.strip()
+
+    node_version = ""
+    raw_node_ver = _first_present(
+        node_pool,
+        FIELD_VERSION,
+        FIELD_NODE_VERSION,
+        FIELD_INITIAL_NODE_VERSION,
+    )
+    if isinstance(raw_node_ver, str):
+        node_version = raw_node_ver.strip()
+
+    family_floor = MIN_GKE_VERSIONS[target_family]
+    if control_plane_version and _version_below_floor(control_plane_version, family_floor):
+        blockers.append(
+            Finding(
+                rule=RULE_GKE_MASTER_VERSION_FLOOR,
+                category=CATEGORY_VERSION,
+                field=FIELD_MASTER_VERSION,
+                message=(
+                    f"Cluster control-plane version '{control_plane_version}' is below "
+                    f"the minimum GKE version '{family_floor}' required for target "
+                    f"family {target_family}."
+                ),
+                remediation=(
+                    f"Upgrade the cluster control plane to GKE {family_floor} or newer "
+                    f"before provisioning {target_family} node pools."
+                ),
+            )
+        )
+
+    if node_version and _version_below_floor(node_version, family_floor):
+        blockers.append(
+            Finding(
+                rule=RULE_GKE_NODE_VERSION_FLOOR,
+                category=CATEGORY_VERSION,
+                field=FIELD_VERSION,
+                message=(
+                    f"Source node pool version '{node_version}' is below the minimum "
+                    f"GKE version '{family_floor}' required for target family "
+                    f"{target_family}."
+                ),
+                remediation=(
+                    f"Set the replacement node pool version to GKE {family_floor} or newer "
+                    f"(matching a control plane at or above {family_floor})."
+                ),
+            )
+        )
+
+    cvm_enabled, cvm_type, _ = _extract_cvm_state(config, cluster)
+    if target_family == FAMILY_C3 and (cvm_enabled or cvm_type == CVM_TYPE_TDX):
+        for ver_label, field_name, ver_value in (
+            ("control-plane", FIELD_MASTER_VERSION, control_plane_version),
+            ("node-pool", FIELD_VERSION, node_version),
+        ):
+            if ver_value and _version_below_floor(ver_value, MIN_GKE_VERSION_CVM_TDX):
+                blockers.append(
+                    Finding(
+                        rule=RULE_GKE_CVM_TDX_VERSION_FLOOR,
+                        category=CATEGORY_VERSION,
+                        field=field_name,
+                        message=(
+                            f"GKE {ver_label} version '{ver_value}' is below the minimum "
+                            f"version '{MIN_GKE_VERSION_CVM_TDX}' required for Confidential "
+                            "VM with Intel TDX on target family c3."
+                        ),
+                        remediation=(
+                            f"Upgrade GKE to {MIN_GKE_VERSION_CVM_TDX} or newer before "
+                            "provisioning Confidential VM (Intel TDX) nodes on c3."
+                        ),
+                    )
+                )
+
+    disk_type = _extract_boot_disk_type(config)
+    crosses_disk_gen = (
+        (
+            (source_family in GEN2_PD_FAMILIES or disk_type.startswith(PD_DISK_PREFIX))
+            and target_family in HYPERDISK_ONLY_FAMILIES
+        )
+        or (
+            (source_family in HYPERDISK_ONLY_FAMILIES or disk_type.startswith(HYPERDISK_PREFIX))
+            and target_family in PD_ONLY_BOOT_FAMILIES
+        )
+    )
+    if crosses_disk_gen or require_dynamic_rwo:
+        for ver_label, field_name, ver_value in (
+            ("control-plane", FIELD_MASTER_VERSION, control_plane_version),
+            ("node-pool", FIELD_VERSION, node_version),
+        ):
+            if ver_value and _version_below_floor(ver_value, MIN_GKE_VERSION_DYNAMIC_RWO):
+                finding = Finding(
+                    rule=RULE_DYNAMIC_RWO_VERSION_FLOOR,
+                    category=CATEGORY_VERSION,
+                    field=field_name,
+                    message=(
+                        f"GKE {ver_label} version '{ver_value}' is below "
+                        f"'{MIN_GKE_VERSION_DYNAMIC_RWO}', the minimum version required "
+                        "for the built-in 'dynamic-rwo' disk-topology-aware StorageClass "
+                        "when mixing Persistent Disk and Hyperdisk families for stateful PVs."
+                    ),
+                    remediation=(
+                        f"Upgrade control plane and node pools to {MIN_GKE_VERSION_DYNAMIC_RWO}+ "
+                        "before mixing Persistent Disk (Gen 2) and Hyperdisk (Gen 4) "
+                        "priorities for stateful PV workloads with 'dynamic-rwo'."
+                    ),
+                )
+                if require_dynamic_rwo:
+                    blockers.append(finding)
+                else:
+                    warnings.append(finding)
+
+    raw_image = _first_present(config, FIELD_IMAGE_TYPE, FIELD_IMAGE_TYPE_SNAKE)
+    if isinstance(raw_image, str) and raw_image.strip():
+        image_upper = raw_image.strip().upper()
+        if image_upper in LEGACY_DOCKER_IMAGES or image_upper.endswith(LEGACY_DOCKER_SUFFIX):
+            blockers.append(
+                Finding(
+                    rule=RULE_OS_IMAGE_LEGACY_DOCKER,
+                    category=CATEGORY_OS_IMAGE,
+                    field=FIELD_IMAGE_TYPE,
+                    message=(
+                        f"Source node pool uses legacy Dockershim OS image '{raw_image.strip()}', "
+                        f"which is unsupported on target family {target_family} and modern GKE."
+                    ),
+                    remediation=(
+                        "Migrate the node image to 'COS_CONTAINERD' or 'UBUNTU_CONTAINERD' "
+                        "(use lowercase 'cos_containerd' or 'ubuntu_containerd' in "
+                        "ComputeClass nodePoolConfig.imageType)."
+                    ),
+                )
+            )
+        elif image_upper.startswith(WINDOWS_IMAGE_PREFIX):
+            if target_family in WINDOWS_UNSUPPORTED_FAMILIES or cvm_enabled:
+                reason_clause = (
+                    f"target family {target_family}"
+                    if target_family in WINDOWS_UNSUPPORTED_FAMILIES
+                    else "Confidential VM node pools"
+                )
+                blockers.append(
+                    Finding(
+                        rule=RULE_OS_IMAGE_WINDOWS_UNSUPPORTED,
+                        category=CATEGORY_OS_IMAGE,
+                        field=FIELD_IMAGE_TYPE,
+                        message=(
+                            f"Source node pool uses Windows OS image '{raw_image.strip()}', "
+                            f"which is not supported on {reason_clause}."
+                        ),
+                        remediation=(
+                            "Keep Windows workloads on a supported non-confidential family "
+                            "(such as n2, n2d, or c3) or migrate Linux workloads to "
+                            "'COS_CONTAINERD' / 'UBUNTU_CONTAINERD'."
+                        ),
+                    )
+                )
+            elif image_upper not in ALLOWED_CONTAINERD_IMAGES:
+                blockers.append(
+                    Finding(
+                        rule=RULE_OS_IMAGE_INCOMPATIBLE,
+                        category=CATEGORY_OS_IMAGE,
+                        field=FIELD_IMAGE_TYPE,
+                        message=(
+                            f"Source node pool uses unrecognized Windows OS image "
+                            f"'{raw_image.strip()}' for target family {target_family}."
+                        ),
+                        remediation=(
+                            f"Use '{IMAGE_WINDOWS_LTSC_CONTAINERD}' on supported families "
+                            "or a supported Linux containerd image."
+                        ),
+                    )
+                )
+        elif image_upper not in ALLOWED_LINUX_IMAGES:
+            blockers.append(
+                Finding(
+                    rule=RULE_OS_IMAGE_INCOMPATIBLE,
+                    category=CATEGORY_OS_IMAGE,
+                    field=FIELD_IMAGE_TYPE,
+                    message=(
+                        f"Source node pool uses unsupported OS image '{raw_image.strip()}' "
+                        f"for target family {target_family} "
+                        f"(supported Linux images: {', '.join(ALLOWED_LINUX_IMAGES)})."
+                    ),
+                    remediation=(
+                        f"Set {FIELD_IMAGE_TYPE} to '{IMAGE_COS_CONTAINERD}' or "
+                        f"'{IMAGE_UBUNTU_CONTAINERD}' (lowercase in ComputeClass "
+                        "nodePoolConfig.imageType)."
+                    ),
+                )
+            )
+
+    return blockers, warnings
+
+
+def evaluate_node_pool_transition(
+    node_pool: dict[str, Any],
+    target_spec: str,
+    *,
+    cluster: dict[str, Any] | None = None,
+    target_machine_type: str = "",
+    cluster_version_override: str = "",
+    require_dynamic_rwo: bool = False,
+) -> TransitionResult:
+    """Evaluate a single source `node_pool` against `target_spec`."""
+    parsed_family, parsed_shape = parse_target_spec(target_spec)
+    effective_target_shape = (target_machine_type or parsed_shape).strip().lower()
+    if effective_target_shape:
+        shape_family = extract_machine_family(effective_target_shape)
+        if shape_family != parsed_family:
+            raise ValueError(
+                f"target machine type {effective_target_shape!r} does not match "
+                f"target family {parsed_family!r}"
+            )
+
+    config = _node_config_of(node_pool)
+    pool_name = str(node_pool.get(FIELD_NAME) or UNNAMED_POOL).strip() or UNNAMED_POOL
+    raw_machine_type = _first_present(
+        config,
+        FIELD_MACHINE_TYPE,
+        FIELD_MACHINE_TYPE_SNAKE,
+    )
+    source_machine_type = (
+        str(raw_machine_type).strip()
+        if isinstance(raw_machine_type, str) and raw_machine_type.strip()
+        else DEFAULT_SOURCE_MACHINE_TYPE
+    )
+    source_family = extract_machine_family(source_machine_type)
+
+    blockers: list[Finding] = []
+    blockers.extend(
+        _evaluate_security(
+            config,
+            cluster,
+            parsed_family,
+            effective_target_shape,
+        )
+    )
+    blockers.extend(
+        _evaluate_disk_and_local_ssd(
+            config,
+            source_machine_type,
+            parsed_family,
+            effective_target_shape,
+        )
+    )
+    ver_blockers, ver_warnings = _evaluate_versions_and_os_image(
+        node_pool,
+        config,
+        cluster,
+        source_family,
+        parsed_family,
+        cluster_version_override=cluster_version_override,
+        require_dynamic_rwo=require_dynamic_rwo,
+    )
+    blockers.extend(ver_blockers)
+
+    return TransitionResult(
+        node_pool=pool_name,
+        source_machine_type=source_machine_type,
+        source_family=source_family,
+        target_family=parsed_family,
+        target_machine_type=effective_target_shape,
+        blockers=tuple(blockers),
+        warnings=tuple(ver_warnings),
+    )
+
+
+def _default_runner(timeout: int = GCLOUD_TIMEOUT_SECONDS) -> Runner:
+    """Execute a read-only gcloud command with a timeout."""
+
+    def run(argv: list[str]) -> tuple[int, str, str]:
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
+        except subprocess.TimeoutExpired as exc:
+            return (
+                EXIT_READ_ERROR,
+                "",
+                f"command timed out after {timeout}s: {' '.join(exc.cmd)}",
+            )
+        except OSError as exc:
+            return EXIT_READ_ERROR, "", f"failed to execute {argv[0]}: {exc}"
+
+    return run
+
+
+def _resolve_project(explicit_project: str | None) -> str:
+    """Resolve the GCP project ID from `--project` or the standard environment variables."""
+    if explicit_project and explicit_project.strip():
+        return explicit_project.strip()
+    for env_key in PROJECT_ENV_VARS:
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _load_json_input(source: str, label: str) -> tuple[Any | None, str]:
+    """Load JSON from a file path, `-` (stdin), or an inline JSON literal."""
+    stripped = source.strip()
+    try:
+        if stripped == STDIN_MARKER:
+            raw_text = sys.stdin.read()
+        elif stripped.startswith(INLINE_JSON_PREFIXES):
+            raw_text = stripped
+        else:
+            raw_text = Path(stripped).read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"could not read {label} from {source!r}: {exc}"
+
+    if not raw_text.strip():
+        return None, f"{label} {source!r} is empty"
+    try:
+        return json.loads(raw_text), ""
+    except json.JSONDecodeError as exc:
+        return None, f"{label} {source!r} contains invalid JSON: {exc}"
+
+
+def _describe_cluster_live(
+    project: str,
+    location: str,
+    cluster_name: str,
+    run: Runner,
+) -> tuple[dict[str, Any] | None, str]:
+    """Run `gcloud container clusters describe` and parse the JSON response."""
+    argv = [
+        GCLOUD_BIN,
+        "container",
+        "clusters",
+        "describe",
+        cluster_name,
+        f"--location={location}",
+        JSON_FORMAT_FLAG,
+    ]
+    if project:
+        argv.append(f"--project={project}")
+    rc, stdout, stderr = run(argv)
+    if rc != 0:
+        detail = " ".join((stderr or stdout or f"exit {rc}").strip().split())
+        return (
+            None,
+            f"gcloud container clusters describe {cluster_name} "
+            f"(--location={location}"
+            + (f", --project={project}" if project else "")
+            + f") failed: {detail}",
+        )
+    try:
+        parsed = json.loads(stdout or "")
+    except json.JSONDecodeError as exc:
+        return (
+            None,
+            f"gcloud container clusters describe {cluster_name} returned invalid JSON: {exc}",
+        )
+    if not isinstance(parsed, dict) or not parsed:
+        return (
+            None,
+            f"gcloud container clusters describe {cluster_name} returned an empty or non-object payload",
+        )
+    return parsed, ""
+
+
+def _describe_node_pool_live(
+    project: str,
+    location: str,
+    cluster_name: str,
+    pool_name: str,
+    run: Runner,
+) -> tuple[dict[str, Any] | None, str]:
+    """Run `gcloud container node-pools describe` and parse the JSON response."""
+    argv = [
+        GCLOUD_BIN,
+        "container",
+        "node-pools",
+        "describe",
+        pool_name,
+        f"--cluster={cluster_name}",
+        f"--location={location}",
+        JSON_FORMAT_FLAG,
+    ]
+    if project:
+        argv.append(f"--project={project}")
+    rc, stdout, stderr = run(argv)
+    if rc != 0:
+        detail = " ".join((stderr or stdout or f"exit {rc}").strip().split())
+        return (
+            None,
+            f"gcloud container node-pools describe {pool_name} "
+            f"(--cluster={cluster_name}, --location={location}"
+            + (f", --project={project}" if project else "")
+            + f") failed: {detail}",
+        )
+    try:
+        parsed = json.loads(stdout or "")
+    except json.JSONDecodeError as exc:
+        return (
+            None,
+            f"gcloud container node-pools describe {pool_name} returned invalid JSON: {exc}",
+        )
+    if not isinstance(parsed, dict) or not parsed:
+        return (
+            None,
+            f"gcloud container node-pools describe {pool_name} returned an empty or non-object payload",
+        )
+    return parsed, ""
+
+
+def _write_output_atomic(path_str: str, payload: dict[str, Any]) -> None:
+    """Write `payload` as formatted JSON to `path_str` atomically via a temp sibling."""
+    target_path = Path(path_str).resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=OUTPUT_TMP_PREFIX,
+        suffix=".json",
+        dir=str(target_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=JSON_INDENT, sort_keys=False)
+            handle.write("\n")
+        os.replace(tmp_name, target_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def render_markdown_report(report: dict[str, Any]) -> str:
+    """Render the evaluation report as a deterministic Markdown summary and table."""
+    lines: list[str] = []
+    status = report.get("status", STATUS_ERROR)
+    if status == STATUS_COMPATIBLE:
+        lines.append(VERDICT_COMPATIBLE)
+    elif status == STATUS_INCOMPATIBLE:
+        lines.append(VERDICT_INCOMPATIBLE)
+    else:
+        lines.append(VERDICT_ERROR)
+
+    cluster_name = report.get("cluster") or UNNAMED_CLUSTER
+    control_plane_version = report.get("control_plane_version") or EMPTY_CELL
+    lines.append(
+        f"Cluster: `{cluster_name}` | Control-plane version: `{control_plane_version}`"
+    )
+    lines.append("")
+
+    results: list[dict[str, Any]] = report.get("results") or []
+    if results:
+        lines.append("| " + " | ".join(TABLE_HEADERS) + " |")
+        lines.append("| " + " | ".join(TABLE_SEPARATOR for _ in TABLE_HEADERS) + " |")
+        for row in results:
+            target_label = row["target_family"]
+            if row.get("target_machine_type"):
+                target_label = f"{row['target_family']} ({row['target_machine_type']})"
+            blocker_rules = ", ".join(b["rule"] for b in row.get("blockers") or []) or EMPTY_CELL
+            warning_rules = ", ".join(w["rule"] for w in row.get("warnings") or []) or EMPTY_CELL
+            lines.append(
+                f"| {row['node_pool']} | {row['source_machine_type']} | "
+                f"{target_label} | {row['status']} | {blocker_rules} | {warning_rules} |"
+            )
+        lines.append("")
+
+    for err in report.get("errors") or []:
+        lines.append(f"- [ERROR] {err.get('target', 'input')}: {err.get('message', '')}")
+
+    for row in results:
+        transition = (
+            f"{row['node_pool']} ({row['source_machine_type']} -> "
+            f"{row.get('target_machine_type') or row['target_family']})"
+        )
+        for blocker in row.get("blockers") or []:
+            lines.append(
+                f"- [BLOCKER] {transition} [{blocker['rule']}] ({blocker['field']}): "
+                f"{blocker['message']} Remediation: {blocker['remediation']}"
+            )
+        for warning in row.get("warnings") or []:
+            lines.append(
+                f"- [WARNING] {transition} [{warning['rule']}] ({warning['field']}): "
+                f"{warning['message']} Remediation: {warning['remediation']}"
+            )
+
+    if status in (STATUS_INCOMPATIBLE, STATUS_ERROR):
+        lines.append("")
+        lines.append(PREFLIGHT_STOP_LINE)
+
+    return "\n".join(lines)
+
+
+def run_preflight(
+    *,
+    project: str = "",
+    location: str = "",
+    cluster_name: str = "",
+    node_pool_names: list[str] | None = None,
+    cluster_json_source: str = "",
+    node_pool_json_sources: list[str] | None = None,
+    target_specs: list[str] | None = None,
+    target_machine_type: str = "",
+    cluster_version_override: str = "",
+    require_dynamic_rwo: bool = False,
+    run: Runner | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Load cluster and node-pool inputs (offline or via gcloud) and grade transitions."""
+    runner = run or _default_runner()
+    resolved_project = _resolve_project(project)
+    errors: list[dict[str, str]] = []
+    cluster_doc: dict[str, Any] | None = None
+    pools_to_check: list[dict[str, Any]] = []
+
+    raw_targets = target_specs or list(SUPPORTED_TARGET_FAMILIES)
+    expanded_targets: list[str] = []
+    for item in raw_targets:
+        for piece in item.split(COMMA_SEPARATOR):
+            if piece.strip():
+                expanded_targets.append(piece.strip())
+
+    normalized_targets: list[tuple[str, str]] = []
+    for spec in expanded_targets:
+        parsed_family, parsed_shape = parse_target_spec(spec)
+        shape = (target_machine_type or parsed_shape).strip().lower()
+        if shape and extract_machine_family(shape) != parsed_family:
+            raise ValueError(
+                f"--target-machine-type {shape!r} does not belong to target family {parsed_family!r}"
+            )
+        normalized_targets.append((parsed_family, shape))
+
+    if cluster_json_source:
+        loaded_cluster, err = _load_json_input(cluster_json_source, "--cluster-json")
+        if err:
+            errors.append({"target": "--cluster-json", "message": err})
+        elif not isinstance(loaded_cluster, dict):
+            errors.append(
+                {
+                    "target": "--cluster-json",
+                    "message": "--cluster-json must contain a JSON object",
+                }
+            )
+        else:
+            cluster_doc = loaded_cluster
+
+    for pool_source in node_pool_json_sources or []:
+        loaded_pool, err = _load_json_input(pool_source, "--node-pool-json")
+        if err:
+            errors.append({"target": f"--node-pool-json ({pool_source})", "message": err})
+        elif isinstance(loaded_pool, dict):
+            pools_to_check.append(loaded_pool)
+        elif isinstance(loaded_pool, list) and all(isinstance(p, dict) for p in loaded_pool):
+            pools_to_check.extend(loaded_pool)
+        else:
+            errors.append(
+                {
+                    "target": f"--node-pool-json ({pool_source})",
+                    "message": "--node-pool-json must contain a JSON object or array of objects",
+                }
+            )
+
+    if not cluster_json_source and not (node_pool_json_sources or []):
+        if not cluster_name or not location:
+            errors.append(
+                {
+                    "target": "cli",
+                    "message": (
+                        "specify either live target flags (--cluster and --location, "
+                        "optionally --project and --node-pool) or offline JSON inputs "
+                        "(--cluster-json and/or --node-pool-json)"
+                    ),
+                }
+            )
+        else:
+            cluster_doc, err = _describe_cluster_live(
+                resolved_project,
+                location,
+                cluster_name,
+                runner,
+            )
+            if err:
+                errors.append({"target": f"cluster/{cluster_name}", "message": err})
+
+    if cluster_doc is not None and not pools_to_check:
+        raw_cluster_pools = _first_present(
+            cluster_doc,
+            FIELD_NODE_POOLS,
+            FIELD_NODE_POOLS_SNAKE,
+        )
+        cluster_pools = (
+            [p for p in raw_cluster_pools if isinstance(p, dict)]
+            if isinstance(raw_cluster_pools, list)
+            else []
+        )
+        requested_names = [n.strip() for n in (node_pool_names or []) if n.strip()]
+        if requested_names:
+            by_name = {
+                str(p.get(FIELD_NAME) or "").strip(): p
+                for p in cluster_pools
+                if p.get(FIELD_NAME)
+            }
+            for req_name in requested_names:
+                if req_name in by_name:
+                    pools_to_check.append(by_name[req_name])
+                elif not cluster_json_source and cluster_name and location:
+                    described_pool, pool_err = _describe_node_pool_live(
+                        resolved_project,
+                        location,
+                        cluster_name,
+                        req_name,
+                        runner,
+                    )
+                    if pool_err:
+                        errors.append(
+                            {
+                                "target": f"node-pool/{req_name}",
+                                "message": pool_err,
+                            }
+                        )
+                    elif described_pool is not None:
+                        pools_to_check.append(described_pool)
+                else:
+                    errors.append(
+                        {
+                            "target": f"node-pool/{req_name}",
+                            "message": (
+                                f"node pool {req_name!r} was not found in cluster "
+                                f"{cluster_doc.get(FIELD_NAME) or cluster_name or UNNAMED_CLUSTER}"
+                            ),
+                        }
+                    )
+        else:
+            pools_to_check.extend(cluster_pools)
+    elif pools_to_check and node_pool_names:
+        requested_names = [n.strip() for n in node_pool_names if n.strip()]
+        if requested_names:
+            by_name = {
+                str(p.get(FIELD_NAME) or "").strip(): p
+                for p in pools_to_check
+                if p.get(FIELD_NAME)
+            }
+            filtered: list[dict[str, Any]] = []
+            for req_name in requested_names:
+                if req_name in by_name:
+                    filtered.append(by_name[req_name])
+                else:
+                    errors.append(
+                        {
+                            "target": f"node-pool/{req_name}",
+                            "message": f"node pool {req_name!r} was not found in provided node-pool JSON",
+                        }
+                    )
+            pools_to_check = filtered
+
+    if not errors and not pools_to_check:
+        errors.append(
+            {
+                "target": f"cluster/{(cluster_doc or {}).get(FIELD_NAME) or cluster_name or UNNAMED_CLUSTER}",
+                "message": "no node pools found to evaluate (fail-closed)",
+            }
+        )
+
+    transitions: list[TransitionResult] = []
+    if not errors:
+        for pool_doc in pools_to_check:
+            for target_family, target_shape in normalized_targets:
+                transitions.append(
+                    evaluate_node_pool_transition(
+                        pool_doc,
+                        target_family,
+                        cluster=cluster_doc,
+                        target_machine_type=target_shape,
+                        cluster_version_override=cluster_version_override,
+                        require_dynamic_rwo=require_dynamic_rwo,
+                    )
+                )
+
+    control_plane_version = cluster_version_override.strip()
+    if not control_plane_version and isinstance(cluster_doc, dict):
+        raw_master = _first_present(
+            cluster_doc,
+            FIELD_MASTER_VERSION,
+            FIELD_MASTER_VERSION_ALT,
+            FIELD_MIN_MASTER_VERSION,
+            FIELD_MASTER_VERSION_SNAKE,
+            FIELD_VERSION,
+        )
+        if isinstance(raw_master, str):
+            control_plane_version = raw_master.strip()
+
+    effective_cluster_name = (
+        cluster_name
+        or (str(cluster_doc.get(FIELD_NAME) or "") if isinstance(cluster_doc, dict) else "")
+        or UNNAMED_CLUSTER
+    )
+    effective_location = (
+        location
+        or (str(cluster_doc.get("location") or "") if isinstance(cluster_doc, dict) else "")
+    )
+
+    if errors:
+        overall_status = STATUS_ERROR
+        compatible = False
+        exit_code = EXIT_READ_ERROR
+    elif any(not t.compatible for t in transitions):
+        overall_status = STATUS_INCOMPATIBLE
+        compatible = False
+        exit_code = EXIT_INCOMPATIBLE
+    else:
+        overall_status = STATUS_COMPATIBLE
+        compatible = True
+        exit_code = EXIT_OK
+
+    report: dict[str, Any] = {
+        "status": overall_status,
+        "compatible": compatible,
+        "project": resolved_project,
+        "location": effective_location,
+        "cluster": effective_cluster_name,
+        "control_plane_version": control_plane_version,
+        "target_families": [fam for fam, _ in normalized_targets],
+        "results": [t.to_dict() for t in transitions],
+        "errors": errors,
+    }
+    return exit_code, report
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser (`allow_abbrev=False` for exact flag matching)."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read-only GKE machine-family migration pre-flight validator "
+            "(n1/e2/n2/n2d/c3/n4/c4 -> n2, n2d, n4, c3, c4)."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--project",
+        default="",
+        help="GCP project ID for live gcloud reads (defaults to GKE_PROJECT_ID / GCP_PROJECT_ID / PROJECT_ID).",
+    )
+    parser.add_argument(
+        "--location",
+        default="",
+        help="GKE cluster region or zone for live gcloud reads.",
+    )
+    parser.add_argument(
+        "--cluster",
+        default="",
+        help="GKE cluster name for live gcloud reads.",
+    )
+    parser.add_argument(
+        "--node-pool",
+        action="append",
+        default=[],
+        dest="node_pools",
+        help="Node pool name to evaluate (repeatable; defaults to all pools in the cluster).",
+    )
+    parser.add_argument(
+        "--cluster-json",
+        default="",
+        help="Path to offline cluster describe JSON (or '-' for stdin, or inline JSON object).",
+    )
+    parser.add_argument(
+        "--node-pool-json",
+        action="append",
+        default=[],
+        dest="node_pool_jsons",
+        help="Path to offline node-pool describe JSON (repeatable; file path, '-', or inline JSON).",
+    )
+    parser.add_argument(
+        "--target-family",
+        action="append",
+        default=[],
+        dest="target_families",
+        help=(
+            "Target machine family in n2, n2d, n4, c3, c4 (repeatable or comma-separated; "
+            "also accepts a full machine type such as c3-standard-8-lssd; defaults to all five)."
+        ),
+    )
+    parser.add_argument(
+        "--target-machine-type",
+        default="",
+        help="Optional concrete target machine shape (for example c3-standard-8-lssd or n4-standard-8).",
+    )
+    parser.add_argument(
+        "--cluster-version",
+        default="",
+        help="Optional GKE control-plane version when evaluating a standalone --node-pool-json.",
+    )
+    parser.add_argument(
+        "--require-dynamic-rwo",
+        action="store_true",
+        help="Treat the GKE 1.35.3-gke.1290000+ floor for dynamic-rwo StorageClass as a hard blocker.",
+    )
+    parser.add_argument(
+        "--output",
+        default="",
+        help="Optional path to write the JSON evaluation report atomically.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=SUPPORTED_OUTPUT_FORMATS,
+        default=FORMAT_MARKDOWN,
+        dest="output_format",
+        help="Stdout report format: 'markdown' (default) or 'json'.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None, *, run: Runner | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        exit_code, report = run_preflight(
+            project=args.project,
+            location=args.location,
+            cluster_name=args.cluster,
+            node_pool_names=args.node_pools,
+            cluster_json_source=args.cluster_json,
+            node_pool_json_sources=args.node_pool_jsons,
+            target_specs=args.target_families,
+            target_machine_type=args.target_machine_type,
+            cluster_version_override=args.cluster_version,
+            require_dynamic_rwo=args.require_dynamic_rwo,
+            run=run,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+        return EXIT_READ_ERROR
+
+    if args.output:
+        try:
+            _write_output_atomic(args.output, report)
+        except OSError as exc:
+            print(f"VERDICT: ERROR\ncould not write --output {args.output!r}: {exc}", file=sys.stderr)
+            return EXIT_READ_ERROR
+
+    if args.output_format == FORMAT_JSON:
+        print(json.dumps(report, indent=JSON_INDENT))
+    else:
+        print(render_markdown_report(report))
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1113,6 +1113,14 @@
 # fixture, 200s default until it has a record.
 ./tasks/cluster-agent-storage-audit-collector/task.yaml
 
+# gke-compute-classes pre-flight machine-family migration validator probe
+# (#5733): migrating a legacy N1 node pool (pd-standard, localSsdCount: 2,
+# enableSecureBoot: false, enableVtpm: false) to N4 runs
+# /opt/data/scripts/machine_family_preflight.py and surfaces security, disk, and
+# Local SSD blockers before generating ComputeClass or NodePool YAML.
+# deployer: noop, read-only, no fixture, transcript-only.
+./tasks/compute-class-machine-family-preflight-probe/task.yaml
+
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
 # verdict lines: the cause is the missing class and not a stockout, and the

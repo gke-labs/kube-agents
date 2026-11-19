@@ -712,6 +712,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          schema it validates against. Its sqlite3 functions
 #                          take a connection the caller opens, and nothing here
 #                          opens one
+#   machine_family_preflight.py  read-only GKE node-pool machine-family migration
+#                          pre-flight validator (n1/e2/n2/n2d/c3/n4/c4 -> n2,
+#                          n2d, n4, c3, c4) for gke-compute-classes,
+#                          gcp-config-connector and gcp-terraform (#5733)
 #
 # agents/platform/scripts/test_sandbox_delivery.py holds this list to the agents'
 # instructions: a skill that starts calling a shared script the sandbox does not
@@ -760,6 +764,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
+     agents/platform/scripts/machine_family_preflight.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
