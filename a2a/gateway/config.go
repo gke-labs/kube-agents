@@ -139,6 +139,14 @@ const (
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+
+// The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
+// hand on the gateway as the Google class's variables are.
+const (
+	envA2ADoorEntraTenantID     = "A2A_DOOR_ENTRA_TENANT_ID"
+	envA2ADoorEntraClientID     = "A2A_DOOR_ENTRA_CLIENT_ID"
+	envA2ADoorEntraAllowedUsers = "A2A_DOOR_ENTRA_ALLOWED_USERS"
+)
 const (
 	envImagePullRefs = "A2A_IMAGE_PULL_REFS"
 	imagePullRefSep  = ","
@@ -445,6 +453,22 @@ type Config struct {
 	// posture: a door any Google account can sign in to is not a default
 	// anyone should get by leaving a list blank.
 	A2ADoorAllowedUsers []string
+	// A2ADoorEntraTenantID and A2ADoorEntraClientID arm the door's
+	// Microsoft Entra class (A2A_DOOR_ENTRA_TENANT_ID,
+	// A2A_DOOR_ENTRA_CLIENT_ID): a bearer shaped like a JWT is checked,
+	// against the tenant's published signing keys, as a token the tenant
+	// issued for this application registration. Both empty leaves the
+	// class off; one without the other is refused, as is either without
+	// A2A_DOOR_LISTEN. Set by hand on the gateway, as the Google class's
+	// are; nothing renders them yet.
+	A2ADoorEntraTenantID string
+	A2ADoorEntraClientID string
+	// A2ADoorEntraAllowedUsers is the Entra class's allowlist
+	// (A2A_DOOR_ENTRA_ALLOWED_USERS, comma-separated object ids), held to
+	// the posture of A2ADoorAllowedUsers: the door refuses an object id off
+	// it (403) before it holds any state for the caller, the gateway checks
+	// the same list again, empty admits nobody, and there is no allow-all.
+	A2ADoorEntraAllowedUsers []string
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
@@ -996,6 +1020,9 @@ func FromEnv() (*Config, error) {
 			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
 		}
 	}
+	cfg.A2ADoorEntraTenantID = strings.TrimSpace(os.Getenv(envA2ADoorEntraTenantID))
+	cfg.A2ADoorEntraClientID = strings.TrimSpace(os.Getenv(envA2ADoorEntraClientID))
+	cfg.A2ADoorEntraAllowedUsers = splitList(os.Getenv(envA2ADoorEntraAllowedUsers))
 	metricsPort, err := metricsPortFromEnv(cfg)
 	if err != nil {
 		return nil, err
@@ -1060,6 +1087,12 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.A2ADoorGoogleClientID != "" && cfg.A2ADoorListen == "" {
 		return nil, fmt.Errorf("A2A_DOOR_GOOGLE_CLIENT_ID is set but A2A_DOOR_LISTEN is not: the Google sign-in class is part of the A2A door and has nothing to arm without it")
+	}
+	if (cfg.A2ADoorEntraTenantID == "") != (cfg.A2ADoorEntraClientID == "") {
+		return nil, fmt.Errorf("%s and %s are set together or not at all: the Microsoft Entra sign-in class checks a token against one tenant's keys for one application", envA2ADoorEntraTenantID, envA2ADoorEntraClientID)
+	}
+	if cfg.A2ADoorEntraTenantID != "" && cfg.A2ADoorListen == "" {
+		return nil, fmt.Errorf("%s is set but A2A_DOOR_LISTEN is not: the Microsoft Entra sign-in class is part of the A2A door and has nothing to arm without it", envA2ADoorEntraTenantID)
 	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
 		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")

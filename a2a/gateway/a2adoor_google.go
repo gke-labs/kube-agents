@@ -390,11 +390,14 @@ func a2aGoogleCaller(email string) string {
 }
 
 // a2aBackendForCaller is the backend a door caller's messages are stamped
-// with: the Google class's for a verified caller, the door's own for
-// everyone else. One helper, so the send and cancel paths cannot disagree.
+// with: a verified class's for its caller, the door's own for everyone
+// else. One helper, so the send and cancel paths cannot disagree.
 func a2aBackendForCaller(caller string) string {
-	if strings.HasPrefix(caller, a2aGoogleCallerPrefix) {
+	switch {
+	case strings.HasPrefix(caller, a2aGoogleCallerPrefix):
 		return a2aGoogleBackend
+	case strings.HasPrefix(caller, a2aEntraCallerPrefix):
+		return a2aEntraBackend
 	}
 	return a2aBackend
 }
@@ -448,8 +451,15 @@ func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified str
 	if hasBearer && subtle.ConstantTimeCompare([]byte(presented), []byte(d.token)) == 1 {
 		return "", true
 	}
-	if d.google == nil || !hasBearer {
+	if !hasBearer || (d.google == nil && d.entra == nil) {
 		return "", d.authorized(w, r)
+	}
+	// The Entra class (a2adoor_entra.go) takes a bearer shaped like a JWT,
+	// and every other bearer when it is the only class armed; the Google
+	// class takes the rest. A Google access token is not a JWT, so a
+	// bearer meant for one class is never checked as the other's.
+	if d.entra != nil && (d.google == nil || entraTokenShaped(presented)) {
+		return d.identifyEntra(w, r, presented)
 	}
 	email, err := d.google.verify(r.Context(), presented)
 	if err == nil && !d.googleAllowed[strings.ToLower(email)] {
@@ -491,7 +501,7 @@ func (d *A2ADoor) callerFor(r *http.Request, verified string, metadata map[strin
 	_, inMetadata := metadata[a2aCallerMetadataKey]
 	if strings.TrimSpace(r.Header.Get(a2aCallerHeader)) != "" || inMetadata {
 		return "", &rpcError{Code: rpcInvalidParams, Message: fmt.Sprintf(
-			"a caller signed in with a Google access token is named by the token: drop the %s header and message.metadata.%s",
+			"a caller signed in with a token is named by the token: drop the %s header and message.metadata.%s",
 			a2aCallerHeader, a2aCallerMetadataKey)}
 	}
 	return verified, nil

@@ -3223,10 +3223,38 @@ Validating a token at the door is not the per-user token brokerage the permissio
 declined: the door holds a client id and an allowlist (which the gateway checks again), never a refresh token or a
 client secret. The principal this class asserts is attribution: the task's capability is the
 install's, as it is for every ingress. Still to come as verifiers of their own, each with its
-own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta). The
+own `verifiedBy`: JWT access tokens from other OpenID Connect providers (Okta). The
 unattended class (`verifiedBy: unattended-ksa`, a trigger's ServiceAccount bound by the callout)
 is built as the trigger ingress (scheduling-on-profiles.md §3), dark until the callout grants a
 source its submit subject.
+
+**Identity, third class: a person signed in with Microsoft Entra ID.** A bearer shaped like a
+JWT is checked, when `A2A_DOOR_ENTRA_TENANT_ID` and `A2A_DOOR_ENTRA_CLIENT_ID` are both set, as a
+token the tenant issued for the install's one application registration. The check is local:
+the door reads the tenant's published signing keys once (refetched when a token names a key the
+cached set does not hold, at most once a minute, and daily otherwise), pins the algorithm to RS256
+before it reads a key, verifies the signature, and then requires the install's tenant as issuer
+(the v2.0 form, or the v1.0 `sts.windows.net` form an application registration issues for its
+own scopes by default) and `tid`, the client id or its `api://` application id URI as audience,
+and an expiry still ahead and a not-before already past, each within a five-minute skew. Nothing
+is asked of Microsoft per request, so the class has no per-check concurrency bound. The
+principal is the token's object id (`oid`), as Entra sent it, never the user principal name or
+the display name: the object id is immutable for the account's life, and it is the string the
+Teams backend reads for the same person (`from.aadObjectId`), so one person's Teams turns and
+API calls share one principal; `preferred_username` goes to the ingress log and nowhere else. It
+is admitted only if it is on the class's own allowlist (`A2A_DOOR_ENTRA_ALLOWED_USERS`, object
+ids compared case-insensitively; empty admits nobody, no allow-all), checked at the door before
+it holds any state for the caller and again by the gateway before it resolves the principal. The
+caller is prefixed `:entra:` inside the door, disjoint from the eval class and from the Google
+class's `:google:` for the reason the Google prefix has its colon. The authority block records
+backend `a2a-entra` and `verifiedBy` `a2a-entra-token`; the hermes bridge treats the class as a
+person, as it treats the Google class. A token the tenant would not vouch for (wrong algorithm,
+unknown key after a fresh read of the set, bad signature, another tenant or application,
+expired) is a 401; an object id off the list is a 403; a check that could not be made (the key
+set unreachable with the token's key not cached, or a key the set does not hold inside the minute
+since it was last read) is a 503. A request carrying the token may not also name a caller, as for
+the Google class. The three variables are set by hand on the gateway, as the Google class's are:
+the operator renders neither class, and the door itself stays an operator-level flag.
 
 **The card is the catalog.** One skill per destination this door routes to, which today is the
 gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
@@ -3235,13 +3263,15 @@ built from. The card is the one unauthenticated route, because discovery reads i
 security scheme to present; it discloses the endpoint URL, the scheme and the default
 destination's name, none of which a 401 hides. With the Google class armed the card lists a
 second scheme beside the bearer, `openIdConnect` at Google's OpenID configuration, as an
-alternative.
+alternative; with the Entra class armed, another `openIdConnect` scheme at the tenant's OpenID
+configuration.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
 `A2A_DOOR_LISTEN` is set, no unauthenticated mode), or, with the Google class armed, a Google
-access token in its place; a bearer shaped like a Google access token (`ya29.`) is then sent
-to Google's tokeninfo endpoint to be checked, and any other is refused without leaving the
-cluster; the caller map is its own file
+access token in its place, or, with the Entra class armed, an Entra token; a bearer shaped like
+a Google access token (`ya29.`) is then sent to Google's tokeninfo endpoint to be checked, a
+bearer shaped like a JWT is checked against the tenant's cached keys, and any other is refused
+without leaving the cluster; the caller map is its own file
 (`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
 the address the card was fetched from (the request's host, or the forwarded host and scheme
 behind a proxy), since behind a port-forward or an ingress the listen address is reachable by

@@ -222,6 +222,10 @@ func verifiedByFor(backend string) string {
 		// What checked the caller is Google, through the door's tokeninfo
 		// call: neither the door's static token nor a map.
 		return a2aGoogleVerifiedBy
+	case a2aEntraBackend:
+		// What checked the caller is the tenant's signature on the token,
+		// read at the door: its own value for the same reason.
+		return a2aEntraVerifiedBy
 	}
 	return "principal-map"
 }
@@ -249,6 +253,8 @@ func unverifiedRemedyFor(backend string) string {
 		return "the A2A door's principal map"
 	case a2aGoogleBackend:
 		return "the A2A door's allowed users list"
+	case a2aEntraBackend:
+		return "the A2A door's Entra allowed users list"
 	}
 	return "the principal map"
 }
@@ -1776,6 +1782,8 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 		return g.resolveA2APrincipal(authorID)
 	case a2aGoogleBackend:
 		return g.resolveA2AGooglePrincipal(authorID)
+	case a2aEntraBackend:
+		return g.resolveA2AEntraPrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -1928,6 +1936,22 @@ func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
 		return ""
 	}
 	return email
+}
+
+// resolveA2AEntraPrincipal is resolveA2AGooglePrincipal for a caller the
+// A2A door verified as a Microsoft Entra token: the object id is the
+// principal, admitted only if it is on the door's Entra allowlist, and only
+// under the class's prefix. It is returned as Entra sent it, case-preserved,
+// the string the Teams backend reads for the same person.
+func (g *Gateway) resolveA2AEntraPrincipal(authorID string) string {
+	objectID, ok := strings.CutPrefix(authorID, a2aEntraCallerPrefix)
+	if !ok || objectID == "" {
+		return ""
+	}
+	if !g.a2aEntraAllowed[strings.ToLower(objectID)] {
+		return ""
+	}
+	return objectID
 }
 
 // gchatConversationID mints the session key for one inbound message. space is

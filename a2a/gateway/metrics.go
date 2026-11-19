@@ -659,7 +659,7 @@ func metricsPlatformLabel(backend string) (string, bool) {
 		return platform, true
 	}
 	switch backend {
-	case injectBackend, a2aBackend, a2aGoogleBackend:
+	case injectBackend, a2aBackend, a2aGoogleBackend, a2aEntraBackend:
 		return "", false
 	}
 	return metricsLabelOther, true

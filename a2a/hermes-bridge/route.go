@@ -386,6 +386,7 @@ const (
 	backendConsole   = "console"
 	backendA2A       = "a2a"
 	backendA2AGoogle = "a2a-google"
+	backendA2AEntra  = "a2a-entra"
 	backendInject    = "inject"
 
 	// originPlatformGooglechat is gchat's origin platform in the chat metrics
@@ -415,6 +416,7 @@ var backendOrigins = map[string]sessionOrigin{
 	backendConsole:   {Origin: originConsole},
 	backendA2A:       {Origin: originAPI},
 	backendA2AGoogle: {Origin: originAPI},
+	backendA2AEntra:  {Origin: originAPI},
 	backendInject:    {Origin: originAPI},
 }
 

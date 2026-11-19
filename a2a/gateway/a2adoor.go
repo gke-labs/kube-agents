@@ -301,7 +301,12 @@ type A2ADoor struct {
 	google *googleTokenVerifier
 	// googleAllowed is the class's allowlist, keyed lower-cased; empty
 	// admits nobody.
-	googleAllowed    map[string]bool
+	googleAllowed map[string]bool
+	// entra verifies the Microsoft Entra class's tokens (a2adoor_entra.go);
+	// nil when the class is not configured. entraAllowed is its allowlist
+	// of object ids, keyed lower-cased; empty admits nobody.
+	entra            *entraTokenVerifier
+	entraAllowed     map[string]bool
 	publicURL        string
 	publicURLSet     bool
 	agentName        string
@@ -376,7 +381,18 @@ type A2ADoorOptions struct {
 	// a verified email off it is refused before the door holds anything for
 	// the caller. Empty admits nobody.
 	GoogleAllowedUsers []string
-	Logger             *slog.Logger
+	// EntraTenantID and EntraClientID arm the Microsoft Entra class
+	// (A2A_DOOR_ENTRA_TENANT_ID, A2A_DOOR_ENTRA_CLIENT_ID): a bearer shaped
+	// like a JWT is checked as a token the tenant issued for this
+	// application. Both empty leaves the class off.
+	EntraTenantID string
+	EntraClientID string
+	// EntraAllowedUsers is the class's allowlist
+	// (A2A_DOOR_ENTRA_ALLOWED_USERS, object ids): a verified object id off
+	// it is refused before the door holds anything for the caller. Empty
+	// admits nobody.
+	EntraAllowedUsers []string
+	Logger            *slog.Logger
 }
 
 // NewA2ADoor builds the door. The token is required here as well as in
@@ -422,6 +438,8 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		log:              log,
 		google:           googleVerifierFor(o.GoogleClientID),
 		googleAllowed:    googleAllowlist(o.GoogleAllowedUsers),
+		entra:            entraVerifierFor(o.EntraTenantID, o.EntraClientID),
+		entraAllowed:     googleAllowlist(o.EntraAllowedUsers),
 		conversations:    map[string]*a2aConversation{},
 		tasks:            map[string]*a2aTask{},
 		submissions:      map[string]*a2aOutcome{},
@@ -471,6 +489,11 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 		d.log.Warn("the A2A door's Google sign-in is armed: a Google account on the door's allowlist that reaches this listener "+
 			"can submit tasks as itself, and any bearer that is not the door's token is sent to Google's tokeninfo endpoint to be checked",
 			"allowedUsers", len(d.googleAllowed))
+	}
+	if d.entra != nil {
+		d.log.Warn("the A2A door's Microsoft Entra sign-in is armed: an account of the tenant on the door's allowlist that reaches this listener "+
+			"can submit tasks as itself; tokens are checked against the tenant's published signing keys",
+			"tenant", d.entra.tenantID, "allowedUsers", len(d.entraAllowed))
 	}
 
 	errs := make(chan error, 1)
@@ -545,13 +568,18 @@ func (d *A2ADoor) rpcURLFor(r *http.Request) string {
 // rendered from DIRECTORY and the caller's entitlements, and the card
 // becomes per caller.
 func (d *A2ADoor) card(rpcURL string) a2aAgentCard {
-	// The schemes are alternatives: the static bearer, and Google sign-in
-	// when the developer class is armed.
+	// The schemes are alternatives: the static bearer, Google sign-in when
+	// the developer class is armed, and Microsoft Entra sign-in when that
+	// class is.
 	schemes := map[string]a2aScheme{"bearer": {Type: "http", Scheme: "bearer"}}
 	security := []map[string][]string{{"bearer": {}}}
 	if d.google != nil {
 		schemes[a2aGoogleSchemeName] = a2aScheme{Type: "openIdConnect", OpenIDConnectURL: a2aGoogleOpenIDConfigURL}
 		security = append(security, map[string][]string{a2aGoogleSchemeName: {}})
+	}
+	if d.entra != nil {
+		schemes[a2aEntraSchemeName] = a2aScheme{Type: "openIdConnect", OpenIDConnectURL: a2aEntraOpenIDConfigURL(d.entra.tenantID)}
+		security = append(security, map[string][]string{a2aEntraSchemeName: {}})
 	}
 	var skills []a2aSkill
 	if d.defaultAddressee != "" {
