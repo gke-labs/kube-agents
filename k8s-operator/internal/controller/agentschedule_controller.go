@@ -384,12 +384,15 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 	now := r.now()
 	startingDeadline := durationOr(sched.Spec.StartingDeadlineSeconds, agentScheduleDefaultStartingDeadline)
 
-	// 1. A run in flight: did it end, or vanish, or outlive its deadline?
+	// 1. Runs that ended on an earlier pass: how was each one's report
+	// delivered? Asked before the run in flight is tracked, so a run that
+	// ends on this pass, whose answer was just read, isn't asked again until
+	// the next one.
+	r.trackDeliveries(ctx, sched, now)
+	// 1b. A run in flight: did it end, or vanish, or outlive its deadline?
 	if st.ActiveTaskID != "" {
 		r.trackActive(ctx, sched, now, pass)
 	}
-	// 1b. Runs that ended: how was each one's report delivered?
-	r.trackDeliveries(ctx, sched, now)
 
 	// 2. A claimed slot the gateway has not taken yet (a retry, or a
 	// restart between the claim and the status write after it).

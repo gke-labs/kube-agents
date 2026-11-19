@@ -80,19 +80,6 @@ func TestAScheduleRunsSubmissionCarriesItsTriggerAndDefaults(t *testing.T) {
 	}
 }
 
-func TestAScheduleNameFoldsIntoAJobKeyLabel(t *testing.T) {
-	for in, want := range map[string]string{
-		"compliance-audit":                    "compliance-audit",
-		"team.a.nightly":                      "team-a-nightly",
-		strings.Repeat("a", 70):               strings.Repeat("a", 63),
-		"x." + strings.Repeat("b", 61) + ".y": "x-" + strings.Repeat("b", 61),
-	} {
-		if got := foldToLabel(in); got != want {
-			t.Errorf("foldToLabel(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 // submitterRig is the operator's submitter on an embedded server, its
 // connection seeded so no bus TLS is needed, and a stub gateway answering
 // on the trigger subjects with answer.

@@ -98,7 +98,7 @@ type AgentScheduleDelivery struct {
 
 	// JobKey groups a schedule's posts into one thread per UTC day. It keys
 	// stored reports, so it is a DNS-1123 label. It defaults to the
-	// schedule's name folded into one (dots become hyphens, cut to 63).
+	// schedule's name, which a schedule that runs already has to be.
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +optional

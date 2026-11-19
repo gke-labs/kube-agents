@@ -260,19 +260,11 @@ func scheduleDeliveryFor(sched *agentv1alpha1.AgentSchedule) scheduleDeliveryWir
 		d.Mode = scheduleDeliveryChat
 	}
 	if d.JobKey == "" {
-		d.JobKey = foldToLabel(sched.Name)
+		// The name is a DNS-1123 label: accept() holds a schedule that
+		// runs to one, since its trigger is schedule/<name>.
+		d.JobKey = sched.Name
 	}
 	return d
-}
-
-// foldToLabel folds a DNS-1123 subdomain into a label: dots become hyphens,
-// cut to 63 characters, with no hyphen left at either end.
-func foldToLabel(name string) string {
-	s := strings.ReplaceAll(strings.ToLower(name), ".", "-")
-	if len(s) > maxLabelValueLength {
-		s = s[:maxLabelValueLength]
-	}
-	return strings.Trim(s, "-")
 }
 
 // scheduleOutcomeFor is a run's outcome from its terminal A2A state.

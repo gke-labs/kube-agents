@@ -62,9 +62,13 @@ func (g *fakeScheduleGateway) distinctRuns() int {
 	return len(g.tasks)
 }
 
-type fakeScheduleTracker struct{ state ScheduleTaskState }
+type fakeScheduleTracker struct {
+	state ScheduleTaskState
+	calls int
+}
 
 func (t *fakeScheduleTracker) State(context.Context, *agentv1alpha1.AgentSchedule, string) (ScheduleTaskState, error) {
+	t.calls++
 	return t.state, nil
 }
 
@@ -387,6 +391,25 @@ func TestAgentScheduleARateLimitedSlotIsCountedNotRetried(t *testing.T) {
 	s := f.get(t)
 	if s.Status.SkipCounts.RateLimited != 1 || s.Status.PendingSlot != nil || res.RequeueAfter == agentScheduleRetry {
 		t.Fatalf("status = %+v, requeue = %s", s.Status, res.RequeueAfter)
+	}
+}
+
+// A run that ends with no final delivery yet is asked about once on the pass
+// that settles it, not a second time for its delivery on the same pass: that
+// answer was just read. The next pass asks for the delivery.
+func TestAgentScheduleASettlingRunIsAskedAboutOncePerPass(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: hourAt(1, 5)}
+	f.tracker.calls = 0
+	f.at(t, hourAt(1, 6))
+	if s := f.get(t); s.Status.ActiveTaskID != "" || f.tracker.calls != 1 {
+		t.Fatalf("settling pass: active = %q, tracker calls = %d, want 1", s.Status.ActiveTaskID, f.tracker.calls)
+	}
+	f.at(t, hourAt(1, 7))
+	if f.tracker.calls != 2 {
+		t.Fatalf("the next pass: tracker calls = %d, want 2 (its delivery)", f.tracker.calls)
 	}
 }
 
