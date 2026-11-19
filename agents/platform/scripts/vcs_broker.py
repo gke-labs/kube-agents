@@ -3674,6 +3674,7 @@ VCS_VERBS = frozenset(
         "proposal-close",
         "proposal-commits",
         "proposal-reviews",
+        "proposal-closer",
         "proposal-acknowledge",
         "proposal-claim",
         "issue-update",
