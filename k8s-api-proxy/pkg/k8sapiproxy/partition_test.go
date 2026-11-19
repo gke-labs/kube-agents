@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -394,5 +395,64 @@ func TestHandlerRefusedWriteInvalidatesItsOwnPartitionOnly(t *testing.T) {
 
 	if got := serve(h, tenantRequest("b")).Header().Get(headerCacheStatus); got != cacheStatusHit {
 		t.Errorf("tenant b after tenant a's refused write: Cache-Status %q, want %q", got, cacheStatusHit)
+	}
+}
+
+// gatedUpstream answers like forbiddingUpstream but holds partition hold's requests until
+// release is closed, signalling arrived when one starts.
+type gatedUpstream struct {
+	*forbiddingUpstream
+	hold    string
+	arrived chan struct{}
+	release chan struct{}
+}
+
+func (u *gatedUpstream) RoundTripCluster(ctx context.Context, clusterID string, req *http.Request) (*http.Response, error) {
+	if partition, _ := PartitionFromContext(req.Context()); partition == u.hold {
+		u.arrived <- struct{}{}
+		<-u.release
+	}
+	return u.forbiddingUpstream.RoundTripCluster(ctx, clusterID, req)
+}
+
+// A 403 in one partition while another partition's fetch is in flight leaves that fetch
+// free to store its result: only the failing partition's invalidation count moves.
+func TestHandlerAuthFailureLeavesOtherPartitionsFlightsStoring(t *testing.T) {
+	upstream := &gatedUpstream{
+		forbiddingUpstream: &forbiddingUpstream{forbid: map[string]bool{"a": true}, calls: map[string]int{}},
+		hold:               "b",
+		arrived:            make(chan struct{}, 1),
+		release:            make(chan struct{}),
+	}
+	h, _ := newTestHandler(t, Config{
+		Authenticator:   tenantAuthenticator{},
+		Upstream:        upstream,
+		Cache:           &CacheConfig{DefaultResourceTTL: testPartitionTTL},
+		CallerPartition: partitionByTenant,
+	})
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- serve(h, tenantRequest("b")) }()
+	select {
+	case <-upstream.arrived:
+	case <-time.After(testArrivalTimeout):
+		close(upstream.release)
+		t.Fatal("tenant b's fetch never reached the upstream")
+	}
+
+	if rec := serve(h, tenantRequest("a")); rec.Code != http.StatusForbidden {
+		close(upstream.release)
+		t.Fatalf("tenant a: code %d, want 403", rec.Code)
+	}
+	close(upstream.release)
+	if rec := <-done; rec.Code != http.StatusOK {
+		t.Fatalf("tenant b's held fetch: code %d, want 200", rec.Code)
+	}
+
+	if got := serve(h, tenantRequest("b")).Header().Get(headerCacheStatus); got != cacheStatusHit {
+		t.Errorf("tenant b after its fetch finished during tenant a's 403: Cache-Status %q, want %q (the fetch's result was discarded)", got, cacheStatusHit)
+	}
+	if got := upstream.count("b"); got != 1 {
+		t.Errorf("tenant b upstream calls = %d, want 1", got)
 	}
 }

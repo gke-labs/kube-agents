@@ -905,8 +905,10 @@ func isCacheableRequest(req *http.Request, info *request.RequestInfo, dryRun boo
 	return true, false
 }
 
+// shouldInvalidateOnMutation reports a write that changed the data: a 2xx. A write
+// refused with 401 or 403 is an auth failure, which the caller handles per partition.
 func shouldInvalidateOnMutation(statusCode int) bool {
-	return (statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices) || isAuthFailureStatus(statusCode)
+	return statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices
 }
 
 func isAuthFailureStatus(statusCode int) bool {
