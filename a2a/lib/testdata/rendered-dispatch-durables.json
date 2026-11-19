@@ -1,0 +1,48 @@
+[
+  {
+    "name": "auditor",
+    "tiers": [
+      "read",
+      "unattended"
+    ],
+    "durables": [
+      "profile-auditor-read-child",
+      "profile-auditor-read-top",
+      "profile-auditor-unattended-child",
+      "profile-auditor-unattended-top"
+    ]
+  },
+  {
+    "name": "leaving",
+    "tiers": [
+      "read"
+    ],
+    "drainingUntil": "2026-11-12T06:00:00Z",
+    "durables": []
+  },
+  {
+    "name": "narrowing",
+    "tiers": [
+      "read"
+    ],
+    "drainingTiers": [
+      "unattended"
+    ],
+    "durables": [
+      "profile-narrowing-read-child",
+      "profile-narrowing-read-top",
+      "profile-narrowing-unattended-child",
+      "profile-narrowing-unattended-top"
+    ]
+  },
+  {
+    "name": "reader",
+    "tiers": [
+      "read"
+    ],
+    "durables": [
+      "profile-reader-read-child",
+      "profile-reader-read-top"
+    ]
+  }
+]

@@ -193,17 +193,28 @@ func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
 	return !a2aBridgeDeclared(agent)
 }
 
-// a2aBridgeInPod reports whether the rendered bridge is in the pod yet: it is
-// rendered, and the bus has been provisioned once (BusProvisioned). Before
-// that the bridge has no bus to connect to and no runtime-state bucket, exits,
-// and would hold the agent pod in CrashLoopBackOff through every install's
-// bring-up. Withheld until then, the way the gateway Deployment is withheld
-// until the callout serves (a2aGatewayWaitsForCallout). The TASKS budget does
-// not wait: it counts the bridge from the first render (a2aBridgeSidecars), so
-// the first provisioning Job is already sized for it and the bridge's arrival
-// does not re-render the Job.
+// a2aBridgeInPod reports whether the rendered bridge is in the pod: from the
+// first render, whether or not the bus is provisioned yet. Until it is, the
+// bridge waits for the bus and its runtime-state bucket instead of exiting
+// (waitForBus in a2a/hermes-bridge), and the agent pod is Ready meanwhile:
+// the agent's own API serves without the bus, and BusProvisioned says the bus
+// is not there yet. It used to be withheld until BusProvisioned, which put the
+// bridge in the pod template a pass after the provisioning Job and so rolled
+// the agent Deployment a second time on every fresh install (#5962). The TASKS
+// budget counts the bridge from the first render too (a2aBridgeSidecars).
+//
+// One exception, from the bus migration (#4488): a run given up has the
+// provision Job recreate, empty, the streams it did not put back, so the
+// bridge leaves the pod until the bus is provisioned again and comes back to
+// the recreated streams, rather than hold the ones the run gave up on. A run
+// in progress keeps the bridge: the streams come through it. The record goes
+// when the stack is torn down, so a later bring-up is a first render again.
 func a2aBridgeInPod(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aBridgeRendered(agent) && busProvisioned(agent)
+	if !a2aBridgeRendered(agent) {
+		return false
+	}
+	run := agent.Status.BusMigration
+	return !(run != nil && run.GivenUp && !busProvisioned(agent))
 }
 
 // a2aRenderedBridgeSettings is the part of the rendered bridge's environment

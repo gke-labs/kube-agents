@@ -58,6 +58,7 @@ from __future__ import annotations
 import fnmatch
 import http.client
 import json
+import math
 import os
 import re
 import shlex
@@ -235,6 +236,23 @@ _HTTP_SERVER_ERROR_FLOOR = 500
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_FORBIDDEN = 403
 _RATE_LIMIT_MESSAGE_RE = re.compile(r"rate limit", re.IGNORECASE)
+# The grading App's installation is shared by every evals repository, so one
+# hourly REST budget (#6105): when concurrent runs spend it, every read answers
+# a rate-limit 403 until the reset GitHub names, minutes away. A grading read
+# so limited waits for that reset (or the Retry-After it asks), at most
+# _FORGE_RATE_LIMIT_SLICE_SEC at a time and BENCH_FORGE_RATE_LIMIT_WAIT_SEC
+# (default _FORGE_RATE_LIMIT_BUDGET_SEC) in all for this process, then answers
+# as it did: transient, so the check reads as the forge's weather.
+_FORGE_RATE_LIMIT_BUDGET_ENV_VAR = "BENCH_FORGE_RATE_LIMIT_WAIT_SEC"
+_FORGE_RATE_LIMIT_BUDGET_SEC = 600.0
+_FORGE_RATE_LIMIT_SLICE_SEC = 300.0
+_FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC = 60.0
+# A reset already past (a clock ahead, the old epoch just after the reset) or a
+# Retry-After of 0 still waits this long while budget is left.
+_FORGE_RATE_LIMIT_FLOOR_SEC = 5.0
+_RETRY_AFTER_HEADER = "Retry-After"
+_RATELIMIT_RESET_HEADER = "X-RateLimit-Reset"
+_RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -3378,10 +3396,9 @@ class DelegatedToVerifier(BaseVerifier):
     ``forbidden_addressees``: Python regular expressions, none of which may
     ``re.fullmatch`` any addressee. At least one of the two lists is set.
 
-    Fails closed: a run that could not say (the api transport, or a door
-    older than the field) is ``status="error"``, never a pass or a fail. A
-    case that relies on this check belongs in
-    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    Fails closed: a run that could not say (the api transport, which no CI
+    lane uses, or a door older than the field) is ``status="error"``, never
+    a pass or a fail.
     """
 
     type: Literal["delegated_to"]
@@ -4309,6 +4326,7 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         context = forges.forge_ssl_context()
     except forges.UnknownForge as exc:
         raise OSError(str(exc)) from exc
+    _last_forge_error_headers.set(None)
     handlers: list[Any] = [_NoRedirect]
     if context is not None:
         # BENCH_FORGE_CA_FILE: the system CAs plus a private one, for a
@@ -4323,6 +4341,8 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         except urllib.error.HTTPError as exc:
             # 404 and 403 are answers, not transport failures: read the body so the
             # caller can distinguish "no such issue" from "no such permission".
+            # The headers go to _forge_get_json's rate-limit wait.
+            _last_forge_error_headers.set(exc.headers)
             try:
                 payload = json.loads(exc.read().decode("utf-8", errors="replace"))
             except (ValueError, OSError):
@@ -4359,6 +4379,88 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
 _forge_unavailable: ContextVar[list[tuple[bool, str]] | None] = ContextVar("forge_unavailable", default=None)
 
 
+# The headers of the last read _http_get_json made in this context that
+# answered an HTTP error, for the rate-limit wait (_forge_rate_limit_wait).
+_last_forge_error_headers: ContextVar[Any] = ContextVar("last_forge_error_headers", default=None)
+# Seconds of rate-limit waiting this process has spent.
+_forge_rate_limit_waited = 0.0
+
+
+def _forge_rate_limit_budget() -> float:
+    raw = os.environ.get(_FORGE_RATE_LIMIT_BUDGET_ENV_VAR, "")
+    if not raw.strip():
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    try:
+        budget = float(raw)
+    except ValueError:
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    if not math.isfinite(budget):
+        # inf would wait for ever, one slice at a time.
+        return _FORGE_RATE_LIMIT_BUDGET_SEC
+    return max(0.0, budget)
+
+
+def _forge_rate_limit_wait(headers: Any) -> float:
+    """Seconds to wait before reading again under a rate limit: the
+    Retry-After GitHub asks, else until its X-RateLimit-Reset when
+    X-RateLimit-Remaining is 0, else the default; at most one slice and what
+    is left of the budget. Zero once the
+    budget is spent."""
+    get = headers.get if headers is not None else (lambda _key: None)
+    wait = _FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    # The reset is when the hourly budget comes back, so it is the wait only
+    # when that budget is spent (remaining 0); a secondary limit with budget
+    # left waits the default instead (#6177).
+    spent = str(get(_RATELIMIT_REMAINING_HEADER) or "").strip() == "0"
+    for header, offset in ((_RETRY_AFTER_HEADER, None), (_RATELIMIT_RESET_HEADER, time.time())):
+        if header == _RATELIMIT_RESET_HEADER and not spent:
+            continue
+        try:
+            value = float(get(header))
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(value):
+            # nan compares false to everything, so min/max would keep it.
+            continue
+        wait = value if offset is None else value - offset + 1
+        break
+    left = max(0.0, _forge_rate_limit_budget() - _forge_rate_limit_waited)
+    return min(max(wait, _FORGE_RATE_LIMIT_FLOOR_SEC), _FORGE_RATE_LIMIT_SLICE_SEC, left)
+
+
+def is_rate_limit_answer(status: int, payload: Any, headers: Any = None) -> bool:
+    """A 429, or a 403 that says it is a rate limit rather than a permission:
+    a message naming a rate limit, a Retry-After, or no budget left."""
+    if status == _HTTP_TOO_MANY_REQUESTS:
+        return True
+    if status != _HTTP_FORBIDDEN:
+        return False
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if isinstance(message, str) and _RATE_LIMIT_MESSAGE_RE.search(message):
+        return True
+    if headers is not None:
+        if headers.get(_RETRY_AFTER_HEADER) is not None:
+            return True
+        if str(headers.get(_RATELIMIT_REMAINING_HEADER, "")).strip() == "0":
+            return True
+    return False
+
+
+def _rate_limit_reason(status: int, payload: Any, what: str) -> str | None:
+    """The check's reason when the read behind it answered a rate limit
+    (is_rate_limit_answer, with the read's headers), so the reader isn't sent
+    to the App's permissions; None for any other answer (#6105)."""
+    if not is_rate_limit_answer(status, payload, _last_forge_error_headers.get()):
+        return None
+    if forges.forge_name() != forges.FORGE_GITHUB:
+        # Only GitHub's evals repositories share one installation's budget.
+        return f"GitLab rate-limited {what} (answered {status}), so this check could not be evaluated"
+    return (
+        f"GitHub rate-limited {what} (answered {status}); the evals repositories share one App "
+        "installation's hourly budget, so this check could not be evaluated"
+    )
+
+
 def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     """:func:`_http_get_json`, noting each read that did not answer 2xx.
 
@@ -4374,23 +4476,36 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     resolve or refuses the connection, an unknown forge) is noted as not
     transient, and keeps the check's error plain unless the check drops it as
     not behind the error."""
-    try:
-        status, payload = _http_get_json(url, token, timeout)
-    except OSError as exc:
-        _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
-        raise
-    if status // 100 != 2:
-        message = payload.get("message") if isinstance(payload, dict) else None
-        rate_limited = status == _HTTP_TOO_MANY_REQUESTS or (
-            status == _HTTP_FORBIDDEN and isinstance(message, str) and bool(_RATE_LIMIT_MESSAGE_RE.search(message))
-        )
-        # The token this read sent, not the variable: read_token falls back
-        # to BENCH_GITHUB_TOKEN when the file holds no usable token.
-        grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
-            forges.FORGE_GITHUB, os.environ
-        )
+    global _forge_rate_limit_waited
+    # The token this read sends, not the variable: read_token falls back to
+    # BENCH_GITHUB_TOKEN when the file holds no usable token. Read once,
+    # before any wait: the job renews the file every 40 minutes, and a
+    # renewal during a wait must not make the next pass read this token as
+    # someone else's and stop waiting (#6177).
+    grading_app = forges.forge_name() == forges.FORGE_GITHUB and token == forges.file_token(
+        forges.FORGE_GITHUB, os.environ
+    )
+    while True:
+        _last_forge_error_headers.set(None)
+        try:
+            status, payload = _http_get_json(url, token, timeout)
+        except OSError as exc:
+            _note_forge_read(_forge_transport_failure(exc), f"{type(exc).__name__}: {exc}")
+            raise
+        if status // 100 == 2:
+            return status, payload
+        headers = _last_forge_error_headers.get()
+        rate_limited = is_rate_limit_answer(status, payload, headers)
+        if rate_limited and grading_app:
+            # The shared installation's budget (#6105): wait for its reset
+            # rather than grade a check that never ran.
+            wait = _forge_rate_limit_wait(headers)
+            if wait > 0:
+                _forge_rate_limit_waited += wait
+                time.sleep(wait)
+                continue
         _note_forge_read(status >= _HTTP_SERVER_ERROR_FLOOR or (rate_limited and grading_app), f"answered {status}")
-    return status, payload
+        return status, payload
 
 
 def _forge_transport_failure(exc: OSError) -> bool:
@@ -4958,6 +5073,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                         continue
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
+            limit = _rate_limit_reason(status_code, payload, f"{label}'s read of {slug}")
+            if limit:
+                return done(False, limit, status="error")
             if status_code in (401, 403):
                 return done(
                     False,
@@ -5374,6 +5492,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
                         return done(False, why, status="error")
                 rejected.append(f"{slug}: no such issue (404)")
                 continue
+            limit = _rate_limit_reason(status_code, payload, f"{label}'s read of {slug}")
+            if limit:
+                return done(False, limit, status="error")
             if status_code in (401, 403):
                 return done(
                     False,
@@ -6176,6 +6297,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
+            limit = _rate_limit_reason(status, files, f"the files of {owner}/{repo}#{number}")
+            if limit:
+                return {}, limit
             if status != 200 or not isinstance(files, list):
                 return {}, (
                     f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
@@ -6231,6 +6355,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             status, files = _forge_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
             )
+            limit = _rate_limit_reason(status, files, f"the files of {owner}/{repo}#{number}")
+            if limit:
+                return [], limit
             if status != 200 or not isinstance(files, list):
                 return [], (
                     f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
@@ -6332,6 +6459,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
+        limit = _rate_limit_reason(status_code, listed, f"the closed pull requests from {ref}")
+        if limit:
+            return None, limit
         if status_code != 200 or not isinstance(listed, list):
             return None, (
                 f"GitHub answered {status_code} listing the closed pull requests from "
@@ -6390,6 +6520,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         token,
                         budget,
                     )
+                limit = _rate_limit_reason(status_code, commits, f"the commits of {slug}")
+                if limit:
+                    return None, limit
                 if status_code != 200 or not isinstance(commits, list):
                     return None, (
                         f"GitHub answered {status_code} listing the commits of {slug}; "
@@ -6467,6 +6600,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         if status_code == 200 and isinstance(payload, dict):
             return payload, None
+        limit = _rate_limit_reason(status_code, payload, f"{owner}/{repo}#{number}")
+        if limit:
+            return None, limit
         if first == 403 and status_code == 403:
             return None, (
                 f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
@@ -6522,8 +6658,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         payload = resolved
         if "changed_files" not in payload:
             status, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
-            # The same three readings `_resolve` gives this endpoint: 401 is
-            # the token, 403 is the permission, anything else is GitHub's.
+            # A limit first (a 429 or a marked 403), as `_resolve` reads it;
+            # then the same three readings: 401 is the token, 403 is the
+            # permission, anything else is GitHub's.
+            limit = _rate_limit_reason(status, payload, f"{owner}/{repo}#{number} on the pulls endpoint")
+            if limit:
+                return (None, None, {}, None, limit)
             if status == 401:
                 return (
                     None,
@@ -6569,6 +6709,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
+        limit = _rate_limit_reason(status, commits, f"{owner}/{repo}#{number}'s commits page")
+        if limit:
+            return (None, None, {}, None, limit)
         if status == 404:
             _forge_read_handled(status)
             return changed, None, payload, None, None
@@ -7380,8 +7523,8 @@ class GitHubWritesVerifier(BaseVerifier):
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
-    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the five first-run audits keep their clock until
+    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): an install that
+    keeps the sweep on has the five first-run audits keep their clock until
     the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
@@ -8443,7 +8586,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
-        "webhook-backend-unreachable",
+        "webhook-backend-unreachable", "serviceentry-host-collision",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -8451,7 +8594,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "schedule-never-succeeds", "rollout-drops-traffic", "strategy-causes-downtime", "cronjob-runs-overlap",
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
-        "pdb-overlapping", "untargeted-compute-class-workload",
+        "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
@@ -9210,8 +9353,10 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     ``status`` when the check names one, has
     each ``required_envelope`` key equal to the value given (a top-level key of
     the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), and has, for each ``required_finding_phrases`` entry, a finding
-    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    and fails), has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it, and has no finding whose id
+    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
+    that plants a look-alike the check must leave alone). ``current_ids`` is not read: it
     also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
@@ -9223,6 +9368,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    forbidden_finding_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
@@ -9307,6 +9453,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            present = [p for p in self.forbidden_finding_phrases if any(p in fid for fid in ids)]
             wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
@@ -9317,6 +9464,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            elif present:
+                failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw

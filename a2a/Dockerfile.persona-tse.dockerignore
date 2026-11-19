@@ -1,0 +1,6 @@
+# The persona directory is this image's build context, and persona.Load refuses
+# any top-level entry it does not know, so a macOS .DS_Store copied into /files
+# would break the persona at load. BuildKit reads this file for
+# a2a/Dockerfile.persona-tse in place of a .dockerignore in the context.
+.DS_Store
+**/.DS_Store

@@ -65,3 +65,17 @@ func TestBrokerFromEnvRewritesWatcherGCPHostsForCustomUniverse(t *testing.T) {
 		t.Fatalf("seenPaths = %v, want [%s]", seenPaths, wantPath)
 	}
 }
+
+func TestBrokerFromEnvRefusesAUniverseDomainUnderGoogleapis(t *testing.T) {
+	tokFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokFile, []byte("broker-token\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	t.Setenv(BrokerURLEnv, "http://broker.example.test")
+	t.Setenv(BrokerTokenFileEnv, tokFile)
+	t.Setenv(UniverseDomainEnv, "mtls.googleapis.com")
+
+	if b, err := BrokerFromEnv(); err == nil {
+		t.Fatalf("BrokerFromEnv() = (%v, nil), want an error for a universe domain under googleapis.com", b)
+	}
+}

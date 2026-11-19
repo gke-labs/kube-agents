@@ -20,6 +20,8 @@ import (
 	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
@@ -152,10 +154,10 @@ const (
 // (spec-chatops-gateway.md, "The Google Chat adapter").
 const (
 	gchatKeyPrefix      = "gchat:"
-	gchatDMKeyPrefix    = "gchat:dm/"
+	gchatDMKeyPrefix    = lib.GchatDMKeyPrefix
 	gchatSpaceKeyPrefix = "gchat:space/"
 	gchatSpacesToken    = "spaces/"
-	gchatThreadsToken   = "/threads/"
+	gchatThreadsToken   = lib.GchatThreadsSep
 	// gchatUsersToken prefixes a user resource name ("users/{id}").
 	gchatUsersToken = "users/"
 	// gchatMentionOpen opens the <users/…> mention Chat parses out of
@@ -486,8 +488,8 @@ type GoogleChatAdapter struct {
 	countInterval time.Duration
 	subscription  string
 
-	// metrics counts each pull by outcome beside the summary line's counts
-	// (SetMetrics; nil counts nothing).
+	// metrics counts each pull by outcome beside the summary line's counts,
+	// and times each Chat API call (SetMetrics; nil counts nothing).
 	metrics *Metrics
 
 	// quotedReadTimeout bounds the read of a quoted message
@@ -520,8 +522,8 @@ func (a *GoogleChatAdapter) admitted(msg InboundMessage) bool {
 }
 
 // SetMetrics gives the adapter the gateway's counters, so each pull is
-// counted by outcome where the summary line counts it. Called once, before
-// Run.
+// counted by outcome where the summary line counts it and each Chat API call
+// is timed. Called once, before Run.
 func (a *GoogleChatAdapter) SetMetrics(m *Metrics) {
 	a.metrics = m
 }
@@ -566,7 +568,9 @@ func (a *GoogleChatAdapter) apiCallContext(ctx context.Context, resource []strin
 	if err != nil {
 		return fmt.Errorf("gchat: encoding %s.%s: %w", strings.Join(resource, "."), method, err)
 	}
-	resp, err := a.relayPostContext(ctx, gchatRelayAPIPath, payload)
+	start := time.Now()
+	resp, relayStatus, err := a.relayPostStatus(ctx, gchatRelayAPIPath, payload)
+	a.metrics.gchatAPICall(gchatAPIMethodLabel(resource, method), relayStatus, gchatCarriedStatus(err), time.Since(start))
 	if err != nil {
 		return err
 	}
@@ -602,31 +606,39 @@ func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, erro
 
 // relayPostContext is relayPost under ctx.
 func (a *GoogleChatAdapter) relayPostContext(ctx context.Context, path string, payload []byte) ([]byte, error) {
+	body, _, err := a.relayPostStatus(ctx, path, payload)
+	return body, err
+}
+
+// relayPostStatus is relayPostContext with the relay's own HTTP status
+// beside the body: 0 when the request was never sent, got no response, or
+// its body could not be read.
+func (a *GoogleChatAdapter) relayPostStatus(ctx context.Context, path string, payload []byte) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("gchat: building relay request: %w", err)
+		return nil, 0, fmt.Errorf("gchat: building relay request: %w", err)
 	}
 	if err := a.authorize(req); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("gchat: relay request: %w", err)
+		return nil, 0, fmt.Errorf("gchat: relay request: %w", err)
 	}
 	defer resp.Body.Close()
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, fmt.Errorf("gchat: reading relay response: %w", err)
+		return nil, 0, fmt.Errorf("gchat: reading relay response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The relay scrubs Chat error bodies before they get here, down to
 		// the Chat status and reason, and those are carried forward: a 502
 		// alone cannot tell a 403 (the app's grant) from a 404 (a space the
 		// app is not in) from an outage.
-		return nil, gchatRelayError(fmt.Sprintf("gchat: relay %s answered %d", path, resp.StatusCode), buf.Bytes())
+		return nil, resp.StatusCode, gchatRelayError(fmt.Sprintf("gchat: relay %s answered %d", path, resp.StatusCode), buf.Bytes())
 	}
-	return buf.Bytes(), nil
+	return buf.Bytes(), resp.StatusCode, nil
 }
 
 // Post writes text to a conversation and returns the created message's

@@ -99,7 +99,9 @@ UNAVAILABLE = "unavailable"
 NEVER = "never"
 UNKNOWN = "unknown"
 NONE = "none"
-DEFAULT_MODE = "today"
+#: What an absent `spec.mode` prints. The field is deprecated and defaults to
+#: `next` in the CRD; every install runs the A2A stack.
+DEFAULT_MODE = "next"
 READY_CONDITION = "Ready"
 OTHER_BUCKET = "other"
 SPEND_CURRENCY = "USD"
@@ -214,8 +216,9 @@ BROKER_SUBCOMMANDS: Mapping[str, frozenset] = {
     }),
     "git": frozenset({
         "add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-        "checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
-        "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
+        "checkout", "cherry-pick", "clean", "clone", "commit", "describe", "diff-tree",
+        "fetch", "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base",
+        "mv", "pull", "push", "rebase", "remote",
         "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
         "sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
         "tag", "update-ref", "version", "worktree",
@@ -748,7 +751,7 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
 
     Whole tokens, not substrings, and never a word the template prints on its
     own: a namespace called ``kube-agents`` is not a leak because the title says
-    ``kube-agents``, and a cluster called ``today`` is not one because the mode
+    ``kube-agents``, and a cluster called ``next`` is not one because the mode
     line can. Such an identifier cannot be told apart from the template, so the
     audit does not try; everything else that the resource declared is refused.
     """

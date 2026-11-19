@@ -172,9 +172,9 @@ func incidentStoreAddress(platform, chatID, threadID string) (incidentAddress, e
 		}
 		thread := threadID
 		if !strings.Contains(thread, "/") {
-			thread = chatID + incidentGchatThreads + thread
+			thread = chatID + lib.GchatThreadsSep + thread
 		}
-		rest, ok := strings.CutPrefix(thread, chatID+incidentGchatThreads)
+		rest, ok := strings.CutPrefix(thread, chatID+lib.GchatThreadsSep)
 		if !ok || rest == "" || strings.Contains(rest, "/") {
 			return incidentAddress{}, fmt.Errorf("google chat thread %q is not a thread of %q", threadID, chatID)
 		}

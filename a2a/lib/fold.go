@@ -220,8 +220,8 @@ func (t *Task) mergeArtifact(u ArtifactUpdate) {
 
 // TaskReplaySubjects is what tasks/get folds, in one stream order: the
 // executor's events and the supervisor's terminal, if it wrote one, in either
-// supervisor form (ProfileSupervisorSubject: a profile task's, once the
-// dispatcher writes it there). All three are on TASKS, and no two overlap.
+// supervisor form (ProfileSupervisorSubject: a profile task's, when the
+// dispatch config selects it). All three are on TASKS, and no two overlap.
 func TaskReplaySubjects(addressee, taskID string) []string {
 	return []string{TaskEventsSubject(addressee, taskID), TaskSupervisorSubject(addressee, taskID), ProfileSupervisorSubject(addressee, taskID)}
 }

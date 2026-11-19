@@ -344,8 +344,9 @@ Enterprise Server is installed through the composition, with the forge in its
 
 `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file the installer writes: the
 generator omits them from `terraform.tfvars` and exports them as `TF_VAR_*` for the apply
-instead, and later runs recover them from the live `platform-agent-secrets` Secret (only
-when kubectl's current context is this install's cluster). `API_SERVER_KEY` is generated
+instead, and later runs recover them from the live `platform-agent-secrets` Secret, through
+this install's own kube context, whenever the cluster exists. A read that fails
+stops `install.sh` and `upgrade.sh` rather than write the keys empty. `API_SERVER_KEY` is generated
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 

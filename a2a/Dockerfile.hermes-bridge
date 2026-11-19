@@ -5,7 +5,7 @@
 # hermes-bridge beside the other first-party images, FROM the platform-agent
 # image the same run pushed under the same commit tag, and images.json carries
 # it. deploy/docker/cloudbuild-ci.yaml builds the presubmit's own in its
-# `a2a-bridge` step under EVAL_MODE_NEXT=1 on the same rule, FROM that build's
+# `a2a-bridge` step on the same rule, FROM that build's
 # platform-agent image. Either way the sidecar and the agent container it
 # shares a pod with are one build.
 #

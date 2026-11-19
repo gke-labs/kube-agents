@@ -71,7 +71,7 @@ run "one_name_reaches_the_binding_and_the_pod" {
     error_message = "binding member: ${module.github_minter[0].workload_identity_member}"
   }
   assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter.ksaName == "ka-today-1-github-minter"
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents[0].values[0])).githubMinter.ksaName == "ka-today-1-github-minter"
     error_message = "chart githubMinter.ksaName differs from the binding's KSA"
   }
 }

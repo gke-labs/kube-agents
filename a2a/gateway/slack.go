@@ -27,7 +27,7 @@ import (
 // is what this adapter keyed every DM as before it threaded them; it still
 // parses, and posts top-level, so a record minted under it relays its
 // terminal where its ask was.
-const slackDMPrefix = "slack:dm/"
+const slackDMPrefix = lib.SlackDMKeyPrefix
 
 // slackKeyPrefix begins every Slack conversation key.
 const slackKeyPrefix = "slack:"
