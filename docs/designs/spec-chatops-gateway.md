@@ -2960,9 +2960,9 @@ the one every other writer here has.
 **Transport.** Core NATS, no stream. The browser publishes a frame -
 `{"messageId","text","kind"}`, `kind` defaulting to `text`, with an optional `addressee` and
 `parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles"), and an optional
-`replyTo`, the task a notify frame reported on, when the turn answers that report (sent by a
-console client such as the MCP server; the page sends none; the gateway puts it on the submission
-as a `replyTo` part, `spec-a2a-payloads.md`) - to
+`replyTo`, the task a notify frame reported on, when the turn answers that report (sent by the MCP
+server's `send_message(reply_to=)` and by the page's reply button; the gateway puts it on the
+submission as a `replyTo` part, `spec-a2a-payloads.md`, and the relayed report ahead of the turn) - to
 `chat.console.<token>.in`;
 the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
@@ -2994,7 +2994,10 @@ carrying the notice; a console client reads the child's answer from TASKS. A kan
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
 notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
 page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
-frame costs it nothing. It shows the notify frames, which it has no other source for. A card's
+frame costs it nothing. It shows the notify frames, which it has no other source for; one whose
+frame names its turn gets a reply button under the text, in a pane that can send, and the next
+typed turn after a click carries that `replyTo` on `.in`, so the agent's follow-up opens with the
+report. A card's
 report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
 subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
 keeps nothing, and the notifier answers the card as posted. This is a known limit of the
