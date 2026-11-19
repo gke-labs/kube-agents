@@ -3177,10 +3177,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # whose request is its limit, so a number sized from an idle week becomes an
 # enforcement ceiling; the SOP has that finding published as `manual`, and the
 # marker keeps a `manifest` the model wrote anyway out of the sweep. The
-# The stockout collector also sets `class-status` on a §3.12(b) finding, a
+# stockout collector also sets `class-status` on a §3.12(b) finding, a
 # ComputeClass that GKE reports misconfigured: the fix taints or relabels a
-# node pool, which decides where every other Pod on it can schedule.
-#
+# node pool, which decides where every other Pod on it can schedule. The
 # compliance collector sets `default-deny` on every §2.6 finding: each arm's
 # fix leaves the namespace denying ingress by default, which drops every
 # connection no allow rule names until the team writes those rules. The

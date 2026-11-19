@@ -10,9 +10,7 @@
     },
     "priorities": [
       {
-        "nodepools": [
-          "default-pool"
-        ]
+        "nodepools": ["default-pool"]
       },
       {
         "machineFamily": "n4"
