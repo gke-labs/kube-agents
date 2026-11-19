@@ -394,8 +394,9 @@ def _logging_resource_name(body: dict) -> str:
 
 
 # For a route whose path does not name what it reads: where the one resource name
-# is in a body the route's check passed. The broker's log line for the forwarded
-# request carries it. `body_resource` runs the check; a reader here only extracts.
+# is in a body the route's check passed. The broker's log carries it on a line at
+# the check and on the forwarded line. `body_resource` runs the check; a reader
+# here only extracts.
 _BODY_RESOURCES: dict[str, Callable[[dict], str]] = {LOGGING_ENTRIES_LIST_RULE: _logging_resource_name}
 
 

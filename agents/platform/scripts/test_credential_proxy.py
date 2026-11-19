@@ -20048,10 +20048,71 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(200, status)
         [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
         self.assertTrue(forwarded.endswith(" resource=projects/kagents-dev"), forwarded)
-        # No other line names it, and the audit fields stay identifiers and outcomes.
-        others = [r.getMessage() for r in logs.records if not r.getMessage().startswith("api forwarded request_id=")]
+        # Beside the line at the check, no other line names it, and the audit fields
+        # stay identifiers and outcomes.
+        named = ("api forwarded request_id=", "api body checked request_id=")
+        others = [r.getMessage() for r in logs.records if not r.getMessage().startswith(named)]
         self.assertNotIn("kagents-dev", "\n".join(others))
         self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_checked_body_names_its_project_before_each_verdict(self):
+        # A read whose body passed the check and then failed still asked Google for
+        # that project's entries, and over the cap Google served them. So the project
+        # is on a line of its own at the check, and the verdict of the request follows
+        # it under the same request id, whatever the verdict is.
+        cap = 4096
+
+        def forwarded():
+            pass
+
+        def over_the_cap():
+            self.reply.update(body=b"x" * (cap + 1))
+
+        def no_relay():
+            CredentialProxyHandler.api_relay = None
+
+        def no_credential():
+            def failing():
+                raise RuntimeError("no credential")
+
+            self.relay.authorization_header = failing
+
+        def unreachable():
+            spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            self.relay.port = spare.server_address[1]
+            spare.server_close()
+
+        cases = (
+            ("forwarded", forwarded, 200, "api forwarded"),
+            ("over the cap", over_the_cap, 502, "api response too large"),
+            ("no relay", no_relay, 503, "api disabled"),
+            ("no credential", no_credential, 503, "api credential unavailable"),
+            ("unreachable", unreachable, 502, "api upstream unreachable"),
+        )
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            for name, arrange, expected, verdict in cases:
+                with self.subTest(name):
+                    arrange()
+                    try:
+                        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+                    finally:
+                        # Each case leaves the handler as the next one expects it.
+                        CredentialProxyHandler.api_relay = self.relay
+                        self.relay.__dict__.pop("authorization_header", None)
+                        self.relay.port = self.upstream.server_address[1]
+                        self.reply.update(status=200, content_type="application/json; charset=UTF-8",
+                                          body=b'{"timeSeries":[]}', headers={})
+                    self.assertEqual(expected, status)
+                    lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+                    [checked] = [line for line in lines if line.startswith("api body checked request_id=")]
+                    self.assertTrue(checked.endswith(" resource=projects/kagents-dev"), checked)
+                    request_id = checked.split("request_id=")[1].split(" ")[0]
+                    # The verdict is the last line of the request, after the check line.
+                    self.assertGreater(len(lines) - 1, lines.index(checked))
+                    self.assertTrue(lines[-1].startswith(f"{verdict} request_id={request_id}"), lines[-1])
+                    # The check line carries no audit mapping: the audit fields stay identifiers and outcomes.
+                    self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
 
     def test_a_forwarded_get_names_no_resource_in_the_forwarded_line(self):
         # A GET's project is in its path, which the first line of the request carries.

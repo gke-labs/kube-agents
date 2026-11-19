@@ -883,6 +883,10 @@ API_RELAY_PATH_LOG_LENGTH = 256
 # What the forwarded line of a read with a body ends with: the one resource name
 # the body check passed. The path of such a read names no project.
 API_RELAY_RESOURCE_LOG_SUFFIX = " resource={}"
+# The line a read with a body writes when its body passes the route's check. It
+# names the same resource, which the check held to the route's grammar, and it
+# carries no audit mapping: the audit fields stay identifiers and outcomes.
+API_RELAY_BODY_CHECKED_LOG = "api body checked request_id=%s rule=%s resource=%s"
 # The width a principal is logged at, on the exec route's audit records and
 # the relay's lines alike. The value comes from the TokenReview, not from the
 # request, and a ServiceAccount username truncated at the default 64 loses
@@ -15730,7 +15734,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
         decision and exactly one verdict -- rejected, blocked, forwarded, or
-        one of the upstream failures. Each carries the exec route's
+        one of the upstream failures. A read with a body that names one
+        resource writes a third line between them, API_RELAY_BODY_CHECKED_LOG,
+        which is no audit line. Each audit line carries the exec route's
         tool-execution audit mapping, under API_RELAY_AUDIT_TOOL and the host's
         service word: started, then rejected, blocked, completed (a forwarded
         answer, whatever its status) or failed. `host` and `path` are caller text and go through
@@ -15812,6 +15818,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if checked is None:
                 return
             forwarded_body, resource = checked
+            if resource:
+                # Before the upstream call, so each verdict of this request follows a
+                # line that names what the body reads: a read that fails after the
+                # check was still let through for that resource, and over the cap
+                # the upstream has served it.
+                LOGGER.info(API_RELAY_BODY_CHECKED_LOG, request_id, decision.rule_id, resource)
         if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
@@ -15948,8 +15960,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         and held to the route's body check. What is returned is the broker's own
         serialisation of the object that passed, so a duplicate key, a comment
         or any byte the parser dropped never reaches the upstream, and with it
-        the one resource name of that object the forwarded line may carry
-        (`api_policy.body_resource`), or None. A refused body returns neither.
+        the one resource name of that object the `api body checked` line and
+        the forwarded line may carry (`api_policy.body_resource`), or None. A
+        refused body returns neither.
         """
         # The length `parse_request` framed the request with: None when it cannot
         # be framed (a Transfer-Encoding, a length that is not a number, two

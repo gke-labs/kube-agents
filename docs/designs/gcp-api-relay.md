@@ -144,20 +144,27 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
 
 6. Writes two audit lines per request, on the pattern of the exec route: one before the
    decision and exactly one verdict after it. The request id is minted by the broker, so the
-   two lines of one request share it:
+   lines of one request share it. A read with a body that names one resource (today
+   `entries:list`) writes one more line between the two, when its body passes the route's
+   check:
 
    ```
    api request_id=%s principal=%s host=%s path=%s
    api rejected request_id=%s code=%s reason=%s
    api blocked request_id=%s rule=%s
-   api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d
+   api body checked request_id=%s rule=%s resource=%s
+   api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d[ resource=%s]
    ```
 
    `host` and `path` are caller text and go through `_sanitize_for_logging` as `argv[0]`
    does (`path` at 256 characters, the width the exec route gives a `cwd`). The forwarded line
    of a read with a body ends with ` resource=projects/<project>`, the one resource name its
-   body check passed: the path of such a read names no project. A refused body's resource is
-   in no line, and the `audit` mapping does not carry it. The upstream
+   body check passed: the path of such a read names no project. The `api body checked` line
+   names the same resource before the upstream call, so a verdict that is not `forwarded`
+   (over the cap, a redirect, an upstream or credential failure, a disabled relay) also
+   follows a line that says which project the read asked for. A refused body returns before
+   that line: its resource is in no line. The `audit` mapping does not carry the resource,
+   and the `api body checked` line carries no `audit` mapping. The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
    writes `api disabled request_id=%s rule=%s`. Each of these records also carries the
@@ -540,7 +547,10 @@ standing in for `monitoring.googleapis.com` and the real `GoogleApiRelay.fetch` 
   and session roles are refused. Each outcome writes its audit record under the `logging`
   subcommand, and the filter is in no log line. The forwarded line of an `entries:list` ends
   with the body's `projects/<project>`, the line of a forwarded `GET` names no resource, and
-  no line of a refused body carries its project.
+  no line of a refused body carries its project. An `entries:list` whose body passed the
+  check writes the `api body checked` line with the project before its verdict, when the
+  verdict is `forwarded` and when it is a failure (over the cap, no relay, no credential,
+  an unreachable upstream).
 - A refused `POST` carrying a body larger than the socket buffers still receives its 403,
   because the body is drained first.
 - Each policy refusal (`gcp.api.path`, `gcp.api.host-refused`, `gcp.api.host`,
