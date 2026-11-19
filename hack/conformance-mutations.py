@@ -76,7 +76,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-a2a-chat-gateway-any-audience",
         "agents/platform/scripts/credential_proxy.py",
-        ("        if username in self.a2a_chat_callers and role != CALLER_ROLE_A2A_CHAT:\n",
+        ("        if username in self.a2a_chat_callers and role not in (CALLER_ROLE_A2A_CHAT, CALLER_ROLE_A2A_REPORTS):\n",
          "        if False:\n"),
         "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
         "let the A2A gateway's account present any audience, since its pod "
@@ -261,8 +261,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-read-any-role",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if role != CALLER_ROLE_PROFILE:\n        return RULE_REPORT_ROLE\n",
-         "    if False:\n        return RULE_REPORT_ROLE\n"),
+        ("        return report_a2a_reports_read_permitted(route, key)\n    return RULE_REPORT_ROLE\n",
+         "        return report_a2a_reports_read_permitted(route, key)\n    return None\n"),
         "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
         "read the store for any role holding an allowlisted profile name, since "
         "only the shell and profile reach the route -- until a role table edit "
@@ -271,8 +271,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-report-read-any-profile",
         "agents/platform/scripts/credential_proxy.py",
-        ("    if not _report_profile_permitted(profile, allowlist):\n        return RULE_REPORT_PROFILE\n    return None\n",
-         "    if False:\n        return RULE_REPORT_PROFILE\n    return None\n"),
+        ("        if not _report_profile_permitted(profile, allowlist):\n            return RULE_REPORT_PROFILE\n        return None\n",
+         "        if False:\n            return RULE_REPORT_PROFILE\n        return None\n"),
         "test_A3_the_audit_report_store_reads_answer_to_the_shell_and_the_allowlist",
         "let any profile task read the store, since reads change nothing -- every "
         "profile's model output then reads the fleet's audit findings",
@@ -315,6 +315,115 @@ MUTATIONS: list[Mutation] = [
         "treat a caller with no role as the shell, as the role table does for a "
         "Unix-socket broker -- a broker with no audience split then hands every "
         "caller the shell's writes",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-reads-as-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if role == CALLER_ROLE_SHELL:\n        return None\n    if role == CALLER_ROLE_PROFILE:\n',
+         '    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_A2A_REPORTS):\n        return None\n    if role == CALLER_ROLE_PROFILE:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader read as the shell does, since reads change nothing -- "
+        "the gateway then lists and reads every repository's findings for every audit",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-writes-as-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if role == CALLER_ROLE_A2A_REPORTS:\n        return RULE_REPORT_A2A_REPORTS_WRITE\n    if role == CALLER_ROLE_SHELL:\n        pass\n',
+         '    if role in (CALLER_ROLE_SHELL, CALLER_ROLE_A2A_REPORTS):\n        pass\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader write as the shell, so a chat reply can drop a stale "
+        "latest -- a prompt injected into a chat then rewrites an audit's baseline",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-write-falls-through",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if role == CALLER_ROLE_A2A_REPORTS:\n        return RULE_REPORT_A2A_REPORTS_WRITE\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_WRITE\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "drop the a2a-reports write refusal as redundant, since the role check below "
+        "refuses it anyway -- until that check is widened and the reader writes",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if route not in REPORT_A2A_READ_ROUTES:\n        return RULE_REPORT_A2A_REPORTS_ROUTE\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_ROUTE\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the reader read a stream's run index too, to offer older runs -- it "
+        "then enumerates every run of every audit it can name",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-any-key",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if key != REPORT_A2A_PUBLISH_KEY:\n        return RULE_REPORT_A2A_REPORTS_KEY\n',
+         '    if False:\n        return RULE_REPORT_A2A_REPORTS_KEY\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the reader send any key, since the broker swaps in the publish key "
+        "anyway -- until that swap is narrowed to the word and a chat user reads "
+        "another repository's findings by naming it",
+    ),
+    Mutation(
+        "A3-report-a2a-reports-key-from-the-request",
+        "agents/platform/scripts/credential_proxy.py",
+        ('                segments[REPORT_STORE_KEY_SEGMENT] = publish if publish is not None else REPORT_NO_FORGE_STORE_KEY\n',
+         '                segments[REPORT_STORE_KEY_SEGMENT] = key\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "relay the reader's key as sent, since the listener only serves keys it "
+        "holds -- the word then reaches the store, and whichever stream it names is read",
+    ),
+    Mutation(
+        "A3-report-publish-word-for-every-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            if rule is None and role == CALLER_ROLE_A2A_REPORTS:\n',
+         '            if rule is None and key == REPORT_A2A_PUBLISH_KEY:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "resolve the word for every caller, as a convenience -- the shell and every "
+        "profile worker then gain an alias whose meaning moves with the ConfigMap",
+    ),
+    Mutation(
+        "A3-report-a2a-chat-reaches-the-store",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_A2A_REPORTS)),\n',
+         '    (AUDIT_REPORTS_PREFIX, (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_A2A_CHAT)),\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "admit the Chat relay's role to the store as well, since it is the same "
+        "gateway -- its token is projected beside a Chat adapter that reads untrusted input",
+    ),
+    Mutation(
+        "A3-a2a-reports-reaches-exec",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),\n',
+         '    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE, CALLER_ROLE_A2A_REPORTS)),\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the report reader run a read-only kubectl too, to enrich a report reply "
+        "-- a token meant for two GETs then reaches the broker's credentialed commands",
+    ),
+    Mutation(
+        "A3-a2a-reports-audience-may-repeat-another",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if a2a_reports_audience and a2a_reports_audience in audience_roles:\n',
+         '        if False:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the reports audience be any string, a copy-paste of the chat one "
+        "included -- the chat token then reads as the report reader's",
+    ),
+    Mutation(
+        "A3-a2a-reports-any-account",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if role == CALLER_ROLE_A2A_REPORTS and username not in self.a2a_reports_callers:\n',
+         '        if False:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the audience alone confer the role, as a2a-chat's does -- any allowed "
+        "caller projecting the reports audience then reads the store as the gateway",
+    ),
+    Mutation(
+        "A3-a2a-reports-caller-any-audience",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if username in self.a2a_reports_callers and role not in (CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_A2A_CHAT):\n',
+         '        if False:\n'),
+        "test_A3_the_a2a_report_reader_reads_one_publish_key_report_as_the_gateway",
+        "let the gateway account present whichever audience it projects, now that "
+        "it is always a broker caller -- it then projects the shell audience and runs commands",
     ),
     Mutation(
         "A3-profile-reaches-gke-mcp",

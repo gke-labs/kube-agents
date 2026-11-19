@@ -2274,9 +2274,10 @@ class GitopsSeededFileStateTest(unittest.TestCase):
                 self.assertEqual(data.decode(), checker.GITOPS_SEEDED_FILES[path] + "\n")
                 hashed = subprocess.run(["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True)
                 self.assertEqual(hashed.stdout.decode().strip(), checker.gitops_seeded_blob_sha(path))
-        # The six-item note, as the forty repositories carry it since the
-        # 2026-11-13 repair (blob cd9d2500 in the issue's record).
-        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("cd9d2500"))
+        # The seven-item note, the one the forty repositories carry once the
+        # re-seed that follows the compute slice's merge runs; the six-item
+        # note of the 2026-11-13 repair was blob cd9d2500.
+        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("3d3a1388"))
         with self.assertRaises(KeyError):
             checker.gitops_seeded_bytes("knowledge/other.md")
 
