@@ -157,6 +157,8 @@ The A2A gateway serves Prometheus counters on a metrics-only port, 9096 (contain
 
 The same port answers `/readyz`, which the gateway Deployment's readinessProbe reads every 5 seconds: 503, with the reason, until the gateway has bound its event relay, which on a fresh install waits for the provisioning Job's `TASKS` stream. The kubelet's probe comes from the node, which the policy does not govern.
 
+The gateway's egress is governed by a second policy, `<name>-a2a-gateway-egress`, which renders and goes with that one. It admits cluster DNS, the bus, the credential broker and the Kubernetes API server on their ports. It also admits TCP 443 except to private, link-local and shared addresses, for the chat platforms the gateway dials directly. Everything else the gateway sends is denied.
+
 ## `spec.harness`
 
 Framework-level settings passed to Hermes. `clusterName`, `location`, and `projectId` are all
