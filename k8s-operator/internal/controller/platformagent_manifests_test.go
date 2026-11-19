@@ -1296,6 +1296,19 @@ func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheEvalRunTagSwitchAsALiteralOnly(t *testing.T) {
+	// The chart renders KUBEAGENTS_EVAL_RUN_TAGS from
+	// platformAgent.deployment.evalRunTags on eval installs; the agent's API
+	// server, board and plugin read it only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "KUBEAGENTS_EVAL_RUN_TAGS", Value: "1"},
+		{Name: "KUBEAGENTS_EVAL_RUN_TAGS", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_EVAL_RUN_TAGS" || got[0].Value != "1" {
+		t.Fatalf("expected only the literal KUBEAGENTS_EVAL_RUN_TAGS to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesThePostMergeReadCap(t *testing.T) {
 	// POST_MERGE_READS_PER_TICK bounds how many records one post-merge check
 	// step reads; it reaches the agent only through this allowlist, and only
@@ -7005,7 +7018,7 @@ func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
 	// the platform on the auto-generated `hermes-google_chat` composite and unions in every
 	// enabled MCP server, which is broader than the worker surface this pins, not narrower.
 	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
-	for _, platform := range []string{"google_chat", "slack"} {
+	for _, platform := range []string{"google_chat", "slack", "teams"} {
 		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
 		want := slices.Sorted(slices.Values(frontDoorToolsets))
 		if !slices.Equal(got, want) {

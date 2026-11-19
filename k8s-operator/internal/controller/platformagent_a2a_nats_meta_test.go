@@ -29,6 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -699,5 +700,255 @@ func TestTheMetaCheckWaitsOutABusMigration(t *testing.T) {
 	}
 	if reads != 0 || state.busMeta.message != "" {
 		t.Errorf("the meta check ran during a migration: %d reads, meta %+v", reads, state.busMeta)
+	}
+}
+
+// noLeaderViews is #6273's shape: every server up, its meta node started,
+// and none agreeing on a leader.
+func noLeaderViews() []a2aBusServerView {
+	return []a2aBusServerView{
+		{Pod: metaN0, ClusterSize: 3},
+		{Pod: metaN1, ClusterSize: 3},
+		{Pod: metaN2, ClusterSize: 3},
+	}
+}
+
+// #6273: a fresh bus whose servers agree no meta leader past the bound has
+// every server restarted, once: the record names them all before any pod is
+// deleted, and a Warning says so.
+func TestAFreshBusWithNoMetaLeaderIsRestartedOnce(t *testing.T) {
+	m := newMetaRig(t, nil)
+	now := time.Now()
+	if !m.heal(noLeaderViews(), now.Add(-a2aBusMetaHealAfter), now) {
+		t.Fatal("no restart with every guard met")
+	}
+	for _, pod := range []string{metaN0, metaN1, metaN2} {
+		if m.podExists(pod) {
+			t.Errorf("%s was not deleted", pod)
+		}
+	}
+	if got := m.restartedRecord(); !slices.Equal(got, []string{metaN0, metaN1, metaN2}) {
+		t.Errorf("restart record %v, want every server", got)
+	}
+	select {
+	case e := <-m.rec.Events:
+		if !strings.Contains(e, "Warning "+a2aBusMetaGroupRestartedReason) || !strings.Contains(e, "no JetStream meta leader") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning for the restart")
+	}
+}
+
+// One attempt only: with any server already in the record, from this
+// restart or the one-stray heal, nothing is restarted, before or after the
+// pods come back.
+func TestAFreshBusWithNoMetaLeaderIsNeverRestartedTwice(t *testing.T) {
+	now := time.Now()
+	m := newMetaRig(t, nil)
+	if !m.heal(noLeaderViews(), now.Add(-a2aBusMetaHealAfter), now) {
+		t.Fatal("no first restart")
+	}
+	// The StatefulSet brings the pods back; still no leader, much later.
+	for i, name := range []string{metaN0, metaN1, metaN2} {
+		if err := m.cl.Create(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: m.agent.Namespace, UID: types.UID("pod-uid-new-" + string(rune('0'+i))),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(m.sts, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.heal(noLeaderViews(), now.Add(-time.Hour), now) {
+		t.Error("restarted a second time")
+	}
+	for _, pod := range []string{metaN0, metaN1, metaN2} {
+		if !m.podExists(pod) {
+			t.Errorf("%s was deleted a second time", pod)
+		}
+	}
+	// A record left by the one-stray heal also rules it out.
+	m2 := newMetaRig(t, func(m *metaRig, objs []client.Object) []client.Object {
+		m.sts.Annotations = map[string]string{a2aBusMetaRestartedAnnotation: metaN2}
+		return objs
+	})
+	if m2.heal(noLeaderViews(), now.Add(-time.Hour), now) {
+		t.Error("restarted every server after the one-stray heal had restarted one")
+	}
+}
+
+// The guards: within the bound, on a bus ever provisioned, with a stream or
+// consumer on any server, or with a server still loading its store, nothing
+// is restarted.
+func TestTheNoLeaderRestartGuards(t *testing.T) {
+	now := time.Now()
+	withStream := noLeaderViews()
+	withStream[1].Streams = 1
+	withConsumer := noLeaderViews()
+	withConsumer[2].Consumers = 1
+	loading := noLeaderViews()
+	loading[0].ClusterSize = 0
+	for name, tc := range map[string]struct {
+		views       []a2aBusServerView
+		since       time.Time
+		provisioned bool
+	}{
+		"within the bound":     {noLeaderViews(), now.Add(-a2aBusMetaHealAfter + time.Second), false},
+		"no clock yet":         {noLeaderViews(), time.Time{}, false},
+		"provisioned":          {noLeaderViews(), now.Add(-time.Hour), true},
+		"a stream on a server": {withStream, now.Add(-time.Hour), false},
+		"a consumer":           {withConsumer, now.Add(-time.Hour), false},
+		"a server loading":     {loading, now.Add(-time.Hour), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := newMetaRig(t, nil)
+			if tc.provisioned {
+				setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+			}
+			if m.heal(tc.views, tc.since, now) {
+				t.Error("restarted")
+			}
+			for _, pod := range []string{metaN0, metaN1, metaN2} {
+				if !m.podExists(pod) {
+					t.Errorf("%s was deleted", pod)
+				}
+			}
+			if rec := m.restartedRecord(); len(rec) != 0 {
+				t.Errorf("record %v", rec)
+			}
+		})
+	}
+}
+
+// The record is written before any delete: a failed record deletes nothing,
+// and a failed delete leaves the record, so the attempt counts and is never
+// made again.
+func TestTheNoLeaderRestartIsRecordedFirst(t *testing.T) {
+	now := time.Now()
+	heal := func(m *metaRig) error {
+		live := &appsv1.StatefulSet{}
+		if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), live); err != nil {
+			t.Fatal(err)
+		}
+		views := noLeaderViews()
+		_, err := m.r.healA2ABusMeta(context.Background(), m.agent, live, views, judgeA2ABusMeta(views, 3), now.Add(-a2aBusMetaHealAfter), now)
+		return err
+	}
+	t.Run("record fails", func(t *testing.T) {
+		m := newMetaRig(t, nil)
+		m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return errors.New("patch refused")
+			},
+		})
+		if heal(m) == nil {
+			t.Error("a failed record reported no error")
+		}
+		for _, pod := range []string{metaN0, metaN1, metaN2} {
+			if !m.podExists(pod) {
+				t.Errorf("%s was deleted although the restart couldn't be recorded", pod)
+			}
+		}
+	})
+	t.Run("a delete fails", func(t *testing.T) {
+		m := newMetaRig(t, nil)
+		m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == metaN1 {
+					return errors.New("delete refused")
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		})
+		if heal(m) == nil {
+			t.Error("a failed delete reported no error")
+		}
+		if got := m.restartedRecord(); !slices.Equal(got, []string{metaN0, metaN1, metaN2}) {
+			t.Errorf("record %v after a partial restart, want every server kept, so it is never tried again", got)
+		}
+		if m.podExists(metaN0) || m.podExists(metaN2) {
+			t.Error("the deletes after the failed one were not made")
+		}
+	})
+}
+
+// After the one restart, the condition says every server was restarted and
+// the bus is left for a person.
+func TestTheConditionSaysEveryServerWasRestarted(t *testing.T) {
+	v := judgeA2ABusMeta(noLeaderViews(), 3)
+	if msg := a2aBusMetaMessage(v, nil); strings.Contains(msg, "restarted") {
+		t.Errorf("before any restart: %q", msg)
+	}
+	msg := a2aBusMetaMessage(v, []string{metaN0, metaN1, metaN2})
+	if !strings.Contains(msg, "Every server was restarted once already") || !strings.Contains(msg, "left for a person") {
+		t.Errorf("after the restart: %q", msg)
+	}
+}
+
+// Only this StatefulSet's live pods: one owned elsewhere, or already going,
+// rules the restart out; a pod that goes on its own before its delete counts
+// as restarted, with no error.
+func TestTheNoLeaderRestartTouchesOnlyThisBussLivePods(t *testing.T) {
+	now := time.Now()
+	foreign := newMetaRig(t, func(m *metaRig, objs []client.Object) []client.Object {
+		for _, o := range objs {
+			if p, ok := o.(*corev1.Pod); ok && p.Name == metaN1 {
+				p.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "other", UID: "other-uid", Controller: ptrTrue()}}
+			}
+		}
+		return objs
+	})
+	if foreign.heal(noLeaderViews(), now.Add(-time.Hour), now) || !foreign.podExists(metaN0) || len(foreign.restartedRecord()) != 0 {
+		t.Error("restarted a bus with a pod another StatefulSet controls")
+	}
+	vanishing := newMetaRig(t, nil)
+	vanishing.r.Client = interceptor.NewClient(vanishing.cl.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == metaN2 {
+				return apierrors.NewNotFound(corev1.Resource("pods"), metaN2)
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	if !vanishing.heal(noLeaderViews(), now.Add(-a2aBusMetaHealAfter), now) {
+		t.Error("a pod already gone failed the restart")
+	}
+}
+
+// A delete that fails says so in the Warning: the restart may be partial and
+// isn't tried again.
+func TestAPartialNoLeaderRestartSaysSo(t *testing.T) {
+	now := time.Now()
+	m := newMetaRig(t, nil)
+	m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == metaN1 {
+				return errors.New("delete refused")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	live := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), live); err != nil {
+		t.Fatal(err)
+	}
+	views := noLeaderViews()
+	_, _ = m.r.healA2ABusMeta(context.Background(), m.agent, live, views, judgeA2ABusMeta(views, 3), now.Add(-a2aBusMetaHealAfter), now)
+	select {
+	case e := <-m.rec.Events:
+		if !strings.Contains(e, "may be partial") || !strings.Contains(e, "not tried again") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning for the attempt")
+	}
+}
+
+// With one server already restarted (the one-stray heal), the bus is never
+// restarted whole, and the condition says nothing more will act.
+func TestTheConditionSaysAnEarlierRestartRulesTheBusOut(t *testing.T) {
+	v := judgeA2ABusMeta(noLeaderViews(), 3)
+	msg := a2aBusMetaMessage(v, []string{metaN2})
+	if !strings.Contains(msg, "won't restart the bus") || !strings.Contains(msg, "left for a person") {
+		t.Errorf("condition %q", msg)
 	}
 }

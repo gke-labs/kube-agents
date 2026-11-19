@@ -384,6 +384,11 @@ readonly PLATFORM_AGENT_CR_NAME="platform-agent"
 # to SCRIPT_DIR at the use site because the tests that lift this file's
 # readonly lines into a harness run them without SCRIPT_DIR.
 readonly CHART_CRD_DIR="charts/kube-agents/crds/"
+# 5b′'s probe for a chart CRD still Terminating from a previous install: each
+# CRD's name and deletionTimestamp, which kubectl prints as this placeholder
+# when the field is absent (#6458, #3764).
+readonly CRD_NAME_DELETION_COLUMNS='NAME:.metadata.name,DELETING:.metadata.deletionTimestamp'
+readonly KUBECTL_EMPTY_COLUMN='<none>'
 # Timeout for deleting the PlatformAgent CR during retry, allowing the live
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
@@ -935,6 +940,9 @@ if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
   replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
   echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, ${REPLAY_SHADOW_MODE} mode, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
+# Per-request eval run tags ride the proxy: on with it, off without it
+# (eval_run_tags_helm_args), and EVAL_RUN_TAGS=false turns them off alone.
+eval_run_tags_helm_args
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
 # RC_COMMIT_SHA unset is the presubmit and everything this script did before the
@@ -2247,7 +2255,28 @@ fi
 # this (apply_crd_upgrades in scripts/installer/installer_common.sh); this
 # deploy does the same. On a fresh project it installs the objects Helm would
 # have installed, so it is idempotent there.
+#
+# Not over a CRD still Terminating, though. One is held by CRs whose
+# finalizers no operator is left to clear, which the opening teardown
+# releases (hack/ci-teardown.sh Step 3, #6458); one that reached this point
+# outlived that too. The apply "succeeds" over it with a warning, and the
+# install then dies downstream: the first CR create is refused (`create not
+# allowed while custom resource definition is terminating`), or the operator
+# loops on `no matches for kind` and the rollout never comes (#3764). Refused
+# here instead, naming the CRDs, as the infrastructure failure it is: nothing
+# about the change under test is implied. A probe that cannot read the CRDs
+# at all leaves the decision to the apply, which fails on the same cause.
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Applying the chart's CRDs (server-side) ==="
+TERMINATING_CRDS="$(kubectl get -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" --ignore-not-found --no-headers \
+  -o custom-columns="${CRD_NAME_DELETION_COLUMNS}" \
+  | awk -v none="${KUBECTL_EMPTY_COLUMN}" '$2 != none {print $1}')" || {
+  echo "WARNING: could not read the chart's CRDs to check for one still Terminating; the apply below decides."
+  TERMINATING_CRDS=""
+}
+if [ -n "${TERMINATING_CRDS}" ]; then
+  echo "ERROR: CRD(s) still Terminating on ${CLUSTER_NAME} in ${PROJECT_ID} from a previous install: ${TERMINATING_CRDS//$'\n'/ }; CRs with finalizers no operator can clear are holding the delete, and a CR cannot be created into a Terminating CRD, so this install cannot succeed; not installing (infrastructure, kube-agents#6458, #3764). Release the CRs' finalizers, as hack/ci-teardown.sh Step 3 does, and re-run." >&2
+  exit 1
+fi
 kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" >/dev/null
 echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 
@@ -2353,6 +2382,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "webConsole.enabled=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
+    ${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e
