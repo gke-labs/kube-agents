@@ -1,79 +1,79 @@
 [
   {
     "since": "2026-08-28T16:02:36+00:00",
-    "commit": "f1908801 feat(bench): the scoring engine (#925)",
+    "commit": "01010101 feat(bench): the first admitted case",
     "admitted": [
-      "gpu-stress-test-diagnosis"
+      "case-05"
     ]
   },
   {
     "since": "2026-09-01T21:41:58+00:00",
-    "commit": "6cae20df feat(gate): admit the thirteen cases whose record earned blocking (#1096)",
+    "commit": "02020202 feat(gate): admit thirteen cases",
     "admitted": [
-      "reliability-pdb-probe",
-      "security-overgrant-probe",
-      "upgrades-lagging-master-probe",
-      "consistency-authorized-networks-probe",
-      "cost-idle-pool-probe",
-      "obtainability-remediation-proposal",
-      "rca-remediation-pr",
-      "compliance-rbac-overgrant",
-      "cluster-agent-crashloop-debug",
-      "cluster-agent-crashloop-misleading-symptom",
-      "cluster-agent-crashloop-evidence-chain",
-      "gpu-stress-test-diagnosis",
-      "agent-kanban-smoke"
+      "case-02",
+      "case-29",
+      "case-27",
+      "case-13",
+      "case-01",
+      "case-35",
+      "case-23",
+      "case-09",
+      "case-19",
+      "case-14",
+      "case-18",
+      "case-05",
+      "case-24"
     ]
   },
   {
     "since": "2026-09-02T18:51:48+00:00",
-    "commit": "33d2abf3 ci(gate): demote compliance-rbac-overgrant (#1171) (#1173)",
+    "commit": "03030303 ci(gate): demote case-09",
     "admitted": [
-      "reliability-pdb-probe",
-      "security-overgrant-probe",
-      "upgrades-lagging-master-probe",
-      "consistency-authorized-networks-probe",
-      "cost-idle-pool-probe",
-      "obtainability-remediation-proposal",
-      "rca-remediation-pr",
-      "cluster-agent-crashloop-debug",
-      "cluster-agent-crashloop-misleading-symptom",
-      "cluster-agent-crashloop-evidence-chain",
-      "gpu-stress-test-diagnosis",
-      "agent-kanban-smoke"
+      "case-02",
+      "case-29",
+      "case-27",
+      "case-13",
+      "case-01",
+      "case-35",
+      "case-23",
+      "case-19",
+      "case-14",
+      "case-18",
+      "case-05",
+      "case-24"
     ]
   },
   {
     "since": "2026-09-02T21:40:59+00:00",
-    "commit": "6850bcf6 fix(gate): demote rca-remediation-pr (#1189) (#1190)",
+    "commit": "04040404 fix(gate): demote case-23",
     "admitted": [
-      "reliability-pdb-probe",
-      "security-overgrant-probe",
-      "upgrades-lagging-master-probe",
-      "consistency-authorized-networks-probe",
-      "cost-idle-pool-probe",
-      "obtainability-remediation-proposal",
-      "cluster-agent-crashloop-debug",
-      "cluster-agent-crashloop-misleading-symptom",
-      "cluster-agent-crashloop-evidence-chain",
-      "gpu-stress-test-diagnosis",
-      "agent-kanban-smoke"
+      "case-02",
+      "case-29",
+      "case-27",
+      "case-13",
+      "case-01",
+      "case-35",
+      "case-19",
+      "case-14",
+      "case-18",
+      "case-05",
+      "case-24"
     ]
   },
   {
     "since": "2026-09-04T13:53:35+00:00",
-    "commit": "077e206b perf(ci): drop the two tofu cases from presubmit (#1218)",
+    "commit": "05050505 perf(ci): drop two provisioning cases from presubmit",
     "admitted": [
-      "reliability-pdb-probe",
-      "security-overgrant-probe",
-      "upgrades-lagging-master-probe",
-      "consistency-authorized-networks-probe",
-      "cost-idle-pool-probe",
-      "obtainability-remediation-proposal",
-      "cluster-agent-crashloop-debug",
-      "cluster-agent-crashloop-misleading-symptom",
-      "cluster-agent-crashloop-evidence-chain",
-      "agent-kanban-smoke"
+      "case-02",
+      "case-29",
+      "case-27",
+      "case-13",
+      "case-01",
+      "case-35",
+      "case-19",
+      "case-14",
+      "case-18",
+      "case-24"
     ]
   }
 ]

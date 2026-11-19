@@ -143,11 +143,29 @@ var ErrOverRenderedLimits = errors.New("snapshot does not fit the operator's ren
 
 // withRenderedLimits is cfg with the limits the operator renders, which the
 // restore sends in place of the snapshot's own: a stream comes back with the
-// caps the install renders now, whatever an earlier render gave it.
+// caps the install renders now, whatever an earlier render gave it. Its
+// max_consumers is the one exception to "what the install renders now": it
+// is only ever widened to the render's, never narrowed
+// (widenedMaxConsumers).
 func withRenderedLimits(cfg nats.StreamConfig, policy StreamPolicy) nats.StreamConfig {
 	cfg.MaxBytes = policy.MaxBytes
 	cfg.MaxAge = policy.MaxAge
+	cfg.MaxConsumers = widenedMaxConsumers(cfg.MaxConsumers, policy.MaxConsumers)
 	return cfg
+}
+
+// widenedMaxConsumers is the max_consumers a forward restore creates a
+// stream with: the snapshot's own, raised to the render's when it is
+// narrower. A stream an earlier render or a larger session count made wider
+// keeps its width, because the consumers that width admitted must still fit;
+// the provision Job asks only that the live stream holds what the CR needs,
+// never that it equals the render. A snapshot with no limit (zero or less)
+// keeps none, and a render of zero or less decides nothing.
+func widenedMaxConsumers(snapshot, rendered int) int {
+	if rendered <= 0 || snapshot <= 0 || snapshot >= rendered {
+		return snapshot
+	}
+	return rendered
 }
 
 // fitsRenderedLimits refuses a snapshot whose state, as its pinned metadata
@@ -174,7 +192,8 @@ type Opener func() (io.ReadCloser, error)
 // RestoreVerified restores one stream from its staged snapshot, sending
 // cfg, the snapshot's own config, pinned by the operator's digest of its
 // metadata, with the operator's rendered max_bytes and max_age in place of
-// its own (withRenderedLimits). A snapshot that does not fit those limits,
+// its own, and its max_consumers widened to the render's
+// (withRenderedLimits). A snapshot that does not fit those limits,
 // by its bytes or by the age of its oldest message, is refused before
 // anything is sent (ErrOverRenderedLimits). policy gates it twice, the same
 // table both times: cfg must pass policy.Check before anything is sent, and
@@ -198,6 +217,9 @@ func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, 
 // them: the restored store's own, before the server assigns any of them.
 func RestoreVerifiedCounting(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, takenAt time.Time, open Opener, wantDigest string, policy StreamPolicy) (int, error) {
 	cfg = withRenderedLimits(cfg, policy)
+	// The stream is held to the width it is sent with, on the way in and on
+	// read-back, as it is to the rendered max_bytes and max_age.
+	policy.MaxConsumers = cfg.MaxConsumers
 	if d := policy.Check(cfg); len(d) != 0 {
 		return 0, fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
 	}
@@ -215,12 +237,12 @@ func RestoreVerifiedCounting(ctx context.Context, nc *nats.Conn, cfg nats.Stream
 // server as the snapshot recorded it, limits included, so that a run turned
 // back by a snapshot that does not fit the rendered limits (or by anything
 // else) can always return the bus to where it was. It differs from
-// RestoreVerified only in the limits: max_bytes and max_age are the
-// snapshot's own, which its metadata digest pins, and policy holds the stream
+// RestoreVerified only in the limits: max_bytes, max_age and max_consumers
+// are the snapshot's own, which its metadata digest pins, and policy holds the stream
 // to those, on the way in and on read-back; every other field is held to the
 // operator's policy as before, and there is no fit check.
 func RestoreAsItWas(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
-	policy.MaxBytes, policy.MaxAge = cfg.MaxBytes, cfg.MaxAge
+	policy.MaxBytes, policy.MaxAge, policy.MaxConsumers = cfg.MaxBytes, cfg.MaxAge, cfg.MaxConsumers
 	if d := policy.Check(cfg); len(d) != 0 {
 		return fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
 	}

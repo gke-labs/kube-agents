@@ -900,7 +900,7 @@ def _chat_notify() -> Any:
 def _with_answer(
     adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict], answer_to: str = "",
 ) -> Optional[dict]:
-    """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
+    """``metadata`` with a completed card's report, or a hard-wall block's reason, marked as the report and, for a Slack card, laid out as an answer, for the chat.notify stand-in.
 
     The gateway lays the report out from a
     ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
@@ -912,10 +912,15 @@ def _with_answer(
     (``kanban_chat_notify.ANSWER_METADATA_KEY``), laid out or not.
     """
     notify = _chat_notify()
-    if quiet is None or kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
+    if kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
+        return metadata
+    # The report post is marked as one on every platform, so the gateway can
+    # tell it from the progress notes that share its thread and its task.
+    metadata = {**(metadata or {}), notify.REPORT_METADATA_KEY: True}
+    if quiet is None:
         return metadata
     if answer_to:
-        metadata = {**(metadata or {}), notify.ANSWER_METADATA_KEY: answer_to}
+        metadata = {**metadata, notify.ANSWER_METADATA_KEY: answer_to}
     try:
         import chat_message
 

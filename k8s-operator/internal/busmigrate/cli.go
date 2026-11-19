@@ -311,8 +311,9 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		// What a restored stream is held to: the render's limits going
 		// forward, the snapshot's own on the way back (RestoreAsItWas).
 		built := policy
+		built.MaxConsumers = widenedMaxConsumers(meta.Config.MaxConsumers, policy.MaxConsumers)
 		if replicas <= 1 {
-			built.MaxBytes, built.MaxAge = meta.Config.MaxBytes, meta.Config.MaxAge
+			built.MaxBytes, built.MaxAge, built.MaxConsumers = meta.Config.MaxBytes, meta.Config.MaxAge, meta.Config.MaxConsumers
 		}
 		// How many consumers the restore brought back, by the server's
 		// final answer; unknown (-1) for a stream an earlier attempt or pod

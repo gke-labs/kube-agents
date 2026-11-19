@@ -134,7 +134,7 @@ class NightDocumentTest(unittest.TestCase):
         self.assertFalse(last["truncated"])
         self.assertFalse(last["complete"])
         # Prow's deadline delivers SIGTERM and records FAILURE, not ABORTED
-        # (collect.py's fixture 2092688354838581248): a night that is not a
+        # (collect.py's fixture 2090000000000000010): a night that is not a
         # SUCCESS and whose log has no verdict line is truncated too.
         data["runs"][-1].update(eval_verdict=None)
         self.assertTrue(nightly.night_reports(data)[0]["truncated"])

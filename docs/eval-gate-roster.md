@@ -979,7 +979,7 @@ The validated-capabilities suite, the cases behind the validated-capabilities pa
 `hack/eval/`: each case is a top-level case under `bench/tasks/` whose task file carries the
 bare line `suite: validated-capabilities`, that line is its registration, and `EVAL_TIER=validated-capabilities` in
 `hack/ci-eval-pr.sh` runs those cases alone, in sections by their `suite_part: N` line under `EVAL_VALIDATED_CAPABILITIES_PART`,
-one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses a suite
+one Prow periodic per section, on a Saturday and Sunday cron and on Rerun from Deck. The script refuses a suite
 case that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
 refuses any other spelling of the two lines, so a case holds one record on one lane. The roster
 above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
