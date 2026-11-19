@@ -1760,7 +1760,19 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 		lineLeading := isLineLeadingKVKey(s, matchStart)
 		class := secretKeyClassOf(key)
 		named := keyClearlyNamesSecret(key)
+		// An Authorization key the auth-scheme rule's lead pattern doesn't
+		// read (#6415): a * or _ left before its separator, or emphasis
+		// around it. That rule, which defers to this one for the plain key,
+		// has already redacted the credential's first token, so the value
+		// here starts with the marker, after the scheme word when it is one
+		// the prefix pattern doesn't take (Hawk, NTLM). The value is the
+		// credential all the same, so it is redacted here as the plain
+		// key's is, the marker and the fields after it together.
+		takenByScheme := strings.HasSuffix(strings.ToLower(key), "authorization") && schemeTookValue(rest)
 		redacts := func(v, after string) bool {
+			if takenByScheme && schemeTookValue(v) {
+				return true
+			}
 			return classValueRedacted(class, v, sep == ':' && runsOnAsSentence(after))
 		}
 		// A code-spanned value is bounded by its backticks, like a quoted
@@ -1837,7 +1849,7 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 			if closeIdx >= 0 {
 				pos++
 			}
-		case strings.HasPrefix(rest, redactedValue):
+		case strings.HasPrefix(rest, redactedValue) && !(takenByScheme && sep == ':' && openQuote == "" && closeQuote == "" && lineLeading):
 			pos = matchEnd + len(redactedValue)
 		default:
 			if sep == ':' && openQuote == "" && closeQuote == "" && lineLeading {
@@ -1856,6 +1868,12 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 					}
 					continue
 				}
+			}
+			if strings.HasPrefix(rest, redactedValue) {
+				// takenByScheme's value on a line the line branches don't
+				// take: the marker is the first token, as the plain key's is.
+				pos = matchEnd + len(redactedValue)
+				continue
 			}
 			valLen := 0
 			for valLen < len(rest) {
@@ -2549,6 +2567,16 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	}
 	prefix := strings.TrimLeft(s[lineStart:matchStart], " \t")
 	return prefix == "" || prefix == "-"
+}
+
+// schemeTookValue says whether v is a value the auth-scheme rule has
+// already redacted the first token of, with more after it: the marker, or
+// a scheme word and the marker, and then the value's other fields.
+func schemeTookValue(v string) bool {
+	if m := authSchemeCredentialPattern.FindStringSubmatchIndex(v); m != nil && m[0] == 0 {
+		v = v[m[4]:]
+	}
+	return len(v) > len(redactedValue) && strings.HasPrefix(v, redactedValue)
 }
 
 // inlineKVLaterKeyPattern is inlineKVSecretPattern without marks before the

@@ -1,6 +1,7 @@
 package hermesbridge
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -827,6 +828,68 @@ func TestScrubProseSecretsAMarkedNounStillNamesTheSecret(t *testing.T) {
 		}
 		if !slices.Contains(seen, "quietpasture") {
 			t.Errorf("scrubProseSecrets(%q) reported %q to the sink; want the value", in, seen)
+		}
+	}
+}
+
+// TestScrubInlineSecretsAMarkedAuthorizationKeyKeepsItsWholeValue: an
+// Authorization key with a stray * or _ before its separator is redacted
+// the way the unmarked key is, its later fields included, not only the
+// first token after the scheme word (#6415). Synthetic values.
+func TestScrubInlineSecretsAMarkedAuthorizationKeyKeepsItsWholeValue(t *testing.T) {
+	const later = "6629fae49393a05397450978507c4ef1"
+	for _, in := range []string{
+		`Authorization*: Digest username="u", response="` + later + `", nonce="n"`,
+		`Authorization_: Digest username="u", response="` + later + `", nonce="n"`,
+		`Authorization *: Digest username="u", response="` + later + `", nonce="n"`,
+		`Proxy-Authorization*: Digest username="u", response="` + later + `"`,
+		`Authorization*: Hawk id="dh37fgj492je", mac="` + later + `"`,
+		`**Authorization**: Bearer abcdefgh1234 ` + later,
+		`**Authorization:** Bearer abcdefgh1234 ` + later,
+		`Authorization*: Hawk abcdefgh1234 ` + later,
+		`authorization *: Hawk username="u", mac="` + later + `"`,
+		`Authorization_: NTLM abcdefgh1234 ` + later,
+	} {
+		if got := scrubInlineSecrets(in); strings.Contains(got, later) {
+			t.Errorf("scrubInlineSecrets(%q) = %q: a later field of the credential is visible", in, got)
+		}
+	}
+	// In every context, the marked key's line scrubs as the unmarked key's
+	// does, mark aside. (Where the unmarked key keeps a later field visible
+	// too, in a list item, mid-sentence or after "=", so does the marked
+	// one: #6415 is about the mark.)
+	for _, f := range []string{"%s%s: %s", "- %s%s: %s", "curl -H '%s%s: %s' x", "see %s%s: %s ok", "%s%s=%s", "headers %s%s: %s, more", "  %s%s: %s"} {
+		for _, key := range []string{"Authorization", "authorization", "Proxy-Authorization"} {
+			for _, v := range []string{`Digest username="u", response="` + later + `", nonce="n"`, "Bearer abcDEF123456789 tail-word", "Basic dXNlcjpwYXNzd29yZDEyMw== x"} {
+				want := scrubInlineSecrets(fmt.Sprintf(f, key, "", v))
+				for _, mark := range []string{"*", "_", " *", " _"} {
+					in := fmt.Sprintf(f, key, mark, v)
+					if got := strings.Replace(scrubInlineSecrets(in), key+mark, key, 1); got != want {
+						t.Errorf("scrubInlineSecrets(%q) = %q; the unmarked key gives %q", in, got, want)
+					}
+				}
+			}
+		}
+	}
+	for in, want := range map[string]string{
+		// The marked key reads as the unmarked one does.
+		`Authorization*: Digest username="u", response="` + later + `"`: `Authorization*: Digest [redacted]`,
+		// Unchanged from main: a key that only ends in "authorization", a
+		// --flag, a quoted key, and a header pair.
+		"preauthorization*: Bearer Synth3tic-Pass-0001":            "preauthorization*: Bearer [redacted]",
+		"--Authorization _=Bearer Synth3tic-Pass-0001":             "--Authorization [redacted] [redacted]",
+		"--Authorization *:Bearer Synth3tic-Pass-0001":             "--Authorization [redacted] [redacted]",
+		`{"Authorization": "Bearer Synth3tic-Pass-0001"}`:          `{"Authorization": "Bearer [redacted]"}`,
+		`setHeader("Authorization", "Bearer Synth3tic-Pass-0001")`: `setHeader("Authorization", "Bearer [redacted]]")`,
+		"Authorization: Bearer Synth3tic-Pass-0001":                "Authorization: Bearer [redacted]",
+		// The marker is the first token where the line's later pair ends the value.
+		"Authorization*: Bearer abcdefgh1234 password: Synth3tic-Pass-0001": "Authorization*: Bearer [redacted] password: [redacted]",
+		// Another marked secret key keeps the auth-scheme rule's redaction.
+		"token_: Bearer Synth3tic-Pass-0001 tail-word":   "token_: Bearer [redacted] tail-word",
+		"api_key*: Bearer Synth3tic-Pass-0001 tail-word": "api_key*: Bearer [redacted] tail-word",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
