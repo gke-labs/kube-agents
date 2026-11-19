@@ -1957,10 +1957,20 @@ def init_db() -> None:
                     reported_at     TEXT,
                     followup_state  TEXT,
                     followup_attempts INTEGER,
-                    followup_detail TEXT
+                    followup_detail TEXT,
+                    changed_paths   TEXT
                 )
                 """
             )
+            # `changed_paths` arrived after the table did: the files a merged fix
+            # changed, read from its diff once by `post_merge_check.py health`
+            # and kept, since a merged pull request's files never change.
+            if "changed_paths" not in {row[1] for row in conn.execute("PRAGMA table_info(post_merge_records)")}:
+                try:
+                    conn.execute("ALTER TABLE post_merge_records ADD COLUMN changed_paths TEXT")
+                except sqlite3.OperationalError as exc:
+                    if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
+                        raise
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
