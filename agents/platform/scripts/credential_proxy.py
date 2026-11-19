@@ -1322,7 +1322,7 @@ BROKER_FAILURE_VCS_FAILED = "vcs_failed"
 BROKER_FAILURE_FORGE_REFRESH_FAILED = "forge_refresh_failed"
 BROKER_FAILURE_API_RELAY_FAILED = "api_relay_failed"
 # The broker's own chat event pull failing: its Pub/Sub subscription or its
-# credential to it, recorded at the three pull sites, since the chat families
+# credential to it, recorded at the four pull sites, since the chat families
 # are otherwise excluded from the response hook (their 502 is the caller's).
 BROKER_FAILURE_CHAT_PULL_FAILED = "chat_pull_failed"
 BROKER_FAILURE_OTHER_FAILED = "other_failed"
@@ -7574,6 +7574,11 @@ class TeamsUpstreamError(RuntimeError):
         self.fields = fields or {}
 
 
+def _teams_field_text(value: Any) -> str:
+    """A Bot Framework or Entra error field as text; ``null`` and absent are empty."""
+    return "" if value is None else str(value)
+
+
 def _teams_upstream_error(exc: urllib.error.HTTPError) -> TeamsUpstreamError:
     """Read the bounded error body Bot Framework or Entra answered with.
 
@@ -7590,12 +7595,13 @@ def _teams_upstream_error(exc: urllib.error.HTTPError) -> TeamsUpstreamError:
     except Exception:
         body = {}
     err = body.get("error") if isinstance(body, dict) else None
+    # A JSON null in a field reads as absent, not as the word "None".
     if isinstance(err, dict):
-        fields["code"] = str(err.get("code", ""))[:TEAMS_UPSTREAM_CODE_MAX_CHARS]
-        fields["message"] = str(err.get("message", ""))[:TEAMS_UPSTREAM_MESSAGE_MAX_CHARS]
+        fields["code"] = _teams_field_text(err.get("code"))[:TEAMS_UPSTREAM_CODE_MAX_CHARS]
+        fields["message"] = _teams_field_text(err.get("message"))[:TEAMS_UPSTREAM_MESSAGE_MAX_CHARS]
     elif isinstance(err, str):
         fields["code"] = err[:TEAMS_UPSTREAM_CODE_MAX_CHARS]
-        fields["message"] = str(body.get("error_description", ""))[:TEAMS_UPSTREAM_MESSAGE_MAX_CHARS]
+        fields["message"] = _teams_field_text(body.get("error_description"))[:TEAMS_UPSTREAM_MESSAGE_MAX_CHARS]
     detail = " ".join(str(fields[k]) for k in ("code", "message") if fields.get(k))
     return TeamsUpstreamError(f"HTTP {exc.code}: {detail or exc.reason}", fields)
 
@@ -14903,6 +14909,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": self.teams_relay.pull()})
             except Exception as exc:
                 LOGGER.warning("Teams event pull failed: %s", type(exc).__name__)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams event pull failed"}
                 )
