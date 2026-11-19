@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import json
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ except Exception:
 
 import platform_mcp_server
 import sandbox_exec
+from test_session_kv_openers_refuse_proxy import _LiveServer
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
 platform_mcp_server._run_env = lambda extra=None: {"HOME": "/tmp", "SLACK_BOT_TOKEN": "dummy-token", **(extra or {})}
 # Pin the transport rather than inheriting it. sandbox_exec decides from the
@@ -746,7 +748,7 @@ class TestSendNotification(unittest.TestCase):
         )
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_with_session_success(self, mock_run, mock_urlopen, mock_env):
@@ -772,7 +774,7 @@ class TestSendNotification(unittest.TestCase):
         )
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_metadata_api_error_fallback(self, mock_run, mock_urlopen, mock_env):
@@ -915,7 +917,7 @@ class TestSendNotificationTargetIntegrity(unittest.TestCase):
         return [call.args[0][3] for call in mock_run.call_args_list]
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {
         **BLANK_CHAT_ENV,
@@ -945,7 +947,7 @@ class TestSendNotificationTargetIntegrity(unittest.TestCase):
         )
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample'})
     def test_a_row_with_no_platform_at_all_is_not_guessed_at(self, mock_run, mock_urlopen, mock_env):
@@ -962,7 +964,7 @@ class TestSendNotificationTargetIntegrity(unittest.TestCase):
         self.assertEqual(["google_chat:spaces/AAAAexample"], self._targets(mock_run))
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample'})
     def test_a_row_that_names_its_platform_is_still_threaded(self, mock_run, mock_urlopen, mock_env):
@@ -983,7 +985,7 @@ class TestSendNotificationTargetIntegrity(unittest.TestCase):
         )
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample'})
     def test_a_row_with_no_thread_is_not_reported_as_a_declined_guess(
@@ -1037,7 +1039,7 @@ class TestSendNotificationDeliveryFallback(unittest.TestCase):
         return [call.args[0][3] for call in mock_run.call_args_list]
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
     def test_a_failed_thread_send_falls_back_to_the_home_channel(self, mock_run, mock_urlopen, mock_env):
@@ -1063,7 +1065,7 @@ class TestSendNotificationDeliveryFallback(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
     def test_a_thread_send_that_lands_is_not_also_broadcast(self, mock_run, mock_urlopen, mock_env):
@@ -1080,7 +1082,7 @@ class TestSendNotificationDeliveryFallback(unittest.TestCase):
         self.assertEqual([self.THREAD_TARGET], self._targets(mock_run))
 
     @patch('platform_mcp_server._run_env')
-    @patch('urllib.request.urlopen')
+    @patch('urllib.request.OpenerDirector.open')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
     def test_a_thread_send_of_unknown_outcome_is_not_broadcast_again(self, mock_run, mock_urlopen, mock_env):
@@ -1211,7 +1213,7 @@ class TestReportToChat(unittest.TestCase):
         return ctx
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_posts_the_report_to_the_relay_route(self, mock_urlopen):
         mock_urlopen.return_value = self._urlopen()
 
@@ -1227,7 +1229,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer k")
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/cluster-prod-a", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_profile_comes_from_hermes_home_not_the_prompt(self, mock_urlopen):
         """A scaffolded cluster profile reports under its own name."""
         mock_urlopen.return_value = self._urlopen()
@@ -1236,7 +1238,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertEqual(body["profile"], "cluster-prod-a")
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_unprofiled_home_does_not_report_as_data(self, mock_urlopen):
         mock_urlopen.return_value = self._urlopen()
         report_to_chat("finding", job_id="j1")
@@ -1249,14 +1251,14 @@ class TestReportToChat(unittest.TestCase):
         self.assertIn("ERROR", report_to_chat("finding", job_id=" "))
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"})
-    @patch("urllib.request.urlopen", side_effect=OSError("connection refused"))
+    @patch("urllib.request.OpenerDirector.open", side_effect=OSError("connection refused"))
     def test_a_dead_relay_returns_an_error_the_agent_can_act_on(self, _mock_urlopen):
         # The job prompt tells the agent to fall back to returning the report as
         # its final response on ERROR, so this string is load-bearing.
         self.assertIn("ERROR", report_to_chat("finding", job_id="j1"))
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_the_wait_outlasts_the_relay_it_is_waiting_on(self, mock_urlopen):
         """The route relays synchronously — it posts to every enabled platform
         before it answers, inside the relay plugin's 360s.
@@ -1277,7 +1279,7 @@ class TestReportToChat(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_a_degraded_relay_is_not_reported_as_a_clean_success(self, mock_urlopen):
         """The route answers 200 for a composed delivery and for a degraded one,
         and says which in `relay`. Reading it is the difference between the agent
@@ -1294,7 +1296,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertIn("do not send it again", result.lower())
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_a_degraded_relay_says_which_degradation_the_route_reported(self, mock_urlopen):
         """The sentence comes from the route, not from this tool.
 
@@ -1318,7 +1320,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertIn("do not send it again", result.lower())
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_a_composed_relay_is_a_plain_success(self, mock_urlopen):
         """`ok` is what the route sends when the Chat Agent framed the report."""
         mock_urlopen.return_value = self._urlopen(
@@ -1330,7 +1332,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertNotIn("partial", result)
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_a_partial_fan_out_is_not_reported_as_a_clean_success(self, mock_urlopen):
         """The route fans out, so `relay: ok` no longer means everyone saw it.
 
@@ -1348,7 +1350,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertIn("do not send it again", result.lower())
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_a_truncated_report_says_so_to_the_agent_that_wrote_it(self, mock_urlopen):
         """The `[truncated]` line goes to the human reading the channel.
 
@@ -1365,7 +1367,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertIn("do not send it again", result.lower())
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_an_untruncated_report_is_not_labelled_truncated(self, mock_urlopen):
         """The route sends `truncated: ""` for a report that fit, and an empty
         string must not read as a flag."""
@@ -1376,7 +1378,7 @@ class TestReportToChat(unittest.TestCase):
         self.assertNotIn("truncated", result)
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
-    @patch("urllib.request.urlopen")
+    @patch("urllib.request.OpenerDirector.open")
     def test_degraded_and_partial_are_both_reported(self, mock_urlopen):
         """A run can hit both, and an early return would drop one of them."""
         mock_urlopen.return_value = self._urlopen(
@@ -1992,7 +1994,7 @@ class TestFindingsTransport(unittest.TestCase):
             yield io.BytesIO(json.dumps({"ok": True}).encode())
 
         with patch.dict(os.environ, {"SESSION_KV_API_KEY": "test-key"}, clear=False):
-            with patch.object(platform_mcp_server.urllib.request, "urlopen", fake_urlopen):
+            with patch.object(platform_mcp_server.urllib.request.OpenerDirector, "open", side_effect=fake_urlopen):
                 result = platform_mcp_server._findings_request(method, path, body)
         return sent, result
 
@@ -2014,6 +2016,51 @@ class TestFindingsTransport(unittest.TestCase):
     def test_a_bodyless_call_declares_no_content_type(self):
         sent, _ = self._send("GET", "/v1/findings")
         self.assertNotIn("content-type", sent["headers"])
+
+
+class TestSessionKvCallsRefuseAProxy(unittest.TestCase):
+    """Session KV is on the pod's loopback. With a proxy variable and no NO_PROXY
+    entry for 127.0.0.1, urllib hands a request and its bearer token to the proxy."""
+
+    def setUp(self):
+        self.server = _LiveServer(
+            self, {"status": "accepted", "platform": "slack", "chat_id": "space123", "thread_id": "thread123"}
+        )
+        port = int(self.server.url.rsplit(":", 1)[1])
+        real_connect = socket.create_connection
+
+        # The Session KV address is a literal in each call, so a connection to it
+        # goes to the live server. A call that takes the proxy connects to the
+        # closed port of the proxy, and that address does not change here.
+        def connect(address, *args, **kwargs):
+            if address == ("127.0.0.1", 8699):
+                address = ("127.0.0.1", port)
+            return real_connect(address, *args, **kwargs)
+
+        patcher = patch.object(socket, "create_connection", side_effect=connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_findings_request_reaches_session_kv(self):
+        platform_mcp_server._findings_request("GET", "/v1/findings/ranked")
+        self.assertEqual([("GET", "/v1/findings/ranked", "Bearer kv-token")], self.server.seen)
+
+    def test_a_cron_report_reaches_session_kv(self):
+        self.assertIn("SUCCESS", report_to_chat("the finding", job_id="j1"))
+        self.assertEqual([("POST", "/v1/cron-reports", "Bearer kv-token")], self.server.seen)
+
+    @patch('platform_mcp_server._run_env', return_value={})
+    @patch('platform_mcp_server.subprocess.run', return_value=MagicMock(stdout="posted"))
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV})
+    def test_a_notification_reaches_session_kv_for_the_thread_and_for_the_report(self, _mock_run, _mock_env):
+        send_notification("rca report", session_id="k8s-evt-abc")
+        self.assertEqual(
+            [
+                ("GET", "/v1/sessions/k8s-evt-abc/metadata", "Bearer kv-token"),
+                ("POST", "/v1/incidents", "Bearer kv-token"),
+            ],
+            self.server.seen,
+        )
 
 
 class TestClusterAgentRoster(unittest.TestCase):

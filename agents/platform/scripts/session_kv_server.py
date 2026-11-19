@@ -295,7 +295,7 @@ PRE_KANBAN_STATUS_COMPLETED = "completed"
 PRE_KANBAN_STATUS_FAILED = "failed"
 # Upper bound for an unclosed front-door routing turn before it is treated as
 # stale rather than permanently `in_progress`. `_start_agent_turn` uses a 300s
-# client-side `urlopen` read timeout, but the Hermes gateway turn can continue
+# client-side read timeout, but the Hermes gateway turn can continue
 # running server-side (and a single MCP call in `agents/platform/config.yaml`
 # allows up to 420s: `connect_timeout: 120` + `timeout: 300`), so 900s (15m)
 # gives slow multi-step routing turns headroom before marking them stale.
@@ -381,6 +381,10 @@ TRIAGE_RETRY_MAX_DELAY_S = 60.0
 TRIAGE_RETRY_JITTER = (0.5, 1.0)
 # The gateway's loopback address, when PLATFORM_API_URL does not name one.
 PLATFORM_API_URL_DEFAULT = "http://127.0.0.1:8642"
+# The gateway API is on the pod's loopback address by default: a proxy from the
+# environment must not get a turn's prompt, and urllib does not leave out a
+# loopback host by itself.
+_GATEWAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # A start queued longer than this still gets one attempt, then no retry, whatever
 # the budget says: the wait bounds the retries, never the first try.
 TRIAGE_QUEUE_WAIT_LIMIT_S = 1200.0
@@ -3707,7 +3711,7 @@ def _gateway_failure(exc: Exception, turn_sent: bool) -> _GatewayAttempt:
     if isinstance(reason, ConnectionRefusedError):
         return _GatewayAttempt(START_RETRY, "refused", answered=False)
     detail = "timeout" if isinstance(reason, TimeoutError) else type(reason).__name__
-    # urlopen wraps an error raised while connecting or sending the request in
+    # urllib wraps an error raised while connecting or sending the request in
     # URLError; an error while waiting for the response (a read timeout) comes
     # out unwrapped. Only the unwrapped one may hide a turn that is running.
     if turn_sent and not isinstance(exc, urllib.error.URLError):
@@ -3732,7 +3736,7 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
+        with _GATEWAY_OPENER.open(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
             return _GatewayAttempt(START_OK)
     except urllib.error.HTTPError as exc:
         # It already exists: a retry after a create that timed out and still committed.
@@ -5143,7 +5147,7 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
+        with _GATEWAY_OPENER.open(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
             if resp.status != 200:
                 logger.error(f"Gateway API chat execution failed (status {resp.status})")
             return _GatewayAttempt(START_OK)

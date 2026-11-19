@@ -27,6 +27,8 @@ opener that the import made.
 
 The tests fail when:
 
+- a non-test Python file of the shipped trees (`SHIPPED_TREES`) has a `urlopen`
+  or a `build_opener` call and is not in `AUDITED_FILES`;
 - an audited file gets a new `urlopen` or `build_opener` call, loses one, or
   moves one to another function, and `DECISIONS` does not say so;
 - the source of a call no longer agrees with the row's state (an opener loses
@@ -45,6 +47,7 @@ no proxy from the environment, or a third-party client.
 """
 
 import ast
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -117,6 +120,7 @@ DECISIONS = (
     Decision(SCRIPTS + "credential_proxy.py", "PodAddressBinding._read_pod", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "SlackRelay.download", BUILD_OPENER, TAKES, KEEP, "slack.com", PUBLIC_HOST),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._TEAMS_OPENER", BUILD_OPENER, TAKES, KEEP, "the Microsoft identity and Bot Framework hosts", PUBLIC_HOST),
+    Decision(SCRIPTS + "credential_proxy_client.py", "<module>._BROKER_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "dial_state.py", "<module>._BROKER_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, "an in-cluster http call with the broker token"),
     Decision(SCRIPTS + "feedback_broker.py", "_fetch", URLOPEN, TAKES, KEEP, "api.github.com, github.io and docs.google.com", PUBLIC_HOST),
     Decision(SCRIPTS + "findings_nudge.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
@@ -133,17 +137,13 @@ DECISIONS = (
     ),
     Decision(SCRIPTS + "google_chat_relay_patch.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "inventory_findings.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(SCRIPTS + "platform_mcp_server.py", "send_notification", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(SCRIPTS + "platform_mcp_server.py", "send_notification", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(SCRIPTS + "platform_mcp_server.py", "report_to_chat", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(SCRIPTS + "platform_mcp_server.py", "_findings_request", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(SCRIPTS + "platform_mcp_server.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(
         SCRIPTS + "providers/transport.py", "HttpTransport._build_opener", BUILD_OPENER, TAKES, KEEP, "the forge's API host",
         "a GitHub, GitLab, Bitbucket or Gitea host; the site tells an operator to set HTTPS_PROXY for this client",
     ),
     Decision(SCRIPTS + "scope_publisher.py", "_kube_request", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
-    Decision(SCRIPTS + "session_kv_server.py", "_create_gateway_session", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_PROMPT),
-    Decision(SCRIPTS + "session_kv_server.py", "_start_agent_turn", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_PROMPT),
+    Decision(SCRIPTS + "session_kv_server.py", "<module>._GATEWAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, GATEWAY_API, LOOPBACK_PROMPT),
     Decision(SCRIPTS + "slack_blocks_post.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "slack_relay_patch.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "stall_watch.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
@@ -161,16 +161,35 @@ DECISIONS = (
         "the host is the caller's choice and can be a public provider; the operator's value is an in-cluster Service "
         "that the suggested NO_PROXY covers",
     ),
+    # The fleet-audit skill.
+    Decision(
+        "agents/platform/skills/fleet-audit/scripts/report_status.py", "_broker_opener", BUILD_OPENER, REFUSES, REFUSE, BROKER,
+        "a call to the broker that carries two credentials of the caller",
+    ),
+    # The LiteLLM hook of the chart.
+    Decision(
+        "charts/kube-agents/files/litellm_oauth2_callback.py", "fetch_token", BUILD_OPENER, TAKES, KEEP,
+        "the OAuth2 token endpoint that the operator names",
+        "the host is the operator's choice: an identity provider outside the cluster needs the proxy, "
+        "and a host inside the cluster needs a NO_PROXY entry",
+    ),
     # The patches of the gateway image, and its chat plugin.
     Decision(PATCHES + "cron_job_template.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(PATCHES + "eval_run_tag.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(PATCHES + "kanban_notifier.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(PATCHES + "kanban_origin.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(PATCHES + "slack_ux_clicks.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision("deploy/docker/plugins/chat/adapter.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    # The operator's leader election probe.
+    Decision(
+        "k8s-operator/internal/controller/leader_elect.py", "<module>.HERMES_PROBE_OPENER", BUILD_OPENER, REFUSES, REFUSE,
+        "the gateway API on the pod (127.0.0.1)",
+        "a loopback probe; its answer must come from this pod's gateway",
+    ),
 )
 
-# The files of the audit. A file stays here when its last call is gone, so a
-# `urlopen` that comes back to it has no row and fails the test.
+# The files of the audit: each non-test Python file of `SHIPPED_TREES` that has a
+# call. A file stays here when its last call is gone.
 AUDITED_FILES = (
     "agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py",
     "agents/chat/defaults/plugins/chat_metrics/metrics.py",
@@ -184,6 +203,7 @@ AUDITED_FILES = (
     SCRIPTS + "audit_report_store.py",
     SCRIPTS + "broker_admission.py",
     SCRIPTS + "credential_proxy.py",
+    SCRIPTS + "credential_proxy_client.py",
     SCRIPTS + "dial_state.py",
     SCRIPTS + "feedback_broker.py",
     SCRIPTS + "findings_nudge.py",
@@ -201,12 +221,22 @@ AUDITED_FILES = (
     SCRIPTS + "upgrade_readiness_review.py",
     SCRIPTS + "wif_credentials.py",
     "agents/platform/skills/decision-memory/scripts/decision_memory.py",
+    "agents/platform/skills/fleet-audit/scripts/report_status.py",
+    "charts/kube-agents/files/litellm_oauth2_callback.py",
     PATCHES + "cron_job_template.py",
+    PATCHES + "eval_run_tag.py",
     PATCHES + "kanban_notifier.py",
     PATCHES + "kanban_origin.py",
     PATCHES + "slack_ux_clicks.py",
     "deploy/docker/plugins/chat/adapter.py",
+    "k8s-operator/internal/controller/leader_elect.py",
 )
+# The trees that an image or the chart ships. `bench/`, `hack/`, `scripts/`,
+# `tests/` and `admin_console/` are developer and CI tools and have no rows.
+SHIPPED_TREES = ("agentplugins", "agents", "charts", "deploy", "k8s-operator")
+# A file with this name prefix is a test. A `verify_` file is not left out: some
+# of them run when a pod starts.
+TEST_FILE_PREFIX = "test_"
 THIS_FILE = "scripts/test_urlopen_proxy_decisions.py"
 
 
@@ -259,6 +289,21 @@ def call_sites_of(source: str) -> list[tuple[str, str, str]]:
     return found
 
 
+def files_with_a_call(root: Path, trees: tuple[str, ...]) -> list[str]:
+    """The non-test Python files under `trees` of `root` that have a `urlopen` or a `build_opener` call, as paths from `root`."""
+    found = []
+    for tree in trees:
+        for path in sorted((root / tree).rglob("*.py")):
+            relative = path.relative_to(root)
+            if path.name.startswith(TEST_FILE_PREFIX) or any(part.startswith(".") for part in relative.parts):
+                continue
+            source = path.read_text(encoding="utf-8", errors="replace")
+            # The text check keeps the parser away from the files that cannot have a call.
+            if (URLOPEN in source or BUILD_OPENER in source) and call_sites_of(source):
+                found.append(relative.as_posix())
+    return found
+
+
 def call_sites(path: str) -> list[tuple[str, str, str]]:
     """`call_sites_of` the file at `path`, a path from the repository root."""
     return call_sites_of((ROOT / path).read_text(encoding="utf-8"))
@@ -275,6 +320,14 @@ class UrlopenProxyDecisionsTest(unittest.TestCase):
     def test_each_audited_file_is_in_the_tree(self) -> None:
         missing = [path for path in AUDITED_FILES if not (ROOT / path).is_file()]
         self.assertEqual(missing, [], f"a file of AUDITED_FILES is gone; move or remove it and its rows in {THIS_FILE}")
+
+    def test_each_shipped_file_with_a_call_is_audited(self) -> None:
+        strays = sorted(set(files_with_a_call(ROOT, SHIPPED_TREES)) - set(AUDITED_FILES))
+        self.assertEqual(
+            strays, [],
+            f"a file of {SHIPPED_TREES} has a `urlopen` or a `build_opener` call and no decision; "
+            f"add the file to AUDITED_FILES and a row to DECISIONS in {THIS_FILE}",
+        )
 
     def test_each_row_is_for_an_audited_file(self) -> None:
         strays = sorted({row.path for row in DECISIONS} - set(AUDITED_FILES))
@@ -361,6 +414,24 @@ class CallSitesTest(unittest.TestCase):
     def test_a_bare_name_call_is_counted(self) -> None:
         source = "from urllib.request import build_opener, urlopen\ndef read():\n    return urlopen(request)\n_OPENER = build_opener()\n"
         self.assertEqual(call_sites_of(source), [("read", URLOPEN, TAKES), ("<module>._OPENER", BUILD_OPENER, TAKES)])
+
+    def test_a_file_with_a_call_is_found_and_a_test_file_is_not(self) -> None:
+        call = "import urllib.request\nurllib.request.urlopen('http://127.0.0.1')\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, source in (
+                ("agents/scripts/client.py", call),
+                ("agents/scripts/test_client.py", call),
+                ("agents/scripts/verify_client.py", call),
+                ("agents/scripts/.venv/client.py", call),
+                ("agents/scripts/words.py", "NOTE = 'urlopen takes a proxy'\n"),
+                ("bench/client.py", call),
+            ):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(source, encoding="utf-8")
+            self.assertEqual(
+                files_with_a_call(root, ("agents",)), ["agents/scripts/client.py", "agents/scripts/verify_client.py"]
+            )
 
     def test_a_call_is_named_by_its_function_and_class(self) -> None:
         source = (
