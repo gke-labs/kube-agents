@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // Every phase a run can be in that is not over.
@@ -20,6 +23,21 @@ var busMigrationLivePhases = []busMigrationPhase{
 	busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationClearing,
 	busMigrationConverting, busMigrationRestoring, busMigrationRollingBack,
 	busMigrationRollbackRestoring, busMigrationReleasing,
+}
+
+// seedWorkloads puts a pod and a Job of the run's on the rig, as a newer
+// operator would have left them, and returns how many objects that is.
+func (m *migrationRig) seedWorkloads() int {
+	m.t.Helper()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "reshape", "3-1"), Namespace: m.agent.Namespace}}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "reshape-job", "3-1"), Namespace: m.agent.Namespace}}
+	for _, obj := range []client.Object{pod, job} {
+		m.own(obj)
+		if err := m.cl.Create(context.Background(), obj); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+	return 2
 }
 
 // workloadCount is how many pods and Jobs the run has on the rig.
@@ -44,25 +62,31 @@ func TestAnUnknownLegIsHeldInEveryPhase(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	for _, leg := range []busMigrationLeg{"Reshape", "Sideways"} {
 		for _, running := range []int32{1, 3} {
-			for _, phase := range busMigrationLivePhases {
+			for _, phase := range append(append([]busMigrationPhase{}, busMigrationLivePhases...), "Reshaping") {
 				m := newMigrationRig(t, leg, phase, running, time.Now().Add(-time.Hour))
 				m.agent.Status.BusMigration.FreezeConfirmed = phase != busMigrationFreezing
-				before := *m.agent.Status.BusMigration.DeepCopy()
+				seeded := m.seedWorkloads()
+				before := m.agent.Status.BusMigration.DeepCopy()
 				for i := 0; i < 3; i++ {
 					m.pass(phase, running)
 				}
-				run := m.agent.Status.BusMigration
-				if run.Phase != before.Phase || run.FailedIn != "" || run.Cause != "" || run.Abandoning || !run.Deadline.Equal(&before.Deadline) {
-					t.Errorf("%s %s at %d: run moved: %+v", leg, phase, running, run)
+				if run := m.agent.Status.BusMigration; !reflect.DeepEqual(run, before) {
+					t.Errorf("%s %s at %d: the hold wrote to the run:\n %+v\nwas\n %+v", leg, phase, running, run, before)
 				}
-				if n := m.workloadCount(); n != 0 {
-					t.Errorf("%s %s at %d: %d pods or Jobs made", leg, phase, running, n)
+				if n := m.workloadCount(); n != seeded {
+					t.Errorf("%s %s at %d: %d pods and Jobs, want the %d already there", leg, phase, running, n, seeded)
 				}
 				if !busMigrationHoldsProvision(m.agent) {
 					t.Errorf("%s %s at %d: the provision Job is not held", leg, phase, running)
 				}
 				if wantFrozen := phase != busMigrationReleasing; busMigrationFreezeActive(m.agent) != wantFrozen {
 					t.Errorf("%s %s at %d: freeze active %v, want %v", leg, phase, running, busMigrationFreezeActive(m.agent), wantFrozen)
+				}
+				// The freeze as rendered: the bus's template keeps the run's
+				// freeze annotation and the callout map holds only the
+				// migration's identities.
+				if wantFrozen := phase != busMigrationReleasing && phase != busMigrationFreezing; (buildA2ANATSStatefulSet(m.agent, "h").Spec.Template.Annotations[a2aBusFreezeAnnotation] == "3-1") != wantFrozen {
+					t.Errorf("%s %s at %d: bus template freeze annotation %q, want frozen %v", leg, phase, running, buildA2ANATSStatefulSet(m.agent, "h").Spec.Template.Annotations[a2aBusFreezeAnnotation], wantFrozen)
 				}
 				events := drainEvents(m.r.Recorder.(*record.FakeRecorder))
 				if countEvents(events, reasonA2ABusMigrationLegUnknown) != 1 {
@@ -180,5 +204,67 @@ func TestAnUnknownLegGivenUpEarlySaysStreamsAreRecreated(t *testing.T) {
 	m.pass(busMigrationFailed, 1)
 	if got := busMigrationFailedActions(m.agent); !strings.Contains(got, "recreated empty") || strings.Contains(got, "keep their data") {
 		t.Errorf("given-up actions %q, want streams recreated empty", got)
+	}
+}
+
+// A new phase of the held run is a new Warning; the same phase on later
+// passes is not.
+func TestTheHoldWarnsOncePerPhase(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, "Reshape", busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m.pass(busMigrationSnapshot, 1)
+	m.pass(busMigrationSnapshot, 1)
+	m.agent.Status.BusMigration.Phase = string(busMigrationHashing) // the newer operator moved it on, then was rolled back again
+	m.pass(busMigrationHashing, 1)
+	m.pass(busMigrationHashing, 1)
+	if n := countEvents(drainEvents(m.r.Recorder.(*record.FakeRecorder)), reasonA2ABusMigrationLegUnknown); n != 2 {
+		t.Errorf("%d hold Warnings over two phases, want 2", n)
+	}
+}
+
+// With no StatefulSet to read the count from, the hold keeps the count the
+// last pass recorded.
+func TestTheHoldKeepsTheRecordedCountWithNoStatefulSet(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, "Reshape", busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	if err := m.cl.Delete(context.Background(), m.sts); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(busMigrationRestoring, 3)
+}
+
+// After a run of an unknown leg ends, any count asked for starts a run: the
+// operator can't read that run's target, and a shrink read into it would
+// ignore a request for one server.
+func TestAnEndedUnknownLegDoesNotGateTheNextRun(t *testing.T) {
+	for _, phase := range []busMigrationPhase{busMigrationDone, busMigrationAbandoned} {
+		for _, want := range []int{1, 3} {
+			agent := a2aTestAgent()
+			agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "Reshape", RunID: "3-1", Phase: string(phase)}
+			if !busMigrationWouldStart(agent, want) {
+				t.Errorf("after a %s Reshape run, a change to %d starts nothing", phase, want)
+			}
+		}
+	}
+	// A known leg still gates as before: one to three Done, asked for
+	// three again, starts nothing.
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationDone)}
+	if busMigrationWouldStart(agent, 3) {
+		t.Error("a Done one to three run, asked for three again, starts another")
+	}
+}
+
+// An unknown leg that ended Abandoned says so, as a known leg's does.
+func TestAnAbandonedUnknownLegHasACondition(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "Reshape", RunID: "3-1", Phase: string(busMigrationAbandoned), Cause: "the Restoring phase failed"}
+	cond, ok := busMigratingCondition(agent)
+	if !ok || cond.Status != metav1.ConditionFalse || cond.Reason != "Abandoned" || !strings.Contains(cond.Message, "Reshape") {
+		t.Errorf("condition %+v (%v), want False Abandoned naming the leg", cond, ok)
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationDone)
+	if _, ok := busMigratingCondition(agent); ok {
+		t.Error("a Done unknown-leg run keeps a condition; a Done known leg has none")
 	}
 }

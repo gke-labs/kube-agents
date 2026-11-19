@@ -5442,7 +5442,13 @@ func busMigrationWouldStart(agent *agentv1alpha1.PlatformAgent, want int) bool {
 	// the count was asked back). A new one starts only when the field asks
 	// for a count other than the last run's target, or a person asks for
 	// another try at the same one by naming the last run: an edit to
-	// anything else, or a GitOps sync, starts nothing.
+	// anything else, or a GitOps sync, starts nothing. A run of a leg this
+	// operator does not run has no target it can read, so any count it is
+	// asked for starts one: reading it as a shrink would ignore a request
+	// for one server, without a word.
+	if !busMigrationLegKnown(busMigrationLeg(run.Leg)) {
+		return true
+	}
 	return want != busMigrationTarget(run) || agent.Annotations[a2aBusMigrationStartAnnotation] == run.RunID
 }
 

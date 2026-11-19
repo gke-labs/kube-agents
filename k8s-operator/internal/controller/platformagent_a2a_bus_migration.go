@@ -653,7 +653,7 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 	}
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
 	if !busMigrationLegKnown(leg) {
-		return unknownLegCondition(agent, run), !busMigrationTerminal(phase) || phase == busMigrationFailed
+		return unknownLegCondition(agent, run), phase != busMigrationDone
 	}
 	from, to := 3, 1
 	if leg == busMigrationGrow {
@@ -1866,11 +1866,13 @@ func busMigrationLegUnknownMessage(run *agentv1alpha1.BusMigrationStatus) string
 
 // holdUnknownBusMigrationLeg is a pass over a run whose leg this operator
 // does not run: one a newer operator started, found after a rollback. It
-// changes nothing the run's own operator reads: no phase moves, no pod or
-// Job is made or deleted, the deadline does not apply, and the freeze and
-// the provision hold stay (busMigrationFrozen, busMigrationHoldsProvision).
-// Upgrading back resumes the run where it was. A Warning says so, once per
-// run and phase. A person who gives the run up with the abandon annotation
+// writes nothing to the run, so nothing the run's own operator reads
+// changes: no phase moves, no pod or Job is made or deleted, the deadline
+// does not apply, and the freeze and the provision hold stay
+// (busMigrationFrozen, busMigrationHoldsProvision). Upgrading back resumes
+// the run where it was. A Warning says so, once per run and phase
+// (heldBusMigrationWarned); the A2ABusMigrating condition says it on every
+// pass (unknownLegCondition). A person who gives the run up with the abandon annotation
 // moves it to Failed, given up, on the next pass, as busMigrationActOnFailed
 // does for any Failed run: the freeze lifts, and the provision Job recreates
 // what the run did not put back.
@@ -1882,16 +1884,20 @@ func (r *PlatformAgentReconciler) holdUnknownBusMigrationLeg(agent *agentv1alpha
 		run.Message = "held, then given up by the abandon annotation"
 		return
 	}
-	msg := busMigrationLegUnknownMessage(run)
-	if run.Message != msg {
-		run.Message = msg
-		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationLegUnknown, msg)
+	key, seen := client.ObjectKeyFromObject(agent), run.RunID+"/"+run.Phase
+	if prev, ok := r.heldBusMigrationWarned.Load(key); !ok || prev != seen {
+		r.heldBusMigrationWarned.Store(key, seen)
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationLegUnknown, busMigrationLegUnknownMessage(run))
 	}
 }
 
 // unknownLegCondition is A2ABusMigrating for a run whose leg this operator
 // does not run.
 func unknownLegCondition(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) metav1.Condition {
+	if busMigrationPhase(run.Phase) == busMigrationAbandoned {
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Abandoned",
+			Message: fmt.Sprintf("the %s migration %s did not complete and was undone (%s); the bus runs as it did before it", run.Leg, run.RunID, run.Cause)}
+	}
 	if busMigrationPhase(run.Phase) == busMigrationFailed {
 		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
 			Message: fmt.Sprintf("the %s migration %s stopped (%s): %s.%s", run.Leg, run.RunID, run.Cause, run.Message, busMigrationFailedActions(agent))}
