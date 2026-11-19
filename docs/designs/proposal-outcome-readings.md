@@ -187,7 +187,7 @@ so a merge reaches `status.usage` within two poll intervals end to end.
 starts no sweep, and the readings' series are simply absent. Unset or `on` leaves it on, and so does
 any other value, with a warning. The step-2 budget
 below assumes one install per App installation. Installs that share one each spend their own
-budget against the same quota, which is why the eval lanes, fifty projects on one installation per shard,
+budget against the same quota, which is why the eval lanes, forty projects on one installation,
 set it (#4611).
 
 **Per managed repository**, with the repository's `whoami` login as `author`:
