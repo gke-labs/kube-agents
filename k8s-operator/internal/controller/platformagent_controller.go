@@ -4041,7 +4041,9 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 	log.Info("agent Pod egress is default-deny with an allowlist; the metadata server is not on it. "+
 		"This does nothing unless the cluster CNI enforces NetworkPolicy, which the operator cannot "+
 		"detect, and it is unioned with every other policy selecting this Pod — including the "+
-		"gateway policy this operator renders, which does permit the metadata server.",
+		"gateway policy this operator renders unless spec.networkPolicy.enabled is false, which "+
+		"permits TCP 443 to any address outside the private, link-local and shared ranges unless an "+
+		"FQDNNetworkPolicy is applied in its place.",
 		"policy", policy.Name, "rules", len(policy.Spec.Egress))
 	return nil
 }
