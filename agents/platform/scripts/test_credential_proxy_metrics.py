@@ -1230,18 +1230,29 @@ class ReadingsMetricTest(_BrokerFixture):
             },
             ignored=1,
             taken_at=time.time() if taken_at is None else taken_at,
+            stockout_proposals={"open": 1, "merged": 3, "closed": 1},
         )
 
     def test_set_readings_renders_the_outcomes_and_details_families_as_gauges(self):
         metrics = CredentialProxyHandler.metrics
         before = metrics.render()
-        for name in ("kubeagents_vcs_proposals", "kubeagents_vcs_readings_age_seconds", "kubeagents_vcs_readings_failures_total"):
+        for name in (
+            "kubeagents_vcs_proposals",
+            "kubeagents_vcs_stockout_proposals",
+            "kubeagents_vcs_readings_age_seconds",
+            "kubeagents_vcs_readings_failures_total",
+        ):
             self.assertNotIn(name, before, "a family rendered before its first reading")
         metrics.set_readings(self.outcomes(), self.details())
         text = metrics.render()
         families = _parse(text)
         for state, value in (("open", 3), ("merged", 5), ("closed", 2)):
             self.assertEqual(value, _series(families, "kubeagents_vcs_proposals", state=state))
+        for state, value in (("open", 1), ("merged", 3), ("closed", 1)):
+            self.assertEqual(value, _series(families, "kubeagents_vcs_stockout_proposals", state=state))
+        # Closed label set: only `state` appears on kubeagents_vcs_stockout_proposals.
+        for label_pairs in families["kubeagents_vcs_stockout_proposals"]:
+            self.assertEqual({"state"}, set(dict(label_pairs).keys()))
         for actor, value in (("install", 1), ("human", 1), ("bot", 0)):
             self.assertEqual(value, _series(families, "kubeagents_vcs_proposals_closed_by", actor=actor))
         self.assertEqual(4, _series(families, "kubeagents_vcs_proposal_touches", kind="review_approved", actor="human"))
@@ -1264,6 +1275,7 @@ class ReadingsMetricTest(_BrokerFixture):
             "kubeagents_vcs_proposal_touches",
             per,
             "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_stockout_proposals",
             "kubeagents_vcs_readings_age_seconds",
         ):
             self.assertIn(f"# TYPE {name} gauge", text)
@@ -1277,6 +1289,7 @@ class ReadingsMetricTest(_BrokerFixture):
         families = self.families()
         self.assertEqual(6, _series(families, "kubeagents_vcs_proposals", state="merged"))
         self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a withheld details reading was dropped")
+        self.assertEqual(3, _series(families, "kubeagents_vcs_stockout_proposals", state="merged"), "a withheld details reading dropped stockout counts")
 
     def test_a_withheld_outcomes_reading_keeps_the_previous_one(self):
         # The other half of the rule: a sweep whose tally failed publishes the
@@ -1304,7 +1317,12 @@ class ReadingsMetricTest(_BrokerFixture):
         self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
         self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
         self.assertIsNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
-        for name in ("kubeagents_vcs_proposals_closed_by", "kubeagents_vcs_proposal_touches", "kubeagents_vcs_proposals_ignored"):
+        for name in (
+            "kubeagents_vcs_proposals_closed_by",
+            "kubeagents_vcs_proposal_touches",
+            "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_stockout_proposals",
+        ):
             self.assertNotIn(name, families)
 
     def test_a_stale_reading_is_omitted_and_its_age_gauge_is_not(self):
@@ -1315,6 +1333,7 @@ class ReadingsMetricTest(_BrokerFixture):
         age = _series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes")
         self.assertGreaterEqual(age, vcs_readings.VCS_READINGS_STALE_SECONDS)
         self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a fresh details reading went with the stale one")
+        self.assertEqual(3, _series(families, "kubeagents_vcs_stockout_proposals", state="merged"))
 
         CredentialProxyHandler.metrics.set_readings(None, self.details(taken_at=stale))
         families = self.families()
@@ -1323,6 +1342,7 @@ class ReadingsMetricTest(_BrokerFixture):
             "kubeagents_vcs_proposal_touches",
             "kubeagents_vcs_proposal_touches_per_proposal",
             "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_stockout_proposals",
         ):
             self.assertNotIn(name, families)
         self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
