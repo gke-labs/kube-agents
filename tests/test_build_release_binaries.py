@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import tarfile
 import unittest
+import zipfile
 
 from tests.testing.common import (
     INVALID_GA_RELEASE_TAGS,
@@ -22,11 +23,27 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "release" / "build_release_binaries.sh"
 _PLATFORMS = ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"]
 _README_AT_RELEASE = "k8s-api-proxy README at the release\n"
+_MCP = "kube-agents-mcp"
+_MCP_PLATFORMS = ["darwin/amd64", "darwin/arm64", "linux/amd64", "linux/arm64", "windows/amd64"]
+_ROOT_README = "kube-agents README at the release\n"
 
 
-def _archive_name(platform):
+def _archive_name(platform, name="k8s-api-proxy"):
     goos, goarch = platform.split("/")
-    return f"k8s-api-proxy_{MOCK_TARGET_RELEASE_TAG}_{goos}_{goarch}"
+    return f"{name}_{MOCK_TARGET_RELEASE_TAG}_{goos}_{goarch}"
+
+
+def _mcp_archive_file(platform):
+    suffix = ".zip" if platform.startswith("windows/") else ".tar.gz"
+    return _archive_name(platform, _MCP) + suffix
+
+
+def _proxy_archive_files():
+    return sorted(f"{_archive_name(p)}.tar.gz" for p in _PLATFORMS)
+
+
+def _mcp_archive_files():
+    return sorted(_mcp_archive_file(p) for p in _MCP_PLATFORMS)
 
 
 class BuildReleaseBinariesTest(unittest.TestCase):
@@ -38,9 +55,9 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         # Only the tools the script needs, so the developer's own go stays out of reach.
         self.bin_dir = create_minimal_tools_bin(base)
 
-    def _run(self, args, env=None, with_go=True, fail_build=False):
+    def _run(self, args, env=None, with_go=True, fail_build=False, fail_build_matching=None):
         if with_go:
-            create_mock_go_binary(self.bin_dir, fail_build=fail_build)
+            create_mock_go_binary(self.bin_dir, fail_build=fail_build, fail_build_matching=fail_build_matching)
         return subprocess.run(
             ["bash", str(_SCRIPT)] + args,
             capture_output=True,
@@ -56,15 +73,22 @@ class BuildReleaseBinariesTest(unittest.TestCase):
             cwd=self.repo_dir,
         )
 
-    def _commit_module_and_tag(self, with_main=True):
+    def _commit_module_and_tag(self, with_main=True, with_mcp=False, with_proxy=True):
         root = pathlib.Path(self.repo_dir)
-        module = root / "k8s-api-proxy"
-        module.mkdir()
-        (module / "go.mod").write_text("module github.com/gke-labs/kube-agents/k8s-api-proxy\n")
-        if with_main:
-            (module / "cmd" / "k8s-api-proxy").mkdir(parents=True)
-            (module / "cmd" / "k8s-api-proxy" / "main.go").write_text("package main\n\nfunc main() {}\n")
-        (module / "README.md").write_text(_README_AT_RELEASE)
+        if with_proxy:
+            module = root / "k8s-api-proxy"
+            module.mkdir()
+            (module / "go.mod").write_text("module github.com/gke-labs/kube-agents/k8s-api-proxy\n")
+            if with_main:
+                (module / "cmd" / "k8s-api-proxy").mkdir(parents=True)
+                (module / "cmd" / "k8s-api-proxy" / "main.go").write_text("package main\n\nfunc main() {}\n")
+            (module / "README.md").write_text(_README_AT_RELEASE)
+        if with_mcp:
+            a2a = root / "a2a"
+            (a2a / "cmd" / _MCP).mkdir(parents=True)
+            (a2a / "go.mod").write_text("module github.com/gke-labs/kube-agents/a2a\n")
+            (a2a / "cmd" / _MCP / "main.go").write_text("package main\n\nfunc main() {}\n")
+            (root / "README.md").write_text(_ROOT_README)
         (root / "LICENSE").write_text("Apache License\n")
         self.git("add", ".")
         self.git("commit", "-m", "feat: add module")
@@ -173,6 +197,108 @@ class BuildReleaseBinariesTest(unittest.TestCase):
 
         proc = self._run([MOCK_TARGET_RELEASE_TAG], fail_build=True)
         self.assertNotEqual(proc.returncode, 0)
+
+    def test_skips_kube_agents_mcp_at_a_commit_without_it(self):
+        self._commit_module_and_tag()
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("a2a/cmd/kube-agents-mcp does not exist", proc.stdout)
+        self.assertEqual(sorted(p.name for p in self.dist.iterdir()), _proxy_archive_files())
+
+    def test_builds_kube_agents_mcp_for_every_platform(self):
+        self._commit_module_and_tag(with_mcp=True)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        built = sorted(p.name for p in self.dist.iterdir())
+        self.assertEqual(built, sorted(_proxy_archive_files() + _mcp_archive_files()))
+        for platform in _MCP_PLATFORMS:
+            if platform.startswith("windows/"):
+                continue
+            with self.subTest(platform=platform):
+                root = _archive_name(platform, _MCP)
+                with tarfile.open(self.dist / _mcp_archive_file(platform)) as archive:
+                    names = sorted(archive.getnames())
+                    self.assertEqual(names, sorted([root, f"{root}/{_MCP}", f"{root}/LICENSE", f"{root}/README.md"]))
+                    self.assertIn(platform, archive.extractfile(f"{root}/{_MCP}").read().decode())
+                    self.assertEqual(archive.extractfile(f"{root}/README.md").read().decode(), _ROOT_README)
+                    self.assertEqual(archive.extractfile(f"{root}/LICENSE").read().decode(), "Apache License\n")
+
+    def test_kube_agents_mcp_for_windows_is_a_zip_holding_an_exe(self):
+        self._commit_module_and_tag(with_mcp=True)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        root = _archive_name("windows/amd64", _MCP)
+        with zipfile.ZipFile(self.dist / f"{root}.zip") as archive:
+            names = sorted(archive.namelist())
+            self.assertEqual(names, sorted([f"{root}/", f"{root}/{_MCP}.exe", f"{root}/LICENSE", f"{root}/README.md"]))
+            self.assertIn("windows/amd64", archive.read(f"{root}/{_MCP}.exe").decode())
+            self.assertEqual(archive.read(f"{root}/README.md").decode(), _ROOT_README)
+            self.assertEqual(archive.read(f"{root}/LICENSE").decode(), "Apache License\n")
+
+    def test_kube_agents_mcp_builds_like_k8s_api_proxy(self):
+        self._commit_module_and_tag(with_mcp=True)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        builds = [line for line in self._go_log().splitlines() if " go build " in line]
+        proxy_builds = [line for line in builds if "./cmd/k8s-api-proxy" in line]
+        mcp_builds = [line for line in builds if f"./cmd/{_MCP}" in line]
+        self.assertEqual(len(proxy_builds), len(_PLATFORMS))
+        self.assertEqual(len(mcp_builds), len(_MCP_PLATFORMS))
+        for line, platform in zip(mcp_builds, _MCP_PLATFORMS):
+            goos, goarch = platform.split("/")
+            self.assertIn(f"GOOS={goos} GOARCH={goarch} CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local", line)
+            self.assertIn("-trimpath", line)
+            self.assertIn(f"-ldflags=-s -w -X main.version={MOCK_TARGET_RELEASE_TAG}", line)
+            binary = f"{_MCP}.exe" if goos == "windows" else _MCP
+            self.assertIn(f"/{_archive_name(platform, _MCP)}/{binary} ", line)
+
+    def test_builds_kube_agents_mcp_without_k8s_api_proxy(self):
+        self._commit_module_and_tag(with_mcp=True, with_proxy=False)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sorted(p.name for p in self.dist.iterdir()), _mcp_archive_files())
+
+    def _assert_kube_agents_mcp_left_out(self, proc, platform):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warnings = [line for line in proc.stdout.splitlines() if line.startswith("::warning::")]
+        self.assertEqual(len(warnings), 1, proc.stdout)
+        self.assertIn(_MCP, warnings[0])
+        self.assertIn(platform, warnings[0])
+        built = sorted(p.name for p in self.dist.iterdir())
+        self.assertEqual(built, sorted(_proxy_archive_files() + ["bundle.tar.gz"]))
+
+    def _seed_dist(self):
+        # Another asset already staged, as package_release_bundle.sh stages the bundle.
+        self.dist.mkdir()
+        (self.dist / "bundle.tar.gz").write_text("bundle\n")
+
+    def test_a_failed_kube_agents_mcp_build_leaves_the_release_without_it(self):
+        self._commit_module_and_tag(with_mcp=True)
+        self._seed_dist()
+
+        # The last platform fails, after the others have written their archives.
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], fail_build_matching=f"windows/amd64*./cmd/{_MCP}*")
+        self._assert_kube_agents_mcp_left_out(proc, "windows/amd64")
+
+    def test_a_failed_kube_agents_mcp_archive_leaves_the_release_without_it(self):
+        self._commit_module_and_tag(with_mcp=True)
+        self._seed_dist()
+        (self.bin_dir / "zip").unlink(missing_ok=True)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG])
+        self._assert_kube_agents_mcp_left_out(proc, "windows/amd64")
+
+    def test_a_failed_k8s_api_proxy_build_still_fails_beside_kube_agents_mcp(self):
+        self._commit_module_and_tag(with_mcp=True)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], fail_build_matching="linux/arm64*./cmd/k8s-api-proxy*")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("go build failed for k8s-api-proxy on linux/arm64", proc.stderr)
 
 
 if __name__ == "__main__":

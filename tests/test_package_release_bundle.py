@@ -238,7 +238,45 @@ class PackageReleaseBundleTest(unittest.TestCase):
             proxy_archive = dist_dir / f"k8s-api-proxy_{MOCK_RELEASE_BUNDLE_VERSION}_linux_amd64.tar.gz"
             self.assertTrue(proxy_archive.exists(), f"{proxy_archive.name} missing from {dist_dir}")
             self.assertIn(proxy_archive.name, checksums_content)
+            # So are the kube-agents-mcp archives, the Windows one a zip.
+            for mcp_archive_name in (
+                f"kube-agents-mcp_{MOCK_RELEASE_BUNDLE_VERSION}_darwin_arm64.tar.gz",
+                f"kube-agents-mcp_{MOCK_RELEASE_BUNDLE_VERSION}_windows_amd64.zip",
+            ):
+                self.assertTrue((dist_dir / mcp_archive_name).exists(), f"{mcp_archive_name} missing from {dist_dir}")
+                self.assertIn(mcp_archive_name, checksums_content)
             self.assertNotIn("checksums.txt", checksums_content)
+
+    def test_failed_kube_agents_mcp_build_is_left_out_of_the_checksums(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir)
+            bin_dir = create_minimal_tools_bin(temp_dir)
+            dist_dir = temp_path / "dist"
+
+            create_mock_helm_binary(bin_dir)
+            create_mock_syft_binary(bin_dir)
+            create_mock_go_binary(bin_dir, fail_build_matching="windows/amd64*./cmd/kube-agents-mcp*")
+
+            head_commit = subprocess.check_output(
+                ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            proc = self._run_script(
+                [MOCK_RELEASE_BUNDLE_VERSION],
+                env={
+                    "PATH": str(bin_dir),
+                    "DIST_DIR": str(dist_dir),
+                    "CI": "true",
+                    "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                    "TARGET_COMMIT": head_commit,
+                },
+            )
+            self.assertEqual(proc.returncode, 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+            self.assertIn("::warning::kube-agents-mcp", proc.stdout)
+            checksums_content = (dist_dir / "checksums.txt").read_text()
+            self.assertNotIn("kube-agents-mcp", checksums_content)
+            self.assertEqual(list(dist_dir.glob("kube-agents-mcp_*")), [])
+            self.assertIn(f"k8s-api-proxy_{MOCK_RELEASE_BUNDLE_VERSION}_linux_amd64.tar.gz", checksums_content)
 
     def test_idempotent_rerun(self):
         with tempfile.TemporaryDirectory() as temp_dir:
