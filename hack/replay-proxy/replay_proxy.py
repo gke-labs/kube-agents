@@ -1046,7 +1046,8 @@ class ShadowProxy:
         # never leaves a pointer to an entry that was not written. Every
         # distinct answer to the key is kept, each in a file of its own named
         # by the line's STORED_ANSWER_HASH: the hash of exactly what is saved
-        # and served, opaque ids and signatures aside (replay_cache.stored_hash),
+        # and served (the answer and its finish reason), opaque ids and
+        # signatures aside (replay_cache.stored_hash),
         # so two answers that differ in anything served never share a file.
         # answer_variant's identity is coarser (it renames ages, pids and keyed
         # numbers the request never held), so it must not name one. A second
@@ -1231,6 +1232,7 @@ class ShadowProxy:
             entry[F.LITELLM_COST_USD] = None
         if served is not None:
             entry[F.SERVED_VIA] = upstream.get("served_via")
+            entry[F.SERVED_KEY] = upstream.get("served_key")
             entry[F.SERVED_ALTERNATE] = upstream.get("served_alternate")
             entry[F.ALTERNATES] = upstream.get("alternates")
             entry[F.SERVED_WEIGHT] = upstream.get("served_weight")
@@ -1280,13 +1282,14 @@ class ShadowProxy:
                 entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
             digests, _ = self.diagnosis.first_seen_with_digests(raw_messages, received)
             prefix_seen = self.prefix_first_seen(body, digests, received)
+            # Diagnostic only (schema.PRIOR_ANSWER): no reader depends on it.
             prior = list(self.history_variants(body, raw_messages, digests, prefix_seen, received, last_only=True))
             if prior:
                 entry[F.PRIOR_ANSWER] = list(prior[0])
             # Before recording, which names the saved file by it; logged on every
             # line, saved or not, so the publisher can tie each run to the file.
             if stored:
-                entry[F.STORED_ANSWER_HASH] = replay_cache.stored_hash(stored)
+                entry[F.STORED_ANSWER_HASH] = replay_cache.stored_hash(stored, upstream.get("finish_reason"))
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))
@@ -1394,6 +1397,7 @@ class Handler(BaseHTTPRequestHandler):
                 answer, saved, fingerprint, via, alternate, alternates, weight, total = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
+                upstream["served_key"] = fingerprint
                 upstream["served_alternate"] = alternate
                 upstream["alternates"] = alternates
                 upstream["served_weight"] = weight

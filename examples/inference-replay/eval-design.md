@@ -722,8 +722,8 @@ and the merge copy takes only the merged pull request's last passing presubmit.
 
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
-some of those runs fail. Requests don't say which run they belong to, but we can work it out after
-the run with data we already have. A worker's request names the card it's working on (its first
+some of those runs fail. Most requests can be tied to their run after the fact with data we already
+have, and the rest carry a run tag (below). A worker's request names the card it's working on (its first
 message is "work kanban task t\_…"), and a front door's request names the cards it created (what
 its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
 and whether it passed. So the copy job can match each saved answer to its card, the card to its
@@ -744,17 +744,18 @@ counted three times. So the cache keeps every distinct answer to a request, each
 of the request's fingerprint and a hash of the answer exactly as it is stored and served, written
 once like every other object; only those a passing run gave are published, decided answer by
 answer, so two runs that gave the same answer share one file and two that differed in any served
-word or action never do. The replay proxy hands a request's
-answers out in turn, each as often as passing runs gave it: a request whose passing runs answered
-one way nine times and another way once is served the second answer one time in ten, in a fixed
-order, rather than every other time. Identical answers share one file, so without the count a rare
-answer would be served as often as the common one. Once a run is served one answer, its next request holds that answer, so it only matches what
-followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
+word or action never do. The replay proxy hands a request's answers out in turn, each as often as
+passing runs gave it: a request whose passing runs answered one way nine times and another way once
+is served the second answer one time in ten, in a fixed order, rather than every other time.
+Identical answers share one file, so without the count a rare answer would be served as often as
+the common one. Once a run is served one answer, its next request holds that answer, so it only
+matches what followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
 once can take turns in either order, so this spreads runs across recordings rather than giving each
 run its own. Giving each run exactly one recording would mean serving by the run tag above, which
 the proxy logs but does not serve by yet.
 
-The lane loads only answers that a passing run of a night inside its 30-hour window produced. A
+The lane loads only answers that a passing run of a night inside its 30-hour window produced
+(older-layout answers aside). A
 night's record lists the answers its passing runs gave, so an older object that a later night only
 found already in the bucket never comes in on that night's record. The record also counts how many
 requests from passing runs got each answer, and the lane adds the counts of the nights in its window.
@@ -920,10 +921,11 @@ before stage 3 of the rollout (turning replay on):
    ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane))
    and the bucket ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)). A nightly running
    as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
-   that account can write. It works out which run each answer came from after the fact, from the
-   cards each request and each run's results name ("Telling the runs in a build apart"). A
-   periodic at 06:00 UTC replays the previous nights' complete recordings plus tonight's partial
-   ones, gating nothing. It checks out the commit the newest recording night ran (each record names
+   that account can write. It works out which run each answer came from using the cards each
+   request and each run's results name, or, for a request with no card, from the run tag the agent
+   stamps on it, and a request whose tag and card name different runs is not published ("Telling
+   the runs in a build apart"). A periodic at 06:00 UTC replays the previous nights' complete
+   recordings plus tonight's partial ones, gating nothing. It checks out the commit the newest recording night ran (each record names
    it), or `main` when no record does, so what merged between 00:00 and 06:00 doesn't change what
    it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
    mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
@@ -973,10 +975,10 @@ request, so the gate stays fair, and we add cases as each one's lane results hol
 
 ## Open questions
 
-- **Following runs live, for one recording per run.** Working out which run an answer came from
-  after the fact is covered above. Doing it live, so each of the three runs gets its own recording,
-  means the harness telling the proxy which case and run each front-door task is, and the proxy
-  following the cards from there. Worth doing only if shadow mode shows replay is worth turning on.
+- **Serving by run, for one recording per run.** Every request already carries its run tag, and
+  the proxy logs it. Serving each of the three runs its own recording means choosing among a key's
+  answers by that tag rather than in turn. Worth doing only if shadow mode shows replay is worth
+  turning on.
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We

@@ -86,6 +86,19 @@ class NormalizeRestoreTest(unittest.TestCase):
         self.assertEqual(missing, ["⟦TASK_1⟧", "⟦TASK_1⟧"])
 
 
+class StoredHashTest(unittest.TestCase):
+    """An alternate's name covers everything served, the finish reason included."""
+
+    ANSWER = {"role": "assistant", "content": "Looking at the card."}
+
+    def test_answers_differing_only_in_finish_reason_get_different_names(self):
+        self.assertNotEqual(replay_cache.stored_hash(self.ANSWER, "stop"), replay_cache.stored_hash(self.ANSWER, "length"))
+
+    def test_no_finish_reason_is_named_as_the_default_it_is_served_with(self):
+        self.assertEqual(replay_cache.stored_hash(self.ANSWER, None),
+                         replay_cache.stored_hash(self.ANSWER, replay_cache.DEFAULT_FINISH_REASON))
+
+
 class AnswerCacheTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

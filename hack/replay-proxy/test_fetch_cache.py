@@ -490,6 +490,17 @@ class PrintCommitTest(FetchTest):
         night = self.fetcher().night_commit()
         self.assertEqual((night.commit, night.answers), (COMMIT_C, {COMMIT_B: 1, COMMIT_C: 2}))
 
+    def test_a_commit_with_more_alternates_but_fewer_keys_loses(self):
+        # Commit C confirmed three alternates of one key; commit B one answer
+        # each to two keys. Requests covered, not objects, decide.
+        a, b, c = "a" * 64, "b" * 64, "c" * 64
+        self.record("202", 1, {VERSION: [f"alts/{fp(5)}-{a}.json", f"alts/{fp(5)}-{b}.json",
+                                         f"alts/{fp(5)}-{c}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_C))
+        self.record("200", 1, {VERSION: [f"alts/{fp(1)}-{a}.json", f"answers/{fp(2)}.json"]},
+                    created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.answers), (COMMIT_B, {COMMIT_B: 2, COMMIT_C: 1}))
+
     def test_no_commit_prints_nothing_and_exits_1(self):
         for name, records in (("empty bucket", ()),
                               ("records before the commit", (("200", None), ("201", ""))),

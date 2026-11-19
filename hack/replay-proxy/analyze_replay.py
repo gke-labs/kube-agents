@@ -64,6 +64,9 @@ class Line:
     # On a served line: how many answers its key had (0 on a line written
     # before the proxy logged it), and which one was served.
     fingerprint: str = ""
+    # The key a served answer came from (served_key): the slot's on an
+    # answer_slots hit; empty on a line written before the proxy logged it.
+    served_key: str = ""
     alternates: int = 0
     served_alternate: str = ""
     # A line whose analysis was dropped or failed: no fingerprint, no hashes.
@@ -90,6 +93,7 @@ class Line:
             miss=entry.get(F.MISS) or {},
             served_from_build=str(served_from.get(F.JOB_BUILD)) if served_from.get(F.JOB_BUILD) else None,
             fingerprint=str(entry.get(F.FINGERPRINT) or ""),
+            served_key=str(entry.get(F.SERVED_KEY) or ""),
             alternates=_count(entry.get(F.ALTERNATES)),
             served_alternate=str(entry.get(F.SERVED_ALTERNATE) or ""),
             lost=not entry.get(F.FINGERPRINT),
@@ -216,7 +220,8 @@ def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top:
     several = [line for line in lines if line.served and line.alternates > 1]
     served_per_key: Dict[str, set] = {}
     for line in several:
-        served_per_key.setdefault(line.fingerprint, set()).add(line.served_alternate)
+        # By the key served from: on a slot hit that is not the request's own.
+        served_per_key.setdefault(line.served_key or line.fingerprint, set()).add(line.served_alternate)
     by_role: Dict[str, int] = {}
     by_signature: Dict[Tuple[str, str], int] = {}
     per_conversation = []

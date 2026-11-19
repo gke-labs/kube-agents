@@ -1,10 +1,10 @@
 """Which eval run each request a proxy logged belongs to, and whether that run passed.
 
-One build runs many cases and repetitions at once on one install, and a request
-does not say which run it belongs to (examples/inference-replay/eval-design.md,
-"Telling the runs in a build apart"). After the run it can be worked out from
-the kanban cards: a request is tied to the cards its own conversation works on,
-and each repetition's results.json names the cards its workers worked.
+One build runs many cases and repetitions at once on one install
+(examples/inference-replay/eval-design.md, "Telling the runs in a build
+apart"). A request is tied to its run by the kanban cards its own conversation
+works on, which each repetition's results.json names, or, with no card of its
+own, by the eval run tag it carried (below).
 
 A request's cards are read from its stored, scrubbed text (the proxy's
 REPLAY_STORE_DIR), and only from two places that belong to its conversation:

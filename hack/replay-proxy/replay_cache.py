@@ -155,25 +155,28 @@ def stored_answer(message: Dict[str, Any], mapping: normalizer.Mapping) -> Dict[
     return normalize_answer(kept, mapping)
 
 
-def _without_opaque(value: Any, key: Optional[str] = None, in_tool_call: bool = False) -> Any:
+def _without_opaque(value: Any, key: Optional[str] = None) -> Any:
     """`value` with every opaque field (ids, signatures) left out, as the normalizer tells them."""
     if isinstance(value, list):
-        return [{k: _without_opaque(v[k], k, True) for k in v if not normalizer.Normalizer.is_opaque(k, True)}
+        return [{k: _without_opaque(v[k], k) for k in v if not normalizer.Normalizer.is_opaque(k, True)}
                 if key == TOOL_CALLS_KEY and isinstance(v, dict) else _without_opaque(v) for v in value]
     if isinstance(value, dict):
         return {k: _without_opaque(v, k) for k, v in value.items() if not normalizer.Normalizer.is_opaque(k, False)}
     return value
 
 
-def stored_hash(stored: Dict[str, Any]) -> str:
-    """An alternate's name: the hash of the answer exactly as stored (stored_answer), opaque fields aside.
+def stored_hash(stored: Dict[str, Any], finish_reason: Optional[str]) -> str:
+    """An alternate's name: the hash of the answer exactly as stored (stored_answer) and of the
+    finish reason it is served with, opaque fields aside.
 
-    Everything served counts (text, tool calls, thinking text, a refusal), so
-    two answers that differ in anything a client reads get different names;
-    only ids and signatures, which differ between two deliveries of the same
-    answer, are left out, so identical answers from different runs share one.
+    Everything served counts (text, tool calls, thinking text, a refusal, and
+    the finish reason, read as the DEFAULT_FINISH_REASON a served answer
+    without one gets), so two answers that differ in anything a client reads
+    get different names; only ids and signatures, which differ between two
+    deliveries of the same answer, are left out, so identical answers from
+    different runs share one.
     """
-    return normalizer.stable_hash(_without_opaque(stored))
+    return normalizer.stable_hash([_without_opaque(stored), finish_reason or DEFAULT_FINISH_REASON])
 
 
 def answer_texts(message: Dict[str, Any]) -> List[str]:
@@ -211,7 +214,7 @@ class AnswerCache:
         try:
             with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
                 handle.write(data)
-            os.link(tmp, path)  # fails if the key is already there: the first write wins
+            os.link(tmp, path)  # fails if the name is already there, so a file is never rewritten
             return True
         except FileExistsError:
             return False

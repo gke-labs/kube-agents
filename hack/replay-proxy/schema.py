@@ -161,6 +161,10 @@ VIA_ANSWER_SLOTS = "answer_slots"
 # many answers the key had. Replay hands a key's answers out in turn, by weight.
 SERVED_ALTERNATE = "served_alternate"
 ALTERNATES = "alternates"
+# On a served line: the key the answer was served from, its own FINGERPRINT on
+# an exact hit and the slot's key on an answer_slots hit; the key whose
+# answers SERVED_ALTERNATE and ALTERNATES count.
+SERVED_KEY = "served_key"
 # On a served line: the served answer's weight, how often passing runs
 # produced it (1 when the replay cache gave no count), and the sum over the
 # key's answers. Replay serves each answer in proportion to its weight, so over
@@ -178,7 +182,9 @@ RECORD_ERROR_BUDGET = "budget_spent"
 # later request's history holds it (normalizer.answer_variant), and the same
 # pair for the last assistant message this request holds. A later request's
 # PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
-# went on from that very answer (hack/replay-proxy/run_attribution.py).
+# went on from that answer, up to what answer_variant renames. Diagnostic only:
+# nothing reads PRIOR_ANSWER now that run_attribution.py ties lines to runs by
+# card and eval run tag.
 ANSWER_VARIANT = "answer_variant"
 PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.

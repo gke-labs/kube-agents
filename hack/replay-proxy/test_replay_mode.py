@@ -1354,6 +1354,7 @@ class ReplayTest(ProxyTestCase):
         self.assertNotEqual(bodies[0], bodies[1])
         lines = self.lines(3, out)
         self.assertEqual([line["served_alternate"] for line in lines], [names[0], names[1], names[0]])
+        self.assertEqual({line["served_key"] for line in lines}, {fingerprint}, "an exact hit: its own key")
         self.assertEqual({line["alternates"] for line in lines}, {2})
         self.assertEqual({(line["served_weight"], line["alternates_weight"]) for line in lines}, {(1, 2)},
                          "no weights file: each answer weighs 1")

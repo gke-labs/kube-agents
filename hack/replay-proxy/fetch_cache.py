@@ -73,7 +73,8 @@ first record, and the newest night is every such build that started within
 NIGHT_SPAN_HOURS of the newest one. A build's records all name its job, so it
 reads the newest record of each build; only when the night's builds name more
 than one commit does it read all their records, and print the commit whose
-records confirmed the most answers, saying so on stderr. Any listed key
+records confirmed answers to the most keys (a key's several alternates
+counting once), saying so on stderr. Any listed key
 outside the layout, and any record it reads that names an object outside the
 layout or a commit that is not one, refuses as in a fetch. It prints nothing
 and exits 1 when no build of that night names a commit (records written
@@ -169,7 +170,7 @@ class NightCommit:
     # The night's builds that name no commit, and the others by the commit they name.
     uncommitted_builds: int = 0
     commit_builds: Dict[str, List[str]] = field(default_factory=dict)
-    # Per commit, the answers its records confirmed: counted only when the night names more than one.
+    # Per commit, the keys its records confirmed an answer to: counted only when the night names more than one.
     answers: Dict[str, int] = field(default_factory=dict)
 
 
@@ -410,7 +411,8 @@ class Fetcher:
         A build's records all carry its job, so its newest record says its
         mode, forge and commit: one small object per build. Only when the
         night's builds name more than one commit are all their records read,
-        to count the answers each commit's records confirmed.
+        to count the keys (version, fingerprint) each commit's records
+        confirmed an answer to, whatever the number of alternates per key.
         """
         result = NightCommit()
         listed = self.listed()
@@ -458,13 +460,15 @@ class Fetcher:
                 build = RECORD_KEY_RE.match(key).group(1)  # type: ignore[union-attr]
                 objects = record.get(P.RECORD_OBJECTS)
                 for version in (objects if isinstance(objects, dict) else {}):
-                    answers[commits[build]].update((version, name) for name, _, _ in self._confirmed(record, version)
+                    # Requests covered, not objects: a key's several alternates count once.
+                    answers[commits[build]].update((version, P.answered_key(name))
+                                                   for name, _, _ in self._confirmed(record, version)
                                                    if P.answered_key(name) is not None)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         result.answers = {commit: len(names) for commit, names in answers.items()}
         latest = {c: max(started[b] for b in builds) for c, builds in result.commit_builds.items()}
-        # The most answers; then the latest build to start; then by name, so the choice is stable.
+        # The most keys answered; then the latest build to start; then by name, so the choice is stable.
         result.commit = max(answers, key=lambda c: (len(answers[c]), latest[c], c))
         return result
 
