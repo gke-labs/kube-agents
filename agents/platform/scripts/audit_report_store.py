@@ -117,6 +117,9 @@ REPORT_LATEST_NAME = "latest.json"
 # which test_audit_report_routes.py holds equal.
 REPORT_WRITER_HEADER = "X-Report-Writer"
 REPORT_WRITER_SUFFIX = ".writer"
+# A sidecar's `sha256`: hashlib's hexdigest form, so a planted value (a JSON
+# \u escape decodes to a non-ASCII str) never reaches secrets.compare_digest.
+REPORT_WRITER_DIGEST_RE = re.compile(r"^[0-9a-f]{64}\Z")
 REPORT_WRITER_LATEST_NAME = "latest" + REPORT_WRITER_SUFFIX
 REPORT_WRITER_SHELL = "shell"
 REPORT_WRITER_BUILTIN = "builtin-schedule"
@@ -615,7 +618,12 @@ def _bound_writer(dir_fd: int, name: str, data: bytes) -> str | None:
         sidecar = None
     writer = sidecar.get("writer") if isinstance(sidecar, dict) else None
     digest = sidecar.get("sha256") if isinstance(sidecar, dict) else None
-    if not isinstance(writer, str) or not REPORT_WRITER_RE.match(writer) or not isinstance(digest, str):
+    if (
+        not isinstance(writer, str)
+        or not REPORT_WRITER_RE.match(writer)
+        or not isinstance(digest, str)
+        or not REPORT_WRITER_DIGEST_RE.match(digest)
+    ):
         LOGGER.warning("ignored a report writer sidecar that is not one: %s", _sanitize(name))
         return None
     if not secrets.compare_digest(digest, hashlib.sha256(data).hexdigest()):

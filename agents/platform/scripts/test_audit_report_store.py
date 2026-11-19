@@ -1205,12 +1205,20 @@ class WriterTests(StoreTestCase):
         for raw in (b"shell", b"shell\r\nX-Other: 1", b"", b"[]", b"{", b'{"writer": "shell"}',
                     json.dumps({"sha256": digest}).encode(), json.dumps({"writer": "Shell", "sha256": digest}).encode(),
                     json.dumps({"writer": "shell\r\nX-Other: 1", "sha256": digest}).encode(),
-                    json.dumps({"writer": "shell", "sha256": 7}).encode(), "\u00e9".encode()):
+                    json.dumps({"writer": "shell", "sha256": 7}).encode(), "\u00e9".encode(),
+                    # ASCII on disk, a non-ASCII str once decoded: never compared.
+                    json.dumps({"writer": "shell", "sha256": "\u00e9" * 64}).encode(),
+                    json.dumps({"writer": "shell", "sha256": digest.upper()}).encode()):
             with self.subTest(raw=raw):
                 (self.runs / f"{STAMP_1}.writer").write_bytes(raw)
                 got = self.call("GET", f"{STREAM}/runs/{STAMP_1}")
                 self.assertEqual(200, got.status_code)
                 self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        # PUT latest copies the matched run's sidecar: a planted digest is no
+        # writer there either, and the copy still goes ahead.
+        (self.runs / f"{STAMP_1}.writer").write_bytes(json.dumps({"writer": "shell", "sha256": "\u00e9" * 64}).encode())
+        self.assertEqual(204, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertNotIn(store.REPORT_WRITER_HEADER, self.call("GET", f"{STREAM}/latest").headers)
         # The same sidecar, well formed, is passed on.
         (self.runs / f"{STAMP_1}.writer").write_text(json.dumps(self.sidecar("shell", body)))
         self.assertEqual("shell", self.call("GET", f"{STREAM}/runs/{STAMP_1}").headers.get(store.REPORT_WRITER_HEADER))
