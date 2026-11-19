@@ -300,8 +300,9 @@ universe domain each `<service>.googleapis.com` host of the table is read as
 `<service>.<universe domain>`, so the host as the table writes it is in no route there: a `GET`
 for it is refused with `gcp.api.host`, any other method at step 1. A `REFUSED_HOSTS` entry is
 refused there as written, and a `<service>.googleapis.com` entry also as
-`<service>.<universe domain>`. A universe domain that is malformed has no routed host, so every
-request is refused: a `GET` with `gcp.api.host`, any other method at step 1.
+`<service>.<universe domain>`. A universe domain that is not valid, which is a malformed one or
+one under `googleapis.com`, has no routed host, so every request is refused: a `GET` with
+`gcp.api.host`, any other method at step 1. The broker does not start with such a value.
 
 `evaluate` answers in this order, and the order is the security argument:
 
