@@ -1,6 +1,6 @@
 ---
 title: GitOps with ArgoCD
-description: Standing up ArgoCD and Config Connector as the pull-based reconciler that applies what the Platform Agent proposes.
+description: Standing up ArgoCD and Config Connector as the pull-based reconciler for Platform Agent pull requests, and deploying the kube-agents Helm chart via Argo CD.
 sidebar:
   order: 6
 ---
@@ -219,20 +219,20 @@ The chart keeps `<platformAgent.name>-shell-authorized-keys` separate from `plat
 
 Keep `platformAgent.credentials.secretName` at its default (`platform-agent-secrets`), because the operator reads `SANDBOX_SSH_PRIVATE_KEY`, `SESSION_KV_API_KEY`, and `SESSION_KV_SALT` from `platform-agent-secrets` by name. Provision both required Secrets in `kubeagents-system` before or alongside the Argo CD `Application`:
 
-| Secret / Helm value                                                                   | Keys                                                                                 | Required    | Consumer and purpose                                                                                                                                     |
-| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `platform-agent-secrets` (`platformAgent.credentials.secretName`)                     | `API_SERVER_KEY`                                                                     | Required    | Bearer key for the Platform Agent API proxy (`agent-api-auth` sidecar) on `<name>-gateway`.                                                              |
-| `platform-agent-secrets`                                                              | `SESSION_KV_API_KEY`                                                                 | Required    | Bearer token for the pod-local Session KV server; when absent, `k8s-event-watcher` exits on startup and Session KV returns `503`.                        |
-| `platform-agent-secrets`                                                              | `SESSION_KV_SALT`                                                                    | Required    | HMAC salt for pseudonymising chat identities and redaction tokens; preserve across upgrades so user sessions stay linked.                                |
-| `platform-agent-secrets`                                                              | `SANDBOX_SSH_PRIVATE_KEY`                                                            | Required    | OpenSSH `ed25519` private key staged by the `sandbox-ssh-key` init container on `<name>-gateway` at `/etc/sandbox-ssh/id_ed25519`.                       |
-| `platform-agent-secrets`                                                              | `SANDBOX_SSH_PUBLIC_KEY`                                                             | Required    | OpenSSH `ed25519` public key (`authorized_keys` line) paired with `SANDBOX_SSH_PRIVATE_KEY` for live Helm upgrades and `upgrade.sh`.                     |
-| `platform-agent-secrets`                                                              | `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY` | Conditional | Model provider API key matching `litellm.modelProvider` (`gemini`, `anthropic`, `openai`, or `openai_compatible`); omit for `vertex_ai` on Workload IAM. |
-| `platform-agent-secrets`                                                              | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD`           | Optional    | Chat adapter credentials when not stored in separate Secrets referenced via `*SecretRef`.                                                                |
-| `<platformAgent.name>-shell-authorized-keys` (`platform-agent-shell-authorized-keys`) | `authorized_keys`                                                                    | Required    | Single public-key line matching `SANDBOX_SSH_PUBLIC_KEY`, mounted read-only into `<name>-shell` at `/etc/ssh-authorized/authorized_keys`.                |
-| `platformAgent.integration.slack.botTokenSecretRef`, `appTokenSecretRef`              | Custom `{name, key}`                                                                 | Optional    | Separate Secret references for the Slack bot (`xoxb-...`) and Socket Mode app (`xapp-...`) tokens.                                                       |
-| `platformAgent.integration.teams.appIdSecretRef`, `appPasswordSecretRef`              | Custom `{name, key}`                                                                 | Optional    | Separate Secret references for the Microsoft Teams adapter application ID and password.                                                                  |
-| `platformAgent.integration.forges[].credentialsRef`                                   | `token` (plus optional `read-token` for `bitbucket`)                                 | Optional    | Per-forge Secret for `gitlab`, `gitea`, `bitbucket`, or `bitbucket-datacenter`, mounted only into `<name>-credential-proxy`.                             |
-| `litellm.envFromSecret`                                                               | Provider-specific env vars                                                           | Optional    | Extra Secret loaded via `envFrom` into `litellm` (required when `litellm.modelProvider` is `sap`, or for custom LiteLLM provider credentials).           |
+| Secret / Helm value                                                                   | Keys                                                                                 | Required    | Consumer and purpose                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `platform-agent-secrets` (`platformAgent.credentials.secretName`)                     | `API_SERVER_KEY`                                                                     | Required    | Bearer key for the Platform Agent API proxy (`agent-api-auth` sidecar) on `<name>-gateway`.                                                                                                                          |
+| `platform-agent-secrets`                                                              | `SESSION_KV_API_KEY`                                                                 | Required    | Bearer token for the pod-local Session KV server; when absent, `k8s-event-watcher` exits on startup and Session KV returns `503`.                                                                                    |
+| `platform-agent-secrets`                                                              | `SESSION_KV_SALT`                                                                    | Required    | HMAC salt for pseudonymising chat identities and redaction tokens; preserve across upgrades so user sessions stay linked.                                                                                            |
+| `platform-agent-secrets`                                                              | `SANDBOX_SSH_PRIVATE_KEY`                                                            | Required    | OpenSSH `ed25519` private key staged by the `sandbox-ssh-key` init container on `<name>-gateway` at `/etc/sandbox-ssh/id_ed25519`.                                                                                   |
+| `platform-agent-secrets`                                                              | `SANDBOX_SSH_PUBLIC_KEY`                                                             | Required    | OpenSSH `ed25519` public key (`authorized_keys` line) paired with `SANDBOX_SSH_PRIVATE_KEY` for live Helm upgrades and `upgrade.sh`.                                                                                 |
+| `platform-agent-secrets`                                                              | `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY` | Conditional | Model provider API key for `litellm.modelProvider` (`gemini`, `anthropic`, `openai`, or optional for `openai_compatible`); omit for `vertex_ai` on Workload Identity (or set `litellm.vertex.credentialsSecretRef`). |
+| `platform-agent-secrets`                                                              | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD`           | Optional    | Chat adapter credentials when not stored in separate Secrets referenced via `*SecretRef`.                                                                                                                            |
+| `<platformAgent.name>-shell-authorized-keys` (`platform-agent-shell-authorized-keys`) | `authorized_keys`                                                                    | Required    | Single public-key line matching `SANDBOX_SSH_PUBLIC_KEY`, mounted read-only into `<name>-shell` at `/etc/ssh-authorized/authorized_keys`.                                                                            |
+| `platformAgent.integration.slack.botTokenSecretRef`, `appTokenSecretRef`              | Custom `{name, key}`                                                                 | Optional    | Separate Secret references for the Slack bot (`xoxb-...`) and Socket Mode app (`xapp-...`) tokens.                                                                                                                   |
+| `platformAgent.integration.teams.appIdSecretRef`, `appPasswordSecretRef`              | Custom `{name, key}`                                                                 | Optional    | Separate Secret references for the Microsoft Teams adapter application ID and password.                                                                                                                              |
+| `platformAgent.integration.forges[].credentialsRef`                                   | `token` (plus optional `read-token` for `bitbucket`)                                 | Optional    | Per-forge Secret for `gitlab`, `gitea`, `bitbucket`, or `bitbucket-datacenter`, mounted only into `<name>-credential-proxy`.                                                                                         |
+| `litellm.envFromSecret`                                                               | Provider-specific env vars                                                           | Optional    | Extra Secret loaded via `envFrom` into `litellm` (required when `litellm.modelProvider` is `sap`, or for custom LiteLLM provider credentials).                                                                       |
 
 ### ExternalSecret and Argo CD Application manifests
 
@@ -288,7 +288,7 @@ spec:
         key: kubeagents-sandbox-ssh-public-key
 ```
 
-In the Argo CD `Application`, set `platformAgent.credentials.create: false` and explicitly set the monitoring flags your cluster uses. Those monitoring flags default to `null` (auto-detect via `.Capabilities.APIVersions.Has`), which evaluates to false during an offline `helm template` render unless set explicitly:
+In the Argo CD `Application`, set `platformAgent.credentials.create: false`, declare the Workload Identity annotations on `platformAgent.security.serviceAccountAnnotations` and `litellm.vertex.serviceAccountAnnotations` from the start, and explicitly set the monitoring flags your cluster uses. Those monitoring flags default to `null` (auto-detect via `.Capabilities.APIVersions.Has`), and `templates/tiers.yaml` gates the default `read` and `unattended` `Tier` resources on `.Capabilities.APIVersions.Has "kubeagents.x-k8s.io/v1alpha1/Tier"`, so add `apiVersions` under `spec.source.helm` for deterministic offline renders:
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -303,6 +303,8 @@ spec:
     chart: kube-agents
     targetRevision: X.Y.Z
     helm:
+      apiVersions:
+        - kubeagents.x-k8s.io/v1alpha1/Tier
       valuesObject:
         platformAgent:
           name: platform-agent
@@ -313,6 +315,9 @@ spec:
             clusterName: HUB_CLUSTER
             location: REGION
             projectId: PROJECT_ID
+          security:
+            serviceAccountAnnotations:
+              iam.gke.io/gcp-service-account: kubeagents-platform-gsa@PROJECT_ID.iam.gserviceaccount.com
           podMonitoring: true
           serviceMonitor: false
           vmPodScrape: false
@@ -321,6 +326,9 @@ spec:
             podMonitoring: true
         litellm:
           modelProvider: vertex_ai
+          vertex:
+            serviceAccountAnnotations:
+              iam.gke.io/gcp-service-account: kubeagents-litellm-gsa@PROJECT_ID.iam.gserviceaccount.com
           podMonitoring: true
         hindsight:
           podMonitoring: false
@@ -340,7 +348,7 @@ spec:
 
 Neither `<name>-shell` nor `<name>-gateway` reloads the sandbox SSH keypair from its mounted Secret volume while running. In `<name>-shell`, `entrypoint.sh` copies `/etc/ssh-authorized/authorized_keys` into `/home/agent/.ssh/authorized_keys` and `/home/hermes/.ssh/authorized_keys` once before starting `sshd`. In `<name>-gateway`, the `sandbox-ssh-key` init container copies `SANDBOX_SSH_PRIVATE_KEY` to `/etc/sandbox-ssh/id_ed25519` once at pod startup.
 
-Rotate the keypair in order so `<name>-shell` accepts the new public key before `<name>-gateway` dials with the new private key:
+Rotate the keypair in order so `<name>-shell` accepts both the old and new public keys before `<name>-gateway` rolls to the new private key:
 
 1. Generate a fresh `ed25519` keypair on your workstation:
 
@@ -348,7 +356,7 @@ Rotate the keypair in order so `<name>-shell` accepts the new public key before 
    ssh-keygen -t ed25519 -N "" -C "platform-agent@kubeagents-system" -f ./sandbox_id_ed25519
    ```
 
-2. Write `./sandbox_id_ed25519.pub` to `authorized_keys` in `<name>-shell-authorized-keys` and `SANDBOX_SSH_PUBLIC_KEY` in `platform-agent-secrets`, and write `./sandbox_id_ed25519` to `SANDBOX_SSH_PRIVATE_KEY` in `platform-agent-secrets`. If you use `ExternalSecret`, update the backing Secret Manager versions and force or wait for both Kubernetes Secrets to sync:
+2. Append the new public key line (`./sandbox_id_ed25519.pub`) to `authorized_keys` in `<name>-shell-authorized-keys` alongside the current line so `<name>-shell` continues trusting the active `<name>-gateway` pod during the rollout. Update `SANDBOX_SSH_PRIVATE_KEY` (`./sandbox_id_ed25519`) and `SANDBOX_SSH_PUBLIC_KEY` (`./sandbox_id_ed25519.pub`) in `platform-agent-secrets`, then force or wait for both Kubernetes Secrets to sync:
 
    ```bash
    kubectl -n kubeagents-system annotate externalsecret \
@@ -356,7 +364,7 @@ Rotate the keypair in order so `<name>-shell` accepts the new public key before 
      force-sync="$(date +%s)" --overwrite
    ```
 
-3. Restart `statefulset/<name>-shell` first and wait for it to become ready so `sshd` loads the new `authorized_keys`:
+3. Restart `statefulset/<name>-shell` first and wait for it to become ready so `sshd` loads the combined `authorized_keys`:
 
    ```bash
    kubectl -n kubeagents-system rollout restart statefulset/platform-agent-shell
@@ -370,7 +378,7 @@ Rotate the keypair in order so `<name>-shell` accepts the new public key before 
    kubectl -n kubeagents-system rollout status deployment/platform-agent-gateway --timeout=180s
    ```
 
-5. Delete the temporary keypair files from your workstation:
+5. Remove the old public key line from `authorized_keys` in `<name>-shell-authorized-keys` (it takes effect on the next `<name>-shell` restart) and delete the temporary keypair files from your workstation:
 
    ```bash
    rm -f ./sandbox_id_ed25519 ./sandbox_id_ed25519.pub
