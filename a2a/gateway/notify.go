@@ -146,6 +146,14 @@ type notifyFeedbackTarget interface {
 	AnswerFeedbackTarget(conversation, answerTo string) string
 }
 
+// notifyReportKeeper is the optional extension NotifyConversations
+// implements to keep the text of a report the route posted into a
+// conversation (Gateway.reports), under the root of the task it reported
+// on, so a reply under it can carry the report to the executor.
+type notifyReportKeeper interface {
+	KeepReport(conversation, root, text string)
+}
+
 // notifyPostFeedback is the optional extension NotifyConversations
 // implements to rate the home posts the agent makes on its own: the id a post
 // of kind with update key (empty for none) is rated under, or "" when answer
@@ -438,6 +446,10 @@ type notifyJob struct {
 	// report's (postHomeReport), whose caller records a late post as one
 	// whose outcome is unknown. A chat.notify request posts late, as before.
 	dropLate bool
+	// rootTask is the root of the task the request's reply_to named, as
+	// postConsole resolved it for the frame; "" when it named none. reply
+	// keeps the post under it.
+	rootTask string
 }
 
 // reply answers the job. When the answer says nothing was posted and the
@@ -451,6 +463,17 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 			"text", firstLine(job.req.Text, notifyLostLineMax))
 	}
 	job.answer(r)
+	// A report that landed is kept for the reply under it: a post the
+	// kanban notifier marked as a card's report (report, set on the settled
+	// card's report post alone) that names the task it reports on
+	// (reply_to, which the notifier puts on every post into a console
+	// thread, progress notes included, so reply_to alone cannot tell them
+	// apart).
+	if r.Error == "" && r.MessageID != "" && job.req.Report && job.rootTask != "" {
+		if keeper, ok := n.conv.(notifyReportKeeper); ok {
+			keeper.KeepReport(job.req.Conversation, job.rootTask, job.req.Text)
+		}
+	}
 	// After the answer, so the requester does not wait on the session lock,
 	// and only for a post that landed, so the ask's reaction comes off when
 	// the answer is in the thread and not when it failed to be.
@@ -912,6 +935,7 @@ func (n *Notifier) postConsole(job notifyJob) {
 		replyTo = rooter.ReplyToRoot(ctx, conversation, replyTo)
 		cancel()
 	}
+	job.rootTask = replyTo
 	message, err := n.frames.PostNotifyFrame(conversation, messageID, job.req.Text, replyTo, edit)
 	if err != nil {
 		n.log.Error("notify post failed", "conversation", conversation, "update", key, "err", err)
@@ -1604,6 +1628,12 @@ func (c gatewayConversations) ReplyToRoot(ctx context.Context, conversation, tas
 	}
 	root, _ := rec.observedAs(taskID)
 	return root
+}
+
+// KeepReport keeps a report the route posted into a conversation, under
+// the root of the task it reported on (notifyReportKeeper).
+func (c gatewayConversations) KeepReport(conversation, root, text string) {
+	c.g.reports.put(conversation, root, text)
 }
 
 func (c gatewayConversations) Post(conversation, text string) (string, error) {

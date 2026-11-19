@@ -194,6 +194,12 @@ type TriggerRun struct {
 	// published again with both, never minted again.
 	Capability    *capability.Ref `json:"capability,omitempty"`
 	CorrelationID string          `json:"correlationId,omitempty"`
+	// Trigger is the trigger the grant was minted with, which a pending
+	// run's publish writes into authority.trigger rather than rebuilding it
+	// from the retry: a retry may name another script, and the verifier
+	// refuses an authority that doesn't equal its grant. Nil on runs
+	// recorded before the field existed, which publish from the retry.
+	Trigger *capability.Trigger `json:"trigger,omitempty"`
 	// Published says the run's submission is on the bus.
 	Published bool `json:"published,omitempty"`
 }

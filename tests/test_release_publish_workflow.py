@@ -65,7 +65,9 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         which is deliberate: the cron on release-scheduler.yml is the only thing
         that encodes how often a staging-promoted commit ships. It fires every
         day, after the nightly staging promotion has had time to push its tag,
-        while release-publish.yml has no schedule trigger.
+        while release-publish.yml has no schedule trigger. The promotion
+        pipeline also dispatches the scheduler when it tags (its step 6b), which
+        covers a promotion that runs past the tick without adding a schedule.
         """
         self.assertNotIn("schedule", self.triggers, "release-publish.yml must remain dispatch-only")
         scheduler_path = _REPO_ROOT / ".github" / "workflows" / "release-scheduler.yml"

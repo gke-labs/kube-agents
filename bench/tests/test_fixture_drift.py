@@ -95,6 +95,18 @@ def published(tmp_path: Path, now=("version-laggard",), before=("version-laggard
 UPGRADES = TASKS / "upgrades-lagging-master-probe" / "task.yaml"
 RELIABILITY = TASKS / "reliability-pdb-probe" / "task.yaml"
 CRASHLOOP = TASKS / "cluster-agent-crashloop-debug" / "task.yaml"
+#: The stockout stream's declared-intent case: `fixtures: [declared-single-zone-pool]`
+#: and no check reading a role, so the role excuses it (#5827).
+STOCKOUT = TASKS / "stockout-declared-intent-no-finding" / "task.yaml"
+#: What hack/fleet-fixture-state.py writes for a pool project whose
+#: declared-intent note is the five-item one (#5827): a drift read in the pool
+#: repository, which no hourly scan confirms because the hourly scan holds no
+#: credential for that repository.
+NOTE_DETAIL = (
+    "repository/knowledge/notification-relay-no-pdb.md as_seeded: observed blob 3c5790d5, seeded blob cd9d2500; "
+    "replace it with the seeded file: python3 -c '...' prints the command "
+    "(why: the note is the declaration the case grades against)"
+)
 
 
 # --- The mapping -------------------------------------------------------------
@@ -273,6 +285,92 @@ def test_an_unreadable_hourly_result_excuses_nothing(laggard_drifted, tmp_path, 
     assert marks_for(laggard_drifted, tmp_path, broken) == []
     assert marks_for(laggard_drifted, tmp_path, tmp_path / "absent.json") == []
     assert "graded as usual" in capsys.readouterr().err
+
+
+# --- A drift read in the pool repository (#5827) ----------------------------
+
+
+@pytest.fixture
+def note_drifted(tmp_path) -> Path:
+    """The lease-time scan of a project with the pool in shape and the
+    five-item note: the declared role drifted on its repository line alone."""
+    return report(tmp_path, {"declared-single-zone-pool": role("drifted", NOTE_DETAIL), "no-pdb-workload": role("converged")})
+
+
+def note_marks(scan_path: Path, tmp_path: Path, published_path: Path, *tasks: Path) -> list[str]:
+    out = tmp_path / "marks"
+    argv = ["--report", str(scan_path), "--published", str(published_path), "--out-dir", str(out), *(str(t) for t in tasks or (STOCKOUT,))]
+    assert fixture_drift.main(argv) == 0
+    return sorted(p.name for p in out.iterdir()) if out.exists() else []
+
+
+def test_the_repository_subject_is_the_scans():
+    # The scan names its repository subject once; this module matches drift
+    # lines on the same word, so the two are read from the scan's own file.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("fleet_fixture_state", Path(__file__).resolve().parents[2] / "hack" / "fleet-fixture-state.py")
+    scan = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scan)
+    assert fixture_drift.REPOSITORY_SUBJECT == scan.REPOSITORY_SUBJECT
+    assert fixture_drift.repository_drift_roles(LeaseScan(project=PROJECT, drifted={"declared-single-zone-pool": [NOTE_DETAIL], "version-laggard": [LAGGARD_DETAIL]})) == {"declared-single-zone-pool"}
+
+
+def test_a_drift_read_in_the_pool_repository_is_excused_without_the_hourly_scan(note_drifted, tmp_path, capsys):
+    # The hourly scan has no credential for the pool repository, so it never
+    # holds this drift; a file's content does not flap, so no second read is
+    # owed. The published document is not even needed.
+    assert note_marks(note_drifted, tmp_path, tmp_path / "absent.json") == ["stockout-declared-intent-no-finding"]
+    reason = (tmp_path / "marks" / "stockout-declared-intent-no-finding").read_text(encoding="utf-8")
+    assert reason.startswith(f"{FIXTURE_DRIFT_LABEL}:declared-single-zone-pool: repository/knowledge/notification-relay-no-pdb.md as_seeded: observed blob 3c5790d5")
+    assert "graded as usual" not in capsys.readouterr().err
+    # And with a published document that says nothing about the role.
+    assert note_marks(note_drifted, tmp_path, published(tmp_path, now=(), before=())) == ["stockout-declared-intent-no-finding"]
+
+
+def test_a_repository_line_leads_the_reason_whole_when_a_cluster_line_comes_first(tmp_path):
+    # The catalog lists the note assertion last on each declared-* role, so a
+    # role out of shape in the cluster and in the repository at once puts a
+    # cluster line first; the reason still carries the repository line, with
+    # the command that prints the repair, and counts the rest.
+    cluster_line = 'poddisruptionbudget? absent: observed {"metadata": {"name": "added"}} (why: a PodDisruptionBudget anyone adds removes the posture)'
+    long_note = NOTE_DETAIL.replace("python3 -c '...'", "python3 -c '" + "x" * (fixture_drift.DETAIL_MAX_CHARS) + "'")
+    scan = LeaseScan(project=PROJECT, drifted={"declared-single-zone-pool": [cluster_line, long_note]})
+    reason = fixture_drift.drift_reason({"declared-single-zone-pool"}, scan)
+    assert long_note in reason, reason
+    assert "(+1 more in the scan report)" in reason
+    assert fixture_drift.ELLIPSIS not in reason.split(" (seeded-fleet scan")[0]
+    # A role with cluster lines alone keeps the old shape
+    # (test_a_long_drift_detail_is_cut_to_its_first_line).
+
+
+def test_a_repository_drift_is_excused_when_another_role_drifted_and_the_hourly_scan_is_unusable(tmp_path, capsys):
+    # The published document decides the cluster drift alone; missing or
+    # stale, it withholds that one and leaves the repository drift excused.
+    scan = report(tmp_path, {"declared-single-zone-pool": role("drifted", NOTE_DETAIL), "version-laggard": role("drifted", LAGGARD_DETAIL)})
+    assert note_marks(scan, tmp_path, tmp_path / "absent.json", STOCKOUT, UPGRADES) == ["stockout-declared-intent-no-finding"]
+    assert "only declared-single-zone-pool, read drifted in the pool repository, can be excused" in capsys.readouterr().err
+    assert note_marks(scan, tmp_path, published(tmp_path, age=timedelta(hours=4)), STOCKOUT, UPGRADES) == ["stockout-declared-intent-no-finding"]
+
+
+def test_a_repository_drift_and_a_transient_cluster_drift_are_judged_apart(tmp_path, capsys):
+    scan = report(tmp_path, {"declared-single-zone-pool": role("drifted", NOTE_DETAIL), "version-laggard": role("drifted", LAGGARD_DETAIL)})
+    marks = note_marks(scan, tmp_path, published(tmp_path, now=("version-laggard",), before=()), STOCKOUT, UPGRADES)
+    assert marks == ["stockout-declared-intent-no-finding"]
+    err = capsys.readouterr().err
+    assert "version-laggard read drifted at lease time but not on the last two hourly scans" in err
+    # The laggard sustained too: both excused.
+    marks = note_marks(scan, tmp_path, published(tmp_path), STOCKOUT, UPGRADES)
+    assert marks == ["stockout-declared-intent-no-finding", "upgrades-lagging-master-probe"]
+
+
+def test_the_seeded_content_and_its_reader_decide_what_the_note_assertion_calls_drift():
+    # The scan reads both shas through the verifier beside it, which the
+    # change under test supplies, and the seeded content lives in a module of
+    # its own; a pull request that edits either is graded as usual throughout,
+    # as one that edits the catalog or the scan is.
+    assert "scripts/gitops_seed_files.py" in fixture_drift.DRIFT_DECIDING_PATHS
+    assert "scripts/verify_ci_pool_project.py" in fixture_drift.DRIFT_DECIDING_PATHS
 
 
 # --- What the gate makes of it ---------------------------------------------

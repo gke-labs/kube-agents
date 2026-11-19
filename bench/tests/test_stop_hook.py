@@ -382,3 +382,24 @@ def test_the_listing_names_stopped_asks_and_nothing_else(tmp_path, capsys):
     ]
     assert stop_hook.main(paths) == 0
     assert capsys.readouterr().out.split() == ["stopped"]
+
+
+def test_the_cancel_report_prefix_is_the_gateways():
+    """CANCEL_REPORT_PREFIX is how the gateway's canceledCardStopText opens.
+
+    The harness checks a canceled task's card-stop text against this prefix,
+    so a gateway that reworded its text would fail every cancel report as
+    "does not open" while the stop itself worked. Read from the Go source,
+    since the bench can't import the gateway.
+    """
+    import re
+    from pathlib import Path
+
+    gateway = Path(__file__).resolve().parents[2] / "a2a" / "gateway" / "gateway.go"
+    body = re.search(
+        r"^func canceledCardStopText\(.*?\n}\n", gateway.read_text(encoding="utf-8"), re.MULTILINE | re.DOTALL
+    )
+    assert body, f"canceledCardStopText is gone from {gateway}"
+    opens = re.search(r'return\s+"([^"]*)"\s*\+', body.group(0))
+    assert opens, f"canceledCardStopText no longer opens with a literal:\n{body.group(0)}"
+    assert opens.group(1) == stop_hook.CANCEL_REPORT_PREFIX

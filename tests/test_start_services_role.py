@@ -27,6 +27,7 @@ _STUBS = "\n".join(
         "start_envoy",
         "start_event_watcher",
         "start_drift_detector",
+        "start_audit_report_store",
     )
 )
 
@@ -63,7 +64,7 @@ class StartServicesRoleTest(unittest.TestCase):
             ("combined", [*runtime, "start_envoy", *watchers]),
             ("", [*runtime, "start_envoy", *watchers]),
             ("broker", [*runtime, "start_envoy"]),
-            ("api-proxy", [*runtime, *watchers]),
+            ("api-proxy", [*runtime, *watchers, "start_audit_report_store"]),
             ("exec", [*runtime, "start_envoy"]),
         ):
             with self.subTest(role=role):

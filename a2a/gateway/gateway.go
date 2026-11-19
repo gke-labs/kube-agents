@@ -243,6 +243,9 @@ type Gateway struct {
 	// to post waits before it is redelivered: scheduledPostRetryDelay, per
 	// gateway so a test can shorten it on its own.
 	scheduledRetry time.Duration
+	// reports keeps the notify route's posts into conversations for the
+	// replies under them (reports.go).
+	reports pushedReports
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -310,6 +313,16 @@ type Gateway struct {
 	// session by construction (a message during a running task is a steer,
 	// never a second task). Entries are refcounted and pruned when idle.
 	sessionLocks map[string]*sessionLockEntry
+	// capCheck lets one session cap check run at a time (refuseAtSessionCap,
+	// #6033): the count, the eviction and the slot's reservation happen as
+	// one, so a burst of conversations can't all pass on the same count. It
+	// is a channel so a wait can give up with its turn's context. capHolds,
+	// guarded by capMu, are the slots granted whose pod isn't created yet,
+	// by conversation key.
+	capOnce  sync.Once
+	capCheck chan struct{}
+	capMu    sync.Mutex
+	capHolds map[string]capHold
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -623,6 +636,7 @@ func New(o Options) (*Gateway, error) {
 		log:              log,
 		runCtx:           context.Background(),
 		sessionLocks:     map[string]*sessionLockEntry{},
+		capHolds:         map[string]capHold{},
 		profiles:         newProfileDirectory(),
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
@@ -1203,6 +1217,9 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	// A cap slot this turn took ends with the turn, whatever happened between
+	// the grant and the spawn (#6033).
+	defer g.releaseCapHold(msg.Conversation)
 	// The stop may have begun while this turn waited for the lock.
 	if g.droppedAtStop(msg) {
 		return
@@ -1233,6 +1250,7 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, prin
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	defer g.releaseCapHold(msg.Conversation)
 	if g.droppedAtStop(msg) {
 		return
 	}
@@ -3135,6 +3153,10 @@ func isMaxBytes(err error) bool {
 type taskStart struct {
 	// Text is the turn's ask.
 	Text string
+	// ReplyTo is InboundMessage's: the task whose report the turn answers,
+	// put on the submission as a replyTo part. Empty on a turn the gateway
+	// starts on its own.
+	ReplyTo string
 	// MessageID and Principal feed only the ingress log: the backend message
 	// id the audit chain joins on, and the plaintext principal. A turn the
 	// gateway starts on its own (a child, a wake) has no backend message.
@@ -3219,6 +3241,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Route:     route,
 		Text:      agentText(msg),
+		ReplyTo:   msg.ReplyTo,
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
@@ -3311,6 +3334,37 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			extra = append(extra, part)
 		}
 	}
+	// A turn answering a report its client named carries the task that
+	// filed it, so the executor can read the report stored for that turn.
+	// One that is not a task id's shape is dropped here, the one check on
+	// the way out, and the turn still starts: the report is a help to the
+	// answer, not a condition of it.
+	if ts.ReplyTo != "" {
+		// The value is sender-chosen, so the line carries it bounded, as the
+		// console door logs its other frame fields; the error quotes it whole.
+		if part, err := lib.ReplyToPart(lib.ReplyTo{TaskID: ts.ReplyTo}); err != nil {
+			g.log.Warn("replyTo dropped: not a task id; the turn runs without the report it answers",
+				"taskId", taskID, "replyTo", truncateRunes(ts.ReplyTo, consoleMessageIDCap), "bytes", len(ts.ReplyTo))
+		} else {
+			extra = append(extra, part)
+		}
+	}
+	// A human turn under a report the notify route posted carries that
+	// report, on every route (pushedReports); the replyTo part above stays
+	// its fallback. Every executor a human turn reaches reads text parts
+	// only and ignores a data part it does not know: the hermes-bridge
+	// (promptFromMessage) frames this one; the a2a-worker (textFromParts),
+	// which runs session pods and profile tasks, does not read it yet; the
+	// dispatcher reads taskParameters alone (dispatch/admission.go).
+	if ts.Role == "" {
+		if report, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+			if part, err := lib.PushedReportPart(report); err != nil {
+				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
+			} else {
+				extra = append(extra, part)
+			}
+		}
+	}
 	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
@@ -3346,7 +3400,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// (unpostableTrigger), for a child or a wake started on its record.
 	if !lineless && !g.unpostableTrigger(rec.Key) {
 		var err error
-		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
+		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID, Profile: topProfile(ts.Route), InReplyTo: topInReplyTo(ts)})
 		if err != nil {
 			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 		}
@@ -3593,6 +3647,13 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		return
 	}
 	g.noteUnreadQuote(rec.Key, msg)
+	// A steer carries no replyTo: the executor attaches a stored report on
+	// an opening turn only, so a reply that names one while the turn still
+	// runs is steered into it without the report.
+	if msg.ReplyTo != "" {
+		g.log.Warn("replyTo not carried: the turn is still running and the message is steered into it; a report is attached on an opening turn only",
+			"taskId", active.TaskID, "replyTo", truncateRunes(msg.ReplyTo, consoleMessageIDCap), "bytes", len(msg.ReplyTo), "conversation", rec.Key)
+	}
 	payload, err := messagePayload(agentText(msg), active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)

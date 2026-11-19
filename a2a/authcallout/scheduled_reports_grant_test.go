@@ -72,10 +72,13 @@ func connectEveryRenderedPrincipal(t *testing.T) (*harness, []scheduledReportsPr
 		out = append(out, scheduledReportsPrincipal{user, nc, v})
 	}
 	for _, c := range callouts {
+		if c.user == "gateway" {
+			continue // the gateway's own ServiceAccount entry: the gateway, asked above
+		}
 		nc, v := h.connectAs(t, c.user, c.token)
 		out = append(out, scheduledReportsPrincipal{c.user, nc, v})
 	}
-	if len(out) < len(callouts)+2 {
+	if len(out) < len(callouts)+1 {
 		t.Fatalf("connected %d principals; the render carries more", len(out))
 	}
 	return h, out

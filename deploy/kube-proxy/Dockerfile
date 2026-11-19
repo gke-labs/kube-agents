@@ -9,6 +9,10 @@ ENV GOTOOLCHAIN=local
 
 ARG TARGETOS
 ARG TARGETARCH
+# The commit the image is built from, which `--version` and the startup log name;
+# docker-publish-ghcr.yml passes the SHA the image is tagged with. A release
+# retags that image without rebuilding, so an image names its commit, not X.Y.Z.
+ARG KUBE_AGENTS_VERSION=dev
 
 WORKDIR /workspace
 
@@ -17,7 +21,7 @@ RUN go mod download
 
 COPY k8s-api-proxy/ ./
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -a -ldflags="-s -w" -o /workspace/k8s-api-proxy ./cmd/k8s-api-proxy/
+    go build -a -ldflags="-s -w -X main.version=${KUBE_AGENTS_VERSION:-dev}" -o /workspace/k8s-api-proxy ./cmd/k8s-api-proxy/
 
 FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
 

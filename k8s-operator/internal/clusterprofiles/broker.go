@@ -121,7 +121,8 @@ func BrokerFromEnv() (*Broker, error) {
 	if rawUniverse != "" {
 		normalized, ok := agentv1alpha1.NormalizeUniverseDomain(rawUniverse)
 		if !ok {
-			return nil, fmt.Errorf("%s=%q is not a valid DNS domain", UniverseDomainEnv, rawUniverse)
+			return nil, fmt.Errorf("%s=%q is not a valid universe domain: a DNS domain that is not under %s",
+				UniverseDomainEnv, rawUniverse, agentv1alpha1.DefaultUniverseDomain)
 		}
 		universe = normalized
 	}
