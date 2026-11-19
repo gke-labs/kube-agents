@@ -13819,6 +13819,15 @@ class ProxyMetrics:
                 f"# TYPE {vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} gauge",
                 f"{vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} {details.ignored}",
             ]
+            lines += [
+                f"# HELP {vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC} Stockout-investigator proposals the install authored in its managed repositories, by state as the forge reports it now; closed is closed without a merge.",
+                f"# TYPE {vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC} gauge",
+            ]
+            for state in vcs_readings.STATES:
+                lines.append(
+                    f'{vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC}{{{VCS_READINGS_STATE_LABEL}="{state}"}} '
+                    f"{details.stockout_proposals.get(state, 0)}"
+                )
         ages = [
             (name, reading)
             for name, reading in ((vcs_readings.READING_OUTCOMES, outcomes), (vcs_readings.READING_DETAILS, details))

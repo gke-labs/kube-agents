@@ -54,7 +54,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 59
+SUMMARY_MAX_LINES = 60
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -190,6 +190,18 @@ USAGE_READINGS: Mapping[str, str] = {
 #: usageSummaryToolStatusOrder verbatim.
 TOOL_INVOCATIONS_FAMILY = "kubeagents_tool_invocations_total"
 TOOL_STATUS_ORDER: Tuple[str, ...] = ("success", "error", "blocked", "busy", "abandoned")
+#: Credential broker stockout-investigator proposal gauge family and closed state vocabulary.
+STOCKOUT_PROPOSALS_FAMILY = "kubeagents_vcs_stockout_proposals"
+STOCKOUT_PROPOSALS_STATE_LABEL = "state"
+STOCKOUT_PROPOSALS_STATE_OPEN = "open"
+STOCKOUT_PROPOSALS_STATE_MERGED = "merged"
+STOCKOUT_PROPOSALS_STATE_CLOSED = "closed"
+STOCKOUT_PROPOSALS_STATES: Tuple[str, ...] = (
+    STOCKOUT_PROPOSALS_STATE_OPEN,
+    STOCKOUT_PROPOSALS_STATE_MERGED,
+    STOCKOUT_PROPOSALS_STATE_CLOSED,
+)
+STOCKOUT_PROPOSALS_LINE_PREFIX = "  stockoutProposals: "
 #: ``status.usage.topTools``: the operator's reading of the top five pairs, the
 #: fallback for an unread broker, and its row fields; the gateway's
 #: usageTopTools* names verbatim.
@@ -238,7 +250,8 @@ TEMPLATE_EXTRA_TOKENS = (
     BROKER_TOOLS
     | frozenset(sub for subs in BROKER_SUBCOMMANDS.values() for sub in subs)
     | frozenset(TOOL_STATUS_ORDER)
-    | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", NONE, OTHER_BUCKET}
+    | frozenset(STOCKOUT_PROPOSALS_STATES)
+    | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", "stockoutProposals", "authored", NONE, OTHER_BUCKET}
 )
 #: The nine ``status.usage`` proposal-origin readings, in the origin table's
 #: order (docs/designs/proposal-origin.md); the block prints them as one line.
@@ -798,6 +811,36 @@ def _origin_line(usage: Mapping[str, Any]) -> str:
     return f"{ORIGIN_LINE_PREFIX}{shown}{USAGE_AGENT_READING_SUFFIX}"
 
 
+def summarise_stockout_proposals(samples: Iterable[Sample]) -> Optional[Dict[str, int]]:
+    """Stockout-investigator proposal counts by state from broker metrics, or None when absent."""
+    counts: Dict[str, int] = {state: 0 for state in STOCKOUT_PROPOSALS_STATES}
+    present = False
+    for sample in samples:
+        if sample.name != STOCKOUT_PROPOSALS_FAMILY:
+            continue
+        state = (sample.labels.get(STOCKOUT_PROPOSALS_STATE_LABEL) or "").lower()
+        if state not in counts:
+            continue
+        value = int(round(sample.value))
+        if value < 0:
+            continue
+        present = True
+        counts[state] += value
+    return counts if present else None
+
+
+def _stockout_proposals_line(counts: Mapping[str, int]) -> str:
+    open_count = int(counts.get(STOCKOUT_PROPOSALS_STATE_OPEN, 0))
+    merged_count = int(counts.get(STOCKOUT_PROPOSALS_STATE_MERGED, 0))
+    closed_count = int(counts.get(STOCKOUT_PROPOSALS_STATE_CLOSED, 0))
+    total = open_count + merged_count + closed_count
+    return (
+        f"{STOCKOUT_PROPOSALS_LINE_PREFIX}{total} authored "
+        f"({open_count} open, {merged_count} merged, {closed_count} closed)"
+        f"{USAGE_FORGE_READING_SUFFIX}"
+    )
+
+
 def audited_block(snapshot: Snapshot) -> Tuple[str, List[str]]:
     """The rendered block and the identifiers that leak into it.
 
@@ -888,14 +931,19 @@ def render(snapshot: Snapshot) -> str:
             lines.append(f"  {counter}: {shown}{suffix}")
         else:
             lines.append(f"  {counter}: {int(value or 0)}")
+    broker_samples = parse_prometheus(snapshot.broker_metrics) if snapshot.broker_metrics is not None else None
     lines.append(_origin_line(usage))
+    if broker_samples is not None:
+        stockout_counts = summarise_stockout_proposals(broker_samples)
+        if stockout_counts is not None:
+            lines.append(_stockout_proposals_line(stockout_counts))
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")
     lines.append(f"  lastHumanActive: {usage.get('lastHumanActiveTime') or NEVER}")
     # The broker's own text first; the operator's reading of it in the status
     # when the broker could not be read; unavailable when neither is there.
     status_tools = usage.get(TOP_TOOLS_STATUS_KEY)
-    if snapshot.broker_metrics is not None:
-        lines.extend(_tools_lines(summarise_broker_tools(parse_prometheus(snapshot.broker_metrics))))
+    if broker_samples is not None:
+        lines.extend(_tools_lines(summarise_broker_tools(broker_samples)))
     elif isinstance(status_tools, list):
         lines.extend(_tools_lines(summarise_status_tools(status_tools)))
     else:
