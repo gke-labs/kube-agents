@@ -1106,7 +1106,7 @@ const (
 	// replays before and after its wait -- one asker, two replays, either
 	// way. The operator renders the gateway's A2A_DEFAULT_ADDRESSEE from
 	// spec.harness.tuning.defaultRoute (resolveA2ADefaultRoute); where it
-	// resolves to "platform" (the opt-out, or a fallback) a plain
+	// resolves to "platform" (the default, or a fallback) a plain
 	// conversation's task is a bridge run and a session pod is spawned only
 	// for a Delegate or a session-routed record; the conversations being
 	// asked about while their task runs are therefore the bridge's
@@ -3720,6 +3720,16 @@ func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	sessionsIs, sessionsEq := a2aSessionCapWords(agent)
 	sessionsAt := strings.Replace(sessionsIs, " is ", " at ", 1)
 	perSession := strconv.Itoa(perSessionN)
+	// Where the spec asks for the session route, fits is computed before the
+	// check, in the shape the operator's own fit shares
+	// (a2aProvisionSessionsFitBlock). On the platform route the script stays
+	// as it was, fits computed inside the refusal, so its Job is unchanged.
+	liveConsumersRead := a2aProvisionLiveConsumersRead
+	fitsInRefusal := `  fits=$(( (live_consumers - ` + reserve + `) / ` + perSession + ` ))
+`
+	if a2aSpecDefaultRoute(agent) == agentv1alpha1.DefaultRouteSession {
+		liveConsumersRead, fitsInRefusal = a2aProvisionSessionsFitBlock(reserveN, perSessionN), ""
+	}
 	// What a session's share is, said as the refusal says it: the named
 	// consumers it creates, and on the session route the replays of its
 	// conversation's task too.
@@ -4251,7 +4261,7 @@ if [ -w "` + a2aProvisionTerminationLogPath + `" ]; then
 fi
 
 ` + readNote + `required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
-` + a2aProvisionSessionsFitBlock(reserveN, perSessionN) + `if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
+` + liveConsumersRead + `if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  ` + sessionsIs + `, each session ` + perSessionWhat + `," >&2
   echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
@@ -4259,7 +4269,7 @@ fi
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
   echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
-` + workersFit + `  if [ "${fits}" -ge 1 ]; then
+` + fitsInRefusal + workersFit + `  if [ "${fits}" -ge 1 ]; then
     echo "So either lower spec.harness.tuning.maxSessions to at most ${fits} - the most a" >&2
     echo "  stream holding ${live_consumers} consumers has room for, with ` + reserve + ` of them reserved and" >&2
     echo "  the rest going ` + perSession + ` to a session - or delete the TASKS stream and provision again." >&2
@@ -4319,19 +4329,23 @@ echo "a2a provisioning complete"
 // against the Go function, so the operator's fitted cap and the number the
 // refusal tells an operator to lower maxSessions to cannot drift apart.
 func a2aProvisionSessionsFitBlock(reserve, perSession int) string {
-	return `live_consumers="$(printf '%s' "${tasks_json}" \
-  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
-if [ -z "${live_consumers}" ]; then
-  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
-  exit 1
-fi
-if [ "${live_consumers}" = "-1" ]; then
+	return a2aProvisionLiveConsumersRead + `if [ "${live_consumers}" = "-1" ]; then
   fits=` + strconv.Itoa(a2aSessionsFitUnbounded) + `
 else
   fits=$(( (live_consumers - ` + strconv.Itoa(reserve) + `) / ` + strconv.Itoa(perSession) + ` ))
 fi
 `
 }
+
+// a2aProvisionLiveConsumersRead is the provision script's read of TASKS'
+// max_consumers off tasks_json, refusing when it finds none.
+const a2aProvisionLiveConsumersRead = `live_consumers="$(printf '%s' "${tasks_json}" \
+  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_consumers}" ]; then
+  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+`
 
 // a2aProvisionCapLowerBlock is the provision script's report for one
 // stream's byte cap, after cap_check has read it (#4476). Provisioning does
@@ -5213,13 +5227,15 @@ func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name core
 }
 
 // a2aSpecDefaultRoute is the route spec.harness.tuning.defaultRoute asks
-// for: DefaultRouteSession when it is unset or says `session`,
-// DefaultRoutePlatform when it says `platform`. Only the CRD's two values are
-// routes: anything else that reaches here (a CR written past the schema) is
-// DefaultRoutePlatform rather than an addressee no executor owns.
+// for: DefaultRouteSession when it says `session`, DefaultRoutePlatform when
+// it is unset or says `platform`, so an install that sets nothing routes as
+// it did before the field existed. Only the CRD's two values are routes:
+// anything else that reaches here (a CR written past the schema) is
+// DefaultRoutePlatform rather than an addressee no executor owns. Everything
+// the session route adds (the session cap's fit to TASKS, its condition and
+// the provision Job's wait for it) runs only where this says session.
 func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	limits := agentTuning(agent)
-	if limits == nil || limits.DefaultRoute == nil || *limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
+	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil && *limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
 		return agentv1alpha1.DefaultRouteSession
 	}
 	return agentv1alpha1.DefaultRoutePlatform
@@ -5235,14 +5251,15 @@ func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 //
 // A cap still waiting on its first reading (a2aSessionCapWaiting: a pass on
 // a provisioned bus that could not read its width and has no earlier
-// reading) keeps what
-// the operator before the default's flip rendered: `session` only where the
-// field says so, `platform` where it is unset. That is an upgrade's first
-// pass on an unreadable bus; resolveA2ASessionCap holds the provision Job
-// meanwhile, and the pass that reads the width moves the route. A bus never
-// provisioned does not wait: its TASKS will be created at maxSessions' width. With no cap and no wait, which
-// the reconcile never renders on the session route (resolveA2ASessionCap
-// sets one or the other first), the route is the spec's at maxSessions.
+// reading) keeps `session` where the field says so and `platform` where it
+// is unset. An unset field resolves to platform today, so that second case
+// waits on a later change making session the default; until then the wait
+// is an opted-in install's, whose route stays session at maxSessions while
+// resolveA2ASessionCap holds the provision Job, and the pass that reads the
+// width fits the cap. A bus never provisioned does not wait: its TASKS will
+// be created at maxSessions' width. With no cap and no wait, which the
+// reconcile never renders on the session route (resolveA2ASessionCap sets
+// one or the other first), the route is the spec's at maxSessions.
 //
 // The gateway's A2A_DEFAULT_ADDRESSEE and the platform agent container's
 // (which the hermes-bridge sidecar copies) all come from here, so the two
@@ -7205,11 +7222,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// where all three become true together.
 		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
 		// Where a plain conversation's first message goes:
-		// spec.harness.tuning.defaultRoute, `session` when
-		// unset (resolveA2ADefaultRoute, which also reads the
-		// fitted session cap). Rendered explicitly at every
-		// value, like A2A_MAX_SESSIONS above. The session
-		// route needs the spawner the line above arms.
+		// spec.harness.tuning.defaultRoute, `platform` when
+		// unset (resolveA2ADefaultRoute, which on the session
+		// route also reads the fitted session cap). Rendered
+		// explicitly at every value, like A2A_MAX_SESSIONS
+		// above. The session route needs the spawner the line
+		// above arms.
 		a2aDefaultAddresseeEnv(agent),
 		// The image those sessions run. Rendered even
 		// when it matches the gateway's own default, so

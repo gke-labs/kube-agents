@@ -2312,7 +2312,7 @@ spec:
             - name: CHAT_METRICS_PORT
               value: "9097"
             - name: A2A_DEFAULT_ADDRESSEE
-              value: session
+              value: platform
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -2589,7 +2589,7 @@ spec:
             - name: CHAT_METRICS_PORT
               value: "9097"
             - name: A2A_DEFAULT_ADDRESSEE
-              value: session
+              value: platform
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: NATS_URL

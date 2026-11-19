@@ -1086,8 +1086,8 @@ func bridgeIdentity() a2aIdentity {
 	//
 	// The operator renders A2A_SPAWN_SESSIONS=true and renders
 	// A2A_DEFAULT_ADDRESSEE from spec.harness.tuning.defaultRoute
-	// (resolveA2ADefaultRoute): `session` by default, `platform` where the
-	// field opts out or the TASKS stream has no room for a session. On
+	// (resolveA2ADefaultRoute): `platform` by default, `session` where the
+	// field opts in and the TASKS stream has room for a session. On
 	// `platform` every turn is addressed to a2aBridgeAddressee and executed by
 	// the sidecar this principal belongs to; on `session` the bridge still
 	// runs every turn addressed to `platform` by handle.

@@ -62,11 +62,20 @@ func unreadableBus(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2
 	return nil, goerrors.New("dial tcp: connection refused")
 }
 
-// sessionCapRig is a stored agent on the default (session) route and a
-// reconciler reading the bus through streams.
+// sessionRouteTestAgent is the bare test agent opted into the session route
+// (spec.harness.tuning.defaultRoute: session), the only route the session cap
+// is fitted on; an unset field is the platform route.
+func sessionRouteTestAgent() *agentv1alpha1.PlatformAgent {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{DefaultRoute: ptr.To(agentv1alpha1.DefaultRouteSession)}}
+	return agent
+}
+
+// sessionCapRig is a stored agent on the session route and a reconciler
+// reading the bus through streams.
 func sessionCapRig(t *testing.T, mutate func(*agentv1alpha1.PlatformAgent), streams func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)) (*PlatformAgentReconciler, client.Client, *record.FakeRecorder, *agentv1alpha1.PlatformAgent) {
 	t.Helper()
-	agent := a2aTestAgent()
+	agent := sessionRouteTestAgent()
 	if mutate != nil {
 		mutate(agent)
 	}
@@ -127,7 +136,7 @@ func TestTheProvisionScriptFitsWhatTheOperatorFits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bash is required to execute the provision script's arithmetic: %v", err)
 	}
-	agent := a2aTestAgent() // the session route at maxSessions=10
+	agent := sessionRouteTestAgent() // the session route at maxSessions=10
 	reserve, per := a2aTasksReserve(agent), a2aTasksConsumersPerSession(agent)
 	if per != a2aTasksConsumersPerSessionOnSessionRoute {
 		t.Fatalf("precondition: the default agent counts %d a session, not the session route's %d", per, a2aTasksConsumersPerSessionOnSessionRoute)
@@ -274,7 +283,7 @@ func TestTheSessionCapFollowsTheLiveTasksWidth(t *testing.T) {
 		}
 	})
 
-	t.Run("unreadable on a provisioned bus with no stored cap waits, rendering what the previous operator did", func(t *testing.T) {
+	t.Run("unreadable on a provisioned bus with no stored cap waits, on the session route at maxSessions", func(t *testing.T) {
 		r, cl, rec, agent := sessionCapRig(t, func(a *agentv1alpha1.PlatformAgent) {
 			setBusProvisionedCondition(a, true, "provision-job", metav1.Now())
 		}, unreadableBus)
@@ -290,17 +299,18 @@ func TestTheSessionCapFollowsTheLiveTasksWidth(t *testing.T) {
 		if !a2aSessionCapWaiting(agent) {
 			t.Error("the render copy does not read as waiting, so the provision Job would not be held")
 		}
-		if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRoutePlatform || gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "10" {
-			t.Errorf("route %q, A2A_MAX_SESSIONS %q; want platform at 10, what the operator before the flip rendered", resolveA2ADefaultRoute(agent), gatewayEnv(t, agent, "A2A_MAX_SESSIONS"))
+		if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession || gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "10" {
+			t.Errorf("route %q, A2A_MAX_SESSIONS %q; want the opted-in session route at 10", resolveA2ADefaultRoute(agent), gatewayEnv(t, agent, "A2A_MAX_SESSIONS"))
 		}
 		if events := drainEvents(rec); len(events) != 0 {
 			t.Errorf("events %q on a wait, want none", events)
 		}
-		// An explicit `session` is what the previous operator rendered too.
-		explicit := agent.DeepCopy()
-		explicit.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{DefaultRoute: ptr.To(agentv1alpha1.DefaultRouteSession)}}
-		if resolveA2ADefaultRoute(explicit) != agentv1alpha1.DefaultRouteSession {
-			t.Errorf("an explicit session route waiting on the width renders %q, want session as before", resolveA2ADefaultRoute(explicit))
+		// The same status under an unset field is the platform route, where
+		// the wait neither applies nor holds the provision Job.
+		unset := agent.DeepCopy()
+		unset.Spec.Harness = nil
+		if resolveA2ADefaultRoute(unset) != agentv1alpha1.DefaultRoutePlatform || a2aSessionCapWaiting(unset) {
+			t.Errorf("an unset field under a waiting condition renders %q, waiting %v; want platform, not waiting", resolveA2ADefaultRoute(unset), a2aSessionCapWaiting(unset))
 		}
 	})
 
@@ -346,15 +356,36 @@ func TestTheSessionCapFollowsTheLiveTasksWidth(t *testing.T) {
 		}
 	})
 
-	t.Run("the platform route fits nothing and clears what was stored", func(t *testing.T) {
+	t.Run("the platform route fits nothing and clears what an opt-in stored, in one write", func(t *testing.T) {
 		r, cl, _, agent := sessionCapRig(t, nil, tasksAt(110))
 		r.resolveA2ASessionCap(ctx, agent, nil)
 		agent = storedCapAgent(t, cl, agent)
+		if agent.Status.EffectiveSessionCap == nil || meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType) == nil {
+			t.Fatalf("precondition: the session route stored cap %v and condition %+v", agent.Status.EffectiveSessionCap, meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType))
+		}
+		before, _ := strconv.Atoi(agent.ResourceVersion)
 		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{DefaultRoute: ptr.To(agentv1alpha1.DefaultRoutePlatform)}}
-		r.resolveA2ASessionCap(ctx, agent, nil)
+		r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+			t.Error("the platform route read the bus")
+			return nil, nil
+		}
+		instance := agent.DeepCopy()
+		r.resolveA2ASessionCap(ctx, agent, instance)
 		got := storedCapAgent(t, cl, agent)
 		if got.Status.EffectiveSessionCap != nil || meta.FindStatusCondition(got.Status.Conditions, sessionCapFittedConditionType) != nil {
-			t.Errorf("on platform: cap %v, condition %+v; want neither", got.Status.EffectiveSessionCap, meta.FindStatusCondition(got.Status.Conditions, sessionCapFittedConditionType))
+			t.Errorf("on platform: cap %v, condition %+v; want both cleared", got.Status.EffectiveSessionCap, meta.FindStatusCondition(got.Status.Conditions, sessionCapFittedConditionType))
+		}
+		if after, _ := strconv.Atoi(got.ResourceVersion); after != before+1 {
+			t.Errorf("clearing took %d status writes, want one", after-before)
+		}
+		if instance.Status.EffectiveSessionCap != nil || instance.ResourceVersion != got.ResourceVersion {
+			t.Errorf("instance carries cap %v at version %q, stored %q", instance.Status.EffectiveSessionCap, instance.ResourceVersion, got.ResourceVersion)
+		}
+		next := got.DeepCopy()
+		next.Spec.Harness = agent.Spec.Harness
+		r.resolveA2ASessionCap(ctx, next, nil)
+		if again := storedCapAgent(t, cl, agent); again.ResourceVersion != got.ResourceVersion {
+			t.Error("the next pass on platform wrote status again")
 		}
 		if gatewayEnv(t, agent, "A2A_MAX_SESSIONS") != "10" || resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRoutePlatform {
 			t.Errorf("platform renders A2A_MAX_SESSIONS %q route %q, want 10 on platform", gatewayEnv(t, agent, "A2A_MAX_SESSIONS"), resolveA2ADefaultRoute(agent))
@@ -366,7 +397,7 @@ func TestTheSessionCapFollowsTheLiveTasksWidth(t *testing.T) {
 // provision Job's check, and does not reach the width a new TASKS is created
 // at, which stays on maxSessions.
 func TestTheEffectiveCapRendersEverywhereButTheCreateWidth(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := sessionRouteTestAgent()
 	agent.Status.EffectiveSessionCap = ptr.To(4)
 	reserve := a2aTasksReserve(agent)
 	if got := gatewayEnv(t, agent, "A2A_MAX_SESSIONS"); got != "4" {
@@ -387,13 +418,13 @@ func TestTheEffectiveCapRendersEverywhereButTheCreateWidth(t *testing.T) {
 		t.Errorf("a2aTasksMaxConsumers = %d, want %d", a2aTasksMaxConsumers(agent), 10*7+reserve)
 	}
 	// A maxSessions lowered under the stored cap wins.
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: ptr.To(3)}}
+	agent.Spec.Harness.Tuning.MaxSessions = ptr.To(3)
 	if got := resolveA2AEffectiveSessions(agent); got != 3 {
 		t.Errorf("maxSessions 3 under a stored cap of 4 renders %d, want 3", got)
 	}
 	// On the fitted cap the narrowed install passes its own check: the
 	// provision script's refusal is not reached at the live width.
-	fitted := a2aTestAgent()
+	fitted := sessionRouteTestAgent()
 	fitted.Status.EffectiveSessionCap = ptr.To(4)
 	if code, stderr := runProvision(t, fitted, 110); code != 0 {
 		t.Errorf("a narrowed install's provision Job exits %d against the TASKS it was fitted to:\n%s", code, stderr)
@@ -491,13 +522,14 @@ func TestTheSessionCapSignalIsGatedOnChange(t *testing.T) {
 	}
 }
 
-// Through Reconcile, on an existing (provisioned) install: with the bus's
-// width unreadable and no stored cap, the provision Job is not created and the gateway keeps platform routing; once
-// the width reads, the Job is created at the fitted cap and the gateway
-// moves to the session route.
+// Through Reconcile, on an existing (provisioned) install that opts into the
+// session route: with the bus's width unreadable and no stored cap, the
+// provision Job is not created and the gateway routes to session at
+// maxSessions; once the width reads, the Job is created at the fitted cap
+// and the gateway's cap follows it.
 func TestTheProvisionJobWaitsForTheBusWidth(t *testing.T) {
-	agent := a2aTestAgent()
-	// An existing install, provisioned by the operator before the flip.
+	agent := sessionRouteTestAgent()
+	// An existing install, provisioned before it opted in.
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
 	r, cl, req := a2aGateTestReconciler(t, agent)
 	r.busStreamState = unreadableBus
@@ -523,8 +555,11 @@ func TestTheProvisionJobWaitsForTheBusWidth(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, gw); err != nil {
 		t.Fatalf("precondition: the gateway is not rendered: %v", err)
 	}
-	if v, _ := envValueCount(gw.Spec.Template.Spec.Containers[0].Env, a2aDefaultAddresseeEnvVar); v != agentv1alpha1.DefaultRoutePlatform {
-		t.Errorf("the waiting gateway routes to %q, want platform", v)
+	if v, _ := envValueCount(gw.Spec.Template.Spec.Containers[0].Env, a2aDefaultAddresseeEnvVar); v != agentv1alpha1.DefaultRouteSession {
+		t.Errorf("the waiting gateway routes to %q, want the session route it opted into", v)
+	}
+	if v, _ := envValueCount(gw.Spec.Template.Spec.Containers[0].Env, "A2A_MAX_SESSIONS"); v != "10" {
+		t.Errorf("the waiting gateway's A2A_MAX_SESSIONS = %q, want maxSessions", v)
 	}
 
 	r.busStreamState = tasksAt(110)
@@ -582,7 +617,7 @@ func routesRendered(t *testing.T, cl client.Client, agent *agentv1alpha1.Platfor
 // maxSessions from its first pass, never platform first, and creates its
 // provision Job without waiting on the bus's width.
 func TestAFreshInstallRendersTheSessionRouteOnce(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := sessionRouteTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
 	r.busStreamState = unreadableBus
 	ctx := context.Background()
@@ -629,7 +664,7 @@ func TestAFreshInstallRendersTheSessionRouteOnce(t *testing.T) {
 // cap and renders it, so the gateway and the platform agent each change
 // once, and the Job checks the fitted budget.
 func TestAnUpgradeOnAReadableBusRollsOnce(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := sessionRouteTestAgent()
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
 	r, cl, req := a2aGateTestReconciler(t, agent)
 	r.busStreamState = tasksAt(110)
@@ -687,7 +722,7 @@ func TestAnUpgradeOnAReadableBusRollsOnce(t *testing.T) {
 // memory and rendered, an unreadable pass keeps it rather than falling back,
 // and the field is not written again within the reprobe.
 func TestAPrunedSessionCapKeepsTheRenderedCap(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := sessionRouteTestAgent()
 	patches := 0
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
@@ -787,7 +822,7 @@ func TestTheSessionCapConditionFollowsTheGeneration(t *testing.T) {
 
 // The refusal names the effective cap it budgeted for, not maxSessions.
 func TestTheRefusalNamesTheFittedCap(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := sessionRouteTestAgent()
 	agent.Status.EffectiveSessionCap = ptr.To(4)
 	if msg := a2aProvisionRefusalStatus(agent); !strings.Contains(msg, "the session cap of 4") || strings.Contains(msg, "maxSessions=10 needs") {
 		t.Errorf("the refusal status does not name the fitted cap it budgeted:\n%s", msg)
@@ -797,13 +832,14 @@ func TestTheRefusalNamesTheFittedCap(t *testing.T) {
 	}
 }
 
-// While the operator's A2A_SESSION_CLUSTER_VIEW is on, the session default
-// does not engage: unset and explicit session both route to platform on both
-// containers, at maxSessions, and the condition says why. Off, the default
-// is session.
+// While the operator's A2A_SESSION_CLUSTER_VIEW is on, defaultRoute: session
+// does not engage: an explicit session routes to platform on both
+// containers, at maxSessions, and the condition says why. Off, it is
+// session. (An unset field is platform either way, and writes nothing:
+// TestTheDefaultPlatformRouteDoesNothingNew.)
 func TestTheClusterViewHoldsTheSessionDefaultOff(t *testing.T) {
 	ctx := context.Background()
-	for _, route := range []*string{nil, ptr.To(agentv1alpha1.DefaultRouteSession)} {
+	for _, route := range []*string{ptr.To(agentv1alpha1.DefaultRouteSession)} {
 		t.Run(ptr.Deref(route, "unset"), func(t *testing.T) {
 			t.Setenv(a2aSessionClusterViewEnvVar, "true")
 			r, cl, _, agent := sessionCapRig(t, func(a *agentv1alpha1.PlatformAgent) {
@@ -836,9 +872,9 @@ func TestTheClusterViewHoldsTheSessionDefaultOff(t *testing.T) {
 	})
 }
 
-// A cached reading is reused only behind a stored cap: an install whose cap
-// was cleared (the platform opt-out) and that returns to the session route
-// reads the bus again rather than refitting to the old reading.
+// A cached reading is not carried across a stay on the platform route: an
+// install that leaves the session route (its stored cap left as it was) and
+// returns reads the bus again rather than refitting to the old reading.
 func TestAClearedCapReadsTheBusAgain(t *testing.T) {
 	ctx := context.Background()
 	r, cl, _, agent := sessionCapRig(t, nil, tasksAt(110))
@@ -870,5 +906,154 @@ func TestNarrowingAgainAfterARecoveryWarnsAgain(t *testing.T) {
 		if n := len(drainEvents(rec)); n != want {
 			t.Errorf("step %d (width %d): %d Warnings, want %d", i+1, width, n, want)
 		}
+	}
+}
+
+// The platform route, which an unset defaultRoute resolves to, runs nothing
+// this file adds: through Reconcile on an existing (provisioned) install and
+// on a fresh one, with the operator's cluster view on and off, the bus's
+// monitoring endpoint is never read, no session cap or SessionCapFitted is
+// written, no Warning is recorded, the provision Job is created without
+// waiting, and the gateway, the platform agent container and the
+// hermes-bridge sidecar render platform at the configured cap, with TASKS'
+// budget and create width at the platform route's 3 a session.
+func TestTheDefaultPlatformRouteDoesNothingNew(t *testing.T) {
+	t.Run("the session cap writes no status on a fresh install", func(t *testing.T) {
+		writes := 0
+		agent := a2aTestAgent()
+		cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+			WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				writes++
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			}}).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+			t.Error("the platform route read the bus")
+			return nil, nil
+		}}
+		stored := storedCapAgent(t, cl, agent)
+		for i := 0; i < 3; i++ {
+			r.resolveA2ASessionCap(context.Background(), stored, stored.DeepCopy())
+		}
+		if writes != 0 {
+			t.Errorf("%d status writes from the session cap on a default install, want none", writes)
+		}
+	})
+	for _, tc := range []struct {
+		name        string
+		provisioned bool
+		clusterView bool
+	}{
+		{"fresh install", false, false},
+		{"existing install", true, false},
+		{"existing install with the cluster view on", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.clusterView {
+				t.Setenv(a2aSessionClusterViewEnvVar, "true")
+			}
+			agent := a2aTestAgent() // defaultRoute unset
+			if tc.provisioned {
+				setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+			}
+			r, cl, req := a2aGateTestReconciler(t, agent)
+			rec := record.NewFakeRecorder(256)
+			r.Recorder = rec
+			reads := 0
+			r.busStreamState = func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+				reads++
+				return map[string]a2aBusStream{a2aTasksStream: {MaxConsumers: ptr.To(64)}}, nil
+			}
+			ctx := context.Background()
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d: %v", i+1, err)
+				}
+			}
+			letTheGatewayThrough(t, ctx, cl, r, req, agent)
+			if reads != 0 {
+				t.Errorf("the platform route read the bus's streams %d times, want never", reads)
+			}
+			stored := storedCapAgent(t, cl, agent)
+			if stored.Status.EffectiveSessionCap != nil {
+				t.Errorf("status.effectiveSessionCap = %d on the platform route, want absent", *stored.Status.EffectiveSessionCap)
+			}
+			if c := meta.FindStatusCondition(stored.Status.Conditions, sessionCapFittedConditionType); c != nil {
+				t.Errorf("SessionCapFitted %+v on the platform route, want none", c)
+			}
+			for _, e := range drainEvents(rec) {
+				if strings.Contains(e, sessionCapFittedConditionType) {
+					t.Errorf("event %q on the platform route", e)
+				}
+			}
+			if resolveA2AEffectiveSessions(stored) != defaultA2AMaxSessions || a2aSessionCapWaiting(stored) {
+				t.Errorf("effective sessions %d, waiting %v; want maxSessions, not waiting", resolveA2AEffectiveSessions(stored), a2aSessionCapWaiting(stored))
+			}
+			jobs := &batchv1.JobList{}
+			if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs.Items) != 1 {
+				t.Fatalf("%d provision Jobs on the platform route, want the one, not held", len(jobs.Items))
+			}
+			script := jobs.Items[0].Spec.Template.Spec.Containers[0].Args
+			joined := strings.Join(script, "\n") + strings.Join(jobs.Items[0].Spec.Template.Spec.Containers[0].Command, "\n")
+			for _, want := range []string{"required_consumers=110\n", "--max-consumers=110 ", "fits=$(( (live_consumers - 80) / 3 ))"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("the platform route's provision script lacks %q", want)
+				}
+			}
+			if strings.Contains(joined, strconv.Itoa(a2aSessionsFitUnbounded)) {
+				t.Error("the platform route's provision script carries the session route's fit block")
+			}
+
+			gwRoute, gwCap, paRoute := routesRendered(t, cl, agent)
+			if gwRoute != agentv1alpha1.DefaultRoutePlatform || gwCap != "10" || paRoute != agentv1alpha1.DefaultRoutePlatform {
+				t.Errorf("gateway %q at A2A_MAX_SESSIONS %q, platform agent %q; want platform at 10 on both", gwRoute, gwCap, paRoute)
+			}
+			pa := &appsv1.Deployment{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gateway", Namespace: agent.Namespace}, pa); err != nil {
+				t.Fatalf("precondition: the platform agent Deployment is not rendered: %v", err)
+			}
+			bridge := false
+			for _, c := range pa.Spec.Template.Spec.Containers {
+				if c.Name == a2aBridgeContainerName {
+					bridge = true
+					if v, _ := envValueCount(c.Env, a2aDefaultAddresseeEnvVar); v != agentv1alpha1.DefaultRoutePlatform {
+						t.Errorf("the hermes-bridge sidecar carries %s=%q, want platform", a2aDefaultAddresseeEnvVar, v)
+					}
+				}
+			}
+			if !bridge {
+				t.Error("precondition: the hermes-bridge sidecar is not rendered")
+			}
+			q := buildA2ASessionQuota(stored)
+			if want := buildA2ASessionQuota(a2aTestAgent()); !q.Spec.Hard.Pods().Equal(*want.Spec.Hard.Pods()) {
+				t.Errorf("the session quota renders %s pods, want the configured %s", q.Spec.Hard.Pods(), want.Spec.Hard.Pods())
+			}
+			if a2aTasksConsumerBudget(stored) != 110 || a2aTasksMaxConsumers(stored) != 110 {
+				t.Errorf("TASKS budget %d, create width %d; want main's 110 and 110", a2aTasksConsumerBudget(stored), a2aTasksMaxConsumers(stored))
+			}
+		})
+	}
+}
+
+// A pruned status.effectiveSessionCap alone brings the steady-state requeue
+// down to the pruned-status reprobe, as the other pruned records do, so the
+// held-off write is retried on time rather than at the secret re-read's
+// interval.
+func TestAPrunedSessionCapAloneShortensTheRequeue(t *testing.T) {
+	agent := sessionRouteTestAgent()
+	r := &PlatformAgentReconciler{}
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("precondition: usageStatusRequeue with no record = %s, want %s", got, secretEnvReprobeInterval)
+	}
+	r.sessionCapPruned.Store(client.ObjectKeyFromObject(agent), time.Now())
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Errorf("usageStatusRequeue with only the session cap pruned = %s, want %s", got, usageStatusReprobeInterval)
+	}
+	r.sessionCapPruned.Store(client.ObjectKeyFromObject(agent), time.Now().Add(-2*sessionCapPrunedReprobe))
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Errorf("usageStatusRequeue after the record expired = %s, want %s", got, secretEnvReprobeInterval)
 	}
 }
