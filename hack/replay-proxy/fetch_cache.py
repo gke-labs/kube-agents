@@ -560,7 +560,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="the normalizer version to fetch (default: this checkout's)")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
-    parser.add_argument("--eval-mode-next", default="", help="the lane's EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="the lane's EVAL_FORGE (empty is github)")
     args = parser.parse_args(argv)
     if not args.print_commit and not args.dest:
@@ -571,7 +570,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # --print-commit keeps stdout for the commit alone.
         print(json.dumps(summary, sort_keys=True), file=sys.stderr if args.print_commit else sys.stdout)
         return 1
-    job = P.job_identity("", args.eval_mode_next, args.forge)
+    job = P.job_identity("", args.forge)
     fetcher = Fetcher(bucket=args.bucket, version=args.version, run=default_run,
                       max_age_hours=args.max_age_hours, max_bytes=args.max_bytes,
                       mode=job[P.JOB_MODE], forge=job[P.JOB_FORGE])

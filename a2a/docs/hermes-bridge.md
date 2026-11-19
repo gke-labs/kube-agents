@@ -61,7 +61,8 @@ of the same commit, so the two containers are one build. Otherwise - an agent im
 custom repository name, which has no bridge published beside it, or one pinned by digest
 alone, which the swap cannot carry over - it is the image the other release A2A images
 resolve to, derived from the operator image the way `A2A_GATEWAY_IMAGE` and the rest are
-when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Four
+when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`; on a chart
+install the value `hermesBridge.image` renders it. Four
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
@@ -184,20 +185,16 @@ meaning of the field - the capability switch above, and the reserved volume name
 webhook refuses. `POD_NAMESPACE` is the other name the render writes, but it goes in as a
 default a CR beats, so it overrides nothing.
 
-**Flipping to `mode: today` with a declared bridge still set takes the agent down.** A
-rendered bridge leaves the pod with the mode: the flip renders none, so it needs no CR edit
-first. A declared one does not leave. The operator copies `spec.deployment.sidecars` into
-the pod without consulting the mode, so the flip removes the NATS Service and leaves the
-bridge dialling a host that no longer resolves. Confirmed live 2026-09-05: the sidecar
-crash-loops, and because it shares the agent's pod the pod never reaches Ready - the whole
-agent is down, not merely carrying an A2A trace. On an install that declares its own
-bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any flip runbook
-for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
-follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
-that look like bus clients, flipped, and the saved list declared again once `next` is back;
-a CR with none, the lane's own, is only flipped. Asked to end under `today`
-(`ROLLBACK_END_MODE=today`, the today lane's run), it refuses a CR with declared sidecars before
-changing anything, since the last flip would leave them unset.
+**A declared bridge outlives the bus it dials.** The operator copies `spec.deployment.sidecars`
+into the pod as declared, so a declared bridge stays in the pod whatever happens to the NATS
+Service; a rendered one is the operator's and goes with the stack it renders. Confirmed live
+2026-09-05, when a flip to `spec.mode: today` still removed the bus: the sidecar crash-looped
+dialling a host that no longer resolved, and because it shared the agent's pod the pod never
+reached Ready - the whole agent was down, not merely carrying an A2A trace. The flip is gone (the
+webhook rewrites `today` to `next`, and `hack/rollback-roundtrip.sh`, which exercised it and
+refused a CR with declared sidecars, is deleted), but the shape remains: on an install that
+declares its own bridge, unset `spec.deployment.sidecars` _before_ removing the bus it dials. In
+any such runbook that step is a blocker, not tidiness.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -213,12 +210,13 @@ workflow publishes it as `hermes-bridge` beside the other first-party images, `F
 platform-agent image the same run pushed under the same commit tag, and `images.json`
 carries it with `A2A_BRIDGE_IMAGE` as its operator override, which the operator reads when
 it renders the bridge. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own in its
-`a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+`a2a-bridge` step on every build `hack/ci-deploy.sh` makes (the release-candidate path builds
+nothing), `FROM` the
 platform-agent image that same build produced, by the tag it just pushed and never from a
 registry default; the deploy then hands it to the operator as `A2A_BRIDGE_IMAGE`, with
 `A2A_BRIDGE_CONCURRENCY`, for the eval install, and leaves `A2A_BRIDGE_EXECUTOR` unset, so the
 eval runs the `api` executor a customer install runs (`docs/designs/eval-next-transport.md`,
-"The CI flag"). Either way the sidecar and the agent
+"The inject door on every lane"). Either way the sidecar and the agent
 container it shares a pod with are one build. The static `bridge` bus user the next section
 describes is the released mechanism, not scaffolding graduation removes: the password arrives
 as sidecar env from the operator's creds Secret, and it stays a password principal for the
@@ -246,7 +244,8 @@ subject under `chat.board.reply.gateway.`, the one namespace it may publish ther
 replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
 key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and the route reads nothing else
 ([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
-A request with a body is a board-health row's Retry or Drop instead (`lib.BoardAction`): the
+A request with a body is a board action instead (`lib.BoardAction`): a board-health row's Retry or
+Drop, or a tap on the Home tab's autonomy dial. The
 bridge relays its known fields to session-kv's `POST /v1/board/actions` on a goroutine of its own,
 so a snapshot is not held behind it, and answers with what session-kv said, or the error.
 
@@ -875,8 +874,8 @@ and a submission past it is finalized `failed` with `reason: bridge-queue-overfl
 infrastructure in the harness's classification. Size the parallelism against both: concurrency
 at or above the parallelism, and the number of submissions a run can have outstanding at once,
 the units in flight plus anything abandoned and not yet cancelled, well under the queue
-capacity. `hack/ci-deploy.sh` under `EVAL_MODE_NEXT=1` sets the operator's
-`A2A_BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`, and the operator renders that
+capacity. `hack/ci-deploy.sh` sets the operator's `A2A_BRIDGE_CONCURRENCY` to the run's
+`EVAL_TASK_PARALLELISM` on every eval install, and the operator renders that
 into the bridge. It sizes the TASKS consumer reserve from the same value, so a concurrency the
 stream cannot hold is a refused provision and a `Degraded` CR, not a silent shortfall. That
 read, the render in [Where it runs](#where-it-runs), the two env names it writes on every

@@ -11,7 +11,7 @@
 {{- $personaRepo := include "kube-agents.imageRepository" (dict "repository" $tse.persona.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
 {{- $personaTag := ($tse.persona.image.tag | default $defaultTag) | toString -}}
 {{- $harnessRepo := include "kube-agents.imageRepository" (dict "repository" $tse.harness.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
-{{- $harnessTag := ($tse.harness.image.tag | default $defaultTag) | toString -}}
+{{- $harnessTag := ($tse.harness.image.tag | default $defaultTag) | toString }}
 ---
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile
@@ -54,7 +54,7 @@ spec:
 {{- end }}
 {{- /*
 The generic cluster agent (#3658): one AgentProfile for every cluster in scope,
-with the target named per task by the project, location and cluster
+with the target named per task by the project, cluster and location
 parameters. Its persona is agents/cluster/persona, published as the
 persona-cluster image, and its worker pods come from the profile dispatcher,
 so no pod runs it until the dispatcher, the worker and the pool land (#4148,
@@ -70,7 +70,7 @@ holds them equal until it does.
 {{- $personaRepo := include "kube-agents.imageRepository" (dict "repository" $cluster.persona.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
 {{- $personaTag := ($cluster.persona.image.tag | default $defaultTag) | toString -}}
 {{- $harnessRepo := include "kube-agents.imageRepository" (dict "repository" $cluster.harness.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
-{{- $harnessTag := ($cluster.harness.image.tag | default $defaultTag) | toString -}}
+{{- $harnessTag := ($cluster.harness.image.tag | default $defaultTag) | toString }}
 ---
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentProfile

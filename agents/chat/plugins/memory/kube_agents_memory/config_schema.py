@@ -23,6 +23,7 @@ DEFAULT_BANK_ID = "kube-agents-memory"
 # The tag every organisation-wide fact carries. Anything without it is only ever
 # returned to the one user whose tag it bears.
 SHARED_TAG = "scope:shared"
+HANDOFF_TAG = "kind:handoff"
 USER_TAG_PREFIX = "user:"
 
 # Excludes untagged rows. See the package docstring — `any` would not.
@@ -155,3 +156,4 @@ def thread_sessions_are_per_user() -> bool:
     except Exception as e:
         logger.debug("Could not read thread_sessions_per_user, assuming shared: %s", e)
     return False
+

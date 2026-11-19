@@ -90,12 +90,20 @@ const (
 	RBACIncompleteCause = "the ClusterRole or namespaced Role bound to the operator is older than this image; " +
 		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together"
 	// rbacAgentNamespaceCause follows RBACIncompleteCause on a condition whose
-	// denials include a PlatformAgent's own namespace: that one is not skew but
-	// a Role and RoleBinding nobody installs by default. A RoleBinding can name
-	// a Role in its own namespace only, so the Role is copied, not referenced.
+	// denials include a PlatformAgent's own namespace or its profile namespace:
+	// that one is not skew but a missing Role and RoleBinding. Both install
+	// paths render them in the install namespace and its profile namespace, so
+	// the fix there is the upgrade, not a hand-made Role: Helm refuses to adopt
+	// one on the next upgrade, so a hand-made copy goes first. A namespace
+	// neither path renders into (an agent created elsewhere; a profile
+	// namespace made by hand under a chart with platformAgent.enabled false)
+	// gets them by hand. A RoleBinding can name a Role in its own namespace
+	// only, so the Role is copied, not referenced.
 	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no copy of the " +
-		"operator's namespaced Role and no RoleBinding to it; create both there (the chart and make deploy " +
-		"render them in the install namespace and in its profile namespace)"
+		"operator's namespaced Role and no RoleBinding to it; for the install namespace's profile namespace " +
+		"(<install namespace>-profiles), which the chart and make deploy render into, delete any hand-made copy " +
+		"and run helm upgrade or make deploy; a namespace neither path renders into (an agent's namespace " +
+		"elsewhere, or a profile namespace made by hand with platformAgent.enabled false) gets both by hand"
 	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
 	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
 	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
@@ -117,7 +125,7 @@ const (
 	// "create secrets (in namespace team-a)", "create deployments.apps (in
 	// namespace kubeagents-system-profiles)". The namespaced Role is bound in
 	// the install namespace and the profile namespace by both install paths
-	// (the chart under mode next, make deploy in every mode); those two
+	// (the chart and make deploy alike, in every mode); those two
 	// namespaces, and an agent elsewhere, are what the operator-namespace
 	// probe cannot see.
 	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
@@ -205,7 +213,7 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	// The bus StatefulSet's revisions: which profiles every server has
-	// loaded (a2aClusterLoadedProfiles).
+	// loaded (a2aRevisionLoadedProfiles).
 	{Group: "apps", Resources: []string{"controllerrevisions"}, Verbs: []string{"get"}},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},

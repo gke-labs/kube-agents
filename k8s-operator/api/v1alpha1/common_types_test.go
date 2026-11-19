@@ -321,3 +321,39 @@ func TestBusCredentialRoutes(t *testing.T) {
 		})
 	}
 }
+
+func TestUniverseDomainUnderGoogleapisIsRefused(t *testing.T) {
+	// <service>.mtls.googleapis.com is a host of the commercial universe, so a
+	// domain under googleapis.com names no other universe.
+	for _, under := range []string{"mtls.googleapis.com", " MTLS.GoogleAPIs.com. ", "a.b.googleapis.com"} {
+		if got, ok := NormalizeUniverseDomain(under); ok {
+			t.Errorf("NormalizeUniverseDomain(%q) = (%q, true), want refused", under, got)
+		}
+	}
+	for _, under := range []string{"mtls.googleapis.com", "a.b.googleapis.com"} {
+		if IsValidUniverseDomain(under) {
+			t.Errorf("IsValidUniverseDomain(%q) = true, want false", under)
+		}
+		if !IsUnderCommercialUniverseDomain(under) {
+			t.Errorf("IsUnderCommercialUniverseDomain(%q) = false, want true", under)
+		}
+	}
+	// The commercial domain itself, and domains that only look like it, are as before.
+	for raw, want := range map[string]string{
+		"googleapis.com":         "googleapis.com",
+		" GoogleAPIs.com. ":      "googleapis.com",
+		"notgoogleapis.com":      "notgoogleapis.com",
+		"googleapis.com.example": "googleapis.com.example",
+		"universe.example.test":  "universe.example.test",
+	} {
+		if got, ok := NormalizeUniverseDomain(raw); !ok || got != want {
+			t.Errorf("NormalizeUniverseDomain(%q) = (%q, %v), want (%q, true)", raw, got, ok, want)
+		}
+		if !IsValidUniverseDomain(want) {
+			t.Errorf("IsValidUniverseDomain(%q) = false, want true", want)
+		}
+		if IsUnderCommercialUniverseDomain(want) {
+			t.Errorf("IsUnderCommercialUniverseDomain(%q) = true, want false", want)
+		}
+	}
+}

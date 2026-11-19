@@ -222,13 +222,12 @@ user" clauses here. Agents with a user in the loop follow this file.
 
 ### The behavioural presubmit gate
 
-`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
-install (3 repetitions per active case, 1.5–3.5 hours). Non-inert
+`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` through the A2A
+gateway's inject door (3 repetitions per active case, 1.5–3.5 hours). Non-inert
 pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
 `main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
 or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
-inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
-mode and rollback: optional `pull-kube-agents-smoke-test-today` (round-trip PRs or `/test`).
+inconsistent liveness signals; a run-less record is infrastructure unless every case is one).
 Roster, inject-lane exclusions: `docs/eval-gate-roster.md`; verdict ladder:
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2. On a red, read the
 health bot comment and <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>:
@@ -289,7 +288,7 @@ reviewer, not another edit.
 with its commit named, or the finding is factually wrong against `main` (not a stale checkout) and
 you have said why. Resolve a `kube-agents-bot` finding you decline or defer once your reply gives
 the reason (and any follow-up issue) and **Self-Review** names it, and the description thread once
-the body is edited: an open thread hides the PR from its reviewer
+the body is edited: an open thread blocks the merge
 ([why](docs/pull-request-workflow.md#who-owns-an-open-pull-request)). Unresolve it if a reviewer
 asks for the fix. A person's thread is different: a judgment call, a declined ask, or an unanswered
 rebuttal stays open with a reply; resolving does not end a disagreement. Reply first:

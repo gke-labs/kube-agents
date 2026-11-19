@@ -42,9 +42,11 @@ persona says:
    cluster": the front door has no cluster tools, and its way to confirm is a
    card whose first step does (agents/chat/SOUL.md, section 2, step 3).
 
-Only the ``today`` path needs this. Under ``spec.mode: next`` the A2A gateway
-fetches no thread history (``a2a/gateway/slack.go``, ``inbound``), so the model
-never sees a context block there.
+Only the Hermes Slack platform needs this, and the operator renders it on no
+install now; the patch stays with the code the image still carries. The A2A
+gateway fetches no thread history
+(``a2a/gateway/slack.go``, ``inbound``), so the model never sees a context
+block there.
 """
 
 from __future__ import annotations

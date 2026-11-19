@@ -73,23 +73,37 @@ const (
 	CloudSDKEndpointOverridesEnvPrefix = "CLOUDSDK_API_ENDPOINT_OVERRIDES_"
 )
 
+// commercialUniverseSuffix ends every name under the commercial universe
+// domain. <service>.mtls.googleapis.com and the like are hosts of that
+// universe, so such a name is no other universe's domain.
+const commercialUniverseSuffix = "." + DefaultUniverseDomain
+
 var universeDomainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
 // NormalizeUniverseDomain trims whitespace and a single trailing DNS dot,
 // lowercases the candidate, and validates it as a multi-label DNS hostname of
-// at most MaxUniverseDomainLength bytes.
+// at most MaxUniverseDomainLength bytes that is not under
+// DefaultUniverseDomain.
 func NormalizeUniverseDomain(raw string) (string, bool) {
 	candidate := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
-	if candidate == "" || len(candidate) > MaxUniverseDomainLength || !universeDomainRegex.MatchString(candidate) {
+	if !IsValidUniverseDomain(candidate) {
 		return "", false
 	}
 	return candidate, true
 }
 
 // IsValidUniverseDomain reports whether raw is already a canonical lower-case
-// multi-label DNS hostname within MaxUniverseDomainLength.
+// multi-label DNS hostname within MaxUniverseDomainLength, and not a name
+// under DefaultUniverseDomain.
 func IsValidUniverseDomain(raw string) bool {
-	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw)
+	return len(raw) <= MaxUniverseDomainLength && universeDomainRegex.MatchString(raw) &&
+		!IsUnderCommercialUniverseDomain(raw)
+}
+
+// IsUnderCommercialUniverseDomain reports whether domain is a name under
+// DefaultUniverseDomain, such as mtls.googleapis.com.
+func IsUnderCommercialUniverseDomain(domain string) bool {
+	return strings.HasSuffix(domain, commercialUniverseSuffix)
 }
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -663,10 +677,12 @@ type ShellSandboxSpec struct {
 	// wholesale: a CR that sets only requests.memory keeps the default 200m CPU
 	// request, 2 CPU limit and 2Gi memory limit. The shell is where every
 	// model-authored command runs, so a fleet sweep that fans out many kubectl
-	// calls at once is bounded by this container's memory; on GKE Autopilot
-	// without bursting the limits are set equal to the requests, so there
-	// requests.memory is the figure to raise when the shell pod is OOM-killed,
-	// with limits.memory to match. Only cpu, memory and ephemeral-storage are
+	// calls at once is bounded by this container's memory. The sandbox's
+	// memory guard stops the largest command before the container reaches its
+	// limit and logs a shell-memory-guard "killed" line, or a "no-candidate"
+	// line when many small commands fill it; either is the sign to raise it; on GKE Autopilot without bursting the limits are set equal to
+	// the requests, so there requests.memory is the figure to raise, with
+	// limits.memory to match. Only cpu, memory and ephemeral-storage are
 	// accepted: the container declares cpu and memory, and an
 	// ephemeral-storage limit set alone becomes its request by the API
 	// server's defaulting. The operator refuses a
@@ -1023,7 +1039,7 @@ type TuningSpec struct {
 	//
 	// Unset means 10, the operator's default - a "busy day" sizing: at the
 	// session-pod shape's default requests (150m CPU / 320Mi, SessionResources)
-	// ten concurrent sessions hold 1.5 CPU / 3.2Gi, which a small dev cluster
+	// ten concurrent sessions hold 1.5 CPU / about 3.1Gi, which a small dev cluster
 	// absorbs without preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
@@ -1550,7 +1566,8 @@ type DeploymentSpec struct {
 
 	// AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
 	// native container that authenticates the agent's API-server calls and also
-	// runs the event watcher and the drift detector.
+	// runs the event watcher and the drift detector, and the audit-report store
+	// listener on 8700, which renders with the A2A stack on every install.
 	// +optional
 	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
 
@@ -3318,6 +3335,33 @@ type AgentUsageStatus struct {
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
+	// AutonomousNegativeFeedbackTotal is the cumulative count of
+	// thumbs-downs verified chat users gave the posts the agent made on its
+	// own (alerts and scheduled or audit reports), counted apart from the
+	// answers NegativeFeedbackTotal counts so a thumbs-down on a noisy alert
+	// reads as noise rather than a bad answer:
+	// kubeagents_a2a_gateway_post_feedback_total under rating down, summed
+	// over its other labels, one count each time a user's rating of a post
+	// becomes down, so a repeated tap adds nothing. Read every five minutes
+	// and kept monotonic the same way as ToolExecutionsTotal. Next mode
+	// only: on a today-mode install this stays at 0. Does not move
+	// LastActiveTime: a rating is a person's verdict on a post, not the
+	// agent at work.
+	// +optional
+	AutonomousNegativeFeedbackTotal int64 `json:"autonomousNegativeFeedbackTotal,omitempty"`
+	// AutonomousPositiveFeedbackTotal is the cumulative count of thumbs-ups
+	// verified chat users gave the posts the agent made on its own (alerts
+	// and scheduled or audit reports), counted apart from the answers
+	// PositiveFeedbackTotal counts so a post's rating never reads as an
+	// answer's: kubeagents_a2a_gateway_post_feedback_total under rating up,
+	// summed over its other labels, one count each time a user's rating of a
+	// post becomes up, so a repeated tap adds nothing. Read every five
+	// minutes and kept monotonic the same way as ToolExecutionsTotal. Next
+	// mode only: on a today-mode install this stays at 0. Does not move
+	// LastActiveTime: a rating is a person's verdict on a post, not the
+	// agent at work.
+	// +optional
+	AutonomousPositiveFeedbackTotal int64 `json:"autonomousPositiveFeedbackTotal,omitempty"`
 	// InputTokensTotal is the cumulative count of prompt tokens the inference
 	// gateway (LiteLLM) billed for the install's model calls, every model and
 	// every caller together. Read every five minutes from each LiteLLM pod's
@@ -3531,9 +3575,10 @@ type AgentUsageStatus struct {
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
 	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
-	// NegativeFeedbackTotal, PositiveFeedbackTotal and the three inference
-	// totals (InputTokensTotal, OutputTokensTotal, SpendMicrosUSDTotal) alone
-	// leave it where it was, and the six proposal readings never move it.
+	// NegativeFeedbackTotal, PositiveFeedbackTotal, the two autonomous
+	// feedback totals and the three inference totals (InputTokensTotal,
+	// OutputTokensTotal, SpendMicrosUSDTotal) alone leave it where it was,
+	// and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

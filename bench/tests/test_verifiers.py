@@ -4743,6 +4743,51 @@ def test_finding_objects_mirrors_the_renderers_reader():
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
         _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "no-memory-limit",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
+        _ledger_body(
+            findings=(
+                f"<!-- audit-listed:begin -->\n"
+                + renderer.render_listed_finding(
+                    {
+                        "id": named[0],
+                        "check": "default-sa-automount",
+                        "severity": "major",
+                        "title": "t",
+                        "cluster": "seeded-a",
+                        "namespace": "seeded-workloads",
+                        "object": "Deployment/memory-unbounded-worker",
+                        "remediation": {
+                            "note": (
+                                f"{renderer.SHARED_ACCOUNT_SHIELD_PREFIX}"
+                                " `Deployment/other` (org/repo:notes/sa.md) — "
+                                "kept `kind: manual` so the namespace-wide ServiceAccount patch is not proposed."
+                            )
+                        },
+                    },
+                    new=True,
+                )
+                + "\n<!-- audit-listed:end -->\n"
+            ),
+            finding_ids=named,
+        ),
         _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
         _ledger_body(
             findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
@@ -5533,7 +5578,7 @@ def test_a_nan_header_waits_as_if_absent(monkeypatch):
     monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
     assert verifiers._forge_rate_limit_wait({"Retry-After": "nan"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
     monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
-    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Reset": "1100"}) == 101.0
+    assert verifiers._forge_rate_limit_wait({"Retry-After": "nan", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100"}) == 101.0
 
 
 def test_a_429_on_the_commits_page_names_the_limit(token, github):
@@ -7274,10 +7319,51 @@ def test_a_local_token_and_a_permission_403_never_wait(monkeypatch, tmp_path):
     assert slept == []
 
 
+def test_a_secondary_limit_with_budget_left_waits_the_default_not_the_reset(monkeypatch):
+    """#6177: X-RateLimit-Reset is when the hourly budget returns, so it is
+    the wait only when that budget is spent; a secondary limit with budget
+    left waits the default, not up to a slice."""
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+    monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "3000"}) == verifiers._FORGE_RATE_LIMIT_DEFAULT_WAIT_SEC
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}) == 121.0
+
+
+def test_a_token_renewal_during_the_wait_does_not_stop_it(monkeypatch, tmp_path):
+    """#6177: the job renews the grading token file every 40 minutes. A
+    renewal while the read waits must not make the next pass read the sent
+    token as someone else's and stop waiting."""
+    sent = _ci_grading_token(monkeypatch, tmp_path)
+    monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
+
+    def renew_while_sleeping(_seconds):
+        (tmp_path / "t").write_text("ghs_renewed\n")
+
+    monkeypatch.setattr(verifiers.time, "sleep", renew_while_sleeping)
+    monkeypatch.setattr(verifiers, "_http_get_json", _limited_then([
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (403, _INSTALLATION_LIMIT, {"Retry-After": "60"}),
+        (200, [], None),
+    ]))
+    assert verifiers._forge_get_json("https://api.github.com/x", sent, 1.0) == (200, [])
+
+
+def test_a_gitlab_limit_is_named_as_gitlabs(monkeypatch):
+    """#6177: only GitHub's evals repositories share one installation, so a
+    GitLab 429 names GitLab and not the shared budget."""
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "gitlab")
+    verifiers._last_forge_error_headers.set(None)
+    reason = verifiers._rate_limit_reason(429, None, "the issue")
+    assert reason.startswith("GitLab rate-limited")
+    assert "installation" not in reason
+    monkeypatch.setenv(forges.FORGE_ENV_VAR, "github")
+    assert "installation" in verifiers._rate_limit_reason(429, None, "the issue")
+
+
 def test_a_past_reset_waits_the_floor_and_an_infinite_budget_is_capped(monkeypatch):
     monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "600")
     monkeypatch.setattr(verifiers.time, "time", lambda: 1000.0)
-    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
+    assert verifiers._forge_rate_limit_wait({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "900"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
     assert verifiers._forge_rate_limit_wait({"Retry-After": "0"}) == verifiers._FORGE_RATE_LIMIT_FLOOR_SEC
     monkeypatch.setenv("BENCH_FORGE_RATE_LIMIT_WAIT_SEC", "inf")
     assert verifiers._forge_rate_limit_budget() == verifiers._FORGE_RATE_LIMIT_BUDGET_SEC
@@ -8490,9 +8576,16 @@ def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, fa
 
 
 _WEBHOOK_RUN = "the-readiness-run-happened"
-# The route objective's whole check, the run it requires and the hand survey it forbids, so the
-# table below exercises both halves as the case runs them.
-_WEBHOOK_RUN_CHECK = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# The route objective is two members under `all`. The first reads the card log's rows: the run it
+# requires and the hand survey it forbids, and the table below exercises both halves on rows. The
+# second reads the same forbidden survey on each worker call as typed; the tests further down grade
+# the two together, as the case runs them.
+_WEBHOOK_RUN_ENTRY = next(e for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+# Read by what each member holds, so that a changed case fails its pin test below and not the
+# import of this file.
+_WEBHOOK_RUN_MEMBERS = _WEBHOOK_RUN_ENTRY["check"].get("checks") or [_WEBHOOK_RUN_ENTRY["check"]]
+_WEBHOOK_RUN_CHECK = next(m for m in _WEBHOOK_RUN_MEMBERS if m.get("required_runs"))
+_WEBHOOK_TYPED_CHECK = next((m for m in _WEBHOOK_RUN_MEMBERS if m.get("after_result_pattern") is not None), {})
 _WEBHOOK_RUNS = _WEBHOOK_RUN_CHECK["required_runs"]
 _SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
 _SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
@@ -8744,7 +8837,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
 
 def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
     # The forbid, not the run reader, is what refuses a survey that stands beside the dictated
-    # run: with the survey the objective fails and names the pattern; without it, it passes.
+    # run: with the survey the rows member fails and names the pattern; without it, it passes.
     _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get pdb -A -o json"])
     res = WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0)
     assert res.status == "fail" and "forbidden run" in res.reason and "kubectl ran as" in res.reason, res.reason
@@ -8755,6 +8848,115 @@ def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
 
     with pytest.raises(ValueError):
         WorkerRun(script="kubectl", word_patterns=["("])
+
+
+_ROUTE_RUN = f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/r.json"
+# The survey as a worker types it over several kubeconfigs: one call, four lines.
+_SURVEY_LOOP = 'for f in /data/kubeconfig_*.yaml; do\n  echo "=== $f ==="\n  kubectl --kubeconfig="$f" get pdb -A\ndone'
+
+
+def _as_row(command: str) -> str:
+    """A call as the card log shows it: on one line."""
+    return " ".join(command.split())
+
+
+def _route_objective(entries, rows=None) -> str:
+    """The whole objective as the case runs it, on the calls as typed and on the card log's rows
+    (each call on one line, unless `rows` names them)."""
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries] if rows is None else rows)
+    return VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status
+
+
+def test_the_route_objective_has_the_same_forbidden_survey_in_both_members():
+    assert _WEBHOOK_RUN_ENTRY["check"]["type"] == "all" and len(_WEBHOOK_RUN_MEMBERS) == 2
+    assert _WEBHOOK_TYPED_CHECK["forbidden_runs"] == _WEBHOOK_RUN_CHECK["forbidden_runs"]
+    assert set(_WEBHOOK_TYPED_CHECK) == {"type", "after_result_pattern", "forbidden_runs"}
+
+
+def test_the_route_objective_sees_a_survey_on_a_later_line_of_a_call():
+    # On the row the loop is one line and `kubectl` reads as a word of the `echo`, so the rows
+    # member passes it; the typed member reads each line as an argv of its own.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=2)]
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    typed = WorkerCommandsVerifier(**_WEBHOOK_TYPED_CHECK).verify(5.0)
+    assert typed.status == "fail" and "kubectl ran as" in typed.reason, typed.reason
+    assert _route_objective(entries) == "fail"
+
+
+@pytest.mark.parametrize(
+    "calls, on_rows, verdict",
+    [
+        # the dictated run alone, and beside a kubectl that is not the survey
+        ([_ROUTE_RUN], "pass", "pass"),
+        ([_ROUTE_RUN, "for c in a b; do\n  kubectl --context $c get nodes\ndone"], "pass", "pass"),
+        # the survey on a later line, which the rows member does not see: in a loop, after an
+        # `echo`, after a `cd`, and on a line that a backslash continues
+        ([_ROUTE_RUN, _SURVEY_LOOP], "pass", "fail"),
+        ([_ROUTE_RUN, 'echo "webhooks next"\nkubectl get validatingwebhookconfigurations -o json'], "pass", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c describe pdb pinned-batch-runner -n seeded-upgrade"], "pass", "fail"),
+        ([_ROUTE_RUN, "cd /opt/data/scratch\nkubectl --context c \\\n  get pdb -A"], "pass", "fail"),
+        # the survey with no run at all: the rows member already fails it, on the missing run
+        ([_SURVEY_LOOP], "fail", "fail"),
+        # a mention on a later line is one word and no command
+        ([_ROUTE_RUN, 'cd /opt/data/scratch\ngrep -n "kubectl get pdb -A" notes.md'], "pass", "pass"),
+        ([_ROUTE_RUN, 'echo "next step"\necho "not running kubectl get validatingwebhookconfigurations"'], "pass", "pass"),
+        # Known limit: a heredoc body is read line by line, so a survey line fails in a script
+        # that never ran and in a notes file alike.
+        ([_ROUTE_RUN, "cat > /tmp/later.sh <<'EOF'\nkubectl get pdb -A\nEOF"], "pass", "fail"),
+        ([_ROUTE_RUN, "cat > /opt/data/scratch/notes.md <<'EOF'\nTo check by hand:\nkubectl get pdb -A\nEOF"], "pass", "fail"),
+        # Known limit: neither member reads a survey whose resource comes from a variable.
+        ([_ROUTE_RUN, "for r in pdb validatingwebhookconfigurations; do\n  kubectl get $r -A\ndone"], "pass", "pass"),
+    ],
+)
+def test_the_route_objective_reads_each_typed_line_as_a_command(calls, on_rows, verdict):
+    entries = [_terminal(command, at=index) for index, command in enumerate(calls, 1)]
+    _stash_terminal(entries, commands=[_as_row(e["args"]["command"]) for e in entries])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == on_rows, calls
+    assert _route_objective(entries) == verdict, calls
+
+
+def test_the_route_objective_does_not_read_a_survey_that_a_program_runs():
+    # Known limit: the typed read splits shell text into argvs; it does not read what a program
+    # in `execute_code` starts.
+    program = {"code": 'import subprocess\nsubprocess.run(["kubectl", "get", "pdb", "-A"])'}
+    entries = [_terminal(_ROUTE_RUN, at=1), {**_terminal("", at=2, args=program), "name": "execute_code"}]
+    _stash_terminal(entries, commands=[_as_row(_ROUTE_RUN)])
+    assert VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status == "pass"
+
+
+def test_the_route_objective_is_an_error_when_a_typed_call_has_no_time():
+    # Known limit: an untimed call makes the typed member `error`, also beside a survey it can see.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal("kubectl get nodes", at=None)]
+    assert _route_objective(entries) == "error"
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, at=None)]
+    assert _route_objective(entries) == "error"
+
+
+def test_the_route_objective_sees_a_survey_the_row_shows_as_a_count():
+    # The card log shows a chain as its first command and a count; the typed call keeps the chain.
+    entries = [_terminal(f"{_ROUTE_RUN} && kubectl --context c get pdb -A", at=1)]
+    assert _route_objective(entries, rows=[f"{_ROUTE_RUN} + 1 command"]) == "fail"
+
+
+def test_the_route_objective_fails_a_typed_survey_that_the_terminal_refused():
+    # The typed read does not know whether a call ran: an attempt at the survey fails too.
+    entries = [_terminal(_ROUTE_RUN, at=1), _terminal(_SURVEY_LOOP, _REFUSAL, at=2)]
+    assert entries[1]["status"] == "error"
+    assert _route_objective(entries) == "fail"
+
+
+def test_the_route_objective_still_reads_a_survey_that_only_the_card_log_has():
+    entries = [_terminal(_ROUTE_RUN, at=1)]
+    assert _route_objective(entries, rows=[_as_row(_ROUTE_RUN), "kubectl --context c get pdb -A"]) == "fail"
+
+
+def test_the_route_objective_is_an_error_without_a_readable_typed_call():
+    # Known limit: with no tagged worker call the typed member cannot say that no survey ran,
+    # so the objective is `error` and not a pass, although the rows member passes.
+    _stash_commands([_as_row(_ROUTE_RUN)])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    assert VerifierAgent().run_entry(VerificationEntry(**_WEBHOOK_RUN_ENTRY), timeout_sec=10.0).status == "error"
 
 
 def test_worker_commands_required_run_names_what_did_not_run():

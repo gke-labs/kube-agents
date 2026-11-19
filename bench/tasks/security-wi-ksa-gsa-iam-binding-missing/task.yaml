@@ -10,7 +10,7 @@
 id: security-wi-ksa-gsa-iam-binding-missing
 name: "Workload Identity Annotation With No workloadIdentityUser Binding Behind It (KSA-to-GSA binding check)"
 domain: security
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - compliance-audit

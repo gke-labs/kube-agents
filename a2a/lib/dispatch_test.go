@@ -520,6 +520,74 @@ func TestTheOperatorsDrainingDispatchConfigDecodesAndValidates(t *testing.T) {
 	}
 }
 
+// A profile's scripts are checked as the CRD writes them (#5622): a name
+// that's a subject token, once; a path under the script root with no "." or
+// ".." segment, no empty segment and no shell metacharacter; and a timeout
+// within the profile's deadline. A bad one fails the whole config, which the
+// dispatcher then doesn't take.
+func TestADispatchConfigsScriptsAreChecked(t *testing.T) {
+	script := func(name, path string, timeout int) func(*DispatchConfig) {
+		return func(c *DispatchConfig) {
+			c.Profiles[0].Scripts = []DispatchScript{{Name: name, Path: path, TimeoutSeconds: timeout}}
+		}
+	}
+	good := validDispatchConfig()
+	script("stall-watch", ScriptRoot+"helpers/stall_watch.py", 1800)(&good)
+	if err := good.Validate(); err != nil {
+		t.Fatalf("a good script: %v", err)
+	}
+	if sc, ok := good.Profiles[0].Script("stall-watch"); !ok || sc.Path != ScriptRoot+"helpers/stall_watch.py" {
+		t.Errorf("Script(stall-watch) = %+v, %v", sc, ok)
+	}
+	if _, ok := good.Profiles[0].Script("other"); ok {
+		t.Error("Script found a script the profile doesn't list")
+	}
+	for name, edit := range map[string]func(*DispatchConfig){
+		"name not a token":      script("stall.watch", ScriptRoot+"a.py", 60),
+		"relative path":         script("s", "helpers/a.py", 60),
+		"outside the root":      script("s", "/usr/bin/env", 60),
+		"root's sibling":        script("s", "/opt/kube-agents/scriptsx/a.py", 60),
+		"the root itself":       script("s", ScriptRoot, 60),
+		"dot-dot segment":       script("s", ScriptRoot+"../../bin/sh", 60),
+		"dot-dot inside":        script("s", ScriptRoot+"a/../b.py", 60),
+		"dot segment":           script("s", ScriptRoot+"./a.py", 60),
+		"empty segment":         script("s", ScriptRoot+"a//b.py", 60),
+		"trailing slash":        script("s", ScriptRoot+"a/", 60),
+		"shell metacharacter":   script("s", ScriptRoot+"a.py;id", 60),
+		"space":                 script("s", ScriptRoot+"a b.py", 60),
+		"newline":               script("s", ScriptRoot+"a.py\n", 60),
+		"no timeout":            script("s", ScriptRoot+"a.py", 0),
+		"timeout over deadline": script("s", ScriptRoot+"a.py", 1801),
+		"listed twice": func(c *DispatchConfig) {
+			sc := DispatchScript{Name: "s", Path: ScriptRoot + "a.py", TimeoutSeconds: 60}
+			c.Profiles[0].Scripts = []DispatchScript{sc, sc}
+		},
+	} {
+		c := validDispatchConfig()
+		c.Profiles = append([]DispatchProfile(nil), c.Profiles...)
+		edit(&c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "script") {
+			t.Errorf("%s: Validate = %v, want a script error", name, err)
+		}
+	}
+}
+
+// The script root and path shape are the AgentProfile CRD's, so a path the
+// API server admits is one the dispatcher takes: a CRD path its config check
+// refused would stop the dispatcher taking any new config at all.
+func TestScriptPathIsTheCRDs(t *testing.T) {
+	crd, err := os.ReadFile("../../charts/kube-agents/crds/kubeagents.x-k8s.io_agentprofiles.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "pattern: " + ScriptPath.String(); !strings.Contains(string(crd), want) {
+		t.Errorf("the AgentProfile CRD has no %q", want)
+	}
+	if !strings.HasPrefix(ScriptPath.String(), "^"+ScriptRoot) {
+		t.Errorf("ScriptPath %s doesn't start at ScriptRoot %s", ScriptPath, ScriptRoot)
+	}
+}
+
 // A profile names its Job template by reference or carries it inline, never
 // both, and a reference needs an object name and a hash.
 // A hash-only ref is valid from #5479 (TestAJobTemplateRefMayCarryOnlyItsHash).
@@ -534,7 +602,7 @@ func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("a well-formed reference was refused: %v", err)
 	}
-	if !ok.Profiles[0].HasJobTemplate() {
+	if !ok.Profiles[0].HasJobTemplate("unattended") {
 		t.Error("a profile naming a template doesn't run as Jobs")
 	}
 	for name, mutate := range map[string]func(*DispatchProfile){
@@ -555,7 +623,7 @@ func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
 			}
 		})
 	}
-	if (DispatchProfile{}).HasJobTemplate() {
+	if (DispatchProfile{}).HasJobTemplate("unattended") {
 		t.Error("a profile with no template runs as Jobs")
 	}
 }
@@ -577,5 +645,58 @@ func TestTheSupervisorFormIsEmptyOrProfile(t *testing.T) {
 	c.ProfileSupervisorForm = "six"
 	if err := c.Validate(); err == nil {
 		t.Error("an unknown profileSupervisorForm validated")
+	}
+}
+
+// A per-tier reference covers each live tier and no draining one; one that
+// isn't per tier, or an inline template, is the unattended-mode tier's alone,
+// which the caller holds the tier to (#5646).
+func TestHasJobTemplateIsPerTierOnlyUnderAPerTierReference(t *testing.T) {
+	perTier := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"},
+		DrainingTiers:  []DrainingTier{{Tier: "triage", Until: time.Now().Add(time.Hour)}},
+		JobTemplateRef: &DispatchJobTemplateRef{Hash: "h", PerTier: true}}
+	legacy := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"}, JobTemplateRef: &DispatchJobTemplateRef{Hash: "h"}}
+	inline := DispatchProfile{Name: "tse", Tiers: []string{"read", "unattended"}, JobTemplate: json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)}
+	for _, c := range []struct {
+		name    string
+		p       DispatchProfile
+		tier    string
+		has     bool
+		perTier bool
+	}{
+		{"per tier, read", perTier, "read", true, true},
+		{"per tier, unattended", perTier, "unattended", true, true},
+		{"per tier, draining", perTier, "triage", false, true},
+		{"per tier, unknown", perTier, "nope", false, true},
+		{"unattended only", legacy, "read", true, false},
+		// Not held to the profile's tiers: the caller holds the tier to the
+		// unattended side, as before per-tier templates.
+		{"unattended only, a tier the profile doesn't list", legacy, "batch", true, false},
+		{"inline", inline, "unattended", true, false},
+		{"none", DispatchProfile{Name: "tse", Tiers: []string{"read"}}, "read", false, false},
+	} {
+		if got := c.p.HasJobTemplate(c.tier); got != c.has {
+			t.Errorf("%s: HasJobTemplate(%s) = %v, want %v", c.name, c.tier, got, c.has)
+		}
+		if got := c.p.JobTemplatesPerTier(); got != c.perTier {
+			t.Errorf("%s: JobTemplatesPerTier = %v, want %v", c.name, got, c.perTier)
+		}
+	}
+}
+
+// A lease record says whether its task ran on a Job, and one that didn't
+// writes no key, so a dispatcher one image behind reads it as before.
+func TestALeaseRecordSaysItRanOnAJob(t *testing.T) {
+	raw, err := json.Marshal(LeaseRecord{TaskID: "t", OnJob: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back LeaseRecord
+	if err := json.Unmarshal(raw, &back); err != nil || !back.OnJob {
+		t.Fatalf("round trip %s: %+v, %v", raw, back, err)
+	}
+	raw, _ = json.Marshal(LeaseRecord{TaskID: "t"})
+	if strings.Contains(string(raw), "onJob") {
+		t.Errorf("a pool task's record %s carries onJob", raw)
 	}
 }

@@ -1,8 +1,10 @@
 """Tests for post_merge_offer: the draft rules-file pull request that offers auto-merge."""
 
-import subprocess
+import contextlib
+import io
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import automation_rules as ar
@@ -13,11 +15,16 @@ BRANCH = "platform-agent/automerge-offer-no-pdb-dev"
 
 
 class FakeForge:
-    def __init__(self, *, state="merged", existing=None, held=False):
+    def __init__(self, *, state="merged", existing=None, held=False, viewer="kube-agents", comments=(), truncated=False):
         self.calls, self.state, self.existing, self.held = [], state, existing, held
+        self.viewer, self.comments, self.truncated = viewer, list(comments), truncated
 
     def __call__(self, verb, payload):
         self.calls.append((verb, payload))
+        if verb == "identity":
+            return {"identity": {"login": self.viewer}}
+        if verb == "proposal-view" and payload.get("comments"):
+            return {"comments": self.comments, "commentsTruncated": self.truncated}
         if verb == "branch-view":
             return {"branch": {"exists": self.held}}
         if verb == "proposal-list":
@@ -90,11 +97,57 @@ class TestOffer(unittest.TestCase):
                 existing = {"url": "https://x/pull/3", "state": state, "body": "...\n\nOffered on https://x/pull/4"}
                 forge, opener = FakeForge(existing=existing), FakeOpen()
                 result = run(forge, opener)
-                self.assertEqual(result, {"action": "none", "reason": "already offered"})
+                self.assertEqual(result, {"action": "none", "reason": "already offered", "offer": "https://x/pull/3"})
                 self.assertEqual(opener.opened, [])
                 self.assertNotIn("proposal-comment", forge.verbs())
                 listed = next(p for v, p in forge.calls if v == "proposal-list")
                 self.assertEqual(listed, {"source": BRANCH, "state": "all", "limit": 1})
+
+    def test_a_draft_left_without_its_comment_is_finished_on_its_own_fix_once(self):
+        draft = {"url": "https://x/pull/3", "state": "open", "body": "...\n\nOffered on https://x/pull/9\n",
+                 "author": "kube-agents", "sourceRepo": "Acme/GitOps"}
+        theirs = {"author": {"login": "someone"}, "body": pmo.MARKER}
+        forge, opener = FakeForge(existing=draft, viewer="kube-agents[bot]", comments=[theirs]), FakeOpen()
+        result = run(forge, opener)
+        self.assertEqual(result["action"], "offered")
+        self.assertEqual(result["offer"], "https://x/pull/3")
+        self.assertEqual(opener.opened, [])
+        comments = [p for v, p in forge.calls if v == "proposal-comment"]
+        self.assertEqual([c["number"] for c in comments], [9])
+        self.assertIn("https://x/pull/3", comments[0]["body"])
+        self.assertIn(pmo.MARKER, comments[0]["body"])
+
+    def test_an_offer_is_not_finished_twice_late_or_on_another_fix(self):
+        mine = {"author": {"login": "kube-agents[bot]"}, "url": "https://x/pull/9#c1", "body": "...\n\n" + pmo.MARKER}
+        cases = {
+            "commented": (dict(comments=[mine]), "open", "https://x/pull/9", "already offered"),
+            "closed": ({}, "closed", "https://x/pull/9", "already offered"),
+            "merged": ({}, "merged", "https://x/pull/9", "already offered"),
+            "another fix": ({}, "open", "https://x/pull/90", "already offered"),
+            "too many comments": (dict(truncated=True), "open", "https://x/pull/9", "not commenting twice"),
+            "no identity": (dict(viewer=""), "open", "https://x/pull/9", "did not say who"),
+            "a fork's branch": ({}, "open", "https://x/pull/9", "already offered", {"sourceRepo": "mallory/gitops"}),
+            "a deleted fork": ({}, "open", "https://x/pull/9", "already offered", {"sourceRepo": ""}),
+            "someone else's": ({}, "open", "https://x/pull/9", "already offered", {"author": "mallory"}),
+        }
+        for name, (kwargs, state, fix, reason, *changed) in cases.items():
+            with self.subTest(name):
+                draft = {"url": "https://x/pull/3", "state": state, "body": f"Offered on {fix}",
+                         "author": {"login": "kube-agents[bot]"}, "sourceRepo": REPO, **(changed[0] if changed else {})}
+                forge = FakeForge(existing=draft, **kwargs)
+                result = run(forge)
+                self.assertIn(reason, result["reason"])
+                self.assertEqual(result["action"], "retry" if name == "no identity" else "none")
+                self.assertNotIn("proposal-comment", forge.verbs())
+
+    def test_the_cli_fails_a_run_that_must_be_retried(self):
+        draft = {"url": "https://x/pull/3", "state": "open", "body": "Offered on https://x/pull/9"}
+        for viewer, code in (("", 1), ("kube-agents", 0)):
+            with self.subTest(viewer=viewer), \
+                    mock.patch.object(pmo.post_merge_stepdown, "_forge", return_value=FakeForge(existing=draft, viewer=viewer)), \
+                    mock.patch("kubeagents_switches.switch", return_value="practice"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(pmo.main(["--repo", REPO, "--number", "9", "--kind", "no-pdb", "--environment", "dev"]), code)
 
     def test_the_repository_is_named_as_a_person_reads_it(self):
         for repo in ("https://github.com/org/infra", "https://github.com/org/infra.git/", "git@github.com:org/infra.git",
@@ -145,10 +198,6 @@ class TestOffer(unittest.TestCase):
         result = run(forge, FakeOpen(raises=pmo.NoOffer("already allows")))
         self.assertEqual(result, {"action": "none", "reason": "already allows"})
         self.assertNotIn("proposal-comment", forge.verbs())
-
-
-def _git(cwd, *args):
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout
 
 
 class TestCountsAreNotAnArgument(unittest.TestCase):
@@ -214,6 +263,19 @@ class TestAllowWriter(unittest.TestCase):
                 self.assertEqual((self.tree / ar.RULES_FILE).read_text(), text)
                 self.assertIsNone(self.vcs.committed)
 
+
+
+class TestCli(unittest.TestCase):
+    def test_an_unexpected_forge_error_prints_retry_with_its_reason(self):
+        import json
+
+        out = io.StringIO()
+        with mock.patch.object(pmo, "offer", side_effect=RuntimeError("identity: 502")), \
+                contextlib.redirect_stdout(out):
+            code = pmo.main(["--repo", "https://github.com/acme/gitops", "--number", "7", "--kind", "no-pdb",
+                             "--environment", "dev"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue()), {"action": "retry", "reason": "RuntimeError: identity: 502"})
 
 if __name__ == "__main__":
     unittest.main()
