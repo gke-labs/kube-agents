@@ -3004,10 +3004,12 @@ type BusMigrationRetry struct {
 // and three.
 type BusMigrationStatus struct {
 	// Leg is the direction: OneToThree (snapshot and restore, behind a write
-	// freeze) or ThreeToOne (in place). Reshape is reserved for a later
-	// release's leg; nothing in this one starts it, and a run of a leg this
-	// operator does not run is held (A2ABusMigrationLegUnknown) until the
-	// operator that started it carries it on or a person abandons it.
+	// freeze), ThreeToOne (in place), or Reshape (TASKS alone recreated at
+	// the width the CR renders, at the count the bus runs, behind a write
+	// freeze; started only by the kubeagents.x-k8s.io/bus-reshape
+	// annotation). A run of a leg this operator does not run is held
+	// (A2ABusMigrationLegUnknown) until the operator that started it carries
+	// it on or a person abandons it.
 	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne;Reshape
 	Leg string `json:"leg"`
 
