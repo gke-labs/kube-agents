@@ -1138,9 +1138,28 @@ HEALTHZ_PAYLOAD = {"status": "ok"}
 # and at one replica a caller fails to connect and falls back to the stateful
 # broker rather than reading `draining` for the whole drain. The requests
 # already in flight are not touched: readiness steers only new connections.
-# The broker keeps answering ok: it rolls with Recreate, so no other pod could
-# take its traffic.
+# On active-standby handoff (/control/drain), /healthz stays 200 while
+# BROKER_STATE_DRAINING so Service Endpoints remain routed to the draining pod
+# for DRAIN_OPEN_ROUTES and DRAIN_OPEN_REPLY_ROUTES, then flips to 503
+# HEALTHZ_DRAINING_PAYLOAD once BROKER_STATE_DRAINED (or on SIGTERM).
 HEALTHZ_DRAINING_PAYLOAD = {"status": "draining"}
+HEALTHZ_STANDBY_PAYLOAD = {"status": "standby"}
+STANDBY_MODE_ENV = "CREDENTIAL_PROXY_STANDBY"
+STANDBY_TRUE_VALUES = frozenset({"1", "true", "yes"})
+CONTROL_FILE_ENV = "CREDENTIAL_PROXY_CONTROL_FILE"
+CONTROL_STATUS_PATH = "/control/status"
+CONTROL_ACTIVATE_PATH = "/control/activate"
+CONTROL_DRAIN_PATH = "/control/drain"
+CONTROL_JSON_CONTENT_TYPE = "application/json"
+CONTROL_BEARER_PREFIX = "Bearer "
+CONTROL_MAX_REQUEST_BYTES = 1024
+BROKER_STATE_STANDBY = "standby"
+BROKER_STATE_ACTIVE = "active"
+BROKER_STATE_DRAINING = "draining"
+BROKER_STATE_DRAINED = "drained"
+HANDOFF_DRAIN_SECONDS = 15.0
+HANDOFF_SETTLE_POLL_SECONDS = 0.05
+HANDOFF_THREAD_NAME = "broker-handoff-drain"
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -5141,6 +5160,10 @@ class InFlight:
             if self._count <= 0:
                 self._idle.notify_all()
 
+    def count(self) -> int:
+        with self._idle:
+            return self._count
+
     def wait_idle(self, deadline: float) -> int:
         """Wait until nothing is in flight or `deadline` passes; the count left."""
         with self._idle:
@@ -6956,6 +6979,10 @@ class GoogleChatRelay:
             return False
         return True
 
+    def has_unsettled(self) -> bool:
+        with self._lock:
+            return bool(self._receipts)
+
     def release_unsettled(self) -> int:
         """Hand every unsettled receipt back to Pub/Sub; the count handed back.
 
@@ -7605,6 +7632,11 @@ class TeamsRelay:
                 self._attempts.pop(event_key, None)
             del self._receipts[receipt]
             return True
+
+    def undelivered(self) -> int:
+        """Events queued or pulled and not yet settled: what is lost if the process exits now."""
+        with self._lock:
+            return self._events.qsize() + len(self._receipts)
 
     def api_call(
         self,
@@ -13125,13 +13157,15 @@ def start_readings_sweep(executor: CommandExecutor, broker) -> None:
     if not readings_sweep_enabled():
         LOGGER.info("proposal readings sweep off (%s)", VCS_READINGS_ENV)
         return
-    vcs_readings.ReadingsSweep(
+    sweep = vcs_readings.ReadingsSweep(
         registry=broker.registry,
         transport_for=lambda forge, repo: sweep_transport_for(executor, forge, repo),
         metrics=CredentialProxyHandler.metrics,
         managed_repositories=managed_repositories,
         app_credential=sweep_app_credential,
-    ).start()
+    )
+    CredentialProxyHandler.readings_sweep = sweep
+    sweep.start()
     LOGGER.info("proposal readings sweep started")
 
 
@@ -14071,10 +14105,227 @@ class ProxyMetrics:
         return "\n".join(lines) + "\n"
 
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """The metrics-only listener: GET /metrics, and nothing else.
+def standby_mode_enabled() -> bool:
+    """Whether the broker starts in standby until the operator activates it."""
+    return os.getenv(STANDBY_MODE_ENV, "").strip().lower() in STANDBY_TRUE_VALUES
 
-    Unauthenticated, like /healthz on the credentialed listener, because its
+
+def control_file_from_env() -> Path | None:
+    """Path to the operator-provisioned control bearer file, or None when unset."""
+    raw = os.getenv(CONTROL_FILE_ENV, "").strip()
+    return Path(raw) if raw else None
+
+
+class BrokerLifecycle:
+    """State machine for warm standby startup, operator activation, and handoff drain."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        control_file: Path | None = None,
+        relays: Sequence[GoogleChatRelay] = (),
+        in_memory_relays: Sequence[Any] | None = None,
+        executor: CommandExecutor | None = None,
+        drain_seconds: float = HANDOFF_DRAIN_SECONDS,
+        settle_seconds: float = SHUTDOWN_SETTLE_SECONDS,
+        end_wait_seconds: float = SHUTDOWN_END_WAIT_SECONDS,
+    ) -> None:
+        self.enabled = enabled
+        self.control_file = control_file
+        self._relays = tuple(relays)
+        self._in_memory_relays_override = (
+            tuple(in_memory_relays) if in_memory_relays is not None else None
+        )
+        self._executor = executor
+        self._drain_seconds = drain_seconds
+        self._settle_seconds = settle_seconds
+        self._end_wait_seconds = end_wait_seconds
+        self._lock = threading.Lock()
+        self._warm = False
+        self._state = BROKER_STATE_STANDBY if enabled else BROKER_STATE_ACTIVE
+        self._on_activate: Callable[[], None] | None = None
+        self._drain_started = False
+
+    def _in_memory_relays(self) -> tuple[Any, ...]:
+        if self._in_memory_relays_override is not None:
+            return self._in_memory_relays_override
+        relays: list[Any] = []
+        for relay in (CredentialProxyHandler.slack_relay, CredentialProxyHandler.teams_relay):
+            if relay is not None:
+                relays.append(relay)
+        return tuple(relays)
+
+    def _has_unsettled_work(self) -> bool:
+        if any(relay.has_unsettled() for relay in self._relays):
+            return True
+        for relay in self._in_memory_relays():
+            undelivered = getattr(relay, "undelivered", None)
+            if callable(undelivered):
+                count = undelivered()
+                if isinstance(count, int) and count > 0:
+                    return True
+        return False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def warm(self) -> bool:
+        with self._lock:
+            return self._warm
+
+    def set_warm(self, on_activate: Callable[[], None] | None = None) -> None:
+        cb: Callable[[], None] | None = None
+        with self._lock:
+            self._warm = True
+            self._on_activate = on_activate
+            if not self.enabled and self._state == BROKER_STATE_ACTIVE:
+                cb = self._on_activate
+                self._on_activate = None
+        if cb is not None:
+            cb()
+
+    def snapshot(self) -> dict[str, Any]:
+        unsettled = sum(1 for r in self._relays if r.has_unsettled())
+        with self._lock:
+            return {
+                "state": self._state,
+                "warm": self._warm,
+                "enabled": self.enabled,
+                "in_flight": CredentialProxyHandler.in_flight.count(),
+                "unsettled_chat": unsettled,
+            }
+
+    def activate(self) -> tuple[HTTPStatus, dict[str, Any]]:
+        cb: Callable[[], None] | None = None
+        with self._lock:
+            if self._state in (BROKER_STATE_DRAINING, BROKER_STATE_DRAINED):
+                return HTTPStatus.CONFLICT, {**self._locked_snapshot(), "error": "pod is draining"}
+            if not self._warm:
+                return HTTPStatus.SERVICE_UNAVAILABLE, {**self._locked_snapshot(), "error": "broker warming"}
+            if self._state == BROKER_STATE_STANDBY:
+                self._state = BROKER_STATE_ACTIVE
+                cb = self._on_activate
+                self._on_activate = None
+        if cb is not None:
+            cb()
+            LOGGER.info("credential proxy activated by operator control")
+        return HTTPStatus.OK, self.snapshot()
+
+    def _locked_snapshot(self) -> dict[str, Any]:
+        unsettled = sum(1 for r in self._relays if r.has_unsettled())
+        return {
+            "state": self._state,
+            "warm": self._warm,
+            "enabled": self.enabled,
+            "in_flight": CredentialProxyHandler.in_flight.count(),
+            "unsettled_chat": unsettled,
+        }
+
+    def _finish_drain(self) -> None:
+        if self._has_unsettled_work():
+            deadline = time.monotonic() + self._settle_seconds
+            while time.monotonic() < deadline and self._has_unsettled_work():
+                time.sleep(min(HANDOFF_SETTLE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        left = CredentialProxyHandler.in_flight.wait_idle(time.monotonic() + self._drain_seconds)
+        if left and self._executor is not None:
+            LOGGER.warning(
+                "handoff drain: %d request(s) still in flight after %ss; ending their commands",
+                left, self._drain_seconds,
+            )
+            self._executor.end_commands.set()
+            left = CredentialProxyHandler.in_flight.wait_idle(time.monotonic() + self._end_wait_seconds)
+        if left:
+            LOGGER.warning("handoff drain: %d request(s) still open; releasing chat receipts", left)
+        released = sum(relay.release_unsettled() for relay in self._relays)
+        with self._lock:
+            self._state = BROKER_STATE_DRAINED
+        LOGGER.info("handoff drain complete: released=%d unsettled chat receipt(s)", released)
+
+    def drain(self) -> tuple[HTTPStatus, dict[str, Any]]:
+        start_worker = False
+        with self._lock:
+            if self._state == BROKER_STATE_DRAINED:
+                return HTTPStatus.OK, self._locked_snapshot()
+            self._state = BROKER_STATE_DRAINING
+            self._on_activate = None
+        CredentialProxyHandler.draining.set()
+        CredentialProxyHandler.handoff_draining.set()
+        slack = CredentialProxyHandler.slack_relay
+        if slack is not None:
+            slack.stop_intake()
+        sweep = CredentialProxyHandler.readings_sweep
+        if sweep is not None:
+            sweep.stop()
+        idle = CredentialProxyHandler.in_flight.count() == 0
+        unsettled = self._has_unsettled_work()
+        if idle and not unsettled:
+            for relay in self._relays:
+                relay.release_unsettled()
+            with self._lock:
+                self._state = BROKER_STATE_DRAINED
+                self._drain_started = True
+            LOGGER.info("handoff drain complete immediately (idle)")
+            return HTTPStatus.OK, self.snapshot()
+        with self._lock:
+            if not self._drain_started:
+                self._drain_started = True
+                start_worker = True
+        if start_worker:
+            threading.Thread(target=self._finish_drain, name=HANDOFF_THREAD_NAME, daemon=True).start()
+        return HTTPStatus.OK, self.snapshot()
+
+    def verify_bearer(self, header_value: str) -> HTTPStatus | None:
+        if self.control_file is None:
+            return HTTPStatus.NOT_FOUND
+        try:
+            expected = self.control_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return HTTPStatus.SERVICE_UNAVAILABLE
+        if not expected:
+            return HTTPStatus.SERVICE_UNAVAILABLE
+        if not header_value.startswith(CONTROL_BEARER_PREFIX):
+            return HTTPStatus.UNAUTHORIZED
+        presented = header_value[len(CONTROL_BEARER_PREFIX):].strip()
+        if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+            return HTTPStatus.UNAUTHORIZED
+        return None
+
+
+def healthz_response() -> tuple[HTTPStatus, dict[str, Any]]:
+    """Return the /healthz HTTP status and JSON body for active, standby, or draining state."""
+    role = CredentialProxyHandler.broker_role
+    lifecycle = CredentialProxyHandler.lifecycle
+    if role == EXEC_ROLE and CredentialProxyHandler.draining.is_set():
+        return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+    if CredentialProxyHandler.shutting_down.is_set():
+        return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+    if lifecycle is not None:
+        state = lifecycle.state
+        if state == BROKER_STATE_DRAINED:
+            return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+        # Keep /healthz 200 during operator-initiated BROKER_STATE_DRAINING so Service
+        # Endpoints stay routed to this pod for DRAIN_OPEN_ROUTES / DRAIN_OPEN_REPLY_ROUTES
+        # until the async drain reaches BROKER_STATE_DRAINED.
+        if state == BROKER_STATE_DRAINING:
+            return HTTPStatus.OK, HEALTHZ_PAYLOAD
+        if lifecycle.enabled and state == BROKER_STATE_STANDBY:
+            return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_STANDBY_PAYLOAD
+        return HTTPStatus.OK, HEALTHZ_PAYLOAD
+    if CredentialProxyHandler.handoff_draining.is_set() or (
+        role == ROLE_BROKER and CredentialProxyHandler.draining.is_set()
+    ):
+        return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+    return HTTPStatus.OK, HEALTHZ_PAYLOAD
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """The port-8766 HTTP listener: unauthenticated GET /metrics plus bearer-authenticated /control/*.
+
+    /metrics is unauthenticated, like /healthz on the credentialed listener, because its
     readers, the managed-Prometheus collector and the operator's usage
     poller, hold no caller token; the operator's NetworkPolicy on this pod is
     what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
@@ -14125,7 +14376,37 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             LOGGER.debug("metrics request not answered type=%s", type(exc).__name__)
 
+    def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", CONTROL_JSON_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _control_authorized(self) -> BrokerLifecycle | None:
+        lifecycle = CredentialProxyHandler.lifecycle
+        if lifecycle is None or lifecycle.control_file is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return None
+        rejection = lifecycle.verify_bearer(self.headers.get("Authorization", ""))
+        if rejection == HTTPStatus.NOT_FOUND:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return None
+        if rejection == HTTPStatus.UNAUTHORIZED:
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return None
+        if rejection is not None:
+            self._write_json(rejection, {"error": "control credential unavailable"})
+            return None
+        return lifecycle
+
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == CONTROL_STATUS_PATH:
+            lifecycle = self._control_authorized()
+            if lifecycle is not None:
+                self._write_json(HTTPStatus.OK, lifecycle.snapshot())
+            return
         if self.path != METRICS_PATH:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -14135,6 +14416,20 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path not in (CONTROL_ACTIVATE_PATH, CONTROL_DRAIN_PATH):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+        lifecycle = self._control_authorized()
+        if lifecycle is None:
+            return
+        if self.path == CONTROL_ACTIVATE_PATH:
+            status, payload = lifecycle.activate()
+        else:
+            status, payload = lifecycle.drain()
+        self._write_json(status, payload)
 
     def log_message(self, message: str, *args: Any) -> None:
         # A scrape every thirty seconds is not an audit event, and the broker's
@@ -14183,12 +14478,16 @@ class HealthHandler(MetricsHandler):
         if self.path != HEALTHZ_PATH:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        body = json.dumps(HEALTHZ_PAYLOAD, separators=(",", ":")).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        status, payload = healthz_response()
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.send_error(HTTPStatus.NOT_FOUND)
 
 
 class HealthServer(MetricsServer):
@@ -14363,6 +14662,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # refused half-way and a retry never runs one twice; the drain waits on
     # in_flight.
     draining = threading.Event()
+    handoff_draining = threading.Event()
+    readings_sweep: vcs_readings.ReadingsSweep | None = None
+    lifecycle: BrokerLifecycle | None = None
     in_flight = InFlight()
     # The read-only Cloud API relay's credential and transport. Armed by
     # serve() unconditionally, like the exec route: the shell role always
@@ -14629,8 +14931,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return report
 
     def _refused_while_shutting_down(self, **fields: Any) -> bool:
-        """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""
-        if not self.shutting_down.is_set():
+        """Answer a Chat event pull 503 SHUTDOWN_ERROR while stopping, draining, or in standby."""
+        lifecycle = self.lifecycle
+        standby = lifecycle is not None and lifecycle.enabled and lifecycle.state != BROKER_STATE_ACTIVE
+        if not self.shutting_down.is_set() and not self.handoff_draining.is_set() and not standby:
             return False
         self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": SHUTDOWN_ERROR, **fields})
         return True
@@ -14776,10 +15080,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
-        if self.broker_role == EXEC_ROLE and self.draining.is_set():
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD)
-            return
-        self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
+        status, payload = healthz_response()
+        self._json(status, payload)
 
     def do_PUT(self) -> None:  # noqa: N802
         self._serve_audit_report_write()
@@ -18251,6 +18553,15 @@ def install_shutdown_handler(
                 )
 
     def drain() -> None:
+        lifecycle = CredentialProxyHandler.lifecycle
+        if lifecycle is not None and lifecycle.state == BROKER_STATE_DRAINED:
+            released = sum(relay.release_unsettled() for relay in relays)
+            LOGGER.info(
+                "shutdown: handoff drain already complete; released=%d late unsettled receipt(s); stopping",
+                released,
+            )
+            server.shutdown()
+            return
         started = time.monotonic()
         time.sleep(settle_seconds)
         if drain_seconds > 0:
@@ -18418,8 +18729,6 @@ def serve(args: argparse.Namespace) -> None:
     if role == EXEC_ROLE:
         reclaimers.append(executor.reclaim_kubectl_cache)
     gate.set_reclaimers(reclaimers)
-    if role in BROKER_ROLES:
-        start_readings_sweep(executor, CredentialProxyHandler.vcs)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
@@ -18429,6 +18738,7 @@ def serve(args: argparse.Namespace) -> None:
     # credential-broker-exec-tier.md), so it starts none of the event relays:
     # no Pub/Sub, Google Chat, Slack or Teams consumer competes with the
     # stateful broker for their subscriptions and sockets.
+    start_slack_callback: Callable[[], None] | None = None
     if role != EXEC_ROLE:
         CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
         CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
@@ -18463,6 +18773,7 @@ def serve(args: argparse.Namespace) -> None:
                 while (
                     CredentialProxyHandler.slack_relay is None
                     and not CredentialProxyHandler.shutting_down.is_set()
+                    and not CredentialProxyHandler.handoff_draining.is_set()
                 ):
                     try:
                         relay = SlackRelay(
@@ -18493,7 +18804,9 @@ def serve(args: argparse.Namespace) -> None:
                             len(relay.bootstrap()),
                         )
 
-            threading.Thread(target=initialize_slack_relay, daemon=True).start()
+            start_slack_callback = lambda: threading.Thread(
+                target=initialize_slack_relay, daemon=True
+            ).start()
         teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
         teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
         teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
@@ -18508,6 +18821,25 @@ def serve(args: argparse.Namespace) -> None:
                 teams_app_id,
                 teams_tenant_id or "common",
             )
+    active_relays = [
+        relay
+        for relay in (CredentialProxyHandler.chat_relay, CredentialProxyHandler.a2a_chat_relay)
+        if relay is not None
+    ]
+    lifecycle = BrokerLifecycle(
+        enabled=(role == ROLE_BROKER and standby_mode_enabled()),
+        control_file=control_file_from_env(),
+        relays=active_relays,
+        executor=executor,
+    )
+    CredentialProxyHandler.lifecycle = lifecycle
+
+    def _activate_background() -> None:
+        if role in BROKER_ROLES:
+            start_readings_sweep(executor, CredentialProxyHandler.vcs)
+        if start_slack_callback is not None:
+            start_slack_callback()
+
     if role == ROLE_COMBINED:
         api_server = start_agent_api_proxy(max_threads=door_thread_cap_from_env())
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
@@ -18531,6 +18863,8 @@ def serve(args: argparse.Namespace) -> None:
     else:
         server = ThreadingTCPHTTPServer((args.host, args.port), CredentialProxyHandler)
         LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
+    # Mark warm before opening metrics so /control/status reports warm:true immediately.
+    lifecycle.set_warm(on_activate=_activate_background)
     # Last, once the credentialed server holds its socket: a scrape never sees
     # a half-configured broker, and a port collision costs the metrics rather
     # than the commands, whatever the ports are. Exempt from the

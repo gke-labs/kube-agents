@@ -336,7 +336,7 @@ func TestTheExecTierIgnoresFieldsOthersSetOnTheBroker(t *testing.T) {
 			},
 		}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
+	if _, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
 		t.Fatal(err)
 	}
 	dep := &appsv1.Deployment{}

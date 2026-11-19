@@ -1,9 +1,6 @@
 # The Credential Proxy Runs as One Pod
 
-> **STATUS — design of record; implemented.** The credential proxy (the broker) runs
-> as one pod, `Replicas: 1` with the `Recreate` strategy. This document records why it is not
-> scaled horizontally today, what the load measurement behind that decision is, and what would
-> make it change.
+> **STATUS — updated by [`proactive-utilization-sizing.md`](proactive-utilization-sizing.md).** The credential proxy (the broker) remains a single active serving pod (`Replicas: 1`), now rolled with `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated active-standby handoff rather than `Recreate`. This document records why multiple active serving pods break stateful relays, the load measurement behind single-pod sizing, and the exec-tier split history.
 >
 > **Proposed successor (draft, not decided):**
 > [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md). This decision stands until
@@ -57,25 +54,9 @@ broker's workspace root, `<state-dir>/workspace` in the pod's own emptyDir, but 
 [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) ("One replica") gave the Slack relay as
 the first reason for one replica; this document owns the decision now.
 
-The `Recreate` strategy follows from the same state: two pods behind the Service during a
-rollout split traffic that assumes one pod.
+Historically, the `Recreate` strategy followed from the same state: two active pods behind the Service during a rollout split traffic that assumed one pod. This has been superseded by [`proactive-utilization-sizing.md`](proactive-utilization-sizing.md), which keeps one active pod at a time behind `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) via operator-coordinated active-standby handoff.
 
-What one pod costs is a gap on every eviction, drain and rollout, and the gap is bounded rather
-than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
-seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
-back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
-replacement. The standalone broker also drains: it keeps the health probe, the event pulls, the
-settle routes and the Chat reply routes open for the whole drain, answers every other new request `503` with the `draining`
-bound, stops taking Slack events, and gives the requests in flight up to 30 s to finish.
-It then ends the commands still running, which answer exit 143 with a line that says why, waits a
-few seconds for those answers, and stops. Its pod's `terminationGracePeriodSeconds` of 45 s holds
-the drain and the entrypoint's stop of Envoy after it. The drain is bounded because `Recreate`
-leaves no other broker serving while it runs. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
-AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
-protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
-`PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
-names the Deployment and what waits on it. The pause that remains under one pod, and what would
-shorten or remove it, is tracked in gke-labs/kube-agents#4409.
+Previously under `Recreate`, one pod cost a gap on every eviction, drain and rollout, and the gap was bounded rather than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled back to Pub/Sub, and exits; without that the message waited out its 60 s ack deadline on the replacement. Under operator-coordinated `/control/drain` (`HANDOFF_DRAIN_SECONDS = 15.0` vs `SHUTDOWN_DRAIN_SECONDS = 30.0` on abrupt `SIGTERM`), the active broker stops taking Slack events and new exec/pull calls while keeping `/healthz` ready (`200`) and settle/reply routes open for `in_flight` and unsettled events to finish before flipping `/healthz` to `503` as the new warm standby pod takes the Lease and activates. On `SIGTERM` fallback, the bounded 30 s drain and 45 s `terminationGracePeriodSeconds` still apply. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy: AlwaysAllow`, which on one active replica refuses no eviction and holds no drain; a budget that would protect the pod is the one the obtainability audit reports as blocking. While the pod is starting or unhealthy the `PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message names the Deployment and what waits on it. The original pause under `Recreate`, and what would shorten or remove it, was tracked in gke-labs/kube-agents#4409.
 
 ## 3. Measured: two replicas behind today's Service
 

@@ -1378,6 +1378,27 @@ spec:
     - Egress
 ---
 apiVersion: v1
+data:
+  token: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy-control
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+type: Opaque
+---
+apiVersion: v1
 kind: Service
 metadata:
   labels:
@@ -1430,11 +1451,15 @@ spec:
       app: platformagent-credential-proxy
       kubeagents.x-k8s.io/component: credential-proxy
   strategy:
-    type: Recreate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
   template:
     metadata:
       annotations:
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-template-hash: <SHA256_FOR_TESTS>
       labels:
         app: platformagent-credential-proxy
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -1544,6 +1569,10 @@ spec:
               value: /var/run/secrets/kubeagents/audit-report-store/token
             - name: CREDENTIAL_PROXY_REPORT_PROFILES
               value: fleet-audit,platform
+            - name: CREDENTIAL_PROXY_STANDBY
+              value: "1"
+            - name: CREDENTIAL_PROXY_CONTROL_FILE
+              value: /var/run/secrets/kubeagents/control/token
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
@@ -1555,13 +1584,13 @@ spec:
             - containerPort: 8768
               name: cred-health
           readinessProbe:
-            failureThreshold: 3
+            failureThreshold: 2
             httpGet:
               path: /healthz
               port: cred-health
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 2
           resources:
             limits:
               cpu: "2"
@@ -1603,6 +1632,9 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/control
+              name: credential-proxy-control
               readOnly: true
             - mountPath: /etc/a2a-tiers
               name: a2a-tiers
@@ -1683,6 +1715,10 @@ spec:
                   audience: kubeagents-audit-report-store
                   expirationSeconds: 3600
                   path: token
+        - name: credential-proxy-control
+          secret:
+            defaultMode: 256
+            secretName: platformagent-credential-proxy-control
         - configMap:
             name: platformagent-a2a-tiers
             optional: true
@@ -2015,7 +2051,7 @@ spec:
             httpGet:
               path: /healthz
               port: cred-health
-            initialDelaySeconds: 5
+            initialDelaySeconds: 2
             periodSeconds: 3
             timeoutSeconds: 2
           resources:

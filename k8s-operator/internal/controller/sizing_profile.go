@@ -26,6 +26,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,8 +39,8 @@ import (
 
 // sizingTier is one of the three preset rows spec.deployment.sizingProfile
 // selects for the credential-proxy container, the agent-api-auth sidecar and
-// the shell container. Ordered: a higher tier compares greater, which is what
-// the upward-only latch under the auto profile compares.
+// the shell container. Ordered: a higher tier compares greater, which lets
+// resolveSizingTier promote and demote across tiers under the auto profile.
 type sizingTier int
 
 const (
@@ -113,6 +114,9 @@ const (
 	sizingCappedByQuotaConditionType = "SizingCappedByQuota"
 	sizingCappedByQuotaReason        = "ResourceQuotaShort"
 	sizingCappedByLimitRangeReason   = "LimitRangeShort"
+	sizingCappedByCapacityReason     = "SurgeUnschedulable"
+	sizingSurgePendingTimeout        = 2 * time.Minute
+	sizingCountPodsResource          = corev1.ResourceName("count/pods")
 	// sizingCappedByQuotaMessageFormat takes the tier earned, the quota's
 	// name, the quota key, the running tier the refused step was measured
 	// from, and the tier that stays: the running tier again when every step
@@ -122,17 +126,19 @@ const (
 	sizingCappedByQuotaMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
 		"but ResourceQuota %s has no room on %s for the step up from %s; the %s tier stays until the quota is raised " +
 		"or sizingProfile names the tier, which the operator applies without this check"
-	// sizingCappedByLimitRangeMessageFormat takes the tier earned, the
-	// LimitRange's name, the item's scope (sizingLimitRangeScopeContainer or
-	// Pod), the bound (sizingLimitRangeMax, Min or Ratio), the resource
-	// name, what crosses it (sizingLimitRangeContainerSubjectFormat or
-	// PodSubjectFormat on the sized container), the running tier the
-	// refused step was measured from, and the tier that stays, as the quota
-	// format does.
+	sizingCappedByUtilizationQuotaMessageFormat = "spec.deployment.sizingProfile is auto and sustained utilization requires the %s tier, " +
+		"but ResourceQuota %s has no room on %s for the step from %s; the %s tier stays until the quota is raised " +
+		"or sizingProfile names the tier, which the operator applies without this check"
 	sizingCappedByLimitRangeMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
 		"but LimitRange %s sets a per-%s %s on %s that the %s crosses at the step up from %s; " +
 		"the %s tier stays until the LimitRange admits the row or sizingProfile names the tier, " +
 		"which the operator applies without this check"
+	sizingCappedByUtilizationLimitRangeMessageFormat = "spec.deployment.sizingProfile is auto and sustained utilization requires the %s tier, " +
+		"but LimitRange %s sets a per-%s %s on %s that the %s crosses at the step from %s; " +
+		"the %s tier stays until the LimitRange admits the row or sizingProfile names the tier, " +
+		"which the operator applies without this check"
+	sizingSurgeStalledMessageFormat = "spec.deployment.sizingProfile is auto and surge pod %s for %s while transitioning to the %s tier stayed Pending (%s); " +
+		"the active %s tier stays until cluster capacity accommodates the surge or sizingProfile names the tier"
 	// The two item scopes the step-up check reads, as the LimitRange spec's
 	// type field names them in lower case, and what each is read against:
 	// a Container item against the sized container, a Pod item against the
@@ -310,9 +316,10 @@ func (b *sizingBound) subject() string {
 // (sizingRefusedStep): the workload (kind and name), the quota the message
 // names, and the message as the condition carries it.
 type sizingRefusal struct {
-	workload string
-	quota    string
-	message  string
+	workload     string
+	quota        string
+	message      string
+	rollbackTier sizingTier
 }
 
 // sizingCap is the SizingCappedByQuota condition's content: the reason
@@ -526,18 +533,18 @@ func shellSandboxTierResources(tier sizingTier) corev1.ResourceRequirements {
 }
 
 // sizingStep is what a step from one tier to another adds, per resource name,
-// on the requests side and on the limits side: the differences across the
+// on the requests side and on the limits side: the rendered changes across the
 // three containers a profile sizes, each side as the reconciler renders that
 // tier (the CR's override where the tier admits it, the row where it does
-// not). Each of
-// the three pods is replaced rather than surged on a template change (the
-// proxy's and the gateway's Recreate Deployments, the sandbox StatefulSet's
-// ordered roll), so what the quota has to admit is the difference, not a
-// second pod; the RollingUpdate shape replicasAndStrategyFor keeps for the
-// multi-replica redesign is reached by no caller.
+// not). The gateway Deployment (Recreate) and shell StatefulSet (ordered
+// RollingUpdate) charge their container deltas (after - before), whereas
+// credential-proxy rolls with active-standby RollingUpdate (maxSurge: 1,
+// maxUnavailable: 0) and charges the full replacement surge pod plus one pod
+// slot while both replicas coexist before drain.
 type sizingStep struct {
-	requests corev1.ResourceList
-	limits   corev1.ResourceList
+	requests  corev1.ResourceList
+	limits    corev1.ResourceList
+	surgePods int64
 }
 
 // The step's limits side is read through a clamped flag: whether the
@@ -596,29 +603,71 @@ func renderedShellSandboxResourcesAt(agent *agentv1alpha1.PlatformAgent, tier si
 
 // sizingStepBetween is the sizingStep from tier from to tier to for agent,
 // each side as the reconciler renders that tier, the limits side read through
-// clamped (sizingRunningLimitsClamped).
+// clamped (sizingRunningLimitsClamped). Because credential-proxy rolls with
+// active-standby RollingUpdate (maxSurge: 1, maxUnavailable: 0), its tier step
+// charges the full replacement surge pod (old + new coexist before drain) plus
+// one pod slot, whereas gateway and shell charge their container deltas.
 func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, from, to sizingTier) sizingStep {
 	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for i := range before {
+		if before[i].container == credentialProxyContainerName {
+			addSurgeStep(&step, before[i].resources, after[i].resources, clamped)
+			continue
+		}
 		addRenderStep(&step, before[i].resources, after[i].resources, clamped)
 	}
 	return step
 }
 
-// sizedContainerStepBetween is sizingStepBetween for the one sized container
-// named name (renderedSizedContainersAt's names): what the step from from to
-// to moves on the pod that container runs in, since the other containers of
-// that pod keep their figures. The zero step for a name that is not sized.
+// sizingStepSurgeOnly computes only the transient surge headroom required to
+// spin up credential-proxy at tier to while from is still active (used when
+// stepping down so concurrent gateway/shell reductions do not offset surge needs).
+func sizingStepSurgeOnly(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, from, to sizingTier) sizingStep {
+	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
+	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
+	for i := range before {
+		if before[i].container == credentialProxyContainerName {
+			addSurgeStep(&step, before[i].resources, after[i].resources, clamped)
+			break
+		}
+	}
+	return step
+}
+
 func sizedContainerStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, name string, from, to sizingTier) sizingStep {
 	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for i := range before {
 		if before[i].container == name {
-			addRenderStep(&step, before[i].resources, after[i].resources, clamped)
+			if name == credentialProxyContainerName {
+				addSurgeStep(&step, before[i].resources, after[i].resources, clamped)
+			} else {
+				addRenderStep(&step, before[i].resources, after[i].resources, clamped)
+			}
 		}
 	}
 	return step
+}
+
+func addSurgeStep(step *sizingStep, before, after corev1.ResourceRequirements, clamped bool) {
+	fromReq, toReq := effectiveRequests(before), effectiveRequests(after)
+	fromLim := clampedLimits(before.Limits, fromReq, clamped)
+	toLim := clampedLimits(after.Limits, toReq, clamped)
+	if equality.Semantic.DeepEqual(fromReq, toReq) && equality.Semantic.DeepEqual(fromLim, toLim) {
+		return
+	}
+	addResourceFull(step.requests, toReq)
+	addResourceFull(step.limits, toLim)
+	step.surgePods = 1
+}
+
+func addResourceFull(total, add corev1.ResourceList) {
+	for _, name := range sortedResourceNames(add) {
+		sum := total[name]
+		sum.Add(add[name])
+		total[name] = sum
+	}
 }
 
 // addRenderStep adds to step what one container's render moves from before
@@ -858,9 +907,9 @@ func (r *PlatformAgentReconciler) sizingAdmittedPriorityClass(ctx context.Contex
 // twin), every replica is available (ready, for a StatefulSet), both the
 // count the spec asks for and the count the operator renders for it
 // (replicas), and the template carries rendered's figures for the sized
-// container (sizedContainerCarries). The available term is what reads the
-// proxy's Recreate window, where the old pod is gone and the new one not yet
-// created: the generation is observed, no replica is old, and none is there.
+// container (sizedContainerCarries). The available term tracks active-standby
+// RollingUpdate warmup on credential-proxy as well as Recreate transitions on
+// sibling workloads before all replicas settle.
 // The rendered count is what reads a workload scaled to zero by hand: its
 // spec asks for nothing and its roll is complete, but the quota's used total
 // charges no pod of it while the step is measured from its row, the same
@@ -1096,9 +1145,8 @@ func (r *PlatformAgentReconciler) sizingAutopilot(ctx context.Context, agent *ag
 // older. The step-up check measures each candidate step from the running tier
 // against those totals, and the latch runs ahead of the pods:
 // resolveSizingTier writes status.effectiveSizingTier before the workloads are
-// re-rendered, the write re-enqueues the CR at once, and the proxy's Recreate
-// rollout admits its new pod only after the old one has gone. A pass in that
-// window that measured the next step from the latch would count the admitted
+// re-rendered, and the write re-enqueues the CR at once while workloads
+// recreate or surge. A pass in that window that measured the next step from the latch would count the admitted
 // step as already charged and could promote past the quota; it measures
 // nothing until the pods have settled instead, and the workloads' status
 // updates re-enqueue the CR when they have. The reads are cache hits (both
@@ -1181,6 +1229,11 @@ func sizingQuotaReadsAStep(quota *corev1.ResourceQuota) bool {
 			return true
 		}
 	}
+	for _, podKey := range []corev1.ResourceName{corev1.ResourcePods, sizingCountPodsResource} {
+		if _, constrained := quota.Spec.Hard[podKey]; constrained {
+			return true
+		}
+	}
 	return false
 }
 
@@ -1223,7 +1276,12 @@ func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, cl
 	if len(quotas) == 0 {
 		return nil
 	}
-	step := sizingStepBetween(agent, autopilot, clamped, from, to)
+	var step sizingStep
+	if to < from {
+		step = sizingStepSurgeOnly(agent, autopilot, clamped, from, to)
+	} else {
+		step = sizingStepBetween(agent, autopilot, clamped, from, to)
+	}
 	for i := range quotas {
 		quota := &quotas[i]
 		if !sizingQuotaBindsThePods(quota, classes) {
@@ -1248,6 +1306,22 @@ func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, cl
 			}
 			if free.Cmp(need) < 0 {
 				return &sizingShortfall{quota: quota.Name, key: dim.key, free: free, need: need}
+			}
+		}
+		if step.surgePods > 0 {
+			need := *resource.NewQuantity(step.surgePods, resource.DecimalSI)
+			for _, podKey := range []corev1.ResourceName{corev1.ResourcePods, sizingCountPodsResource} {
+				hard, constrained := quota.Spec.Hard[podKey]
+				if !constrained {
+					continue
+				}
+				free := hard.DeepCopy()
+				if used, ok := quota.Status.Used[podKey]; ok {
+					free.Sub(used)
+				}
+				if free.Cmp(need) < 0 {
+					return &sizingShortfall{quota: quota.Name, key: podKey, free: free, need: need}
+				}
 			}
 		}
 	}
@@ -1484,23 +1558,72 @@ func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, c
 // the condition says; the lower row's pod, refused by a new ReplicaSet,
 // comes with a new message at the lower figure and is stepped back from in
 // turn.
+func brokerActiveTierFromPods(pods []corev1.Pod, agent *agentv1alpha1.PlatformAgent, autopilot, clamped bool, target sizingTier) (sizingTier, bool) {
+	targetRes := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, target)
+	var order []sizingTier
+	if target > sizingTierSmall {
+		order = append(order, target-1)
+	}
+	for _, c := range []sizingTier{sizingTierFleet, sizingTierMedium, sizingTierSmall} {
+		if c != target && !slices.Contains(order, c) {
+			order = append(order, c)
+		}
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || brokerPodContainer(pod) == nil {
+			continue
+		}
+		if proxyContainerMatchesTierResourcesForCluster(pod, targetRes, clamped) {
+			continue
+		}
+		for _, candidate := range order {
+			if proxyContainerMatchesTierResourcesForCluster(pod, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, candidate), clamped) {
+				return candidate, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (r *PlatformAgentReconciler) hasActiveBrokerAtOtherTier(ctx context.Context, agent *agentv1alpha1.PlatformAgent, autopilot, clamped bool, target sizingTier) bool {
+	pods := &corev1.PodList{}
+	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err != nil {
+		return false
+	}
+	_, hasDiff := brokerActiveTierFromPods(pods.Items, agent, autopilot, clamped, target)
+	return hasDiff
+}
+
 func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) *sizingRefusal {
-	if tier == sizingTierSmall {
+	autopilot := r.sizingAutopilot(ctx, agent)
+	clamped := r.sizingRunningLimitsClamped(ctx, agent)
+	pods := &corev1.PodList{}
+	activeTier, hasActiveDiff := sizingTier(0), false
+	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err == nil {
+		activeTier, hasActiveDiff = brokerActiveTierFromPods(pods.Items, agent, autopilot, clamped, tier)
+	}
+	isStepDown := hasActiveDiff && activeTier > tier
+	if tier == sizingTierSmall && !isStepDown {
 		return nil
+	}
+	from := tier - 1
+	rollbackTier := tier - 1
+	if isStepDown {
+		from = activeTier
+		rollbackTier = activeTier
 	}
 	sized := []struct {
 		key       client.ObjectKey
 		container string
 	}{{client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, credentialProxyContainerName}}
-	if !useStatefulSet(agent) {
+	if !isStepDown && !useStatefulSet(agent) {
 		sized = append(sized, struct {
 			key       client.ObjectKey
 			container string
 		}{client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}, agentAPIAuthContainerName})
 	}
 	recorded := sizingCappedCondition(agent).message
-	autopilot := r.sizingAutopilot(ctx, agent)
-	clamped, clampRead := false, false
 	for _, workload := range sized {
 		dep := &appsv1.Deployment{}
 		if err := r.Get(ctx, workload.key, dep); err != nil {
@@ -1514,56 +1637,37 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 			if !named || strings.Contains(recorded, cond.Message) {
 				continue
 			}
-			if !clampRead {
-				clamped, clampRead = r.sizingRunningLimitsClamped(ctx, agent), true
-			}
-			if !sizingRefusalIsTheSteps(agent, autopilot, clamped, dep.Spec.Template, workload.container, tier, quotaRefusalRequested(cond.Message)) {
+			if !sizingRefusalIsTheSteps(agent, autopilot, clamped, dep.Spec.Template, workload.container, from, tier, quotaRefusalRequested(cond.Message)) {
 				continue
 			}
-			return &sizingRefusal{workload: fmt.Sprintf(sizingUnsettledDeploymentFormat, workload.key.Name), quota: quota, message: cond.Message}
+			return &sizingRefusal{workload: fmt.Sprintf(sizingUnsettledDeploymentFormat, workload.key.Name), quota: quota, message: cond.Message, rollbackTier: rollbackTier}
 		}
 	}
 	return nil
 }
 
 // sizingRefusalIsTheSteps reports whether a quota refusal of the pod the
-// sized container named name runs in, read with the latch at tier, is a
-// refusal of that tier's pod on a key the step up to it moved. requested is
-// the refusal's list (quotaRefusalRequested): the quota keys the pod crossed
-// and the pod's figure on each. One key is enough when it is a key the
-// step-up check reads (sizingQuotaDimensions), the container's own figure
-// on it rose from the tier below (sizedContainerStepBetween, the limits
-// through clamped), and the pod's figure the refusal names is under what the
-// pod would ask at the row above tier (sizingPodFigures on template with the
-// container at that row's render). The last term tells a refusal of the row
-// above, lingering on the Deployment after a step back from it, from the
-// latched row's own: the one asks for the row above's figure or more, the
-// other for less. It is read only where the row above moves the key on this
-// pod: an override pins a request across the rows it fits, and the proxy's
-// 4Gi memory request is the bare row at small and 4Gi at medium and fleet,
-// so at a medium latch the row above asks the same figure the medium pod
-// does and a refusal naming it is the medium pod's own; where the two rows
-// coincide nothing lingers from above that the recorded message in
-// sizingRefusedStep does not already answer. At the top row nothing lingers
-// from above.
-func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, template corev1.PodTemplateSpec, name string, tier sizingTier, requested corev1.ResourceList) bool {
-	if tier == sizingTierSmall || len(requested) == 0 {
+// sized container named name runs in, read with the latch transitioning from
+// from to to, is a refusal of that transition's pod on a key the step moved.
+func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, template corev1.PodTemplateSpec, name string, from, to sizingTier, requested corev1.ResourceList) bool {
+	if (to == sizingTierSmall && from <= to) || len(requested) == 0 {
 		return false
 	}
-	step := sizedContainerStepBetween(agent, autopilot, clamped, name, tier-1, tier)
+	step := sizedContainerStepBetween(agent, autopilot, clamped, name, from, to)
 	var atRequests, atLimits, aboveRequests, aboveLimits corev1.ResourceList
-	for _, rendered := range renderedSizedContainersAt(agent, autopilot, tier) {
+	for _, rendered := range renderedSizedContainersAt(agent, autopilot, to) {
 		if rendered.container == name {
 			atRequests, atLimits = sizingPodFigures(template, name, rendered.resources, clamped)
 		}
 	}
-	if tier < sizingTierFleet {
-		for _, rendered := range renderedSizedContainersAt(agent, autopilot, tier+1) {
+	if to < sizingTierFleet {
+		for _, rendered := range renderedSizedContainersAt(agent, autopilot, to+1) {
 			if rendered.container == name {
 				aboveRequests, aboveLimits = sizingPodFigures(template, name, rendered.resources, clamped)
 			}
 		}
 	}
+	sawAbove := false
 	for _, dim := range sizingQuotaDimensions {
 		asked, named := requested[dim.key]
 		if !named {
@@ -1578,10 +1682,18 @@ func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool,
 		}
 		if bound, ok := above[dim.resource]; ok && asked.Cmp(bound) >= 0 {
 			if own, has := at[dim.resource]; !has || bound.Cmp(own) > 0 {
+				sawAbove = true
 				continue
 			}
 		}
 		return true
+	}
+	if !sawAbove && step.surgePods > 0 {
+		for _, podKey := range []corev1.ResourceName{corev1.ResourcePods, sizingCountPodsResource} {
+			if asked, named := requested[podKey]; named && asked.Sign() > 0 && asked.Value() <= step.surgePods {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -1659,7 +1771,9 @@ func setSizingCappedCondition(agent *agentv1alpha1.PlatformAgent, capped sizingC
 func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
 	if existing == nil || existing.Status != metav1.ConditionTrue ||
-		(existing.Reason != sizingCappedByQuotaReason && existing.Reason != sizingCappedByLimitRangeReason) {
+		(existing.Reason != sizingCappedByQuotaReason &&
+			existing.Reason != sizingCappedByLimitRangeReason &&
+			existing.Reason != sizingCappedByCapacityReason) {
 		return sizingCap{}
 	}
 	return sizingCap{reason: existing.Reason, message: existing.Message}
@@ -1708,6 +1822,197 @@ func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 // gate treats "" as settled while the echo record (prunedSizingTier) is fresh,
 // as the Ready writer does for status.usage, rather than writing and logging
 // on every pass.
+type sizingSurgeStall struct {
+	podName      string
+	reason       string
+	rollbackTier sizingTier
+}
+
+func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier, now time.Time) (*sizingSurgeStall, time.Duration) {
+	autopilot := r.sizingAutopilot(ctx, agent)
+	clamped := r.sizingRunningLimitsClamped(ctx, agent)
+	pods := &corev1.PodList{}
+	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err != nil {
+		return nil, 0
+	}
+	activeTier, hasActiveDiff := brokerActiveTierFromPods(pods.Items, agent, autopilot, clamped, tier)
+	isStepDown := hasActiveDiff && activeTier > tier
+	if tier <= sizingTierSmall && !isStepDown {
+		return nil, 0
+	}
+	rollbackTier := tier - 1
+	if isStepDown {
+		rollbackTier = activeTier
+	}
+	wantRes := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)
+	var minCreatedAt time.Time
+	if prevStatus := r.previousSizingStatus(agent); prevStatus != nil && prevStatus.LastTransitionTime != nil {
+		minCreatedAt = prevStatus.LastTransitionTime.Time
+	}
+	hasActive := false
+	var earliestPending *corev1.Pod
+	var pendingSince time.Time
+	var pendingReason string
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodRunning {
+			hasActive = true
+			continue
+		}
+		if pod.Status.Phase != corev1.PodPending {
+			continue
+		}
+		if !minCreatedAt.IsZero() && !pod.CreationTimestamp.IsZero() && pod.CreationTimestamp.Time.Before(minCreatedAt) {
+			continue
+		}
+		if brokerPodContainer(pod) != nil && !proxyContainerMatchesTierResourcesForCluster(pod, wantRes, clamped) {
+			continue
+		}
+		since, reason := pendingSurgeStartTime(pod)
+		if since.IsZero() {
+			continue
+		}
+		if earliestPending == nil || since.Before(pendingSince) {
+			earliestPending = pod
+			pendingSince = since
+			pendingReason = reason
+		}
+	}
+	if !hasActive || earliestPending == nil {
+		return nil, 0
+	}
+	elapsed := now.Sub(pendingSince)
+	if elapsed >= sizingSurgePendingTimeout {
+		return &sizingSurgeStall{podName: earliestPending.Name, reason: pendingReason, rollbackTier: rollbackTier}, 0
+	}
+	return nil, sizingSurgePendingTimeout - elapsed
+}
+
+func pendingSurgeStartTime(pod *corev1.Pod) (time.Time, string) {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+			reason := cond.Reason
+			if cond.Message != "" {
+				if reason != "" {
+					reason = reason + ": " + cond.Message
+				} else {
+					reason = cond.Message
+				}
+			}
+			if reason == "" {
+				reason = string(corev1.PodReasonUnschedulable)
+			}
+			if !cond.LastTransitionTime.IsZero() {
+				return cond.LastTransitionTime.Time, reason
+			}
+			if !pod.CreationTimestamp.IsZero() {
+				return pod.CreationTimestamp.Time, reason
+			}
+			return time.Time{}, reason
+		}
+	}
+	if !pod.CreationTimestamp.IsZero() {
+		return pod.CreationTimestamp.Time, string(corev1.PodPending)
+	}
+	return time.Time{}, ""
+}
+
+func (r *PlatformAgentReconciler) sizingStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	recorded, pruned := r.prunedSizingStatus.Load(client.ObjectKeyFromObject(agent))
+	if !pruned {
+		return false
+	}
+	return r.clockNow().Sub(recorded.(time.Time)) < usageStatusReprobeInterval
+}
+
+func (r *PlatformAgentReconciler) noteSizingStatusEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wanted *agentv1alpha1.SizingStatus) {
+	key := client.ObjectKeyFromObject(agent)
+	if wanted == nil {
+		return
+	}
+	if agent.Status.Sizing != nil {
+		r.prunedSizingStatus.Delete(key)
+		r.sizingUtilState.Store(key, wanted.DeepCopy())
+		return
+	}
+	fresh := r.sizingStatusPruned(agent)
+	r.prunedSizingStatus.Store(key, r.clockNow())
+	r.sizingUtilState.Store(key, wanted.DeepCopy())
+	if !fresh {
+		logf.FromContext(ctx).Info("the served CRD has no status.sizing; apply this release's CRD to get it, which is probed again after the interval",
+			"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
+	}
+}
+
+func (r *PlatformAgentReconciler) previousSizingStatus(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.SizingStatus {
+	if agent.Status.Sizing != nil {
+		return agent.Status.Sizing
+	}
+	if _, wasPruned := r.prunedSizingStatus.Load(client.ObjectKeyFromObject(agent)); wasPruned {
+		if saved, ok := r.sizingUtilState.Load(client.ObjectKeyFromObject(agent)); ok {
+			return saved.(*agentv1alpha1.SizingStatus)
+		}
+	}
+	return nil
+}
+
+func sizingStatusEquivalent(cur, next *agentv1alpha1.SizingStatus) bool {
+	if cur == nil && next == nil {
+		return true
+	}
+	if cur == nil || next == nil {
+		return false
+	}
+	if cur.ActiveTier != next.ActiveTier ||
+		cur.DesiredTier != next.DesiredTier ||
+		cur.Trigger != next.Trigger ||
+		cur.LastObservedDimension != next.LastObservedDimension ||
+		cur.LastObservedWorkload != next.LastObservedWorkload ||
+		!metav1TimePtrEqual(cur.ScaleUpSustainedSince, next.ScaleUpSustainedSince) ||
+		!metav1TimePtrEqual(cur.ScaleDownSustainedSince, next.ScaleDownSustainedSince) ||
+		!metav1TimePtrEqual(cur.LastTransitionTime, next.LastTransitionTime) {
+		return false
+	}
+	if (cur.LastObservedPeakPct == nil) != (next.LastObservedPeakPct == nil) {
+		return false
+	}
+	if cur.LastObservedPeakPct != nil {
+		diff := *cur.LastObservedPeakPct - *next.LastObservedPeakPct
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff >= sizingTelemetryWriteDeltaPct {
+			return false
+		}
+	}
+	return true
+}
+
+func metav1TimePtrEqual(a, b *metav1.Time) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Time.Equal(b.Time)
+}
+
+func (r *PlatformAgentReconciler) sizingAutoRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
+	if sizingProfileOf(agent.Spec.Deployment) != sizingProfileAuto {
+		return secretEnvReprobeInterval
+	}
+	if v, ok := r.sizingNextRequeue.Load(client.ObjectKeyFromObject(agent)); ok {
+		if d := v.(time.Duration); d > 0 {
+			return d
+		}
+	}
+	return sizingUtilizationPollInterval
+}
+
 func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	profile := sizingProfileOf(agent.Spec.Deployment)
 	latched, _ := parseSizingTier(agent.Status.EffectiveSizingTier)
@@ -1716,161 +2021,271 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 	var short *sizingShortfall
 	var bound *sizingBound
 	var refused *sizingRefusal
+	var stalled *sizingSurgeStall
 	var count int64
-	if profile == sizingProfileAuto {
+	var desired sizingTier
+	now := r.clockNow()
+	prevStatus := r.previousSizingStatus(agent)
+	var nextSizing *agentv1alpha1.SizingStatus
+
+	if profile != sizingProfileAuto {
+		desired = tier
+		nextSizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:  tier.String(),
+			DesiredTier: tier.String(),
+			Trigger:     sizingTriggerManual,
+		}
+		if prevStatus != nil {
+			nextSizing.LastTransitionTime = prevStatus.LastTransitionTime
+			nextSizing.LastObservedPeakPct = prevStatus.LastObservedPeakPct
+			nextSizing.LastObservedDimension = prevStatus.LastObservedDimension
+			nextSizing.LastObservedWorkload = prevStatus.LastObservedWorkload
+		}
+		if previous := agent.Status.EffectiveSizingTier; previous != "" && previous != tier.String() {
+			t := metav1.NewTime(now)
+			nextSizing.LastTransitionTime = &t
+		}
+		r.sizingNextRequeue.Delete(client.ObjectKeyFromObject(agent))
+	} else {
 		tier = latched
+		running := tier
 		if refused = r.sizingRefusedStep(ctx, agent, tier); refused != nil {
-			// The latched tier's recreated pod was refused on a quota the
-			// gate had found room on (sizingRefusedStep): the latch steps
-			// back one tier, so that it again records what the pods run,
-			// and the cap names the quota and what admission said. The
-			// next pass renders the lower row; when its pod settles, the
-			// gate measures the step up again against the used totals as
-			// they stand, and when it too is refused this reads that
-			// refusal and steps back once more. The count is not read
-			// here: a refused pod is backed out of whatever the count
-			// earns, and the pass after decides from the count.
 			from := tier
-			tier--
+			tier = refused.rollbackTier
+			desired = from
 			capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingStepRefusedMessageFormat,
 				refused.workload, from, refused.quota, refused.message, tier)}
-		} else if observed, ok := observedClusterCount(agent); ok {
-			count = observed
-			if earned := sizingTierForClusterCount(count); earned > tier {
-				quotas, err := r.sizingQuotas(ctx, agent)
-				if err != nil {
-					return err
+			nextSizing = &agentv1alpha1.SizingStatus{}
+			if prevStatus != nil {
+				nextSizing = prevStatus.DeepCopy()
+			}
+			nextSizing.ActiveTier = tier.String()
+			nextSizing.DesiredTier = desired.String()
+			nextSizing.ScaleUpSustainedSince = nil
+			nextSizing.ScaleDownSustainedSince = nil
+			t := metav1.NewTime(now)
+			nextSizing.LastTransitionTime = &t
+			if nextSizing.Trigger == "" {
+				nextSizing.Trigger = sizingTriggerClusterCount
+			}
+			r.sizingNextRequeue.Delete(client.ObjectKeyFromObject(agent))
+		} else {
+			var surgeWait time.Duration
+			if _, heldBack := r.sizingStepBackHeld(agent); !heldBack {
+				stalled, surgeWait = r.sizingSurgeStalled(ctx, agent, tier, now)
+			}
+			if stalled != nil {
+				from := tier
+				tier = stalled.rollbackTier
+				desired = from
+				capped = sizingCap{reason: sizingCappedByCapacityReason, message: fmt.Sprintf(sizingSurgeStalledMessageFormat,
+					stalled.podName, sizingWorkloadProxy, from, stalled.reason, tier)}
+				nextSizing = &agentv1alpha1.SizingStatus{}
+				if prevStatus != nil {
+					nextSizing = prevStatus.DeepCopy()
 				}
-				ranges, err := r.sizingLimitRanges(ctx, agent)
-				if err != nil {
-					return err
+				nextSizing.ActiveTier = tier.String()
+				nextSizing.DesiredTier = desired.String()
+				nextSizing.ScaleUpSustainedSince = nil
+				nextSizing.ScaleDownSustainedSince = nil
+				t := metav1.NewTime(now)
+				nextSizing.LastTransitionTime = &t
+				if nextSizing.Trigger == "" {
+					nextSizing.Trigger = sizingTriggerUtilization
 				}
-				waitingOn := ""
-				if len(quotas) > 0 || len(ranges) > 0 {
-					waitingOn = r.sizingTierUnsettledWorkload(ctx, agent, tier)
+				r.sizingNextRequeue.Delete(client.ObjectKeyFromObject(agent))
+			} else {
+				observed, countKnown := observedClusterCount(agent)
+				if countKnown {
+					count = observed
 				}
-				heldFor, heldBack := time.Duration(0), false
-				if waitingOn == "" {
-					heldFor, heldBack = r.sizingStepBackHeld(agent)
+				floor := sizingTierSmall
+				if countKnown {
+					floor = sizingTierForClusterCount(count)
 				}
-				classes, answered := []string(nil), true
-				if waitingOn == "" && !heldBack {
-					classes, answered = r.sizingQuotaPriorityClasses(ctx, agent, quotas)
+				autopilot := r.sizingAutopilot(ctx, agent)
+				clamped := r.sizingRunningLimitsClamped(ctx, agent)
+				brokerMismatched := r.hasActiveBrokerAtOtherTier(ctx, agent, autopilot, clamped, running)
+				var sample SizingUtilizationSample
+				if !brokerMismatched {
+					sample = r.sizingSamplesFor(ctx, agent)
 				}
-				switch {
-				case waitingOn != "":
-					// The running tier's pods have not all been admitted yet
-					// (the pass after a promotion, while the proxy recreates),
-					// so the quotas' used totals do not yet charge the step
-					// just taken and a step measured from the latch would
-					// count it as free, and the running templates a Pod-type
-					// LimitRange item is read against are not all there or
-					// not yet at the tier's render, so a pod's sum read off
-					// them would miss a container or carry the wrong row.
-					// Nothing is measured: the cap stands as written, and the
-					// workloads' status updates re-enqueue the CR when the
-					// pods have settled. With no quota and no LimitRange
-					// there is nothing to measure against, and the earned
-					// tier is taken as before. The hold is logged on every
-					// pass it takes, so a wait that never ends (a workload
-					// that cannot settle at the tier's render) is told apart
-					// from a quiet pass.
-					capped = sizingCappedCondition(agent)
-					logf.FromContext(ctx).Info("sizing step held until the running tier's workloads settle",
-						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
-						"waitingOn", waitingOn, "clusters", count)
-				case heldBack:
-					// A step back (sizingRefusedStep) within the last
-					// sizingStepBackHoldInterval: the room the refused step
-					// lost may be back already, and a pass that measured it
-					// would take the step again, into the next pod the
-					// namespace admits during the drain. Nothing is measured
-					// until the interval has passed; the cap stands as the
-					// step back wrote it, and the hold is logged on every pass
-					// it takes, as the settled hold is.
-					capped = sizingCappedCondition(agent)
-					logf.FromContext(ctx).Info("sizing step held after a step back until the hold interval passes",
-						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
-						"heldFor", heldFor.Round(time.Second).String(), "holdInterval", sizingStepBackHoldInterval.String(), "clusters", count)
-				case !answered:
-					// A quota scopes the pods by PriorityClass and admission
-					// refused the dry run that asks which class they get
-					// (sizingAdmittedPriorityClass, whose log line names the
-					// refusal). Which quotas bind the pods is unknown, so
-					// nothing is measured, as above: the latch and the
-					// condition stand, and the pass that finds admission
-					// answering measures. Reading the scoped quotas as
-					// binding instead would cap the tier on a quota that may
-					// not count these pods and tell the reader to raise it.
-					capped = sizingCappedCondition(agent)
-					logf.FromContext(ctx).Info("sizing step held until admission answers the sizing pods' priority class",
-						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
-						"clusters", count)
-				default:
-					autopilot := r.sizingAutopilot(ctx, agent)
-					clamped := r.sizingRunningLimitsClamped(ctx, agent)
-					templates := map[string]corev1.PodTemplateSpec{}
-					if len(ranges) > 0 {
-						templates = r.sizedPodTemplates(ctx, agent)
+				if brokerMismatched {
+					// Wait for active-standby cutover to finish before scoring utilization so an
+					// older-tier active broker pod's child budget or watermark cannot skew the new tier.
+					desired = tier
+					nextSizing = &agentv1alpha1.SizingStatus{
+						ActiveTier:  tier.String(),
+						DesiredTier: desired.String(),
+						Trigger:     sizingTriggerClusterCount,
 					}
-					// The earned tier first, then each tier between it and
-					// the running one, every step measured from the running
-					// tier against the same used totals: the highest step the
-					// LimitRanges and the quotas admit is taken, so a count
-					// that earns fleet with room for medium alone reaches
-					// medium rather than waiting at small for the whole fleet
-					// step. The cap reports the lowest step refused, the one
-					// raising the quota or the bound by the least relieves,
-					// and the check that refused it.
-					running := tier
-					for candidate := earned; candidate > running; candidate-- {
-						if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, templates, candidate); crossed != nil {
-							bound, short = crossed, nil
-							continue
-						}
-						if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, candidate); shortfall != nil {
-							short, bound = shortfall, nil
-							continue
-						}
-						tier = candidate
-						break
+					if prevStatus != nil {
+						nextSizing = prevStatus.DeepCopy()
 					}
-					// The message names the step the figures were measured
-					// from (running) and the tier that stays (tier, the
-					// admitted candidate when one was taken); the next
-					// settled pass measures from that tier and the message
-					// changes once, recording that step's figures with it.
+					if floor > desired {
+						desired = floor
+						nextSizing.DesiredTier = desired.String()
+						switch nextSizing.Trigger {
+						case "", sizingTriggerManual, sizingTriggerClusterCount:
+							nextSizing.Trigger = sizingTriggerClusterCount
+						default:
+							nextSizing.Trigger = sizingTriggerBoth
+						}
+					} else {
+						nextSizing.DesiredTier = desired.String()
+					}
+					nextPoll := sizingUtilizationPollInterval
+					if surgeWait > 0 {
+						nextPoll = minRequeue(nextPoll, surgeWait)
+					}
+					r.sizingNextRequeue.Store(client.ObjectKeyFromObject(agent), nextPoll)
+				} else if !countKnown && !sample.HasAnyData() {
+					// Preserve any standing cap when the event watcher is on (outage
+					// or pre-first-poll), or clear it when the watcher is switched off.
+					if eventWatcherEnabled(agent) {
+						capped = sizingCappedCondition(agent)
+					}
+					nextSizing = prevStatus
+					desired = tier
+				} else {
+					decision := r.evaluateSizingUtilization(agent, autopilot, clamped, tier, floor, prevStatus, sample, now)
+					desired = decision.DesiredTier
+					nextSizing = decision.NextStatus
+
+					nextPoll := minRequeue(decision.RequeueAfter, sizingUtilizationPollInterval)
+					if surgeWait > 0 {
+						nextPoll = minRequeue(nextPoll, surgeWait)
+					}
+					r.sizingNextRequeue.Store(client.ObjectKeyFromObject(agent), nextPoll)
+				}
+
+				if desired != running {
+					quotas, err := r.sizingQuotas(ctx, agent)
+					if err != nil {
+						return err
+					}
+					ranges, err := r.sizingLimitRanges(ctx, agent)
+					if err != nil {
+						return err
+					}
+					waitingOn := ""
+					if len(quotas) > 0 || len(ranges) > 0 {
+						waitingOn = r.sizingTierUnsettledWorkload(ctx, agent, running)
+					}
+					heldFor, heldBack := time.Duration(0), false
+					if waitingOn == "" && desired > running {
+						heldFor, heldBack = r.sizingStepBackHeld(agent)
+					}
+					classes, answered := []string(nil), true
+					if waitingOn == "" && !heldBack {
+						classes, answered = r.sizingQuotaPriorityClasses(ctx, agent, quotas)
+					}
 					switch {
-					case bound != nil:
-						capped = sizingCap{reason: sizingCappedByLimitRangeReason, message: fmt.Sprintf(sizingCappedByLimitRangeMessageFormat,
-							earned, bound.limitRange, bound.scope, bound.bound, bound.key, bound.subject(), running, tier)}
-					case short != nil:
-						capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingCappedByQuotaMessageFormat,
-							earned, short.quota, short.key, running, tier)}
+					case waitingOn != "":
+						capped = sizingCappedCondition(agent)
+						if agent.Status.Sizing == nil && prevStatus == nil {
+							nextSizing = nil
+						}
+						logf.FromContext(ctx).Info("sizing step held until the running tier's workloads settle",
+							"name", agent.Name, "namespace", agent.Namespace, "tier", running.String(), "desired", desired.String(),
+							"waitingOn", waitingOn, "clusters", count)
+					case heldBack:
+						capped = sizingCappedCondition(agent)
+						if agent.Status.Sizing == nil && prevStatus == nil {
+							nextSizing = nil
+						}
+						logf.FromContext(ctx).Info("sizing step held after a step back until the hold interval passes",
+							"name", agent.Name, "namespace", agent.Namespace, "tier", running.String(), "desired", desired.String(),
+							"heldFor", heldFor.Round(time.Second).String(), "holdInterval", sizingStepBackHoldInterval.String(), "clusters", count)
+					case !answered:
+						capped = sizingCappedCondition(agent)
+						if agent.Status.Sizing == nil && prevStatus == nil {
+							nextSizing = nil
+						}
+						logf.FromContext(ctx).Info("sizing step held until admission answers the sizing pods' priority class",
+							"name", agent.Name, "namespace", agent.Namespace, "tier", running.String(), "desired", desired.String(),
+							"clusters", count)
+					default:
+						templates := map[string]corev1.PodTemplateSpec{}
+						if len(ranges) > 0 {
+							templates = r.sizedPodTemplates(ctx, agent)
+						}
+						if desired > running {
+							for candidate := desired; candidate > running; candidate-- {
+								if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, templates, candidate); crossed != nil {
+									bound, short = crossed, nil
+									continue
+								}
+								if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, candidate); shortfall != nil {
+									short, bound = shortfall, nil
+									continue
+								}
+								tier = candidate
+								break
+							}
+							quotaFmt := sizingCappedByQuotaMessageFormat
+							rangeFmt := sizingCappedByLimitRangeMessageFormat
+							if !(countKnown && floor >= desired) {
+								quotaFmt = sizingCappedByUtilizationQuotaMessageFormat
+								rangeFmt = sizingCappedByUtilizationLimitRangeMessageFormat
+							}
+							switch {
+							case bound != nil:
+								capped = sizingCap{reason: sizingCappedByLimitRangeReason, message: fmt.Sprintf(rangeFmt,
+									desired, bound.limitRange, bound.scope, bound.bound, bound.key, bound.subject(), running, tier)}
+							case short != nil:
+								capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(quotaFmt,
+									desired, short.quota, short.key, running, tier)}
+							}
+						} else {
+							// Step-down: ensure Limits and credential-proxy surge fit quota/LimitRange before rolling.
+							if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, templates, desired); crossed != nil {
+								bound = crossed
+							} else if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, desired); shortfall != nil {
+								short = shortfall
+							} else {
+								tier = desired
+							}
+							switch {
+							case bound != nil:
+								capped = sizingCap{reason: sizingCappedByLimitRangeReason, message: fmt.Sprintf(sizingCappedByUtilizationLimitRangeMessageFormat,
+									desired, bound.limitRange, bound.scope, bound.bound, bound.key, bound.subject(), running, tier)}
+							case short != nil:
+								capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingCappedByUtilizationQuotaMessageFormat,
+									desired, short.quota, short.key, running, tier)}
+							}
+						}
 					}
+				} else {
+					if _, heldBack := r.sizingStepBackHeld(agent); heldBack {
+						capped = sizingCappedCondition(agent)
+					}
+					if (countKnown || sample.HasAnyData()) && agent.Status.Sizing == nil && prevStatus == nil && !sample.HasAnyData() && sizingCappedConditionCurrent(agent, capped) && agent.Status.EffectiveSizingTier == tier.String() {
+						// Settled legacy/seeded CR with no utilization data yet: do not force a spurious Status write.
+						nextSizing = nil
+					}
+				}
+
+				if tier != running && nextSizing != nil {
+					nextSizing.ActiveTier = tier.String()
+					nextSizing.ScaleUpSustainedSince = nil
+					nextSizing.ScaleDownSustainedSince = nil
+					t := metav1.NewTime(now)
+					nextSizing.LastTransitionTime = &t
 				}
 			}
-		} else if eventWatcherEnabled(agent) {
-			// No reading with the watcher on is an outage or the time before
-			// the first poll: the cap stands as written. With the watcher off
-			// by spec the poller clears the gauges for as long as it stays
-			// off, and a cap carried through that would outlive the quota
-			// being raised; auto cannot promote without a reading, so there
-			// is nothing to cap, and the first reading after the watcher is
-			// switched back on checks the quota again.
-			capped = sizingCappedCondition(agent)
 		}
 	}
+
 	tierSettled := agent.Status.EffectiveSizingTier == tier.String() ||
 		(agent.Status.EffectiveSizingTier == "" && r.sizingTierPruned(agent))
-	if tierSettled && sizingCappedConditionCurrent(agent, capped) {
+	sizingSettled := r.sizingStatusPruned(agent) || sizingStatusEquivalent(agent.Status.Sizing, nextSizing)
+	if tierSettled && sizingCappedConditionCurrent(agent, capped) && sizingSettled {
 		return nil
 	}
 	log := logf.FromContext(ctx)
 	if previous := agent.Status.EffectiveSizingTier; previous != tier.String() {
 		log.Info("sizing tier resolved", "name", agent.Name, "namespace", agent.Namespace, "from", previous, "to", tier.String(), "profile", profile)
-		// The first write, on every CR after the upgrade that brought the
-		// field, is not a change worth an event.
 		if previous != "" {
 			r.recordEvent(agent, corev1.EventTypeNormal, sizingTierChangedReason, fmt.Sprintf(sizingTierChangedMessageFormat, previous, tier, profile))
 		}
@@ -1879,6 +2294,11 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 		log.Info("sizing tier stepped back: admission refused the recreated pod on a ResourceQuota", "name", agent.Name, "namespace", agent.Namespace,
 			"workload", refused.workload, "quota", refused.quota, "from", agent.Status.EffectiveSizingTier, "to", tier.String(), "admission", refused.message)
 		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByQuotaEventReason, capped.message)
+	}
+	if stalled != nil {
+		log.Info("sizing tier rolled back: surge pod stayed Pending past timeout", "name", agent.Name, "namespace", agent.Namespace,
+			"pod", stalled.podName, "reason", stalled.reason, "from", agent.Status.EffectiveSizingTier, "to", tier.String())
+		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByCapacityReason, capped.message)
 	}
 	if short != nil && !sizingCappedConditionCurrent(agent, capped) {
 		log.Info("sizing tier capped by ResourceQuota", "name", agent.Name, "namespace", agent.Namespace,
@@ -1894,14 +2314,16 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			fmt.Sprintf(sizingCappedByLimitRangeEventFormat, capped.message, count, bound.bound, bound.quantity.String(), bound.figure))
 	}
 	agent.Status.EffectiveSizingTier = tier.String()
+	agent.Status.Sizing = nextSizing
 	setSizingCappedCondition(agent, capped, metav1.Now())
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}
-	if refused != nil {
-		r.steppedBackAt.Store(client.ObjectKeyFromObject(agent), time.Now())
+	if refused != nil || stalled != nil {
+		r.steppedBackAt.Store(client.ObjectKeyFromObject(agent), now)
 	}
 	r.noteSizingTierEcho(ctx, agent)
+	r.noteSizingStatusEcho(ctx, agent, nextSizing)
 	return nil
 }
 
@@ -1914,7 +2336,7 @@ func (r *PlatformAgentReconciler) sizingStepBackHeld(agent *agentv1alpha1.Platfo
 	if !stepped {
 		return 0, false
 	}
-	held := time.Since(recorded.(time.Time))
+	held := r.clockNow().Sub(recorded.(time.Time))
 	return held, held < sizingStepBackHoldInterval
 }
 

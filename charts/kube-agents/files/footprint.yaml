@@ -101,6 +101,7 @@ operatorRendered:
     ephemeralStorageBytesRequest: 8589934592
     ephemeralStorageBytesLimit: 8589934592
     pods: 1
+    surges: true
   kubeProxy:
     requests:
       cpu: 200m

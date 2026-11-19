@@ -112,6 +112,11 @@ _SURGE_FIRST_BY_DESIGN = {
         "ready verifiers refuses every task submission, and the executor does not "
         "retry the refusal"
     ),
+    "platformagent-credential-proxy": (
+        "active-standby RollingUpdate (maxSurge: 1, maxUnavailable: 0) warms a "
+        "standby replacement pod on :8766 before the operator drains the active "
+        "broker and flips the lease, avoiding broker and relay downtime (#proactive-sizing)"
+    ),
 }
 
 

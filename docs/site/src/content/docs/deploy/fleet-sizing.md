@@ -162,16 +162,16 @@ through the inputs, or add pools beside the managed ones.
 
 Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
 the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
-The proxy Deployment recreates its pod rather than rolling it: applied on the default pools, the
-example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and
-`kubectl` command, and the Google Chat relay, is then down until a node fits.
+The proxy Deployment rolls with `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated
+active-standby handoff: if the new surge pod stays `Pending`, the existing active broker pod keeps serving. Only a fresh install with no running pod stays unavailable until a node fits.
 
-The same holds under `spec.deployment.sizingProfile: auto`, which applies the `medium` row at 10
-clusters and the `fleet` row at 25 with no human in the loop. Before a step up the operator checks
-the namespace's `ResourceQuota` and the bounds of its `LimitRange` objects, not node
-allocatable capacity. A Standard pool therefore needs nodes that fit the `fleet` row's 4 vCPU proxy
-request (`e2-standard-8` or larger) before the count reaches 25. The `medium` row's 1 vCPU request
-fits an `e2-standard-4`. A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
+The same holds under `spec.deployment.sizingProfile: auto`, which sets a cluster-count floor (`medium` at 10
+clusters, `fleet` at 25) and promotes or steps down proactively from live pod and broker metrics with no human in the loop.
+
+Before each tier transition, the operator checks
+the namespace's `ResourceQuota` (including the broker's surge pod) and `LimitRange` bounds, not node
+allocatable capacity. It rolls back a `Pending` surge pod past two minutes with `SizingCappedByQuota` (`SurgeUnschedulable`) while keeping the running pod active. A Standard pool still needs nodes that fit the `fleet` row's 4 vCPU proxy
+request (`e2-standard-8` or larger) before load or count reaches `fleet` (`medium`'s 1 vCPU request fits an `e2-standard-4`). A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
 the tier at the row it admits, and the CR's `SizingCappedByQuota` condition names it.
 
 | Pool             | Shape (modeled)                                                                                                                                         | Carries                                                               |

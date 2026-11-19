@@ -69,8 +69,8 @@ const (
 // ApiSession whose connect fails stays on the stateful broker for the rest of
 // the session (credential_proxy_client.py), and CredentialProxyExecReady would
 // flip on each miss. The 2s timeout is ample for a handler that returns a
-// constant. The stateful broker keeps its own probe: it rolls with Recreate,
-// so no other pod could take its traffic.
+// constant. The stateful broker uses a tighter 2s/2s/2-failure readiness probe
+// for fast active-standby RollingUpdate cutover.
 const (
 	credentialProxyExecTierReadinessPeriodSeconds    int32 = 3
 	credentialProxyExecTierReadinessTimeoutSeconds   int32 = 2
@@ -174,6 +174,8 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// a subscription change must not roll every exec replica.
 	a2aGoogleChatSubscriptionEnvVar:      true,
 	credentialProxyA2AChatAudienceEnvVar: true,
+	credentialProxyStandbyEnv:            true,
+	credentialProxyControlFileEnv:        true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
 	// allowed callers, the A2A gateway among them while Chat is armed, and
 	// the binding is what holds that account to the a2a-chat audience. The
@@ -326,6 +328,7 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	}
 	dep.Spec.Template.Labels = podLabels
 	delete(dep.Spec.Template.Annotations, secretEnvHashAnnotation)
+	delete(dep.Spec.Template.Annotations, credentialProxyTemplateHashAnnotation)
 
 	// The audit-report store's token goes too: a projected ServiceAccount
 	// token, which the by-source filter keeps, and an exec pod runs brokered

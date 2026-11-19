@@ -30,10 +30,9 @@ import (
 const kubernetesDefaultTerminationGraceSeconds = 30
 
 // TestTheBrokerPodHoldsItsDrain pins the grace period that lets the broker's
-// SIGTERM drain finish, and the Recreate strategy it is sized for: the drain
-// runs while no other broker serves, so it is bounded, not as long as the
-// longest command. tests/test_credential_proxy_drain_budget.py holds the
-// drain's own terms under this value.
+// SIGTERM drain finish, and the RollingUpdate (maxSurge=1, maxUnavailable=0)
+// active-standby strategy it uses: tests/test_credential_proxy_drain_budget.py
+// holds the drain's own terms under this value.
 func TestTheBrokerPodHoldsItsDrain(t *testing.T) {
 	dep := buildCredentialProxyDeployment(brokerPodAgent(), brokerTestPolicyHash)
 
@@ -47,8 +46,11 @@ func TestTheBrokerPodHoldsItsDrain(t *testing.T) {
 	if *grace <= kubernetesDefaultTerminationGraceSeconds {
 		t.Errorf("terminationGracePeriodSeconds = %d, not above the %ds default the drain outlasts", *grace, kubernetesDefaultTerminationGraceSeconds)
 	}
-	if got := dep.Spec.Strategy.Type; got != appsv1.RecreateDeploymentStrategyType {
-		t.Errorf("strategy = %q, want Recreate: the bounded drain is sized for a pod no other broker serves beside", got)
+	if got := dep.Spec.Strategy.Type; got != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("strategy = %q, want RollingUpdate: active-standby surge brings up the replacement before draining the active broker", got)
+	}
+	if ru := dep.Spec.Strategy.RollingUpdate; ru == nil || ru.MaxSurge == nil || ru.MaxSurge.IntValue() != int(credentialProxyMaxSurge) || ru.MaxUnavailable == nil || ru.MaxUnavailable.IntValue() != int(credentialProxyMaxUnavailable) {
+		t.Errorf("rollingUpdate = %#v, want maxSurge=%d maxUnavailable=%d", ru, credentialProxyMaxSurge, credentialProxyMaxUnavailable)
 	}
 }
 

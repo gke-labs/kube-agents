@@ -135,7 +135,7 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # default is None (unbounded). A test that calls `serve` puts them back: a later
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
-_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots", "lifecycle", "readings_sweep")
 
 
 def setUpModule():
@@ -10217,6 +10217,9 @@ class GracefulDrainTest(unittest.TestCase):
         slack = mock.patch.object(CredentialProxyHandler, "slack_relay", None)
         slack.start()
         self.addCleanup(slack.stop)
+        lifecycle = mock.patch.object(CredentialProxyHandler, "lifecycle", None)
+        lifecycle.start()
+        self.addCleanup(lifecycle.stop)
 
     def _handler(self, path):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
@@ -10269,15 +10272,15 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual({}, captured)
 
     def test_a_draining_exec_pod_fails_its_readiness_probe(self):
-        # The readiness probe reads /healthz. An exec pod that drains answers
-        # 503, so the Service stops sending it new connections and a caller at
-        # one replica falls back to the stateful broker; the broker, which
-        # rolls with Recreate, and any pod that does not drain answer ok.
+        # The readiness probe reads /healthz. Both an exec pod and a RollingUpdate
+        # standalone broker return 503 while draining so Kubernetes stops routing
+        # new connections to them while in-flight requests finish; a sidecar role
+        # or non-draining pod answers ok.
         cases = (
             (credential_proxy_client.EXEC_ROLE, True, HTTPStatus.SERVICE_UNAVAILABLE,
              credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             (credential_proxy_client.EXEC_ROLE, False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
-            ("broker", True, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", True, HTTPStatus.SERVICE_UNAVAILABLE, credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             ("broker", False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
         )
         for role, draining, status, payload in cases:

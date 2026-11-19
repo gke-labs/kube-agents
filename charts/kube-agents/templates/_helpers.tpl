@@ -2690,9 +2690,9 @@ and pod count as JSON.
        lowered to a limit set alone below it, as resolveCredentialProxyResources does. The
        CR block fails the render on a zero limit, on a crossed pair set together, and on a
        request set alone above the row's limit; under auto that row is the fleet one
-       (kube-agents.credentialProxyCeilingRow), the highest the latch reaches, while the
+       (kube-agents.credentialProxyCeilingRow), the highest the active tier reaches, while the
        preflight counts auto at the small row, so a request set alone between the two
-       rows' limits renders and reaches here crossed. The operator refuses it at a latch
+       rows' limits renders and reaches here crossed. The operator refuses it at an active tier
        whose row it crosses and renders that row, Degraded, so the preflight counts such
        an override at the row, as the shell's rule and the agent-api-auth delta do, rather
        than charging the quota for a pod the operator never writes. Decided on the merged
@@ -2970,10 +2970,10 @@ tier's replica count, which gates the tier's scrape objects and its quota term.
 
 {{- /* The row the CR template reads a request-only proxy override against when it
        checks the request against a limit the override does not set: the profile's
-       row, and under auto the fleet row, the highest the operator's latch reaches.
-       The chart cannot read the latch (status.effectiveSizingTier), so under auto
+       row, and under auto the fleet row, the highest the active tier reaches.
+       The chart cannot read the active tier (status.effectiveSizingTier), so under auto
        the template refuses only a request no row's limit admits, and leaves the row
-       the install runs to the webhook and the reconciler, which read the latch. */ -}}
+       the install runs to the webhook and the reconciler, which read the active tier. */ -}}
 {{- define "kube-agents.credentialProxyCeilingRow" -}}
 {{- $profile := ((.Values.platformAgent.deployment | default dict).sizingProfile) | default "" -}}
 {{- $tier := include "kube-agents.sizingTier" . -}}
@@ -3511,7 +3511,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          override the operator refuses against the row counted here at that row
          (kube-agents.credentialProxyOverrideRefused, kube-agents.shellSandboxOverrideRefused),
          the defaults the operator then renders: under auto, a proxy request set alone
-         between the small and the fleet limits renders and is refused at the small latch. An
+         between the small and the fleet limits renders and is refused at the small tier. An
          ephemeral-storage limit set alone is counted as a request of that size too: the
          operator renders no ephemeral-storage request and the API server defaults it to
          the limit. On GKE Autopilot the proxy's helper runs without an override too,
@@ -3545,6 +3545,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $busOne := eq (toString ((((.Values.platformAgent | default dict).harness | default dict).tuning | default dict).busReplicas)) "1" -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- $surges := $workload.surges -}}
       {{- if and $busOne (eq $key "a2aNats") -}}
         {{- $n := $workload.pods | default 1 | int64 -}}
         {{- $workload = dict "pods" 1 "surges" $workload.surges
@@ -3574,7 +3575,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
       {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
       {{- $pods := $workload.pods | default 0 | int64 -}}
-      {{- if and $workload.surges (gt $pods (int64 0)) -}}
+      {{- if and $surges (gt $pods (int64 0)) -}}
         {{- $surgeCpuReq = max $surgeCpuReq (div ($workload.cpuMillisRequest | default 0 | int64) $pods) -}}
         {{- $surgeCpuLim = max $surgeCpuLim (div ($workload.cpuMillisLimit | default 0 | int64) $pods) -}}
         {{- $surgeMemReq = max $surgeMemReq (div ($workload.memoryBytesRequest | default 0 | int64) $pods) -}}

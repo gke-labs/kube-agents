@@ -65,6 +65,16 @@ import (
 // reference that hands the broker its memory limit names it too.
 const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
 
+const (
+	credentialProxyMaxSurge       = int32(1)
+	credentialProxyMaxUnavailable = int32(0)
+
+	credentialProxyReadinessInitialDelaySeconds = int32(2)
+	credentialProxyReadinessPeriodSeconds       = int32(2)
+	credentialProxyReadinessTimeoutSeconds      = int32(2)
+	credentialProxyReadinessFailureThreshold    = int32(2)
+)
+
 // credentialProxyClusterTypeAnnotation records, on the proxy Deployment's own
 // metadata, the cluster type its requests were rendered for, so a reconcile
 // whose Autopilot check fails can keep it (liveCredentialProxyAutopilot). It
@@ -107,11 +117,11 @@ const credentialProxyPDBMaxUnavailable = 1
 // agents/platform/scripts/credential_proxy.py), ends the commands still
 // running and waits up to 5s for their answers, then hands its Chat receipts
 // back; the entrypoint waits up to 40s for that (BROKER_RUNTIME_DRAIN_SECONDS
-// in deploy/shared/start-services.sh) before it stops Envoy. The pod keeps
-// Recreate, so every route is down while it drains; the drain is bounded so
-// that stays short. An idle broker exits after its 3s settle window
-// (SHUTDOWN_SETTLE_SECONDS), as before, so this lengthens nothing when there is
-// no work in flight.
+// the entries in flight end with it. On operator-coordinated cutovers, /control/drain
+// drains gracefully first while active-standby RollingUpdate keeps serving; on
+// abrupt SIGTERM it falls back to the 30s drain above. An idle broker exits after
+// its 3s settle window (SHUTDOWN_SETTLE_SECONDS), as before, so this lengthens
+// nothing when there is no work in flight.
 const credentialProxyTerminationGraceSeconds int64 = 45
 
 const (
@@ -153,13 +163,13 @@ const (
 	//   - On Standard the request is scheduling weight and the broker bursts
 	//     to its limit when the node has the cores. The small row's request
 	//     stays at 500m because a larger one has to fit on one node before
-	//     the broker can start, and its Deployment is Recreate: on a one-node
-	//     default pool with the other agent pods on it, a 2-CPU request
-	//     leaves the new broker Pending after the old one stopped. The
+	//     a surge pod or initial replica can schedule; on a small node pool
+	//     a 2-CPU request would leave a surged or recreated broker Pending. The
 	//     medium and fleet rows (sizing_profile.go) raise the request to 1
 	//     and 4 CPU on both cluster types, so on Standard they need a node
 	//     that fits it, under an explicit profile and under auto alike; the
-	//     quota gate before a step up does not read node capacity.
+	//     quota gate before a step up does not read node capacity (and under
+	//     auto an unschedulable surge pod rolls back cleanly after 2m).
 	//   - On GKE Autopilot without bursting the limit is clamped to the
 	//     request, so only the request buys CPU, and the broker requests 2 CPU
 	//     there (credentialProxyAutopilotCPURequest). The operator learns the
@@ -525,19 +535,17 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 
 // buildCredentialProxyDeploymentForPlugins renders the standalone proxy pod.
 //
-// Recreate, not RollingUpdate. The Google Chat relay pulls from a Pub/Sub
-// subscription when the gateway fetches over this Service and keeps each
-// message's ack id in this process; with two pods during a rollout, an ack the
-// Service sends to the other pod fails, and a message that misses its ack
-// deadline is delivered again and its turn runs twice. A few seconds of
-// unavailability is the cheaper failure: the gateway retries its long poll.
+// RollingUpdate (maxSurge=1, maxUnavailable=0) with operator-coordinated
+// active-standby handoff (credential_proxy_control.go): the replacement pod
+// warms in standby (503 /healthz) while the old pod stays active; once warm,
+// the operator drains the old pod, transfers the Lease, and activates the new
+// pod so single-pod stateful routes (Google Chat acks, Slack Socket Mode,
+// scope MemberWindow) never split across two active brokers.
 //
-// One replica, by design. The Chat relay's ack ids and the Slack relay's
-// event queue and receipts live in this process or its emptyDir, so a second
-// pod behind the Service breaks them; only the exec route scales as it is. docs/designs/credential-proxy-single-pod.md records the
-// decision, the load it was sized against, and the split exec tier to build if
-// it reopens. What one pod costs on an eviction or a rollout, and how the pod
-// leaves, is buildCredentialProxyPDB's and the proxy's SIGTERM handler's.
+// One active replica, by design (see docs/designs/credential-proxy-single-pod.md
+// and docs/designs/proactive-utilization-sizing.md); only the exec route scales
+// horizontally when configured. What one pod costs on an unexpected eviction and
+// how it exits on SIGTERM is buildCredentialProxyPDB's and the proxy's handler's.
 //
 // The AgentPlugins resolved for the agent reach the container's environment
 // (buildCredentialProxyEnvForPlugins); buildCredentialProxyDeployment is this
@@ -585,7 +593,13 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
-			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxSurge:       ptr.To(intstr.FromInt32(credentialProxyMaxSurge)),
+					MaxUnavailable: ptr.To(intstr.FromInt32(credentialProxyMaxUnavailable)),
+				},
+			},
 			Selector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -630,6 +644,7 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 	}
 	withCommonLabels(dep, agent)
 	dep.Labels["app"] = credentialProxyName(agent)
+	stampCredentialProxyTemplateHash(&dep.Spec.Template)
 	return dep
 }
 
@@ -681,6 +696,7 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// after the merge with spec.deployment.env, which reserves both names, as
 	// the federation pair below is.
 	envVars = append(envVars, auditReportStoreBrokerEnv(agent)...)
+	envVars = append(envVars, credentialProxyControlEnv()...)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -728,10 +744,10 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/healthz", Port: intstr.FromString(credentialProxyHealthPortName),
 			}},
-			InitialDelaySeconds: 5,
-			PeriodSeconds:       10,
-			TimeoutSeconds:      5,
-			FailureThreshold:    3,
+			InitialDelaySeconds: credentialProxyReadinessInitialDelaySeconds,
+			PeriodSeconds:       credentialProxyReadinessPeriodSeconds,
+			TimeoutSeconds:      credentialProxyReadinessTimeoutSeconds,
+			FailureThreshold:    credentialProxyReadinessFailureThreshold,
 		},
 		// Sized where the constants are declared: CPU for the warm-up after an
 		// eviction, memory for Envoy, the broker's bounded share and the child
@@ -799,6 +815,7 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The token for the audit-report store and nothing else
 	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
 	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
+	mounts = append(mounts, credentialProxyControlMountSpec())
 	_, tiersMount, _ := a2aTiersVolumeAndMount(agent)
 	mounts = append(mounts, tiersMount)
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
@@ -982,7 +999,8 @@ var (
 		// fleet cluster's events and named objects, and the drift subscription.
 		// It is projected into agent-api-auth alone, and that geometry is the
 		// whole of what keeps it from the model's container.
-		watcherTokenVolume: true,
+		watcherTokenVolume:           true,
+		credentialProxyControlVolume: true,
 	}
 	credentialProxyRuntimeVolumeNames = map[string]bool{
 		"credential-proxy-policy":    true,
@@ -1025,6 +1043,7 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	// The token the broker presents to the audit-report store.
 	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)
+	volumes = append(volumes, credentialProxyControlVolumeSpec(agent))
 	// The install's tier table (#6091): the operator's rendered, non-secret
 	// tiers ConfigMap, mounted read-only.
 	tiersVolume, _, _ := a2aTiersVolumeAndMount(agent)

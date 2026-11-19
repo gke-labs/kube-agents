@@ -172,8 +172,8 @@ in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. Se
 
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
 every caller of its credentialed listener with a `TokenReview` over an audience-bound
-projected token (the metrics-only listener, [Architecture](#architecture), serves counters
-and authenticates nobody), and
+projected token (on port 8766, [Architecture](#architecture), `/metrics` serves counters
+unauthenticated while `/control/*` requires bearer auth against `<name>-credential-proxy-control`), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds
@@ -237,15 +237,15 @@ ten-second deadline as the metrics listener, so that a probe an operator
 points at the broker directly reads it as alive while the credentialed
 listener is at its thread cap; the operator's readiness probe reads `/healthz`
 through Envoy's health listener on 8768 instead (below), and the broker's
-NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The second listener on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
 set by the operator) serves Prometheus series whose label values are
-static enums and closed vocabularies, holds no route, credential or policy,
+static enums and closed vocabularies on `/metrics` (unauthenticated) plus bearer-authenticated active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`, authenticated against `CREDENTIAL_PROXY_CONTROL_FILE`), holds no workload route or upstream credential,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
 process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
 namespace, where the managed-Prometheus collector runs, and to the operator's own
-pods, which read the counters into the `PlatformAgent`'s `status.usage`
+pods, which read the counters into the `PlatformAgent`'s `status.usage` and `status.sizing` and coordinate broker handoffs
 ([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica, a shape the operator does not render today.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an

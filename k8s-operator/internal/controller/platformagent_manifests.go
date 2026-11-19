@@ -5301,10 +5301,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	} {
 		reserved[name] = struct{}{}
 	}
-	// The audit-report store's names (auditReportStoreEnvNames).
+	// The audit-report store's names (auditReportStoreEnvNames) and broker
+	// active-standby control env vars.
 	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
+	reserved[credentialProxyStandbyEnv] = struct{}{}
+	reserved[credentialProxyControlFileEnv] = struct{}{}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {

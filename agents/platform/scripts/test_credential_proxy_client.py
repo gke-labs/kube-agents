@@ -1237,6 +1237,68 @@ class VcsCallErrorTest(unittest.TestCase):
             with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
                 self.assertEqual(credential_proxy_client.vcs_call(self.endpoint, "capabilities", {}), answer)
 
+    def test_a_draining_503_refusal_is_retried(self):
+        draining = json.dumps(
+            {
+                "status": "busy",
+                "code": "CREDENTIAL_PROXY_BUSY",
+                "bound": "draining",
+                "before_admission": True,
+                "error": "draining",
+            }
+        ).encode()
+        ok_body = json.dumps({"baseBranch": "main"}).encode()
+        calls = 0
+
+        def open_req(request, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "Service Unavailable", {"Retry-After": "1"}, io.BytesIO(draining)
+                )
+            return io.BytesIO(ok_body)
+
+        sleeps = []
+        with self._no_token_file, patch.object(credential_proxy_client, "open_broker_request", open_req):
+            answer = credential_proxy_client.vcs_call(
+                self.endpoint,
+                "capabilities",
+                {},
+                clock=lambda: 0.0,
+                sleep_fn=sleeps.append,
+                rng=type("R", (), {"uniform": staticmethod(lambda a, b: b)})(),
+            )
+        self.assertEqual({"baseBranch": "main"}, answer)
+        self.assertEqual(2, calls)
+        self.assertEqual(1, len(sleeps))
+
+    def test_a_forge_429_rate_limit_is_not_retried(self):
+        rate_limited = json.dumps({"error": "rate limited", "code": "FORGE_RATE_LIMITED"}).encode()
+        calls = 0
+
+        def open_req(request, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", {"Retry-After": "1"}, io.BytesIO(rate_limited)
+            )
+
+        sleeps = []
+        with self._no_token_file, patch.object(credential_proxy_client, "open_broker_request", open_req):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                credential_proxy_client.vcs_call(
+                    self.endpoint,
+                    "proposal-claim",
+                    {},
+                    clock=lambda: 0.0,
+                    sleep_fn=sleeps.append,
+                )
+        self.assertEqual(429, caught.exception.status)
+        self.assertEqual("FORGE_RATE_LIMITED", caught.exception.payload.get("code"))
+        self.assertEqual(1, calls)
+        self.assertEqual([], sleeps)
+
 
 class TestCallerCredential(SubmittedPayloadTestCase):
     """The client half of the broker's authentication.

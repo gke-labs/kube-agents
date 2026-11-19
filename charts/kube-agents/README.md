@@ -697,7 +697,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
+tool-invocation, request and version-control metrics from its port 8766 (which also serves bearer-authenticated `/control/*` handoff endpoints), and the A2A
 gateway pod, so it scrapes the gateway's inbound-message,
 task terminal and Google Chat pull counters from its metrics-only port 9096.
 The operator's policies on all three pods admit the
@@ -1043,8 +1043,8 @@ comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
 decimal one can compare equal to it; the operator decides that pair. A request
 set without its limit is checked against the sizing profile row's limit, and
-under `auto` against the fleet row's, the highest the operator's latch reaches:
-the chart cannot read the latch, so it refuses only a request no row admits and
+under `auto` against the fleet row's, the highest `status.effectiveSizingTier` reaches:
+the chart cannot read `status.effectiveSizingTier`, so it refuses only a request no row admits and
 leaves the row the install runs to the webhook. The quota
 preflight sums the
 override merged over the operator's defaults. On an existing install, apply the
@@ -1069,10 +1069,10 @@ predates the field.
 `platformAgent.deployment.sizingProfile` picks the preset the credential proxy,
 the `agent-api-auth` sidecar and the shell container start from, forwarded to the
 CR's `spec.deployment.sizingProfile` when set: `small` (the operator's defaults,
-and what an unset value means), `medium`, `fleet`, or `auto`, which steps the
-tier up with the cluster count the operator polls, holding a step the
-namespace's ResourceQuota has no room for, and steps it back one tier when
-admission refuses the pod a step recreated; a count that falls never lowers it. The
+and what an unset value means), `medium`, `fleet`, or `auto`, which sets a cluster-count
+floor (`medium` at 10, `fleet` at 25), promotes proactively when sustained utilization
+hits 75%, steps back on quota refusal or unschedulable surge pods, and steps down one
+tier at a time when shrinking dimensions remain at or below 55% of the lower row. The
 [`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
 has each row's figures and the auto rules. The three per-key overrides (the two
 above and `platformAgent.deployment.agentAPIAuth.resources`, the sidecar's) are
@@ -1392,7 +1392,7 @@ as a request of that size too, because the operator renders no ephemeral-storage
 the API server defaults it to the limit. A proxy override the operator refuses against the row
 the preflight counts (a zero limit, a request above that row's limit) is counted at the row; under
 `auto` that is a request set alone between the small row's limit and the fleet row's, which the
-CR template admits and the small latch refuses. The shell sandbox is counted the same way with
+CR template admits and the small tier refuses. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
 ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
 override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
@@ -1504,7 +1504,8 @@ not on upgrade or for claim-shaped keys, where `used` already holds the release'
 running pods or retained PVCs. Claim counts and `requests.storage` get no surge allowance,
 because a surge Pod mounts the existing claim rather than creating one. The surge Pod it
 sizes for is the largest one in the release that a rollout actually creates: rollouts are
-per-workload, so room for one at a time is enough. The shell sandbox's StatefulSet and the
+per-workload, so room for one at a time is enough. That includes `platform-agent-credential-proxy`
+(`RollingUpdate`, `maxSurge: 1, maxUnavailable: 0` for active-standby cutover). The shell sandbox's StatefulSet and the
 pre-delete cleanup Job never surge, and neither does the agent pod at the default
 `platformAgent.deployment.availability.replicas` of one, where the operator rolls the
 gateway Deployment with `strategy: Recreate`. The check counts an agent-pod surge from two

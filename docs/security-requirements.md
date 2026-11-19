@@ -110,14 +110,7 @@ peer by the Service or the NetworkPolicy. The runtime's
 health-only one, closed unless `CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers `GET /healthz`
 and nothing else with a fixed `{"status":"ok"}` body, holds no route, credential or policy,
 shares the metrics listener's connection cap and deadline, and is opened by the broker's
-NetworkPolicy to no pod, so only a kubelet probe reaches it. The metrics-only one on 8766
-serves Prometheus counters whose label values are static enums and closed
-vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
-time with a ten-second deadline on each, and is the one port the broker's
-NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
-collector runs, and to the operator's own pods, selected by namespace and pod label, which
-read the counters into the `PlatformAgent`'s `status.usage`; both are readers of counters, and
-no other peer reaches it by selector; the site's security reference states the one residual above one replica, a shape the operator does not render today ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
+The listener on 8766 serves unauthenticated Prometheus `/metrics` (whose label values are static enums and closed vocabularies) plus operator-only active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`) gated by a bearer token from `<name>-credential-proxy-control`. It holds no workload CLI/API route or upstream credential, answers at most sixteen connections at a time with a ten-second deadline on each, and is the one port the broker's NetworkPolicy opens to `gke-gmp-system` (Managed Prometheus collector) and to the operator's own pods (for `status.usage`, `status.sizing`, and `/control/*` handoffs). No other peer reaches it by selector; the site's security reference states the one residual above one replica, a shape the operator does not render today ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount and the sandbox's (and, under that flag, the
 session pods') and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a
