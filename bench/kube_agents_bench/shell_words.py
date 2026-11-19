@@ -10,7 +10,11 @@ because ``verifiers`` imports ``github_writes``.
 
 The agent images copy this one file beside
 ``agents/platform/scripts/worker_transcript.py``, which loads it by path. So
-it imports only the standard library and nothing from this package.
+it imports only the standard library and nothing from this package. That
+module's secret-read detector reads command lines with
+``_shell_words_and_spans``, ``_ShellOperator``, ``_is_redirect`` and
+``_substitution_commands``, so a change to one of them also changes which
+tool results the detector withholds.
 """
 
 from __future__ import annotations

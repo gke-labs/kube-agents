@@ -29,8 +29,9 @@
 # day on its own is `scripts/release/README.md`, "The daily GA release". It is
 # canonical for the reasoning; do not restate it here.
 #
-# There is deliberately no weekday or elapsed-time check in here. The cron is
-# the cadence, so no wall-clock arithmetic exists anywhere in the decision, and
+# There is deliberately no weekday or elapsed-time check in here. The trigger
+# is the cadence (a staging promotion's dispatch, or the daily tick), so no
+# wall-clock arithmetic exists anywhere in the decision, and
 # "has this candidate already been released?" needs no condition of its own:
 # if the candidate's base GA tag was cut from the gated commit, condition 2's
 # range is empty and the skip already covers it. The state lives in the tags.

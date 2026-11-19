@@ -1,6 +1,6 @@
 {{- /*
 The web console: a browser chat page for the Platform Agent, for installs with
-no chat platform configured. docs/site/src/content/docs/deploy/web-console.md
+no chat platform configured. docs/site/src/content/docs/deploy/web-console.mdx
 is the user-facing page.
 
 Access is `kubectl port-forward` and nothing else, and three things here hold

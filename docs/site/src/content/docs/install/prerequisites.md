@@ -156,7 +156,7 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 
 Of those totals, the session pods at the default cap of 10 are 10 pods, 1500m CPU and 3200Mi memory requested, 20 CPU and 20Gi memory in limits, and 10880Mi of ephemeral storage: one `a2a-worker` row below per session. `spec.harness.tuning.maxSessions` scales them. On GKE Autopilot without Pod bursting, Autopilot admits each pod at its per-Pod minimums where those exceed the request, with limits equal to requests: 2500m CPU and 5Gi memory at the same cap, the figures the quota preflight uses on Autopilot (the Autopilot profile's row above carries them).
 
-The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
+The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's transient overshoot at the cap.
 
 The A2A stack, per pod:
 

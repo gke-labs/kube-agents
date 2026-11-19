@@ -677,6 +677,14 @@ SECRET_READ_COMMAND_RE = re.compile(
 # `gcloud`, another tool with a token printer or an interpreter
 # (`WALK_LIMIT_COMMAND_WORDS`), and a call past its read budget
 # (`MAX_READ_CHARS_FACTOR`) withholds.
+# That is the first read (`_first_read_prints`). A second read
+# (`_read_script_prints`) takes the script's words, operators and substitutions
+# from the shell reader, which keeps one quote model and reads each
+# substitution whole, and gives each simple command to the same word walk. The
+# rule withholds when either read withholds, so the second read can only add a
+# withhold. It reads only text that the reader gives words for: text with an
+# unclosed quote, a redirect with no target or the reader's mark character is
+# the first read's alone.
 #
 # `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
 # but the ones named here, which print no token, and a flag right behind
@@ -778,8 +786,9 @@ SHORT_FLAG_CLUSTER_RE = re.compile(r"^-[A-Za-z]+$")
 # under `/proc` withholds, quoted as a whole or not and for any reader, when
 # it names `environ` or when its file part, below the process's directory, is
 # a glob or an expansion (`/proc/self/e*`, `/proc/1/$F`; `/proc/sys/vm/*` is
-# no process's). A quote inside the path ends it for this rule
-# (`/proc/"self"/e*` is not seen). A word that ends in `/environ` withholds
+# no process's). A quote inside the path ends it for the first read; the
+# second read tests each word with its quotes off (`/proc/"self"/e*`). A word
+# that ends in `/environ` withholds
 # too (`/proc/$(pgrep x)/environ`, `./environ`), and so does a file named
 # `environ` behind a file reader or as a command's input, since the shell may
 # stand in the process's directory.
@@ -833,6 +842,8 @@ REMOTE_NAMED_COMMAND_WORDS = WALK_LIMIT_COMMAND_WORDS | SHELL_BINARIES
 BINARY_DIRECTORY_SUFFIX = "bin"
 FIND_BINARY = "find"
 FIND_COMMAND_FLAGS = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+# The word that ends the command of one of these flags.
+FIND_COMMAND_END = ";"
 # The words that take a quoted argument as a script.
 SCRIPT_RUNNING_WORDS = SHELL_BINARIES | frozenset(("ssh", "su", "watch", "trap", "parallel", "script", "flock", "runuser"))
 # Every word the walk has a rule for; a command that starts with another word costs nothing to read.
@@ -875,6 +886,20 @@ SHELL_COMMAND_END = ";"
 SHELL_EXPANSION = "$"
 SUBSTITUTION_OPEN = SHELL_EXPANSION + SUBSHELL_OPEN
 PARENTHESIS_RE = re.compile(r"[()]")
+# A call's read budget is a list with a slot for each of the rule's two reads. The first read and
+# the word walk count against the first slot, also when the second read calls the walk.
+MARKS_BUDGET = 0
+SHELL_READER_BUDGET = 1
+READ_COUNT = 2
+# The openers of a substitution in a word (`$(`, `<(`, `>(`, a backtick).
+SPAN_OPENERS = (SUBSTITUTION_OPEN, "<(", ">(", SHELL_BACKTICK)
+# The second read reads substitutions inside substitutions to this depth, and withholds past it.
+MAX_SUBSTITUTION_NESTING = 16
+# The shell reader marks operators and substitutions in its text with this character.
+SHELL_READER_MARK_CHAR = "\x00"
+# Behind these words a word that is only a substitution gives names in the usual case
+# (`export $(cat .env | xargs)`), so it stays a word when the words are read without their substitutions.
+NAME_TAKING_BUILTINS = DECLARING_BUILTINS | frozenset((SET_BUILTIN,))
 # A backtick pair, written as the substitution it is.
 BACKTICK_OPENS = f" {SUBSTITUTION_OPEN} "
 BACKTICK_CLOSES = f" {SUBSHELL_CLOSE} "
@@ -2271,6 +2296,14 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
                 return True
         elif base == FIND_BINARY:
             starts.extend((behind + index + 1, False) for index, word in enumerate(rest) if word in FIND_COMMAND_FLAGS)
+            # The command behind `-exec` ends at the `;` word (`find . -exec env \;` runs a bare `env`),
+            # so each command is also read by itself. The shell reader gives that word; the first read never does.
+            for index, word in enumerate(rest):
+                if word in FIND_COMMAND_FLAGS and FIND_COMMAND_END in rest[index + 1 :]:
+                    command = rest[index + 1 : rest.index(FIND_COMMAND_END, index + 1)]
+                    budget[MARKS_BUDGET] -= READ_COST_CHARS * len(command)
+                    if budget[MARKS_BUDGET] < 0 or _words_print_token_or_environment(command, depth, budget):
+                        return True
         elif base == COMMAND_BUILTIN and rest[:1] and rest[0] in COMMAND_LOOKUP_FLAGS:
             continue
         elif base in COMMAND_PREFIX_WORDS:
@@ -2504,7 +2537,7 @@ def _text_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
     return False
 
 
-def script_prints_token_or_environment(script: str, depth: int, budget: Optional[List[int]] = None) -> bool:
+def _first_read_prints(script: str, depth: int, budget: Optional[List[int]] = None) -> bool:
     """Whether a shell script holds a command that prints the caller's token or its environment (see `GCLOUD_BINARY`).
 
     The script is a tool call's line, or a quoted argument that a word on
@@ -2525,6 +2558,141 @@ def script_prints_token_or_environment(script: str, depth: int, budget: Optional
     if _reads_process_environment(folded):
         return True
     return may_print and any(_text_prints_token_or_environment(simple, depth, budget) for simple in split_shell_commands(folded) if _holds_print_fragment(simple))
+
+
+def _without_substitutions(words: Sequence[str], spans: Sequence[str], budget: List[int]) -> Optional[List[str]]:
+    """The words as they are when each substitution prints nothing; None when the read budget ends first.
+
+    A word is then what stands beside its substitution (`env$(true)` runs
+    `env`), and a word that is only a substitution is no word (`env $(true)`
+    runs a bare `env`). Behind a builtin that takes names such a word stays
+    (`NAME_TAKING_BUILTINS`).
+    """
+    # The longest first: one substitution's text can stand inside another's.
+    texts = sorted(set(spans), key=len, reverse=True)
+    bare: List[str] = []
+    for word in words:
+        if isinstance(word, SHELL_READER._ShellOperator) or not any(opener in word for opener in SPAN_OPENERS):
+            bare.append(word)
+            continue
+        budget[SHELL_READER_BUDGET] -= len(texts)
+        if budget[SHELL_READER_BUDGET] < 0:
+            return None
+        without = word
+        for text in texts:
+            without = without.replace(text, "")
+        if without or (bare and _base_word(bare[-1]) in NAME_TAKING_BUILTINS):
+            bare.append(without or word)
+    return bare
+
+
+def _script_part_prints(script: str, depth: int, budget: List[int]) -> bool:
+    """Whether a quoted argument that a word on its command runs as a script prints a token or the environment, by either read."""
+    if _script_value_prints(script, depth, budget):
+        return True
+    # A script of several words went to both reads there. A script of one word went to the first read alone.
+    if _holds_whitespace(script) or depth >= MAX_NESTED_COMMAND_DEPTH:
+        return False
+    return _read_script_prints(SCRIPT_ESCAPED_SUBSTITUTION_RE.sub(SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT, script), depth + 1, budget)
+
+
+def _commands_print(words: Sequence[str], depth: int, budget: List[int]) -> bool:
+    """Whether a command among the shell reader's words and operators prints a token or the environment."""
+    segment: List[str] = []
+    here_strings: List[str] = []
+    foreign = False
+    prefix_only = True
+    # The redirection operator whose target the next word is.
+    redirect: Optional[str] = None
+    for word in [*words, SHELL_READER._ShellOperator(SHELL_COMMAND_END)]:
+        if not isinstance(word, SHELL_READER._ShellOperator):
+            if _reads_process_environment(word):
+                return True
+            if redirect is None:
+                # A flag of a prefix word keeps the prefix (`time -p (env)`).
+                prefix_only = prefix_only and (word in HARMLESS_COMMAND_PREFIX_WORDS or word.startswith(OPTION_PREFIXES))
+                segment.append(word)
+            elif redirect.endswith(HERE_STRING_OPERATOR):
+                here_strings.append(word)
+            elif SHELL_INPUT_REDIRECT_CHAR in redirect and _is_environ_file(word):
+                return True
+            redirect = None
+            continue
+        if word == SUBSHELL_OPEN:
+            # A `(` behind a word opens no command. Behind shell keywords the words go on (`if (env); then`);
+            # behind another word this is no shell command but another language's call, a function's
+            # head or prose (`print(set())`, `seen | set()`, `f() { ...; }`), and its words are not read.
+            foreign = foreign or not prefix_only
+            continue
+        if SHELL_READER._is_redirect(word):
+            # A redirection goes off with its file descriptor and its target.
+            if segment and segment[-1].isdigit():
+                segment.pop()
+            redirect = word
+            continue
+        if not foreign:
+            if _words_print_token_or_environment(segment, depth, budget):
+                return True
+            # A shell reads a here-string as its script (`bash <<< env`).
+            if any(_base_word(part) in SHELL_BINARIES for part in segment) and any(_script_word_prints(script, depth, budget) for script in here_strings):
+                return True
+            # A quoted argument is a script where a word on the command runs one.
+            if any(_base_word(part) in SCRIPT_RUNNING_WORDS for part in segment):
+                if any(_script_part_prints(part, depth, budget) for part in (*segment, *here_strings) if _is_quoted_script(part)):
+                    return True
+        foreign, prefix_only, segment, here_strings = False, True, [], []
+        redirect = None
+    return False
+
+
+def _read_script_prints(text: str, depth: int, budget: List[int], nesting: int = 0) -> bool:
+    """Whether a shell script, read as the shell reader's words and operators, holds a command that prints a token or the environment.
+
+    This is the rule's second read. It decides only on text that the reader
+    gives words for. It serves the rest, which the first read decides: text
+    with an unclosed quote or a redirect with no target, and text that holds
+    the reader's mark character.
+    """
+    if len(budget) < READ_COUNT:
+        # The first read made this budget, in a call by its own name.
+        budget.append(MAX_READ_CHARS_FACTOR * len(text) + MAX_READ_CHARS_FLOOR)
+    budget[SHELL_READER_BUDGET] -= len(text) + READ_COST_CHARS
+    if budget[SHELL_READER_BUDGET] < 0:
+        return True
+    if SHELL_READER_MARK_CHAR in text:
+        return False
+    words, spans = SHELL_READER._shell_words_and_spans(text)
+    if _commands_print(words, depth, budget):
+        return True
+    if not spans:
+        return False
+    if nesting >= MAX_SUBSTITUTION_NESTING:
+        return True
+    bare = _without_substitutions(words, spans, budget)
+    if bare is None or (bare != words and _commands_print(bare, depth, budget)):
+        return True
+    # The shell runs each substitution of the line, inside double quotes too.
+    for span in spans:
+        inner = SHELL_READER._substitution_commands(span)
+        if inner is not None and _read_script_prints(inner, depth, budget, nesting + 1):
+            return True
+    return False
+
+
+def script_prints_token_or_environment(script: str, depth: int, budget: Optional[List[int]] = None) -> bool:
+    """Whether either read of a shell script finds a command that prints the caller's token or its environment.
+
+    The first read (`_first_read_prints`) finds comments, backticks and `$(`
+    with marks of its own. The second (`_read_script_prints`) takes words,
+    operators and substitutions from the shell reader. Each read knows
+    spellings the other does not, so the script is withheld when either
+    withholds it.
+    """
+    if not _holds_print_fragment(script) and PROC_DIRECTORY not in script.translate(SHELL_QUOTING_CHARS_REMOVED):
+        return False
+    if budget is None:
+        budget = [MAX_READ_CHARS_FACTOR * len(script) + MAX_READ_CHARS_FLOOR] * READ_COUNT
+    return _first_read_prints(script, depth, budget) or _read_script_prints(script, depth, budget)
 
 
 def _simple_command_reads_a_secret(command: str, depth: int) -> bool:

@@ -37,21 +37,21 @@ CHROME_CANDIDATES = (
 )
 UTC = timezone.utc
 CRASHLOOP_TRIO = [
-    "cluster-agent-crashloop-debug",
-    "cluster-agent-crashloop-evidence-chain",
-    "cluster-agent-crashloop-misleading-symptom",
+    "case-14",
+    "case-18",
+    "case-19",
 ]
 # 2026-09-08 12:00Z is 08:00 ET (EDT); the outage began 09-08 09:00Z = 5:00 AM ET.
 NOW = "2026-09-08T14:30:00+00:00"
 OUTAGE_SINCE = "2026-09-08T09:00:00+00:00"
 # The later of the fixture's two setup deaths after SETUP_DEATHS_SINCE: PR
-# 1274, finished 09-08 10:39:30Z = Tue 6:39 AM ET.
+# 339, finished 09-08 10:39:30Z = Tue 6:39 AM ET.
 SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
-SETUP_DEATH_BUILD = "2097273589702070272"
+SETUP_DEATH_BUILD = "2091000000000000559"
 # The one derived run in the fixture (SCHEMA.md, Fixtures): the suite's
 # not-evaluated verdict, re-dated into the outage window.
-NOT_EVALUATED_BUILD = "2097362141184626688"
-SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
+NOT_EVALUATED_BUILD = "2091000000000000609"
+SETUP_DEATH_LABEL = "PR #339 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
 # The poll-timing tests run the page's setInterval this many times faster, so
 # two polls fit in a budget of a few virtual seconds (see fast_timers_page).
@@ -142,7 +142,9 @@ class NightPartWordsTest(unittest.TestCase):
 # and reads the hash through linkState's caseHash), so Chrome's native
 # anchor matches nothing and the call has no stall on record. The call
 # site and DomHtmlGuardTest's kept list read these two names, not copies.
-CASES_ROW_ANCHOR = "#cluster-agent-crashloop-evidence-chain"
+# The row is one the Cases test adds itself: with the fixture's case ids all
+# `case-NN`, a fixture row's bare name would read as an element id to the guard.
+CASES_ROW_ANCHOR = "#old-failure-case"
 CASES_TWO_POLLS_BUDGET_MS = 130000
 # Below this the page may not finish booting inside the budget, and the
 # scroll-once test would pass or fail on load time rather than on the poll.
@@ -173,7 +175,7 @@ def health_doc(state="OUTAGE", **overrides):
         "cause": "shared fixture/environment break: " + ", ".join(CRASHLOOP_TRIO) if state == "OUTAGE" else "",
         "failing_cases": list(CRASHLOOP_TRIO) if state == "OUTAGE" else [],
         "tracking_issues": ["#1278"] if state == "OUTAGE" else [],
-        "incident": {"prs": [1275, 1246], "runs": 6, "window_start": None, "window_end": None},
+        "incident": {"prs": [340, 322], "runs": 6, "window_start": None, "window_end": None},
         "evidence": [], "advice": "Don't retest yet; the failing cases share a cause. Tracking: #1278",
         "recovering": False, "stale": False,
         "metrics": {"window_hours": 24, "full_runs": 10},
@@ -388,7 +390,7 @@ class HealthInputsTest(unittest.TestCase):
         self.assertEqual(full["failing_cases"], ["a"])
         self.assertIsNone(full["since"])
         self.assertEqual(full["tracking_issues"], ["#1278"])
-        self.assertEqual(full["incident"]["prs"], [1275, 1246])
+        self.assertEqual(full["incident"]["prs"], [340, 322])
         # The slow-gate note: the five fields the Brief's sentence reads,
         # each defaulted; the rest of the note is not carried.
         self.assertIsNone(minimal["slow"])
@@ -454,7 +456,7 @@ class HealthInputsTest(unittest.TestCase):
         docs = [
             dict(health_doc("GREEN"), tick="2026-09-07T20:00:00+00:00"),
             dict(health_doc(), tick="2026-09-08T09:00:00+00:00"),
-            dict(health_doc(failing_cases=CRASHLOOP_TRIO + ["agent-kanban-smoke"]), tick="2026-09-08T10:00:00+00:00"),
+            dict(health_doc(failing_cases=CRASHLOOP_TRIO + ["case-24"]), tick="2026-09-08T10:00:00+00:00"),
             dict(health_doc("DEGRADED", condition="storm", failing_cases=[]), tick="2026-09-08T11:00:00+00:00"),
             dict(health_doc("GREEN"), tick="2026-09-08T12:00:00+00:00"),
             dict(health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], since="2026-09-08T13:00:00+00:00"), tick="2026-09-08T13:00:00+00:00"),
@@ -464,7 +466,7 @@ class HealthInputsTest(unittest.TestCase):
         self.assertEqual(len(incidents), 2)
         first, second = incidents
         self.assertEqual((first["since"], first["until"], first["state"]), (OUTAGE_SINCE, "2026-09-08T12:00:00+00:00", "OUTAGE"))
-        self.assertEqual(first["failing_cases"], CRASHLOOP_TRIO + ["agent-kanban-smoke"], "the union over the episode")
+        self.assertEqual(first["failing_cases"], CRASHLOOP_TRIO + ["case-24"], "the union over the episode")
         self.assertEqual(first["condition"], "storm", "the last condition reported")
         self.assertEqual(first["tracking_issues"], ["#1278"])
         self.assertEqual((second["since"], second["until"], second["condition"]), ("2026-09-08T13:00:00+00:00", None, "setup_deaths"))
@@ -525,9 +527,17 @@ class MergesTest(unittest.TestCase):
 class BriefDocumentTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # The roster the fixture week was recorded under (ROSTER_AT_SPLIT), as
+        # BrowserTest pins it: the fixture's case ids are not the checkout's.
+        cls.roster_patch = unittest.mock.patch.object(render.classify, "admitted_cases", return_value=ROSTER_AT_SPLIT)
+        cls.roster_patch.start()
         cls.data = load_fixture()
         cls.data["generated_at"] = NOW
         cls.data["cases"] = [{"name": n, "active": True} for n in CRASHLOOP_TRIO]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.roster_patch.stop()
 
     def test_the_document_shape_and_the_window(self):
         health = render.normalize_health(health_doc())
@@ -536,16 +546,16 @@ class BriefDocumentTest(unittest.TestCase):
         self.assertEqual(brief["health"]["state"], "OUTAGE")
         self.assertIsNone(brief["history"])
         self.assertIsNone(brief["merges"])
-        self.assertIn("cluster-agent-crashloop-debug", brief["admitted"])
+        self.assertIn("case-19", brief["admitted"])
         builds = [r["build"] for r in brief["runs"]]
-        self.assertIn("2097282860221206528", builds)
-        run_1275 = next(r for r in brief["runs"] if r["build"] == "2097282860221206528")
-        self.assertEqual(run_1275["verdict"], "infra")
-        self.assertTrue(run_1275["matches_incident"], "classified against the current verdict when there is no history")
-        self.assertIsNone(run_1275["health_at"])
-        self.assertEqual({c["cls"] for c in run_1275["cases"] if c["case"] in CRASHLOOP_TRIO}, {"shared"})
+        self.assertIn("2091000000000000563", builds)
+        run_340 = next(r for r in brief["runs"] if r["build"] == "2091000000000000563")
+        self.assertEqual(run_340["verdict"], "infra")
+        self.assertTrue(run_340["matches_incident"], "classified against the current verdict when there is no history")
+        self.assertIsNone(run_340["health_at"])
+        self.assertEqual({c["cls"] for c in run_340["cases"] if c["case"] in CRASHLOOP_TRIO}, {"shared"})
         for key in ("pr", "head_sha", "project", "started", "finished", "duration_s", "result", "headline", "lede", "cases", "setup_death", "storm_reps"):
-            self.assertIn(key, run_1275)
+            self.assertIn(key, run_340)
 
     def test_runs_older_than_the_window_are_left_out(self):
         data = dict(self.data, generated_at="2026-09-30T00:00:00+00:00")
@@ -564,11 +574,11 @@ class BriefDocumentTest(unittest.TestCase):
         brief = render.brief_document(self.data, render.normalize_health(health_doc()), ticks, [])
         self.assertEqual(len(brief["history"]["incidents"]), 1)
         self.assertEqual(brief["history"]["ticks"][0]["state"], "GREEN")
-        run_1275 = next(r for r in brief["runs"] if r["build"] == "2097282860221206528")  # finished 09-08 13:28Z
-        self.assertEqual(run_1275["health_at"]["state"], "OUTAGE")
-        early = next(r for r in brief["runs"] if r["build"] == "2097160163919138816")  # #1246, finished 09-08 05:12Z
+        run_340 = next(r for r in brief["runs"] if r["build"] == "2091000000000000563")  # finished 09-08 13:28Z
+        self.assertEqual(run_340["health_at"]["state"], "OUTAGE")
+        early = next(r for r in brief["runs"] if r["build"] == "2091000000000000552")  # #322, finished 09-08 05:12Z
         self.assertEqual(early["health_at"]["state"], "GREEN")
-        before = next(r for r in brief["runs"] if r["build"] == "2096888100671197184")  # #1200, finished 09-07 11:30Z, before the history began
+        before = next(r for r in brief["runs"] if r["build"] == "2091000000000000516")  # #302, finished 09-07 11:30Z, before the history began
         self.assertIsNone(before["health_at"])
         self.assertFalse(before["matches_incident"], "today's outage says nothing about a run that predates the history")
         self.assertEqual(brief["merges"], [])
@@ -707,16 +717,16 @@ class RenderedFilesTest(unittest.TestCase):
 # roster, so every admission since (#1023 admitted two on 2026-09-22) would
 # otherwise move the "10 gate cases" the expectations below pin.
 ROSTER_AT_SPLIT = frozenset({
-    "reliability-pdb-probe",
-    "security-overgrant-probe",
-    "upgrades-lagging-master-probe",
-    "consistency-authorized-networks-probe",
-    "cost-idle-pool-probe",
-    "obtainability-remediation-proposal",
-    "cluster-agent-crashloop-debug",
-    "cluster-agent-crashloop-misleading-symptom",
-    "cluster-agent-crashloop-evidence-chain",
-    "agent-kanban-smoke",
+    "case-02",
+    "case-29",
+    "case-27",
+    "case-13",
+    "case-01",
+    "case-35",
+    "case-19",
+    "case-14",
+    "case-18",
+    "case-24",
 })
 
 
@@ -784,8 +794,8 @@ class DomHtmlGuardTest(unittest.TestCase):
         # admitted, as do the view= form and an encoded trailing space
         # (%20), which Chrome does not trim and which matches no view.
         refused = [
-            {"query": "cases=cluster-agent-crashloop-debug#gate"},
-            {"query": "cases=cluster-agent-crashloop-debug#agent", "budget_ms": TWO_POLLS_BUDGET_MS},
+            {"query": "cases=case-19#gate"},
+            {"query": "cases=case-19#agent", "budget_ms": TWO_POLLS_BUDGET_MS},
             {"fragment": "#%67ate"},
             {"fragment": "#a%67ent"},
             {"query": "cases=x#%67ate"},
@@ -865,7 +875,7 @@ class DomHtmlGuardTest(unittest.TestCase):
             (fast, {"fragment": "#since=2026-09-07T14:00:00Z&view=gate", "budget_ms": TWO_POLLS_BUDGET_MS}),
             (fast, {"budget_ms": TWO_POLLS_BUDGET_MS}),
             (anchored, {}),
-            (anchored, {"query": "cases=cluster-agent-crashloop-debug&since=2026-09-07T14%3A00%3A00Z"}),
+            (anchored, {"query": "cases=case-19&since=2026-09-07T14%3A00%3A00Z"}),
             (cases, {"fragment": CASES_ROW_ANCHOR, "budget_ms": CASES_TWO_POLLS_BUDGET_MS}),
         ]
         self.assertFalse(CASES_ROW_ANCHOR.lstrip("#").startswith("case-"), "the Cases call names the row by case name; case-<name> is the element id")
@@ -885,7 +895,8 @@ class DomHtmlGuardTest(unittest.TestCase):
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
 class BrowserTest(unittest.TestCase):
-    """The pages as a browser renders them. Data: the real fixture week with
+    """The pages as a browser renders them. Data: the fixture week (synthetic
+    names and ids, the real timeline) with
     generated_at pinned to 2026-09-08 14:30Z; the verdicts are what #1305's
     adjudicator published at those ticks, reduced to the fields read."""
 
@@ -941,7 +952,7 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("GitLab lane", app)
         self.assertIn("No GitLab run on record", app)
         data = copy.deepcopy(self.data)
-        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        base = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         lane_run = dict(base, build_id="2097282860221206600", tier="gitlab", job="pull-kube-agents-smoke-test-gitlab", pr=2475, result="FAILURE", eval_verdict="RED")
         data["runs"].append(lane_run)
         out = render_to(pathlib.Path(self.tmp.name) / "gitlab", data, health=health_doc())
@@ -990,7 +1001,7 @@ class BrowserTest(unittest.TestCase):
             paused = render_to(pathlib.Path(self.tmp.name) / "paused", self.data, health=health_doc())
         self.assertIn("GHES's scheduled jobs are off: the weekly job waits on a fix", dom_text(paused / "index.html"))
         data = copy.deepcopy(self.data)
-        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        base = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
         data["runs"] += [
             dict(base, build_id="2097282860221206800", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", pr=4480, result="SUCCESS", eval_verdict="GREEN", gcs_base=lane_base),
@@ -1022,7 +1033,7 @@ class BrowserTest(unittest.TestCase):
         totals must include them, or a three-rep case reads "all 0 reps lost
         before grading" beside its delegation-ceiling tag."""
         data = copy.deepcopy(self.data)
-        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        run = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
         task["result"] = "infra"
         task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
@@ -1030,7 +1041,7 @@ class BrowserTest(unittest.TestCase):
         mixed["reps"] = [{"n": 1, "result": "pass", "reason": None}, {"n": 2, "result": "pass", "reason": None}, {"n": 3, "result": "infra", "reason": CEILING_REASON}]
         mixed["result"] = "pass"
         out = render_to(pathlib.Path(self.tmp.name) / "ceiling", data, health=health_doc())
-        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("all 3 reps hit the delegation ceiling with the worker still running", page)
         self.assertIn('class="tag storm">delegation ceiling<', page)
         self.assertIn(f"<span>{CRASHLOOP_TRIO[1]}</span>", page, "two passes and a ceiling rep is a pass, listed by name")
@@ -1041,13 +1052,13 @@ class BrowserTest(unittest.TestCase):
         """Forge reps sit under their own key in `reps` (#5342); the card is
         tagged and worded as a forge outage, not as unexplained or lost."""
         data = copy.deepcopy(self.data)
-        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        run = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
         task["result"] = "infra"
         reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
         task["reps"] = [{"n": n, "result": "infra", "reason": reason} for n in (1, 2, 3)]
         out = render_to(pathlib.Path(self.tmp.name) / "forge", data, health=health_doc())
-        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("all 3 reps not graded: a forge read failed during grading", page)
         self.assertIn('class="tag storm">forge unavailable<', page)
         self.assertNotIn('class="tag unclear">unexplained<', page)
@@ -1055,13 +1066,13 @@ class BrowserTest(unittest.TestCase):
     def test_a_forge_and_ceiling_mix_counts_only_the_kinds_it_has(self):
         """No "0 lost before grading" when no repetition was lost to the storm."""
         data = copy.deepcopy(self.data)
-        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        run = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
         task["result"] = "infra"
         forge = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
         task["reps"] = [{"n": 1, "result": "infra", "reason": forge}] + [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (2, 3)]
         out = render_to(pathlib.Path(self.tmp.name) / "forge-ceiling", data, health=health_doc())
-        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("all 3 reps ungraded: 2 at the delegation ceiling, 1 not graded, forge unavailable", page)
         self.assertNotIn("0 lost before grading", page)
 
@@ -1080,7 +1091,7 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("ended at the harness's delegation wait with the worker still running, across 0 PRs", app, "the fixture week has no ceiling reps; the fact still counts")
         self.assertIn("#1879", app)
         self.assertNotIn("quota storm", app.lower().replace("no shared break, storm", ""))
-        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        run_page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("Workers not finishing", run_page)
         self.assertIn("those runs read not evaluated, not red", run_page)
 
@@ -1092,7 +1103,7 @@ class BrowserTest(unittest.TestCase):
             incident={"prs": [1, 2], "runs": 4, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
         )
         data = json.loads(json.dumps(self.data))
-        hit = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        hit = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         forge = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited: writes: answered 403"
         hit["tasks"][0]["reps"] = [{"n": i + 1, "result": "infra", "reason": forge} for i in range(3)]
         hit["tasks"][0]["result"] = "infra"
@@ -1104,29 +1115,29 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("writes: answered 403", app, "the agent-saw pick is the forge-unavailable case")
         self.assertIn("#6105", app)
         self.assertNotIn("Gate outage", app)
-        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        run_page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("Grading cannot read GitHub", run_page)
 
     def test_a_red_only_the_forge_safeguard_explains_is_not_the_prs(self):
         safeguard = "KUBE_AGENTS_FORGE_SAFEGUARD: checks errored rather than ran: ['writes'] -- writes: KUBE_AGENTS_FORGE_UNAVAILABLE (answered 403): GitHub denied"
         data = json.loads(json.dumps(self.data))
-        hit = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        hit = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         hit["result"] = "FAILURE"
         for t in hit["tasks"]:
             t["reps"] = [rep if rep.get("result") == "pass" else dict(rep, result="fail", reason=safeguard) for rep in t.get("reps") or []]
-            if t["name"] == "reliability-pdb-probe":
+            if t["name"] == "case-02":
                 # Admitted, passes beside a block: partial, and the case that reds the run.
                 t["reps"][-1] = dict(t["reps"][-1], result="fail", reason=safeguard)
             if any(rep["result"] == "fail" for rep in t["reps"]):
                 t["result"] = "fail"
         base = dom_text(render_to(pathlib.Path(self.tmp.name) / "forge-red-base", self.data, health=health_doc("GREEN")) / "index.html")
         out = render_to(pathlib.Path(self.tmp.name) / "forge-red", data, health=health_doc("GREEN"))
-        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        run_page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("a catastrophic safeguard could not read GitHub", run_page)
         self.assertNotIn("Fix the PR", run_page)
         # Admitted partial, held-out partial and held-out ungraded forge cases are listed together, none as passed.
         group = run_page[run_page.index("Could not read GitHub · "):]
-        for name in ("reliability-pdb-probe", "capacity-pinned-pool-probe", "obtainability-healthy-namespace-silence"):
+        for name in ("case-02", "case-16", "case-03"):
             self.assertIn(name, group.split("These checks errored on a GitHub read")[0], name)
         self.assertNotIn("Passed on retry", run_page)
         own = re.compile(r"(\d+) look like the PR")
@@ -1247,7 +1258,7 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Why we think it's the environment, not a PR", app)
         self.assertIn("unrelated PR", app)
         self.assertIn("What the agent saw", app)
-        self.assertIn("rca-names-the-oom", app)
+        self.assertIn("check-16", app)
         self.assertIn("Tracking <a", app)
         self.assertIn("issues/1278", app)
 
@@ -1273,8 +1284,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('<a href="https://github.com/gke-labs/kube-agents/issues/1300">#1300</a>', app)
         self.assertIn('<a href="https://github.com/gke-labs/kube-agents-eval-triage/issues/12">gke-labs/kube-agents-eval-triage#12</a>', app)
         self.assertIn("Runs in this window", app)
-        self.assertIn('href="run.html#build=2097282860221206528"', app)
-        self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
+        self.assertIn('href="run.html#build=2091000000000000563"', app)
+        self.assertIn('class="chip hit">case-19', app)
         self.assertNotIn("What changed right before", app, "no merges were given, so the block is omitted")
         self.assertIn("See it in the grid", app)
         # The Grid link carries the incident's scope in the fragment, the
@@ -1309,20 +1320,20 @@ class BrowserTest(unittest.TestCase):
         self.assertIn(f'<div class="q">“{words}”', app)
         self.assertIn("From the agent's report on", app)
         self.assertNotIn("nothing here is quoted from the agent", app)
-        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        run_page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn(f'<div class="quote">“{words}”</div>', run_page)
 
     def test_the_quote_links_the_transcript_of_the_repetition_it_came_from(self):
         """A case whose rep 1 was lost to infra shows rep 2's reason and
         quote; the transcript link beside them must be rep 2's, not rep 1's."""
         data = copy.deepcopy(self.data)
-        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        run = next(r for r in data["runs"] if r["build_id"] == "2091000000000000563")
         task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
         self.assertGreaterEqual(len(task["reps"]), 2)
         task["reps"][0] = {"n": 1, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE: agent transport"}
         task["reps"][1] = dict(task["reps"][1], n=2, result="fail", excerpt="Rep two's own words.")
         out = render_to(pathlib.Path(self.tmp.name) / "rep2", data, health=health_doc())
-        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        page = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("“Rep two's own words.”", page)
         self.assertIn(f"artifacts/eval_{CRASHLOOP_TRIO[0]}_rep2.log", page)
         self.assertIn("transcript (rep 2)", page)
@@ -1347,7 +1358,7 @@ class BrowserTest(unittest.TestCase):
                 for r in t.get("reps") or []:
                     if r.get("result") == "infra":
                         r["reason"] = None
-        run = next(r for r in data["runs"] if r["build_id"] == "2095859789312561152")
+        run = next(r for r in data["runs"] if r["build_id"] == "2091000000000000403")
         task = run["tasks"][0]
         task["result"] = "infra"
         reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: forge-evidence-check: answered 503"
@@ -1377,7 +1388,7 @@ class BrowserTest(unittest.TestCase):
         app = self.render_state(health, "setup-link")
         match = re.search(r'The build log is the evidence: <a href="([^"]*)">([^<]*)</a>\.', app)
         self.assertTrue(match, app)
-        self.assertTrue(match.group(1).endswith(f"/gke-labs_kube-agents/1274/pull-kube-agents-smoke-test/{SETUP_DEATH_BUILD}"), match.group(1))
+        self.assertTrue(match.group(1).endswith(f"/gke-labs_kube-agents/339/pull-kube-agents-smoke-test/{SETUP_DEATH_BUILD}"), match.group(1))
         self.assertEqual(match.group(2), SETUP_DEATH_LABEL)
         hostile = json.loads(json.dumps(self.data))
         next(r for r in hostile["runs"] if r["build_id"] == SETUP_DEATH_BUILD)["pr"] = HOSTILE_PR
@@ -1392,9 +1403,9 @@ class BrowserTest(unittest.TestCase):
         # window reaches back two hours, so the lost runs are on the page.
         lost = health_doc("DEGRADED", condition="lost_pods", failing_cases=[], tracking_issues=[], since="2026-09-08T14:30:00+00:00",
                           cause="lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC",
-                          incident={"prs": [1275, 1246], "runs": 12, "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:19:16+00:00", "nodes": {"gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3}, "event": True})
+                          incident={"prs": [340, 322], "runs": 12, "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:19:16+00:00", "nodes": {"gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3}, "event": True})
         out = render_to(pathlib.Path(self.tmp.name) / "lost", self.data, health=lost)
-        run_app = dom_text(out / "run.html", query="build=2097282860221206528")
+        run_app = dom_text(out / "run.html", query="build=2091000000000000563")
         self.assertIn("<b>Build nodes lost right now</b> since Tue 10:30 AM ET: runs died with the node under them; nothing about the branch.", run_app)
         self.assertNotIn("Gate outage", run_app)
         self.assertIn('lost_pods: 2 * 3600 * 1000', (out / "index.html").read_text())
@@ -1554,8 +1565,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("PAST OUTAGE · Mon 10:00 AM – 9:00 PM ET", app, label)
         self.assertIn("3 gate cases failed on", app, label)
         self.assertIn("This incident is over", app, label)
-        self.assertIn("run.html#build=2096999509014876160", app, f"{label}: #1195, red inside that window")
-        self.assertNotIn("run.html#build=2097282860221206528", app, f"{label}: #1275 ran the next morning")
+        self.assertIn("run.html#build=2091000000000000540", app, f"{label}: #298, red inside that window")
+        self.assertNotIn("run.html#build=2091000000000000563", app, f"{label}: #340 ran the next morning")
 
     def test_past_incident_through_the_fragment(self):
         # The form every emitter writes: the scope in the fragment, which the
@@ -1579,26 +1590,26 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(app, dom_text(self.index, fragment=fragment), "both forms render the same page")
 
     def test_the_query_wins_when_both_forms_are_present(self):
-        query = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
+        query = urllib.parse.urlencode({"cases": "case-19", "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
         app = dom_text(self.index, query=query, fragment="#since=2026-09-08T09:00:00Z&view=gate")
         self.assertIn("PAST OUTAGE · Mon 10:00 AM – 9:00 PM ET", app)
         self.assertIn("1 gate case failed on", app)
-        app = dom_text(self.run_page, query="build=2097282860221206528", fragment="#build=1")
-        self.assertIn("PR #1275", app)
+        app = dom_text(self.run_page, query="build=2091000000000000563", fragment="#build=1")
+        self.assertIn("PR #340", app)
         self.assertNotIn("No run with that id", app)
 
     def test_pr_view_through_the_fragment(self):
-        app = dom_text(self.run_page, fragment="#build=2097282860221206528")
-        self.assertIn("PR #1275", app)
+        app = dom_text(self.run_page, fragment="#build=2091000000000000563")
+        self.assertIn("PR #340", app)
         self.assertIn("3 of 10 gate cases failed. None of them look like your PR.", app)
         self.assertIn("Gate outage at the time of this run", app)
-        self.assertEqual(app, dom_text(self.run_page, query="build=2097282860221206528"), "the old query form renders the same run")
+        self.assertEqual(app, dom_text(self.run_page, query="build=2091000000000000563"), "the old query form renders the same run")
         app = dom_text(self.run_page, fragment="#build=1")
         self.assertIn(f"No run with that id in the last {render.RUN_VIEW_DAYS} days.", app)
 
     def test_past_incident_without_history_is_described_by_the_parameters(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohist", self.data, health=health_doc("GREEN"))
-        query = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
+        query = urllib.parse.urlencode({"cases": "case-19", "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
         app = dom_text(out / "index.html", query=query)
         self.assertIn("PAST INCIDENT", app)
         self.assertIn("1 gate case failed on", app)
@@ -1642,15 +1653,15 @@ class BrowserTest(unittest.TestCase):
             self.assertIn("Which run?", app, form)
 
     def test_a_space_separated_since_is_read_as_utc(self):
-        query = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07 14:00:00", "until": "2026-09-08 01:00:00"})
+        query = urllib.parse.urlencode({"cases": "case-19", "since": "2026-09-07 14:00:00", "until": "2026-09-08 01:00:00"})
         app = dom_text(self.index, query=query)
         self.assertIn("Mon 10:00 AM – 9:00 PM ET", app)
 
     def test_a_no_colon_offset_in_since_scopes_the_brief_like_the_colon_form(self):
         # 16:00+02:00 is 14:00Z and 03:00+02:00 the next day is 01:00Z: the
         # same past window test_a_space_separated_since_is_read_as_utc opens.
-        with_colon = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T16:00:00+02:00", "until": "2026-09-08T03:00:00+02:00"})
-        without = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T16:00:00+0200", "until": "2026-09-08T03:00:00+0200"})
+        with_colon = urllib.parse.urlencode({"cases": "case-19", "since": "2026-09-07T16:00:00+02:00", "until": "2026-09-08T03:00:00+02:00"})
+        without = urllib.parse.urlencode({"cases": "case-19", "since": "2026-09-07T16:00:00+0200", "until": "2026-09-08T03:00:00+0200"})
         expected = dom_text(self.index, query=with_colon)
         self.assertIn("Mon 10:00 AM – 9:00 PM ET", expected)
         self.assertEqual(dom_text(self.index, query=without), expected, "in V8, which reads ±HHMM on its own")
@@ -1673,7 +1684,7 @@ class BrowserTest(unittest.TestCase):
                 self.assertIn("issues/1278", app, f"{label}, {form}")
         # The PR view's own banner link is that fragment, so following it
         # lands on the live brief.
-        run_app = dom_text(nohist / "run.html", fragment="#build=2097282860221206528")
+        run_app = dom_text(nohist / "run.html", fragment="#build=2091000000000000563")
         self.assertIn(f'href="index.html#{scope}&view=gate"'.replace("&", "&amp;"), run_app)
 
     def test_an_incident_without_a_start_or_a_red_run_dates_nothing_from_1969(self):
@@ -1706,7 +1717,7 @@ class BrowserTest(unittest.TestCase):
         sixty = [f"case-{i:02d}" for i in range(59)]
         sixty.insert(3, "bad case!")
         out = render_to(pathlib.Path(self.tmp.name) / "sixty", self.data, health=health_doc(failing_cases=sixty))
-        app = dom_text(out / "run.html", fragment="#build=2097282860221206528")
+        app = dom_text(out / "run.html", fragment="#build=2091000000000000563")
         hrefs = re.findall(r'href="(index\.html#since=[^"]*)"', app)
         self.assertEqual(len(hrefs), 1, app[:300])
         fragment = urllib.parse.urlparse(html.unescape(hrefs[0])).fragment
@@ -1728,45 +1739,45 @@ class BrowserTest(unittest.TestCase):
         transcript link the object itself, for a run with gcs_base; the
         Spyglass link under the old bucket is gone from that page."""
         data = copy.deepcopy(self.data)
-        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/"
-        moved = [r for r in data["runs"] if r["build_id"] == "2097282860221206528"]
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/340/pull-kube-agents-smoke-test/2091000000000000563/"
+        moved = [r for r in data["runs"] if r["build_id"] == "2091000000000000563"]
         self.assertEqual(len(moved), 1)
         moved[0]["gcs_base"] = base
         out = render_to(pathlib.Path(self.tmp.name) / "moved", data, health=health_doc())
-        app = dom_text(out / "run.html", query="build=2097282860221206528")
-        self.assertIn("console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
-        self.assertIn("storage.cloud.google.com/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
-        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
+        app = dom_text(out / "run.html", query="build=2091000000000000563")
+        self.assertIn("console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/340/pull-kube-agents-smoke-test/2091000000000000563", app)
+        self.assertIn("storage.cloud.google.com/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/340/pull-kube-agents-smoke-test/2091000000000000563/artifacts/eval_case-19_rep1.log", app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/340/pull-kube-agents-smoke-test/2091000000000000563", app)
 
     def test_pr_view_outage_run(self):
-        app = dom_text(self.run_page, query="build=2097282860221206528")
+        app = dom_text(self.run_page, query="build=2091000000000000563")
         self.assertIn("Smoke run for <a", app)
-        self.assertIn("PR #1275", app)
+        self.assertIn("PR #340", app)
         self.assertIn("started Tue 7:16 AM ET", app)
         self.assertIn("finished 9:28 AM ET", app)
         self.assertIn("3 of 10 gate cases failed. None of them look like your PR.", app)
         self.assertIn("Gate outage at the time of this run", app)
         self.assertIn("since Tue 5:00 AM ET", app)
         self.assertIn('class="tag shared">failing on 4 other PRs', app)
-        self.assertIn("rca-names-the-oom", app)
+        self.assertIn("check-16", app)
         self.assertIn("passed", app)
-        self.assertIn("artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
-        self.assertIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
+        self.assertIn("artifacts/eval_case-19_rep1.log", app)
+        self.assertIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/340/pull-kube-agents-smoke-test/2091000000000000563", app)
         self.assertIn("Nothing right now.", app)
         self.assertIn("held out", app)
-        self.assertIn('href="cases.html#cluster-agent-crashloop-debug">this case\'s history</a>', app)
+        self.assertIn('href="cases.html#case-19">this case\'s history</a>', app)
 
     def test_pr_view_run_with_an_unexplained_failure(self):
-        app = dom_text(self.run_page, query="build=2097253644305960960")
+        app = dom_text(self.run_page, query="build=2091000000000000557")
         self.assertIn("3 of 4 failures match the outage; 1 is unexplained so far.", app)
         self.assertIn('class="tag unclear">unexplained', app)
         self.assertIn("Fix the PR.", app)
 
     def test_pr_view_green_and_setup_death(self):
-        app = dom_text(self.run_page, query="build=2096047888260927488")
+        app = dom_text(self.run_page, query="build=2091000000000000459")
         self.assertIn("All 10 gate cases passed.", app)
         self.assertIn("This run is green", app)
-        app = dom_text(self.run_page, query="build=2096985236955992064")
+        app = dom_text(self.run_page, query="build=2091000000000000534")
         self.assertIn("died during setup", app)
         # The bold lead is the `do`'s own first sentence, not a prefix (#1608).
         self.assertIn("<b>Retest.</b> If it dies the same way again", app)
@@ -1825,7 +1836,7 @@ class BrowserTest(unittest.TestCase):
         # No task was parsed, so there is no card; the case the suite named
         # is still listed under the heading the lede and "What to do" point at.
         self.assertIn("Not graded · 1", app)
-        self.assertIn("security-overgrant-probe", app)
+        self.assertIn("case-29", app)
         self.assertIn("recorded no grading for it", app)
 
     def test_a_lost_case_the_dashboards_roster_holds_out_is_still_listed_as_not_graded(self):
@@ -1835,13 +1846,13 @@ class BrowserTest(unittest.TestCase):
         # suite's list, so the run page lists it too, with the held-out tag,
         # instead of showing the author nothing under "Not graded".
         data = copy.deepcopy(self.data)
-        renamed = "security-overgrant-probe-next"
+        renamed = "case-29-next"
         self.assertNotIn(renamed, ROSTER_AT_SPLIT)
         for run in data["runs"]:
             if str(run.get("build_id")) == NOT_EVALUATED_BUILD:
                 run["not_evaluated"] = [renamed]
                 for task in run["tasks"]:
-                    if task["name"] == "security-overgrant-probe":
+                    if task["name"] == "case-29":
                         task["name"] = renamed
         out = render_to(pathlib.Path(self.tmp.name) / "noteval-heldout", data, health=health_doc())
         app = dom_text(out / "run.html", query=f"build={NOT_EVALUATED_BUILD}")
@@ -1871,7 +1882,7 @@ class BrowserTest(unittest.TestCase):
         for name, query, expect in (
             ("index.html", "", "3 gate cases fail on every PR"),
             ("index.html", "", "Runs in this window"),
-            ("run.html", "build=2097282860221206528", "3 of 10 gate cases failed. None of them look like your PR."),
+            ("run.html", "build=2091000000000000563", "3 of 10 gate cases failed. None of them look like your PR."),
         ):
             page = clock_page(self.out / name, NOW)
             html = dom_html(page, query=query)
@@ -1886,7 +1897,7 @@ class BrowserTest(unittest.TestCase):
 
     def test_a_page_without_its_data_element_says_so(self):
         # A truncated upload must not read as a quiet, empty dashboard.
-        for name, query in (("index.html", ""), ("run.html", "build=2097282860221206528")):
+        for name, query in (("index.html", ""), ("run.html", "build=2091000000000000563")):
             page = self.out / name
             copy = page.with_name(page.stem + "-nodata" + page.suffix)
             copy.write_text(re.sub(r'<script type="application/json" id="inline-brief">.*?</script>', "", page.read_text(), count=1, flags=re.DOTALL))
@@ -1909,11 +1920,11 @@ class BrowserTest(unittest.TestCase):
 
 
 RC_RELEASE = {
-    "build_id": "2097891568546484224", "rc_tag": "staging_2609092307_5b5ad10", "commit": "5b5ad10", "tier": "nightly",
-    "verdict": "GREEN", "result": "SUCCESS", "started": "2026-09-10T03:35:01+00:00", "finished": "2026-09-10T07:51:10+00:00",
-    "duration_s": 15006, "project": "kube-agents-evals-10",
-    "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224",
-    "pass_rate": 0.9, "baseline_rate": None, "margin": None,
+    "build_id": "2090000000000000070", "rc_tag": "staging_2609092307_0707070", "commit": "0707070", "tier": "nightly",
+    "verdict": "GREEN", "result": "SUCCESS", "started": "2025-09-11T03:35:01+00:00", "finished": "2025-09-11T07:51:10+00:00",
+    "duration_s": 10554, "project": "kube-agents-evals-10",
+    "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2090000000000000070",
+    "pass_rate": 0.88, "baseline_rate": None, "margin": None,
     "tasks": [{"name": f"case-{n}", "result": "pass" if n < 15 else "fail"} for n in range(25)] + [{"name": "case-infra", "result": "infra"}],
 }
 MERGES = [
@@ -1934,7 +1945,7 @@ def clicked_page(page: pathlib.Path, selector: str) -> pathlib.Path:
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
 class CasesAndGridPagesTest(unittest.TestCase):
-    """The Cases page and the Grid as a browser renders them from the real
+    """The Cases page and the Grid as a browser renders them from the
     fixture week. The roster is the test's: two of the trio are admitted,
     the third is dated as demoted, so every pill has a row."""
 
@@ -1947,12 +1958,12 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
         data["releases"] = [
             RC_RELEASE,
-            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00"),
+            dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2025-09-10T03:35:01+00:00"),
             # A release read from the lane's private bucket (SCHEMA.md,
             # releases[].gcs_base): its row links the Console, not Spyglass.
-            dict(RC_RELEASE, build_id="2097891568546484225", rc_tag="evalcand_2611100000_5b5ad10", started="2026-09-09T01:35:01+00:00",
-                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225/",
-                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"),
+            dict(RC_RELEASE, build_id="2090000000000000071", rc_tag="evalcand_2611100000_0707070", started="2025-09-10T01:35:01+00:00",
+                 gcs_base="gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000071/",
+                 artifacts_url="https://oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000071"),
         ]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
         # A green run that recorded no cases (the gate revalidated the
@@ -2001,7 +2012,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         app = dom_text(self.cases_page)
         self.assertIn("How reliable is each test?", app)
         self.assertIn('<tr class="grp"><td colspan="8">cluster debugging</td></tr>', app)
-        self.assertIn('id="case-cluster-agent-crashloop-debug"', app)
+        self.assertIn('id="case-case-19"', app)
         self.assertIn('<span class="st blocking">blocking</span>', app)
         self.assertIn('<span class="st demoted">demoted 09-02</span>', app)
         self.assertIn("held out · 3 cases", app, "the active demoted case, the active held-out one and the nightly demoted one")
@@ -2012,7 +2023,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn("Nightly 7d", app)
         self.assertIn('<span class="rate none">—</span>', app, "no nightly on record reads as a dash")
         self.assertIn("Last failure was", app)
-        self.assertIn("rca-names-the-oom", app)
+        self.assertIn("check-16", app)
         self.assertIn('<span class="lbl">Last failure was</span> <span><b>', app)
         self.assertIn(" ET", app)
         self.assertNotIn(" UTC", app)
@@ -2034,8 +2045,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('id="case-demoted-nightly-case"', held, "a case demoted to the nightly is a held-out row")
         self.assertNotIn('class="st blocking"', held)
         self.assertNotIn('id="case-demoted-nightly-case"', blocking)
-        highlighted = dom_text(self.cases_page, fragment="#cluster-agent-crashloop-evidence-chain")
-        self.assertIn('<tr id="case-cluster-agent-crashloop-evidence-chain" class="main hl">', highlighted)
+        highlighted = dom_text(self.cases_page, fragment="#case-18")
+        self.assertIn('<tr id="case-case-18" class="main hl">', highlighted)
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
         # The row is scrolled to once, on navigation; the polls that follow
         # re-render without pulling the reader back to it.
@@ -2074,7 +2085,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
                 self.assertNotIn("<script>alert", app, f"{page.name}{fragment}")
                 self.assertNotIn("<b>x</b>", app, f"{page.name}{fragment}")
                 self.assertNotIn("could not render", app, f"{page.name}{fragment}")
-                self.assertIn("cluster-agent-crashloop-debug", app, f"{page.name}{fragment} rendered")
+                self.assertIn("case-19", app, f"{page.name}{fragment} rendered")
         cases = dom_text(self.cases_page)
         self.assertIn("&lt;img src=x onerror=alert(2)&gt;", cases, "the hostile name is on the page, escaped")
 
@@ -2111,8 +2122,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('data-window="linked" class="on">this incident</button>', app)
         self.assertIn('class="grp">in this incident</div>', app)
         self.assertEqual(app.count('class="nm lk"'), 3, "the linked cases are pinned first")
-        self.assertIn("#1195", app, "red inside that window")
-        self.assertNotIn("#1275", app, "ran the next morning")
+        self.assertIn("#298", app, "red inside that window")
+        self.assertNotIn("#340", app, "ran the next morning")
         self.assertIn("merge #1280", app, "merged inside the window")
         self.assertNotIn('class="c running"', app, "a past window has no running columns")
         self.assertIn("Mon 10:00 AM – 9:00 PM ET", app)
@@ -2121,32 +2132,32 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertEqual(app, dom_text(self.grid_page, query=query))
 
     def test_a_cell_click_opens_the_detail_panel(self):
-        page = clicked_page(self.grid_page, 'button.c.fail[data-case="cluster-agent-crashloop-debug"]')
+        page = clicked_page(self.grid_page, 'button.c.fail[data-case="case-19"]')
         app = dom_text(page)
         self.assertIn('id="detail"', app)
-        self.assertIn("<code>cluster-agent-crashloop-debug</code>", app)
+        self.assertIn("<code>case-19</code>", app)
         self.assertIn("failed all 3 graded reps", app)
-        self.assertIn("rca-names-the-oom", app)
+        self.assertIn("check-16", app)
         self.assertIn("other case", app)
-        self.assertIn('href="cases.html#cluster-agent-crashloop-debug"', app)
+        self.assertIn('href="cases.html#case-19"', app)
         self.assertIn("this run&#x27;s page".replace("&#x27;", "'"), app)
-        self.assertIn("artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
+        self.assertIn("artifacts/eval_case-19_rep1.log", app)
         self.assertIn('class="c fail sel"', app)
         self.assertNotIn('id="detail"', dom_text(self.grid_page), "nothing is selected until a cell is clicked")
 
     def test_the_brief_lists_the_release_candidates(self):
         app = dom_text(self.out / "index.html")
         self.assertIn("Release candidates", app)
-        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
-        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2097891568546484225"', app)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2090000000000000070"', app)
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/2090000000000000071"', app)
         self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-evals-presubmit-logs", app)
         self.assertIn('<span class="pill p-pass">GREEN</span>', app)
-        self.assertIn("90.0%", app)
+        self.assertIn("88.0%", app)
         self.assertIn("baselines maturing", app)
         self.assertIn("15/25", app)
         self.assertIn("1 infra excluded", app)
-        self.assertIn("Wed 11:35 PM ET", app)
-        self.assertIn("4h 10m", app)
+        self.assertIn("Sep 10, 11:35 PM ET", app)
+        self.assertIn("2h 56m", app)
         self.assertIn('<span class="pill p-infra">NO VERDICT</span>', app)
         self.assertIn("no eval banner · job SUCCESS", app)
         self.assertNotIn("javascript:", app)
@@ -2165,10 +2176,10 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
         brief = render.brief_document(data, render.normalize_health(health_doc()), None, None)
         run = next(r for r in brief["runs"] if r["build"] == NOT_EVALUATED_BUILD)
         self.assertEqual(run["verdict"], "not_evaluated")
-        self.assertEqual(run["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(run["not_evaluated"], ["case-29"])
         self.assertTrue(run["headline"].startswith("Not evaluated: 1 gate case lost every repetition"))
         self.assertTrue(run["do"].startswith("Retest once the environment is healthy."))
-        other = next(r for r in brief["runs"] if r["build"] == "2097282860221206528")
+        other = next(r for r in brief["runs"] if r["build"] == "2091000000000000563")
         self.assertEqual(other["not_evaluated"], [], "every other verdict carries the empty list")
 
     def test_pages_js_and_the_template_know_the_token(self):
@@ -2179,8 +2190,8 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
 
 # --- the Scenarios page -----------------------------------------------------
 
-SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
-SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="gemini-3-1-pro-preview-kubeagents-mcp", mode=None)
+SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "model-x", "fleet": 1, "verifiers": 1, "mode": "next"}
+SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="setup-x", mode=None)
 SCENARIO_LEAD_IN = "critical requirements:\n- The reply names the cluster.\n  It cites a live read.\n- It says nothing else.\n"
 # The window's clock in the unit tests: records on Sep 1-10 at 05:00Z, the
 # last seven days before this reach back to Sep 4 14:30Z, so Sep 5-10 are in.

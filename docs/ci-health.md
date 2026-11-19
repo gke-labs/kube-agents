@@ -195,8 +195,8 @@ harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
 not as the bot's guess), a forge outage (6+ forge repetitions,
 below, across 2+ pull requests among the runs that finished in the last 2
-hours: the evals repositories share one GitHub App installation and its
-hourly REST budget, so a second pull request already shows the fleet's
+hours: the evals repositories share one GitHub App installation per shard of ten projects (`hack/eval/ledger-reader-apps.txt`) and its
+hourly REST budget, so a second pull request already shows a shard's
 budget rather than one branch; it ranks below the storm and the ceiling,
 which lose the agent's run rather than its grading), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
@@ -545,9 +545,10 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
-not a pool job but the validated-capabilities lane's weekly slice, watched here because
-its record is its logs bucket and nothing else reads a failed build of it. A fifth,
+daily pass over every project. Two more, `ci-kube-agents-validated-capabilities-1` and `-2`, are
+not pool jobs but the validated-capabilities lane's weekly slices, one a suite part, watched here because
+their record is their logs bucket and nothing else reads a failed build of them. The first slice is
+also watched as `ci-kube-agents-certification-1`, the name its job has until `oss-test-infra` renames it. Another,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
 and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
 `ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
@@ -556,7 +557,7 @@ its messages are built from, so adding the next periodic is one entry. The 15-mi
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
 identities cannot write the Prow archive), or from the nightlies' bucket
-`gs://kube-agents-evals-nightly-logs` for the validated-capabilities slice and the replay lane, which are
+`gs://kube-agents-evals-nightly-logs` for the validated-capabilities slices and the replay lane, which are
 decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
@@ -596,7 +597,7 @@ recovery needs a build that passed, or for the postsubmit reconcile a later
 daily run that reached its projects (below): a failed check under the
 threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile and the daily replay lane, eight days for the weekly validated-capabilities slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile and the daily replay lane, eight days for the weekly validated-capabilities slices; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -1573,7 +1574,7 @@ roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours`
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). One assertion this job never makes: the five `declared-*` roles
+read failed). One assertion this job never makes: the `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
 credential for the pool repositories by design, so the state script leaves
 that assertion out, judges those roles on their cluster assertions (healthy,
@@ -1875,11 +1876,15 @@ python3 scripts/eval_dashboard/health.py --replay --data data.json --step 30m \
 walks a `data.json` as if the job had run every 30 minutes and prints the state
 timeline. `scripts/test_eval_dashboard_health.py` asserts that timeline for
 2026-09-01 → 2026-09-08 against the incidents filed that week (#1171, #1189,
-#1214, #1269, #1278). The roster history matters: `compliance-rbac-overgrant`
-and `rca-remediation-pr` were admitted when they collapsed and were demoted
-afterwards, so a replay with today's roster would not see the 09-02 outage.
-A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`, is the day
-the build cluster lost five nodes (#1478); the same test file asserts it reads
+#1214, #1269, #1278). The roster history matters: the two cases the fixture
+calls `case-09` and `case-23` were admitted when they collapsed and were
+demoted afterwards, so a replay with today's roster would not see the 09-02
+outage. The fixtures are synthetic cuts of the real weeks (case ids, pull
+request and build numbers and reasons invented; timeline kept: `SCHEMA.md`,
+"Fixtures"), so a replay of a real `data.json` pairs with the real roster, not
+this file. A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`,
+is the day the build cluster lost five nodes (#1478); the same test file
+asserts it reads
 as `lost_pods` with 12 runs on 12 pull requests, and that the setup-death rule
 no longer claims them. A third, `testdata_health/slow-gate-2026-09-14.json.gz`,
 is the week ending 2026-09-14 18:20Z (#1586), the seven days the slow-gate

@@ -30,9 +30,9 @@ poller = importlib.util.module_from_spec(_spec)
 sys.modules["poll_rc_eval_verdict"] = poller
 _spec.loader.exec_module(poller)
 
-# The commit from scripts/eval_dashboard/testdata_rc/2097891568546484224 -- a
-# real build of this job, so the artifact shapes here are the deployment's.
-COMMIT = "5b5ad10163cf10c73871b279518c7165c098bec9"
+# The commit from scripts/eval_dashboard/testdata_rc/2090000000000000070, the
+# collector's synthetic build of this job; the artifact shapes are the lane's.
+COMMIT = "0707070707070707070707070707070707070707"
 OTHER_COMMIT = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 PREFIX = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
 # The lane's archive after it moves to the presubmit lanes' private bucket,
@@ -41,33 +41,33 @@ PRIVATE_PREFIX = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-ev
 CONSOLE = "https://console.cloud.google.com/storage/browser/"
 SUMMARY_PATH = poller.ARTIFACTS_DIR + poller.RC_SUMMARY_FILE
 VERDICT_JSON_PATH = poller.ARTIFACTS_DIR + poller.RC_VERDICT_JSON_FILE
-# bench-gate's roll-up of the RED night of 2026-11-04 (Prow build
-# 2117823019274473472), cut to the fields the red-cases line carries plus one
-# INFRA entry and one GREEN one, which the line must leave out.
-ROLL_UP_1104 = json.dumps(
+# bench-gate's roll-up of a synthetic RED night (build 2090000000000000110, PR
+# 109), cut to the fields the red-cases line carries plus one INFRA entry and
+# one GREEN one, which the line must leave out. Case ids follow the fixture map.
+ROLL_UP_109 = json.dumps(
     {
         "green": False,
         "outcome": "red",
         "cases": [
-            {"case": "reliability-pdb-probe", "domain": "reliability", "rung": 7, "rung_name": "GREEN", "blocking": False},
-            {"case": "compliance-rbac-overgrant", "domain": "fleet-audits", "rung": 4, "rung_name": "COLLAPSE", "blocking": True},
-            {"case": "capacity-headroom", "domain": "capacity", "rung": 99, "rung_name": "INFRA", "blocking": False},
+            {"case": "case-02", "domain": "reliability", "rung": 7, "rung_name": "GREEN", "blocking": False},
+            {"case": "case-09", "domain": "fleet-audits", "rung": 4, "rung_name": "COLLAPSE", "blocking": True},
+            {"case": "case-39", "domain": "capacity", "rung": 99, "rung_name": "INFRA", "blocking": False},
         ],
     }
 )
 # The literal line the notifier reads back; a change here is a change there.
-RED_CASES_LINE_1104 = 'red_cases={"cases":[{"case":"compliance-rbac-overgrant","rung":4,"rung_name":"COLLAPSE"}],"partial":false}'
+RED_CASES_LINE_109 = 'red_cases={"cases":[{"case":"case-09","rung":4,"rung_name":"COLLAPSE"}],"partial":false}'
 
-# The `timestamp` from that same real started.json, and a nomination pushed a
+# The `timestamp` from that same started.json, and a nomination pushed a
 # day later. Two attempts at ONE commit is the shape the `--not-before` floor
 # exists for, so the tests below need both a "last night's build" stamp and a
 # "tonight's nomination" one.
-STAMP = 1789011301
+STAMP = 1757561701
 A_DAY = 24 * 60 * 60
 TONIGHT = STAMP + A_DAY
 
 
-def started(commit, tag="evalcand_2609092307_5b5ad10", timestamp=STAMP):
+def started(commit, tag="evalcand_2609092307_0707070", timestamp=STAMP):
     """started.json as Prow's decoration writes it for a tag-push postsubmit."""
     return json.dumps(
         {
@@ -90,7 +90,7 @@ def finished(passed, commit=COMMIT):
     )
 
 
-def summary(verdict, tag="evalcand_2609092307_5b5ad10"):
+def summary(verdict, tag="evalcand_2609092307_0707070"):
     """rc-eval-summary.md in the shape hack/ci-eval-rc.sh writes it.
 
     Kept structurally faithful -- the surrounding prose included -- because the
@@ -544,7 +544,7 @@ class ArtifactParsingTest(unittest.TestCase):
         self.assertTrue(poller.started_names_commit(started(COMMIT), COMMIT[:7]))
 
     def test_the_repos_value_is_split_off_its_ref(self):
-        text = json.dumps({"repos": {"gke-labs/kube-agents": f"evalcand_2609092307_5b5ad10:{COMMIT}"}})
+        text = json.dumps({"repos": {"gke-labs/kube-agents": f"evalcand_2609092307_0707070:{COMMIT}"}})
         self.assertTrue(poller.started_names_commit(text, COMMIT))
 
     def test_a_repository_name_is_not_a_commit(self):
@@ -929,12 +929,12 @@ class RedCasesTest(unittest.TestCase):
     """The red-cases line: the blocking cases of a settled RED's roll-up,
     printed after the verdict line for the broken-stage notifier."""
 
-    def test_the_line_for_the_recorded_11_04_night_is_literal(self):
-        self.assertEqual(poller.red_cases_line(poller.red_cases(ROLL_UP_1104)), RED_CASES_LINE_1104)
+    def test_the_red_cases_line_for_the_roll_up_is_literal(self):
+        self.assertEqual(poller.red_cases_line(poller.red_cases(ROLL_UP_109)), RED_CASES_LINE_109)
 
     def test_only_blocking_cases_are_listed(self):
-        cases = poller.red_cases(ROLL_UP_1104)
-        self.assertEqual([case["case"] for case in cases["cases"]], ["compliance-rbac-overgrant"])
+        cases = poller.red_cases(ROLL_UP_109)
+        self.assertEqual([case["case"] for case in cases["cases"]], ["case-09"])
         self.assertEqual(set(cases["cases"][0]), set(poller.RED_CASE_KEYS))
         self.assertFalse(cases["partial"])
 
@@ -947,7 +947,7 @@ class RedCasesTest(unittest.TestCase):
     def test_a_blocking_entry_outside_bench_gates_vocabulary_withholds_the_whole_line(self):
         """The one shape check sits here, at the producer, so neither the
         step summary nor the notifier renders a value the archive made up."""
-        good = {"case": "compliance-rbac-overgrant", "rung": 4, "rung_name": "COLLAPSE", "blocking": True}
+        good = {"case": "case-09", "rung": 4, "rung_name": "COLLAPSE", "blocking": True}
         for bad in (
             dict(good, case="bad`name"),
             dict(good, case="#4821"),
@@ -961,7 +961,7 @@ class RedCasesTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(poller.red_cases(json.dumps({"cases": [good, bad]})))
         # A non-blocking entry outside the vocabulary is not the line's concern.
-        self.assertEqual([c["case"] for c in poller.red_cases(json.dumps({"cases": [good, dict(good, case="x`y", blocking=False)]}))["cases"]], ["compliance-rbac-overgrant"])
+        self.assertEqual([c["case"] for c in poller.red_cases(json.dumps({"cases": [good, dict(good, case="x`y", blocking=False)]}))["cases"]], ["case-09"])
 
     def test_anything_but_a_roll_up_reads_as_none(self):
         for text in (None, poller.UNREADABLE, "", "not json", "[]", json.dumps({"outcome": "red"}), json.dumps({"cases": "x"})):
@@ -982,9 +982,9 @@ class RedCasesTest(unittest.TestCase):
     def test_a_roll_up_prints_the_line_and_returns_the_cases(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cases = poller.report_red_cases(f"{PREFIX}100/", lambda url: ROLL_UP_1104 if url == f"{PREFIX}100/{VERDICT_JSON_PATH}" else None)
-        self.assertEqual(out.getvalue(), RED_CASES_LINE_1104 + "\n")
-        self.assertEqual(cases["cases"][0]["case"], "compliance-rbac-overgrant")
+            cases = poller.report_red_cases(f"{PREFIX}100/", lambda url: ROLL_UP_109 if url == f"{PREFIX}100/{VERDICT_JSON_PATH}" else None)
+        self.assertEqual(out.getvalue(), RED_CASES_LINE_109 + "\n")
+        self.assertEqual(cases["cases"][0]["case"], "case-09")
 
 
 class MainTest(unittest.TestCase):
@@ -1108,7 +1108,7 @@ class MainTest(unittest.TestCase):
     def test_a_red_verdict_writes_the_outputs_and_summary_the_workflow_reads(self):
         code, written, rendered = self._run_main(
             {"100": build(verdict=poller.SUMMARY_RED)},
-            ["--commit", COMMIT, "--evalcand-tag", "evalcand_2609092307_5b5ad10"],
+            ["--commit", COMMIT, "--evalcand-tag", "evalcand_2609092307_0707070"],
         )
         self.assertEqual(code, poller.EXIT_RED)
         self.assertIn("verdict=red", written)
@@ -1121,15 +1121,15 @@ class MainTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code, written, rendered = self._run_main(
-                {"100": build(verdict=poller.SUMMARY_RED, roll_up=ROLL_UP_1104)},
-                ["--commit", COMMIT, "--evalcand-tag", "evalcand_2609092307_5b5ad10"],
+                {"100": build(verdict=poller.SUMMARY_RED, roll_up=ROLL_UP_109)},
+                ["--commit", COMMIT, "--evalcand-tag", "evalcand_2609092307_0707070"],
             )
         self.assertEqual(code, poller.EXIT_RED)
         lines = out.getvalue().splitlines()
         verdict_at = next(i for i, line in enumerate(lines) if line.startswith("verdict=red settled=true build_id=100 "))
-        self.assertEqual(lines[verdict_at + 1], RED_CASES_LINE_1104)
+        self.assertEqual(lines[verdict_at + 1], RED_CASES_LINE_109)
         self.assertIn("settled=true", written)
-        self.assertIn("Red cases: `compliance-rbac-overgrant` (rung `4 COLLAPSE`)", rendered)
+        self.assertIn("Red cases: `case-09` (rung `4 COLLAPSE`)", rendered)
 
     def test_a_red_verdict_without_a_roll_up_keeps_its_verdict_outputs_and_exit(self):
         """The line is best-effort: an absent roll-up is a warning, and the
