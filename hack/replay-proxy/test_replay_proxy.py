@@ -1,5 +1,6 @@
 """The shadow proxy end to end against a fake LiteLLM: pass-through, the log line, /metrics, never replaying."""
 
+import concurrent.futures
 import http.client
 import io
 import json
@@ -32,6 +33,11 @@ STALL_SECONDS = 0.3
 LONG_STALL_SECONDS = 1.0
 SHORT_TIMEOUT_SECONDS = 0.25
 DEEP_NESTING = 100_000
+# The deepest document the search of `nested_past_the_parser` tries: its
+# brackets are a quarter of the bytes that the proxy observes of an answer.
+DEEPEST_DOCUMENT_TRIED = replay_proxy.MAX_OBSERVED_BYTES // 8
+# Why a test skips when the search of `nested_past_the_parser` finds no document.
+NO_DOCUMENT_REFUSED = "the JSON parser of this Python parses %d levels, the deepest that this test tries"
 SLOW_CHUNKS = 100
 SLOW_CHUNK_SECONDS = 0.05
 
@@ -380,6 +386,39 @@ def sse(event):
     return f"data: {event}\n\n".encode()
 
 
+def nested_past_the_parser(levels, most):
+    """A JSON array nested `levels` deep or deeper that `json.loads` refuses for its
+    depth on this run, or None when one of `most` levels still parses.
+
+    The parser's depth limit is the interpreter's: about 10,000 levels on Python
+    3.12 and 3.13, and on 3.14 as many as the stack holds (more than 100,000
+    with a 16 MB stack). So no fixed depth is past it on every run.
+    """
+    depth = levels
+    while True:
+        text = "[" * depth + "]" * depth
+        try:
+            json.loads(text)
+        except RecursionError:
+            return text
+        if depth >= most:
+            return None
+        depth = min(2 * depth, most)
+
+
+def nested_past_the_parser_on_a_thread(levels, most):
+    """`nested_past_the_parser`, searched on a new thread: the server parses on
+    one, and on Python 3.14 the limit is that thread's stack."""
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        return pool.submit(nested_past_the_parser, levels, most).result()
+
+
+def nested_too_deep_stream():
+    """A stream whose one event the proxy's parser refuses for its depth, or None."""
+    deep = nested_past_the_parser_on_a_thread(DEEP_NESTING, DEEPEST_DOCUMENT_TRIED)
+    return None if deep is None else sse('{"choices": ' + deep + "}")
+
+
 MALFORMED_STREAMS = {
     "tool_call index null": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": None, "id": "c"}]}}]})),
     "tool_call index string": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": "0", "id": "c"}]}}]})),
@@ -389,7 +428,7 @@ MALFORMED_STREAMS = {
     "data that is not JSON": sse("not json at all"),
     "delta not a dict": sse(json.dumps({"choices": [{"delta": ["x"]}]})),
     "choices a number": sse(json.dumps({"choices": 5})),
-    "nested too deep": sse('{"choices": ' + "[" * DEEP_NESTING + "]" * DEEP_NESTING + "}"),
+    "nested too deep": nested_too_deep_stream(),
 }
 
 
@@ -410,6 +449,8 @@ class ObserveFailureTest(ProxyTestCase):
     def test_malformed_streamed_chunks(self):
         for name, body in MALFORMED_STREAMS.items():
             with self.subTest(name):
+                if body is None:
+                    self.skipTest(NO_DOCUMENT_REFUSED % DEEPEST_DOCUMENT_TRIED)
                 self.out.seek(0)
                 self.out.truncate()
                 self.check(body, stream=True)
