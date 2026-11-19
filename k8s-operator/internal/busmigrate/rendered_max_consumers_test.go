@@ -185,16 +185,22 @@ func TestTheRestorePodWidensForwardAndNotOnTheWayBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nc.Close()
+	var created time.Time
 	for i := 1; i <= 2; i++ {
 		if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 1); err != nil {
 			t.Fatalf("way back, run %d: %v", i, err)
 		}
-	}
-	info, err := streamInfo(ctx, nc, "TASKS")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Config.MaxConsumers != 110 {
-		t.Errorf("way back max_consumers %d, want the snapshot's 110", info.Config.MaxConsumers)
+		info, err := streamInfo(ctx, nc, "TASKS")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Config.MaxConsumers != 110 || info.State.Msgs != meta.State.Msgs {
+			t.Errorf("way back, run %d: max_consumers %d msgs %d, want the snapshot's 110 and %d", i, info.Config.MaxConsumers, info.State.Msgs, meta.State.Msgs)
+		}
+		if i == 1 {
+			created = info.Created
+		} else if !info.Created.Equal(created) {
+			t.Error("way back: the second run re-created the stream")
+		}
 	}
 }
