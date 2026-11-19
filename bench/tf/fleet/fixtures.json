@@ -4,7 +4,7 @@
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A project-scoped role (`cluster_slot: null`, for a Compute Engine object no cluster carries) takes `<kind>/<name-prefix>*` instead, where the kind is `instance`, `firewall`, `network` or `snapshot`: the runner lists the project's instances, firewall rules, networks or Persistent Disk snapshots whose name starts with the prefix, with gcloud, and the probe passes when at least one is there. The prefix stops before the fleet's `cluster_prefix`, which is the Terraform's business, or is the whole name where the object carries none (the declared network, which a repository note has to spell, and `default`, which the stack peers with rather than plants). A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
   "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, on a project-scoped role a probe-shaped `<kind>/<name-prefix>*` (every Compute Engine object of that kind whose name starts with the prefix, read with `gcloud compute ... list --format json`), `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded, or `repository/<path>` for a file provisioning seeds into the pool project's GitOps repository (gke-agentic/<project>-infra; the content is scripts/gitops_seed_files.py's), read through scripts/verify_ci_pool_project.py on a cluster role or a project-scoped one alike; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `age_hours_ge` (an RFC 3339 timestamp at least `value` hours in the past; an unparseable one fails), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), `not_ahead_of_channel` (cluster subject only, no value: the version is in the cluster's own release channel's `validVersions` in get-server-config, or that list has a newer patch of the same minor, or a newer version when it carries none of that minor; an unrecognised version string fails), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked), `serial_contains` (a project-scoped `instance/<name-prefix>*` subject with no path: at least one matched instance's serial port 1 output, read with `gcloud compute instances get-serial-port-output`, holds the literal string `value`; a failed read with no other console holding it leaves the role not checked), `source_disk_gone` (a project-scoped `snapshot/<name-prefix>*` subject with no path and no value: at least one snapshot matched, each carries a `sourceDisk`, and the project holds no disk of the name that field ends in, read with `gcloud compute disks list`; a failed disk list with no live disk found leaves the role not checked), or `ready_after_hours` (an RFC 3339 timestamp at least `value` hours in the past, as `age_hours_ge`, except that a younger one is the fixture's clock, not its shape: the role is NOT READY, reported with the time the gate passes and never written as drift, so a project applied today is registrable; an unparseable timestamp is drift), or `as_seeded` (a `repository/<path>` subject with no path and no value: the file's git blob sha is the one provisioning seeds there, the verifier's GITOPS_SEEDED_FILES content plus the seed command's trailing newline; a file missing from a repository that answers fails it; a repository the credential cannot see, or a transient, leaves the role not checked; a pass with no credential at all does not make the assertion, judges the role on its other assertions and names the subject in its report's `unasserted` list; only an operator's replace clears it, so it never holds a wait; the hourly scan holds no credential for the pool repositories, so a drift read there needs no hourly confirmation to excuse a case); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion other than a `ready_after_hours` clock is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit and the nightly run this pass at lease time, and bench/kube_agents_bench/fixture_drift.py records a case as infrastructure when a role it needs is drifted there and on the CI health bot's last two hourly scans of every pool project. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
   "cluster_slots": {
-    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
+    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the declared zonal pool and the pool that names a missing reservation (both at zero nodes), the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
     "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
@@ -109,6 +109,41 @@
           "path": null,
           "op": "as_seeded",
           "why": "the note is the declaration the case grades against; a note without the pool's single-zone-nodepool item (forty projects kept the five-item note after it was added) files the pool as a finding, and the case fails on a correct report"
+        }
+      ]
+    },
+    "missing-reservation-pool": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": [],
+      "fixture": "missing-reservation-pool, a pool held at zero nodes behind a NO_SCHEDULE taint, with no autoscaling, that consumes the one reservation it names (SPECIFIC_RESERVATION) while no reservation of that name exists in any zone of the project: GKE reports the pool RUNNING and refuses the first node it would add. The stack plants no reservation; the missing one is the defect",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='missing-reservation-pool')].config.reservationAffinity.consumeReservationType",
+          "op": "any_eq",
+          "value": "SPECIFIC_RESERVATION",
+          "why": "the defect is a pool bound to one named reservation; with any other affinity the pool can take on-demand capacity, and a check that compares the pool with the project's reservations has nothing to name"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='missing-reservation-pool')].config.reservationAffinity.values[*]",
+          "op": "any_eq",
+          "value": "seeded-absent-reservation",
+          "why": "the name is one that no reservation carries; a pool edited to name a real reservation is healed, and the case then grades a pool with nothing wrong"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='missing-reservation-pool')].autoscaling.enabled",
+          "op": "none_eq",
+          "value": true,
+          "why": "with autoscaling on, the stockout SOP's 3.9 names the pool as a single-zone autoscaling pool, a second finding on the object that no case expects"
+        },
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=missing-reservation-pool",
+          "path": "metadata.name",
+          "op": "absent",
+          "why": "the pool grows only when its affinity changed or a reservation of that name exists now, so a node in it means the defect is gone. Nothing adds a node by itself (no autoscaling, a taint), and the scan reads no Compute Engine reservation, so a reservation that someone creates stays unseen until the pool is resized"
         }
       ]
     },
@@ -746,6 +781,81 @@
           "path": null,
           "op": "as_seeded",
           "why": "the note is the declaration the waste case grades against; a note missing or edited away from what provisioning seeds files the headroom as a finding, and the case fails on a correct report"
+        }
+      ]
+    },
+    "generated-name-family": {
+      "cluster_slot": "a",
+      "namespace": "seeded-family",
+      "probes": [
+        "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6",
+        "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b",
+        "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132"
+      ],
+      "fixture": "three Deployments named calibration-<uuid>, the shape a spawner leaves, with the common label app.kubernetes.io/part-of=calibration and no owner reference; each is two pause replicas requesting 10m / 128Mi and using almost none of the memory, behind a budget and a default-deny policy. No repository file declares a member's name, so the waste audit's overrequest findings name objects that only the parent can fix. The names are literals in the stack, the same on every project",
+      "state": [
+        {
+          "subject": "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "each member is a running workload that reserves more than it uses; a Pending replica is not measured, the check then names fewer members than the family has, and a case that counts the family grades another fixture"
+        },
+        {
+          "subject": "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "each member is a running workload that reserves more than it uses; a Pending replica is not measured, the check then names fewer members than the family has, and a case that counts the family grades another fixture"
+        },
+        {
+          "subject": "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "each member is a running workload that reserves more than it uses; a Pending replica is not measured, the check then names fewer members than the family has, and a case that counts the family grades another fixture"
+        },
+        {
+          "subject": "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a resize anyone applies to one member removes its over-request, and the family then has fewer members to roll up than the cases were written against"
+        },
+        {
+          "subject": "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a resize anyone applies to one member removes its over-request, and the family then has fewer members to roll up than the cases were written against"
+        },
+        {
+          "subject": "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a resize anyone applies to one member removes its over-request, and the family then has fewer members to roll up than the cases were written against"
+        },
+        {
+          "subject": "deployment/calibration-eb84fcb6-cb5b-4a66-ae6e-76d9f868a0d6",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "calibration",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a case that reads the parent grades a different grouping rule"
+        },
+        {
+          "subject": "deployment/calibration-374472b8-d3be-4c23-879f-9a44a5775c2b",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "calibration",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a case that reads the parent grades a different grouping rule"
+        },
+        {
+          "subject": "deployment/calibration-20192efa-2b20-4f64-87c3-a3919cdcd132",
+          "path": "metadata.labels[\"app.kubernetes.io/part-of\"]",
+          "op": "eq",
+          "value": "calibration",
+          "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a case that reads the parent grades a different grouping rule"
         }
       ]
     },
