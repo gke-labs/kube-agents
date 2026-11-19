@@ -206,6 +206,12 @@ elif args[0] == "compute" and args[2] == "list":
     if answer == "UNREACHABLE":
         print(f"ERROR: (gcloud.compute.{args[1]}.list) Some requests did not succeed: Required 'compute.{args[1]}.list' permission", file=sys.stderr)
         sys.exit(1)
+    if answer == "PARTIAL":
+        # gcloud's default for a list that failed in part: a warning, what it
+        # could read (here nothing), and exit 0.
+        print("WARNING: Some requests did not succeed.\n - Internal error in zone us-central1-a", file=sys.stderr)
+        print("[]")
+        sys.exit(0)
     # `name ~ ^<prefix>` is a prefix read; `name ~ ^<name>$` (the disk read
     # behind source_disk_gone) is an exact one.
     pattern = next(a for a in args if a.startswith("--filter=name ~ ^"))[len("--filter=name ~ ^"):]
@@ -1916,6 +1922,79 @@ class ProjectScopedRoleTest(_Harness):
         path.write_text(json.dumps(catalog))
         with self.assertRaises(ffs.CatalogError):
             ffs.load_assertions(path)
+
+
+class ReservationSubjectTest(_Harness):
+    """`reservation/<name-prefix>*` is the project's reservations, read with
+    `gcloud compute reservations list`. It is the one project subject that a
+    cluster role carries: the pool that names a reservation is a cluster's, and
+    the reservation is not (#6367)."""
+
+    _LIST = "gcloud compute reservations list --project kube-agents-evals --filter=name ~ ^seeded-absent-reservation --format json"
+
+    def test_the_reservations_are_listed_in_the_project_for_the_pool_role(self):
+        done = self.run_script(_healthy_world())
+        assert done.returncode == 0, done.stderr
+        assert self.drift_files() == {}, done.stderr
+        assert self._LIST in self.log.read_text()
+
+    def test_a_reservation_with_the_fixtures_name_is_drift_that_names_it(self):
+        """Someone created the reservation: the pool can grow now, and nothing
+        on the cluster shows it until the first node."""
+        world = _healthy_world()
+        world["compute"]["reservations"] = [{"name": "seeded-absent-reservation", "zone": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/zones/us-central1-a"}]
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"missing-reservation-pool"}, done.stderr
+        body = self.drift_files()["missing-reservation-pool"]
+        assert 'reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"' in body, body
+
+    def test_a_reservation_of_another_name_is_not_drift(self):
+        """The pool consumes one exact name. A reservation whose name only
+        starts with it gives the pool nothing."""
+        world = _healthy_world()
+        world["compute"]["reservations"] = [{"name": "team-batch-reservation"}, {"name": "seeded-absent-reservation-2"}]
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+
+    def test_a_list_that_gcloud_read_in_part_is_not_checked(self):
+        """gcloud exits 0 on a list that failed in part. An empty answer then
+        is not "no reservation": the role is not checked, never healthy."""
+        world = _healthy_world()
+        world["compute"]["reservations"] = "PARTIAL"
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
+        assert "compute reservations list was partial" in done.stderr
+
+    def test_a_refused_reservation_list_is_not_checked_and_leaves_no_drift_file(self):
+        world = _healthy_world()
+        world["compute"]["reservations"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert "54 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "fixture role 'missing-reservation-pool' could not be checked" in done.stderr
+
+    def test_no_other_project_subject_is_for_a_cluster_role(self):
+        catalog = json.loads(_CATALOG.read_text())
+        reservation = {"subject": "reservation/seeded-absent-reservation*", "path": "name", "op": "none_eq", "value": "seeded-absent-reservation", "why": "w"}
+        path = self.tmp / "catalog.json"
+        for subject, refused in (
+            ("reservation/seeded-absent-reservation*", False),
+            ("firewall/world-open-2379-*", True),
+            ("reservation/Seeded*", True),
+            ("reservation/seeded-absent-reservation", True),
+            ("reservation?", True),
+            ("reservation?name=seeded-absent-reservation", True),
+        ):
+            with self.subTest(subject=subject):
+                catalog["roles"]["missing-reservation-pool"]["state"] = [{**reservation, "subject": subject}]
+                path.write_text(json.dumps(catalog))
+                if refused:
+                    with self.assertRaises(ffs.CatalogError):
+                        ffs.load_assertions(path)
+                else:
+                    assert ffs.load_assertions(path)["missing-reservation-pool"]["state"][0]["subject"] == subject
 
 
 class RepositorySubjectTest(_Harness):
