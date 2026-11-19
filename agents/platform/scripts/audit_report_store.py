@@ -290,7 +290,14 @@ def _http_get_json(url: str, token: str | None, ca_file: str | None) -> dict:
     if url.startswith("https://"):
         context = ssl.create_default_context(cafile=ca_file if ca_file and os.path.exists(ca_file) else None)
     try:
-        with urllib.request.urlopen(request, timeout=JWKS_FETCH_TIMEOUT_SECONDS, context=context) as response:
+        # The API server is inside the cluster: a proxy from the environment must
+        # not be in the path of the read. The opener is built for each call, because
+        # it carries this call's TLS context; with no context, the handler makes
+        # its default.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+        )
+        with opener.open(request, timeout=JWKS_FETCH_TIMEOUT_SECONDS) as response:
             body = response.read(JWKS_MAX_BYTES + 1)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise JWKSUnavailable(f"GET {url}: {exc}") from exc

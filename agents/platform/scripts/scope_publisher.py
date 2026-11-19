@@ -335,7 +335,7 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
 def _kube_request(method: str, namespace: str, name: str, body: dict | None = None) -> dict:
     """One call on the ConfigMap through the Kubernetes API, and its decoded JSON body.
 
-    Raises what `urlopen` raises (HTTPError for an API refusal, URLError and OSError for the
+    Raises what the opener raises (HTTPError for an API refusal, URLError and OSError for the
     rest); the caller treats each as "not read" or "not written".
     """
     host = os.environ.get(KUBE_HOST_ENV, "").strip()
@@ -351,7 +351,13 @@ def _kube_request(method: str, namespace: str, name: str, body: dict | None = No
         headers["Content-Type"] = MERGE_PATCH_CONTENT_TYPE
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     context = ssl.create_default_context(cafile=str(KUBE_CA_FILE))
-    with urllib.request.urlopen(request, timeout=KUBE_API_TIMEOUT_SECONDS, context=context) as response:
+    # The API server is inside the cluster: a proxy from the environment must not
+    # be in the path of the call. The opener is built for each call, because it
+    # carries this call's TLS context.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+    )
+    with opener.open(request, timeout=KUBE_API_TIMEOUT_SECONDS) as response:
         return json.loads(response.read() or b"{}")
 
 

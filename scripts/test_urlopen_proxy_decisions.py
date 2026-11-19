@@ -113,10 +113,10 @@ DECISIONS = (
     Decision("agents/platform/plugins/pr_opened/__init__.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     # The platform profile's scripts.
     Decision(SCRIPTS + "agent_common_server.py", "<module>._AGENT_OPENER", BUILD_OPENER, REFUSES, REFUSE, "the platform agent Service", "an in-cluster https call with the prompt; a proxy must not be in its path"),
-    Decision(SCRIPTS + "audit_report_store.py", "_http_get_json", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
+    Decision(SCRIPTS + "audit_report_store.py", "_http_get_json", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "broker_admission.py", "<module>._OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._METADATA_OPENER", BUILD_OPENER, REFUSES, REFUSE, METADATA, "a link-local address must never go through a proxy"),
-    Decision(SCRIPTS + "credential_proxy.py", "ServiceAccountAuthenticator._review", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
+    Decision(SCRIPTS + "credential_proxy.py", "ServiceAccountAuthenticator._review", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "PodAddressBinding._read_pod", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "SlackRelay.download", BUILD_OPENER, TAKES, KEEP, "slack.com", PUBLIC_HOST),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._TEAMS_OPENER", BUILD_OPENER, TAKES, KEEP, "the Microsoft identity and Bot Framework hosts", PUBLIC_HOST),
@@ -142,7 +142,7 @@ DECISIONS = (
         SCRIPTS + "providers/transport.py", "HttpTransport._build_opener", BUILD_OPENER, TAKES, KEEP, "the forge's API host",
         "a GitHub, GitLab, Bitbucket or Gitea host; the site tells an operator to set HTTPS_PROXY for this client",
     ),
-    Decision(SCRIPTS + "scope_publisher.py", "_kube_request", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
+    Decision(SCRIPTS + "scope_publisher.py", "_kube_request", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "session_kv_server.py", "<module>._GATEWAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, GATEWAY_API, LOOPBACK_PROMPT),
     Decision(SCRIPTS + "slack_blocks_post.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "slack_relay_patch.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
@@ -432,6 +432,23 @@ class CallSitesTest(unittest.TestCase):
             self.assertEqual(
                 files_with_a_call(root, ("agents",)), ["agents/scripts/client.py", "agents/scripts/verify_client.py"]
             )
+
+    def test_an_opener_that_a_function_builds_for_each_call_is_named_by_the_function(self) -> None:
+        # A client whose TLS context is made for each call cannot keep one module-level opener.
+        source = (
+            "import urllib.request\n"
+            "def read(request, context):\n"
+            "    opener = urllib.request.build_opener(\n"
+            "        urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)\n"
+            "    )\n"
+            "    return opener.open(request)\n"
+            "def read_through_the_proxy(request, context):\n"
+            "    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=context)).open(request)\n"
+        )
+        self.assertEqual(
+            call_sites_of(source),
+            [("read", BUILD_OPENER, REFUSES), ("read_through_the_proxy", BUILD_OPENER, TAKES)],
+        )
 
     def test_a_call_is_named_by_its_function_and_class(self) -> None:
         source = (
