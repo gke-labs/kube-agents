@@ -197,6 +197,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
+	$(wildcard agents/*/recipes/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
