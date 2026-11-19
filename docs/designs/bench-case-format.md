@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -60,9 +60,9 @@ A first line of `[bench:slack-question-wake]` makes the run a replay of the wake
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
-the front door there under `spec.mode: next` too. A `session: fresh` answer carries today's Slack
-thread context, which next's door does not send, so a case with one stays in
-`hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
+the front door there too. A `session: fresh` answer carries the Slack thread context the
+api transport sends and the inject door does not, so a case with one stays in
+`hack/eval/inject-lane-exclusions.txt`, which no CI lane runs. The reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
 first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
 `dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
@@ -71,8 +71,7 @@ first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
-only over the inject transport, so the case needs an entry in
-`hack/eval/api-lane-exclusions.txt`. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
+only over the inject transport, which every CI lane uses. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
 `observe=<seconds>`, is the same stop sent while the opening turn still runs, `after` seconds after
 the harness first sees it working; a run whose stopped turn filed no card passes.
 `[bench:stop-in-card-wait]`, optionally with `deadline=<seconds>` and `observe=<seconds>`, sends the
@@ -81,15 +80,28 @@ It cancels the door task (`tasks/cancel`) once a card filed since the send is on
 task still works. No card within `deadline`, or a task that ends before any card, is
 infrastructure, not a pass. The next lane turns the door on for it, so an eval install runs with a
 door a default install doesn't have. The harness writes two entries for any of these cases, `harness_stop_sent` and `harness_cards_stopped`, and the case's
-`tool_called` objectives name them.
+`tool_called` objectives name them. When the door accepted the cancel and the task ended canceled,
+it writes a third, `harness_cancel_reported`: completed only when the canceled task carries a
+`cardStop` result whose stopped cards are exactly the cards the board shows archived (less any the
+result calls settled) and whose text opens `canceled; ` (#5528).
+
+A prompt that starts with `[bench:profile name=<profile> <key>=<value> ...]` sends its ask to that
+AgentProfile as a new top task, with the other fields as the task's parameters, rather than to the
+platform agent ([`bench/kube_agents_bench/profile_hook.py`](../../bench/kube_agents_bench/profile_hook.py),
+#5945). The directive ends at its first `]`, so the ask may follow on the same line, and its values
+take the `{{AGENT_CLUSTER_*}}` and `{{FLEET_CLUSTER_*}}` placeholders. It must open the prompt, and the
+lint refuses one that doesn't. No other `[bench:...]` directive may follow it, because the readers that
+schedule a stopped ask or a replay read only a prompt's first line, so a combined case would run in
+the wrong phase; combining one is a later change.
+It runs only over the inject transport (the door's `profile` and `parameters`), which every CI
+lane uses; the api transport errors on it.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
 into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
 ([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
 the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
-for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
-as well.
+for the plant. Inject transport only, as the stop directives are.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
 carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
@@ -353,7 +365,7 @@ profile at least one delegated worker ran as, read from the tags the harness put
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
 inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
-error on the api transport, so a case using it is listed in `hack/eval/api-lane-exclusions.txt`),
+error on the api transport, so a case using it runs over the inject transport alone),
 `worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
@@ -428,7 +440,7 @@ the run started (or, with `since_state_file`, since the `fired_at` a case's stac
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
-`required_finding_phrases` entry, a finding in its `document` whose id contains it. `report_store_reply`, in its own module
+`required_finding_phrases` entry, a finding in its `document` whose id contains it, and no finding whose id contains a `forbidden_finding_phrases` entry. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
@@ -455,7 +467,10 @@ job's threads since the fire, and the chat report the run's `finish` left on the
 passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
 silent run or one that never ended is an error. `triage_starts`, in its own module
-(`bench/kube_agents_bench/triage_starts.py`), lists the pods in its `namespace` on the agent's cluster,
+(`bench/kube_agents_bench/triage_starts.py`), reads the planted pods from the ConfigMap the stack
+records them in (`planted_record`, optional; without it, or when the namespace holds no such ConfigMap,
+the pods in its `namespace` on the agent's cluster), so a pod deleted mid-run is still graded and is
+named in the reason; a live pod the record leaves out is an error. It
 joins the Session KV server's admitted `intercepted_events` rows for them (by pod UID) to the default
 profile's Hermes `state.db`, and passes when at least `min_alerts` pods have an admitted alert and every
 one of those alerts has a session with a message, a started triage turn; a session with no message is a
@@ -590,7 +605,7 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
 job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
-`EVAL_TIER=certification`, every case whose task file carries the bare line `suite: certification`. A case
+`EVAL_TIER=validated-capabilities`, every case whose task file carries the bare line `suite: validated-capabilities`. A case
 runs because a file names it or its task file carries that line; other cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
@@ -602,9 +617,7 @@ test checks both, so two case pull requests don't edit the same lines). It lands
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
-the night it merges, its record accrues in the evidence store (for a case in
-`hack/eval/api-lane-exclusions.txt`, which runs only over the inject transport, under the
-version key's `next` mode), and a presubmit seat is a
+the night it merges, its record accrues in the evidence store, and a presubmit seat is a
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as
@@ -617,10 +630,10 @@ for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
-The one exception is a case with the bare line `suite: certification` in its task file: that
-line is its registration (with `certification_part: N` for a section other than 1), it runs only under `EVAL_TIER=certification`, and never
+The one exception is a case with the bare line `suite: validated-capabilities` in its task file: that
+line is its registration (with `suite_part: N` for a section other than 1), it runs only under `EVAL_TIER=validated-capabilities`, and never
 in the presubmit or nightly files
-([`bench/README.md`](../../bench/README.md#certification-suite)).
+([`bench/README.md`](../../bench/README.md#validated-capabilities-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was

@@ -83,7 +83,8 @@ _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 MAX_KUBECONFIG_BYTES = 1 << 20
 
 # The broker's read-only Cloud API relay: `GET {broker}/v1/gcp/<host>/<path>`
-# forwards a permitted Google API read on the broker's credential. Declared
+# forwards a permitted Google API read on the broker's credential (a `POST`
+# for the one read whose arguments are a JSON body). Declared
 # here rather than in the broker because both sides spell it and this is the
 # module both import; `credential_proxy` re-exports it. `ApiSession` below is
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
@@ -188,8 +189,8 @@ RETRY_JITTER_FLOOR = 0.5
 BROKER_ADMISSION_WAIT_SECONDS = 60.0
 RETRY_DEADLINE_SECONDS = 170.0
 RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
-# What a refusal with no JSON body is reported as; the broker's own text is
-# used when it sent one.
+# What an answer with no JSON body is reported as, a refusal or a 2xx; the
+# broker's own text is used when a refusal sent one.
 NON_JSON_RESPONSE_TEXT = "non-JSON response"
 CLASS_INTERACTIVE = "interactive"
 CLASS_BACKGROUND = "background"
@@ -240,6 +241,12 @@ _exec_url_notice_written = False
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
 _DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the command may have run"
+# A 2xx answer on `/v1/exec` that cannot be read. The broker ran the command
+# before it answered, so the line ends as the dropped connection's does, and
+# the command is never sent again. `{what}` names the shape: the body can be
+# a command's output and is never printed.
+_UNREADABLE_ANSWER_LINE = "credential proxy error (HTTP {status}): {what}; the command may have run"
+_NOT_AN_OBJECT_TEXT = "the response is JSON of type {type}, not an object"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -368,7 +375,10 @@ KUBECONFIG_FLAG = "--kubeconfig"
 
 
 def normalize_universe_domain(raw: str | None) -> str:
-    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank."""
+    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank.
+
+    Refuses a domain under `googleapis.com`: such a value names hosts of the commercial universe.
+    """
     trimmed = (raw or "").strip()
     if not trimmed:
         return DEFAULT_UNIVERSE_DOMAIN
@@ -380,6 +390,14 @@ def normalize_universe_domain(raw: str | None) -> str:
     ):
         raise ValueError(
             f"universe domain {raw!r} must be a lowercase DNS domain with at least two labels"
+        )
+    if cleaned.endswith(_GOOGLE_API_SUFFIX):
+        # `<service>.mtls.googleapis.com` and the like are hosts of the commercial
+        # universe. As a universe domain such a value would pass the rule that a
+        # custom universe refuses the commercial hosts, and stay in the commercial one.
+        raise ValueError(
+            f"universe domain {raw!r} is under {DEFAULT_UNIVERSE_DOMAIN}, which is the "
+            f"commercial universe and not another one; use {DEFAULT_UNIVERSE_DOMAIN}"
         )
     return cleaned
 
@@ -587,9 +605,11 @@ def authorization_headers() -> dict[str, str]:
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
-# the task's end. Sent in this header on every exec, re-read on every call, so a
-# warm pod's next task presents its own. The broker confines the call to the
-# cluster the credential names (credential_proxy.TASK_CREDENTIAL_HEADER).
+# the task's end. Sent in this header on every exec and version-control call,
+# re-read on every call, so a warm pod's next task presents its own. The broker
+# confines an exec to the cluster the credential names, and admits a
+# version-control write only under its permit
+# (credential_proxy.TASK_CREDENTIAL_HEADER).
 TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
 TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 # The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
@@ -1210,12 +1230,22 @@ def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
     return Path(path) in _default_kubeconfig_candidates()
 
 
+def _caller_owns_folder(folder: Path) -> bool:
+    """Whether the caller owns `folder`. A default kubeconfig is created only in a folder that its
+    caller owns. Only a kubeconfig's owner registers a context in it, so the agent can never add a
+    cluster to a file that root made in the agent's folder. The question is about the folder that
+    holds the file, not the one above it. A worker's home can be a mount that root owns, and the
+    worker makes `.kube` in it."""
+    return folder.stat().st_uid == os.geteuid()
+
+
 def _ensure_host_kubeconfig_initialized(
     proxy_url: str,
     ca_file: str,
     token_file: str,
 ) -> None:
-    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent."""
+    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent, in a
+    folder that the caller owns."""
     host_context = os.environ.get("KUBE_PROXY_HOST_CONTEXT", "").strip()
     if not host_context:
         return
@@ -1226,6 +1256,8 @@ def _ensure_host_kubeconfig_initialized(
         return
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not _caller_owns_folder(path.parent):
+            return
         content = build_kube_proxy_kubeconfig(
             host_context,
             proxy_url=proxy_url,
@@ -1295,6 +1327,8 @@ def _merge_context_into_kubeconfig_file(
             else:
                 return
         if not path.exists() and not path.is_symlink() and path == _caller_default_kubeconfig_path():
+            if not _caller_owns_folder(path.parent):
+                return
             _replace_file(
                 path,
                 build_kube_proxy_kubeconfig(
@@ -2087,7 +2121,20 @@ def execute(
             return 1
         try:
             with open_broker_request(request) as response:
-                payload = json.load(response)
+                # Only the parse is guarded: a read that breaks is a dropped
+                # connection, below.
+                try:
+                    payload = json.load(response)
+                except ValueError:
+                    print(
+                        _UNREADABLE_ANSWER_LINE.format(status=response.status, what=NON_JSON_RESPONSE_TEXT),
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not isinstance(payload, dict):
+                    shape = _NOT_AN_OBJECT_TEXT.format(type=type(payload).__name__)
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=sys.stderr)
+                    return 1
             break
         except urllib.error.HTTPError as exc:
             payload = _refusal_payload(exc)
@@ -2257,6 +2304,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     # 401, and the stock opener would put a total socket timeout on a clone
     # that legitimately runs for minutes.
     headers.update(authorization_headers())
+    # A profile worker's task credential, as `execute` sends it: the broker
+    # refuses a profile caller's version-control verbs without one, and its
+    # permit is what admits the writes (#3993). Nothing outside task mode.
+    headers.update(task_credential_headers())
     request = urllib.request.Request(
         endpoint.rstrip("/") + f"/v1/vcs/{verb}",
         data=body,
@@ -2265,11 +2316,24 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     )
     try:
         with open_broker_request(request) as response:
-            return json.load(response)
+            try:
+                answer = json.load(response)
+            except RecursionError as exc:
+                # A body nested deeper than the parser goes. A RuntimeError by
+                # type, so no clause for a body that is not JSON sees it. A
+                # ValueError, as for the answer below that is not an object.
+                raise ValueError("the broker's answer is JSON nested too deep to read") from exc
+            if not isinstance(answer, dict):
+                # Valid JSON, but not an object, and every consumer reads the
+                # answer as one. A ValueError, as for a body that is not JSON:
+                # `vcs_client.call` has an arm for it. The type's name only,
+                # never the body.
+                raise ValueError(f"the broker's answer is JSON of type {type(answer).__name__}, not an object")
+            return answer
     except urllib.error.HTTPError as exc:
         try:
             answer = json.load(exc)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):  # RecursionError: a body nested too deep to parse
             # The status arrived but the body is not a refusal document. The
             # status is the whole answer.
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
@@ -2287,6 +2351,10 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # The body is read, or lost: nothing reads the response again. The
             # status stays on the error.
             exc.close()
+        if not isinstance(answer, dict):
+            # Valid JSON, but not an object, so no refusal document either.
+            # The status is the whole answer, as above.
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
@@ -2304,7 +2372,7 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
 
 
 class ApiSession:
-    """A requests-shaped session whose GETs to a Google API go through the broker.
+    """A requests-shaped session whose reads of a Google API go through the broker.
 
     The sandbox holds no Google credential, so a script that needs a Cloud
     Monitoring read cannot call `monitoring.googleapis.com` itself. This
@@ -2377,11 +2445,23 @@ class ApiSession:
         the collectors that make hundreds of these calls own their own pacing
         for a quota refusal.
         """
+        return self._send(url, params=params, timeout=timeout)
+
+    def post(self, url: str, *, json, timeout=None):
+        """One relayed POST of a JSON body, on the same schedule as `get`.
+
+        For a read whose arguments travel in a body, which the broker's table
+        names with a body check (Logging `entries:list`). The broker reads the
+        body, holds it to that check, and forwards its own copy of it.
+        """
+        return self._send(url, timeout=timeout, json_body=json)
+
+    def _send(self, url: str, **kwargs):
         attempts_made = 0
         started = self._clock()
         deadline = retry_deadline_seconds()
         while True:
-            response = self._get_once(url, params=params, timeout=timeout)
+            response = self._get_once(url, **kwargs)
             attempts_made += 1
             if not self._refused_admission(response):
                 return response
@@ -2417,11 +2497,12 @@ class ApiSession:
             return False
         return busy_reply_retryable(self._json_body(response))
 
-    def _get_once(self, url: str, *, params=None, timeout=None, headers=None):
+    def _get_once(self, url: str, *, params=None, timeout=None, headers=None, json_body=None):
         """One relayed GET, moved to the stateful broker when the exec tier cannot be reached.
 
         `headers` are sent beside the caller's credential (the get-credentials
-        check's GET_CREDENTIALS_CHECK_HEADER)."""
+        check's GET_CREDENTIALS_CHECK_HEADER). With `json_body` the request is
+        a POST of that body, for `post`."""
         caller_timeout = timeout
         started = time.monotonic()
         with self._lock:
@@ -2433,6 +2514,13 @@ class ApiSession:
             # refusing it.
             timeout = _exec_connect_bound(timeout)
         try:
+            if json_body is not None:
+                return self._http.post(
+                    self.relay_url(url, endpoint),
+                    json=json_body,
+                    headers={**authorization_headers(), **(headers or {})},
+                    timeout=timeout,
+                )
             return self._http.get(
                 self.relay_url(url, endpoint),
                 params=params,
@@ -2443,7 +2531,7 @@ class ApiSession:
             with self._lock:
                 if self._endpoint == endpoint and self._fallback is not None:
                     # The first reader to fail moves the session. Every relay
-                    # call is a GET, so sending it again is safe even when the
+                    # call is a read, so sending it again is safe even when the
                     # error came after the request left, and the rest of the
                     # session stays on the stateful broker: a missing exec
                     # Service would otherwise cost each read its connect bound.
@@ -2457,7 +2545,7 @@ class ApiSession:
             left = _time_left(caller_timeout, time.monotonic() - started)
             if left is False:
                 raise
-            return self._get_once(url, params=params, timeout=left, headers=headers)
+            return self._get_once(url, params=params, timeout=left, headers=headers, json_body=json_body)
 
 
 def _exec_connect_bound(timeout):

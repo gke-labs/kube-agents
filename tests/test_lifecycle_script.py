@@ -153,7 +153,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    untaint_stub="exit 0",
                    stdout_path=None,
                    sigint_after=None,
-                   tee_fails=False):
+                   tee_fails=False,
+                   extra_env=None):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -417,8 +418,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
             # has been trying them out by hand.
             env = get_isolated_test_env(
                 bin_dir=str(bin_dir),
-                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS"],
+                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS",
+                        "KUBEAGENTS_ALLOW_NODE_POOL_DESTROY"],
             )
+            env.update(extra_env or {})
             cwd = str(_REPO_ROOT / "terraform" / "examples" / "full-install")
             if stdout_path is not None:
                 # stdout a regular file, as `./lifecycle.sh apply > apply.log`
@@ -798,16 +801,24 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_guard_release_namespace_refuses_a_release_move(self):
-        """helm_release.namespace is ForceNew: a changed NAMESPACE plans destroy-and-recreate."""
-        proc = self._run_guard(
-            "guard_release_namespace",
-            state_list="helm_release.kube_agents",
-            state_show='resource "helm_release" "kube_agents" {\n    name      = "kube-agents"\n    namespace = "kubeagents-system"\n}',
-            tfvar_namespace='"agents-two"',
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
-        self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+        """helm_release.namespace is ForceNew: a changed NAMESPACE plans destroy-and-recreate.
+
+        The release has a count (install_helm_releases), so a state written since
+        holds it at [0]; a state from before holds the unindexed address until
+        the apply runs the moved block, and this guard runs before that apply.
+        Both must be refused."""
+        for address in ("helm_release.kube_agents[0]", "helm_release.kube_agents"):
+            with self.subTest(address=address):
+                proc = self._run_guard(
+                    "guard_release_namespace",
+                    state_list=address,
+                    state_show='resource "helm_release" "kube_agents" {\n    name      = "kube-agents"\n    namespace = "kubeagents-system"\n}',
+                    tfvar_namespace='"agents-two"',
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
+                self.assertIn(f"({address})", proc.stderr)
+                self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
     # terraform state show prints a number bare and the top-level attributes
     # before the nested blocks; the node_pool block repeats the name.
@@ -1123,6 +1134,40 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_no_op_without_a_pool_in_state(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list="", tfvar_enable_gvisor="false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_gvisor_pool_teardown_passes_a_kept_pool(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_gvisor_pool_teardown_refuses_a_pool_the_flag_drops(self):
+        """The upgrade that read a missing ENABLE_GVISOR as false planned the pool's destroy."""
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="false")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("this state's cluster runs the gVisor pool", proc.stderr)
+        self.assertIn("would DESTROY that pool", proc.stderr)
+        self.assertIn('set ENABLE_GVISOR="true" in install.env', proc.stderr)
+        self.assertIn("--allow-node-pool-destroy", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_lets_a_confirmed_destroy_go(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="false",
+                               extra_env={"KUBEAGENTS_ALLOW_NODE_POOL_DESTROY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("as KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true confirms", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_runs_on_apply(self):
+        text = (_REPO_ROOT / "terraform/examples/full-install/lifecycle.sh").read_text()
+        apply = text[text.index("  apply)\n"):]
+        apply = apply[: apply.index("log \"terraform apply\"")]
+        self.assertIn("guard_gvisor_pool_teardown", apply)
 
     def test_guard_node_pool_shape_lets_a_gvisor_pool_being_removed_go(self):
         """enable_gvisor_node_pool off with the pool still in state is the apply that destroys
@@ -2737,7 +2782,10 @@ class UninstallHelmReleasesTest(unittest.TestCase):
     state installed with the helm CLI, and stops the destroy when it cannot.
     """
 
-    _KUBE_AGENTS = "helm_release.kube_agents"
+    # The release has a count (install_helm_releases); a state from before it
+    # holds the unindexed address until an apply runs the moved block.
+    _KUBE_AGENTS = "helm_release.kube_agents[0]"
+    _KUBE_AGENTS_LEGACY = "helm_release.kube_agents"
     _CERT_MANAGER = "helm_release.cert_manager[0]"
     _CONTEXT = "gke_test-project_us-central1_test-cluster"
 
@@ -2834,6 +2882,11 @@ exit 0
             # get-credentials sharing it can move mid-teardown.
             self.assertIn(f"--kube-context {self._CONTEXT}", " ".join(uninstall))
             self.assertIn("--wait", uninstall)
+
+    def test_a_state_from_before_the_count_still_uninstalls_kube_agents(self):
+        proc, calls = self._run(state=(self._CERT_MANAGER, self._KUBE_AGENTS_LEGACY))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([u[2] for u in self._uninstalls(calls)], ["kube-agents", "cert-manager"], calls)
 
     def test_a_cert_manager_this_state_did_not_install_is_left_alone(self):
         proc, calls = self._run(state=(self._KUBE_AGENTS,))

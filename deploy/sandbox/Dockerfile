@@ -125,7 +125,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       '    ;;' \
       '  esac' \
       'fi' \
-      'exec /usr/local/libexec/kubectl "$@"' \
+      'exec python3 -I /usr/local/libexec/kubectl-admit "$@"' \
       >/usr/local/bin/kubectl && \
     chmod 0755 /usr/local/bin/kubectl && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
@@ -144,9 +144,9 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Pinned and checked against the release's SHA256SUMS, per architecture; a
 # version bump moves the hashes and the `leeway version` check in
 # deploy/sandbox/smoke-test.sh with it.
-ARG LEEWAY_VERSION=0.1.5
-ARG LEEWAY_SHA256_AMD64=f241671cf5a6e6b642fda5238b31ea3283e8dcb7aa6b9782358f268515e71d8a
-ARG LEEWAY_SHA256_ARM64=6282ea89eeb9af23a50ac4f9f06bcf135206ff93f3beda9efa96cf94144ccc5c
+ARG LEEWAY_VERSION=0.1.6
+ARG LEEWAY_SHA256_AMD64=20e9eb1caa3c0517ff86bd0d96f3ba88fc5a76e817cf425be62bc895c8372e39
+ARG LEEWAY_SHA256_ARM64=77c923ab64626aea0b60be0ab5916c2bf820adf44f2ee41caf69208072a8b846
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \
@@ -520,6 +520,17 @@ COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 # 0755: the model can run it and cannot rewrite it, which is the point, since
 # sshd runs it for every session that account opens.
 COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-session-command
+# Started by the entrypoint as root before sshd: it stops the largest session
+# process when the container nears its memory limit, so one oversized command
+# fails instead of the container being OOMKilled with every session in it.
+# Root-owned under libexec, so a session can neither rewrite nor stop it.
+COPY --chmod=0755 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-memory-guard
+# The kubectl admission /usr/local/bin/kubectl execs: it charges a large `get` the
+# peak the cost table lists for it and refuses one the shell cannot hold, before
+# it starts. The table is profiled ahead of time
+# (.agents/skills/update-kubectl-cost-table); nothing is estimated at run time.
+COPY --chmod=0755 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
+COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
 
 # What the agent's shell actually reads and runs, staged at /opt/defaults for the
 # entrypoint to copy onto the volume (step 1a). Same two-part arrangement as the
@@ -628,6 +639,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   post_merge_stepdown.py opens the revert and the rules-file pull request for an
 #                          auto-merged fix still broken after merge; imports
 #                          automation_rules, kubeagents_switches and vcs_client
+#   automerge_switch.py    the autonomy dial's per-kind switch: the rules-file pull
+#                          request that turns auto-merge on or off for a kind of
+#                          fix in one repository; imports automation_rules,
+#                          post_merge_stepdown, kubeagents_switches and vcs_client
 #   post_merge_offer.py    opens the draft rules-file pull request that offers
 #                          auto-merge for a kind of fix; imports post_merge_stepdown,
 #                          repo_ref and clean_merges, whose thresholds it states
@@ -637,6 +652,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          through credential_proxy_client and sizes their pools
 #                          from it, falling back to four. Every sweep collector
 #                          imports it at load
+#   logging_reads.py       a `gcloud logging read` through the broker's Cloud API
+#                          relay (credential_proxy_client.ApiSession), for the
+#                          stockout collector and the readiness report's audit-log
+#                          rules; when the relay does not answer, they run gcloud
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py`, submit-suggestion,
@@ -721,10 +740,12 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/automation_rules.py \
      agents/platform/scripts/post_merge_stepdown.py \
+     agents/platform/scripts/automerge_switch.py \
      agents/platform/scripts/post_merge_offer.py \
      agents/platform/scripts/clean_merges.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
+     agents/platform/scripts/logging_reads.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \

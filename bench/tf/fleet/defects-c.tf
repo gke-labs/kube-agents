@@ -19,7 +19,7 @@
 # Why seeded-c. The obtainability audit's 3.24 (`untargeted-compute-class-
 # workload`) files nothing while the cluster has an untainted node pool with
 # no compute-class label ("general capacity is available"), and the stockout
-# checks the certification suite waits for reuse that predicate. seeded-a's
+# checks the validated-capabilities suite waits for reuse that predicate. seeded-a's
 # default-pool must stay untainted and unlabelled for the fixtures it hosts,
 # so the family lives on the one seeded cluster whose only pool can carry the
 # class label: seeded-c, which main.tf labels for `general-ccc` and which
@@ -213,10 +213,11 @@ resource "kubernetes_pod_disruption_budget_v1" "app_worker_a" {
   }
 }
 
-# Defect (stockout): the class named only in nodeAffinity, never in
-# nodeSelector. The pre-filter reads `nodeSelector` alone, so a workload
-# targeted this way is dropped from the scale-up simulation while reading as
-# correctly targeted.
+# Control: the class named only in a required nodeAffinity, never in
+# nodeSelector. A required nodeAffinity on the class key also requests the
+# class: the autoscaler grew the pool for such a pod on GKE 1.35.8 and 1.36.4
+# (gke-compute-classes, references/compute-class-debug.md, Symptom 13). No
+# check may flag this workload; it stands beside the untargeted app-worker-a.
 # Addressed by the compute-class-affinity-workload role.
 resource "kubernetes_deployment_v1" "app_worker_b" {
   provider = kubernetes.seeded_c

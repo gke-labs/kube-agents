@@ -173,6 +173,116 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	}
 }
 
+// A console turn that names the task a report was on carries it to the
+// executor as a replyTo part.
+func TestConsoleReplyToRidesTheSubmission(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-rt", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "and the other pool?", ReplyTo: "task-7",
+	}
+	origin := r.awaitTask(t, "platform")
+	got, found, err := lib.ReplyToOf(messageParts(t, origin))
+	if err != nil || !found || got.TaskID != "task-7" {
+		t.Fatalf("replyTo part = %+v found=%v err=%v, want task-7", got, found, err)
+	}
+}
+
+// A replyTo that is not a task id's shape is dropped with one warn and the
+// turn starts without the part: the report is a help, not a condition.
+func TestAMalformedReplyToStartsTheTurnWithoutThePart(t *testing.T) {
+	t.Parallel()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-bad", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "and the other pool?", ReplyTo: "not a task",
+	}
+	origin := r.awaitTask(t, "platform")
+	if _, found, _ := lib.ReplyToOf(messageParts(t, origin)); found {
+		t.Fatal("a malformed replyTo reached the submission")
+	}
+	if n := strings.Count(logs.String(), "replyTo dropped: not a task id"); n != 1 {
+		t.Fatalf("warns = %d, want one:\n%s", n, logs.String())
+	}
+}
+
+// The dropped value is sender-chosen, so the warn carries it bounded, as
+// the console door logs its other frame fields, and never the whole string.
+func TestAMalformedReplyToIsLoggedBounded(t *testing.T) {
+	t.Parallel()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	r.adapter.roster = []string{consoleAuthor}
+	long := strings.Repeat("x", 10*1024) + " not a task"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-long", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "and the other pool?", ReplyTo: long,
+	}
+	r.awaitTask(t, "platform")
+	got := logs.String()
+	if !strings.Contains(got, "replyTo dropped: not a task id") {
+		t.Fatalf("no warn:\n%s", got)
+	}
+	if strings.Contains(got, long) || strings.Contains(got, strings.Repeat("x", consoleMessageIDCap+1)) {
+		t.Fatalf("the warn carries the whole %d-byte value; want it cut to %d runes", len(long), consoleMessageIDCap)
+	}
+	if !strings.Contains(got, fmt.Sprintf("bytes=%d", len(long))) {
+		t.Fatalf("the warn does not say the value's length:\n%s", got)
+	}
+}
+
+// A reply that names a report while the conversation's turn still runs is
+// steered into that turn, which carries no replyTo part; the gateway says so
+// once in its log.
+func TestAConsoleReplyWhileTheTurnRunsIsSteeredWithoutReplyTo(t *testing.T) {
+	t.Parallel()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	r.adapter.roster = []string{consoleAuthor}
+	conv := "console:tab-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "check the pools"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	long := "task-7" + strings.Repeat("x", 10*1024)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m2", Text: "and the other pool?", ReplyTo: long}
+	waitFor(t, "steer envelope", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) >= 2 })
+	envs := inSubjectEnvelopes(t, r.url, "platform")
+	steer := envs[len(envs)-1]
+	if steer.TaskID != origin.TaskID {
+		t.Fatalf("the reply started a new task %s; want a steer into %s", steer.TaskID, origin.TaskID)
+	}
+	if _, found, _ := lib.ReplyToOf(messageParts(t, steer)); found {
+		t.Fatal("the steer carried a replyTo part, which no executor reads")
+	}
+	if n := strings.Count(logs.String(), "replyTo not carried: the turn is still running"); n != 1 {
+		t.Fatalf("warns = %d, want one:\n%s", n, logs.String())
+	}
+	if got := logs.String(); strings.Contains(got, long) || !strings.Contains(got, fmt.Sprintf("bytes=%d", len(long))) {
+		t.Fatalf("the steer warn carries the whole %d-byte value or no length", len(long))
+	}
+}
+
+func TestAConsoleTurnNamingNoReportCarriesNoReplyTo(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-rt2", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m2", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	if _, found, _ := lib.ReplyToOf(messageParts(t, origin)); found {
+		t.Fatal("a turn that named no report carried a replyTo part")
+	}
+}
+
 // The console page renders answers off TASKS, so the deliverable never goes
 // out as a notice on chat.console.<token>.out. Here the backend takes no
 // terminal frames, so the answer goes nowhere on the console subject at all.

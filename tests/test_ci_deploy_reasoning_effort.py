@@ -1,6 +1,6 @@
 """hack/ci-deploy.sh takes the reasoning effort a run asks for and gives it to the chart.
 
-A certification run names its model and the effort the gateway asks for beside
+A validated-capabilities run names its model and the effort the gateway asks for beside
 it (gke-labs/kube-agents#3332). The script reads `EVAL_REASONING_EFFORT` from
 the job environment, refuses anything but low, medium, high or empty before
 the lease is spent, and passes the value as `litellm.reasoningEffort`, the

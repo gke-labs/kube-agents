@@ -472,14 +472,37 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     h.task_confinement.confine(argv, None, None)
         self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
 
-    def test_A3_the_profile_role_reaches_exec_the_mcp_relay_and_the_audit_reports_alone(self) -> None:
-        # The audit-report routes (#5619) hold a profile caller to the report
-        # rules (the next row) inside the handler.
+    def test_A3_the_profile_role_reaches_exec_mcp_vcs_and_the_audit_reports_alone(self) -> None:
+        # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
+        # its handler (#3658), the version-control routes to the reads and the
+        # permit-gated writes (the next row, #3993), and the audit-report routes
+        # (#5619) to the report rules (the row after) inside theirs.
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
         self.assertEqual(
-            sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX, h.credential_proxy.AUDIT_REPORTS_PREFIX]), reached
+            sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX, "/v1/vcs/", h.credential_proxy.AUDIT_REPORTS_PREFIX]),
+            reached,
         )
+
+    def test_A3_a_profile_caller_publishes_a_change_only_under_the_permit(self) -> None:
+        # #3993: the profile role reaches the forge credential only with a
+        # task credential, and the three writes that put a change up only
+        # when that credential carries the permit the dispatcher mints after a
+        # structured confirm. Every other write is outside the role's verbs.
+        cp = h.credential_proxy
+        principal = cp.Principal(workload="system:serviceaccount:ns:profile", role=cp.CALLER_ROLE_PROFILE)
+        task = type("Task", (), {"permits": frozenset()})()
+        permitted = type("Task", (), {"permits": frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})})()
+        writes = cp.PROFILE_PERMIT_GATED_VCS_VERBS
+        self.assertEqual(frozenset({"publish", "proposal-create", "proposal-update"}), writes)
+        for verb in sorted(cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE]):
+            with self.subTest(verb=verb):
+                self.assertIsNotNone(cp.profile_vcs_refusal(principal, verb), "no credential, yet admitted")
+                with_task = dataclasses.replace(principal, task=task)
+                self.assertEqual(verb in writes, cp.profile_vcs_refusal(with_task, verb) is not None)
+                self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
+        others = cp.vcs_broker.WRITE_VERBS - writes
+        self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
 
     def test_A3_only_the_matching_schedules_grant_writes_a_builtin_audits_baseline(self) -> None:
         # The broker's write rule for the audit-report store (#5619), driven
@@ -2381,6 +2404,78 @@ class A2EffectiveAuthorityIsAnIntersection(unittest.TestCase):
                 "test_C5_no_minted_role_grants_a_write_verb",
             ),
             "the minted-RBAC ceiling test is gone; A2 now has no assertion at all",
+        )
+
+
+class A3TheA2AChatRoleIsTheA2AGatewaysAlone(unittest.TestCase):
+    """A3: the a2a-chat role is conferred to the A2A gateway's ServiceAccount alone.
+
+    The broker confers a caller role from the token's audience, and a pod
+    chooses the audience it projects. With the operator's binding rendered,
+    the a2a-chat audience is refused to every other allowed caller, and the
+    gateway's account is refused every other audience. With none rendered (an
+    older operator), the audience alone decides, as it did before (#6090).
+    """
+
+    GATEWAY = "system:serviceaccount:ns:agent-a2a-gateway"
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": "shell,chat," + GATEWAY,
+        "CREDENTIAL_PROXY_AUDIENCE": "shell-aud",
+        "CREDENTIAL_PROXY_CHAT_AUDIENCE": "chat-aud",
+        "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "a2a-chat-aud",
+        "KUBERNETES_SERVICE_HOST": "127.0.0.1",
+    }
+
+    @staticmethod
+    def _review(username: str, audience: str) -> dict:
+        return {"status": {"authenticated": True, "audiences": [audience], "user": {"username": username, "uid": "u"}}}
+
+    def test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone(self) -> None:
+        from unittest import mock
+
+        cp = h.credential_proxy
+        with mock.patch.dict("os.environ", {**self.BASE, cp.A2A_CHAT_CALLERS_ENV: self.GATEWAY}, clear=True):
+            authenticator = cp.build_authenticator()
+        self.assertEqual(
+            cp.CALLER_ROLE_A2A_CHAT, authenticator._principal_from(self._review(self.GATEWAY, "a2a-chat-aud")).role
+        )
+        for caller in ("shell", "chat"):
+            with self.subTest(other_caller=caller), self.assertRaises(cp.AuthenticationError):
+                authenticator._principal_from(self._review(caller, "a2a-chat-aud"))
+        for audience in ("shell-aud", "chat-aud"):
+            with self.subTest(gateway_audience=audience), self.assertRaises(cp.AuthenticationError):
+                authenticator._principal_from(self._review(self.GATEWAY, audience))
+        # An older operator renders no binding: the audience alone decides.
+        with mock.patch.dict("os.environ", dict(self.BASE), clear=True):
+            unbound = cp.build_authenticator()
+        self.assertEqual(cp.CALLER_ROLE_A2A_CHAT, unbound._principal_from(self._review("shell", "a2a-chat-aud")).role)
+
+    def test_A3_the_operator_binds_the_a2a_chat_role_to_the_a2a_gateway(self) -> None:
+        cp = h.credential_proxy
+        go_name = re.search(r'credentialProxyA2AChatCallersEnvVar\s*=\s*"([^"]+)"', h.text("a2a_chat_callers_env_go"))
+        self.assertIsNotNone(go_name, "the operator's a2a-chat callers env name is gone")
+        self.assertEqual(
+            cp.A2A_CHAT_CALLERS_ENV,
+            go_name.group(1),
+            "the operator renders the a2a-chat binding under a name the broker does not read: "
+            "the binding is dropped and the audience alone decides",
+        )
+        render = h.text("manifests_go")
+        self.assertRegex(
+            render,
+            r"Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
+            "the broker env no longer names the A2A gateway's ServiceAccount as the a2a-chat caller",
+        )
+
+    def test_A3_the_exec_tier_keeps_the_a2a_chat_binding(self) -> None:
+        # The exec tier inherits the broker's allowed callers, the A2A gateway
+        # among them while Chat is armed, so it carries the binding too and
+        # refuses the gateway's identity every audience.
+        self.assertNotRegex(
+            h.text("exec_tier_env_go"),
+            r"credentialProxyA2AChatCallersEnvVar:\s*true",
+            "the exec tier drops the a2a-chat binding while keeping the A2A gateway as a caller",
         )
 
 

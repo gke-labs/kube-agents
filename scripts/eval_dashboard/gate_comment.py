@@ -319,10 +319,18 @@ def build_url(run: health.Run) -> str:
 
 
 def is_red(run: health.Run) -> bool:
-    """FAILURE, with tasks, and at least one graded repetition: not aborted,
-    not a setup death, not a suite the storm emptied, and not a run the
-    suite itself said it could not evaluate (module docstring)."""
-    return run.result == health.RUN_FAILURE and run.full and any(task.graded for task in run.tasks) and not run.not_evaluated
+    """FAILURE, with tasks, and at least one graded or safeguard-blocked
+    repetition: not aborted, not a setup death, not a suite the storm or a
+    forge outage emptied, and not a run the suite itself said it could not
+    evaluate (module docstring). A safeguard-blocked repetition (rung 2,
+    FORGE_SAFEGUARD_MARKER) counts because it reds the run without being
+    graded; an `infra` forge repetition does not."""
+    return (
+        run.result == health.RUN_FAILURE
+        and run.full
+        and (any(task.graded for task in run.tasks) or run.safeguard_reps > 0)
+        and not run.not_evaluated
+    )
 
 
 def is_commented_on(run: health.Run) -> bool:
@@ -389,6 +397,12 @@ def health_box(red: Red, health_doc: dict) -> str:
         text = HARD_FAILURE
         if red.held_out_failed:
             text += HELD_OUT_NOTE
+        # Only on a run that carries the outage's signature (health.py rule
+        # 2c): a hard failure without it is a real trip the outage does not
+        # explain. cause_text falls through to post_health.cause_sentence,
+        # whose forge-outage sentence carries no repetition count.
+        if incident and health_doc.get("condition") == health.FORGE_OUTAGE and red.run.forge_reps >= health.FORGE_RUN_SIGNATURE_REPS:
+            text += " " + BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=cause_text(health_doc))
         return f"> {text} {' · '.join(links)}"
 
     theirs, yours, unclear = red.theirs(), red.yours(), red.unclear()

@@ -225,10 +225,12 @@ type natsCardPublisher struct {
 	// reader fetches the bus's CA bundle, which the operator trusts the bus
 	// by like every other client: the bus requires TLS.
 	reader client.Reader
+	// recheck holds back re-creating a durable that existed (#6283).
+	recheck *durableRecheck
 }
 
 func newNATSCardPublisher(reader client.Reader) *natsCardPublisher {
-	return &natsCardPublisher{conns: map[string]*nats.Conn{}, reader: reader}
+	return &natsCardPublisher{conns: map[string]*nats.Conn{}, reader: reader, recheck: newDurableRecheck()}
 }
 
 // busTLS is the operator's trust in this agent's bus: the CA bundle the

@@ -725,7 +725,8 @@ MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
 PINNED_BASE_REF_PREFIX = "refs/heads/"
 PINNED_BASE_REFUSED_PREFIXES = ("refs/heads/", "heads/")
 
-# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
+# The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>` (and `POST`
+# for a read the policy names with a body check). The route
 # prefix itself is API_RELAY_PREFIX, imported above from the client module so
 # the two sides cannot spell it differently. `api_policy` decides what may be
 # relayed; these bound how. docs/designs/gcp-api-relay.md argues each value.
@@ -767,8 +768,17 @@ API_RELAY_STRIPPED_QUERY_KEYS = frozenset({"key", "access_token", "oauth_token",
 # two. Every header the caller sent is dropped.
 API_RELAY_ACCEPT = "application/json"
 API_RELAY_UPSTREAM_PORT = 443
-# The method the MCP relay forwards with. The Cloud API relay never sends it.
+# The method the MCP relay forwards with, and the Cloud API relay for a route
+# with a body check (api_policy.API_BODY_METHOD).
 API_RELAY_POST = "POST"
+# The body of a relayed POST read (api_policy.API_BODY_METHOD routes). The cap is
+# the broker's own: a Logging `entries:list` body is a resource name, a filter
+# and a page token, a few kilobytes as `gcloud` sends it. The broker forwards its
+# own re-serialisation of the body the policy passed, as JSON.
+API_RELAY_MAX_BODY_BYTES = 16 * 1024
+API_RELAY_BODY_CONTENT_TYPE = "application/json"
+API_RELAY_BAD_BODY = "API_RELAY_BAD_BODY"
+API_RELAY_BODY_TOO_LARGE = "API_RELAY_BODY_TOO_LARGE"
 
 # The remote MCP relay, `POST /v1/mcp/<server>`. `mcp_policy` decides what is
 # relayed; it shares the Cloud API relay's credential, connect timeout,
@@ -1319,9 +1329,15 @@ BROKER_FAILURE_KINDS = frozenset({
     BROKER_FAILURE_CHAT_PULL_FAILED,
     BROKER_FAILURE_OTHER_FAILED,
 })
-# The methods the broker serves. The base class answers any other with a 501
-# of its own before authentication, which is no relay's failure.
-BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST"})
+# The methods the broker serves: GET and POST, and PUT and DELETE on the
+# audit-report store's writes (#5619), whose listener faults (502), timeouts
+# (504) and relayed 500s are the broker's failures like any other route's.
+# The base class answers any other method with a 501 of its own before
+# authentication, and so does _serve_audit_report_write for a PUT or DELETE
+# off the store's paths; neither is a relay's failure
+# (_broker_failure_counted).
+BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+BROKER_FAILURE_STORE_ONLY_METHODS = frozenset({"PUT", "DELETE"})
 BROKER_FAILURE_STATUS_CODES = frozenset({
     str(int(HTTPStatus.INTERNAL_SERVER_ERROR)),
     str(int(HTTPStatus.BAD_GATEWAY)),
@@ -1436,6 +1452,8 @@ FEEDBACK_REASON_LOG_LENGTH = 200
 # `gcloud`, so a record whose tool is `gcloud` still means a gcloud process ran.
 # The subcommand is the service word of a host the route table names (the host's
 # first label), and LABEL_OTHER for every other host, so no caller text is a label.
+# The table holds the commercial hosts; `api_relay_audit_subcommand` reads it for
+# the configured universe domain.
 API_RELAY_AUDIT_TOOL = "gcp-api"
 API_RELAY_AUDIT_SUBCOMMANDS = {
     route.host: route.host.partition(".")[0] for route in api_policy.API_READ_ROUTES
@@ -1460,7 +1478,22 @@ SHELL_KUBECTL_REFUSAL_HINT = (
 )
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
+# A profile caller at the version-control routes without a task credential,
+# or at a write verb without the permit its credential must carry (#3993).
+RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
+# The refusal code a profile caller gets for a version-control verb its task
+# credential doesn't cover (no credential, or a write without the permit).
+CALLER_PERMIT_REQUIRED_CODE = "CALLER_PERMIT_REQUIRED"
+# A profile caller's permitted write that names a proposal or branch this
+# install does not own (VcsBroker.require_agent_proposal, #3993).
+RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
+# A profile caller's proposal-update that edits labels (#3993): refused whoever
+# owns the proposal (vcs_broker.ProfileLabelsRefused).
+RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
+# The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
+DIAL_PATH = "/v1/dial"
+DIAL_MAX_REQUEST_BYTES = 1024
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -1482,7 +1515,7 @@ def probe_gce_universe_domain_status(
 ) -> tuple[str, bool]:
     """Probe the GCE/GKE metadata server, returning `(domain, determined)`.
 
-    Only HTTP 200 (with a valid DNS domain) and HTTP 404 (authoritative non-GCE
+    Only HTTP 200 (with a valid universe domain) and HTTP 404 (authoritative non-GCE
     or older emulator) return `determined=True`; timeouts, connection errors,
     and 5xx responses return `(googleapis.com, False)` so callers never cache a
     transient metadata blip as commercial Google Cloud.
@@ -2259,7 +2292,7 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # not known", rather than with some other role's reach.
 DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 
-# The scope publisher's audience (#4119). A next-mode Job with no gcloud of its
+# The scope publisher's audience (#4119). A Job with no gcloud of its
 # own: it runs five read-only lookups through /v1/exec, and scope_policy holds
 # it to them. Bound to its callers both ways, and conferred to nobody when no
 # callers are named, as the mcp audience is.
@@ -2277,6 +2310,13 @@ SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
 DEFAULT_CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE = "kubeagents-credential-proxy-a2a-reports"
 A2A_REPORTS_AUDIENCE_ENV = "CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE"
 A2A_REPORTS_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_REPORTS_CALLERS"
+DEFAULT_CREDENTIAL_PROXY_CURATOR_AUDIENCE = "kubeagents-credential-proxy-curator"
+CURATOR_AUDIENCE_ENV = "CREDENTIAL_PROXY_CURATOR_AUDIENCE"
+CURATOR_CALLERS_ENV = "CREDENTIAL_PROXY_CURATOR_CALLERS"
+# The A2A gateway's ServiceAccount, the one caller the a2a-chat audience is for
+# (#6090). The operator renders it beside CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE,
+# only while Google Chat is armed on the A2A stack.
+A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"
 # The profile workers' audience (#3889). An AgentProfile's worker pod runs
 # model output and reaches this broker the way a session pod does, over the
 # ClusterIP with a projected token, and gets a role of its own: the exec route,
@@ -2306,11 +2346,15 @@ CALLER_ROLE_WATCHER = "watcher"
 # so nothing it can be asked to do may write to a forge, clone into the broker,
 # or spend the forge credential on anything but a read of a managed repository.
 CALLER_ROLE_MCP = "mcp"
-# An AgentProfile worker pod (#3889). Exec route only, kubectl and gcloud only,
+# An AgentProfile worker pod (#3889). The exec route, kubectl and gcloud only,
 # with the session's kubectl flag allowlist, and every call held to the target
 # cluster in the task credential the pod presents (TASK_CREDENTIAL_HEADER). The
 # credential is mandatory for anything that reaches a cluster or a project: a
 # profile caller without a valid one runs local-only commands and nothing else.
+# And the version-control routes (#3993), credential required for every verb:
+# the read verbs ROLE_VCS_VERBS names with any valid credential, the three
+# writes that publish a change only under the permit
+# PROFILE_PERMIT_GATED_VCS_VERBS names.
 CALLER_ROLE_PROFILE = "profile"
 # The scope publisher Job. The exec route only, gcloud only, and within it the
 # five lookups scope_policy names, each on an argument scope.json declares or an
@@ -2321,6 +2365,10 @@ CALLER_ROLE_SCOPE = "scope"
 # The A2A gateway's report reader (#5618): GET one finished audit report
 # (latest, or one run) on the install's publish key, and no other route.
 CALLER_ROLE_A2A_REPORTS = "a2a-reports"
+# The OKF memory curator pod. Version-control snapshot route only, on a
+# managed repository only, so the curator can verify active and superseded
+# records from Git without holding a forge credential of its own.
+CALLER_ROLE_CURATOR = "curator"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -2348,6 +2396,7 @@ CALLER_ROLES = (
     CALLER_ROLE_PROFILE,
     CALLER_ROLE_SCOPE,
     CALLER_ROLE_A2A_REPORTS,
+    CALLER_ROLE_CURATOR,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -2442,9 +2491,64 @@ def executable_refusal_message(role: str, executable: str) -> str:
 # credential's own login and reach, which the MCP pod has no use for), and
 # `clone` and `snapshot` (fill the broker's disk on a caller's say-so, and
 # `snapshot` reads repositories this install does not manage).
+#
+# The profile role (#3993) reads the managed repository its task works on and
+# publishes a change only when asked to:
+#
+#   * the reads a change needs: clone (the working copy publish builds on),
+#     proposal-view, proposal-list, proposal-commits, branch-view, identity
+#     (the forge login a submission checks it is not proposing as), issue-list
+#     and issue-view. Each is held to the managed list like every other verb.
+#   * publish, proposal-create and proposal-update, the writes that put a
+#     change up for review, each further gated in `_dispatch_vcs_post` on the
+#     task credential's permit (PROFILE_PERMIT_GATED_VCS_VERBS).
+#
+# Left out: `snapshot` (reads repositories this install does not manage),
+# `capabilities` (ungated by the managed list), and every other write --
+# comments, closes, labels, issues, acknowledgements and `branch-delete`. None
+# of them is a step of putting a change up, and a permit that names one action
+# does not stretch to the rest.
 ROLE_VCS_VERBS: dict[str, frozenset[str]] = {
     CALLER_ROLE_MCP: frozenset({"proposal-view"}),
+    CALLER_ROLE_CURATOR: frozenset({"snapshot"}),
+    CALLER_ROLE_PROFILE: frozenset(
+        {
+            "clone",
+            "proposal-view",
+            "proposal-list",
+            "proposal-commits",
+            "branch-view",
+            "identity",
+            "issue-list",
+            "issue-view",
+            "publish",
+            "proposal-create",
+            "proposal-update",
+        }
+    ),
 }
+
+# The permit a profile caller's task credential must carry for the write verbs
+# below (task_credential.PERMIT_VCS_PROPOSAL_CREATE, taskcred's
+# PermitVCSProposalCreate). Spelled here rather than imported because
+# task_credential needs `cryptography`, which this module loads only when the
+# profile role is configured; a test holds the two equal.
+VCS_PROPOSAL_CREATE_PERMIT = "vcs:proposal-create"
+
+# The profile role's write verbs, each admitted only when the caller's verified
+# task credential carries VCS_PROPOSAL_CREATE_PERMIT. The dispatcher mints that
+# permit only for a task whose submission asked for a change, which only a
+# structured confirm sets, so a profile worker the model drives to publish on
+# its own initiative is refused here however the call is spelled.
+PROFILE_PERMIT_GATED_VCS_VERBS = frozenset({"publish", "proposal-create", "proposal-update"})
+
+# The profile writes further held to the install's own work
+# (VcsBroker.require_agent_proposal): an update only of a proposal the install
+# opened from its own branch here; a publish only under AGENT_BRANCH_PREFIX, and
+# onto a branch carrying open proposals only when every one is the install's; a
+# proposal-create only from the install's own branch in this repository. Every
+# profile write verb is in this set.
+PROFILE_OWNERSHIP_GATED_VCS_VERBS = frozenset({"publish", "proposal-create", "proposal-update"})
 
 
 def vcs_verb_permitted(role: str, verb: str) -> bool:
@@ -2458,7 +2562,34 @@ def vcs_verb_permitted(role: str, verb: str) -> bool:
     return narrowed is None or verb in narrowed
 
 
-def _validate_role_vcs_verbs(table: dict[str, frozenset[str]]) -> None:
+def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
+    """Why a profile caller may not reach ``POST /v1/vcs/<verb>``, or None.
+
+    Checked after ``vcs_verb_permitted`` and before the body is read or a slot
+    taken. Every verb needs a verified task credential: the profile role
+    reaches the forge credential only for a task the dispatcher handed this
+    pod, and a request with none (no header, a warm pod between tasks) is
+    refused rather than read as a task-less caller. A write verb in
+    PROFILE_PERMIT_GATED_VCS_VERBS also needs the credential's permit. Which
+    repository the request names is not this check's question: the managed
+    list bounds that for every verb, after the body is read.
+    """
+    task = getattr(principal, "task", None)
+    if task is None:
+        return "a profile caller needs a task credential for version control"
+    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in getattr(task, "permits", ()):
+        return (
+            f"this task's credential carries no {VCS_PROPOSAL_CREATE_PERMIT} permit; a change is "
+            "published only for a request that asked for one"
+        )
+    return None
+
+
+def _validate_role_vcs_verbs(
+    table: dict[str, frozenset[str]],
+    gated: frozenset[str] = PROFILE_PERMIT_GATED_VCS_VERBS,
+    owned: frozenset[str] = PROFILE_OWNERSHIP_GATED_VCS_VERBS,
+) -> None:
     """Refuse a ``ROLE_VCS_VERBS`` entry that is not what it appears to be.
 
     Every key must be a caller role and every value a frozenset (a bare string
@@ -2481,23 +2612,47 @@ def _validate_role_vcs_verbs(table: dict[str, frozenset[str]]) -> None:
             raise ValueError(
                 f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unknown))} is not a vcs verb"
             )
-    writes = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.WRITE_VERBS
-    if writes:
+    for read_only_role in (CALLER_ROLE_MCP, CALLER_ROLE_CURATOR):
+        writes = table.get(read_only_role, frozenset()) & vcs_broker.WRITE_VERBS
+        if writes:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{read_only_role!r}]: {', '.join(sorted(writes))} writes to the forge"
+            )
+    # The profile role's writes are claim-gated: every write in its set must be
+    # one `_dispatch_vcs_post` checks the permit for, so a write added to the
+    # set without the gate is a red import rather than an ungated write.
+    ungated = (table.get(CALLER_ROLE_PROFILE, frozenset()) & vcs_broker.WRITE_VERBS) - gated
+    if ungated:
         raise ValueError(
-            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(writes))} writes to the forge"
+            f"ROLE_VCS_VERBS[{CALLER_ROLE_PROFILE!r}]: {', '.join(sorted(ungated))} writes to the "
+            "forge without the task credential's permit"
+        )
+    # And every one of them must be held to the install's own work as well: a
+    # write in the role's set and the permit's but not the ownership set would
+    # reach any proposal or branch in a managed repository under the permit.
+    unowned = (table.get(CALLER_ROLE_PROFILE, frozenset()) & vcs_broker.WRITE_VERBS) - owned
+    if unowned:
+        raise ValueError(
+            f"ROLE_VCS_VERBS[{CALLER_ROLE_PROFILE!r}]: {', '.join(sorted(unowned))} writes to the "
+            "forge without the ownership check (PROFILE_OWNERSHIP_GATED_VCS_VERBS)"
+        )
+    if not gated <= vcs_broker.WRITE_VERBS:
+        raise ValueError(
+            f"PROFILE_PERMIT_GATED_VCS_VERBS: {', '.join(sorted(gated - vcs_broker.WRITE_VERBS))} is not a write verb"
         )
     # A role-selected verb reads repositories nobody registered and clones into
     # the broker on the caller's say-so, which is wider than a read of a managed
-    # repository.
-    unlisted = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.ROLE_SELECTED_VERBS
-    if unlisted:
-        raise ValueError(
-            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(unlisted))} reads "
-            "repositories this install does not manage"
-        )
+    # repository. An ungated verb skips the managed list altogether.
+    for role in (CALLER_ROLE_MCP, CALLER_ROLE_PROFILE):
+        unlisted = table.get(role, frozenset()) & (vcs_broker.ROLE_SELECTED_VERBS | vcs_broker.UNGATED_VERBS)
+        if unlisted:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unlisted))} reads "
+                "repositories this install does not manage"
+            )
 
 
-_validate_role_vcs_verbs(ROLE_VCS_VERBS)
+_validate_role_vcs_verbs(ROLE_VCS_VERBS, PROFILE_PERMIT_GATED_VCS_VERBS, PROFILE_OWNERSHIP_GATED_VCS_VERBS)
 
 
 # The kubectl flags a session caller may pass. An allowlist, for the reason
@@ -2673,9 +2828,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route, the MCP relay's profile set and the
-    # audit-report store: the Cloud API relay, the watcher and Pub/Sub routes
-    # all stay closed to it.
+    # The profile role reaches this route, the MCP relay's profile set, the
+    # version-control routes (#4458) and the audit-report store: the Cloud API
+    # relay, the watcher and Pub/Sub routes all stay closed to it.
     # The scope role reaches it alone too (scope_policy).
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
@@ -2718,9 +2873,16 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # subscription sets, and the prefix is what this table keys the role on.
     (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
-    # The MCP pod reaches this family and no other; which verbs within it is
-    # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
-    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
+    # The MCP and curator pods reach this family and no other; the profile role
+    # reaches it beside the exec route. Which verbs within it is ROLE_VCS_VERBS's
+    # to say, and for a profile caller the task credential's, checked in
+    # _dispatch_vcs_post.
+    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE, CALLER_ROLE_CURATOR)),
+    # The autonomy dial's level (vcs_broker.dial_level), reported from the agent
+    # pod after an install admin's pick. The chat role alone: the agent pod holds
+    # that token and the sandbox the model drives does not, so no command the
+    # model runs can move the dial, in either direction.
+    (DIAL_PATH, (CALLER_ROLE_CHAT,)),
 )
 
 # The failure kind a 5xx on a route family counts under, keyed by the family
@@ -2769,6 +2931,19 @@ def _broker_failure_kind(family: str, status_code: str) -> str | None:
             return None
         return kind if BROKER_FAILURE_RELAY_STATUS_FLOOR <= status < BROKER_FAILURE_RELAY_STATUS_CEILING else None
     return kind if status_code in BROKER_FAILURE_STATUS_CODES else None
+
+
+def _broker_failure_counted(method: str, path: str) -> bool:
+    """Whether a response to ``method`` on ``path`` can count as a broker failure.
+
+    PUT and DELETE are served on the audit-report store's paths alone; on any
+    other path they get the unsupported-method 501 before authentication,
+    which on a relay family (whose bound is the whole 5xx class) would
+    otherwise count as the relay failing.
+    """
+    if method not in BROKER_FAILURE_COUNTED_METHODS:
+        return False
+    return method not in BROKER_FAILURE_STORE_ONLY_METHODS or is_audit_report_path(path)
 
 
 def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
@@ -3144,8 +3319,8 @@ def report_write_permitted(
     REPORT_NO_FORGE_STORE_KEY.
 
     - The shell may write any stream, to the install's key or to the key of any
-      repository in ``registered_keys`` (managed_repos as the broker reads it,
-      never the request): what `finish --repo` writes to the file store today.
+      repository in ``registered_keys`` (managed_repos as audit_report reads
+      it, gitops_workspace.get_managed_repos; never the request): what `finish --repo` writes to the file store today.
     - A profile caller needs all of: a task credential whose profile is in
       ``allowlist``; a trigger of origin builtin, named ``schedule/<stream>``,
       whose stream is ``audit_id`` (so only that schedule's grant writes that
@@ -3222,28 +3397,31 @@ class ReportStoreCredentialRefused(ReportStoreFault):
     """The listener refused the broker's own store token (401 or 403): a 502, never the caller's."""
 
 
-def report_publish_store_key_for(managed_keys: Sequence[str], gitops_repo: str | None) -> str | None:
+def report_publish_store_key_for(managed: Sequence[str], gitops_repo: str | None) -> str | None:
     """The store key audit_report's `finish` publishes to, for these inputs; None for no_forge.
 
     A mirror of audit_report.resolve_repo's install-level rule (the explicit
-    `--repo`, workspace and lease steps are a run's own, not the install's):
+    `--repo`, workspace and lease steps are a run's own, not the install's),
+    on the same inputs it reads:
 
     - no managed repository: None (`finish` keeps its report under no_forge);
-    - exactly one: that repository, whatever its role (the operator renders
-      `gitops_repo` only when a repository has role gitops);
+    - exactly one: that repository, whatever its role (resolve_repo does not
+      read `gitops_repo` then);
     - more than one: ``gitops_repo`` when it is set and registered, else None
-      (`finish` writes its no-repository-chosen envelope under no_forge).
+      (NoGitOpsRepo: `finish` writes its no-repository-chosen envelope under
+      no_forge).
 
-    ``managed_keys`` are managed_repositories()'s `provider:host/path` keys;
-    ``gitops_repo`` is gitops_workspace.get_gitops_repo's name, which that
-    function only returns for a registered repository. Raises
-    ReportStoreUnavailable for a name no store key can be made of.
+    ``managed`` is gitops_workspace.get_managed_repos()'s list, as resolve_repo
+    reads it, entries the script skips (a type this image serves no forge for,
+    a non-Gitea URL with a port) already gone; ``gitops_repo`` is
+    gitops_workspace.get_gitops_repo(managed)'s name, which that function only
+    returns for a name in ``managed``. Raises ReportStoreUnavailable for a name
+    no store key can be made of.
     """
-    keys = sorted(set(managed_keys))
-    if not keys:
+    if not managed:
         return None
-    if len(keys) == 1:
-        repo: str | None = keys[0].split(":", 1)[-1]
+    if len(managed) == 1:
+        repo: str | None = managed[0]
     else:
         repo = gitops_repo or None
         if repo is None:
@@ -3254,9 +3432,9 @@ def report_publish_store_key_for(managed_keys: Sequence[str], gitops_repo: str |
     return key
 
 
-def report_registered_store_keys(managed_keys: Sequence[str]) -> frozenset[str]:
-    """The store keys of every managed repository (managed_repositories()'s keys)."""
-    keys = (report_store_key(key.split(":", 1)[-1]) for key in managed_keys)
+def report_registered_store_keys(managed: Sequence[str]) -> frozenset[str]:
+    """The store keys of every managed repository, as get_managed_repos() names them."""
+    keys = (report_store_key(name) for name in managed)
     return frozenset(key for key in keys if key)
 
 
@@ -3271,28 +3449,35 @@ def report_publish_store_key() -> str | None:
     return _report_publish_store_key_and_managed()[0]
 
 
-def _report_publish_store_key_and_managed() -> tuple[str | None, frozenset[str]]:
-    """report_publish_store_key, with the managed keys it read.
+def _report_publish_store_key_and_managed() -> tuple[str | None, tuple[str, ...]]:
+    """report_publish_store_key, with the managed repository names it read.
 
-    Known window: managed_repos comes through managed_repositories(), cached
-    for MANAGED_REPOSITORY_CACHE_SECONDS, while gitops_repo is read fresh, so
-    for up to that long after a ConfigMap edit the two can disagree (a new
-    gitops_repo against the old list's count). In that window a write can be
-    checked against a key neither state alone gives, no_forge included; the
-    key is still a repository one of the two states registers, or no_forge; the
-    kubelet's own mount refresh is a lag of the same order.
+    The names come from gitops_workspace.get_managed_repos(), the reader
+    audit_report.resolve_repo uses, not from managed_repositories()'s keys:
+    the script's reader skips entries the keys keep (a type no forge in this
+    image serves, a non-Gitea URL with a port), and the two counts must not
+    differ, or the broker would answer no_forge for an install whose script
+    publishes to its one served repository. The read is cached as
+    managed_repositories() is (managed_repository_names()).
 
-    Read per call: managed_repos through managed_repositories() (its cache and
-    refresh, the list the broker's forge gates read), and with more than one
-    repository the gitops_repo key from the gitops-state ConfigMap the broker
-    mounts at /etc/gitops (GITOPS_STATE_PATH names its managed_repos file).
-    Raises ReportStoreUnavailable when either cannot be read: a write is then
-    refused, rather than checked against a guess.
+    Known window: the names are cached for MANAGED_REPOSITORY_CACHE_SECONDS,
+    while gitops_repo is read fresh, so for up to that long after a ConfigMap
+    edit the two can disagree (a new gitops_repo against the old list's
+    count). In that window a write can be checked against a key neither state
+    alone gives, no_forge included; the key is still a repository one of the
+    two states registers, or no_forge; the kubelet's own mount refresh is a lag
+    of the same order.
+
+    With more than one repository, the gitops_repo key from the gitops-state
+    ConfigMap the broker mounts at /etc/gitops (GITOPS_STATE_PATH names its
+    managed_repos file), resolved by get_gitops_repo(managed) as resolve_repo
+    resolves it. Raises ReportStoreUnavailable when either cannot be read: a
+    write is then refused, rather than checked against a guess.
     """
     import gitops_workspace
 
     try:
-        managed = managed_repositories()
+        managed = managed_repository_names()
     except Exception as exc:  # noqa: BLE001 - every failure is the one answer
         raise ReportStoreUnavailable(f"managed_repos could not be read ({type(exc).__name__})") from None
     gitops_repo = None
@@ -3301,7 +3486,7 @@ def _report_publish_store_key_and_managed() -> tuple[str | None, frozenset[str]]
             text = gitops_workspace.gitops_repo_key_text()
         except Exception as exc:  # noqa: BLE001 - every failure is the one answer
             raise ReportStoreUnavailable(f"the gitops_repo key could not be read ({type(exc).__name__})") from None
-        gitops_repo = gitops_workspace.get_gitops_repo() if text else None
+        gitops_repo = gitops_workspace.get_gitops_repo(list(managed)) if text else None
     return report_publish_store_key_for(managed, gitops_repo), managed
 
 
@@ -3471,8 +3656,9 @@ def exec_pod_serves(method: str, path: str) -> bool:
     tier: the command route, the Cloud API relay's reads, the admission route
     and the readiness probe. The metrics listener is a server of its own and
     does not pass through here. Everything else is the stateful broker's.
-    A POST to the Cloud API relay passes too: the relay refuses it by policy
-    and writes the audit line, as the stateful broker does (do_POST). The
+    A POST to the Cloud API relay passes too: the relay forwards the one read
+    its policy names with a body check, refuses every other by policy, and
+    writes the audit line, as the stateful broker does (do_POST). The
     audit-report routes (#5619) are the stateful broker's: the exec tier has
     no store token (credential_proxy_exec_tier.go drops it), so an exec pod
     answers them, every method, with the unknown route's 404.
@@ -3570,6 +3756,31 @@ def managed_repositories() -> frozenset[str]:
     moment an operator most needs to tell them apart.
     """
     return _cached_repository_slugs("_managed_repository_cache", "get_managed_repo_keys")
+
+
+_managed_repository_name_cache: tuple[float, tuple[str, ...]] | None = None
+
+
+def managed_repository_names() -> tuple[str, ...]:
+    """gitops_workspace.get_managed_repos()'s names, in its order, cached as managed_repositories() is.
+
+    The list audit_report.resolve_repo reads to choose where `finish`
+    publishes, for the audit-report write rule. Not managed_repositories():
+    that reader keeps entries this one skips. Raises when the list cannot be
+    read, as managed_repositories() does; tests reset the cache by assigning
+    `None` to `_managed_repository_name_cache`.
+    """
+    now = time.monotonic()
+    with _managed_repository_lock:
+        cached = _managed_repository_name_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    import gitops_workspace
+
+    names = tuple(gitops_workspace.get_managed_repos())
+    with _managed_repository_lock:
+        globals()["_managed_repository_name_cache"] = (now + MANAGED_REPOSITORY_CACHE_SECONDS, names)
+    return names
 
 
 def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str]:
@@ -5242,6 +5453,13 @@ class ServiceAccountAuthenticator:
     meaning nobody, with one difference: a caller named there (the A2A
     gateway) may present the a2a-chat audience as well, which its Google Chat
     adapter holds, and no other.
+    ``a2a_chat_callers`` binds the a2a-chat role as ``session_callers`` binds
+    the session role, empty set included: a caller named there (the A2A
+    gateway) may present only the a2a-chat audience, or the a2a-reports one
+    when ``a2a_reports_callers`` names it too, and when the set is
+    non-empty the a2a-chat audience is refused to anyone not named. Empty
+    leaves the audience alone deciding, as an older operator's rendering, which
+    names no a2a-chat callers, still needs.
     ``profile_identities`` binds the profile role the way ``mcp_callers``
     binds the mcp one, empty meaning nobody: its keys are the profile workers'
     ServiceAccounts, each held to the profile audience and the only callers
@@ -5265,8 +5483,10 @@ class ServiceAccountAuthenticator:
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
         scope_callers: frozenset[str] = frozenset(),
+        curator_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
         a2a_reports_callers: frozenset[str] = frozenset(),
+        a2a_chat_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -5280,6 +5500,8 @@ class ServiceAccountAuthenticator:
         self.mcp_callers = mcp_callers
         self.scope_callers = scope_callers
         self.a2a_reports_callers = a2a_reports_callers
+        self.curator_callers = curator_callers
+        self.a2a_chat_callers = a2a_chat_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
@@ -5429,6 +5651,18 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("an a2a-reports caller may present only the a2a-reports or a2a-chat audience")
         if role == CALLER_ROLE_A2A_REPORTS and username not in self.a2a_reports_callers:
             raise AuthenticationError("the a2a-reports audience is only for a2a-reports callers")
+        if username in self.curator_callers and role != CALLER_ROLE_CURATOR:
+            raise AuthenticationError("a curator caller may present only the curator audience")
+        if role == CALLER_ROLE_CURATOR and username not in self.curator_callers:
+            raise AuthenticationError("the curator audience is only for curator callers")
+        # The a2a-chat binding, as the session one: empty leaves the audience
+        # deciding, for an operator that renders no a2a-chat callers.
+        # The gateway also holds the a2a-reports token, which the a2a-reports
+        # binding above confines to its own callers.
+        if username in self.a2a_chat_callers and role not in (CALLER_ROLE_A2A_CHAT, CALLER_ROLE_A2A_REPORTS):
+            raise AuthenticationError("the A2A gateway may present only the a2a-chat or a2a-reports audience")
+        if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:
+            raise AuthenticationError("the a2a-chat audience is only for the A2A gateway")
         # The profile binding, as the mcp one: empty names nobody.
         if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
             raise AuthenticationError("a profile caller may present only the profile audience")
@@ -5658,6 +5892,16 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv(A2A_REPORTS_CALLERS_ENV, "").split(",")
         if caller.strip()
     )
+    curator_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(CURATOR_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
+    a2a_chat_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(A2A_CHAT_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     # The profile workers' identities, read only once the profile audience is
     # conferred below; an empty map confers the role on nobody.
     profile_identities: dict[str, Any] = {}
@@ -5681,6 +5925,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif a2a_audience:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
+            if not a2a_chat_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE is set but %s is not; any allowed "
+                    "caller presenting the a2a-chat audience gets the a2a-chat role",
+                    A2A_CHAT_CALLERS_ENV,
+                )
         session_audience = os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip()
         if session_audience and session_audience in audience_roles:
             LOGGER.warning(
@@ -5760,6 +6010,21 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "CREDENTIAL_PROXY_SCOPE_AUDIENCE is set but CREDENTIAL_PROXY_SCOPE_CALLERS "
                     "is not; the scope role is bound to the callers named there, so every "
                     "caller presenting the scope audience is refused"
+                )
+        curator_audience = os.getenv(CURATOR_AUDIENCE_ENV, "").strip()
+        if curator_audience and curator_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_CURATOR_AUDIENCE equals the %s audience; the curator "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[curator_audience] or CALLER_ROLE_SHELL,
+            )
+        elif curator_audience:
+            audience_roles[curator_audience] = CALLER_ROLE_CURATOR
+            if not curator_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_CURATOR_AUDIENCE is set but CREDENTIAL_PROXY_CURATOR_CALLERS "
+                    "is not; the curator role is bound to the callers named there, so every "
+                    "caller presenting the curator audience is refused"
                 )
         # The profile workers' audience (#3889), read raw for the same reason,
         # and refused on a collision for the mcp one's. Its callers come from
@@ -5843,6 +6108,8 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         mcp_callers=mcp_callers,
         scope_callers=scope_callers,
         a2a_reports_callers=a2a_reports_callers,
+        curator_callers=curator_callers,
+        a2a_chat_callers=a2a_chat_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -6589,9 +6856,10 @@ class GoogleApiRelay:
         `OSError` and `http.client.HTTPException` through for the handler to
         answer 502; redirects are not followed, the 3xx comes back as a status.
 
-        `body` and `headers` are the MCP relay's: a POST of a body the broker
-        re-serialised itself, with the extra headers it chose. The Cloud API
-        relay passes neither, and its request is byte-for-byte what it was.
+        `body` and `headers` are for a POST of a body the broker re-serialised
+        itself, with the extra headers it chose: the MCP relay's message, and
+        the Cloud API relay's read with a body. A Cloud API `GET` passes
+        neither, and its request is byte-for-byte what it was.
         """
         deadline = time.monotonic() + API_RELAY_DEADLINE_S
         connection = self.connection(host)
@@ -8160,12 +8428,16 @@ VCS_SCRATCH_DIR = "vcs"
 # `archive` and `ls-tree` are on it for one caller: `snapshot` lists one
 # revision's tree to size the tar, then writes the tree as a tar, to a file in
 # its scratch directory (`--output`), from a bare clone.
+#
+# `diff-tree` is on it for one caller: `publish` diffs the incoming tip's tree
+# against the policy base's merge-base before pushing.
 VCS_GIT_SUBCOMMANDS = frozenset(
     {
         "archive",
         "bundle",
         "checkout",
         "clone",
+        "diff-tree",
         "fetch",
         "init",
         "ls-remote",
@@ -8183,9 +8455,9 @@ VCS_GIT_SUBCOMMANDS = frozenset(
 # The broker's own git subcommands that no caller's argv may name. `archive`
 # takes `--output=<path>` and `--remote=<url>`, and only `snapshot` issues it,
 # with a path and a revision the broker chose, so it stays off the `/v1/exec`
-# argument gate below. `ls-tree` is there for the same caller, and stays off
-# the gate because no caller of `/v1/exec` needed it before.
-VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "ls-tree"})
+# argument gate below. `ls-tree` and `diff-tree` stay off `/v1/exec` too so
+# `ALLOWED_GIT_SUBCOMMANDS` does not widen for sandbox callers.
+VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "diff-tree", "ls-tree"})
 
 
 def _allowed_git_subcommands() -> frozenset[str]:
@@ -12785,6 +13057,21 @@ def assert_disjoint_roots(tree_root: Path, agent_workspace_root: Path, purpose: 
         )
 
 
+def _cluster_read(executor: CommandExecutor, argv: list[str], context: str) -> tuple[int, str, str]:
+    """`(exit code, stdout, stderr)` of one read the broker runs for itself.
+
+    A refusal or a failure to start is an answer with a non-zero code, so the
+    caller reads it as "not read" rather than as an error of its own.
+    """
+    try:
+        result = executor.execute(argv, kubeconfig_context=context or None)
+    except (ValueError, RuntimeError, OSError) as error:
+        return 1, "", str(error)
+    if result.truncated or result.timed_out:
+        return 1, "", "the read was cut short"
+    return result.exit_code, result.stdout, result.stderr
+
+
 def build_vcs_broker(
     executor: CommandExecutor,
     base_branch: str = "",
@@ -12821,6 +13108,10 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
+        # The reads `proposal-practice-label` makes for itself: a gcloud
+        # describe and a namespaced kubectl get, through the same executor,
+        # kubeconfig selection and output cap as a caller's.
+        cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -13272,6 +13563,23 @@ def api_relay_target_problem(host: str, path: str, query: str) -> tuple[str, str
             "and complete percent-escapes"
         )
     return None
+
+
+def api_relay_audit_subcommand(host: str, universe_domain: str) -> str:
+    """The audit subcommand of a relay request for `host`.
+
+    The service word when a route names `host` in `universe_domain`, which is
+    how `api_policy.evaluate` reads the route table, and LABEL_OTHER for every
+    other host. A malformed universe domain has no routed host, so every host
+    there is LABEL_OTHER.
+    """
+    try:
+        for route_host, service in API_RELAY_AUDIT_SUBCOMMANDS.items():
+            if credential_proxy_client.rewrite_google_api_host(route_host, universe_domain) == host:
+                return service
+    except ValueError:
+        pass
+    return LABEL_OTHER
 
 
 def strip_credential_query_keys(query: str) -> str:
@@ -14863,9 +15171,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self._exec_pod_refuses("POST", principal):
             return
         if self.path.startswith(API_RELAY_PREFIX):
-            # Reaches the relay so that the refusal is the policy's
+            # Reaches the relay so that a refusal is the policy's
             # `gcp.api.method`, named in the audit line, rather than a 404
-            # that reads as "no such route". The body is never read.
+            # that reads as "no such route". The body is read only for a
+            # route the policy allowed with a body check.
             self._handle_api_relay()
             return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
@@ -14906,6 +15215,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         if self.path == feedback_broker.ROUTE:
             self._handle_feedback_post()
+            return
+        if self.path == DIAL_PATH:
+            self._handle_dial_post(principal)
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -15645,11 +15957,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
 
+        Also `POST /v1/gcp/<host>/<path>` for a read the policy names with a
+        body check (Logging `entries:list`): the body is read only after the
+        policy allowed the host and the path, held to API_RELAY_MAX_BODY_BYTES,
+        parsed, checked by `api_policy.evaluate_body`, and forwarded as the
+        broker's own re-serialisation, never as the caller's bytes.
+
         The second shape the broker speaks, beside the argv of `/v1/exec`. The
         caller is already authenticated and its role checked against
         ROUTE_ROLES by `_authenticated`; what happens here, in order, is the
         normal-form check on the caller's text, the `api_policy` decision, the
-        upstream request with exactly the broker's two headers, and the
+        upstream request with exactly the broker's two headers (and its own
+        `Content-Type` on a read with a body), and the
         passthrough of the upstream's status, `Content-Type` and body (a 2xx body
         cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
@@ -15663,19 +15982,27 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         """
         principal = self.principal
         request_id = str(uuid.uuid4())
-        if self.command != api_policy.API_READ_METHOD:
-            # A POST is refused below without its body being read, and closing
-            # on unread bytes sends a reset that can swallow the 403. Same
-            # bounded drain the agent API proxy uses for its pre-auth 401.
-            drain_request_body(self, self.max_request_bytes)
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(API_RELAY_PREFIX) :].partition("/")
+        problem = api_relay_target_problem(host, path, parts.query)
+        universe_domain = self._active_universe_domain()
+        decision = (
+            None
+            if problem is not None
+            else api_policy.evaluate(self.command, host, path, parts.query, universe_domain=universe_domain)
+        )
+        has_body = decision is not None and decision.allowed and api_policy.carries_body(decision.rule_id)
+        if self.command != api_policy.API_READ_METHOD and not has_body:
+            # Every other POST is refused below without its body being read, and
+            # closing on unread bytes sends a reset that can swallow the 403. Same
+            # bounded drain the agent API proxy uses for its pre-auth 401.
+            drain_request_body(self, self.max_request_bytes)
         # Same width as the exec line, for the same reason: this value is the
         # TokenReview's, and a truncated identity names the wrong ServiceAccount.
         principal_label = _sanitize_for_logging(
             principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH
         )
-        subcommand_label = API_RELAY_AUDIT_SUBCOMMANDS.get(host, LABEL_OTHER)
+        subcommand_label = api_relay_audit_subcommand(host, universe_domain)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
             return {
@@ -15696,7 +16023,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             _sanitize_for_logging(path, max_length=API_RELAY_PATH_LOG_LENGTH),
             extra=audit(AUDIT_STATUS_STARTED),
         )
-        problem = api_relay_target_problem(host, path, parts.query)
         if problem is not None:
             code, reason = problem
             LOGGER.warning(
@@ -15707,9 +16033,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         # From here on `host` has passed api_policy.HOST_SHAPE, so the lines
         # below log it as-is; `path` is never logged again.
-        decision = api_policy.evaluate(
-            self.command, host, path, parts.query, universe_domain=self._active_universe_domain()
-        )
         if not decision.allowed:
             LOGGER.warning(
                 "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
@@ -15725,6 +16048,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        forwarded_body: bytes | None = None
+        if has_body:
+            forwarded_body = self._api_relay_body(request_id, decision.rule_id, audit)
+            if forwarded_body is None:
+                return
         if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
@@ -15757,7 +16085,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         query = strip_credential_query_keys(parts.query)
         target = f"/{path}?{query}" if query else f"/{path}"
         started = time.monotonic()
-        upstream = self._relay_fetch("api", request_id, host, target, authorization, audit)
+        upstream = self._relay_fetch(
+            "api", request_id, host, target, authorization, audit,
+            **(
+                {"body": forwarded_body, "headers": (("Content-Type", API_RELAY_BODY_CONTENT_TYPE),)}
+                if forwarded_body is not None
+                else {}
+            ),
+        )
         if upstream is None:
             return
         duration_ms = int((time.monotonic() - started) * MILLISECONDS_PER_SECOND)
@@ -15841,6 +16176,83 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(upstream.body)))
         self._end_headers()
         self.wfile.write(upstream.body)
+
+    def _api_relay_body(
+        self, request_id: str, rule_id: str, audit: Callable[..., dict[str, Any]]
+    ) -> bytes | None:
+        """The body the broker forwards for the allowed route `rule_id`, or None after answering.
+
+        The caller's body is read up to API_RELAY_MAX_BODY_BYTES, parsed as JSON
+        and held to the route's body check. What is returned is the broker's own
+        serialisation of the object that passed, so a duplicate key, a comment
+        or any byte the parser dropped never reaches the upstream.
+        """
+        # The length `parse_request` framed the request with: None when it cannot
+        # be framed (a Transfer-Encoding, a length that is not a number, two
+        # lengths that disagree), which is never read as a body here.
+        length = getattr(self, "_body_length", None)
+        refusal: tuple[HTTPStatus, str, str] | None = None
+        parsed: Any = None
+        if length is None:
+            # Nothing to drain: a body with no usable length cannot be read to
+            # its end, and the server closes the connection after the answer.
+            refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body has no usable Content-Length")
+        elif length > API_RELAY_MAX_BODY_BYTES:
+            drain_request_body(self, self.max_request_bytes)
+            refusal = (
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                API_RELAY_BODY_TOO_LARGE,
+                f"the request body is longer than {API_RELAY_MAX_BODY_BYTES} bytes",
+            )
+        else:
+            try:
+                raw = self.rfile.read(length)
+            except OSError:
+                # The body stalled past the request's read deadline, or the peer
+                # reset. The connection is the server's to close; the audit trail
+                # still gets this request's verdict.
+                LOGGER.warning(
+                    "api rejected request_id=%s code=%s reason=%s",
+                    request_id, API_RELAY_BAD_BODY, "the request body did not arrive",
+                    extra=audit(AUDIT_STATUS_REJECTED),
+                )
+                raise
+            if len(raw) < length:
+                # The peer closed its side before the length it announced: what
+                # arrived is not the request, even where it parses.
+                refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body did not arrive")
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, RecursionError):
+                    # UnicodeDecodeError is a ValueError; a body nested past the
+                    # parser's depth is a RecursionError.
+                    refusal = (HTTPStatus.BAD_REQUEST, API_RELAY_BAD_BODY, "the request body is not JSON")
+        if refusal is not None:
+            status, code, reason = refusal
+            LOGGER.warning(
+                "api rejected request_id=%s code=%s reason=%s", request_id, code, reason,
+                extra=audit(AUDIT_STATUS_REJECTED),
+            )
+            self._json(status, {"error": reason, "code": code})
+            return None
+        decision = api_policy.evaluate_body(rule_id, parsed)
+        if not decision.allowed:
+            LOGGER.warning(
+                "api blocked request_id=%s rule=%s", request_id, decision.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=decision.rule_id),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return None
+        return json.dumps(parsed, separators=(",", ":")).encode()
 
     def _handle_mcp_relay(self) -> None:
         """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.
@@ -16487,6 +16899,52 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if connection is not None:
                 connection.close()
 
+    def _handle_dial_post(self, principal: Principal | None) -> None:
+        """`POST /v1/dial` — the agent pod reports the autonomy dial's level.
+
+        The body is `{"level": "explain" | "propose" | "automerge"}`. With
+        `KUBEAGENTS_DIAL` not `on` the dial is no source and nothing is stored
+        (409 DIAL_OFF), so a stale report cannot outlive the switch.
+
+        The chat role, named: ROUTE_ROLES admits a principal with no role
+        everywhere (a broker no operator has given a second audience), and on
+        such a broker the sandbox's token would carry no role either. A dial the
+        model could move is no dial, so that caller is refused here.
+        """
+        if getattr(principal, "role", "") != CALLER_ROLE_CHAT:
+            LOGGER.warning(
+                "refused a dial report from role=%s", _sanitize_for_logging(getattr(principal, "role", "") or "none")
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {"error": "only the agent pod's chat role may report the dial", "code": "CALLER_ROLE_FORBIDDEN"},
+            )
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0 or content_length > DIAL_MAX_REQUEST_BYTES:
+                raise ValueError("invalid request size")
+            payload = json.loads(self.rfile.read(content_length))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            level = payload.get("level")
+            if not isinstance(level, str) or level not in vcs_broker.DIAL_LEVELS:
+                raise ValueError(f"level must be one of {', '.join(vcs_broker.DIAL_LEVELS)}")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if not vcs_broker.dial_enabled():
+            self._json(HTTPStatus.CONFLICT, {"error": "KUBEAGENTS_DIAL is not on", "code": "DIAL_OFF"})
+            return
+        before = vcs_broker.dial_level()
+        vcs_broker.set_dial_level(level)
+        if before != level:
+            LOGGER.info("dial level set from=%s to=%s", before, level)
+        self._json(
+            HTTPStatus.OK,
+            {"level": level, "writeMode": vcs_broker.write_mode()[0], "automerge": vcs_broker.dial_allows_automerge()},
+        )
+
     def _handle_forge_refresh(self, provider: str = "") -> None:
         """`POST /v1/forge/refresh` — make a credential current before it is spent.
 
@@ -16777,6 +17235,26 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     refusal["detail"] = detail
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return TOOL_STATUS_BLOCKED
+        if role == CALLER_ROLE_PROFILE:
+            refusal = profile_vcs_refusal(principal, verb)
+            if refusal is not None:
+                LOGGER.warning(
+                    "vcs verb refused for a profile caller verb=%s principal=%s rule=%s reason=%s",
+                    _sanitize_for_logging(verb),
+                    _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH),
+                    RULE_CALLER_VCS_PERMIT,
+                    refusal,
+                )
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "error": refusal,
+                        "code": CALLER_PERMIT_REQUIRED_CODE,
+                        "rule": RULE_CALLER_VCS_PERMIT,
+                    },
+                )
+                return TOOL_STATUS_BLOCKED
         if self.vcs is None:
             self._json(
                 HTTPStatus.NOT_FOUND,
@@ -16797,7 +17275,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # admitted, the verb's git commands, and the response. See
             # CommandExecutor.request_slot for why the response is inside it;
             # the body is inside it for the same reason, from the other end.
-            with self._request_slot():
+            # A profile caller takes its own bounded share (profile_slots) and
+            # the background class, as on /v1/exec: a profile worker's clone or
+            # publish must not spend the interactive reserve the shell and the
+            # session pods keep. Every other role keeps the interactive slot
+            # it had.
+            vcs_session_slot = (
+                self._session_slot(role) if role == CALLER_ROLE_PROFILE else contextlib.nullcontext()
+            )
+            with vcs_session_slot, self._request_slot(admission_class(role)):
                 # Read under one deadline for the whole body: the slot is held
                 # from here on, and a caller that stalls or trickles mid-send
                 # would otherwise keep it with nothing running in it. A stalled
@@ -16854,10 +17340,21 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         )
                         return TOOL_STATUS_BLOCKED
                     payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
-                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
+                role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS and role != CALLER_ROLE_CURATOR
                 named, outside = payload.get("repository"), None
                 if role_selected:
                     named, outside = self.vcs.snapshot_source(named)
+                elif verb == "snapshot" and role == CALLER_ROLE_CURATOR:
+                    named, outside = self.vcs.snapshot_source(named)
+                    if outside is not None:
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "the curator caller may snapshot only managed repositories",
+                                "code": "REPOSITORY_NOT_MANAGED",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
                 resolves = verb not in vcs_broker.UNGATED_VERBS and outside is None
                 if resolves:
                     try:
@@ -16877,6 +17374,35 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         # not be read: the first is a refusal, the second a fault.
                         if self.repository_refusal_status == HTTPStatus.SERVICE_UNAVAILABLE:
                             return TOOL_STATUS_ERROR
+                        return TOOL_STATUS_BLOCKED
+                # The profile role's ownership bar (#3993), after the managed
+                # list and before the verb: under the permit it still updates
+                # only the install's own proposals and publishes only under the
+                # install's branch namespace. The shell never comes here.
+                if role == CALLER_ROLE_PROFILE and verb in PROFILE_OWNERSHIP_GATED_VCS_VERBS:
+                    try:
+                        self.vcs.require_agent_proposal(verb, payload)
+                    except vcs_broker.ProposalNotOurs as exc:
+                        rule = (
+                            RULE_CALLER_VCS_LABELS
+                            if isinstance(exc, vcs_broker.ProfileLabelsRefused)
+                            else RULE_CALLER_VCS_OWNERSHIP
+                        )
+                        LOGGER.warning(
+                            "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
+                            _sanitize_for_logging(verb),
+                            rule,
+                            _sanitize_for_logging(str(exc), max_length=256),
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": str(exc),
+                                "code": exc.fields.get("code"),
+                                "rule": rule,
+                            },
+                        )
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
                 if verb == PROPOSAL_CREATE_VERB:
@@ -17358,7 +17884,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # The same hook counts the broker's failures, by the route's family
         # and the status (_broker_failure_kind).
         kind = _broker_failure_kind(family, status_code)
-        if kind is not None and getattr(self, "command", "") in BROKER_FAILURE_COUNTED_METHODS:
+        if kind is not None and _broker_failure_counted(getattr(self, "command", ""), getattr(self, "path", "")):
             self.metrics.record_failure(kind)
         super().log_request(code, size)
 
@@ -17803,7 +18329,7 @@ def install_shutdown_handler(
     message pulled but not yet acked sits in Pub/Sub until its ack deadline
     (SHUTDOWN_SETTLE_SECONDS has the argument). The Slack relay's queue is not
     handed back: its envelopes were acknowledged to Slack on arrival, and the
-    gateway on a next install reads Slack itself. A second SIGTERM changes
+    gateway reads Slack itself where it holds Slack. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
     With drain_seconds (the broker role's SHUTDOWN_DRAIN_SECONDS, the exec role's

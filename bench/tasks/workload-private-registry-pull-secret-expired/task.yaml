@@ -5,7 +5,7 @@
 id: workload-private-registry-pull-secret-expired
 name: "Private Registry Pull Secret No Longer Works (registry credential check)"
 domain: security
-suite: certification
+suite: validated-capabilities
 expected_fail: true
 audit_streams:
   - compliance-audit

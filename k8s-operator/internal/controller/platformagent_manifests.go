@@ -733,6 +733,42 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	return renderManagedEnvForPlugins(agent, nil)
 }
 
+// dialAdminsEnvKey names the Slack members who may move the autonomy dial.
+const dialAdminsEnvKey = "KUBEAGENTS_DIAL_ADMINS"
+
+// slackMemberID is the shape of a Slack member id the dial's admin list keeps.
+var slackMemberID = regexp.MustCompile(`^[UW][A-Z0-9]{2,20}$`)
+
+// dialAdminsNone is pinned when the CR names admins but none of its entries is
+// a member id: it matches nobody, so the dial stays read-only rather than a
+// mistyped list reading as unset.
+const dialAdminsNone = "none"
+
+// dialAdmins is spec.deployment.env's literal KUBEAGENTS_DIAL_ADMINS, reduced
+// to the comma-separated entries shaped like a Slack member id, in order;
+// anything else in the value is dropped, and a valueFrom is ignored. A value
+// with no such entry fails closed (dialAdminsNone).
+func dialAdmins(agent *agentv1alpha1.PlatformAgent) string {
+	raw := ""
+	if agent.Spec.Deployment != nil {
+		for _, env := range agent.Spec.Deployment.Env {
+			if env.Name == dialAdminsEnvKey && env.ValueFrom == nil {
+				raw = env.Value
+			}
+		}
+	}
+	var kept []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); slackMemberID.MatchString(part) {
+			kept = append(kept, part)
+		}
+	}
+	if len(kept) == 0 && strings.TrimSpace(raw) != "" {
+		return dialAdminsNone
+	}
+	return strings.Join(kept, ",")
+}
+
 // renderManagedEnvForPlugins pins the platform settings that decide whether the agent can reach
 // chat at all, for the ones that have no config.yaml equivalent.
 //
@@ -867,6 +903,13 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// empty costs no install anything; the script treats an empty value as unset and
 	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
+
+	// The autonomy dial's admin list (ADMINS_NAME in
+	// agents/platform/scripts/dial_state.py, which session-kv reads before it
+	// changes the dial), pinned and unconditional for the reason the switches
+	// are: unpinned, one line in the PVC .env written by the agent would name
+	// who may change what the agent may change. Empty when unset: nobody may.
+	add(dialAdminsEnvKey, dialAdmins(agent))
 
 	// GKE_PROJECT_ID, pinned to the harness's own value, for the same reason. The
 	// reconcile reads it as the management project once RECONCILE_PROJECT is empty: the
@@ -1188,9 +1231,8 @@ const (
 
 	// kubeagentsModeEnvKey is the managed .env key an agent image from before
 	// the removal of spec.mode today reads to learn which stack it runs, and
-	// kubeagentsModeValue the one answer. The agent image's runtime_mode.py
-	// still reads it; the pin goes once no supported agent image predates the
-	// removal.
+	// kubeagentsModeValue the one answer. Nothing in the current image reads
+	// it; the pin goes once no supported agent image predates the removal.
 	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
 	kubeagentsModeValue  = agentv1alpha1.PlatformAgentModeNext
 )
@@ -3755,7 +3797,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
-	// of its own, once the bus is provisioned (a2aBridgeInPod). It takes the executor environment every task-executing
+	// of its own, from the first render (a2aBridgeInPod). It takes the executor environment every task-executing
 	// sidecar gets, like a declared bridge does. See platformagent_a2a_bridge.go.
 	if a2aBridgeInPod(agent) {
 		for _, c := range containers {
@@ -4915,6 +4957,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// The A2A gateway's report-reader audience and its binding, on every
 	// install (a2a_report_reader.go).
 	envVars = append(envVars, a2aReportsBrokerEnv(agent)...)
+	envVars = append(envVars, a2aCuratorBrokerEnv(agent)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
 	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
@@ -4980,9 +5023,14 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				// not built, so one consumer pulls it. The audience is what
 				// the broker confers the a2a-chat role by; the legacy chat
 				// caller's audience must not reach the A2A event routes.
+				// The callers bind that role to the A2A gateway's
+				// ServiceAccount, the one pod that projects the audience,
+				// so no other caller holding it gets the role. Rendered
+				// only here, so turning Chat off drops both together.
 				envVars = append(envVars,
 					corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: subscription},
 					corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+					corev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},
 				)
 			} else {
 				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
@@ -5007,6 +5055,12 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	// is what enforces the base, and the agent and the shell sandbox get no
 	// copy they could be mistaken for the authority over.
 	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
+	// The install's tier table (#6091), for the report-credential rule to key
+	// on a tier's mode rather than its name. Declared in the managed set, so
+	// mergeCredentialProxyEnv reserves the name: a CR must not point the
+	// broker at a tier table the operator did not render.
+	_, _, tiersEnv := a2aTiersVolumeAndMount(agent)
+	envVars = append(envVars, tiersEnv)
 	// The Pub/Sub platform relay's subscription set, from the AgentPlugin
 	// configs (platformagent_pubsub_relay.go). Absent when no plugin configures
 	// a Pub/Sub platform, and the broker refuses every relayed Pub/Sub call.
@@ -5089,6 +5143,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		// And its callers: one that could set them would choose who holds
+		// the a2a-chat role. Rendered only while Chat is armed, so reserved
+		// by name.
+		credentialProxyA2AChatCallersEnvVar,
 		// The report reader's audience, callers and the gateway's pair
 		// (a2a_report_reader.go, a2aReportsEnvNames).
 		credentialProxyA2AReportsAudienceEnvVar,
@@ -5116,6 +5174,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		credentialProxyCuratorAudienceEnvVar,
+		credentialProxyCuratorCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// The profile role's four, by name because each is rendered only
@@ -5472,6 +5532,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// the roster run, by moving their next_run_at in the profile's own
 		// store, and adds no job, path, destination or credential.
 		"CRON_CATCH_UP_STAGGER_MINUTES": {},
+
+		// The post-merge check's per-step cap on the records one run reads
+		// from the forge and the clusters (READS_PER_TICK_ENV in
+		// post_merge_check.py; default 20). Parsed as a whole number from 1
+		// to 25, and anything else means the default, so it bounds how much
+		// one run reads and adds no job, path, destination or credential.
+		"POST_MERGE_READS_PER_TICK": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

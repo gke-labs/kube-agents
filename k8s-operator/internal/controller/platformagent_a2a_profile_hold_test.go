@@ -63,6 +63,24 @@ func (b *holdBus) revision(t *testing.T, name, profiles string, owned bool) {
 	b.objs = append(b.objs, rev)
 }
 
+// plainRevision adds a ControllerRevision whose pod template records no
+// profile list, as this operator renders every template.
+func (b *holdBus) plainRevision(t *testing.T, name string) {
+	t.Helper()
+	b.objs = append(b.objs, &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: b.agent.Namespace, OwnerReferences: b.owner()},
+		Data:       runtime.RawExtension{Raw: []byte(`{"spec":{"template":{"$patch":"replace","metadata":{}}}}`)},
+	})
+}
+
+// configSecret adds the bus's config Secret with annotations.
+func (b *holdBus) configSecret(annotations map[string]string) {
+	b.objs = append(b.objs, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(b.agent), Namespace: b.agent.Namespace, Annotations: annotations},
+		Data:       map[string][]byte{a2aNATSConfKey: []byte("conf")},
+	})
+}
+
 // pod adds the server at ordinal on revision.
 func (b *holdBus) pod(ordinal int, revision string, mutate ...func(*corev1.Pod)) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
@@ -98,9 +116,10 @@ func loadedList(l a2aLoadedProfiles) string {
 	return encodeA2AConfigProfiles(setNames(l.names))
 }
 
-// A cluster mid-roll has loaded what every server's revision lists, and
-// what the update revision lists for a server still to be created. Once
-// every server is on the update revision, it has loaded that revision's list.
+// During an upgrade from the rolling operator, a cluster's revisions still
+// carry the lists its servers loaded, and narrow the config Secret's: what
+// every server's revision lists, and what the update revision lists for a
+// server still to be created. The Secret lists x,y here, all of it confirmed.
 func TestAClusterHasLoadedTheProfilesEveryServersRevisionLists(t *testing.T) {
 	agent := a2aTestAgentWithBusReplicas(3)
 	agent.Status.BusReplicas = 3
@@ -163,11 +182,12 @@ func TestAClusterHasLoadedTheProfilesEveryServersRevisionLists(t *testing.T) {
 			b.sts.Status.UpdateRevision = "bus-b"
 			b.pod(0, "bus-other", func(p *corev1.Pod) { p.OwnerReferences = nil })
 		}, ""},
-		{"no revision yet loads nothing", func(t *testing.T, b *holdBus) {}, ""},
+		{"no revision records a list, so the Secret alone answers", func(t *testing.T, b *holdBus) {}, "x,y"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newHoldBus(agent.DeepCopy())
 			tc.setup(t, b)
+			b.configSecret(map[string]string{a2aConfigProfilesAnnotation: "x,y"})
 			if got := loadedList(loadedOrFatal(t, b.client(), b.agent)); got != tc.want {
 				t.Errorf("loaded = %q, want %q", got, tc.want)
 			}
@@ -204,6 +224,7 @@ func TestASingleServerHasLoadedTheSecretsListOnceTheReloadLands(t *testing.T) {
 		b.sts.Status.ObservedGeneration = 1
 		b.sts.Status.UpdatedReplicas = 1
 		b.sts.Status.CurrentRevision, b.sts.Status.UpdateRevision = "bus-a", "bus-a"
+		b.plainRevision(t, "bus-a")
 	}
 	terminating := func(p *corev1.Pod) {
 		p.DeletionTimestamp = &metav1.Time{Time: time.Now()}
@@ -253,10 +274,10 @@ func TestASingleServerHasLoadedTheSecretsListOnceTheReloadLands(t *testing.T) {
 
 // The AgentProfile reconciler reads the CR as stored, never resolved. With
 // no server count recorded (a served CRD that prunes status.busReplicas, or
-// before the first status write) and none asked for, a single server is read
-// by the shape its StatefulSet was rendered for, not as the default three:
-// otherwise every new profile's card would wait on a cluster annotation a
-// single server never carries.
+// before the first status write) and none asked for, a one-server bus is
+// still read by its own pods and revisions, not as the default three: the
+// hold's loaded set comes from the servers that exist, so a new profile's
+// card doesn't wait on servers that were never rendered.
 func TestAnUnrecordedSingleServerIsReadByItsRenderedShape(t *testing.T) {
 	rendered := a2aSingleServerTestAgent()
 	b := newHoldBus(rendered) // a one-server template
@@ -264,6 +285,7 @@ func TestAnUnrecordedSingleServerIsReadByItsRenderedShape(t *testing.T) {
 	b.sts.Status.ObservedGeneration = 1
 	b.sts.Status.UpdatedReplicas = 1
 	b.sts.Status.CurrentRevision, b.sts.Status.UpdateRevision = "bus-a", "bus-a"
+	b.plainRevision(t, "bus-a")
 	b.pod(0, "bus-a")
 	stored := a2aTestAgent() // no record, no tuning
 	stored.Status.BusReplicas = 0
@@ -322,7 +344,7 @@ func TestTheConfigSecretRecordsThePreviousListUntilTheServerIsOnTheNewOne(t *tes
 
 	// Still pending: carried as it was.
 	config = a2aDesiredConfig(agent, "new")
-	stampA2ABusReload(config, "2026-11-11T00:00:00Z", "t0")
+	a2aBusReloadState{requestedAt: "2026-11-11T00:00:00Z", servers: map[string]a2aBusServerRecord{b.sts.Name + a2aNATSPodOrdinalSuffix: {UID: "pod", Start: "s", Loaded: "t0"}}}.stamp(config, b.sts.Name)
 	live.Annotations[a2aBusReloadRequestedAnnotation] = "2026-11-11T00:00:00Z"
 	if err := c.Update(ctx, live); err != nil {
 		t.Fatal(err)
@@ -378,6 +400,7 @@ func TestASingleServerOnAnEarlierTemplateHasNotLoadedTheNewList(t *testing.T) {
 	agent := a2aSingleServerTestAgent()
 	b := newHoldBus(agent)
 	b.sts.Generation, b.sts.Status.ObservedGeneration, b.sts.Status.UpdatedReplicas = 1, 1, 1
+	b.plainRevision(t, "bus-a")
 	b.pod(0, "bus-a")
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace, Annotations: map[string]string{
@@ -391,28 +414,16 @@ func TestASingleServerOnAnEarlierTemplateHasNotLoadedTheNewList(t *testing.T) {
 	b2 := newHoldBus(agent.DeepCopy())
 	b2.sts.Spec.Template.Annotations[a2aConfigHashAnnotation] = "h2"
 	b2.sts.Generation, b2.sts.Status.ObservedGeneration, b2.sts.Status.UpdatedReplicas = 1, 1, 1
+	b2.plainRevision(t, "bus-a")
 	b2.pod(0, "bus-a")
 	if got := loadedList(loadedOrFatal(t, b2.client(secret.DeepCopy()), b2.agent)); got != "x,y" {
 		t.Errorf("loaded = %q settled on h2, want \"x,y\"", got)
 	}
 }
 
-// The profile list rides a cluster's pod template, so each revision records
-// it, and stays off a single server's, where it reaches the server by a
-// reload and a template change would restart it.
-func TestTheProfileListRidesOnlyAClustersPodTemplate(t *testing.T) {
-	cluster := a2aTestAgentWithBusReplicas(3)
-	sts := buildA2ANATSStatefulSet(cluster, "h1")
-	annotateA2ABusProfiles(cluster, sts, []string{"y", "x", "y"})
-	if got := sts.Spec.Template.Annotations[a2aConfigProfilesAnnotation]; got != "x,y" {
-		t.Errorf("cluster template lists %q, want \"x,y\"", got)
-	}
+// The profile list rides the config Secret, which every server reloads.
+func TestTheConfigSecretListsTheProfiles(t *testing.T) {
 	single := a2aSingleServerTestAgent()
-	sts = buildA2ANATSStatefulSet(single, "h1")
-	annotateA2ABusProfiles(single, sts, []string{"x"})
-	if got, ok := sts.Spec.Template.Annotations[a2aConfigProfilesAnnotation]; ok {
-		t.Errorf("single-server template lists %q; a profile change would restart the server", got)
-	}
 	secret := buildA2ANATSConfigSecret(single, &corev1.Secret{}, &a2aCalloutKeys{}, []string{"y", "x"})
 	if got := secret.Annotations[a2aConfigProfilesAnnotation]; got != "x,y" {
 		t.Errorf("config Secret lists %q, want \"x,y\"", got)
@@ -429,6 +440,7 @@ func TestANewlyBoundProfileIsHeldUntilTheBusHasLoadedIt(t *testing.T) {
 	b.revision(t, "bus-b", "x,y,z", true)
 	b.sts.Status.UpdateRevision = "bus-b"
 	b.pod(0, "bus-a")
+	b.configSecret(map[string]string{a2aConfigProfilesAnnotation: "x,y,z"})
 	applied, err := json.Marshal(a2aDispatchConfig{Profiles: []a2aDispatchProfile{
 		{Name: "z"},
 		{Name: "gone", DrainingUntil: time.Now().Add(time.Hour)},
@@ -554,8 +566,9 @@ func TestADrainingProfileBoundAgainKeepsDrainingWhileHeld(t *testing.T) {
 // grant leaves out its supervisor subjects until it is dispatchable.
 // The unbucketed shape, where the dispatcher entry carries every profile's
 // subjects. With bucketed grants the callout derives each bucket's grants
-// from the profile entries, and a held profile's are not yet left out
-// (gke-labs/kube-agents#5935); the dispatch config leaves it out either way.
+// from the profile entries and skips the ones the entry lists as held
+// (TestABucketedDispatcherEntryListsTheHeldProfiles); the dispatch config
+// leaves it out either way.
 func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	withDispatcher(t)
 	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // on unless "false" since #5577
@@ -588,6 +601,64 @@ func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	}
 }
 
+// With bucketed grants the callout derives a bucket's grants from the
+// profile entries, which a held profile keeps, so the dispatcher's entry lists
+// it as held for the callout to skip (#5935): listed while held, gone once it
+// is dispatchable, and never on an unbucketed entry, which leaves it out by
+// construction.
+func TestABucketedDispatcherEntryListsTheHeldProfiles(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	agent := a2aTestAgent()
+	x, y := testAgentProfile(agent.Namespace, "x"), testAgentProfile(agent.Namespace, "y")
+	dispatcherOf := func(doc a2aAuthMapDocument) a2aAuthMapIdentity {
+		t.Helper()
+		for _, id := range doc.Identities {
+			if id.User == a2aDispatcherUser {
+				return id
+			}
+		}
+		t.Fatal("no dispatcher in the map")
+		return a2aAuthMapIdentity{}
+	}
+	doc, err := renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; !slices.Equal(got, []string{"y"}) {
+		t.Errorf("held = %v, want [y] while y is held", got)
+	}
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x, y}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; len(got) != 0 {
+		t.Errorf("held = %v once y is dispatchable, want none", got)
+	}
+
+	// Sorted, whatever order the profiles were bound in; and a refused
+	// profile (no entry, and so never dispatchable) is not held: it would
+	// stay listed for good, and a name the operator refuses is one the
+	// callout refuses too (#5935 review).
+	z, dotted := testAgentProfile(agent.Namespace, "z"), testAgentProfile(agent.Namespace, "dotted.name")
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{z, x, y, dotted}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; !slices.Equal(got, []string{"y", "z"}) {
+		t.Errorf("held = %v, want [y z]: sorted, and without the refused profile", got)
+	}
+
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; len(got) != 0 {
+		t.Errorf("held = %v on an unbucketed entry, want none", got)
+	}
+}
+
 // The card waits with the dispatcher: a newly bound profile's card is not
 // published, and the profile says why, until every bus server has loaded its
 // config. A card already on the directory stays.
@@ -600,6 +671,7 @@ func TestANewlyBoundProfilesCardWaitsForTheBus(t *testing.T) {
 	b.revision(t, "bus-a", "", true)
 	b.sts.Status.UpdateRevision = "bus-a"
 	b.pod(0, "bus-a")
+	b.configSecret(map[string]string{a2aConfigProfilesAnnotation: "auditor"})
 	c := b.client(chartProfileNamespace(agent), &p)
 	dir := newFakeDirectory()
 	h := &profileHarness{t: t, c: c, r: &AgentProfileReconciler{Client: c, Scheme: setupScheme(), Cards: dir}, dir: dir}
@@ -629,9 +701,10 @@ func TestANewlyBoundProfilesCardWaitsForTheBus(t *testing.T) {
 		t.Fatalf("publishes = %v, want the card once the bus has the profile", dir.publishes)
 	}
 
-	// The bus reads as not having it again (a roll onto a revision
-	// recorded before the list, say): the published card stays.
-	rev.Data.Raw = []byte(`{"spec":{"template":{"metadata":{}}}}`)
+	// The bus reads as not having it again (a revision that records an
+	// empty profile list, so the loaded set comes back empty): the
+	// published card stays, read back from the directory.
+	rev.Data.Raw = []byte(`{"spec":{"template":{"metadata":{"annotations":{"` + a2aConfigProfilesAnnotation + `":""}}}}}`)
 	if err := c.Update(context.Background(), rev); err != nil {
 		t.Fatal(err)
 	}
@@ -678,8 +751,17 @@ func TestTheReconcileHoldsANewProfileOutOfTheDispatcherUntilTheBusHasIt(t *testi
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, shard); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(shard.Data[a2aAuthMapKey], `"a2a.tasks.auditor.*.supervisor"`) {
-		t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+	// The dispatcher's allows, not the map as a whole: the gateway's entry
+	// denies every bound profile's supervisor subjects, held ones included,
+	// as nats.conf does (#5301).
+	var heldDoc a2aAuthMapDocument
+	if err := json.Unmarshal([]byte(shard.Data[a2aAuthMapKey]), &heldDoc); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range heldDoc.Identities {
+		if id.User == a2aDispatcherUser && slices.Contains(id.Grants.Publish, "a2a.tasks.auditor.*.supervisor") {
+			t.Error("the dispatcher's grant carries the held profile's supervisor subjects")
+		}
 	}
 	config := &corev1.Secret{}
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, config); err != nil {
@@ -697,9 +779,10 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 	r, agent, sts, _ := a2aReloadFixture(t, "v1", map[string]string{
 		a2aBusReloadRequestedAnnotation: time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 		a2aBusReloadBaselineAnnotation:  "t0",
+		a2aBusReloadServersAnnotation:   singleServerRecord("t0"),
 	})
 	now := time.Date(2026, 11, 9, 22, 0, 30, 0, time.UTC)
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t0", nil }
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t0", nil }
 	config := a2aDesiredConfig(agent, "v2")
 	if _, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now); err != nil {
 		t.Fatal(err)
@@ -717,16 +800,16 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatal(err)
 	}
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t1", nil }
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t1", nil }
 	config = a2aDesiredConfig(agent, "v2")
 	plan, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.reloaded || plan.restartPod {
+	if plan.reloaded || plan.restart != "" {
 		t.Fatalf("plan = %+v: the first move confirmed a folded reload", plan)
 	}
-	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
+	if state, _ := readA2ABusReloadState(config.Annotations, sts.Name); state.servers[sts.Name+a2aNATSPodOrdinalSuffix].Loaded != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
 		t.Errorf("the wait didn't re-arm off the new load time: %v", config.Annotations)
 	}
 	if config.Annotations[a2aBusReloadRearmedAnnotation] == "" {
@@ -763,24 +846,27 @@ func TestAReArmedFoldedReloadRestartsAtTheBoundWithoutAWarning(t *testing.T) {
 			ann := map[string]string{
 				a2aBusReloadRequestedAnnotation: armed.Format(time.RFC3339Nano),
 				a2aBusReloadBaselineAnnotation:  "t1",
+				a2aBusReloadServersAnnotation:   singleServerRecord("t1"),
 			}
 			if tc.rearmed {
 				ann[a2aBusReloadRearmedAnnotation] = "true"
 			}
 			r, agent, sts, rec := a2aReloadFixture(t, "v2", ann)
-			r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return tc.loadTime, tc.loadErr }
+			r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) {
+				return tc.loadTime, tc.loadErr
+			}
 			config := a2aDesiredConfig(agent, "v2")
 			plan, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), armed.Add(tc.at))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if plan.reloaded != tc.wantReload || plan.restartPod != tc.wantRestart {
+			if plan.reloaded != tc.wantReload || (plan.restart != "") != tc.wantRestart {
 				t.Fatalf("plan = %+v, want reloaded=%v restartPod=%v", plan, tc.wantReload, tc.wantRestart)
 			}
 			if !tc.wantReload && !tc.wantRestart && config.Annotations[a2aBusReloadRearmedAnnotation] == "" {
 				t.Errorf("a still-pending re-armed wait dropped its mark: %v", config.Annotations)
 			}
-			if err := r.actOnA2ABusReload(context.Background(), agent, sts.Name, plan); err != nil {
+			if err := r.actOnA2ABusReload(context.Background(), agent, plan); err != nil {
 				t.Fatal(err)
 			}
 			if tc.wantRestart && a2aBusPodExists(t, r, sts) {
@@ -808,9 +894,10 @@ func TestAWriteAfterTheEarlierReloadLandedIsNotFolded(t *testing.T) {
 	r, agent, sts, _ := a2aReloadFixture(t, "v1", map[string]string{
 		a2aBusReloadRequestedAnnotation: time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 		a2aBusReloadBaselineAnnotation:  "t0",
+		a2aBusReloadServersAnnotation:   singleServerRecord("t0"),
 	})
 	now := time.Date(2026, 11, 9, 22, 0, 10, 0, time.UTC)
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t1", nil } // v1 landed
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t1", nil } // v1 landed
 	config := a2aDesiredConfig(agent, "v2")
 	if _, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now); err != nil {
 		t.Fatal(err)
@@ -818,7 +905,7 @@ func TestAWriteAfterTheEarlierReloadLandedIsNotFolded(t *testing.T) {
 	if config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
 		t.Fatalf("a write after the earlier reload landed is marked folded: %v", config.Annotations)
 	}
-	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t1" {
+	if state, _ := readA2ABusReloadState(config.Annotations, sts.Name); state.servers[sts.Name+a2aNATSPodOrdinalSuffix].Loaded != "t1" {
 		t.Fatalf("baseline %q, want the load time v1 left, t1", config.Annotations[a2aBusReloadBaselineAnnotation])
 	}
 
@@ -830,7 +917,7 @@ func TestAWriteAfterTheEarlierReloadLandedIsNotFolded(t *testing.T) {
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatal(err)
 	}
-	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t2", nil } // v2 landed
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent, *corev1.Pod) (string, error) { return "t2", nil } // v2 landed
 	plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "v2"), sts.DeepCopy(), now.Add(20*time.Second))
 	if err != nil {
 		t.Fatal(err)

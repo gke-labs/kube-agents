@@ -65,6 +65,55 @@ class Mutation:
 MUTATIONS: list[Mutation] = [
     # ---- A. Authority ---------------------------------------------------
     Mutation(
+        "A3-a2a-chat-any-caller",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if role == CALLER_ROLE_A2A_CHAT and self.a2a_chat_callers and username not in self.a2a_chat_callers:\n",
+         "        if False:\n"),
+        "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
+        "leave the a2a-chat audience to decide, since only the A2A gateway's pod "
+        "projects it -- the role is then bound to no identity at all",
+    ),
+    Mutation(
+        "A3-a2a-chat-gateway-any-audience",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if username in self.a2a_chat_callers and role not in (CALLER_ROLE_A2A_CHAT, CALLER_ROLE_A2A_REPORTS):\n",
+         "        if False:\n"),
+        "test_A3_the_a2a_chat_role_is_the_a2a_gateways_alone",
+        "let the A2A gateway's account present any audience, since its pod "
+        "projects only the a2a-chat one -- the binding then holds in one "
+        "direction only",
+    ),
+    Mutation(
+        "A3-a2a-chat-binding-not-rendered",
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("\t\t\t\t\tcorev1.EnvVar{Name: credentialProxyA2AChatCallersEnvVar, Value: a2aGatewayBrokerCaller(agent)},\n",
+         ""),
+        "test_A3_the_operator_binds_the_a2a_chat_role_to_the_a2a_gateway",
+        "drop the binding from the render, since the broker still confers the "
+        "role from the audience -- every install then runs unbound, as an older "
+        "operator's does",
+    ),
+    Mutation(
+        "A3-a2a-chat-binding-off-the-exec-tier",
+        "k8s-operator/internal/controller/credential_proxy_exec_tier.go",
+        ("\tcredentialProxyA2AChatAudienceEnvVar: true,\n",
+         "\tcredentialProxyA2AChatAudienceEnvVar: true,\n\tcredentialProxyA2AChatCallersEnvVar:  true,\n"),
+        "test_A3_the_exec_tier_keeps_the_a2a_chat_binding",
+        "leave the a2a-chat binding off the exec tier beside its audience, since "
+        "that tier runs no Chat relay -- the A2A gateway stays an allowed caller "
+        "there with no binding to hold it",
+    ),
+    Mutation(
+        "A3-a2a-chat-callers-env-renamed",
+        "agents/platform/scripts/credential_proxy.py",
+        ('A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLERS"\n',
+         'A2A_CHAT_CALLERS_ENV = "CREDENTIAL_PROXY_A2A_CHAT_CALLER"\n'),
+        "test_A3_the_operator_binds_the_a2a_chat_role_to_the_a2a_gateway",
+        "rename the broker's env constant, since its own tests read the same "
+        "constant -- the operator's render is then read by nothing and the "
+        "binding silently drops",
+    ),
+    Mutation(
         "A3-profile-context-unchecked",
         "agents/platform/scripts/task_confinement.py",
         ("    for value in contexts:\n        if value != target.context_name:\n",
@@ -85,13 +134,31 @@ MUTATIONS: list[Mutation] = [
         "the host cluster, so a task the dispatcher gave no target still works",
     ),
     Mutation(
-        "A3-profile-reaches-vcs",
+        "A3-profile-reaches-forge",
         "agents/platform/scripts/credential_proxy.py",
-        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
-         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
-        "test_A3_the_profile_role_reaches_exec_the_mcp_relay_and_the_audit_reports_alone",
-        "let a profile worker read a proposal the way the MCP pod does -- a "
-        "forge read no task target confines",
+        ('    ("/v1/forge/", (CALLER_ROLE_SHELL,)),\n',
+         '    ("/v1/forge/", (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_exec_mcp_vcs_and_the_audit_reports_alone",
+        "let a profile worker refresh the forge credential the way the shell "
+        "does, since it already reaches the version-control routes",
+    ),
+    Mutation(
+        "A3-profile-write-without-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in",
+         "    if False and VCS_PROPOSAL_CREATE_PERMIT not in"),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "admit a profile worker's publish on any task credential, trusting the "
+        "persona rule to keep it from opening an unrequested pull request",
+    ),
+    Mutation(
+        "A3-profile-vcs-without-credential",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if task is None:\n        return "a profile caller needs a task credential for version control"\n',
+         '    if False:\n        return "a profile caller needs a task credential for version control"\n'),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "let a warm profile pod between tasks read the managed repository, "
+        "as the shell does with no per-task identity",
     ),
     Mutation(
         "A3-report-credential-any-route",
@@ -1130,8 +1197,8 @@ Mutation(
     Mutation(
         "C3-management-project-unpinned",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
-         "    RECONCILE_PROJECT=\n"),
+        ("    KUBEAGENTS_DIAL_ADMINS=\n    GKE_PROJECT_ID=example-project\n",
+         "    KUBEAGENTS_DIAL_ADMINS=\n"),
         "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
         "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
         "line in the agent-writable PVC .env then re-points the management "
@@ -1740,6 +1807,16 @@ Mutation(
         "keep commercial googleapis.com hosts in routed_hosts alongside the "
         "custom universe's hosts for convenience, letting custom-universe "
         "credentials cross a universe boundary when route_host also matches",
+    ),
+    Mutation(
+        "C2-universe-domain-under-googleapis",
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("    if cleaned.endswith(_GOOGLE_API_SUFFIX):\n",
+         "    if False and cleaned.endswith(_GOOGLE_API_SUFFIX):\n"),
+        "test_C2_a_universe_domain_under_googleapis_com_is_refused",
+        "accept every well-formed domain as the universe domain again, so "
+        "mtls.googleapis.com passes as a custom universe and its hosts, "
+        "which are commercial hosts, are relayed",
     ),
     Mutation(
         "C3-policy-reads-a-file",

@@ -169,7 +169,7 @@ class LiteLLMLogCollectionTest(unittest.TestCase):
         self.assertEqual(log.stat().st_size, cap)
 
     def test_a_missing_deployment_is_a_note_not_a_failure(self):
-        """A today-mode or next-mode install without LiteLLM, or one that
+        """An install without LiteLLM, or one that
         renders it under another name, costs the run this file and nothing
         else: the trap reads `$?` for the dumper after this runs."""
         proc, log = run_collect(STUB_NO_DEPLOYMENT="1")

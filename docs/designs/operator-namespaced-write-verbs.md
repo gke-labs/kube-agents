@@ -5,11 +5,12 @@
 > namespaced Role in the install namespace. This document is the follow-up that change named: the
 > write verbs on every other namespaced kind the operator renders. Shape (a), §3, is what ships:
 > the write verbs are the namespaced Role, bound in the install namespace and the profile namespace
-> on both install paths, with one Role document for both namespaces (decision 3). The ruling
-> between the two shapes on the tracking issue is still open, as is decision 2; the switch to
-> shape (b) is a kind change in the chart template, the kustomize `allowKindChange` patch, the
-> guard flip in §4, and dropping the profile Role copy. §1 and §2 describe the ClusterRole as it
-> was before the move.
+> on both install paths, with one Role document for both namespaces (decision 3). Decision 2 is
+> taken: the validating webhook refuses a `PlatformAgent` created outside the operator's namespace
+> (§7, "Stale copies"). The ruling between the two shapes on the tracking issue is still open; the
+> switch to shape (b) is a kind change in the chart template, the kustomize `allowKindChange`
+> patch, the guard flip in §4, and dropping the profile Role copy. §1 and §2 describe the
+> ClusterRole as it was before the move.
 
 **Scope:** which verbs on the operator's ClusterRole (`k8s-operator/config/rbac/role.yaml`,
 rendered from the `+kubebuilder:rbac` markers in
@@ -56,8 +57,7 @@ The guard in §3 supplies the pin for the rest: the Role document carries write 
 `dispatchjobtemplates` looked like an exception (no `watch`, read only through the uncached reader
 in the profile namespace, not in the `minimal` ClusterRole), and is not one: the teardown walk
 lists the kind in `<ns>-profiles` on every deletion and every flip to `today`, before any check
-that the namespace or a RoleBinding in it exists, and a Helm install in `mode: today` binds the
-Role in the install namespace only. The API server authorises a namespaced `list` before it looks
+that the namespace or a RoleBinding in it exists. The API server authorises a namespaced `list` before it looks
 for the namespace, so a read in the Role is a 403 there. Its reads stay cluster-wide like every
 other kind's.
 
@@ -129,8 +129,8 @@ each kind stays without `namespace=`.
 Objects. In the install namespace: the Role (`kubeagents-manager-role` under kustomize,
 `<release>-operator-namespaced-role` under Helm) and its RoleBinding, both existing. In the profile
 namespace: a second Role with the same rules and a RoleBinding, new. The chart renders the Role and
-its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace only
-under `mode: next`, where `profiles-namespace.yaml` creates it), with the spliced rules block
+its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace
+whenever `profiles-namespace.yaml` creates it, on every install with a platform agent), with the spliced rules block
 inline rather than in a named template: `hack/sync-chart-manifests.sh` keeps splicing one block
 between the `GENERATED NAMESPACED RULES` markers, and the conformance harness's text reader would
 drop an `include` line (§3 Guard). Kustomize's `config/default` rewrites every namespaced object to
@@ -169,9 +169,12 @@ What goes stale. A `PlatformAgent` outside the install namespace needs a hand co
 a RoleBinding in its namespace and in `<its namespace>-profiles`; the copy is stale the next time a
 marker gains a verb. The self-check reports it (`Degraded`/`RBACIncomplete` naming the namespace)
 and nothing else does. The shipped shape has no such agent: both install paths place it in the
-install namespace, the webhook admits one per cluster, and
-`test_no_shipped_manifest_places_a_platformagent_outside_the_install_namespace` keeps every shipped
-manifest there.
+install namespace, the webhook admits one per cluster and, where it is enabled, refuses a create
+outside the operator's namespace (`POD_NAMESPACE`, the namespace main.go reads for the self-check),
+and `test_no_shipped_manifest_places_a_platformagent_outside_the_install_namespace` keeps every
+shipped manifest there. An agent that already exists elsewhere, created while the webhook was off
+or before that rule, is updated with a warning naming the two namespaces that need the Role, so the
+self-check's per-namespace probe stays the disclosure for it.
 
 ## 4. Shape (b): one write ClusterRole, bound per namespace
 
@@ -222,15 +225,17 @@ one.
 
 The self-check. `requiredPermissions` marks every write tuple `Namespaced: true`; `probeRBAC`
 reviews them in the operator's namespace, in each agent namespace it observes, and, new, in the
-profile namespace of each `mode: next` agent whose profile namespace is ready
+profile namespace of each agent whose profile namespace is ready
 (`profileNamespaceReady`). A denial reads `create deployments.apps (in namespace
 kubeagents-system-profiles)` and the cause sentence names the object to add. The probe count grows
 from one namespace to two on a stock install; the reviews are concurrent and bounded by
 `rbacProbeConcurrency`.
 
-The webhook. One `PlatformAgent` per cluster, in any namespace. Neither shape changes it. A rule
-that also pins the namespace to the operator's (`POD_NAMESPACE`) would remove the hand-managed case
-from shape (a) entirely; it is a behaviour change and a decision for the owner, listed below.
+The webhook. One `PlatformAgent` per cluster, and, since decision 2 (§8), in the operator's
+namespace (`POD_NAMESPACE`): a create elsewhere is refused where the webhook is enabled, an update
+of an agent that already exists elsewhere is admitted with a warning, and an operator with no
+`POD_NAMESPACE` skips the rule. Neither shape changes it; it removes the hand-managed agent
+namespace from shape (a).
 
 The leader-election Role. The chart's `operator-leader-election-role` grants `events` only and its
 comment says the lease verbs are in the ClusterRole; after the move they are in the install
@@ -282,7 +287,10 @@ comparison with both costs stated:
   a profile namespace made by hand before `make deploy` carried one) holds a Role copy that is stale
   the next time a marker gains a verb; the self-check reports it and nothing else does. (b): one
   RoleBinding per namespace, which has nothing to go stale. (b) wins, on a case no install path
-  produces, no shipped manifest places, and the webhook does not require.
+  produces, no shipped manifest places, and the webhook, where it is enabled, refuses on create
+  (decision 2): the hand-managed agent namespace is closed, and only a profile namespace made by
+  hand before `make deploy` carried one, or an agent created elsewhere while the webhook was off,
+  still holds a copy.
 - What an auditor sees. (a): no ClusterRole grants a write verb on a namespaced kind; reading the
   ClusterRoles and running `kubectl auth can-i --all-namespaces` give the same answer. (b): a
   ClusterRole that grants cluster-wide `create` on Secrets, Pods and ServiceAccounts exists on every
@@ -295,8 +303,9 @@ comparison with both costs stated:
 
 The recommendation holds because the cost shape (b) removes falls on a namespace nobody ships, and
 the cost it adds falls on every audit of every install. It is a judgment about weights, and the
-ruling is the owners': if a `PlatformAgent` outside the install namespace is a shape to support, or
-hand-managed namespaces weigh more than the scanner surface, shape (b) is the right choice. The
+ruling is the owners': if a `PlatformAgent` outside the install namespace is a shape to support
+(which also reverses decision 2, the webhook's namespace rule), or hand-managed namespaces weigh
+more than the scanner surface, shape (b) is the right choice. The
 switch is a kind change in the chart template, a kustomize patch, the guard flip in §4, and the
 removal of the `config/profiles` Role copy; nothing in the prepared implementation stands in its
 way.
@@ -305,9 +314,13 @@ way.
 
 1. Shape (a) or (b). Shape (a) is implemented; the ruling may still switch it (the banner names
    the switch).
-2. Whether the webhook should also refuse a `PlatformAgent` outside the operator's namespace. Yes
-   removes the only hand-managed case from shape (a); no keeps today's behaviour and the
-   `RBACIncomplete` disclosure. Open.
+2. Whether the webhook should also refuse a `PlatformAgent` outside the operator's namespace.
+   Decided yes: the validating webhook refuses a create whose `metadata.namespace` is not the
+   operator's (from `POD_NAMESPACE`), naming the namespace and the Role bound there, and allows an
+   update of an agent that already exists elsewhere with a warning, so an object admitted while the
+   webhook was off is not stranded (the controller's own finalizer writes pass through the webhook).
+   The `RBACIncomplete` disclosure stays for that pre-existing case and for the profile namespace.
+   Off the cluster, with no `POD_NAMESPACE`, the rule is skipped, as the metrics rule is.
 3. One Role document for both namespaces (implemented), or a narrower profile-namespace document (the profile
    namespace needs ConfigMaps, ServiceAccounts, Deployments, ResourceQuotas, NetworkPolicies, Roles,
    RoleBindings, Jobs, PodTemplates and DispatchJobTemplates; not Secrets, Services, PVCs,

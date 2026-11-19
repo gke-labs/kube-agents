@@ -180,7 +180,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, fleet, gitops, profile_hook, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -3063,6 +3063,45 @@ def _skip_report_only_judges() -> None:
     )
 
 
+def _cancel_report_entry(task: dict[str, Any], statuses: dict[str, str]) -> dict[str, Any]:
+    """:data:`stop_hook.CANCEL_REPORTED_ENTRY` for a canceled A2A door task
+    (#5528): ``completed`` when the task carries a card-stop result whose
+    stopped cards are exactly the cards the board showed archived after the
+    stop (``statuses``, as :meth:`KubeAgentsHarness._stop_after_first_card`
+    read them, before the harness archived any leftover), less any the
+    result calls already settled, and whose text opens
+    :data:`stop_hook.CANCEL_REPORT_PREFIX`. ``error`` with the reason
+    otherwise; a canceled task with no card-stop result at all is the first.
+
+    Strict on purpose: a card the stop reported still pending whose archive
+    lands inside the window fails it, since the caller was told the card may
+    run on. A card the result calls failed and that never archived is
+    ``harness_cards_stopped``'s miss as well."""
+    archived = {t for t, s in statuses.items() if s == stop_hook.STOPPED_STATUS}
+    found = a2a_door.card_stop_result(task)
+    if found is None:
+        why = "the canceled task carries no card-stop result"
+        return {"name": stop_hook.CANCEL_REPORTED_ENTRY, "args": {"archived": sorted(archived)}, "status": "error", "result": why}
+    text, card_stop = found
+    problems = []
+    listed = card_stop.get("stopped") or []
+    if not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in listed):
+        problems.append("its stopped list holds an entry that is not a card with a string id")
+    stopped = sorted(c["id"] for c in listed if isinstance(c, dict) and isinstance(c.get("id"), str))
+    settled = {c["id"] for c in card_stop.get("settled") or [] if isinstance(c, dict) and isinstance(c.get("id"), str)}
+    archived = sorted(archived - settled)
+    if not text.startswith(stop_hook.CANCEL_REPORT_PREFIX):
+        problems.append(f"its text does not open {stop_hook.CANCEL_REPORT_PREFIX.strip()!r}")
+    if stopped != archived:
+        problems.append(f"it names stopped card(s) {stopped}, the board shows archived {archived}")
+    return {
+        "name": stop_hook.CANCEL_REPORTED_ENTRY,
+        "args": {"archived": archived, "stopped": stopped},
+        "status": "error" if problems else "completed",
+        "result": "; ".join(problems) if problems else text,
+    }
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -3166,6 +3205,10 @@ class KubeAgentsHarness(AgentHarness):
         if pushed_report.is_reply_under_pushed_report(prompt):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
+        if profile_hook.is_profile_ask(prompt):
+            return AgentResult.errored(
+                f"{profile_hook.PROFILE_DIRECTIVE} ...] needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
         if transport == TRANSPORT_SLACK:
             return _execute_slack(prompt)
@@ -3406,6 +3449,8 @@ class KubeAgentsHarness(AgentHarness):
 
             card_wait = stop_hook.Stop(prompt=stop.prompt, observe_seconds=stop.observe_seconds)
             self._stop_after_first_card(result, session, card_wait, send_stop=_send_stop, poll_interval=poll_interval)
+            if cancel[0] and final_state == a2a_door.STATE_CANCELED:
+                result.trajectory.append(_cancel_report_entry(final, result.metadata.get("stop_card_statuses") or {}))
         except _TransportError as exc:
             return _abandon(str(exc))
         return result
@@ -3876,6 +3921,11 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
+            # Read first. No other directive may follow it (profile_hook), so
+            # the stop and pushed-report reads below find nothing behind one.
+            target = None if follow_up else profile_hook.parse(prompt)
+            if target is not None:
+                prompt = target.prompt
             stop = None if follow_up else stop_hook.parse(prompt)
             pushed = None if follow_up else pushed_report.parse(prompt)
         except ValueError as exc:
@@ -4200,6 +4250,9 @@ class KubeAgentsHarness(AgentHarness):
                 return "cancelled"
             return "no cancel was published (see the log), so it may still be running"
 
+        # The profile fields go only on a turn addressed to a profile, so every
+        # other turn is built exactly as it was before #5945.
+        addressed = {"profile": target.name, "parameters": target.parameters} if target is not None else {}
         task = inject.InjectTask(
             base_url=base_url,
             conversation=conversation,
@@ -4207,6 +4260,7 @@ class KubeAgentsHarness(AgentHarness):
             token=token,
             author=author,
             message_id=message_id,
+            **addressed,
         )
 
         # A stopped ask waits on nothing it filed: the stop is the point. Sent
