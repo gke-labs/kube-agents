@@ -65,6 +65,7 @@ NOT_STARTED_NOTICES = (
     "🚦 not started: 1 session worker is already running (cap 1). Wait for one to finish or `stop` one you started; "
     "an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
     "⚠️ not started: can't count the running session workers right now — try again in a moment",
+    "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment",
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
     "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",
@@ -1411,7 +1412,9 @@ class UnitTest(unittest.TestCase):
         # And each one is posted in place of a task: refuseAtSessionCap returns true
         # after both, and the retire refusal is the one passed to retireIncarnation.
         self.assertIn('retireRefusalNotStarted = "⚠️ not started: ', sources["gateway.go"])
-        self.assertIn('g.post(rec.Key, "⚠️ not started: can\'t count the running session workers', sources["spawn.go"])
+        # The cap check collects its posts and sends them once the check ends
+        # (#6033), so the count refusal is spelled as a capNotice for rec.Key.
+        self.assertIn('capNotice{rec.Key, "⚠️ not started: can\'t count the running session workers', sources["spawn.go"])
         self.assertIn('g.post(rec.Key, "⚠️ not started: could not mint this task\'s capability")', sources["gateway.go"])
 
     def test_redactor_cuts_the_escaped_forms_of_a_registered_value(self):

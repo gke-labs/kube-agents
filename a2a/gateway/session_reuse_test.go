@@ -768,7 +768,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		}
 	})
 	t.Run("a pod that turned busy after the candidate scan stays", func(t *testing.T) {
-		// evictIdleSession read this conversation idle; a turn then took and
+		// evictIdleSessions read this conversation idle; a turn then took and
 		// released its lock, leaving a task running. evictSession is what
 		// sees the record now, under the lock, so it is called directly:
 		// nothing between the two reads can be hooked.
@@ -779,7 +779,7 @@ func TestTheCapEvictsTheLongestIdlePod(t *testing.T) {
 		if err := r.g.reg.Put(ctx, turned); err != nil {
 			t.Fatal(err)
 		}
-		if r.g.evictSession(ctx, sessionPod{PodName: "chat-vole-turned", SessionKey: turned.Key, Reuse: true}) {
+		if r.g.evictSession(ctx, sessionPod{PodName: "chat-vole-turned", SessionKey: turned.Key, Reuse: true}, r.g.post) {
 			t.Fatal("evictSession evicted a pod whose fresh record has a task running")
 		}
 		if d := spawn.deleted(); len(d) != 0 {
@@ -929,14 +929,6 @@ func TestSessionPodsListsTheLiveOnes(t *testing.T) {
 	slices.Sort(got)
 	if want := []string{"live=conv-live", "pending=conv-pending"}; !slices.Equal(got, want) {
 		t.Fatalf("SessionPods = %v, want %v", got, want)
-	}
-	// The cap counts exactly the pods its eviction can choose from.
-	n, err := s.LiveSessions(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != len(pods) {
-		t.Fatalf("LiveSessions = %d over %d evictable pods; the count and the candidates disagree", n, len(pods))
 	}
 }
 

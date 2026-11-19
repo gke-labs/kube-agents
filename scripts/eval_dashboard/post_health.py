@@ -955,7 +955,7 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_FORGE_OUTAGE:
         lines = [
             f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} The GitHub App's hourly rate limit ran out (the evals"
-            " repositories share one installation, #6105); retest once it has reset."
+            " repositories of a shard share one installation, #6105); retest once it has reset."
         ]
     elif condition == CONDITION_LOST_PODS:
         tag = issue_tag(issue)

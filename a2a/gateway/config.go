@@ -696,8 +696,11 @@ type Config struct {
 	// sooner - a UX decision, not a safety one, because this cap is the
 	// usability half. The enforcement half is the namespace ResourceQuota
 	// the operator renders above this number (a compromised or buggy gateway
-	// ignores its own cap and cannot ignore that one), which is also what
-	// bounds the count-then-create race between concurrent conversations.
+	// ignores its own cap and cannot ignore that one). The gateway serializes
+	// the check and counts slots granted but not yet spawned, so concurrent
+	// conversations don't race past the cap (#6033); a replacing turn or a
+	// leader handover can still overshoot it briefly, which the quota's
+	// margin absorbs.
 	MaxSessions int
 
 	// SessionResources are the session pod's CPU and memory requests and

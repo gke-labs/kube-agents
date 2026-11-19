@@ -195,8 +195,8 @@ harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
 not as the bot's guess), a forge outage (6+ forge repetitions,
 below, across 2+ pull requests among the runs that finished in the last 2
-hours: the evals repositories share one GitHub App installation and its
-hourly REST budget, so a second pull request already shows the fleet's
+hours: the evals repositories share one GitHub App installation per shard of ten projects (`hack/eval/ledger-reader-apps.txt`) and its
+hourly REST budget, so a second pull request already shows a shard's
 budget rather than one branch; it ranks below the storm and the ceiling,
 which lose the agent's run rather than its grading), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
@@ -1574,7 +1574,7 @@ roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours`
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
-read failed). One assertion this job never makes: the five `declared-*` roles
+read failed). One assertion this job never makes: the `declared-*` roles
 assert the pool repository's declared-intent note, and the job holds no
 credential for the pool repositories by design, so the state script leaves
 that assertion out, judges those roles on their cluster assertions (healthy,
@@ -1876,11 +1876,15 @@ python3 scripts/eval_dashboard/health.py --replay --data data.json --step 30m \
 walks a `data.json` as if the job had run every 30 minutes and prints the state
 timeline. `scripts/test_eval_dashboard_health.py` asserts that timeline for
 2026-09-01 → 2026-09-08 against the incidents filed that week (#1171, #1189,
-#1214, #1269, #1278). The roster history matters: `compliance-rbac-overgrant`
-and `rca-remediation-pr` were admitted when they collapsed and were demoted
-afterwards, so a replay with today's roster would not see the 09-02 outage.
-A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`, is the day
-the build cluster lost five nodes (#1478); the same test file asserts it reads
+#1214, #1269, #1278). The roster history matters: the two cases the fixture
+calls `case-09` and `case-23` were admitted when they collapsed and were
+demoted afterwards, so a replay with today's roster would not see the 09-02
+outage. The fixtures are synthetic cuts of the real weeks (case ids, pull
+request and build numbers and reasons invented; timeline kept: `SCHEMA.md`,
+"Fixtures"), so a replay of a real `data.json` pairs with the real roster, not
+this file. A second fixture, `testdata_health/lost-pods-2026-09-11.json.gz`,
+is the day the build cluster lost five nodes (#1478); the same test file
+asserts it reads
 as `lost_pods` with 12 runs on 12 pull requests, and that the setup-death rule
 no longer claims them. A third, `testdata_health/slow-gate-2026-09-14.json.gz`,
 is the week ending 2026-09-14 18:20Z (#1586), the seven days the slow-gate

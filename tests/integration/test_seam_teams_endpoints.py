@@ -124,6 +124,34 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertFalse(body["settled"])
 
+        # A nack on a live receipt requeues the activity: the next pull hands
+        # the same text back under a new receipt, and the old one is spent.
+        seeded = self._call(
+            "/v1/chat/teams/events",
+            {
+                "type": "message",
+                "text": "second turn",
+                "conversation": {"id": "c-1", "tenantId": "tenant-allowed-1"},
+            },
+            method="POST",
+        )
+        self.assertEqual(seeded, (202, {"status": "accepted"}))
+        status, body = self._call("/v1/chat/teams/events", method="GET")
+        self.assertEqual(status, 200)
+        first_receipt = body["event"]["receipt"]
+        status, body = self._call(
+            "/v1/chat/teams/events/nack", {"receipt": first_receipt}, method="POST"
+        )
+        self.assertEqual((status, body), (200, {"settled": True}))
+        status, body = self._call("/v1/chat/teams/events", method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["event"]["event"]["text"], "second turn")
+        self.assertNotEqual(body["event"]["receipt"], first_receipt)
+        status, body = self._call(
+            "/v1/chat/teams/events/nack", {"receipt": first_receipt}, method="POST"
+        )
+        self.assertEqual((status, body), (404, {"settled": False}))
+
     def test_api_forwarding_with_oauth_token_exchange_and_method_or_host_restrictions(self):
         upstream_requests = []
 
