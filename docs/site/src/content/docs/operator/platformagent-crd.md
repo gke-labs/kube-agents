@@ -78,6 +78,9 @@ A one-server bus starts its server with a `stale-cluster-meta` init step. A serv
 3. **The clear.** With the snapshot pinned, the operator's pod deletes the streams from the single server, so it joins the cluster with nothing on disk; the conversion would have dropped them anyway.
 4. **The conversion.** The bus renders three servers. On a cluster that provisions nodes on demand, such as Autopilot, that includes the nodes for servers 1 and 2. The conversion has 15 minutes of its own (`status.busMigration.phaseDeadline`) to get all three Ready, so a cluster that cannot schedule servers 1 and 2 turns the run back then, not at the run's two-hour deadline.
 5. **The restore.** The operator's restore pod restores each stream, with its consumers, and raises it to three replicas. Before it restores a stream, it checks the snapshot against the operator's digests and against the operator's policy for that stream: its subjects, limits and retention. The stream comes back with the limits the install renders now. A snapshot that does not fit them is refused, which turns the run back: more bytes than the rendered `max_bytes`, or an oldest message older than the rendered `max_age`. After, it checks the restored stream against the same policy and deletes one that fails.
+
+   The one exception to the rendered limits is `max_consumers`. It is raised to the rendered value when the snapshot's is lower, and never lowered. A wider stream, or one with no limit, keeps its own, because its consumers must still fit.
+
 6. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
 
 The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (15Gi today), so the default StorageClass must support that access mode.

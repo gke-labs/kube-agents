@@ -289,7 +289,15 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			return warnings, fmt.Errorf("stream %s: %w", name, err)
 		}
 		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
-		warnings = append(warnings, fresh.OutsidePolicyDrift(meta.Config)...)
+		// Drift is of the stream as it is restored: going forward that is the
+		// config the restore sends, whose max_consumers may be widened past
+		// the snapshot's, so a stream this restore widens to a fresh
+		// install's width is not reported at the width it had.
+		restored := meta.Config
+		if replicas > 1 {
+			restored = withRenderedLimits(meta.Config, policy)
+		}
+		warnings = append(warnings, fresh.OutsidePolicyDrift(restored)...)
 		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) } // #nosec G304 -- under the Job's own --snapshot-dir
 		// What a restored stream is held to: the render's limits going
 		// forward, the snapshot's own on the way back (RestoreAsItWas).

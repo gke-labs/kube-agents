@@ -1345,7 +1345,13 @@ func TestAStepsJobStopsBeforeItsCredentialExpires(t *testing.T) {
 // provision script, continuations joined, keyed by stream name, as flag maps.
 func provisionCreateLines(t *testing.T) map[string]map[string]string {
 	t.Helper()
-	script := buildA2AProvisionJob(a2aTestAgent()).Spec.Template.Spec.Containers[0].Command[2]
+	return provisionCreateLinesFor(t, a2aTestAgent())
+}
+
+// provisionCreateLinesFor is provisionCreateLines for agent's script.
+func provisionCreateLinesFor(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]map[string]string {
+	t.Helper()
+	script := buildA2AProvisionJob(agent).Spec.Template.Spec.Containers[0].Command[2]
 	script = strings.ReplaceAll(script, "\\\n", " ")
 	lines := map[string]map[string]string{}
 	for _, line := range strings.Split(script, "\n") {
@@ -1437,6 +1443,27 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 		if !reflect.DeepEqual(p, want) {
 			t.Errorf("%s: policy\n %+v\nscript\n %+v", p.Name, p, want)
 		}
+	}
+}
+
+// TASKS's policy width is the CR's, not the fresh install's: with
+// maxSessions raised it is a2aTasksMaxConsumers(agent), the width the
+// provision script creates TASKS with for that CR, and a one to three
+// restore widens to it.
+func TestTheTasksPolicyWidthFollowsTheCR(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: ptr.To(20)}}
+	want := a2aTasksMaxConsumers(agent)
+	if want == a2aTasksMaxConsumers(a2aTestAgent()) {
+		t.Fatalf("maxSessions 20 renders the default width %d; the test can't tell them apart", want)
+	}
+	for _, p := range a2aStreamPolicies(agent, 1) {
+		if p.Name == "TASKS" && p.MaxConsumers != want {
+			t.Errorf("TASKS policy max_consumers %d, want the CR's %d", p.MaxConsumers, want)
+		}
+	}
+	if got := provisionCreateLinesFor(t, agent)["TASKS"]["max-consumers"]; got != strconv.Itoa(want) {
+		t.Errorf("provision script --max-consumers %q, want %d: the policy and the script disagree", got, want)
 	}
 }
 
