@@ -373,7 +373,7 @@ func (m *migrationRig) snapshotKept() {
 		m.t.Fatal(err)
 	}
 	digests, _ := parseBusDigests(validDigests())
-	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(1)})
+	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(m.agent, 1)})
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}, Data: map[string][]byte{busMigrationRunKey: body}}
 	m.own(sec)
 	if err := m.cl.Create(ctx, sec); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -475,7 +475,7 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantDigests, _ := parseBusDigests(validDigests())
-	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
+	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(m.agent, 1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
 		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
 	}
 
@@ -1378,7 +1378,7 @@ func provisionCreateLines(t *testing.T) map[string]map[string]string {
 // same streams, and every value the script passes on a policy field.
 func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 	lines := provisionCreateLines(t)
-	policies := a2aStreamPolicies(1)
+	policies := a2aStreamPolicies(a2aTestAgent(), 1)
 	var names []string
 	for _, p := range policies {
 		names = append(names, p.Name)
@@ -1427,7 +1427,7 @@ func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
 			_, direct := f["allow-direct"]
 			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: strings.Split(f["subjects"], ","), Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
 				MaxBytes: num(f["max-bytes"], -1), MaxAge: dur(f["max-age"]), Discard: nats.DiscardOld, MaxMsgsPerSubject: num(f["max-msgs-per-subject"], -1),
-				AllowDirect: direct, Replicas: 1}
+				AllowDirect: direct, Replicas: 1, MaxConsumers: int(num(f["max-consumers"], 0))}
 		case "kv":
 			bucket := strings.TrimPrefix(p.Name, "KV_")
 			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
@@ -1449,7 +1449,7 @@ func TestTheStreamPoliciesMatchAFreshInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		ref, ok := fresh.Streams[p.Name]
 		if !ok {
 			t.Errorf("%s: not in the fresh-install reference; regenerate it", p.Name)
@@ -1571,7 +1571,7 @@ func TestTheSnapshotPhaseCreatesAOnePodStage(t *testing.T) {
 		t.Errorf("storage class %v owners %v", pvc.Spec.StorageClassName, pvc.OwnerReferences)
 	}
 	var caps int64
-	for _, p := range a2aStreamPolicies(1) {
+	for _, p := range a2aStreamPolicies(a2aTestAgent(), 1) {
 		caps += p.MaxBytes
 	}
 	got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]

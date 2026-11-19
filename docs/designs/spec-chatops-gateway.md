@@ -935,12 +935,15 @@ detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
 the supervisor rule below is what keeps that from being a silent stop.
 
-**The session cap** (`A2A_MAX_SESSIONS`) counts live pods, and with one pod per live
+**The session cap** (`A2A_MAX_SESSIONS`) counts live pods and slots granted to pods not yet created, and with one pod per live
 conversation it fills with conversations nobody is in right now. When it is full and a
 conversation needs a pod, the gateway evicts the one idle longest - a live pod whose conversation
 has no task at all, oldest last user message first - and posts one line in that conversation: its
 session was paused to make room, and its next message starts fresh with the conversation so far.
-Only with no idle pod is the turn refused, with the notice it always had. A conversation running
+Over the cap (after the cap is lowered, say), it evicts the idle surplus too, so the count comes back
+to the cap rather than staying over it. Only with too few idle pods to get under the cap is the turn refused, with the notice it always had, naming the count left. The check is serialized, and a slot
+granted counts as live until its pod is created (or for two minutes), so conversations arriving
+together can't all pass on one count: before that, a burst of 10 on 9 live pods reached 19 (#6033). A conversation running
 anything (a task, a stopped task finishing, a delegated child whose wake will need the pod) is
 never evicted; each candidate is re-checked under its own conversation's lock, and a lock that is
 held means busy. A reused pod that its conversation's record names neither as its pod nor as the

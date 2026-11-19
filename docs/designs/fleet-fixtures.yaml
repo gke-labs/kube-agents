@@ -357,8 +357,9 @@ fixtures:
     namespace: seeded-compute-class
     defect: >-
       A Deployment naming ComputeClass general-ccc only in a required
-      nodeAffinity term and never in nodeSelector, which is the one field the
-      pre-filter reads.
+      nodeAffinity term and never in nodeSelector. A required nodeAffinity on
+      the class key also requests the class, so this is the targeted control
+      beside the untargeted workload and no check flags it.
 
   - role: compute-class-toleration-workload
     slot: c
