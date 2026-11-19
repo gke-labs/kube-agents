@@ -247,8 +247,11 @@ validator check lands with the first stack that needs it:
 9. A declared-gap fixture is one a correct check flips: a check written to the platform's own
    documented behaviour names the planted object. A shape only a wrong check would name (a
    zero-node pool with a large `maxSurge`, which GKE bounds to the pool's live nodes) is not a
-   fixture. Where no fixture a correct check flips can stand at an acceptable cost, the case
-   parks as `FIXTURE_NOT_READY` with the cost named in its reason.
+   fixture. Neither is a setting left at the platform's documented default (a gcsfuse sidecar
+   with no memory limit, which GKE ships and its performance guide recommends): a check that
+   names it files on every workload that follows the guide, so such a case is removed. Where no
+   fixture a correct check flips can stand at an acceptable cost, the case parks as
+   `FIXTURE_NOT_READY` with the cost named in its reason.
 
 Each case record of the lane (`case-<id>.json`) names the gateway's model setup it was graded
 under: an `agent` object with the provider the gateway routes to, the model the records name and,
