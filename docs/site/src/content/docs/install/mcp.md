@@ -14,7 +14,7 @@ You need four things:
 - **An installed `PlatformAgent`.** The MCP server is a client of the install's message bus. Check with `kubectl get platformagent -A`.
 - **The MCP server turned on.** It is off by default; the next section turns it on.
 - **A kubeconfig context for the cluster** the install runs on, which works from a terminal on the same machine. [Reach the cluster](#reach-the-cluster) checks it, including for a private cluster.
-- **Go 1.27 or later**, to build the bridge.
+- **Go 1.27 or later**, to build the bridge, on Linux or macOS. The bridge does not build for Windows yet.
 
 ## Turn on the MCP server
 
