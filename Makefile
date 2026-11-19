@@ -10,7 +10,17 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # stay pinned in the Dockerfile and images.json); unset ones are simply not
 # passed, so an ordinary build is unchanged:
 #   make docker-build HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent
-BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
+# GOLANG_VERSION is the one tag among them: a mirrored golang copy is frozen at
+# one patch, and the builder stages run with GOTOOLCHAIN=local, so when a `go`
+# directive moves past that patch, a rebuild needs a tag that names a newer one.
+# Each list holds it where its Dockerfile declares the arg. It counts from the
+# make command line only: the golang image exports an environment variable of
+# the same name (a bare version, no `-alpine`), and a build inside such a
+# container must not take its builder tag from there.
+ifeq ($(origin GOLANG_VERSION),environment)
+GOLANG_VERSION :=
+endif
+BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE GOLANG_VERSION
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
 # The sandbox image is built from a different Dockerfile and shares none of
@@ -19,10 +29,10 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE DISTROLESS_IMAGE
+KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE GOLANG_VERSION DISTROLESS_IMAGE
 KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-HERMES_BRIDGE_IMAGE_VARS := GOLANG_IMAGE
+HERMES_BRIDGE_IMAGE_VARS := GOLANG_IMAGE GOLANG_VERSION
 HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
 # What the image reports as its own version. Hermes interpolates it into the
