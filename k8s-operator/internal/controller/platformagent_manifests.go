@@ -7423,25 +7423,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
 	// so domain-level filtering is strictly enforced by FQDNNetworkPolicy.
 	if !fqdnEnabled {
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
-			},
-			To: []networkingv1.NetworkPolicyPeer{
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "0.0.0.0/0",
-						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"},
-					},
-				},
-				{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR:   "::/0",
-						Except: []string{"fc00::/7", "fe80::/10", "ff00::/8"},
-					},
-				},
-			},
-		})
+		egressRules = append(egressRules, publicHTTPSEgressRule())
 	}
 
 	// 8. GKE Managed OpenTelemetry Collector (Trace Export). Skipped when the agent is
