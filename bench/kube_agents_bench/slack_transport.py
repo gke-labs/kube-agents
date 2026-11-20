@@ -90,14 +90,19 @@ THEN_ENV = "BENCH_SLACK_THEN"
 # channel, on the lane), not in a thread a mention opens: the case's setup has
 # the agent post (a scheduled report, an alert), and the rest of the prompt is
 # the reply. The post is the newest top-level bot post holding <marker> since
-# HOME_POST_LOOKBACK_ENV seconds before the turn (default
-# HOME_POST_LOOKBACK_SECONDS), watched for up to HOME_POST_WAIT_ENV seconds
-# (default HOME_POST_WAIT_SECONDS), since it may land after the setup returns.
+# the case started (CASE_START_ENV, epoch seconds, which the lane's runner sets
+# before each case), or, run by hand without it, since HOME_POST_LOOKBACK_ENV
+# seconds before the turn (default HOME_POST_LOOKBACK_SECONDS). So an earlier
+# run's post with the same marker is never this run's. It is watched for up to
+# HOME_POST_WAIT_ENV seconds (default HOME_POST_WAIT_SECONDS), since it may
+# land after the setup returns, read every HOME_POST_POLL_SECONDS.
 HOME_POST_DIRECTIVE = "[reply-under-home-post:"
+CASE_START_ENV = "BENCH_SLACK_CASE_START"
 HOME_POST_LOOKBACK_ENV = "BENCH_SLACK_HOME_POST_LOOKBACK"
 HOME_POST_LOOKBACK_SECONDS = 3600.0
 HOME_POST_WAIT_ENV = "BENCH_SLACK_HOME_POST_WAIT"
 HOME_POST_WAIT_SECONDS = 600.0
+HOME_POST_POLL_SECONDS = 10.0
 HISTORY_PAGE_LIMIT = 200
 
 POLL_SECONDS = 2.0
@@ -327,14 +332,16 @@ class SlackTurn:
         ex = SlackExchange(ask_ts=str(sent["ts"]))
         return self._await(ex, first.ask_ts, deadline_seconds, also_marked=first.ask_ts)
 
-    def find_home_post(self, marker: str, lookback_seconds: float, wait_seconds: float) -> dict | None:
-        """The newest top-level post of the bot's holding marker, from lookback_seconds
-        ago on, watched for until wait_seconds pass; None if none came.
+    def find_home_post(self, marker: str, since: float, wait_seconds: float,
+                       errors: list[str] | None = None) -> dict | None:
+        """The newest top-level post of the bot's holding marker, posted after since
+        (epoch seconds), watched for until wait_seconds pass; None if none came.
 
         A thread reply never counts (a post the agent made on its own opens its
-        thread), and neither does another app's post or a test user's.
+        thread), and neither does another app's post or a test user's. A
+        transient read error is polled through and appended to errors.
         """
-        oldest = f"{self._wall() - lookback_seconds:.6f}"
+        oldest = f"{since:.6f}"
         deadline = self._clock() + wait_seconds
         while True:
             try:
@@ -343,12 +350,18 @@ class SlackTurn:
             except SlackAPIError as err:
                 if not err.transient:
                     raise
+                if errors is not None:
+                    errors.append(str(err))
                 found = []
             if found:
                 return max(found, key=lambda m: ts_value(m.get("ts")) or Decimal(0))
             if self._clock() >= deadline:
                 return None
-            self._sleep(self._poll)
+            self._sleep(max(self._poll, HOME_POST_POLL_SECONDS))
+
+    def wall(self) -> float:
+        """The wall clock the turn reads, epoch seconds."""
+        return self._wall()
 
     def reply_under(self, post_ts: str, text: str, deadline_seconds: float) -> SlackExchange:
         """Reply in post_ts's thread as the test user, mentioning the bot, and read that

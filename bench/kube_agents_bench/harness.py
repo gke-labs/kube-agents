@@ -84,7 +84,9 @@ Environment:
         thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
         ``AGENT_SLACK_TIMEOUT``, 600 s unset; a prompt opening with
         ``[reply-under-home-post: <marker>]`` replies under a post the agent
-        made on its own instead, and only this transport takes it) or ``inject``, which
+        made on its own instead, its wait for the post,
+        ``BENCH_SLACK_HOME_POST_WAIT``, coming before that budget, and only this
+        transport takes it) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -158,6 +160,7 @@ import http.client
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -3011,23 +3014,31 @@ def _execute_slack(prompt: str) -> AgentResult:
         home_post = slack.parse_home_post(prompt)
         lookback = _numeric_env(slack.HOME_POST_LOOKBACK_ENV, str(slack.HOME_POST_LOOKBACK_SECONDS), float)
         wait = _numeric_env(slack.HOME_POST_WAIT_ENV, str(slack.HOME_POST_WAIT_SECONDS), float)
+        case_start = _numeric_env(slack.CASE_START_ENV, "0", float)
+        for name, value in ((slack.HOME_POST_LOOKBACK_ENV, lookback), (slack.HOME_POST_WAIT_ENV, wait),
+                            (slack.CASE_START_ENV, case_start)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite number of seconds, at least 0")
     except ValueError as exc:
         return AgentResult.errored(str(exc))
     turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
     home_ts = ""
+    search_errors: list[str] = []
     try:
         if home_post is None:
             exchange = turn.run(prompt, timeout)
         else:
             marker, reply = home_post
-            post = turn.find_home_post(marker, lookback, wait)
+            since = case_start or turn.wall() - lookback
+            post = turn.find_home_post(marker, since, wait, search_errors)
             if post is None:
                 # The agent never posted what the case set it up to post: the
                 # case's failure to grade, not infrastructure.
                 return AgentResult(
                     output="", trajectory=[], tokens={},
                     errors=[f"slack: no top-level post of the bot's holding {marker!r} in the channel within {wait:g}s"],
-                    metadata={"transport": TRANSPORT_SLACK, "outcome": "no_home_post", "slack_home_post_marker": marker},
+                    metadata={"transport": TRANSPORT_SLACK, "outcome": "no_home_post", "slack_home_post_marker": marker,
+                              "slack_transient_errors": len(search_errors)},
                 )
             home_ts = str(post["ts"])
             exchange = turn.reply_under(home_ts, reply, timeout)
@@ -3064,7 +3075,7 @@ def _execute_slack(prompt: str) -> AgentResult:
             "slack_home_post_ts": home_ts or None,
             "slack_reaction": exchange.reaction or None,
             "slack_buttons": exchange.buttons,
-            "slack_transient_errors": len(exchange.errors),
+            "slack_transient_errors": len(exchange.errors) + len(search_errors),
             **timing,
         },
     )

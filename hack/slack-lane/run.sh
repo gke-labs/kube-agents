@@ -139,7 +139,9 @@ main() {
     # A run that fails before writing its timing must not report the last run's.
     rm -f -- "${dir}/${TIMING_FILE_NAME}" "${timing}"
     # The token reaches the child's environment only, never a file or argv.
-    (cd "${BENCH_DIR}" && AGENT_TRANSPORT=slack BENCH_SLACK_THEN="${reply}" \
+    # The case's start, so a reply-under-home-post case finds only a post made
+    # since (bench/kube_agents_bench/slack_transport.py, CASE_START_ENV).
+    (cd "${BENCH_DIR}" && AGENT_TRANSPORT=slack BENCH_SLACK_THEN="${reply}" BENCH_SLACK_CASE_START="$(date +%s)" \
       BENCH_SLACK_USER_TOKEN="${token}" BENCH_SLACK_CHANNEL_ID="${channel}" BENCH_SLACK_BOT_USER_ID="${bot}" \
       KUBE_AGENTS_TIMING_FILE="${dir}/${TIMING_FILE_NAME}" BENCH_SLACK_TIMING_FILE="${timing}" \
       uv run devops-bench "./tasks/${case_id}" --agent-type kubeagents >"${log}" 2>&1) || rc=$?

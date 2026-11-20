@@ -392,19 +392,36 @@ def test_the_home_post_is_the_bots_newest_top_level_post_holding_the_marker():
     other_app = {"ts": "1800000003.000100", "user": "UOTHER", "bot_id": "BOTHER", "text": MARKER}
     unmarked = {"ts": "1800000004.000100", "user": BOT, "text": "another report"}
     fake = HomeSlack([[older, HOME_POST, reply_in_thread, test_user, other_app, unmarked]], [{}])
-    post = _turn(fake, FakeClock()).find_home_post(MARKER, 3600, 60)
+    post = _turn(fake, FakeClock()).find_home_post(MARKER, 1799996401.5, 60)
     assert post["ts"] == HOME_TS
-    # The lookback is from the wall clock, the turn's 1800000001.5.
     assert fake.history_calls[0]["oldest"] == "1799996401.500000"
 
 
 def test_a_home_post_is_watched_for_until_it_lands_and_given_up_on_after():
     late = HomeSlack([[], [], [HOME_POST]], [{}])
-    assert _turn(late, FakeClock()).find_home_post(MARKER, 3600, 60)["ts"] == HOME_TS
+    assert _turn(late, FakeClock()).find_home_post(MARKER, 0, 60)["ts"] == HOME_TS
     never = HomeSlack([[]], [{}])
     clock = FakeClock()
-    assert _turn(never, clock).find_home_post(MARKER, 3600, 10) is None
+    assert _turn(never, clock).find_home_post(MARKER, 0, 10) is None
     assert clock.now >= 10
+
+
+def test_the_home_post_search_reads_every_page_and_polls_through_a_transient_error():
+    class Flaky(HomeSlack):
+        def call(self, method, **params):
+            if method == "conversations.history":
+                self.history_calls.append(params)
+                if len(self.history_calls) == 1:
+                    raise slack.SlackAPIError("conversations.history", "http_503")
+                if not params.get("cursor"):
+                    return {"ok": True, "messages": [STATUS], "response_metadata": {"next_cursor": "p2"}}
+                return {"ok": True, "messages": [HOME_POST]}
+            return super().call(method, **params)
+
+    errors = []
+    post = _turn(Flaky([], [{}]), FakeClock()).find_home_post(MARKER, 0, 60, errors)
+    assert post["ts"] == HOME_TS
+    assert len(errors) == 1
 
 
 def test_a_reply_under_the_home_post_reads_only_what_came_after_it():
@@ -435,6 +452,7 @@ def _slack_env(monkeypatch, tmp_path):
     clock = FakeClock()
     monkeypatch.setattr(slack.time, "monotonic", clock.clock)
     monkeypatch.setattr(slack.time, "sleep", clock.sleep)
+    monkeypatch.setattr(slack.time, "time", lambda: 1800000001.5)
 
 
 def test_the_harness_replies_under_the_home_post(monkeypatch, tmp_path):
@@ -450,6 +468,27 @@ def test_the_harness_replies_under_the_home_post(monkeypatch, tmp_path):
     assert [p["thread_ts"] for p in fake.posted] == [HOME_TS]
 
 
+def test_the_case_start_bounds_the_search_when_the_lane_sets_it(monkeypatch, tmp_path):
+    _slack_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(slack.CASE_START_ENV, "1799999990")
+    answer = {"ts": "1800000012.000100", "user": BOT, "text": "Two findings."}
+    fake = HomeSlack([[HOME_POST]], [{"replies": [answer]}])
+    monkeypatch.setattr(slack, "SlackClient", lambda token: fake)
+    harness._execute_slack(f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\nhow many findings?")
+    assert fake.history_calls[0]["oldest"] == "1799999990.000000"
+
+
+@pytest.mark.parametrize("name,value", [(slack.HOME_POST_WAIT_ENV, "inf"), (slack.HOME_POST_LOOKBACK_ENV, "nan"),
+                                        (slack.CASE_START_ENV, "-1")])
+def test_a_home_post_knob_that_is_not_finite_seconds_is_refused(monkeypatch, tmp_path, name, value):
+    _slack_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(name, value)
+    fake = HomeSlack([[HOME_POST]], [{}])
+    monkeypatch.setattr(slack, "SlackClient", lambda token: fake)
+    result = harness._execute_slack(f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\nq")
+    assert result.has_errors() and name in result.errors[0] and fake.posted == []
+
+
 def test_no_home_post_is_a_graded_failure_not_infrastructure(monkeypatch, tmp_path):
     _slack_env(monkeypatch, tmp_path)
     monkeypatch.setenv(slack.HOME_POST_WAIT_ENV, "5")
@@ -462,7 +501,14 @@ def test_no_home_post_is_a_graded_failure_not_infrastructure(monkeypatch, tmp_pa
 
 
 def test_a_home_post_directive_is_refused_off_the_slack_transport(monkeypatch):
+    h = harness.KubeAgentsHarness()
+
+    def sent(*args, **kwargs):
+        raise AssertionError("a home-post prompt was sent off the Slack transport")
+
+    monkeypatch.setattr(h, "_execute_inject", sent)
+    monkeypatch.setattr(h, "_execute_api", sent)
     for transport in (harness.TRANSPORT_INJECT, harness.TRANSPORT_API):
         monkeypatch.setenv("AGENT_TRANSPORT", transport)
-        result = harness.KubeAgentsHarness()._execute(f"{slack.HOME_POST_DIRECTIVE} {MARKER}]\nq", opening_turn=True)
+        result = h._execute(f"  \n{slack.HOME_POST_DIRECTIVE} {MARKER}]\nq", opening_turn=True)
         assert result.has_errors() and "needs AGENT_TRANSPORT=slack" in result.errors[0]
