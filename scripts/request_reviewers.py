@@ -648,6 +648,7 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
     """
     uncovered = list(uncovered_files(approvers_by_file, {author.lower()}).values())
     picked = []
+    waited_for_all = []
     while uncovered:
         narrowest = min(uncovered, key=len)
         candidates = [name for name in pool if name.lower() in narrowest]
@@ -658,8 +659,9 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
         if not candidates:
             waited_for = back_soonest([name for name in last_resort if name.lower() in narrowest], away, rng)
             if waited_for:
-                log(f"Everyone here who approves a file is away; drawing {waited_for}, back soonest")
+                log(f"Nobody here approves a file; drawing {waited_for}, away and back soonest")
                 picked.append(waited_for)
+                waited_for_all.append(waited_for)
                 # Someone away stands in only where nobody here can: a file
                 # an approver who is here covers is still drawn for below.
                 here = {name.lower() for name in [*pool, *fallback]}
@@ -670,7 +672,9 @@ def draw_covering(pool, approvers_by_file, author, rng=random, fallback=(), last
             uncovered = [logins for logins in uncovered if logins != narrowest]
             continue
         pick = rng.choice(candidates)
-        if picked:
+        if waited_for_all:
+            log(f"Also drawing {pick}, who is here: {', '.join(waited_for_all)} is asked only for what nobody here approves")
+        elif picked:
             log(f"Also drawing {pick}: {', '.join(picked)} cannot approve every changed file")
         picked.append(pick)
         uncovered = [logins for logins in uncovered if pick.lower() not in logins]

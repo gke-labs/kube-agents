@@ -12,7 +12,8 @@ name: Auto Request Review
 # none, and the marker in that comment is what keeps the grey-check request
 # from firing again.
 #
-# A reviewer who is away is not drawn. The `REVIEWERS_AWAY` repository secret
+# A reviewer who is away is passed over while someone on the roster who is here
+# can do the job. The `REVIEWERS_AWAY` repository secret
 # lists who and until when (the format is beside `AWAY_ENV` in the script);
 # unset, or unreadable, nobody is away. It is a secret because the log of this
 # run is public and prints a step's `env:`, which a secret is masked in.

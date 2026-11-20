@@ -674,6 +674,23 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(len(picked), 2, seed)
             self.assertIn(picked[1], set(OWNERS) - {"jayantid"}, seed)
 
+    def test_an_away_pick_leaves_a_file_to_an_approver_in_the_pool_who_is_here(self):
+        by_file = {"README.md": {"bradhoekstra", "jayantid"}, "hack/eval/presubmit-cases.txt": {"jayantid"}}
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            picked = rr.draw_covering(
+                ["bradhoekstra"], by_file, "author", rng=random.Random(0), last_resort=["jayantid"], away={"jayantid": AWAY_BACK}
+            )
+        self.assertEqual(picked, ["jayantid", "bradhoekstra"])
+        self.assertNotIn("cannot approve every changed file", stderr.getvalue())
+
+    def test_an_away_pick_is_asked_once_for_every_file_only_the_away_approve(self):
+        by_file = {"a.txt": {"jayantid"}, "b.txt": {"jayantid", "lapis2002"}}
+        away = {"jayantid": AWAY_BACK_SOONER, "lapis2002": AWAY_BACK}
+        for seed in range(20):
+            with contextlib.redirect_stderr(io.StringIO()):
+                picked = rr.draw_covering([], by_file, "author", rng=random.Random(seed), last_resort=["jayantid", "lapis2002"], away=away)
+            self.assertEqual(picked, ["jayantid"], seed)
+
     def test_with_everyone_away_the_one_back_soonest_may_be_a_default_reviewer(self):
         # jayantid's own roster change routes to lapis2002, away like every
         # default reviewer. dshnayder is back first and can give the lgtm.

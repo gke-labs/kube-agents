@@ -717,7 +717,7 @@ approver's review, so the draw is narrowed to the `OWNERS` approvers for the cha
 `approved` is per file, so it takes as many of them as it needs to cover every file: first one for
 the file with the fewest approvers, then one more for whatever that person cannot approve, from
 the default reviewers when nobody the glob matched can approve it. Both draws pass over a
-reviewer who is away while someone here can do the same job
+reviewer who is away while someone on the roster who is here can do the same job
 ([who owns an open pull request](#who-owns-an-open-pull-request)). A change
 to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
 unless that member is one. The
@@ -1046,9 +1046,9 @@ is all this page can state about it.
 The script passes over a reviewer who is away, on the check-run path and on `/request-review`. The
 `REVIEWERS_AWAY` repository secret holds a JSON list of who is away and until when, and those people
 leave the draw. A change that needs only `lgtm`, with everyone it routes to away, draws from the
-default reviewers who are here. Where nobody here can approve a file, or nobody is here at all, the
-script asks the person back soonest, at random among those back the same day, so a pull request is
-never left with nobody; a file someone here can approve still gets that person. A request already
+default reviewers who are here. Where nobody here on the roster can approve a file, or nobody on it
+is here at all, the script asks the person back soonest, at random among those back the same day,
+in place of nobody; a file someone here can approve still gets that person. A request already
 made stays with its reviewer. A maintainer sets the list, and each set replaces all of it. Keep the
 value on one line: GitHub masks a secret in the log one line at a time.
 
@@ -1060,7 +1060,7 @@ gh secret set REVIEWERS_AWAY --repo gke-labs/kube-agents \
 gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
 ```
 
-GitHub does not show a secret back, so keep the list you set. The run log names who was passed over
+GitHub does not show a secret back, so keep the list you set. The run log names logins
 and never a date.
 
 ```bash
