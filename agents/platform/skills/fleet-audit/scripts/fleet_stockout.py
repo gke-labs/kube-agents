@@ -250,6 +250,7 @@ POOLS_CANNOT_GROW = "If {pools} cannot grow, pods that use this class wait."
 NO_OPTION_BACKED = "{options} {have} no node pool, and automatic node pool creation is off, so GKE cannot create {them}."
 LABELLED_POOLS_MATCH_NONE = "The node pools with this class's label match no option: {pools}."
 PODS_WAIT = "Pods that use this class wait."
+NO_NODE_ADDED = "GKE adds no node for these options."
 OPTIONS_UNCHECKED = "{options} could not be checked: {names} no node pool and no machine type."
 # The name GKE gives the cluster-level default ComputeClass.
 CLUSTER_DEFAULT_CLASS = "default"
@@ -509,7 +510,7 @@ IMPACT = {
     "ccc-priority-starvation": "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities.",
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
-    UNBACKED_MANUAL_FALLBACK: "Automatic node pool creation is off for this class, so GKE uses only the node pools that exist. A machine option with no node pool is a backup that GKE cannot use, and pods that use this class wait when its node pools cannot take them.",
+    UNBACKED_MANUAL_FALLBACK: "Automatic node pool creation is off for this class, so GKE uses only the node pools that exist. A machine option with no node pool is one that GKE cannot use, and pods that use this class wait when its node pools cannot take them.",
     "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
     # Both arms of §3.9 set their own `impact` on the hit -- and a pool
     # matching both gets both sentences -- so this entry is the fallback
@@ -1342,11 +1343,22 @@ def _option_what(rule: dict) -> str:
     return ""
 
 
-def _options(positions: list[int], priorities: list[dict]) -> str:
+def _options(positions: list[int], priorities: list[dict], pools_of: list[list[str] | None] | None = None) -> str:
     """`option 1 (default-pool)`, `options 2 (n4) and 3 (c3)`: the options at
-    these 1-based places, each with what it asks for when it names something."""
-    named = [f"{position} ({what})" if (what := _option_what(priorities[position - 1])) else str(position) for position in positions]
+    these 1-based places, each with what it asks for when it names something.
+    With `pools_of`, an option that names node pools shows the ones that
+    exist, not the names it lists."""
+    named = []
+    for position in positions:
+        rule = priorities[position - 1]
+        what = ", ".join(pools_of[position - 1] or []) if pools_of and rule.get("nodepools") else _option_what(rule)
+        named.append(f"{position} ({what})" if what else str(position))
     return f"{OPTION_NOUN[len(positions) > 1]} {_and_list(named)}"
+
+
+def _sentence_start(text: str) -> str:
+    """The text with its first letter in upper case and the rest as it is."""
+    return text[:1].upper() + text[1:]
 
 
 def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict | None:
@@ -1375,18 +1387,22 @@ def check_ccc_unbacked_manual_fallback(cc: dict, node_pools: list[dict]) -> dict
     sentences = [OPTIONS_LISTED.format(count=len(priorities))]
     if backed:
         backing = list(dict.fromkeys(pool_name for position in backed for pool_name in pools_of[position - 1]))
-        sentences.append(OPTIONS_BACKED.format(options=_options(backed, priorities), have=HAVE[len(backed) > 1]))
-        sentences.append(OPTIONS_UNBACKED.format(options=_options(unbacked, priorities).capitalize(), have=HAVE[many], them=THEM[many]))
+        sentences.append(OPTIONS_BACKED.format(options=_options(backed, priorities, pools_of), have=HAVE[len(backed) > 1]))
+        sentences.append(OPTIONS_UNBACKED.format(options=_sentence_start(_options(unbacked, priorities)), have=HAVE[many], them=THEM[many]))
         sentences.append(POOLS_CANNOT_GROW.format(pools=_and_list(backing)))
     else:
-        sentences.append(NO_OPTION_BACKED.format(options=_options(unbacked, priorities).capitalize(), have=HAVE[many], them=THEM[many]))
+        sentences.append(NO_OPTION_BACKED.format(options=_sentence_start(_options(unbacked, priorities)), have=HAVE[many], them=THEM[many]))
         labelled = [f"{pool.get('name')} ({(pool.get('config') or {}).get('machineType')})" for pool in _class_pools(name, node_pools)]
         if labelled:
+            # Pods may still run on a labelled pool that matches no option, so
+            # this form says only what GKE does not do.
             sentences.append(LABELLED_POOLS_MATCH_NONE.format(pools=_and_list(labelled)))
-        sentences.append(PODS_WAIT)
+            sentences.append(NO_NODE_ADDED)
+        else:
+            sentences.append(PODS_WAIT)
     if unjudged:
         several = len(unjudged) > 1
-        sentences.append(OPTIONS_UNCHECKED.format(options=_options(unjudged, priorities).capitalize(), names=IT_NAMES[several]))
+        sentences.append(OPTIONS_UNCHECKED.format(options=_sentence_start(_options(unjudged, priorities)), names=IT_NAMES[several]))
     return {"object": f"ComputeClass/{name}", "excerpt": " ".join(sentences), "needs_triage": MANUAL_POOL_TRIAGE}
 
 

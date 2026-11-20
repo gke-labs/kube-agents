@@ -4380,7 +4380,8 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         """3.12 (c) passes on the label, so nothing else names this class."""
         hit = self.check([{"machineFamily": "n4"}, {"machineFamily": "c3"}], [manual_pool("e2-pool", "e2-medium", "general-ccc")])
         self.assertIn("Options 1 (n4) and 2 (c3) have no node pool", hit["excerpt"])
-        self.assertIn("The node pools with this class's label match no option: e2-pool (e2-medium). Pods that use this class wait.", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("The node pools with this class's label match no option: e2-pool (e2-medium). GKE adds no node for these options."))
+        self.assertNotIn("wait", hit["excerpt"])
         workload = deployment("api", node_selector={fs.COMPUTE_CLASS_LABEL: "general-ccc"})
         cc = compute_class("general-ccc", [{"machineFamily": "n4"}, {"machineFamily": "c3"}], node_pool_auto_creation=False)
         self.assertIsNone(fs.check_dangling_compute_class(workload, {"general-ccc": cc}, {"general-ccc"}))
@@ -4408,7 +4409,8 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
     def test_a_nodepools_rule_with_several_names_is_backed_by_one_that_exists(self):
         rules = [{"nodepools": ["gone-pool", "default-pool"]}, {"machineFamily": "n4"}]
         hit = self.check(rules, [FLEET_POOL])
-        self.assertIn("Only option 1 (gone-pool, default-pool) has a node pool.", hit["excerpt"])
+        self.assertIn("Only option 1 (default-pool) has a node pool.", hit["excerpt"])
+        self.assertNotIn("gone-pool", hit["excerpt"])
         self.assertIn("If default-pool cannot grow, pods that use this class wait.", hit["excerpt"])
 
     def test_the_finding_is_marked_for_triage(self):
@@ -4446,6 +4448,10 @@ class CccUnbackedManualFallbackTest(unittest.TestCase):
         self.assertIn("Only options 1 (a) and 3 (b) have a node pool. Option 2 (n4) has none", hit["excerpt"])
         self.assertIn("If a and b cannot grow, pods that use this class wait.", hit["excerpt"])
         self.assertTrue(hit["excerpt"].endswith("Options 4 and 5 could not be checked: they name no node pool and no machine type."))
+
+    def test_the_detail_keeps_the_case_of_a_name(self):
+        rules = [{"nodepools": ["default-pool"]}, {"machineType": "N4-Standard-8"}]
+        self.assertIn("Option 2 (N4-Standard-8) has none", self.check(rules, [FLEET_POOL])["excerpt"])
 
     def test_no_customer_text_of_the_check_says_priority_rule(self):
         """The finding is written for a reader who does not know ComputeClasses."""
