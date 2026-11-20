@@ -364,8 +364,8 @@ func TestTheVersionControlSkillUsesTheNamedRepositoryAndStopsAtARefusal(t *testi
 	}
 	text := strings.Join(strings.Fields(string(b)), " ")
 	for _, phrase := range []string{
-		"Use the repository the task names. If it names none, run `python3 \"$V\" identity` with no `--repo`: it answers the install's managed repositories (`managedRepositories`), the only ones the broker serves.",
-		"if none fits, or more than one could, say so in your answer and stop; don't guess one.",
+		"Use the repository the task names. If it names none, run `python3 \"$V\" identity` with no `--repo`, before cloning anything: it answers the install's managed repositories (`managedRepositories`), the only ones the broker serves.",
+		"Use the one the task means, passing its name to `--repo` exactly as listed; if none fits, or more than one could, say so in your answer and stop; don't guess one.",
 		"If a verb is refused, report the refusal and stop; don't probe other verbs or repositories.",
 		"**Write only to what this task created.** `proposal update` and `publish --advance` only on the branch and pull request this task opened in this run; never on another existing `platform-agent/` branch or pull request, even one this install opened earlier.",
 		"On `proposal update`, the pull request isn't this task's to edit; report it and stop.",
