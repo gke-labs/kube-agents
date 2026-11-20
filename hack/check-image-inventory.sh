@@ -450,6 +450,7 @@ check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platf
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
 check_compiled_image_name a2a-dispatcher k8s-operator/internal/controller/platformagent_a2a_dispatcher.go a2aDispatcherImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
+check_compiled_image_name a2a-teams-inbound k8s-operator/internal/controller/platformagent_teams_inbound.go a2aTeamsInboundImageName
 check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
 check_compiled_image_name kube-proxy k8s-operator/internal/controller/kube_proxy_manifests.go kubeProxyRepositoryName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
