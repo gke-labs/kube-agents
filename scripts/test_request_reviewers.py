@@ -605,9 +605,9 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(picked, ["lapis2002"], seed)
 
     def test_an_away_approver_of_one_file_leaves_the_other_file_to_someone_present(self):
-        # The roster half goes to the eval-crew member who is here; the doc
-        # half is hers too only if she approves it, and jayantid, away, is not
-        # asked for either.
+        # The roster half goes to lapis2002, the eval-crew member who is here,
+        # who does not approve the doc half; that goes to a root approver who
+        # is here, and jayantid, away, is not asked for either.
         by_file = {"README.md": {name.lower() for name in OWNERS}, "hack/eval/presubmit-cases.txt": set(EVAL_CREW)}
         for seed in range(20):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -663,8 +663,8 @@ class SelectionTest(unittest.TestCase):
 
     def test_an_away_pick_does_not_stand_in_for_a_file_someone_here_approves(self):
         # Both eval-crew members are away and jayantid, back first, is a root
-        # approver too. He is asked for the roster half only he and lapis2002
-        # approve; the README half still goes to a root approver who is here.
+        # approver too. jayantid is asked for the roster half only the two of
+        # them approve; the README half still goes to a root approver who is here.
         by_file = {"README.md": {name.lower() for name in OWNERS}, "hack/eval/presubmit-cases.txt": set(EVAL_CREW)}
         away = {"jayantid": AWAY_BACK_SOONER, "lapis2002": AWAY_BACK}
         for seed in range(20):
