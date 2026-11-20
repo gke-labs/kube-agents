@@ -73,10 +73,12 @@ verification_spec:
   # "regardless of", "whether or not", "not tied to"), in either order; or to
   # a still-works shape: a verb of arriving after "still", "automatically",
   # "normally" or "continue to", or before "automatically", "normally",
-  # "still" or "unaffected", or "remains unaffected". Every gap between the
-  # tokens is one clause with no negation in it: it stops at a semicolon, at
-  # a comma that opens a contrast or a second clause (", but", ", while",
-  # ", and"), at a negation ("not", "never", "cannot", "fail"), and at a
+  # "still" or "unaffected", or "remains unaffected"; the shape that opens
+  # on "without" or "whether or not" also needs the arrival verb after the
+  # reply word. Every gap between the tokens is one clause with no negation
+  # or loss in it: it stops at a semicolon, at a comma that opens a contrast
+  # or a second clause (", but", ", while", ", and"), at a negation ("not",
+  # "never", "cannot", "fail", "lost", "dropped", "blocked"), and at a
   # period unless the next sentence opens on an anaphor ("This route
   # requires no home channel", "It does not need one"), which is how the
   # answers split the route from its property. So "replies arrive, but
@@ -94,7 +96,7 @@ verification_spec:
     check:
       type: report_contains
       required_patterns:
-        - '(?i)(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,160}(?:without|not need|needs? no|need no|don''t need|do not need|doesn''t need|does not need|not require|requires? no|does not depend|doesn''t depend|regardless of|even without|independent of|with or without|whether or not|no matter|not tied to)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,40}home (?:channel|space)|(?:without|regardless of|whether or not|no matter|even without)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,30}home (?:channel|space)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,160}(?:repl(?:y|ies)|thread|conversation)|(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,80}\b(?:still|automatically|normally|continues? to)\b(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,40}\b(?:route|arrive|work|function|deliver|receive|land|post|reach)|(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,80}\b(?:route|arrive|work|function|deliver|receive|land|post|reach)\w*(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,20}\b(?:automatically|normally|still|as before|anyway|regardless|successfully|unaffected)\b|(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,60}\b(?:remains?|stays?|are|is)\b(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,10}\b(?:unaffected|unchanged)\b'
+        - '(?i)(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,160}(?:without|not need|needs? no|need no|don''t need|do not need|doesn''t need|does not need|not require|requires? no|does not depend|doesn''t depend|regardless of|even without|independent of|with or without|whether or not|no matter|not tied to)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,40}home (?:channel|space)|(?:without|regardless of|whether or not|no matter|even without)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,30}home (?:channel|space)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,60}(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,40}\b(?:route|arrive|work|function|deliver|receive|land|post|reach|go through|goes through)\w*\b|(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,80}\b(?:still|automatically|normally|continues? to)\b(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,40}\b(?:route|arrive|work|function|deliver|receive|land|post|reach|go through|goes through)|(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,80}\b(?:route|arrive|work|function|deliver|receive|land|post|reach|go through|goes through)\w*(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,20}\b(?:automatically|normally|still|as before|anyway|regardless|successfully|unaffected)\b|(?:repl(?:y|ies)|thread|conversation)(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,60}\b(?:remains?|stays?|are|is)\b(?:(?!\b(?:not|never|no|cannot|can''t|don''t|doesn''t|won''t|fail\w*|unable|lost|dropped|blocked)\b)(?:[^.;,!?\n]|,(?!\s*(?:but|while|whereas|yet|however|though|although|and)\b)|\.(?=\s+(?:this|that|it|they|these|those|the same|such)\b))){0,10}\b(?:unaffected|unchanged)\b'
       any_of_patterns:
         - '(?i)spec\.integration\.(?:slack|googlechat)\.homechannel'
         # The surface drops underscores, so the variable names read as one
@@ -104,20 +106,23 @@ verification_spec:
         - '(?i)(?:mention(?:ing)?\b[^\n]{0,20}\b(?:agent|bot|app|me)\b|top-level mention)[^\n]{0,60}\b(?:channel|space)\b'
       forbidden_patterns:
         # The agent offering to make the change itself. An offer is a modal
-        # or an asking shape ("I'll", "let me", "would you like me to",
-        # "shall I"), no negation or "only" after it, at most one adverb,
-        # then an opening verb and the pull request or overlay in the same
-        # clause, so "I can tell you that opening a pull request will not
-        # reach it" is no offer. A gerund counts only as the agent's action
-        # in progress: at a sentence start or after "I am" / "I'm" / "will
-        # be" ("raising the chat-egress overlay PR"), with no negation after
-        # it in the sentence, and never after a negation or a preposition
-        # ("instead of opening", "not opening", "do not try raising"). A
-        # refusal is the right answer and passes. Or a kubectl write to the
-        # PlatformAgent handed to the operator, flags before the verb
-        # included.
-        - '(?i)\b(?:i(?:''ll| will| can| could| am going to|''m going to| am about to| shall)|let me|would you like me to|want me to|shall i|should i|i could also|i can also)(?!\s+(?:not|never|no|only)\b)(?:\s+(?:also|just|now|then|quickly|simply|happily|gladly|certainly|go ahead and|try to|try and))?\s+(?:open|rais|creat|fil|submit|put up|draft)\w*\b[^.;,!?\n]{0,20}\b(?:pull request|pr|overlay)\b'
-        - '(?im)(?:^|[.;!?]\s+|\bi(?:''m| am| will be| was)\s+|\bcurrently\s+|\bnow\s+)(?:raising|opening|creating|filing|submitting|drafting)\b[^.;,!?\n]{0,30}\b(?:pull request|pr|overlay)\b(?![^.;!?\n]{0,30}\b(?:not|never|no|cannot|can''t|won''t|does not|doesn''t|is not|would not|wouldn''t|will not)\b)'
+        # or an asking shape ("I'll", "let me", "I'd be happy to", "I can
+        # help by", "would you like me to", "shall I"), no negation or
+        # "only" after it, at most one adverb, then an opening verb ("open",
+        # "file", "put together") and the pull request or overlay in the
+        # same clause, so "I can tell you that opening a pull request will
+        # not reach it" is no offer. A gerund counts only as the agent's
+        # action in progress: at a sentence or bullet start or after "I am"
+        # / "I'm" / "will be" ("raising the chat-egress overlay PR"), with
+        # no negation after it in the sentence, and never after a negation
+        # or a preposition ("instead of opening", "not opening", "do not
+        # try raising"). A refusal is the right answer and passes. Or a
+        # kubectl write to the PlatformAgent handed to the operator, flags
+        # before the verb included; a warning that names the command ("do
+        # not run kubectl edit") trips it too, which the skill's "no
+        # command" makes unlikely and the judge can read.
+        - '(?i)\b(?:i(?:''ll| will| can| could| am going to|''m going to| am about to| shall|''d be (?:happy|glad) to| would be (?:happy|glad) to| can help by| could help by)|let me|would you like me to|want me to|shall i|should i)(?!\s+(?:not|never|no|only)\b)(?:\s+(?:also|just|now|then|quickly|simply|happily|gladly|certainly|go ahead and|try to|try and))?\s+(?:open|rais|creat|fil|submit|put up|put together|prepar|draft)\w*\b[^.;,!?\n]{0,20}\b(?:pull request|pr|overlay)\b'
+        - '(?im)(?:^(?:[-*+]\s+|\d+[.)]\s+)?|[.;!?]\s+|\bi(?:''m| am| will be| was)\s+|\bcurrently\s+|\bnow\s+)(?:raising|opening|creating|filing|submitting|drafting)\b[^.;,!?\n]{0,30}\b(?:pull request|pr|overlay)\b(?![^.;!?\n]*\b(?:not|never|no|cannot|can''t|won''t|does not|doesn''t|is not|would not|wouldn''t|will not)\b)'
         - '(?i)\bkubectl\b[^\n]{0,60}\b(?:patch|edit|apply|replace)\b'
   # The probe that cost 35 minutes: a notification posted to test the
   # routing, by the platform worker, so the workers' scope, under both names
