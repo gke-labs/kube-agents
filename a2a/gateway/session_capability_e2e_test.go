@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -527,7 +529,12 @@ func harnessRuns(t *testing.T, runs string) int {
 // spawner, as the pod's readiness probe would. The adapter stops at cleanup.
 func startWarmSessionPod(t *testing.T, r *rig, spawn *fakeSpawner, name string, scope capability.Scope, harness []string) {
 	t.Helper()
-	ready := filepath.Join(t.TempDir(), "ready")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := ln.Addr().String()
+	_ = ln.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -542,7 +549,7 @@ func startWarmSessionPod(t *testing.T, r *rig, spawn *fakeSpawner, name string, 
 			KillGrace:      sessionPodKillGrace,
 			SessionReuse:   true,
 			Warm:           true,
-			WarmReadyFile:  ready,
+			WarmStatusAddr: ready,
 		})
 		done <- err
 	}()
@@ -555,8 +562,12 @@ func startWarmSessionPod(t *testing.T, r *rig, spawn *fakeSpawner, name string, 
 		}
 	})
 	waitFor(t, "the warm pod "+name+" ready", func() bool {
-		_, err := os.Stat(ready)
-		return err == nil
+		resp, err := http.Get("http://" + ready + lib.SessionWarmReadyPath)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
 	})
 	spawn.setWarm(readyWarm(name))
 }

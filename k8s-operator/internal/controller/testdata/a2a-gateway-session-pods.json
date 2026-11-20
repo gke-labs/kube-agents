@@ -785,7 +785,8 @@
         "a2a.kubeagents.dev/addressee": "warm",
         "a2a.kubeagents.dev/bus-transport": "01ba4719c80b6fe9",
         "a2a.kubeagents.dev/session-reuse": "true",
-        "a2a.kubeagents.dev/warm": "true"
+        "a2a.kubeagents.dev/warm": "true",
+        "a2a.kubeagents.dev/warm-shape": "d60726aed34cc32b"
       }
     },
     "spec": {
@@ -916,7 +917,7 @@
               ]
             },
             "timeoutSeconds": 25,
-            "periodSeconds": 5
+            "periodSeconds": 15
           },
           "securityContext": {
             "capabilities": {

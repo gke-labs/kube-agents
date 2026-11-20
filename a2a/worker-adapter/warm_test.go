@@ -3,7 +3,8 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +17,45 @@ import (
 // to it through the same capability check every turn takes, and then serves
 // its conversation as a reused pod.
 
-func warmConfig(url, session string, harness []string, ready string) Config {
+func warmConfig(url, session string, harness []string, statusAddr string) Config {
 	cfg := reuseConfig(url, "", session, harness)
 	cfg.Warm = true
-	cfg.WarmReadyFile = ready
+	cfg.WarmStatusAddr = statusAddr
 	return cfg
+}
+
+// freeLoopbackAddr is a loopback address nothing is listening on.
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+// warmReadyNow asks the warm status endpoint once.
+func warmReadyNow(addr string) bool {
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get("http://" + addr + lib.SessionWarmReadyPath)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func waitWarmReady(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(waitDeadline)
+	for !warmReadyNow(addr) {
+		if time.Now().After(deadline) {
+			t.Fatal("the warm pod never reported ready")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // The pod is ready only once the consumer it will take its first task from
@@ -33,13 +68,13 @@ func TestAWarmPodIsReadyOnceItsWatcherIsLiveAndThenServesItsConversation(t *test
 	c := testClient(t, url)
 	const session = "chat-otter-w4rm"
 	dir := t.TempDir()
-	ready := filepath.Join(t.TempDir(), "ready")
+	ready := freeLoopbackAddr(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runAdapter(ctx, warmConfig(url, session, recordingStub(t, dir, ""), ready))
 
-	waitPath(t, ready, "the warm pod never reported ready")
+	waitWarmReady(t, ready)
 	ictx, icancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer icancel()
 	if _, err := c.JetStream().Consumer(ictx, lib.TasksStream, lib.SessionConsumerName(session, lib.SessionConsumerOrigin)); err != nil {
@@ -59,6 +94,11 @@ func TestAWarmPodIsReadyOnceItsWatcherIsLiveAndThenServesItsConversation(t *test
 	}
 	if a := readRun(t, dir, "argv", 2); !strings.HasSuffix(strings.TrimSpace(a), harnessResumeFlag+" sess-1") {
 		t.Errorf("the second turn did not resume the first run's session: %q", a)
+	}
+	// Claimed and serving, the pod still answers its probe: readiness is the
+	// adapter's own state, which nothing a turn writes can take away.
+	if !warmReadyNow(ready) {
+		t.Error("a claimed warm pod stopped answering its readiness probe")
 	}
 	cancel()
 	out := waitOutcome(t, done, 30*time.Second)
@@ -80,11 +120,11 @@ func TestAWarmPodRefusesATaskWithNoCapabilityMintedForIt(t *testing.T) {
 	c := testClient(t, url)
 	const session = "chat-heron-w4rn"
 	dir := t.TempDir()
-	ready := filepath.Join(t.TempDir(), "ready")
+	ready := freeLoopbackAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runAdapter(ctx, warmConfig(url, session, recordingStub(t, dir, ""), ready))
-	waitPath(t, ready, "the warm pod never reported ready")
+	waitWarmReady(t, ready)
 
 	for _, tc := range []struct {
 		taskID    string
@@ -111,7 +151,7 @@ func TestAWarmPodRefusesATaskWithNoCapabilityMintedForIt(t *testing.T) {
 // that does not know warm pods (its sweep deletes the exited pod).
 func TestAnUnclaimedWarmPodExitsAtItsIdleBound(t *testing.T) {
 	url := startServer(t)
-	cfg := warmConfig(url, "chat-lynx-w4ro", noHarness, filepath.Join(t.TempDir(), "ready"))
+	cfg := warmConfig(url, "chat-lynx-w4ro", noHarness, freeLoopbackAddr(t))
 	cfg.WarmIdle = 2 * time.Second
 	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
 	if out.err != nil || out.res != (Result{}) {

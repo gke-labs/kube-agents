@@ -89,7 +89,7 @@ type Config struct {
 	// Warm starts the pod with no task (lib.EnvSessionWarm): a pod the
 	// gateway's warm pool started before any conversation needed it. Run
 	// opens the task watcher on the pod's own `…in` subjects, writes
-	// WarmReadyFile once its consumer exists, and runs the first task that
+	// WarmStatusAddr once its consumer exists, and runs the first task that
 	// arrives through the same path every later turn takes. TaskID must be
 	// empty and SessionReuse set (validate). Nothing about the pod's reach
 	// changes: the subjects and consumer names are the pod's own, and every
@@ -99,9 +99,11 @@ type Config struct {
 	// exits with nothing to publish (lib.EnvSessionWarmIdleSeconds). Zero
 	// waits until SIGTERM.
 	WarmIdle time.Duration
-	// WarmReadyFile is where a warm pod reports its watcher is live
-	// (lib.SessionWarmReadyFile in a pod). Empty writes nothing.
-	WarmReadyFile string
+	// WarmStatusAddr is the loopback address a warm pod answers
+	// lib.SessionWarmReadyPath on once its watcher is live, for as long as
+	// the process runs (lib.SessionWarmStatusPort in a pod). Empty serves
+	// nothing.
+	WarmStatusAddr string
 
 	// OriginSeq is the TASKS stream sequence of the submission this process
 	// exists to execute, from the spawner's own PubAck (lib.EnvOriginSeq).

@@ -6,7 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
+	"net"
+	"net/http"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -42,9 +43,9 @@ const (
 	// stream's first sequence. Its subjects carry its own freshly minted
 	// name, so nothing is there before the pod is.
 	warmStartSeq = 1
-	// warmReadyFileMode is the ready file's mode: an empty marker only
-	// the pod's own user reads.
-	warmReadyFileMode = 0o600
+	// warmStatusReadHeaderTimeout bounds a request's headers on the warm
+	// status endpoint.
+	warmStatusReadHeaderTimeout = 5 * time.Second
 )
 
 // runSessionLoop is a reused session pod's life after its first task: wait for
@@ -89,7 +90,7 @@ func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask stri
 // runWarm is a warm pod's life (Config.Warm): no task named at start, so it
 // opens the task watcher on its own `…in` subjects from the stream's first
 // sequence, reports itself ready once the watcher's consumer exists
-// (WarmReadyFile, read by the pod's readiness probe), and runs the first
+// (WarmStatusAddr, read by the pod's readiness probe), and runs the first
 // task that arrives exactly as a reused pod runs its next turn: the same
 // execute, so the same capability check before any harness starts. From
 // there it is a reused session pod (sessionLoop).
@@ -113,7 +114,7 @@ func runWarm(ctx context.Context, cfg Config, b *busConns) (Result, error) {
 		addr:    cfg.Addressee(),
 		next:    warmStartSeq,
 		handled: map[string]bool{},
-		onLive:  func() { markWarmReady(cfg) },
+		onLive:  func() { serveWarmStatus(ctx, cfg) },
 	}
 	waitCtx, cancelWait := ctx, context.CancelFunc(func() {})
 	if cfg.WarmIdle > 0 {
@@ -140,19 +141,29 @@ func runWarm(ctx context.Context, cfg Config, b *busConns) (Result, error) {
 	return sessionLoop(ctx, cfg, b, w, out)
 }
 
-// markWarmReady writes the warm pod's ready file. A failure is logged and
-// leaves the pod unready, so the gateway never claims it and its pool
-// replaces it at the recycle age: a pod that is never handed a task is the
-// safe failure.
-func markWarmReady(cfg Config) {
-	if cfg.WarmReadyFile == "" {
+// serveWarmStatus starts the warm pod's status endpoint: 200 on
+// lib.SessionWarmReadyPath, from now until ctx ends, whatever the pod does
+// after its claim. A listen failure is logged and leaves the pod unready, so
+// the gateway never claims it and its pool replaces it: a pod that is never
+// handed a task is the safe failure.
+func serveWarmStatus(ctx context.Context, cfg Config) {
+	if cfg.WarmStatusAddr == "" {
 		return
 	}
-	if err := os.WriteFile(cfg.WarmReadyFile, nil, warmReadyFileMode); err != nil {
-		cfg.Logger.Error("could not report this warm pod ready; it will not be claimed", "file", cfg.WarmReadyFile, "err", err)
+	ln, err := net.Listen("tcp", cfg.WarmStatusAddr)
+	if err != nil {
+		cfg.Logger.Error("could not serve this warm pod's status; it will not be claimed", "addr", cfg.WarmStatusAddr, "err", err)
 		return
 	}
-	cfg.Logger.Info("warm pod ready: its task watcher is live", "file", cfg.WarmReadyFile)
+	mux := http.NewServeMux()
+	mux.HandleFunc(lib.SessionWarmReadyPath, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: warmStatusReadHeaderTimeout}
+	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	cfg.Logger.Info("warm pod ready: its task watcher is live", "addr", cfg.WarmStatusAddr)
 }
 
 // sessionLoop is runSessionLoop's body over a watcher already positioned,

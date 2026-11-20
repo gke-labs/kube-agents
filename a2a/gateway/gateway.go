@@ -318,10 +318,13 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
-	// warmMu serializes a claim of a warm pod against the pool's own
-	// deletes, so the pool never deletes a pod a turn is claiming
-	// (warm_pool.go).
-	warmMu sync.Mutex
+	// warmMu guards warmClaiming and warmDeleting, the warm pods a turn is
+	// claiming and the pool is deleting right now, so neither acts on a pod
+	// the other has in hand (warm_pool.go). It is held only to read and mark
+	// them, never across an API call.
+	warmMu       sync.Mutex
+	warmClaiming map[string]bool
+	warmDeleting map[string]bool
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.

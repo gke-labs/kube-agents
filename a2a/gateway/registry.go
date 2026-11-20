@@ -120,6 +120,11 @@ type SessionRecord struct {
 	// handed a later task, and only such a pod's running task is held to
 	// the reap scan's overdue bound; a one-task pod has its own deadline.
 	PodReuse bool `json:"podReuse,omitempty"`
+	// PodClaimedAt is when PodName was claimed from the warm pool, zero for
+	// a pod spawned for the conversation. A warm pod was started before its
+	// claim, so its reuse window counts from here, ending when a fresh
+	// spawn's would (reuseLivePod). An older gateway ignores it.
+	PodClaimedAt time.Time `json:"podClaimedAt,omitzero"`
 	// warmClaim is the warm pod this turn claimed as the conversation's
 	// next incarnation (claimOrMint), for ensureSessionPod to record in
 	// place of a spawn. The turn's own: never stored, since the record's
@@ -1478,6 +1483,23 @@ func (r *Registry) WarmClaims(ctx context.Context) (map[string]string, error) {
 		claims[strings.TrimPrefix(key, warmClaimPrefix)] = string(entry.Value())
 	}
 	return claims, nil
+}
+
+// StillLeading reports whether this gateway's term is still the newest: no
+// later term has begun on the counter. At term 0 (no election) it always is.
+// A read that fails is not leading: the caller is about to delete, and a
+// delete a deposed leader should not make waits for the next pass.
+func (r *Registry) StillLeading(ctx context.Context) bool {
+	mine := r.epoch.Load()
+	if mine == 0 {
+		return ctx.Err() == nil
+	}
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return false
+	}
+	term, _, err := readTerm(ctx, kv)
+	return err == nil && term <= mine
 }
 
 // DropWarmClaim removes a claim whose pod is gone (the pool's pass). Not

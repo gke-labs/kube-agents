@@ -1160,7 +1160,8 @@ type TuningSpec struct {
 	// running pod instead of waiting for one to be scheduled and its image
 	// pulled. Unset means 1. Each warm pod holds one session pod's requests
 	// while it waits (sessionResources: 150m CPU and 320Mi by default, billed
-	// on Autopilot), so the default costs one session pod's requests per
+	// on Autopilot, where without Pod bursting the per-Pod minimum of 250m and
+	// 512Mi applies), so the default costs one session pod's requests per
 	// install; 0 turns the pool off.
 	//
 	// A warm pod becomes the conversation's session pod as it is, with exactly

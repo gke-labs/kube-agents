@@ -216,10 +216,23 @@ const (
 	// conversation spawns cold, as without a pool.
 	workerAdapterPath = "/usr/local/bin/worker-adapter"
 	// warmReadinessPeriodSeconds paces the warm pod's readiness probe. It
-	// only decides how soon after start a new warm pod can be claimed.
-	warmReadinessPeriodSeconds = 5
+	// only decides how soon after start a new warm pod can be claimed; the
+	// probe passes for the pod's whole life once its watcher is live, so a
+	// longer period costs nothing but that.
+	warmReadinessPeriodSeconds = 15
+	// annoWarmShape stamps a warm pod with a digest of the spec it was
+	// created with (warmShape): the worker image, the scope and capability
+	// switch, the resources, the deadlines and the bus transport. A pod whose
+	// stamp is not this gateway's current one was made under an earlier
+	// config, so it is never claimed and the pool replaces it.
+	annoWarmShape = "a2a.kubeagents.dev/warm-shape"
+	// warmShapeName is the placeholder name warmShape builds the spec under,
+	// so the digest is of the config and not of any one pod's name.
+	warmShapeName = "warm-shape"
+	// warmShapeLength is how much of the digest the stamp carries.
+	warmShapeLength = 16
 	// warmReadinessTimeoutMargin is what the probe's timeout adds above the
-	// probe command's own wait for the ready file
+	// probe command's own wait for the status endpoint
 	// (lib.SessionWarmReadyWaitSeconds), so the command answers before the
 	// kubelet gives up on it.
 	warmReadinessTimeoutMargin = 5
@@ -308,6 +321,8 @@ type warmPod struct {
 	Ready bool
 	// Gone is a pod in a terminal phase or being deleted.
 	Gone bool
+	// Current is a pod made under this gateway's config (annoWarmShape).
+	Current bool
 }
 
 // mintSessionName gives an incarnation its bus session name,
@@ -443,8 +458,25 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 // task reaches it only with a capability whose delegate is this name.
 func (s *podSpawner) SpawnWarm(ctx context.Context, name string) error {
 	rec := &SessionRecord{BusSession: name, Addressee: name, Profile: sessionProfile, SessionRouted: true}
-	_, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, s.sessionPodSpec(rec, "", "", 0, true), metav1.CreateOptions{})
+	pod := s.sessionPodSpec(rec, "", "", 0, true)
+	pod.Annotations[annoWarmShape] = s.warmShape()
+	_, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	return err
+}
+
+// warmShape is the digest annoWarmShape carries: the warm pod spec this
+// gateway would create now, under a placeholder name.
+func (s *podSpawner) warmShape() string {
+	rec := &SessionRecord{BusSession: warmShapeName, Addressee: warmShapeName, Profile: sessionProfile, SessionRouted: true}
+	spec, err := json.Marshal(s.sessionPodSpec(rec, "", "", 0, true).Spec)
+	if err != nil {
+		// A PodSpec always marshals; an empty stamp matches no pod, so the
+		// failure is a pool that spawns cold rather than one that claims a
+		// pod of unknown shape.
+		return ""
+	}
+	sum := sha256.Sum256(spec)
+	return hex.EncodeToString(sum[:])[:warmShapeLength]
 }
 
 // warmPodLifetime is a warm pod's activeDeadlineSeconds: its unclaimed
@@ -936,6 +968,7 @@ func (s *podSpawner) WarmPods(ctx context.Context) ([]warmPod, error) {
 		return nil, err
 	}
 	now := time.Now()
+	shape := s.warmShape()
 	var out []warmPod
 	for i := range pods.Items {
 		p := &pods.Items[i]
@@ -947,6 +980,7 @@ func (s *podSpawner) WarmPods(ctx context.Context) ([]warmPod, error) {
 			Created: p.CreationTimestamp.Time,
 			Ready:   podReusable(p, s.busTransport(), s.cfg.TaskDeadline, now) && podReady(p),
 			Gone:    p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil,
+			Current: shape != "" && p.Annotations[annoWarmShape] == shape,
 		})
 	}
 	return out, nil
@@ -1175,6 +1209,7 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 		}
 		rec.PodName = pod
 		rec.PodReuse = true
+		rec.PodClaimedAt = time.Now()
 		g.log.Info("handed the conversation a warm session pod", "session", rec.Key, "pod", pod, "task", taskID)
 		return
 	}
@@ -1202,6 +1237,7 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	}
 	rec.PodName = podName
 	rec.PodReuse = g.cfg.reusePod(rec)
+	rec.PodClaimedAt = time.Time{}
 	g.log.Info("spawned session pod", "session", rec.Key, "pod", podName, "task", taskID, "reuse", rec.PodReuse)
 }
 

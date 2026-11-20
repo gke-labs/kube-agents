@@ -296,3 +296,73 @@ func TestAPrunedWarmCountRendersNoWarmPodAndIsNotRewritten(t *testing.T) {
 	}
 	check(pass, "the reprobe")
 }
+
+// An unreadable pass with a cap stored and no warm count (a status written
+// before the warm pool) keeps the count the live gateway runs with rather
+// than writing 0, so the gateway doesn't roll to 0 and back once a reading
+// arrives.
+func TestAnUnreadablePassKeepsTheGatewaysWarmCount(t *testing.T) {
+	ctx := context.Background()
+	agent := sessionRouteTestAgent()
+	agent.Status.EffectiveSessionCap = ptr.To(4)
+	gw := buildA2AGatewayDeployment(agent)
+	gw.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{{Name: a2aWarmSessionsEnvVar, Value: "1"}}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, gw).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: unreadableBus}
+	stored := storedCapAgent(t, cl, agent)
+	stored.Status.BusMigration = nil
+	r.resolveA2ASessionCap(ctx, stored, nil)
+	if got := stored.Status.EffectiveWarmSessions; got == nil || *got != 1 {
+		t.Fatalf("effectiveWarmSessions = %v on an unreadable pass, want the gateway's 1", got)
+	}
+	if got := gatewayEnv(t, stored, a2aWarmSessionsEnvVar); got != "1" {
+		t.Fatalf("%s = %q, want 1 again, so the gateway doesn't roll", a2aWarmSessionsEnvVar, got)
+	}
+}
+
+// On the platform route nothing new runs, whatever warmSessions says: the
+// gateway carries no A2A_WARM_SESSIONS (its default is no pool), and the
+// TASKS budget, the width a new TASKS is created at, the session quota and
+// the status carry no warm term, exactly as before the field. An unset
+// defaultRoute is the platform route, so a default install renders as it
+// did before warm pods.
+func TestThePlatformRouteRendersNoWarmPod(t *testing.T) {
+	ctx := context.Background()
+	check := func(t *testing.T, mutate func(*agentv1alpha1.PlatformAgent)) {
+		t.Helper()
+		r, cl, _, agent := sessionCapRig(t, mutate, tasksAt(151))
+		r.resolveA2ASessionCap(ctx, agent, nil)
+		if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRoutePlatform {
+			t.Fatalf("the route resolves to %q here, not platform", resolveA2ADefaultRoute(agent))
+		}
+		if _, n := envValueCount(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env, a2aWarmSessionsEnvVar); n != 0 {
+			t.Fatalf("the gateway carries %s %d times on the platform route, want none", a2aWarmSessionsEnvVar, n)
+		}
+		sessions := resolveA2AMaxSessions(agent)
+		if got, want := a2aTasksConsumerBudget(agent), sessions*a2aSessionConsumersPerSession+a2aTasksReserve(agent); got != want {
+			t.Errorf("budget = %d, want %d with no warm consumer", got, want)
+		}
+		if got, want := a2aTasksMaxConsumers(agent), max(sessions*a2aSessionConsumersPerSession+a2aTasksReserve(agent), a2aTasksMaxConsumersFloor); got != want {
+			t.Errorf("a new TASKS is created at %d, want %d with no warm consumer", got, want)
+		}
+		quota := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+		if want := int64(sessions) + a2aQuotaHeadroom(agent); quota.Value() != want {
+			t.Errorf("session quota pods = %d, want %d with no warm pod", quota.Value(), want)
+		}
+		if got := storedCapAgent(t, cl, agent).Status.EffectiveWarmSessions; got != nil {
+			t.Errorf("status.effectiveWarmSessions = %d on the platform route, want absent", *got)
+		}
+	}
+	t.Run("set to platform", func(t *testing.T) {
+		check(t, func(a *agentv1alpha1.PlatformAgent) {
+			a.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{
+				DefaultRoute: ptr.To(agentv1alpha1.DefaultRoutePlatform), WarmSessions: ptr.To(3)}}
+		})
+	})
+	t.Run("unset", func(t *testing.T) {
+		check(t, func(a *agentv1alpha1.PlatformAgent) {
+			a.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{WarmSessions: ptr.To(3)}}
+		})
+	})
+}

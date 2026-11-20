@@ -727,20 +727,27 @@ the cap less one and fewer while live sessions fill the cap (`a2a/gateway/warm_p
 pod is the session pod `Spawn` builds, created through the same CREATE-only path and admission
 policy, with no task or conversation annotation and an `a2a.kubeagents.dev/warm` mark. It has a
 freshly minted name, and its adapter starts without `TASK_ID` (`A2A_SESSION_WARM`), opens its
-task watcher on its own `…in` subjects and reports Ready once the watcher's consumer exists. A
+task watcher on its own `…in` subjects and reports Ready once the watcher's consumer exists,
+from a loopback endpoint that keeps answering for the pod's life. It carries a digest of the
+spec it was made with (`a2a.kubeagents.dev/warm-shape`), so after a release or a config change
+the old pods are never claimed and the pool replaces them. A
 session pod's bus identity is its name, so the gateway claims a warm pod by setting the
 record's bus session and addressee to the pod's name instead of minting one. Nothing is
 re-bound: the capability names the pod, and its grants are what a fresh spawn under that
 name gets, so an unclaimed pod can run nothing. Only a session-routed conversation with no
 earlier turn claims one (a warm pod has no primer, which is read once at start), never a
-one-shot Delegate, and with none ready the turn spawns cold. The gateway cannot patch the
+one-shot Delegate, and with none ready the turn spawns cold. A pod anything was ever
+published to is never claimed, whatever the claim index says. The gateway cannot patch the
 pod, so the claim goes in the session-state bucket (`warm.<pod>` naming the conversation),
 and the cap count, the cap eviction and both sweeps read the claim in place of the
 annotations; an unclaimed warm pod holds no cap slot and is no stranded orphan. The pool
 replaces an unclaimed pod at 25 minutes; its adapter exits unclaimed at 30, which is what
 frees it under a gateway that predates the pool, whose sweep deletes an ended pod with no
-task annotations. A warm pod's deadline is that 30 minutes plus a reused pod's lifetime, so a
-claimed pod lives as long as a fresh one. Each warm pod takes one `TASKS` consumer and one pod in the session quota, and warm pods use only consumers the session cap leaves spare (`status.effectiveWarmSessions`): the cap is fitted as before, and a stream with none spare runs without a warm pod rather than losing a session. A new `TASKS` is created with room for them. Recycling is quiet: the readiness probe waits out the adapter's start rather than failing during it, and the pool and the sweep log at info and record no Event.
+task annotations. A claimed pod has no such bound there: it lasts until its conversation is
+reaped or its deadline, and that gateway's cap counts it but its eviction can't choose it, since
+the pod carries no session key and the gateway can't patch one on. A warm pod's deadline is
+that 30 minutes plus a reused pod's lifetime, and a claimed pod takes turns only as long as one
+spawned at the claim would (`podClaimedAt` on the record). Each warm pod takes one `TASKS` consumer and one pod in the session quota, and warm pods use only consumers the session cap leaves spare (`status.effectiveWarmSessions`): the cap is fitted as before, and a stream with none spare runs without a warm pod rather than losing a session. A new `TASKS` is created with room for them. Recycling is quiet: the readiness probe waits out the adapter's start rather than failing during it, and the pool and the sweep log at info and record no Event. On Autopilot without Pod bursting a warm pod is billed at the per-Pod minimum of 250m and 512Mi.
 
 What this costs is pods: one per live conversation, bounded by the session cap and the
 idle TTL, and the warm pods, one session pod's requests each. That is the figure to measure

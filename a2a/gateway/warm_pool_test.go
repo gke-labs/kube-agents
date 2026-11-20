@@ -3,10 +3,16 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +41,7 @@ func startWarmRig(t *testing.T) (*rig, *fakeSpawner) {
 }
 
 func readyWarm(name string) warmPod {
-	return warmPod{Name: name, Created: time.Now(), Ready: true}
+	return warmPod{Name: name, Created: time.Now(), Ready: true, Current: true}
 }
 
 func warmClaims(t *testing.T, r *rig) map[string]string {
@@ -77,10 +83,11 @@ func TestTheWarmPoolNeverTakesTheLastSlot(t *testing.T) {
 		cfg  Config
 		want bool
 	}{
-		{"on", Config{SessionReuse: true, WarmSessions: 1, MaxSessions: 2}, true},
-		{"warmSessions 0", Config{SessionReuse: true, WarmSessions: 0, MaxSessions: 10}, false},
-		{"a cap below two", Config{SessionReuse: true, WarmSessions: 1, MaxSessions: 1}, false},
-		{"reuse off", Config{SessionReuse: false, WarmSessions: 1, MaxSessions: 10}, false},
+		{"on", Config{DefaultAddressee: RouteSession, SessionReuse: true, WarmSessions: 1, MaxSessions: 2}, true},
+		{"the platform route", Config{DefaultAddressee: "platform", SessionReuse: true, WarmSessions: 1, MaxSessions: 10}, false},
+		{"warmSessions 0", Config{DefaultAddressee: RouteSession, SessionReuse: true, WarmSessions: 0, MaxSessions: 10}, false},
+		{"a cap below two", Config{DefaultAddressee: RouteSession, SessionReuse: true, WarmSessions: 1, MaxSessions: 1}, false},
+		{"reuse off", Config{DefaultAddressee: RouteSession, SessionReuse: false, WarmSessions: 1, MaxSessions: 10}, false},
 	} {
 		cfg := tc.cfg
 		g := &Gateway{cfg: &cfg, spawner: &fakeSpawner{}}
@@ -88,7 +95,7 @@ func TestTheWarmPoolNeverTakesTheLastSlot(t *testing.T) {
 			t.Errorf("%s: warmPoolOn = %v, want %v", tc.name, got, tc.want)
 		}
 	}
-	if (&Gateway{cfg: &Config{SessionReuse: true, WarmSessions: 1, MaxSessions: 10}}).warmPoolOn() {
+	if (&Gateway{cfg: &Config{DefaultAddressee: RouteSession, SessionReuse: true, WarmSessions: 1, MaxSessions: 10}}).warmPoolOn() {
 		t.Error("a gateway with no spawner keeps a pool")
 	}
 }
@@ -195,9 +202,10 @@ func TestAFirstTurnSpawnsColdWithNoClaimableWarmPod(t *testing.T) {
 		warm    warmPod
 		claimed bool
 	}{
-		{"not ready", warmPod{Name: pod, Created: time.Now()}, false},
-		{"past its claim window", warmPod{Name: pod, Created: time.Now().Add(-warmClaimableAge), Ready: true}, false},
-		{"ending", warmPod{Name: pod, Created: time.Now(), Ready: true, Gone: true}, false},
+		{"not ready", warmPod{Name: pod, Created: time.Now(), Current: true}, false},
+		{"made under an earlier config", warmPod{Name: pod, Created: time.Now(), Ready: true}, false},
+		{"past its claim window", warmPod{Name: pod, Created: time.Now().Add(-warmClaimableAge), Ready: true, Current: true}, false},
+		{"ending", warmPod{Name: pod, Created: time.Now(), Ready: true, Gone: true, Current: true}, false},
 		{"claimed by another conversation", readyWarm(pod), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -366,8 +374,8 @@ func TestTheWarmPoolKeepsItsSizeAndRecyclesByAge(t *testing.T) {
 	}
 
 	const aged, old = "chat-otter-w6aa", "chat-otter-w6bb"
-	spawn.setWarm(warmPod{Name: aged, Created: time.Now().Add(-warmClaimableAge), Ready: true},
-		warmPod{Name: old, Created: time.Now().Add(-2 * warmRecycleAge), Ready: true})
+	spawn.setWarm(warmPod{Name: aged, Created: time.Now().Add(-warmClaimableAge), Ready: true, Current: true},
+		warmPod{Name: old, Created: time.Now().Add(-2 * warmRecycleAge), Ready: true, Current: true})
 	if err := r.g.reg.ClaimWarmPod(ctx, old, "discord:g1/t-old"); err != nil {
 		t.Fatal(err)
 	}
@@ -508,11 +516,14 @@ func TestAnOlderGatewaysSweepDeletesAnEndedWarmPod(t *testing.T) {
 	}
 }
 
-// A recycle is routine, so it is quiet: a pass that replaces an aged warm
-// pod over the API deletes it and creates its replacement and records no
-// Event, and the replacement's readiness probe waits out the adapter's start
-// (lib.SessionWarmReadyWaitSeconds) rather than failing during it, which
-// would record a Warning Unhealthy Event for every warm pod started.
+// A recycle over the API is a delete and a create and nothing else: the
+// gateway records no Event of its own for it. It does not show the probe is
+// quiet, which is the kubelet's to record: that rests on the probe command
+// waiting out the adapter's start (cmd/worker-adapter's
+// TestAWarmSessionPodStartsWithNoTaskID) and on the endpoint answering for
+// the pod's life (worker-adapter's
+// TestAWarmPodIsReadyOnceItsWatcherIsLiveAndThenServesItsConversation); this
+// checks only that the probe's timeout outlasts the command's wait.
 func TestARecycleRecordsNoEvent(t *testing.T) {
 	g, cs, _ := capRig(t, 4)
 	g.cfg.SessionReuse, g.cfg.WarmSessions = true, 1
@@ -558,5 +569,197 @@ func TestARecycleRecordsNoEvent(t *testing.T) {
 	probe := pods.Items[0].Spec.Containers[0].ReadinessProbe
 	if probe == nil || probe.TimeoutSeconds <= lib.SessionWarmReadyWaitSeconds {
 		t.Fatalf("the replacement's probe %+v does not outlast the probe command's %ds wait", probe, lib.SessionWarmReadyWaitSeconds)
+	}
+}
+
+// A warm pod made under another config (a release that changed the worker
+// image, a moved scope, new resources) is never claimed and the pool
+// replaces it: the stamp of the spec it was made with no longer matches.
+func TestAConfigChangeRetiresTheWarmPodsMadeUnderTheOldOne(t *testing.T) {
+	cfg := &Config{Namespace: "ns", WorkerImage: "worker:1", SessionServiceAccount: "sa", TaskDeadline: 30 * time.Minute,
+		SessionReuse: true, AuthorityScope: "namespace/team-a"}
+	cs := k8sfake.NewSimpleClientset()
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	if err := s.SpawnWarm(context.Background(), "chat-otter-wcfg"); err != nil {
+		t.Fatal(err)
+	}
+	current := func() bool {
+		pods, err := s.WarmPods(context.Background())
+		if err != nil || len(pods) != 1 {
+			t.Fatalf("WarmPods = %v, %v", pods, err)
+		}
+		return pods[0].Current
+	}
+	if !current() {
+		t.Fatal("a warm pod is not current under the config it was made with")
+	}
+	for name, change := range map[string]func(){
+		"worker image": func() { cfg.WorkerImage = "worker:2" },
+		"scope":        func() { cfg.AuthorityScope = "namespace/team-b" },
+		"capability":   func() { cfg.CapabilityOptional = true },
+		"deadline":     func() { cfg.TaskDeadline = 45 * time.Minute },
+	} {
+		saved := *cfg
+		change()
+		if current() {
+			t.Errorf("a warm pod is still current after the %s changed", name)
+		}
+		*cfg = saved
+	}
+
+	// The pool replaces a pod made under an earlier config, and a first
+	// turn meanwhile spawns cold (TestAFirstTurnSpawnsColdWithNoClaimableWarmPod).
+	t.Run("replaced", func(t *testing.T) {
+		r, spawn := startWarmRig(t)
+		waitFor(t, "the leader's first warm pod", func() bool { return len(spawn.warmSpawned()) == 1 })
+		const stale = "chat-otter-wold"
+		spawn.setWarm(warmPod{Name: stale, Created: time.Now(), Ready: true})
+		r.g.warmPoolOnce(context.Background())
+		if d := spawn.deleted(); len(d) != 1 || d[0] != stale {
+			t.Fatalf("deleted %v, want the pod made under the earlier config", d)
+		}
+		if n := len(spawn.warmSpawned()); n != 2 {
+			t.Fatalf("%d warm pods created, want a replacement", n)
+		}
+	})
+}
+
+// The claim index is not all that keeps a pod to one conversation: a pod
+// whose task subjects carry anything is never claimed, so a claimed pod
+// whose warm.<pod> entry is lost is not handed to a second conversation. It
+// spawns cold instead, and the pod survives: it may be serving the first
+// conversation, and its lifetime and that conversation's reap end it.
+func TestAClaimedWarmPodWhoseClaimIsLostIsNeverHandedToASecondConversation(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmRig(t)
+	const pod = "chat-otter-wlost"
+	spawn.setWarm(readyWarm(pod))
+	say(r, "discord:g1/t-warm-first", "m1", "what pods are failing")
+	r.awaitTask(t, pod)
+	waitFor(t, "the first conversation's claim", func() bool { return warmClaims(t, r)[pod] != "" })
+	if err := r.g.reg.DropWarmClaim(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	second := "discord:g1/t-warm-second"
+	say(r, second, "m2", "what nodes are cordoned")
+	waitFor(t, "the second conversation's cold spawn", func() bool { return len(spawn.calls()) == 1 })
+	if got := spawn.calls()[0].Session; got == pod {
+		t.Fatalf("the second conversation was spawned as the first one's pod %s", got)
+	}
+	rec, _ := r.g.reg.Get(context.Background(), second)
+	if rec == nil || rec.BusSession == pod {
+		t.Fatalf("the second conversation's record names the first one's pod: %+v", rec)
+	}
+	if _, ok := warmClaims(t, r)[pod]; ok {
+		t.Fatal("the second conversation claimed a pod the first one had used")
+	}
+	// Nor does the pool delete it once it ages past its claim window.
+	spawn.setWarm(warmPod{Name: pod, Created: time.Now().Add(-warmClaimableAge), Ready: true, Current: true})
+	r.g.warmPoolOnce(context.Background())
+	if slices.Contains(spawn.deleted(), pod) {
+		t.Errorf("deleted %v: the used pod was deleted, which would take the first conversation's pod", spawn.deleted())
+	}
+}
+
+// Two turns claiming the same pod at once: exactly one gets it, because the
+// claim is a create in the index, not a put.
+func TestTwoClaimsOfOneWarmPodLeaveOneWinner(t *testing.T) {
+	t.Parallel()
+	r, _ := startWarmRig(t)
+	const pod, attempts = "chat-otter-wrace", 8
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	for i := range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- r.g.reg.ClaimWarmPod(context.Background(), pod, fmt.Sprintf("discord:g1/t-race-%d", i))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	won := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			won++
+		case !errors.Is(err, jetstream.ErrKeyExists):
+			t.Fatalf("a claim failed for another reason: %v", err)
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d claims of one pod succeeded, want exactly 1", won)
+	}
+}
+
+// The pool deletes nothing once a newer term has begun: an overlapping
+// leader's claim is never deleted from under it.
+func TestADeposedLeaderDeletesNoWarmPod(t *testing.T) {
+	g, cs, _ := capRig(t, 4)
+	ctx := context.Background()
+	warmCapPod(t, g, cs, "chat-vole-wdep", true, "")
+	kv, err := g.reg.kv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("5")); err != nil {
+		t.Fatal(err)
+	}
+	g.reg = NewRegistry(g.reg.c)
+	g.reg.setEpoch(4)
+	g.deleteWarmIfUnclaimed(ctx, "chat-vole-wdep", "test")
+	if _, err := cs.CoreV1().Pods("test-ns").Get(ctx, "chat-vole-wdep", metav1.GetOptions{}); err != nil {
+		t.Fatalf("a deposed leader deleted a warm pod: %v", err)
+	}
+	g.reg.setEpoch(5)
+	g.deleteWarmIfUnclaimed(ctx, "chat-vole-wdep", "test")
+	if _, err := cs.CoreV1().Pods("test-ns").Get(ctx, "chat-vole-wdep", metav1.GetOptions{}); err == nil {
+		t.Fatal("the leader did not delete an unclaimed warm pod")
+	}
+}
+
+// A claimed warm pod's reuse window counts from its claim, ending where a
+// pod spawned at the claim would stop taking turns, though the warm pod's
+// own deadline runs longer by the time it waited.
+func TestAClaimedWarmPodsReuseWindowCountsFromItsClaim(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmRig(t)
+	const pod = "chat-otter-wlife"
+	spawn.setReusable(pod)
+	window := podLifetime(r.g.cfg, true) - r.g.cfg.TaskDeadline - 2*podDeadlineGrace
+	for _, tc := range []struct {
+		name    string
+		claimed time.Time
+		want    bool
+	}{
+		{"claimed just now", time.Now(), true},
+		{"claimed inside a fresh pod's window", time.Now().Add(-window + time.Minute), true},
+		{"claimed past it", time.Now().Add(-window - time.Minute), false},
+		{"spawned for the conversation", time.Time{}, true},
+	} {
+		rec := &SessionRecord{Key: "discord:g1/t-life", BusSession: pod, PodName: pod, PodReuse: true, SessionRouted: true, PodClaimedAt: tc.claimed}
+		if got := r.g.reuseLivePod(context.Background(), rec); got != tc.want {
+			t.Errorf("%s: reuseLivePod = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// On the platform route nothing new runs: a gateway there creates no warm
+// pod and claims none, even with a warm count set, and a Delegate's first
+// turn spawns cold.
+func TestThePlatformRouteRunsNoWarmPool(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, warmOn(1, 10))
+	if r.g.warmPoolOn() {
+		t.Fatal("the pool is on on the platform route")
+	}
+	spawn.setWarm(readyWarm("chat-otter-wplat"))
+	say(r, "discord:g1/t-warm-platform", "m1", "delegate: check the nodes")
+	waitFor(t, "the delegate's cold spawn", func() bool { return len(spawn.calls()) == 1 })
+	if got := spawn.warmSpawned(); len(got) != 0 {
+		t.Fatalf("warm pods created on the platform route: %v", got)
+	}
+	if claims := warmClaims(t, r); len(claims) != 0 {
+		t.Fatalf("a warm pod was claimed on the platform route: %v", claims)
 	}
 }

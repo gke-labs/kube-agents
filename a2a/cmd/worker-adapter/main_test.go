@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -719,27 +720,28 @@ func TestAWarmSessionPodStartsWithNoTaskID(t *testing.T) {
 	if !ok {
 		t.Fatal("a warm pod's environment was refused")
 	}
-	if !cfg.Warm || !cfg.SessionReuse || cfg.WarmIdle != 30*time.Minute || cfg.WarmReadyFile != lib.SessionWarmReadyFile {
-		t.Errorf("warm config = Warm %v SessionReuse %v WarmIdle %v WarmReadyFile %q", cfg.Warm, cfg.SessionReuse, cfg.WarmIdle, cfg.WarmReadyFile)
+	if !cfg.Warm || !cfg.SessionReuse || cfg.WarmIdle != 30*time.Minute || cfg.WarmStatusAddr != warmStatusHostPort() {
+		t.Errorf("warm config = Warm %v SessionReuse %v WarmIdle %v WarmStatusAddr %q", cfg.Warm, cfg.SessionReuse, cfg.WarmIdle, cfg.WarmStatusAddr)
 	}
-	file := filepath.Join(t.TempDir(), "ready")
-	if warmReady(file, 0) == 0 {
-		t.Error("the readiness probe passed before the file existed")
-	}
-	if err := os.WriteFile(file, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if warmReady(file, 0) != 0 {
-		t.Error("the readiness probe failed with the file there")
+	if !strings.HasPrefix(cfg.WarmStatusAddr, warmStatusHost+":") {
+		t.Errorf("the warm status endpoint binds %q, not the loopback interface alone", cfg.WarmStatusAddr)
 	}
 	// The probe waits out the adapter's start rather than failing during it,
-	// so a routine warm pod start records no Unhealthy Event.
-	later := filepath.Join(t.TempDir(), "later")
+	// so a routine warm pod start records no Unhealthy Event, and fails only
+	// when nothing ever answers.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "http://" + ln.Addr().String() + lib.SessionWarmReadyPath
+	if warmReady(url, 0) == 0 {
+		t.Error("the readiness probe passed with nothing answering")
+	}
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		_ = os.WriteFile(later, nil, 0o600)
+		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 	}()
-	if warmReady(later, 10*time.Second) != 0 {
-		t.Error("the readiness probe failed while the file was on its way")
+	if warmReady(url, 10*time.Second) != 0 {
+		t.Error("the readiness probe failed while the endpoint was on its way")
 	}
 }

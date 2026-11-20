@@ -110,18 +110,23 @@ const (
 	// (a rollback): such a gateway's sweep deletes the exited pod, and the
 	// slot it held is free again.
 	EnvSessionWarmIdleSeconds = "A2A_SESSION_WARM_IDLE_SECONDS"
-	// SessionWarmReadyFile is the file a warm pod's adapter writes once its
-	// task watcher's consumer exists, and the file SessionWarmReadyCommand
-	// checks for the pod's readiness probe. The gateway hands a warm pod a
+	// SessionWarmStatusPort is the loopback port a warm pod's adapter
+	// answers SessionWarmReadyPath on, from the moment its task watcher's
+	// consumer exists until the process ends. The gateway hands a warm pod a
 	// conversation only once it is Ready, so the first task never waits on a
-	// consumer that is not there yet. It is in the scratch emptyDir, the
-	// pod's one writable place, so a new pod never finds an old one's.
-	SessionWarmReadyFile = "/scratch/.a2a-warm-ready"
+	// consumer that is not there yet. It is the adapter's own state, not a
+	// file: once claimed the pod runs a model-directed harness that can write
+	// wherever the adapter can, and a claimed pod's probe must never start
+	// failing because a turn removed something. Bound to 127.0.0.1 only, so
+	// nothing outside the pod reaches it.
+	SessionWarmStatusPort = 8090
+	// SessionWarmReadyPath is the path the warm status endpoint answers.
+	SessionWarmReadyPath = "/readyz"
 	// SessionWarmReadyCommand is the worker-adapter subcommand the warm
-	// pod's readiness probe runs: exit 0 once SessionWarmReadyFile exists.
+	// pod's readiness probe runs: exit 0 once the status endpoint answers.
 	SessionWarmReadyCommand = "warm-ready"
 	// SessionWarmReadyWaitSeconds is how long SessionWarmReadyCommand waits
-	// for the file before it fails. A probe that failed while the adapter
+	// for the endpoint before it fails. A probe that failed while the adapter
 	// was still dialling the bus would record a Warning Unhealthy Event for
 	// every warm pod the pool starts, about every half hour on an idle
 	// install, and the cluster's event watcher counts Unhealthy toward an

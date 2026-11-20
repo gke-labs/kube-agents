@@ -15,7 +15,7 @@ func (s *fakeSpawner) SpawnWarm(_ context.Context, name string) error {
 		return s.warmSpawnErr
 	}
 	s.warmSpawns = append(s.warmSpawns, name)
-	s.warm = append(s.warm, warmPod{Name: name, Created: time.Now()})
+	s.warm = append(s.warm, warmPod{Name: name, Created: time.Now(), Current: true})
 	return nil
 }
 

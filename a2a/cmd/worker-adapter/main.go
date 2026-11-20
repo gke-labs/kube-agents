@@ -36,6 +36,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -142,8 +144,12 @@ const (
 	modelUseVertexEnv = "CLAUDE_CODE_USE_VERTEX"
 )
 
-// warmReadyPoll paces warmReady's look for the ready file.
+// warmReadyPoll paces warmReady's asks of the status endpoint, and bounds
+// each one.
 const warmReadyPoll = 250 * time.Millisecond
+
+// warmStatusHost is the loopback address the warm status endpoint binds.
+const warmStatusHost = "127.0.0.1"
 
 func main() {
 	os.Exit(run())
@@ -180,10 +186,10 @@ func run() int {
 		return 0
 	}
 	// `worker-adapter warm-ready` is a warm session pod's readiness probe:
-	// exit 0 once the adapter has written lib.SessionWarmReadyFile, which it
-	// does when its task watcher's consumer exists (workeradapter.runWarm).
+	// exit 0 once the adapter's loopback status endpoint answers, which it
+	// does from when its task watcher's consumer exists (workeradapter.runWarm).
 	if len(os.Args) > 1 && os.Args[1] == lib.SessionWarmReadyCommand {
-		return warmReady(lib.SessionWarmReadyFile, lib.SessionWarmReadyWaitSeconds*time.Second)
+		return warmReady(warmStatusURL(), lib.SessionWarmReadyWaitSeconds*time.Second)
 	}
 	// `worker-adapter mcp` forwards the session's one delegate tool call to
 	// this adapter process over a unix socket (worker-adapter/mcp.go).
@@ -315,9 +321,9 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker or a warm session pod needs no TASK_ID")
 		return workeradapter.Config{}, false
 	}
-	warmReadyFile := ""
+	warmStatusAddr := ""
 	if warm {
-		warmReadyFile = lib.SessionWarmReadyFile
+		warmStatusAddr = warmStatusHostPort()
 	}
 
 	// The scope arrives resolved and already validated -- the gateway's
@@ -404,20 +410,34 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
 		// Literal "true" only, like EnvSessionReuse; validate refuses it
 		// without reuse or beside a TASK_ID.
-		Warm:          warm,
-		WarmIdle:      envDurationOrZero(lib.EnvSessionWarmIdleSeconds),
-		WarmReadyFile: warmReadyFile,
+		Warm:           warm,
+		WarmIdle:       envDurationOrZero(lib.EnvSessionWarmIdleSeconds),
+		WarmStatusAddr: warmStatusAddr,
 	}, true
 }
 
-// warmReady is the warm pod's readiness probe: 0 once file exists, waiting up
-// to wait for it (lib.SessionWarmReadyWaitSeconds says why), 1 if it never
-// appears.
-func warmReady(file string, wait time.Duration) int {
+// warmStatusHostPort is where a warm pod's adapter serves its status: the
+// loopback interface only.
+func warmStatusHostPort() string {
+	return net.JoinHostPort(warmStatusHost, strconv.Itoa(lib.SessionWarmStatusPort))
+}
+
+func warmStatusURL() string {
+	return "http://" + warmStatusHostPort() + lib.SessionWarmReadyPath
+}
+
+// warmReady is the warm pod's readiness probe: 0 once url answers 200,
+// waiting up to wait for it (lib.SessionWarmReadyWaitSeconds says why), 1 if
+// it never does.
+func warmReady(url string, wait time.Duration) int {
+	client := &http.Client{Timeout: warmReadyPoll}
 	deadline := time.Now().Add(wait)
 	for {
-		if _, err := os.Stat(file); err == nil {
-			return 0
+		if resp, err := client.Get(url); err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return 0
+			}
 		}
 		if !time.Now().Before(deadline) {
 			return 1
