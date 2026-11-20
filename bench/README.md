@@ -150,7 +150,7 @@ Delegation on the inject path is a seam, not a feature, and it is deliberately n
 
 ## The gate
 
-devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`. It also reads `timing.json`, which the shell copies from the harness's `KUBE_AGENTS_TIMING_FILE`, for the opening chat turn's seconds, and `shape.json`, copied the same way from `KUBE_AGENTS_SHAPE_FILE`, for the shape of the reply the run delivered (`kube_agents_bench/chat_shape.py`: whether it opens on its answer, an apology, the messages the thread received, and word counts); both are reported, not scored, and `bench-gate case` prints them as each repetition's `rep N timing:` and `rep N shape:` lines. Before handing a run over, the shell asks the judge once more for a missing `OutcomeValidity` devops-bench left out (`kube_agents_bench/rejudge.py`), marks the record with `rejudged` or `judge_errors`, and recomputes `OutcomeScore`.
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`. It also reads `timing.json`, which the shell copies from the harness's `KUBE_AGENTS_TIMING_FILE`, for the opening chat turn's seconds, and `shape.json`, copied the same way from `KUBE_AGENTS_SHAPE_FILE`, for the shape of the reply the run delivered (`kube_agents_bench/chat_shape.py`: whether it opens on its answer, an apology, the messages the thread received, and word counts); both are reported, not scored, and `bench-gate case` prints them as each repetition's `rep N timing:` and `rep N shape:` lines. The shell also copies `eval_run.json` from `KUBE_AGENTS_EVAL_RUN_FILE`: the repetition's eval run tag (`<run>/<case>/<rep>`) and run id, for joining the replay proxy's log to the run; `bench-gate` does not read it. Before handing a run over, the shell asks the judge once more for a missing `OutcomeValidity` devops-bench left out (`kube_agents_bench/rejudge.py`), marks the record with `rejudged` or `judge_errors`, and recomputes `OutcomeScore`.
 
 ```bash
 uv run bench-gate case --task ./tasks/<id>/task.yaml \
@@ -247,8 +247,11 @@ validator check lands with the first stack that needs it:
 9. A declared-gap fixture is one a correct check flips: a check written to the platform's own
    documented behaviour names the planted object. A shape only a wrong check would name (a
    zero-node pool with a large `maxSurge`, which GKE bounds to the pool's live nodes) is not a
-   fixture. Where no fixture a correct check flips can stand at an acceptable cost, the case
-   parks as `FIXTURE_NOT_READY` with the cost named in its reason.
+   fixture. Neither is a setting left at the platform's documented default (a gcsfuse sidecar
+   with no memory limit, which GKE ships and its performance guide recommends): a check that
+   names it files on every workload that follows the guide, so such a case is removed. Where no
+   fixture a correct check flips can stand at an acceptable cost, the case parks as
+   `FIXTURE_NOT_READY` with the cost named in its reason.
 
 Each case record of the lane (`case-<id>.json`) names the gateway's model setup it was graded
 under: an `agent` object with the provider the gateway routes to, the model the records name and,

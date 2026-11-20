@@ -97,8 +97,10 @@ func terminalEnvelopeID(hk holdKey) string {
 }
 
 // publishTerminal is the dispatcher's one write to a task: a final status
-// update on its `.supervisor` subject (lib.TaskSupervisorSubject, contract
-// addendum 6), `rejected` for a submission refused at admission (nothing
+// update on its `.supervisor` subject, the five-token
+// lib.TaskSupervisorSubject or the six-token lib.ProfileSupervisorSubject as
+// the dispatch config says (DispatchConfig.SupervisorSubjectFor; contract
+// addendum 6, #5301), `rejected` for a submission refused at admission (nothing
 // ran) or `failed` once a worker had it. `.supervisor`, not `.events`, so
 // `.events` stays the executor's alone and replay can tell the two apart.
 // Every terminal the dispatcher writes goes through here.
@@ -122,5 +124,8 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.E
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.busFor(hk.profile).Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
+	// The five- or six-token form, as the operator's config says (#5301):
+	// readers watch both, and the operator moves the dispatcher to the
+	// six-token one only once every reader that can run does.
+	return d.busFor(hk.profile).Publish(ctx, d.src.Config().SupervisorSubjectFor(hk.profile, sub.TaskID), env)
 }

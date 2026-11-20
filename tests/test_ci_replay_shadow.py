@@ -445,6 +445,27 @@ class ReplayLaneResolveTest(unittest.TestCase):
         self.assertIn("EVAL_REPLAY_LANE=true", err)
 
 
+class EvalRunTagsHelmArgsTest(unittest.TestCase):
+    """eval_run_tags_helm_args: the tag switch rides the proxy, and EVAL_RUN_TAGS=false turns it off alone."""
+
+    def _args(self, **env):
+        script = ("set -euo pipefail\n" + _lifted("eval_run_tags_helm_args", constants=False)
+                  + "eval_run_tags_helm_args\n"
+                  + 'for a in ${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
+        proc = subprocess.run([shutil.which("bash"), "-c", script], env={"PATH": os.environ.get("PATH", ""), **env},
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line.split("=", 1)[1] for line in proc.stdout.splitlines()]
+
+    def test_on_with_the_proxy(self):
+        self.assertEqual(self._args(REPLAY_SHADOW_ACTIVE="true"), ["--set", "platformAgent.deployment.evalRunTags=true"])
+
+    def test_off_without_the_proxy_or_when_turned_off(self):
+        for env in ({}, {"REPLAY_SHADOW_ACTIVE": "false"}, {"REPLAY_SHADOW_ACTIVE": "true", "EVAL_RUN_TAGS": "false"}):
+            with self.subTest(**env):
+                self.assertEqual(self._args(**env), [])
+
+
 class HelmArgsTest(unittest.TestCase):
     def _args(self, **overrides):
         script = ("set -euo pipefail\n" + _lifted(*_RESOLVE, "replay_shadow_helm_args")
@@ -523,6 +544,9 @@ class DeployWiringTest(unittest.TestCase):
         install = self.text[self.text.index('helm upgrade --install "${HELM_RELEASE_NAME}"'):]
         install = install[: install.index("--wait --timeout 15m")]
         self.assertIn('${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}', install)
+        self.assertIn('${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}', install)
+        self.assertLess(self.text.index('  replay_shadow_helm_args "${AR_REPO}'),
+                        self.text.index("\neval_run_tags_helm_args\n"))
         # No later upgrade, so nothing can drop the values.
         self.assertEqual(len(re.findall(r"^\s*[^#\n]*\bhelm upgrade\b", self.text, re.MULTILINE)), 1)
 
@@ -864,13 +888,15 @@ class ModeCollectorTest(_LifecycleBase):
 
     def test_the_lane_collects_in_replay_mode_with_its_seed_and_report_inputs(self):
         body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
+                'REPLAY_LANE_NEWEST_NIGHT=/n.json\n'
                 'start_replay_shadow_collector\n' + _AWAIT_ARGV + 'wait_replay_shadow_collector\n')
         self._fake_collector()
         proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv), FAKE_DEPLOYED="replay")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--kind"], pairs["--keep-dir"], pairs["--seed-dir"],
-                          pairs["--nightly-runs"], pairs["--pr"]), ("replay", "replay-lane", "/k", "/s", "/r.json", ""))
+                          pairs["--nightly-runs"], pairs["--newest-night"], pairs["--pr"]),
+                         ("replay", "replay-lane", "/k", "/s", "/r.json", "/n.json", ""))
 
     def test_the_lane_names_the_commit_it_replays_and_where_it_came_from(self):
         head = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -915,6 +941,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         script += lift_function("seed_replay_lane_cache", text, _CI_ENV)
         script += f"REPLAY_CACHE_FETCH_SCRIPT={str(self.fetch)!r}\n"
         script += 'rc=0\nprepare_replay_lane_cache || rc=$?\necho "rc=${rc}"\n'
+        script += 'echo "newest-night=${REPLAY_LANE_NEWEST_NIGHT:-}"\n'
         if seed:
             script += '[ "${rc}" != 0 ] || { seed_replay_lane_cache || rc=$?; echo "seed rc=${rc}"; }\n'
         overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
@@ -954,6 +981,10 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertIn(f"--max-bytes {512 * 1024 * 1024}", calls[0])
         self.assertIn("--forge gitlab", calls[0], "the lane's own forge picks the records")
         self.assertNotIn("--eval-mode-next", calls[0])
+        # The newest night's builds go where the collector's report reads them (--newest-night).
+        night = re.search(r"^newest-night=(\S+/newest-night\.json)$", proc.stdout, re.M)
+        self.assertIsNotNone(night, proc.stdout)
+        self.assertIn(f"--night-out {night.group(1)} ", calls[0])
         self.assertIn("--seed-once", calls[1])
         self.assertIn("--mode replay", calls[1])
 

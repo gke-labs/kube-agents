@@ -1504,7 +1504,13 @@ def _read_in_cluster(path: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, f"no service-account token or CA: {exc}"
     request = urllib.request.Request(f"https://{host}:{port}{path}", headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib.request.urlopen(request, timeout=BOSKOS_TIMEOUT_SECONDS, context=context) as response:
+        # The API server is inside the cluster: a proxy from the environment must
+        # not be in the path of the read. The opener is built for each call, because
+        # it carries this call's TLS context.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+        )
+        with opener.open(request, timeout=BOSKOS_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8")), None
     except urllib.error.HTTPError as exc:
         return None, f"HTTP {exc.code} from the API server (the pod's service account may lack the boskos-crd-reader role)"

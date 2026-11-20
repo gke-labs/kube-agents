@@ -1205,6 +1205,44 @@ describe("console notices and local lines", () => {
     expect(state.chat[0].text).toBe("⚙️ working");
   });
 
+  it("keeps the report's root task on a notify frame's entry, and off every other notice", () => {
+    let state = reduce(initialState, {
+      type: "notice",
+      frame: { messageId: "n-1", text: "the card reported: two pods pending", edit: false, kind: "notify", replyTo: "task-root", report: true },
+      conversation: "console:abc",
+      at: 1,
+    });
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "c-1", text: "⏳ submitted…", edit: false },
+      conversation: "console:abc",
+      at: 2,
+    });
+    // A card's progress note names the same task but is not the report: no reply goes under it.
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "p-1", text: "⏳ reading pod state", edit: false, kind: "notify", replyTo: "task-root" },
+      conversation: "console:abc",
+      at: 3,
+    });
+    expect(state.chat.map((c) => [c.id, c.replyTo])).toEqual([
+      ["notice:n-1", "task-root"],
+      ["notice:c-1", undefined],
+      ["notice:p-1", undefined],
+    ]);
+    // The entry is the gateway's line, not the task's: the session view must not claim it.
+    expect(state.chat[0].taskId).toBeUndefined();
+    // An edit of the report replaces its text and keeps the task it answers.
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "n-1", text: "the card reported: one pod pending", edit: true, kind: "notify" },
+      conversation: "console:abc",
+      at: 3,
+    });
+    expect(state.chat[0].text).toBe("the card reported: one pod pending");
+    expect(state.chat[0].replyTo).toBe("task-root");
+  });
+
   it("gives local lines unique ids, and clear empties the transcript and pending turns", () => {
     let state = reduce(initialState, { type: "local", text: "one", at: 1 });
     state = reduce(state, { type: "local", text: "two", at: 2 });

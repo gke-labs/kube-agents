@@ -2562,6 +2562,261 @@ class TestSecretReadDetector(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.command_reads_a_secret(cmd))
 
+    # The rule's second read takes quotes, operators and substitutions from the bench's shell reader (`SHELL_READER`).
+    WITHHELD_BY_THE_SECOND_READ = [
+        # each substitution has a quote state of its own
+        'echo "$(echo "a # b")"; gcloud auth print-access-token',
+        "echo \"$(echo ')'; env)\"",
+        'echo "$(echo \\); env)"',
+        'echo "$(echo "$(echo "$(env)")")"',
+        "echo $(echo `env`)",
+        # a line of many substitutions
+        "echo " + "$(date) " * 40 + '"$(true; env)"',
+        # quotes inside a /proc path
+        'cat /proc/"self"/e*',
+        'cat /proc/se"lf"/environ',
+        # an escaped `;` is a word: it ends the command of find's `-exec`
+        "find . -exec true \\; -exec env \\;",
+        "find . \\( -type f -exec printenv \\; \\)",
+        "find . -exec env \\; -print",
+        "find . -exec sh -c env \\;",
+        "eval \\( env \\)",
+        # a flag of a prefix word, then a subshell
+        "time -p (env)",
+        # ... and the flag may take the next word as its value, as in `time -p ls env`
+        "time -p (ls env)",
+        # a script in double quotes keeps the backslash ahead of its `$(` or backtick, on one line or more
+        'bash -c "\necho \\$(env)\n"',
+        'ssh host "\necho \\`printenv\\`\n"',
+        # a substitution beside a command word can print nothing, and the word then runs
+        "env$(true)",
+        "env`true`",
+        "printenv$(:)",
+        '"$(true)"env',
+        "sudo env`true`",
+        "sh -c 'env$(true)'",
+        'sh -c "env\\$(true)"',
+        "env$(true)$(true)",
+        "true $(a); env$(echo $(a))",
+        # ... also when a quoted copy of the substitution's text stands ahead of it
+        "echo '$(true)'; env$(true)",
+        # ... and a word that is only a substitution is then no word
+        "sudo $(true) env",
+        "env $(true)",
+        "env `true`",
+        # `env` with assignments and no program prints the environment
+        "env NAME=$(date)",
+        "env NAME=value",
+        "env A=$(x) env",
+        "env A=$(x) printenv",
+        # a heredoc body that a shell runs
+        "bash <<'EOF'\nenv\nEOF",
+        "sh <<'EOF'\nprintenv\nEOF",
+        "bash -s <<'EOF'\ngcloud auth print-access-token\nEOF",
+        "cat <<EOF | bash\nenv\nEOF",
+        # a redirect goes off with its descriptor and its target
+        "env 2>/dev/null",
+        "env > out.txt",
+        # a here-string of a shell, and input from a file `environ`
+        "bash <<< env",
+        "cd /proc/self && cat < environ",
+        # a comment hides no command behind its line
+        "echo a # b\nenv",
+        "kubectl get pods \\\n# x\nenv",
+        # an escaped `$` and `(` are text, and the command behind them is read
+        "sh -c 'echo set \\$\\(' ; env",
+    ]
+    SERVED_BY_BOTH_READS = [
+        # an escaped backtick is text
+        "echo \\`env\\`",
+        # quoted text
+        "echo '$(env)'",
+        "echo '`env`'",
+        'echo "(env)"',
+        "echo 'a;env'",
+        'echo "a # b"; echo env',
+        "echo \"$(echo ')'; echo env)\"",
+        "echo env # env",
+        "# x; env",
+        "# first; printenv",
+        "echo env $'('",
+        "grep -n \\$\\( set-env.sh",
+        # Markdown in an argument: a code fence, a list item that starts with a flag-like word, inline code
+        'gh pr comment 7 --body "Run:\n```\nkubectl get pods -n legacy-env\n```"',
+        "cat > notes.md <<'EOF'\n- (env) the variables\nEOF",
+        'gh pr comment 7 --body "The \\`env\\` list is wrong.\nSee the diff."',
+        "cat > x.md <<'EOF'\nThe pod's `env` has `LOG_LEVEL`.\nEOF",
+        # a substitution of more lines makes its word one of more lines, and that word is no script
+        "LOGS=$(gcloud compute ssh gke-node-1 --zone us-central1-a \\\n  --command 'sudo journalctl -u kubelet --no-pager | tail -50')",
+        'git commit -m "$(cat <<\'EOF\'\nfix(installer): reset the lease on exit\n\nThe script printed "lease busy" and left the lock file.\nEOF\n)"',
+        'gh pr create --title "fix: hook" --body "$(cat <<\'EOF\'\n## Summary\n\nThe hook now resets the trap.\n\n```bash\ntrap cleanup EXIT\n```\nEOF\n)"',
+        # find's command with words behind `env`, and a name that is no command
+        "find . -exec echo env \\;",
+        "find . -name env -exec ls {} \\;",
+        "find . -exec env VAR=1 ls {} \\;",
+        "find . -exec printenv HOME \\;",
+        # a substitution beside a word that is no command word, and one with a program behind it
+        "ls x$(date)",
+        "echo env$(date)",
+        "env $(cat vars) python3 app.py",
+        # an empty word is a word: `env` runs it and prints nothing
+        "env '' $(x)",
+        # behind a builtin that takes names, a word that is only a substitution gives the names
+        "export $(cat .env | xargs) && terraform plan -out=tfplan",
+        "set $(date)",
+        # text that holds the shell reader's mark character: the second read does not read it
+        "echo env \x00S0\x00",
+        # known limits. The shell reader ends a substitution at the `)` of a `case` label.
+        'echo "$(case $x in a) env;; esac)"',
+        # A heredoc body that another language runs is not read as that language's code.
+        "python3 - <<'EOF'\nimport os\nprint(os.environ)\nEOF",
+    ]
+    # The second read serves these, for the reason given. The first read withholds them, so the
+    # rule withholds them: nothing that the first read withholds is served.
+    SERVED_BY_THE_SECOND_READ_ALONE = [
+        # an assignment behind `env` holds a substitution, and a program follows
+        'env PROJECT=$(gcloud config get-value project) PYTHONWARNINGS="ignore" python3 scripts/x.py --project-id "$PROJECT"',
+        "env A=$(x) ls",
+        # an escaped operator or `$(` is text
+        "echo a \\; env",
+        "echo a \\| env",
+        "echo \\$(env)",
+        "env \\;",
+        # arithmetic runs no command
+        "echo $((1 + 2)) env",
+    ]
+    # The second read does not read these, and the first read withholds them. They stay
+    # withheld, and each needs a rule of the second read before the first read can go.
+    WITHHELD_BY_THE_FIRST_READ_ALONE = [
+        # text that the shell reader gives no words for: a redirect with no target ...
+        "eval printenv >",
+        "(set > )",
+        "env\necho >",
+        # ... or an unclosed quote
+        "sudo env; echo 'x",
+        "gh auth \\\n  token\necho 'x",
+        'echo "$(env',
+        "cat > f.md <<'EOF'\nRun `env` to see it. Don't do it.\nEOF",
+        # a substitution with no end
+        "echo $(env",
+        "printenv`",
+        # a control operator beside a redirect
+        "true;>&2 printenv",
+        ":;<&0 env",
+        "true;</dev/null env",
+        # a redirect that overwrites, with a descriptor
+        "env 2>|/dev/null",
+        # a form feed ahead of `#` starts no comment
+        "echo \x0c#; env",
+        # `$((` that is no arithmetic, and a substitution inside arithmetic
+        "echo $((env) )",
+        "echo $((printenv) | cat)",
+        "echo $(( $(printenv >&2; echo 1) ))",
+        ": $(($(env>&2)))",
+        # a quoted word of more lines ahead of a line that the reader refuses
+        "bash -c 'cd /tmp\nenv'\ncat <<EOF\nit's\nEOF",
+        "eval '\nenv'\n'",
+        "sh -c ':\nenv'\n(( 5 > (2) ))",
+        # a heredoc body with an apostrophe line and a substitution
+        "cat <<EOF\ndon't\nx '$(env)' y\nEOF",
+        # a backtick pair with a `)` inside a substitution
+        "echo $(echo `echo )`); env",
+        # `env` with assignments and a program word that can be nothing
+        "env A=$() $X",
+        "env A=$(x) sh -c $'env'",
+    ]
+
+    @staticmethod
+    def _read_budget(cmd):
+        return [worker_transcript.MAX_READ_CHARS_FACTOR * len(cmd) + worker_transcript.MAX_READ_CHARS_FLOOR] * worker_transcript.READ_COUNT
+
+    def _first_read(self, cmd):
+        return worker_transcript._first_read_prints(cmd, 0, self._read_budget(cmd))
+
+    def _second_read(self, cmd):
+        return worker_transcript._read_script_prints(cmd, 0, self._read_budget(cmd))
+
+    def test_the_rule_withholds_what_either_read_withholds(self):
+        for cmd in self.WITHHELD_BY_THE_SECOND_READ + self.SERVED_BY_THE_SECOND_READ_ALONE + self.WITHHELD_BY_THE_FIRST_READ_ALONE:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+        for cmd in self.SERVED_BY_BOTH_READS:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(worker_transcript.command_reads_a_secret(cmd))
+
+    def test_the_second_read_by_itself(self):
+        for cmd in self.WITHHELD_BY_THE_SECOND_READ:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self._second_read(cmd))
+        for cmd in self.SERVED_BY_BOTH_READS + self.SERVED_BY_THE_SECOND_READ_ALONE + self.WITHHELD_BY_THE_FIRST_READ_ALONE:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(self._second_read(cmd))
+
+    def test_the_first_read_by_itself(self):
+        for cmd in self.SERVED_BY_THE_SECOND_READ_ALONE + self.WITHHELD_BY_THE_FIRST_READ_ALONE:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self._first_read(cmd))
+        # A call by its own signature makes a budget of one slot, and a script that it hands on is still read.
+        self.assertTrue(worker_transcript._first_read_prints("sh -c 'x; env'", 0))
+        self.assertFalse(worker_transcript._first_read_prints("sh -c 'x; echo env'", 0))
+
+    def test_no_read_can_serve_what_the_other_read_withholds(self):
+        # The construction of the rule: the first read stays callable by itself, and the second read can
+        # only add a withhold. Over every command of this class's lists, the rule withholds each time one
+        # read withholds.
+        corpus = (
+            self.TOKEN_AND_ENVIRONMENT_PRINTS
+            + self.NO_TOKEN_OR_ENVIRONMENT_PRINTS
+            + self.WITHHELD_BY_THE_SECOND_READ
+            + self.SERVED_BY_BOTH_READS
+            + self.SERVED_BY_THE_SECOND_READ_ALONE
+            + self.WITHHELD_BY_THE_FIRST_READ_ALONE
+        )
+        decided_by_the_first = decided_by_the_second = 0
+        for cmd in corpus:
+            with self.subTest(cmd=cmd):
+                first, second = self._first_read(cmd), self._second_read(cmd)
+                decided_by_the_first += first and not second
+                decided_by_the_second += second and not first
+                self.assertEqual(worker_transcript.script_prints_token_or_environment(cmd, 0), first or second)
+        # Each read decides some command of the corpus by itself, so the check above is not empty.
+        self.assertTrue(decided_by_the_first)
+        self.assertTrue(decided_by_the_second)
+
+    def test_the_second_read_has_a_fixed_depth_and_a_budget(self):
+        # Substitutions inside substitutions are read to a fixed depth, and withhold past it.
+        nested = "echo env2 " + "$(echo " * worker_transcript.MAX_SUBSTITUTION_NESTING + "x" + ")" * worker_transcript.MAX_SUBSTITUTION_NESTING
+        self.assertFalse(worker_transcript.command_reads_a_secret(nested))
+        self.assertTrue(worker_transcript.command_reads_a_secret("echo env2 $(echo " + nested + ")"))
+        # Past its read budget the second read withholds: here the innermost substitution is the one read too many.
+        self.assertFalse(self._second_read("echo env2 " + "$(x " * 5 + "y" * 50000 + ")" * 5))
+        self.assertTrue(self._second_read("echo env2 " + "$(x " * 7 + "y" * 50000 + ")" * 7))
+        # Many words that hold a substitution, on a line of many substitutions, count against the budget.
+        self.assertFalse(self._second_read("echo env2 " + " ".join("a$((%d))" % index for index in range(20))))
+        self.assertTrue(self._second_read("echo env2 " + " ".join("a$((%d))" % index for index in range(600))))
+        # The budget of a call is as large as its whole script, also when a script inside it is read first.
+        self.assertFalse(worker_transcript.command_reads_a_secret("sh -c 'echo env2'; " + "echo aaaa; " * 8000))
+        # Long text that the shell reader refuses raises nothing, and the first read decides it.
+        hostile = "x" * 20000 + " " + "`" * 500
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo env2 " + hostile + "'"))
+        self.assertTrue(worker_transcript.command_reads_a_secret("sh -c 'echo set " + hostile + "\"'; env"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo env2 " + "x" * 20000 + "$(" * 900))
+
+    def test_the_command_of_a_find_flag_is_read_by_itself_and_the_older_read_stays(self):
+        def walk(*words):
+            return worker_transcript._words_print_token_or_environment(list(words), 0, self._read_budget(" ".join(words)))
+
+        # Read by itself, the command ends at the `;` word.
+        self.assertTrue(walk("find", ".", "-exec", "true", ";", "-exec", "env", ";"))
+        self.assertTrue(walk("find", ".", "-exec", "env", ";", "-print"))
+        self.assertFalse(walk("find", ".", "-exec", "env", "VAR=1", "ls", "{}", ";"))
+        self.assertFalse(walk("find", ".", "-name", "env", "-exec", "ls", "{}", ";"))
+        # The older read, of all the words behind the flag, stays: the change can only withhold more.
+        self.assertTrue(walk("find", ".", "-exec", "sudo", "env"))
+        # (The command `nice -n` by itself prints nothing. The older read takes `;` as the value of `-n`.)
+        self.assertTrue(walk("find", ".", "-exec", "nice", "-n", ";", "env"))
+        self.assertFalse(walk("nice", "-n"))
+
     def test_a_long_line_of_wrappers_is_read_without_recursion(self):
         self.assertTrue(worker_transcript.command_reads_a_secret("sudo " * 1200 + "env"))
         self.assertFalse(worker_transcript.command_reads_a_secret("sudo " * 1200 + "ls"))
@@ -2580,6 +2835,9 @@ class TestSecretReadDetector(unittest.TestCase):
         long_substitution = 'echo "$(echo ' + "x " * worker_transcript.MAX_READ_SUBSTITUTION_CHARS
         self.assertFalse(worker_transcript.command_reads_a_secret(long_substitution + ')"'))
         self.assertTrue(worker_transcript.command_reads_a_secret(long_substitution + '; env)"'))
+        # The commands of find's `-exec` flags that one `;` word ends count against the read budget.
+        self.assertFalse(worker_transcript.command_reads_a_secret("find . " + "-exec sudo " * 3 + "ls token BB;".replace("BB", chr(92))))
+        self.assertTrue(worker_transcript.command_reads_a_secret("find . " + "-exec sudo " * 2000 + "ls token BB;".replace("BB", chr(92))))
         # Text with an unclosed quote: read line by line up to the line limit, then on a dump that starts a line.
         many_lines = "echo 'x" + "\necho env" * (worker_transcript.MAX_READ_LINES - 1)
         self.assertTrue(worker_transcript.command_reads_a_secret(many_lines + "\nsudo env"))

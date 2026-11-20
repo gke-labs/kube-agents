@@ -31,6 +31,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -93,6 +94,19 @@ const (
 	// during a rotation.
 	MaxTrustedKeys = 2
 
+	// Skew is the clock skew a credential's expiry and issue time are
+	// allowed against a verifier's clock: the dispatcher that signed it runs
+	// on another node, and adds the same allowance to a task's deadline when
+	// it mints. DefaultMaxLifetime bounds how far out an expiry may be where
+	// no lower ceiling is configured. The callout, the dispatcher and the
+	// worker share both.
+	Skew               = 30 * time.Second
+	DefaultMaxLifetime = 6 * time.Hour
+
+	// trustedKeySeparator separates the keys in a trusted-key list
+	// (A2A_TASK_SIGNING_PUBLIC_KEYS).
+	trustedKeySeparator = ","
+
 	// maxPodUID and maxTargetField bound the claims that aren't subject
 	// tokens. A Kubernetes UID is 36 bytes; a GCP project id is at most 30
 	// and a cluster name 40.
@@ -124,6 +138,55 @@ const (
 // signs one thing in this deployment, and a seed leaked from the dispatcher
 // can't be mistaken for, or configured as, anything with more reach.
 const keyPrefix = nkeys.PrefixByteCluster
+
+// ParseTrustedKeys reads a comma-separated list of task-signing public keys,
+// as A2A_TASK_SIGNING_PUBLIC_KEYS carries it: empty is none, and an empty
+// element, a malformed key or more than MaxTrustedKeys is an error.
+func ParseTrustedKeys(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var keys []string
+	for _, field := range strings.Split(raw, trustedKeySeparator) {
+		key := strings.TrimSpace(field)
+		if key == "" {
+			return nil, fmt.Errorf("the task-signing key list %q has an empty element", raw)
+		}
+		if !ValidPublicKey(key) {
+			return nil, fmt.Errorf("%q is not a task-signing public key (C...)", key)
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) > MaxTrustedKeys {
+		return nil, fmt.Errorf("%d task-signing keys; at most %d (the current one and the one it replaces)", len(keys), MaxTrustedKeys)
+	}
+	return keys, nil
+}
+
+// UnverifiedTrigger is the trigger a credential's claims name, read without
+// checking its signature, nil when they name none. It is for refusing
+// only: a worker that can't run a task as a model turn when its credential
+// names a script asks it, and an unsigned or forged claim can only make it
+// refuse more. Nothing may grant on what it returns.
+func UnverifiedTrigger(token string) (*Trigger, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("a task credential is three dot-separated parts")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't base64url: %w", err)
+	}
+	var claims struct {
+		Nats struct {
+			Trigger *Trigger `json:"trigger"`
+		} `json:"nats"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't JSON: %w", err)
+	}
+	return claims.Nats.Trigger, nil
+}
 
 // NewSigningKey generates a task-signing keypair.
 func NewSigningKey() (nkeys.KeyPair, error) {
@@ -195,6 +258,14 @@ type Trigger struct {
 // TriggerOriginBuiltin is the one trigger origin a credential may name, lib's.
 const TriggerOriginBuiltin = lib.TriggerOriginBuiltin
 
+// ReportTier is the one tier an AudienceCredentialProxy credential with no
+// Target may name, and only with a Trigger: a report credential (#5619), what
+// an unattended task a trigger started gets when it names no cluster. It
+// confines nothing, so the broker holds it to the audit-report routes alone.
+// It is capability.TierUnattended, the only tier a grant may bind a trigger
+// at, and the Python verifier's REPORT_TIER.
+const ReportTier = "unattended"
+
 // Claims is a task credential's content.
 type Claims struct {
 	// Task is the task id: a2a.tasks.<Profile>.<Task>.… on the bus.
@@ -211,7 +282,8 @@ type Claims struct {
 	Audience Audience
 	Expires  time.Time
 
-	// Target is for AudienceCredentialProxy only, and optional there.
+	// Target is for AudienceCredentialProxy only, and required there except
+	// on a report credential (ReportTier).
 	Target *Target
 
 	// Permits is for AudienceCredentialProxy only: each a known Permit, none
@@ -322,8 +394,10 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 //     DNS-1123 labels: no ".", "*", ">" or whitespace, at most 63 bytes), and
 //     pod_uid a bounded UID.
 //   - target, permits and trigger may appear only under
-//     AudienceCredentialProxy, and permits, when present, is a non-empty list
-//     of known permits, none twice.
+//     AudienceCredentialProxy; permits, when present, is a non-empty list of
+//     known permits, none twice; and an AudienceCredentialProxy credential
+//     with no target must be a report credential: tier ReportTier and a
+//     trigger.
 func Verify(token string, trusted []string, aud Audience, now time.Time, maxLifetime, skew time.Duration) (Claims, error) {
 	if !aud.known() {
 		return Claims{}, fmt.Errorf("audience %q is not one this package verifies", aud)
@@ -485,6 +559,12 @@ func (c Claims) validate() error {
 		if err := c.Trigger.validate(); err != nil {
 			return err
 		}
+	}
+	// A proxy credential with no target confines nothing, so only a report
+	// credential may omit it: the Python verifier's rule, held here too so
+	// Mint never makes a shape the broker refuses (#5619).
+	if c.Audience == AudienceCredentialProxy && c.Target == nil && (c.Tier != ReportTier || c.Trigger == nil) {
+		return fmt.Errorf("a %q task credential names no target; only a %q task started by a trigger may omit it", AudienceCredentialProxy, ReportTier)
 	}
 	return nil
 }

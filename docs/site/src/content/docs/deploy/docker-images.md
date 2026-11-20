@@ -378,7 +378,15 @@ images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than 
 Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mirrored `golang` copy
 is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`.
 A later bump of the `go` directive in `k8s-operator/go.mod` past that patch therefore fails the
-rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
+rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION` on
+the same `make` command, for a tag that the mirror holds.
+
+A rebuilt `platform-agent` image needs a `hermes-bridge` image at the same registry path and tag
+for the bridge sidecar. `make docker-build-hermes-bridge` with the same variables builds the agent
+image and the bridge image from it; otherwise set `A2A_BRIDGE_IMAGE` on the operator to a bridge
+image built another way. The operator takes the `credential-proxy` image from the agent image in
+the same way: build it with `make docker-build-credential-proxy` and the same variables, or set
+`CREDENTIAL_PROXY_IMAGE` on the operator.
 
 ### Registry authentication
 
@@ -425,4 +433,4 @@ yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
-`make docker-build` at the repository root builds the agent, credential-proxy, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.
+`make docker-build` at the repository root builds the agent, credential-proxy, hermes-bridge, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one, and `make docker-build-hermes-bridge` builds the agent image and the bridge image from it. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.

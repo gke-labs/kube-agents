@@ -105,8 +105,9 @@ func (d *Dispatcher) permitJobOffPool(prof lib.DispatchProfile, tier string, cha
 // carriesPermit reports whether a task's credential-proxy credential would
 // carry the vcs:proposal-create permit: a confirmed change (changeRequested,
 // which only the gateway sets, on a structured confirm) on a task with a
-// cluster, the only tasks a proxy credential is minted for. The mint and the
-// refusal read this one predicate.
+// cluster, the only tasks a targeted proxy credential is minted for (a report
+// credential, which names no cluster, never carries a permit). The mint and
+// the refusal read this one predicate.
 func carriesPermit(changeRequested bool, cluster *taskcred.Target) bool {
 	return changeRequested && cluster != nil
 }
@@ -192,10 +193,18 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	// A script-run task's script must be one the profile allowlists
 	// (#5622). The verifier holds the script to the grant's; this holds it to
 	// the profile, whose list is where the path comes from.
+	// It runs only in Job mode, where each task gets a fresh pod: never on
+	// a pool pod that takes the next task after it.
+	var script *lib.DispatchScript
 	if trigger != nil && trigger.Script != "" {
-		if _, ok := prof.Script(trigger.Script); !ok {
+		sc, ok := prof.Script(trigger.Script)
+		if !ok {
 			return admitted{}, &refusal{ReasonScriptNotAllowed, fmt.Sprintf("profile %s allowlists no script %q", prof.Name, trigger.Script)}, nil
 		}
+		if !d.cfg.unattendedFor(prof, tier) || d.jobs == nil || !prof.HasJobTemplate(tier) {
+			return admitted{}, &refusal{ReasonScriptNotAllowed, fmt.Sprintf("script %q runs only in Job mode, which profile %s at tier %s doesn't have here", sc.Name, prof.Name, tier)}, nil
+		}
+		script = &sc
 	}
 	// The permit is for what the verifier was asked: this ref, this target.
 	// The stream keeps one submission per subject and a newer one replaces
@@ -206,7 +215,7 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	// changeRequested is read from this delivery every time, never cached
 	// with the permit: it is not the verifier's to answer, and a retry's
 	// newer submission says whether a change is asked for now.
-	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger), changeRequested: changeRequested}
+	adm := admitted{cluster: cluster, trigger: credentialTrigger(trigger), changeRequested: changeRequested, script: script}
 	d.mu.Lock()
 	p, cached := d.verified[hk]
 	d.mu.Unlock()
@@ -238,6 +247,9 @@ type admitted struct {
 	cluster         *taskcred.Target
 	trigger         *taskcred.Trigger
 	changeRequested bool
+	// script is the profile's entry for the trigger's script, resolved from
+	// the snapshot admission checked: what the confirm hands the worker.
+	script *lib.DispatchScript
 }
 
 // credentialTrigger is the verifier-checked trigger in the credential's
