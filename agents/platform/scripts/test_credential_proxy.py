@@ -13700,6 +13700,45 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
                     with self.assertRaises(credential_proxy.AuthenticationError):
                         self._authenticator().authenticate(self._headers("Bearer agent-token"))
 
+    def test_a_body_that_the_parser_refuses_for_its_depth_is_a_rejection(self):
+        # The depth that the JSON parser refuses is the interpreter's and differs
+        # between Python versions, so the parser's refusal is given directly.
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(urllib.request.OpenerDirector, "open", return_value=Response(b"[]")), \
+                mock.patch.object(credential_proxy.json, "load", side_effect=RecursionError("too deep")):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_status_with_a_value_of_the_wrong_type_is_a_rejection(self):
+        for label, overrides in (
+            ("the user is a string", {"user": "system:serviceaccount:kubeagents-system:agent"}),
+            ("the user is a list", {"user": [self.CALLER]}),
+            ("the username is a list", {"user": {"username": [self.CALLER]}}),
+            ("the audiences are a number", {"audiences": 1}),
+            ("the audiences are a mapping", {"audiences": {self.AUDIENCE: True}}),
+            ("the groups are a number", {"user": {"username": self.CALLER, "groups": 1}}),
+            ("the groups are a mapping", {"user": {"username": self.CALLER, "groups": {"system:serviceaccounts": True}}}),
+            ("the groups are text", {"user": {"username": self.CALLER, "groups": "system:serviceaccounts"}}),
+            ("the uid is a list", {"user": {"username": self.CALLER, "uid": ["sa-uid"]}}),
+        ):
+            with self.subTest(label):
+                authenticator = self._with_review(self._authenticator(), self._ok_status(**overrides))
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_an_own_token_file_that_is_not_utf8_is_a_rejection(self):
+        self.own_token.write_bytes(b"\xff\xfe not text")
+        with mock.patch.object(urllib.request.OpenerDirector, "open") as opened:
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+        opened.assert_not_called()
+
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
         captured = {}

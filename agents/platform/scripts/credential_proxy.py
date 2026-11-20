@@ -5904,7 +5904,7 @@ class ServiceAccountAuthenticator:
     def _own_token(self) -> str:
         try:
             return Path(self.token_file).read_text(encoding="utf-8").strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise AuthenticationError(
                 f"this pod's own API server token is unreadable: {type(exc).__name__}"
             ) from exc
@@ -5939,11 +5939,12 @@ class ServiceAccountAuthenticator:
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
                 review = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, RecursionError) as exc:
             # A TokenReview that cannot be completed is a rejection, not an
             # allow. An API server outage must not turn into an open broker.
             # HTTPException: an answer that is not HTTP, or a body that ends
-            # early, is not an OSError.
+            # early, is not an OSError. RecursionError: a body nested past the
+            # JSON parser's depth is not a ValueError.
             raise AuthenticationError(
                 f"TokenReview could not be completed: {type(exc).__name__}"
             ) from exc
@@ -5961,6 +5962,11 @@ class ServiceAccountAuthenticator:
         # authenticated for some other audience is not for us, and one it
         # validated for two of ours breaks the assumption the role rests on.
         audiences = status.get("audiences") or []
+        # The audiences, the user, its username, its uid and its groups: a value
+        # of another type than the API server's is a malformed answer, and a
+        # malformed answer is a rejection.
+        if not isinstance(audiences, list):
+            raise AuthenticationError("TokenReview returned audiences that are not a list")
         matched = sorted(
             {
                 audience
@@ -5975,7 +5981,11 @@ class ServiceAccountAuthenticator:
                 "the presented token names more than one of this broker's audiences"
             )
         user = status.get("user") or {}
+        if not isinstance(user, dict):
+            raise AuthenticationError("TokenReview returned a user that is not a mapping")
         username = user.get("username") or ""
+        if not isinstance(username, str):
+            raise AuthenticationError("TokenReview returned a username that is not text")
         if username not in self.allowed_callers:
             raise AuthenticationError("the authenticated caller is not permitted")
         role = self.audience_roles[matched[0]]
@@ -6017,6 +6027,11 @@ class ServiceAccountAuthenticator:
         if role == CALLER_ROLE_PROFILE and username not in self.profile_callers:
             raise AuthenticationError("the profile audience is only for profile callers")
         groups = user.get("groups") or []
+        if not isinstance(groups, list):
+            raise AuthenticationError("TokenReview returned groups that are not a list")
+        uid = user.get("uid") or ""
+        if not isinstance(uid, str):
+            raise AuthenticationError("TokenReview returned a uid that is not text")
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
         pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
@@ -6024,7 +6039,7 @@ class ServiceAccountAuthenticator:
         pod_uid = pod_uids[0] if isinstance(pod_uids, list) and pod_uids else ""
         return Principal(
             workload=username,
-            uid=str(user.get("uid") or ""),
+            uid=uid,
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
             role=role,
             pod=pod if isinstance(pod, str) else "",
