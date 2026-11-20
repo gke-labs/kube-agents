@@ -120,9 +120,9 @@ func TestCLI_OversizeStdoutIsRefusedWithTheLimitNamed(t *testing.T) {
 
 // The boundary's other side: a child whose stdout is exactly the cap
 // completes with the whole answer, so the cap refuses nothing it admits.
-// The bridge runs at atCapAnswerBytes here, not cliStdoutCap, as the api
-// at-cap test does: the chat fold and the chunked publish scale with the
-// answer, and at 8 MiB they outran the publish window on a loaded runner.
+// The bridge runs at atCapAnswerBytes in atCapChunkBytes chunks here, not at
+// cliStdoutCap, as the api at-cap test does; the comment on atCapAnswerBytes
+// says why.
 func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeWith(t, url, printingScript(t, atCapAnswerBytes), 0, func(b *Bridge) {
@@ -139,13 +139,22 @@ func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 	if result == nil || len(result.Parts) == 0 {
 		t.Fatal("no result artifact")
 	}
-	// The artifact is published in chunks (ResultChunkSize), one part each.
-	got := 0
+	// The artifact is published in chunks (ResultChunkSize), one text part
+	// each. The chunk size is set so the answer still takes the path that
+	// appends a second chunk.
+	got, chunks := 0, 0
 	for _, part := range result.Parts {
+		if part.Text == "" {
+			continue
+		}
 		got += len(part.Text)
+		chunks++
 	}
 	if got != atCapAnswerBytes {
-		t.Errorf("result is %d bytes across %d parts, want the child's %d", got, len(result.Parts), atCapAnswerBytes)
+		t.Errorf("result is %d bytes across %d chunks, want the child's %d", got, chunks, atCapAnswerBytes)
+	}
+	if want := atCapAnswerBytes / atCapChunkBytes; chunks != want {
+		t.Errorf("result is in %d chunks, want %d", chunks, want)
 	}
 }
 

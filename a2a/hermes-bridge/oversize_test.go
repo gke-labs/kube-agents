@@ -196,8 +196,8 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 // with the cause only in the bridge log.
 //
 // The limit is the server's, not the bus default of 1 MiB: an answer past
-// 1 MiB spent 40 s in the chat fold before its first publish on a loaded
-// runner, and the refusal is the same comparison at any limit. At 64 KiB the
+// 1 MiB took 40 s to reach its first publish on a loaded runner, and the
+// refusal is the same comparison at any limit. At 64 KiB the
 // 128 KiB answer's scrub (scrubAnswer) still took the terminal to 9 s to 19 s
 // of the 20 s wait with twelve busy loops on four cores, and past it in 3
 // runs of 10.
