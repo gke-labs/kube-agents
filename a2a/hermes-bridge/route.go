@@ -217,7 +217,7 @@ func hasSharedPrincipal(key string, auth routeAuthority) bool {
 }
 
 // identityRouteFor extracts an identity-only record for doors without a chat
-// notify route (such as the Google-token A2A door or Discord) when the gateway
+// notify route (such as the Google- or Entra-token A2A door, or Discord) when the gateway
 // supplies a non-shared requester principal. Doors whose credential is shared
 // across callers (console, inject, and static-token A2A) clear userID and do
 // not record a user route, since any a2a-* session without a stored user_id
@@ -386,6 +386,7 @@ const (
 	backendConsole   = "console"
 	backendA2A       = "a2a"
 	backendA2AGoogle = "a2a-google"
+	backendA2AEntra  = "a2a-entra"
 	backendInject    = "inject"
 
 	// originPlatformGooglechat is gchat's origin platform in the chat metrics
@@ -415,6 +416,7 @@ var backendOrigins = map[string]sessionOrigin{
 	backendConsole:   {Origin: originConsole},
 	backendA2A:       {Origin: originAPI},
 	backendA2AGoogle: {Origin: originAPI},
+	backendA2AEntra:  {Origin: originAPI},
 	backendInject:    {Origin: originAPI},
 }
 
