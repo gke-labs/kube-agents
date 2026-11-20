@@ -229,8 +229,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
 	// the gateway's chat.notify route. It holds every platform whose route is
 	// armed under the next stack with a home channel set on the CR,
-	// comma-separated, Chat first; the agent adds a learned Slack channel and
-	// sends home posts to every armed route when no platform has a home. An
+	// comma-separated, Chat first; the agent adds a learned Slack channel or
+	// Chat space after those and sends home posts to every armed route when
+	// no platform has a home. An
 	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS holds every route the gateway arms,

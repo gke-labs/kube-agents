@@ -54,7 +54,7 @@ def test_every_command_line_becomes_a_row_without_its_suffixes(monkeypatch):
     assert seen and "/opt/data/kanban/logs/t_ab12.log" in seen[0]
 
 
-def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):
+def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch, real_agent_shell):
     # ``head -c`` can cut a transcript between the bytes of one character. The
     # decode must not raise out of _settle ahead of the purge that follows it,
     # so this runs the real subprocess call, against a child that writes a

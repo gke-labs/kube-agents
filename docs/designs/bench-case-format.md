@@ -372,10 +372,12 @@ which a kanban worker gets in its newest tool result at 90% of a finite cap and 
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
 the cap closes with `Iteration budget exhausted (N/M)`; `budget` is the `M` every such record must
 name; a worker that finishes inside 90% of its cap records neither, so the check is for a card
-written to outrun the cap; a run whose cards have no run rows, in which no attempt
-ran out and none completed either (the harness archives a card still running at its delegation
-ceiling, which closes the attempt `reclaimed`), or whose capture recorded gaps and no attempt ran
-out, is `status: "error"`),
+written to outrun the cap; a run with no worker capture to read, a run in which no record names a
+cap and no attempt has the outcome `completed` (no run rows, or the harness archives a card still
+running at its delegation ceiling, which closes the attempt `reclaimed`), or a run in which no
+record names a cap and either the capture recorded gaps or the workers' captured results, one or
+more, are all withheld or absent, is `status: "error"`; any other run in which no record names a
+cap is a fail),
 `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question

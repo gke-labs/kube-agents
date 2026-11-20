@@ -89,7 +89,7 @@ by its update key: the gateway draws the rating controls on it.
 --reply-to names the gateway task whose turn filed the work the post reports
 on; the console passes it on so its client can join the post to that turn.
 --report, with --conversation, marks the post as a card's report, the one the
-gateway keeps for a reply under it.
+gateway keeps for a reply under it and the one a console client offers a reply under.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway

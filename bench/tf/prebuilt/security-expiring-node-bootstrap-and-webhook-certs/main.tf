@@ -18,10 +18,10 @@
 # already-expired self-signed certificate (expired-ca.pem beside this file;
 # a certificate only, no key). The webhook is inert: failurePolicy Ignore, one
 # rule on an API group nothing serves, the system namespaces excluded, and no
-# backend. No compliance check reads a CA bundle's notAfter today; the case
-# carries expected_fail: true and the planted object is what a fix would have
-# to name. A TLS Secret would be the other half of the scenario, but the
-# agent's read role reaches no Secret, so a fixture there could never flip.
+# backend. Check 2.20 (webhook-ca-bundle-expired) reads clientConfig.caBundle
+# notAfter and names this planted object. A TLS Secret would be the other half
+# of the scenario, but the agent's read role reaches no Secret, so a fixture
+# there could never flip.
 #
 # Isolation class: one cluster-scoped object, removed by this stack's destroy.
 # A leftover from a killed run is removed by the teardown's bench plant sweep

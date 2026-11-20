@@ -55,12 +55,12 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 ```
 
 The home channel is the CR field (`spec.integration.googleChat.homeChannel` or
-`spec.integration.slack.homeChannel`) or, for Slack, a channel the gateway learned from a mention.
+`spec.integration.slack.homeChannel`) or a channel or space the gateway learned from a mention.
 `/sethome` does not reach the gateway. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. The operator names every armed platform in
 `A2A_NOTIFY_CONVERSATIONS` and every armed platform with a home channel set on the CR in
-`A2A_NOTIFY_PLATFORM`; the agent adds Slack when the gateway learned a channel, and with no
+`A2A_NOTIFY_PLATFORM`; the agent adds a platform whose home the gateway learned, and with no
 home anywhere, every armed platform keeps the posts for its digest. So an
 install whose gateway holds no platform with a home channel sends anyway: the gateway refuses the
 recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error

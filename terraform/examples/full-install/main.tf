@@ -142,14 +142,16 @@ locals {
   # The CR's spec.integration, as one local so the tests can read it.
   platform_agent_integration = merge(
     var.enable_google_chat ? {
-      googleChat = {
+      googleChat = merge({
         enabled          = true
         topicName        = module.chat_pubsub[0].topic_name
         subscriptionName = module.chat_pubsub[0].subscription_name
         allowedUsers     = var.google_chat_allowed_users
         homeChannel      = var.google_chat_home_channel
         mode             = var.google_chat_mode
-      }
+        }, var.google_chat_home_channel_policy != "" ? {
+        homeChannelPolicy = var.google_chat_home_channel_policy
+      } : {})
     } : {},
     var.enable_slack ? {
       slack = merge({

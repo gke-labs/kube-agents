@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -264,7 +265,10 @@ func relayOne(ctx context.Context, client *http.Client, u *url.URL, message []by
 // relayCredentials reads the pod's two credentials, on every request as the
 // shims do: the kubelet rewrites the projected token in place, and a warm
 // pod's next task brings its own task credential. A missing task file is no
-// task; the broker then refuses what needs one.
+// task; the broker then refuses what needs one. A report credential (one
+// naming no target cluster) is never sent: the broker admits it on the
+// audit-report routes alone and refuses it on the MCP relay, so the task's
+// MCP calls go as a task with no credential's do.
 func relayCredentials() (map[string]string, error) {
 	headers := map[string]string{}
 	tokenFile := strings.TrimSpace(os.Getenv(EnvCredentialProxyTokenFile))
@@ -298,8 +302,35 @@ func relayCredentials() (map[string]string, error) {
 	if len(t) > maxTaskCredentialBytes || !taskCredentialShape.MatchString(t) {
 		return nil, errors.New("the task credential file doesn't hold a task credential")
 	}
+	if isReportCredential(t) {
+		return headers, nil
+	}
 	headers[taskCredentialHeader] = t
 	return headers, nil
+}
+
+// isReportCredential is whether a task credential's claims name no target
+// cluster, read without verifying: it decides only whether to send it, and the
+// broker verifies whatever is sent. A token whose claims can't be read is not
+// called one, so it is sent and the broker refuses it loudly
+// (credential_proxy_client._is_report_credential).
+func isReportCredential(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return false
+	}
+	var claims struct {
+		NATS map[string]json.RawMessage `json:"nats"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.NATS == nil {
+		return false
+	}
+	_, targeted := claims.NATS["target"]
+	return !targeted
 }
 
 // jsonMessages is a JSON body's messages: one object, or each of a batch.
