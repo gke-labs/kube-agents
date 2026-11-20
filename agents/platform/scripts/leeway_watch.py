@@ -117,11 +117,12 @@ unfiltered `leeway` report but suppressed by active thresholds remain silently
 in `ledger.json` rather than retiring as resolved. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE` (topology
 findings), `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and
-`LEEWAY_WATCH_REFRESH_DAYS` — together with `LEEWAY_WATCH_CLUSTERS`,
-`LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` — are optional overrides for
-runs started by hand in the pod (pass `--dry-run` when probing narrower or wider
-thresholds so `ledger.json` and `reports/latest.*` are not mutated); the
-operator's `spec.deployment.env` allowlist does not carry them.
+`LEEWAY_WATCH_REFRESH_DAYS` reach the scheduled run from the `PlatformAgent`
+CR's `spec.deployment.env`, which the operator's allowlist carries.
+`LEEWAY_WATCH_CLUSTERS`, `LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` are
+not carried; they are overrides for runs started by hand in the pod. Pass
+`--dry-run` when probing narrower or wider thresholds by hand, so `ledger.json`
+and `reports/latest.*` are not mutated.
 
 State ledger, blackboard topic, and 7-day reminder gate. Under
 `<profile home>/leeway/`:
