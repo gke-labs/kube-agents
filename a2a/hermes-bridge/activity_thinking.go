@@ -166,6 +166,7 @@ type sessionTrace struct {
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
 	sessionCards         map[string]string // worker sessionID -> cardID
 	cardTitles           map[string]string // cardID -> short cluster/card title
+	filedCards           map[string]bool   // cardID -> made by this task's kanban_create, title or not
 	claimedSessions      map[string]bool   // worker sessionID claimed by this task
 	reportedSettledCards map[string]bool   // cardID -> KindSubtask step already emitted for this task
 }
@@ -201,6 +202,7 @@ func (a *activityState) initSessionTraceLocked() {
 	if a.trace.sessionCards == nil {
 		a.trace.sessionCards = make(map[string]string)
 		a.trace.cardTitles = make(map[string]string)
+		a.trace.filedCards = make(map[string]bool)
 		a.trace.claimedSessions = make(map[string]bool)
 		a.trace.plannedTitles = make(map[string]string)
 		a.trace.reportedSettledCards = make(map[string]bool)
@@ -295,8 +297,10 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
 		// A card is recorded only from an id the create's result reports in a
 		// JSON field without error: free text or error text may name another
-		// task's card (#6430).
+		// task's card (#6430). A filed card claims its workers' deliveries even
+		// with no title.
 		if kanbanCardIDFromJSON(d.Extra.Result) == createdCardID {
+			a.trace.filedCards[createdCardID] = true
 			if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
 				a.trace.cardTitles[createdCardID] = short
 			}
@@ -508,7 +512,7 @@ func (a *activityState) hasCardID(cardID string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.trace.cardTitles[cardID] != ""
+	return a.trace.filedCards[cardID] || a.trace.cardTitles[cardID] != ""
 }
 
 // buildAPIRequestSteps reads one post_api_request delivery into the step

@@ -267,7 +267,7 @@ jobs:
         with:
           syft-version: "v1.51.1"
 
-      # The bundle step builds the k8s-api-proxy release binaries
+      # The bundle step builds the k8s-api-proxy and kube-agents-mcp release binaries
       # (build_release_binaries.sh) with the toolchain main's go.mod pins; the
       # build runs with GOTOOLCHAIN=local, so a release commit needing a newer
       # one fails rather than downloads it. No cache: a release build restores

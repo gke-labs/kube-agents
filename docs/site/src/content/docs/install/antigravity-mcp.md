@@ -97,7 +97,7 @@ The module needs Go 1.27; an older `go` command fetches the right toolchain by i
 kube-agents-mcp --version
 ```
 
-It prints `kube-agents` and the bridge's version. Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
+It prints `kube-agents-mcp` and a version: the release for a binary from a release archive, or for a build from source the module version Go recorded (a pseudo-version for `@main`; `dev` when it recorded none). Note the binary's full path (`command -v kube-agents-mcp`): Antigravity starts it by that path.
 
 ## Configure Antigravity
 
