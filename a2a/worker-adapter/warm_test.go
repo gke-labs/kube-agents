@@ -174,3 +174,36 @@ func TestAWarmPodNeedsReuseAndNoTask(t *testing.T) {
 		t.Errorf("a warm reused session pod with no task: %v", err)
 	}
 }
+
+// A warm pod whose minted name repeats one TASKS still holds an unfinished
+// task for (an earlier pod's, within the stream's retention) never runs that
+// task: its watcher reads only what is published once its consumer exists,
+// which is before it reports ready, so the claimed conversation's first task,
+// sent after ready, is the first one it runs.
+func TestAWarmPodNeverRunsAnEarlierPodsTaskUnderItsName(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-otter-w4rp"
+	dir := t.TempDir()
+	ready := freeLoopbackAddr(t)
+	// The earlier pod's task: submitted, never finished.
+	submit(t, c, session, "task-w-old", "the earlier pod's question")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, warmConfig(url, session, recordingStub(t, dir, ""), ready))
+	waitWarmReady(t, ready)
+	submit(t, c, session, "task-w-new", "the claimed conversation's question")
+	waitState(t, c, session, "task-w-new", lib.StateCompleted)
+	if n := runCount(dir); n != 1 {
+		t.Fatalf("%d harness runs, want only the claimed conversation's", n)
+	}
+	if p := readRun(t, dir, "prompt", 1); !strings.Contains(p, "the claimed conversation's question") {
+		t.Fatalf("the warm pod ran %q, not the claimed conversation's task", p)
+	}
+	if n := finals(t, url, session, "task-w-old"); n != 0 {
+		t.Fatalf("the earlier pod's task has %d finals from the warm pod, want none", n)
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}

@@ -39,10 +39,6 @@ const (
 	// a wake's follow-ups do stacks this many behind a submission in the
 	// seconds the watcher may lag.
 	maxPendingBehindSubmission = 32
-	// warmStartSeq is where a warm pod's watcher starts reading: the
-	// stream's first sequence. Its subjects carry its own freshly minted
-	// name, so nothing is there before the pod is.
-	warmStartSeq = 1
 	// warmStatusReadHeaderTimeout bounds a request's headers on the warm
 	// status endpoint.
 	warmStatusReadHeaderTimeout = 5 * time.Second
@@ -88,17 +84,22 @@ func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask stri
 }
 
 // runWarm is a warm pod's life (Config.Warm): no task named at start, so it
-// opens the task watcher on its own `…in` subjects from the stream's first
-// sequence, reports itself ready once the watcher's consumer exists
-// (WarmStatusAddr, read by the pod's readiness probe), and runs the first
-// task that arrives exactly as a reused pod runs its next turn: the same
-// execute, so the same capability check before any harness starts. From
-// there it is a reused session pod (sessionLoop).
+// opens the task watcher on its own `…in` subjects reading only what is
+// published from then on (DeliverNewPolicy), reports itself ready once the
+// watcher's consumer exists (WarmStatusAddr, read by the pod's readiness
+// probe), and runs the first task that arrives exactly as a reused pod runs
+// its next turn: the same execute, so the same capability check before any
+// harness starts. From there it is a reused session pod (sessionLoop).
 //
-// Reading from the first sequence reads nothing it should not: the subjects
-// are named for this pod's freshly minted name, so nothing was published
-// there before the pod existed, and the consumer is the one the callout
-// grants every session pod (`<pod>-origin`, filtered `a2a.tasks.<pod>.*.in`).
+// Reading only new messages misses nothing it is owed: the gateway claims
+// only a Ready pod, and the pod is Ready only once the consumer exists, so a
+// claimed conversation's first task is published after the consumer's start.
+// What it keeps out is whatever TASKS still holds under the same name: a
+// minted name can repeat one an earlier pod had within the stream's
+// retention, and that pod's unfinished task must never run here. (The
+// gateway's pool also never mints a name TASKS holds; this is the pod's own
+// half.) The consumer is the one the callout grants every session pod
+// (`<pod>-origin`, filtered `a2a.tasks.<pod>.*.in`).
 //
 // The wait is bounded by WarmIdle. A pod nobody claimed in that time exits
 // with nothing to publish (exit 0): the gateway's pool has replaced it
@@ -112,7 +113,7 @@ func runWarm(ctx context.Context, cfg Config, b *busConns) (Result, error) {
 		log:     log,
 		stem:    cfg.consumerStem(),
 		addr:    cfg.Addressee(),
-		next:    warmStartSeq,
+		fromNew: true,
 		handled: map[string]bool{},
 		onLive:  func() { serveWarmStatus(ctx, cfg) },
 	}
@@ -241,7 +242,11 @@ type taskWatcher struct {
 	// next is the stream sequence the next read starts at: one past the
 	// last message looked at, so a recreated consumer neither repeats nor
 	// skips anything.
-	next    uint64
+	next uint64
+	// fromNew makes the first consumer read only messages published after
+	// it exists (a warm pod, runWarm); its start is then taken as next, so a
+	// recreated consumer resumes there rather than skipping what came since.
+	fromNew bool
 	handled map[string]bool
 	// onLive, when set, runs once, the first time the watcher's consumer
 	// exists (a warm pod's readiness).
@@ -303,6 +308,19 @@ func (w *taskWatcher) nextTask(ctx context.Context) (*lib.Envelope, uint64, erro
 func (w *taskWatcher) consumer(ctx context.Context, filter string) (jetstream.Consumer, error) {
 	name := lib.SessionConsumerName(w.stem, lib.SessionConsumerOrigin)
 	_ = w.js.DeleteConsumer(ctx, lib.TasksStream, name)
+	if w.fromNew {
+		cons, err := w.js.CreateOrUpdateConsumer(ctx, lib.TasksStream, sessionConsumerConfig(name, filter, jetstream.ConsumerConfig{
+			DeliverPolicy: jetstream.DeliverNewPolicy,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		// A new-only consumer starts one past the stream's last sequence
+		// and reports that as delivered, so the next read is from there.
+		w.next = cons.CachedInfo().Delivered.Stream + 1
+		w.fromNew = false
+		return cons, nil
+	}
 	return w.js.CreateOrUpdateConsumer(ctx, lib.TasksStream, sessionConsumerConfig(name, filter, jetstream.ConsumerConfig{
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:   w.next,
