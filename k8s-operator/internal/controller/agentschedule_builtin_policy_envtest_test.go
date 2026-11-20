@@ -131,6 +131,11 @@ func TestTheBuiltinPolicyLeavesBuiltinToTheOperator(t *testing.T) {
 	// Create.
 	refused(writer.Create(ctx, schedule("w-label", true, false)), "a writer's create labelled builtin")
 	refused(writer.Create(ctx, schedule("w-ref", false, true)), "a writer's create with a PlatformAgent controller")
+	disguised := schedule("w-disguised", false, false)
+	disguised.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "v1", Kind: "ConfigMap", Name: "not-an-agent", UID: controller.UID, Controller: ptr.To(true),
+	}}
+	refused(writer.Create(ctx, disguised), "a writer's create with a controller of another kind carrying the PlatformAgent's uid")
 	allowed(writer.Create(ctx, schedule("w-user", false, false)), "a writer's user schedule")
 	allowed(operator.Create(ctx, schedule("builtin", true, true)), "the operator's built-in schedule")
 

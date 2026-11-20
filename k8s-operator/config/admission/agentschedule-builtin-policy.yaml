@@ -20,8 +20,9 @@
 #
 #   1. The origin label doesn't become, or stop being, `builtin`: a create may not carry it, and an
 #      update may not add it, change it to it, or change or remove it where it was.
-#   2. The controller references to a PlatformAgent don't change: a create may not carry one, and
-#      an update may not add, change or remove one.
+#   2. The controller reference doesn't change, whatever kind it names: a create may not carry
+#      one, and an update may not add, change or remove one. Every kind, not only PlatformAgent,
+#      because the reconciler's controller check matches on the owner's uid alone.
 #
 # Anything else passes, so a person may still annotate a built-in schedule (`run-now`, `stop`) or
 # edit a user schedule. A built-in schedule written before this policy existed isn't refused for
@@ -67,19 +68,19 @@ spec:
         request.operation == 'UPDATE' && has(oldObject.metadata.labels) &&
         variables.originKey in oldObject.metadata.labels ?
         oldObject.metadata.labels[variables.originKey] : ''
-    # Each controller reference to a PlatformAgent, as its name and uid.
+    # Every controller reference, whatever its kind: the reconciler's controller
+    # check (metav1.IsControlledBy) matches on the uid alone, so a reference
+    # that names another kind but carries the PlatformAgent's uid counts too.
     - name: newControllers
       expression: >-
         has(object.metadata.ownerReferences) ?
-        object.metadata.ownerReferences.filter(r,
-          has(r.controller) && r.controller && r.kind == 'PlatformAgent' &&
-          r.apiVersion.startsWith('kubeagents.x-k8s.io/')).map(r, r.name + '/' + r.uid) : []
+        object.metadata.ownerReferences.filter(r, has(r.controller) && r.controller)
+          .map(r, r.apiVersion + '/' + r.kind + '/' + r.name + '/' + r.uid) : []
     - name: oldControllers
       expression: >-
         request.operation == 'UPDATE' && has(oldObject.metadata.ownerReferences) ?
-        oldObject.metadata.ownerReferences.filter(r,
-          has(r.controller) && r.controller && r.kind == 'PlatformAgent' &&
-          r.apiVersion.startsWith('kubeagents.x-k8s.io/')).map(r, r.name + '/' + r.uid) : []
+        oldObject.metadata.ownerReferences.filter(r, has(r.controller) && r.controller)
+          .map(r, r.apiVersion + '/' + r.kind + '/' + r.name + '/' + r.uid) : []
   validations:
     - expression: >-
         variables.newOrigin == variables.oldOrigin ||
@@ -87,7 +88,7 @@ spec:
       message: "only the operator may set, change or remove an AgentSchedule's kubeagents.x-k8s.io/origin: builtin label"
       reason: Forbidden
     - expression: "variables.newControllers == variables.oldControllers"
-      message: "only the operator may add, change or remove an AgentSchedule's controller reference to a PlatformAgent"
+      message: "only the operator may add, change or remove an AgentSchedule's controller reference"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

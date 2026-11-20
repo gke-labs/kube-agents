@@ -873,3 +873,20 @@ func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
 		}
 	})
 }
+
+// A controller reference of another kind that carries the PlatformAgent's uid
+// doesn't make a schedule built-in: metav1.IsControlledBy matches uids alone,
+// so the reconciler checks the kind too.
+func TestAgentScheduleAControllerOfAnotherKindIsNotThePlatformAgent(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+		s.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "v1", Kind: "ConfigMap", Name: "not-an-agent", UID: "agent-uid", Controller: ptr.To(true),
+		}}
+	})
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
+		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
+	}
+}

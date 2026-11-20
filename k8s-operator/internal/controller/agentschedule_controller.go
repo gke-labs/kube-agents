@@ -261,12 +261,20 @@ func (r *AgentScheduleReconciler) builtinNames(agent *agentv1alpha1.PlatformAgen
 // origin unlocks a built-in audit's report stream (design section 1); the
 // gateway checks the stream against the trigger again.
 func agentScheduleOrigin(sched *agentv1alpha1.AgentSchedule, agent *agentv1alpha1.PlatformAgent, builtins []string) string {
-	if agent != nil && metav1.IsControlledBy(sched, agent) &&
+	if agent != nil && metav1.IsControlledBy(sched, agent) && controlledByAPlatformAgent(sched) &&
 		sched.Labels[agentv1alpha1.AgentScheduleOriginLabel] == agentv1alpha1.AgentScheduleOriginBuiltin &&
 		slices.Contains(builtins, sched.Name) {
 		return agentv1alpha1.AgentScheduleOriginBuiltin
 	}
 	return agentv1alpha1.AgentScheduleOriginUser
+}
+
+// controlledByAPlatformAgent reports whether the schedule's controller
+// reference names a PlatformAgent, not only its uid: metav1.IsControlledBy
+// compares uids alone.
+func controlledByAPlatformAgent(sched *agentv1alpha1.AgentSchedule) bool {
+	ref := metav1.GetControllerOf(sched)
+	return ref != nil && ref.Kind == "PlatformAgent" && ref.APIVersion == agentv1alpha1.GroupVersion.String()
 }
 
 func slotKey(sched *agentv1alpha1.AgentSchedule, slot time.Time) string {
