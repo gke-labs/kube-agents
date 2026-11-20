@@ -49,9 +49,14 @@ import (
 // made in between nor an overlapping leader's turn loses its pod.
 //
 // The claim index is not the only thing keeping a pod to one conversation: a
-// pod is claimed only if nothing was ever published to its task subjects
+// pod is claimed only if TASKS holds nothing on its task subjects
 // (warmPodUsed), so a claim entry lost from the bucket can't hand a pod in
-// use to a second conversation. Such a pod is left alone, not deleted.
+// use to a second conversation. Such a pod is left alone, not deleted, and
+// counts as a live session (sessionPods). "Nothing published" holds only
+// within TASKS' retention, and a minted name can repeat one an earlier pod
+// had inside it, so the pool never creates a warm pod under a name TASKS
+// holds anything for (mintWarmName), and the pod's own watcher reads only
+// what is published after it starts (the worker adapter's runWarm).
 const (
 	// warmRecycleAge is how long a warm pod waits unclaimed. Its adapter
 	// exits at this age if nothing has claimed it
@@ -132,7 +137,7 @@ func (g *Gateway) claimOrMint(ctx context.Context, rec *SessionRecord) {
 // name, or "" when rec may not have one or none is Ready. Any failure is a
 // cold spawn, never a refused turn. The pods and the claim index are read
 // with no lock held; a candidate is then marked as being claimed
-// (beginWarmClaim), checked for any task ever published to it, and claimed
+// (beginWarmClaim), checked for any task TASKS holds for it, and claimed
 // with a create in the index, which fails for a pod already claimed.
 func (g *Gateway) claimWarm(ctx context.Context, rec *SessionRecord) string {
 	if !g.warmPoolOn() || !warmClaimEligible(g.cfg, rec) {

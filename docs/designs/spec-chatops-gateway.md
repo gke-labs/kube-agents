@@ -726,8 +726,10 @@ so on platform no warm pod runs), at most
 the cap less one and fewer while live sessions fill the cap (`a2a/gateway/warm_pool.go`). A warm
 pod is the session pod `Spawn` builds, created through the same CREATE-only path and admission
 policy, with no task or conversation annotation and an `a2a.kubeagents.dev/warm` mark. It has a
-freshly minted name, and its adapter starts without `TASK_ID` (`A2A_SESSION_WARM`), opens its
-task watcher on its own `…in` subjects and reports Ready once the watcher's consumer exists,
+freshly minted name, never one `TASKS` holds anything for (a minted name can repeat an earlier
+pod's within the stream's retention, so the pool mints again), and its adapter starts without
+`TASK_ID` (`A2A_SESSION_WARM`), opens its task watcher on its own `…in` subjects reading only
+what is published from then on, and reports Ready once the watcher's consumer exists,
 from a loopback endpoint that keeps answering for the pod's life. It carries a digest of the
 spec it was made with (`a2a.kubeagents.dev/warm-shape`), so after a release or a config change
 the old pods are never claimed and the pool replaces them. A
@@ -736,8 +738,9 @@ record's bus session and addressee to the pod's name instead of minting one. Not
 re-bound: the capability names the pod, and its grants are what a fresh spawn under that
 name gets, so an unclaimed pod can run nothing. Only a session-routed conversation with no
 earlier turn claims one (a warm pod has no primer, which is read once at start), never a
-one-shot Delegate, and with none ready the turn spawns cold. A pod anything was ever
-published to is never claimed, whatever the claim index says. The gateway cannot patch the
+one-shot Delegate, and with none ready the turn spawns cold. A pod `TASKS` holds anything for
+on its subjects (anything published within the stream's retention) is never claimed, whatever
+the claim index says, and counts as a live session. The gateway cannot patch the
 pod, so the claim goes in the session-state bucket (`warm.<pod>` naming the conversation),
 and the cap count, the cap eviction and both sweeps read the claim in place of the
 annotations; an unclaimed warm pod holds no cap slot and is no stranded orphan. The pool
