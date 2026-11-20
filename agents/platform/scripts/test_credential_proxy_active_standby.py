@@ -644,38 +644,57 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         self.assertEqual(["recovered"], activated)
 
     def test_standby_watchdog_survives_http_exceptions_and_probe_errors(self) -> None:
-        # Malformed HTTP responses (BadStatusLine/IncompleteRead) or URL ValueErrors
-        # must return False rather than killing _run_standby_watchdog.
+        # DNS/network/HTTP/URL errors must fail closed (None) so an active peer
+        # hidden behind a transient partition does not cause split-brain activation,
+        # while ConnectionRefusedError (0 ready backends after DNS) returns False.
         with mock.patch("http.client.HTTPConnection.request", side_effect=http.client.BadStatusLine("bad")), \
                 mock.patch("http.client.HTTPConnection.close"):
-            self.assertFalse(credential_proxy._probe_peer_healthz("http://127.0.0.1:8765/healthz", 0.5))
-        self.assertFalse(credential_proxy._probe_peer_healthz("http://[::1:8765/healthz", 0.5))
+            self.assertIsNone(credential_proxy._probe_peer_healthz("http://127.0.0.1:8765/healthz", 0.5))
+        with mock.patch("http.client.HTTPConnection.request", side_effect=OSError("gaierror: name resolution failed")), \
+                mock.patch("http.client.HTTPConnection.close"):
+            self.assertIsNone(credential_proxy._probe_peer_healthz("http://127.0.0.1:8765/healthz", 0.5))
+        with mock.patch("http.client.HTTPConnection.request", side_effect=TimeoutError("timed out")), \
+                mock.patch("http.client.HTTPConnection.close"):
+            self.assertIsNone(credential_proxy._probe_peer_healthz("http://127.0.0.1:8765/healthz", 0.5))
+        self.assertIsNone(credential_proxy._probe_peer_healthz("http://[::1:8765/healthz", 0.5))
+        with mock.patch("http.client.HTTPConnection.request", side_effect=ConnectionRefusedError("connection refused")), \
+                mock.patch("http.client.HTTPConnection.close"):
+            self.assertIs(credential_proxy._probe_peer_healthz("http://127.0.0.1:8765/healthz", 0.5), False)
 
         calls = [0]
+        allow_absent = threading.Event()
 
-        def flaky_probe() -> bool:
+        def flaky_then_absent() -> bool | None:
             calls[0] += 1
-            if calls[0] <= 2:
-                raise http.client.IncompleteRead(b"partial")
+            if not allow_absent.is_set():
+                if calls[0] % 2 == 1:
+                    raise http.client.IncompleteRead(b"partial")
+                return None
             return False
 
         activated: list[str] = []
         lifecycle = BrokerLifecycle(
             enabled=True,
             control_file=self.token_path,
-            peer_active_probe=flaky_probe,
+            peer_active_probe=flaky_then_absent,
             peer_probe_interval_seconds=0.01,
             self_activate_grace_seconds=0.04,
         )
         self.addCleanup(lifecycle.stop_watchdog)
         lifecycle.set_warm(on_activate=lambda: activated.append("survived"))
 
+        # Stay in standby well past the grace window while probes fail/error.
+        time.sleep(0.12)
+        self.assertEqual(BROKER_STATE_STANDBY, lifecycle.state)
+        self.assertEqual([], activated)
+        self.assertGreaterEqual(calls[0], 4)
+
+        allow_absent.set()
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and lifecycle.state != BROKER_STATE_ACTIVE:
             time.sleep(0.01)
         self.assertEqual(BROKER_STATE_ACTIVE, lifecycle.state)
         self.assertEqual(["survived"], activated)
-        self.assertGreaterEqual(calls[0], 3)
 
     def test_activate_refuses_while_shutting_down_and_sigterm_stops_watchdog(self) -> None:
         external_stop = threading.Event()

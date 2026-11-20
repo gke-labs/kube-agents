@@ -1453,7 +1453,7 @@ spec:
             - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
               value: "8388608"
             - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
-              value: "12"
+              value: "8"
             - name: CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES
               valueFrom:
                 resourceFieldRef:

@@ -809,7 +809,8 @@ The arithmetic behind `6`:
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
   request only when its children fit the proxy's memory limit: 176 MiB per request after a 192 MiB
   reserve for the broker and Envoy. At `small` (default `2Gi` limit), that fits 10 at once, held to
-  8 by `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (`12` on `medium`, `16` on `fleet`).
+  8 by `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (fixed `medium`/`fleet` profiles stay at `8`; under
+  `sizingProfile: auto`, `medium` sets `12` and `fleet` sets `16`).
 
   The proxy slots are shared. The stall watch runs four commands at a time for most of its tick,
   and cluster-agent reconcile lists four projects at a time. When both run under the 8-slot `small`
@@ -819,9 +820,10 @@ The arithmetic behind `6`:
   if worker logs show them, lower `maxInProgress`.
 
 If you raise `maxInProgress`, check your model quota, and know where the credential proxy stops it.
-At `small` (2Gi default), the memory budget admits 10 while the slot cap binds at 8 (`12` on
-`medium` with 4Gi, `16` on `fleet` with 8Gi). Raising `spec.deployment.credentialProxy.resources`
-alone does not raise the slot cap; set `spec.deployment.sizingProfile` to scale slots too. Keep
+At `small` (2Gi default), the memory budget admits 10 while the slot cap binds at 8. Fixed profiles
+keep 8 slots, while under `sizingProfile: auto`, `medium` (4Gi) admits 22 with a `12` slot cap and
+`fleet` (8Gi) admits 45 with a `16` slot cap. Raising `spec.deployment.credentialProxy.resources`
+alone does not raise the slot cap; set `spec.deployment.sizingProfile: auto` to scale slots too. Keep
 the memory limit at 2Gi or more, because below it the memory budget binds first.
 
 The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
@@ -1072,11 +1074,11 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `scaleToZero` — when `true`, scales the gateway Deployment to 0 replicas (idle cost saving). The shell sandbox, the credential broker and the A2A stack keep running. Once the gateway has no ready replica the `PlatformAgent` reads `phase: Paused`, with `Ready` `False` and reason `ScaledToZero`. That tells a paused install from one whose rollout never finishes. Set the field to `false` or remove it, and the normal phases return: `Provisioning` while the gateway starts, then `Ready`. [What `Ready` reports](#what-ready-reports) has the detail. On the way back the Platform Agent's scheduled audits do not all start at once: [Catch-ups after a pause](/kube-agents/concepts/autonomous-watchdogs/#catch-ups-after-a-pause).
 - `sizingProfile` — the preset row the credential-proxy container, the `agent-api-auth` sidecar and the shell container start from, before the per-key overrides above and under [`shellSandbox`](#shellsandbox) are applied over it; an explicit key always wins. One of `small` (the default, and what an absent field means: the operator's defaults as documented above), `medium`, `fleet` or `auto`. The agent container's own `resources` are not part of a profile.
 
-  | Tier     | Credential proxy                                                                                               | `agent-api-auth`   | Shell            |
-  | -------- | -------------------------------------------------------------------------------------------------------------- | ------------------ | ---------------- |
-  | `small`  | the defaults above (8 slots)                                                                                   | the defaults above | the defaults     |
-  | `medium` | 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE Autopilot), 2 CPU and 4Gi limits, 8Gi ephemeral-storage, 12 slots | 4Gi memory limit   | the defaults     |
-  | `fleet`  | 4 CPU and 8Gi requests, 8 CPU and 8Gi limits, 8Gi ephemeral-storage, 16 slots                                  | 8Gi memory limit   | 4Gi memory limit |
+  | Tier     | Credential proxy                                                                                                                       | `agent-api-auth`   | Shell            |
+  | -------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------------- |
+  | `small`  | the defaults above (8 slots)                                                                                                           | the defaults above | the defaults     |
+  | `medium` | 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE Autopilot), 2 CPU and 4Gi limits, 8Gi ephemeral-storage (`12` slots on `auto`, `8` fixed) | 4Gi memory limit   | the defaults     |
+  | `fleet`  | 4 CPU and 8Gi requests, 8 CPU and 8Gi limits, 8Gi ephemeral-storage (`16` slots on `auto`, `8` fixed)                                  | 8Gi memory limit   | 4Gi memory limit |
 
   Figures a row does not name keep the small row's. `auto` sets the minimum floor from the cluster count the operator polls into `status.usage`, the larger of `clustersRegistered` and `clustersMonitored`: `medium` at 10 clusters, `fleet` at 25. It starts from `status.effectiveSizingTier` (`small` when unset, or the explicit tier an edited CR held).
 
@@ -1098,7 +1100,9 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   When the dry run is refused, the step is held: nothing is measured, the tier and any standing condition stay as written, and the pass logs the hold until admission answers. A broker Deployment that does not exist yet holds the step the same way, before admission is asked.
 
-  Under `sizingProfile: auto` in-cluster, `credential-proxy` uses `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated active-standby handoff (after one `Recreate` hop on upgrade from pre-standby pods; default and fixed profiles keep `Recreate`). The surge pod warms in standby (`/healthz` returning `503`) while the old pod stays active; if no active peer answers `200`, it self-activates after `45s`. Otherwise, the operator drains the old pod, records the active holder on the `<agent>-credential-proxy` Lease (an audit record the broker never reads), and activates the new pod. Across drain, the old pod keeps `/healthz` at `200` so Service Endpoints remain non-empty while refusing new commands with retryable `503 draining`; Kubernetes terminates it once the replacement passes readiness.
+  Under `sizingProfile: auto` in-cluster, `credential-proxy` uses `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) under operator-coordinated active-standby handoff (after one `Recreate` hop on upgrade from pre-standby pods; default and fixed profiles keep `Recreate`). The surge pod warms in standby (`/healthz` returning `503`) while the old pod stays active. It self-activates after `45s` only when DNS resolves a clean non-`200` or `ConnectionRefusedError` from an empty Service; DNS/network/HTTP probe errors fail closed and reset the timer.
+
+  Otherwise, the operator drains the old pod, records the active holder on the `<agent>-credential-proxy` Lease (an audit record the broker never reads), and activates the new pod. Across drain, the old pod keeps `/healthz` at `200` so Service Endpoints remain non-empty while refusing new commands with retryable `503 draining`; Kubernetes terminates it once the replacement passes readiness.
 
   If node capacity cannot schedule that surge pod and it remains `Pending` past `2m`, `auto` rolls back to the active running tier, keeps the running active pod untouched, and sets `SizingCappedByQuota` with reason `SurgeUnschedulable`. Similarly, if the proxy or gateway Deployment carries `ReplicaFailure` with `exceeded quota` on a step up or step down, the next pass reverts to the active tier (or `tier - 1` when no running tier differs) and sets `SizingCappedByQuota` naming the quota.
 

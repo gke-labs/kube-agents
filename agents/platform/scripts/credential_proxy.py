@@ -14652,15 +14652,23 @@ PEER_PROBE_HEADERS = {"Connection": "close"}
 
 def _probe_peer_healthz(
     url: str, timeout: float = STANDBY_PEER_PROBE_TIMEOUT_SECONDS
-) -> bool:
-    """Return True iff an active/draining peer answers 200 on the broker Service."""
+) -> bool | None:
+    """Probe the broker Service /healthz.
+
+    Returns:
+      True: active peer responded 200 (stay in standby).
+      False: peer answered non-200 or TCP ConnectionRefused (0 ready backends
+        after DNS resolution succeeded), indicating no active peer.
+      None: DNS, timeout, network, URL, or HTTP parse failure; peer state is
+        unknown so standby fails closed and does not self-activate.
+    """
     if not url:
-        return False
+        return None
     conn: http.client.HTTPConnection | None = None
     try:
         parts = urllib.parse.urlsplit(url)
         if parts.scheme not in STANDBY_PEER_ALLOWED_SCHEMES or not parts.hostname:
-            return False
+            return None
         target = parts.path or HEALTHZ_PATH
         if parts.query:
             target = f"{target}?{parts.query}"
@@ -14673,8 +14681,15 @@ def _probe_peer_healthz(
         resp = conn.getresponse()
         resp.read()
         return resp.status == HTTPStatus.OK
-    except (OSError, http.client.HTTPException, ValueError):
+    except ConnectionRefusedError:
         return False
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        LOGGER.warning(
+            "standby peer health probe inconclusive (%s): %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
     finally:
         if conn is not None:
             with contextlib.suppress(OSError):
@@ -14696,7 +14711,7 @@ class BrokerLifecycle:
         settle_seconds: float = SHUTDOWN_SETTLE_SECONDS,
         end_wait_seconds: float = SHUTDOWN_END_WAIT_SECONDS,
         peer_health_url: str = "",
-        peer_active_probe: Callable[[], bool] | None = None,
+        peer_active_probe: Callable[[], bool | None] | None = None,
         peer_probe_interval_seconds: float = STANDBY_PEER_PROBE_INTERVAL_SECONDS,
         self_activate_grace_seconds: float = STANDBY_SELF_ACTIVATE_GRACE_SECONDS,
         external_stop: threading.Event | None = None,
@@ -14742,21 +14757,19 @@ class BrokerLifecycle:
             if probe is None:
                 return
             try:
-                healthy = probe()
+                peer_state = probe()
             except Exception as exc:
                 LOGGER.warning(
                     "standby watchdog peer health probe raised %s: %s",
                     type(exc).__name__,
                     exc,
                 )
-                healthy = False
+                peer_state = None
             if self._watchdog_stop.is_set() or (
                 self._external_stop is not None and self._external_stop.is_set()
             ):
                 return
-            if healthy:
-                no_peer_since = None
-            else:
+            if peer_state is False:
                 now = self._clock()
                 if no_peer_since is None:
                     no_peer_since = now
@@ -14768,6 +14781,10 @@ class BrokerLifecycle:
                             self._self_activate_grace_seconds,
                         )
                     return
+            else:
+                # Reset on confirmed active peer (True) or unknown failure (None) so
+                # DNS/network faults cannot advance the grace window toward split-brain.
+                no_peer_since = None
             self._watchdog_stop.wait(self._peer_probe_interval_seconds)
 
     def stop_watchdog(self) -> None:

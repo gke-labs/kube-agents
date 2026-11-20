@@ -1256,8 +1256,9 @@ spec:
                             their number: the broker charges each command about 128Mi, the size of
                             a listing of a small cluster, and a kubectl listing thousands of objects
                             holds several hundred Mi on its own, so size the limit to the largest
-                            listing the fleet produces for every command that runs at once (8 at
-                            small/default, 12 at medium, 16 at fleet) plus the 192Mi resident reserve
+                            listing the fleet produces for every command that runs at once (8 on
+                            fixed/default profiles, or 8/12/16 across small/medium/fleet under
+                            sizingProfile: auto) plus the 192Mi resident reserve
                             for the broker and Envoy; the broker's child peak and memory high-water
                             series give the figure.
                             Only cpu, memory and ephemeral-storage
@@ -10234,11 +10235,11 @@ spec:
                             quota. The credential proxy sets the ceiling on brokered commands: its small/default
                             2Gi already admits more than its slot cap of 8, so up to about eight workers' worth
                             of commands fit at the defaults, fewer while the listings above run. Past that the
-                            slot cap binds (8 on small/default, 12 on medium, 16 on fleet via
-                            spec.deployment.sizingProfile); raising only the proxy memory limit in
-                            spec.deployment.credentialProxy.resources without raising sizingProfile does not
-                            raise the slot cap, and a command beyond the cap waits up to 60 s for a slot and is
-                            then refused busy. Keep that limit at 2Gi or more, since below it the memory budget
+                            slot cap binds (8 on fixed profiles and default, stepping 8/12/16 across
+                            small/medium/fleet under spec.deployment.sizingProfile: auto); raising only the
+                            proxy memory limit in spec.deployment.credentialProxy.resources without enabling
+                            auto does not raise the slot cap, and a command beyond the cap waits up to 60 s for
+                            a slot and is then refused busy. Keep that limit at 2Gi or more, since below it the memory budget
                             (176 MiB per command after the 192 MiB resident reserve) binds first. Set it to 1 to
                             serialise all delegated work. When quota rather than memory binds, note the related
                             failure mode: workers that exhaust their retry budget exit without calling a terminal

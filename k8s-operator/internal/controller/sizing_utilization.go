@@ -529,7 +529,7 @@ func capacitiesAtTier(agent *agentv1alpha1.PlatformAgent, autopilot, clamped boo
 			out.proxyCPUMilli = effectiveCPUCapacityMilli(r.resources)
 			out.proxyMemBytes = effectiveMemoryCapacityBytes(r.resources, clamped)
 			out.proxyChildBudget = childMemoryBudgetForLimit(out.proxyMemBytes)
-			out.proxySlotCap = effectiveBrokerSlotCapAtTier(out.proxyMemBytes, credentialProxyTierSlotCap(tier))
+			out.proxySlotCap = effectiveBrokerSlotCapAtTier(out.proxyMemBytes, credentialProxySlotCapIntForAgent(agent, tier))
 		case agentAPIAuthContainerName:
 			out.sidecarMemBytes = effectiveMemoryCapacityBytes(r.resources, clamped)
 		case shellSandboxContainerName:

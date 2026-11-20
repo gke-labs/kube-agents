@@ -81,9 +81,9 @@ platformAgent:
         value: "false"
     credentialProxy:
       # The broker that runs every credentialed command (gcloud, kubectl) in a
-      # pod of its own. With sizingProfile unset (the small row), it admits at
-      # most eight commands at once (set sizingProfile to medium for 12, fleet
-      # for 16, or auto to scale), and budgets each in-flight command against
+      # pod of its own. On default and fixed sizing profiles it admits at most
+      # eight commands at once (under sizingProfile: auto it scales 8 -> 12 -> 16
+      # across small/medium/fleet), and budgets each in-flight command against
       # limits.memory: 128 MiB reserved for the child plus six copies of the
       # 8 MiB output cap, 176 MiB a slot, after the broker's and Envoy's own
       # reserves. The 2Gi default already covers all eight slots, so 8Gi admits

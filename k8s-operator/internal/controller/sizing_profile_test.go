@@ -841,15 +841,15 @@ func TestRenderedSizingTier(t *testing.T) {
 func TestSizedContainersFollowTheRenderedTier(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name, profile, latched               string
+		name, profile, latched                          string
 		proxyLimit, sidecarLimit, shellLimit, wantSlots string
 	}{
 		{"auto with no latch yet renders the small row", sizingProfileAuto, "", credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
 		{"auto latched at medium renders the medium row", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
 		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyFleetMaxConcurrentCommands},
-		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
-		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyFleetMaxConcurrentCommands},
-		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
+		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
 		{"an explicit small profile renders the small row over a fleet latch", sizingProfileSmall, sizingProfileFleet, credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3135,5 +3135,41 @@ func TestUsageStatusRequeueSchedulesSizingPrunedReprobeUnderManualProfiles(t *te
 	now = now.Add(usageStatusReprobeInterval + time.Second)
 	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
 		t.Fatalf("usageStatusRequeue after reprobe interval expiry = %v, want %v", got, secretEnvReprobeInterval)
+	}
+}
+
+func TestSizingProfileAutoSlotCapsFitChildMemoryBudget(t *testing.T) {
+	t.Parallel()
+	// Under auto, medium (4Gi) raises slot cap 8->12 and fleet (8Gi) raises 8->16;
+	// fixed medium/fleet keep 8 so existing upgrades do not raise concurrency in-place.
+	for _, tc := range []struct {
+		name      string
+		tier      sizingTier
+		wantAuto  int64
+		minAdmit  int64
+		limitName string
+	}{
+		{"small", sizingTierSmall, 8, 10, credentialProxyMemoryLimit},
+		{"medium", sizingTierMedium, 12, 22, credentialProxyMediumMemoryLimit},
+		{"fleet", sizingTierFleet, 16, 45, credentialProxyFleetMemoryLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limitBytes := resource.MustParse(tc.limitName)
+			admitted := credentialProxyAdmittedRequests(limitBytes.Value(), credentialProxyOutputCapBytes)
+			if admitted != tc.minAdmit {
+				t.Fatalf("%s (%s) credentialProxyAdmittedRequests = %d, want %d", tc.name, tc.limitName, admitted, tc.minAdmit)
+			}
+			if tc.wantAuto > admitted {
+				t.Fatalf("%s auto slot cap %d exceeds child memory budget %d", tc.name, tc.wantAuto, admitted)
+			}
+			fixed := sizingAgent(tc.name, "", nil, nil)
+			if got := credentialProxySlotCapIntForAgent(fixed, tc.tier); got != 8 {
+				t.Fatalf("fixed %s slot cap = %d, want 8", tc.name, got)
+			}
+			auto := sizingAgent(sizingProfileAuto, tc.name, nil, nil)
+			if got := credentialProxySlotCapIntForAgent(auto, tc.tier); got != tc.wantAuto {
+				t.Fatalf("auto %s slot cap = %d, want %d", tc.name, got, tc.wantAuto)
+			}
+		})
 	}
 }

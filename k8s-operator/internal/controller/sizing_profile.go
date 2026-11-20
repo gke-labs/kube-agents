@@ -72,10 +72,12 @@ const (
 	// and a step up that lowered the broker's CPU there would be a step down.
 	// The memory limit sizes the broker's child memory budget
 	// (credentialProxyAdmittedRequests): 4Gi admits 22 requests in memory, so
-	// medium raises the slot cap from 8 to 12 with ~1.84 GiB headroom. The
-	// sidecar's memory limit doubles to 4Gi for the event watcher's informers;
-	// its requests, CPU limit and ephemeral-storage limit keep the small row's
-	// figures, and the shell keeps the small row entirely.
+	// under sizingProfile=auto medium raises the slot cap from 8 to 12 with
+	// 1792 MiB headroom (fixed medium keeps 8 to leave existing upgrades
+	// unchanged). The sidecar's memory limit doubles to 4Gi for the event
+	// watcher's informers; its requests, CPU limit and ephemeral-storage
+	// limit keep the small row's figures, and the shell keeps the small row
+	// entirely.
 	credentialProxyMediumCPURequest            = "1"
 	credentialProxyMediumMemoryRequest         = "4Gi"
 	credentialProxyMediumAutopilotCPURequest   = "2"
@@ -86,12 +88,14 @@ const (
 
 	// The fleet row. The broker gets 4 CPU and 8Gi of requests on both
 	// cluster types (2 GiB per vCPU, inside the band Autopilot admits
-	// unchanged), 8 CPU and 8Gi of limits, raises the slot cap to 16 (leaving
-	// ~500 MiB/slot even on heavy listings), and keeps the 8Gi
-	// ephemeral-storage limit, which already holds its two emptyDir caps and
-	// is the most Autopilot admits per pod with headroom. The sidecar's memory
-	// limit goes to 8Gi and the shell's to 4Gi, for the fan-out of a fleet
-	// sweep; every other figure keeps the small row's.
+	// unchanged), 8 CPU and 8Gi of limits, under sizingProfile=auto raises
+	// the slot cap to 16 (45 admitted in 8Gi via
+	// credentialProxyAdmittedRequests, leaving 5184 MiB headroom; fixed fleet
+	// keeps 8), and keeps the 8Gi ephemeral-storage limit, which already
+	// holds its two emptyDir caps and is the most Autopilot admits per pod
+	// with headroom. The sidecar's memory limit goes to 8Gi and the shell's
+	// to 4Gi, for the fan-out of a fleet sweep; every other figure keeps the
+	// small row's.
 	credentialProxyFleetCPURequest            = "4"
 	credentialProxyFleetMemoryRequest         = "8Gi"
 	credentialProxyFleetCPULimit              = "8"
@@ -507,8 +511,19 @@ func credentialProxyTierMaxConcurrentCommands(tier sizingTier) string {
 	}
 }
 
-func credentialProxyTierSlotCap(tier sizingTier) int64 {
-	v, _ := strconv.ParseInt(credentialProxyTierMaxConcurrentCommands(tier), 10, 64)
+// credentialProxySlotCapForAgent returns the rendered broker command-slot cap.
+// Fixed/default profiles keep credentialProxyMaxConcurrentCommands ("8") so
+// existing medium/fleet upgrades keep identical runtime concurrency; opt-in
+// sizingProfile=auto scales 8/12/16 across tiers.
+func credentialProxySlotCapForAgent(agent *agentv1alpha1.PlatformAgent, tier sizingTier) string {
+	if agent == nil || sizingProfileOf(agent.Spec.Deployment) != sizingProfileAuto {
+		return credentialProxyMaxConcurrentCommands
+	}
+	return credentialProxyTierMaxConcurrentCommands(tier)
+}
+
+func credentialProxySlotCapIntForAgent(agent *agentv1alpha1.PlatformAgent, tier sizingTier) int64 {
+	v, _ := strconv.ParseInt(credentialProxySlotCapForAgent(agent, tier), 10, 64)
 	return v
 }
 
