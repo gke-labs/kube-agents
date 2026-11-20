@@ -963,6 +963,20 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		held       []string
 	)
 
+	// refuseHeld refuses, on the stream and before the terminal, every steer
+	// still held when the task ends with no turn left for it: after the
+	// loop, and on the eviction arm's early returns. An abandoned task's
+	// terminal is the dispatcher's, so nothing goes out for it.
+	refuseHeld := func() {
+		if a.abandoned() {
+			return
+		}
+		for _, text := range held {
+			a.publishSteerRefusal(text, "")
+		}
+		held = nil
+	}
+
 	// stopForAbandon reports an abandon, from whichever arm finds it first,
 	// and kills the harness once. The loop still waits for it to exit and
 	// drain, as cancel does: the worker frees the pod for the next task when
@@ -1038,24 +1052,30 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						}
 					}
 					pendingTurns--
-					if holdSteers && len(held) > 0 && !ev.Failed {
-						// Another turn follows: the driver prepares it, then
-						// the held steers go onto stdin in the order they came.
+					// Another turn follows when a steer is held and the turn
+					// neither failed nor was ended by cancel or the deadline,
+					// whose kill is already on its way: the driver prepares
+					// that turn, then the oldest held steer goes onto stdin.
+					// One per boundary, so every turn the harness runs gets
+					// its own PrepareTurn; the rest wait for the next result.
+					if holdSteers && len(held) > 0 && !ev.Failed && !canceled && !deadlineHit {
 						if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
 							log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
 							sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
 							proc.closeStdin()
 							continue
 						}
-						for _, text := range held {
-							if err := proc.writeUser(text); err == nil {
-								pendingTurns++
-								log.Info("held steer written at turn boundary", "task", a.taskID)
-							} else {
-								log.Warn("steer write failed", "err", err)
-							}
+						text := held[0]
+						held = held[1:]
+						if err := proc.writeUser(text); err == nil {
+							pendingTurns++
+							log.Info("held steer written at turn boundary", "task", a.taskID)
+						} else {
+							// The adapter held it, so the adapter owns
+							// saying it never arrived.
+							log.Warn("held steer write failed; refusing it", "task", a.taskID, "err", err)
+							a.publishSteerRefusal(text, "")
 						}
-						held = nil
 					}
 					if ev.Failed {
 						sawResult = true
@@ -1187,6 +1207,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// wake the gateway could not route to this pod starts a fresh
 			// incarnation that retires it while the harness is still
 			// inside KillGrace.
+			refuseHeld()
 			if delegated {
 				return a.completeWith(resultText)
 			}
@@ -1204,11 +1225,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// Steers held for a turn that never came: the task ended first. Each is
 	// refused where its sender can see it, before the terminal, like a steer
 	// that arrives after the deliverable.
-	if !a.abandoned() {
-		for _, text := range held {
-			a.publishSteerRefusal(text, "")
-		}
-	}
+	refuseHeld()
 
 	// Harness exited and stdout is drained. Decide the terminal in strict
 	// precedence: a clean deliverable beats everything (cancel lost the

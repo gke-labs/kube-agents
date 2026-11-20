@@ -1,8 +1,9 @@
 // Package workeradapter is the in-pod shim between the bus and the harness
 // (spec-subagent-profiles.md, "The adapter"): it fetches its one task by
-// subject, publishes the lifecycle events, drives the harness over the
-// headless stream-json contract, forwards steering and follow-ups onto the
-// harness stdin, and exits with a code matching the terminal state. One task
+// subject, publishes the lifecycle events, drives the harness over its
+// headless contract (Driver: Claude Code's stream-json unless Config.Driver
+// names another), forwards steering and follow-ups onto the harness stdin,
+// and exits with a code matching the terminal state. One task
 // per process, unless the pod is a reused session pod (Config.SessionReuse),
 // which runs each turn of its conversation in turn; either way the pod exists
 // because the message is already durable.
@@ -210,9 +211,9 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 			}
 			evs, err := dec.Decode(line)
 			if err != nil {
-				// Non-JSON chatter on stdout is logged, never fatal - the
-				// harness owns its stdout and the contract owns only the
-				// JSON lines.
+				// A line the driver can't read (for Claude, non-JSON chatter)
+				// is logged, never fatal - the harness owns its stdout and
+				// the contract owns only the lines it defines.
 				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), chatterEchoCap))
 				continue
 			}

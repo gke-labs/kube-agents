@@ -430,6 +430,9 @@ func TestAPrepareTurnErrorFailsTheTask(t *testing.T) {
 			if _, err := os.Stat(got); err == nil {
 				t.Error("the held steer was written after PrepareTurn failed")
 			}
+			if at == 2 && refusalBeforeTerminal(t, url, session, taskID) < 0 {
+				t.Error("the held steer was not refused after PrepareTurn failed")
+			}
 		})
 	}
 }
@@ -460,6 +463,15 @@ echo 'ERR toy_broke it broke'
 	if out.res.State != lib.StateFailed {
 		t.Fatalf("state %q err %v", out.res.State, out.err)
 	}
+	if refusalBeforeTerminal(t, url, session, taskID) < 0 {
+		t.Fatal("want a steer refusal before the terminal")
+	}
+}
+
+// refusalBeforeTerminal is the index of the last steer refusal on the task's
+// stream if it comes before the terminal, else -1.
+func refusalBeforeTerminal(t *testing.T, url, session, taskID string) int {
+	t.Helper()
 	refusalAt, terminalAt := -1, -1
 	for i, env := range replayEvents(t, url, session, taskID) {
 		if env.Kind != lib.KindStatusUpdate {
@@ -474,7 +486,130 @@ echo 'ERR toy_broke it broke'
 			refusalAt = i
 		}
 	}
-	if refusalAt < 0 || refusalAt > terminalAt {
-		t.Fatalf("refusal at %d, terminal at %d: want a refusal before the terminal", refusalAt, terminalAt)
+	if refusalAt < 0 || terminalAt < 0 || refusalAt > terminalAt {
+		return -1
+	}
+	return refusalAt
+}
+
+// TestEachHeldSteerGetsATurnOfItsOwn: two steers held during one turn go
+// onto stdin one per boundary, each after its own PrepareTurn, so every turn
+// the harness runs was prepared. Written together after one PrepareTurn, the
+// third line would arrive before the third PrepareTurn ran.
+func TestEachHeldSteerGetsATurnOfItsOwn(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-toy-f6", "task-toy-two-held"
+	origin := submit(t, c, session, taskID, "opening")
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	harness := stub(t, fmt.Sprintf(`
+dir=%q
+echo 'S toy-two'
+read first || exit 1
+: > "$dir/started"
+sleep 3
+echo 'OK turn one'
+read second || exit 1
+[ -e "$dir/prepared-2" ] && p2=yes || p2=no
+sleep 1
+echo 'OK turn two'
+read third || exit 1
+[ -e "$dir/prepared-3" ] && p3=yes || p3=no
+echo "OK second=${second#TOY } p2=$p2 third=${third#TOY } p3=$p3"
+`, dir))
+	d := &toyDriver{hold: true, prepare: func(n int, _ TurnDirs) error {
+		return os.WriteFile(filepath.Join(dir, fmt.Sprintf("prepared-%d", n)), nil, 0o600)
+	}}
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = d
+	done := runAdapter(context.Background(), cfg)
+	waitPath(t, started, "the harness never started its first turn")
+	publishSteerFor(t, c, origin, session, "STEERWORD one")
+	publishSteerFor(t, c, origin, session, "STEERWORD two")
+
+	out := waitOutcome(t, done, waitDeadline)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	want := "second=STEERWORD one p2=yes third=STEERWORD two p3=yes"
+	if got := artifactText(foldTask(t, c, session, taskID), lib.ArtifactResult); got != want {
+		t.Fatalf("result %q, want %q", got, want)
+	}
+	if calls, _ := d.prepared(); calls != 3 {
+		t.Errorf("PrepareTurn ran %d times, want 3 (spawn and two boundaries)", calls)
+	}
+}
+
+// TestAHeldSteerAfterTheDeadlineStartsNoTurn: once the deadline has fired, a
+// clean result does not prepare another turn for a harness being killed. The
+// held steer is refused, and the result still wins, as it does against a
+// cancel it raced.
+func TestAHeldSteerAfterTheDeadlineStartsNoTurn(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-toy-g7", "task-toy-deadline"
+	origin := submit(t, c, session, taskID, "opening")
+	started := filepath.Join(t.TempDir(), "started")
+	harness := stub(t, fmt.Sprintf(`
+trap 'echo "OK answered at the deadline"; exit 0' TERM
+echo 'S toy-deadline'
+read first || exit 1
+: > %q
+sleep 30 &
+wait
+`, started))
+	d := &toyDriver{hold: true}
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = d
+	cfg.TaskDeadline = 4 * time.Second
+	cfg.KillGrace = 3 * time.Second
+	done := runAdapter(context.Background(), cfg)
+	waitPath(t, started, "the harness never started its first turn")
+	publishSteerFor(t, c, origin, session, "STEERWORD late")
+
+	out := waitOutcome(t, done, waitDeadline)
+	if out.res.State != lib.StateCompleted {
+		t.Fatalf("state %q err %v: the result raced the deadline and should win", out.res.State, out.err)
+	}
+	if calls, _ := d.prepared(); calls != 1 {
+		t.Errorf("PrepareTurn ran %d times, want once: no turn after the deadline", calls)
+	}
+	if refusalBeforeTerminal(t, url, session, taskID) < 0 {
+		t.Error("the held steer was not refused")
+	}
+}
+
+// TestAHeldSteerIsRefusedOnEviction: a steer held when the pod is evicted is
+// refused on the stream before the evicted terminal.
+func TestAHeldSteerIsRefusedOnEviction(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-toy-h8", "task-toy-evict"
+	origin := submit(t, c, session, taskID, "opening")
+	started := filepath.Join(t.TempDir(), "started")
+	harness := stub(t, fmt.Sprintf(`
+echo 'S toy-evict'
+read first || exit 1
+: > %q
+sleep 30
+`, started))
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = &toyDriver{hold: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+	waitPath(t, started, "the harness never started its first turn")
+	publishSteerFor(t, c, origin, session, "STEERWORD evicted")
+	// The steer has to be held before the eviction lands.
+	time.Sleep(time.Second)
+	cancel()
+
+	out := waitOutcome(t, done, waitDeadline)
+	if !out.res.Evicted {
+		t.Fatalf("result %+v err %v, want evicted", out.res, out.err)
+	}
+	if refusalBeforeTerminal(t, url, session, taskID) < 0 {
+		t.Error("the held steer was not refused before the evicted terminal")
 	}
 }

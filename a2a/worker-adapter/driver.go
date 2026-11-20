@@ -12,8 +12,10 @@ import (
 
 // Driver is everything the adapter knows about one harness's headless
 // contract: how a user message goes onto its stdin, how its stdout lines map
-// onto the adapter's events, how a session is resumed, and where its MCP and
-// config settings live. The supervision around it (the process group, the
+// onto the adapter's events, how a session is resumed, how its MCP
+// configuration names the delegate server, and which environment entry
+// points it at a per-task config directory. Removing a reused pod's user
+// settings file (Config.HarnessUserSettings) is still the adapter's. The supervision around it (the process group, the
 // stdout ceiling, steering, cancel, the deadline, the terminal) is the
 // adapter's and is the same for every harness.
 //
