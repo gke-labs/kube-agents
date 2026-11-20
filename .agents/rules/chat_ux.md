@@ -14,6 +14,7 @@ paths:
   - "agents/platform/scripts/kanban_board_health.py"
   - "agents/platform/scripts/kanban_workspace_gc.py"
   - "agents/platform/scripts/leeway_watch.py"
+  - "agents/platform/scripts/post_merge_check.py"
   - "agents/platform/scripts/sa_role_watch.py"
   - "agents/platform/scripts/session_retention.py"
   - "agents/platform/scripts/stall_watch.py"

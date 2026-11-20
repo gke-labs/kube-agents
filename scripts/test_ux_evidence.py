@@ -128,7 +128,7 @@ class ChatGlobsTest(unittest.TestCase):
                     f"is not covered by .agents/rules/chat_ux.md paths",
                 )
                 checked += 1
-        self.assertGreaterEqual(checked, 13)
+        self.assertGreaterEqual(checked, 14)
 
 
 class ClassifyTest(unittest.TestCase):
