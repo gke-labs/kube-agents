@@ -592,10 +592,14 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 			Annotations: map[string]string{credentialProxyClusterTypeAnnotation: clusterType},
 		},
 		Spec: appsv1.DeploymentSpec{
-			// One pod, rolled with Recreate: the broker keeps a process-local record
-			// of which profile task made which branch and proposal (#6400), which is
-			// only right while one process serves /v1/vcs/. Scaling this out moves
-			// that record to shared state first (TestTheStatefulBrokerIsOnePod...).
+			// One active pod at a time: the broker keeps a process-local record of
+			// which profile task made which branch and proposal (ProfileTaskWrites in
+			// agents/platform/scripts/credential_proxy.py, #6400). In-cluster
+			// RollingUpdate (maxSurge=1, maxUnavailable=0) keeps the surge standby
+			// pod on 503 standby until the outgoing pod is drained (in_flight=0) and
+			// transfers ProfileTaskWrites across /control/drain -> /control/activate;
+			// off-cluster falls back via disableCredentialProxyStandby to Recreate
+			// (TestTheStatefulBrokerIsOnePodAndARolloutNeverOverlaps).
 			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,

@@ -2680,6 +2680,65 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 			t.Fatalf("status.effectiveSizingTier = %q after the hold interval, want fleet", agent.Status.EffectiveSizingTier)
 		}
 	})
+	t.Run("a same-tier broker quota refusal with an active matching-tier pod does not demote", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		runningFleetPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      credentialProxyName(agent) + "-fleet-active",
+				Namespace: agent.Namespace,
+				Labels:    credentialProxySelector(agent),
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name:      credentialProxyContainerName,
+				Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierFleet),
+				Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyFleetMaxConcurrentCommands}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent, runningFleetPod}, workloads...), sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q on same-tier quota refusal, want fleet (no demotion)", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none on same-tier rollout", cond)
+		}
+	})
+	t.Run("a gateway quota refusal still steps back even after the broker pod cut over to tier", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+		refusedByQuotaOn(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceLimitsMemory, "4Gi")
+		runningMedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      credentialProxyName(agent) + "-med-active",
+				Namespace: agent.Namespace,
+				Labels:    credentialProxySelector(agent),
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name:      credentialProxyContainerName,
+				Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierMedium),
+				Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMediumMaxConcurrentCommands}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent, runningMedPod}, workloads...), sizingQuotaOn("platform-baseline-quota", corev1.ResourceLimitsMemory, "6Gi", "5Gi"))...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q on gateway quota refusal after broker cutover, want small", agent.Status.EffectiveSizingTier)
+		}
+	})
 }
 
 // The steady-state requeue is capped at what is left of the hold while a step

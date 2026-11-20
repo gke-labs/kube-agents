@@ -100,6 +100,12 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
             "readings_sweep",
             "policy",
             "enforce_read_only",
+            "profile_task_writes",
+            "authenticator",
+            "vcs",
+            "profile_gate",
+            "max_request_bytes",
+            "a2a_chat_relay",
         ):
             self._saved[attr] = (attr in CredentialProxyHandler.__dict__, CredentialProxyHandler.__dict__.get(attr))
         self.addCleanup(self._restore_handler_attrs)
@@ -110,6 +116,7 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
         CredentialProxyHandler.slack_relay = None
         CredentialProxyHandler.readings_sweep = None
         CredentialProxyHandler.metrics = ProxyMetrics()
+        CredentialProxyHandler.profile_task_writes = credential_proxy.ProfileTaskWrites()
         CredentialProxyHandler.broker_role = credential_proxy.ROLE_BROKER
 
     def _restore_handler_attrs(self) -> None:
@@ -341,6 +348,203 @@ class ActiveStandbyLifecycleTest(unittest.TestCase):
             time.sleep(0.02)
         fake_server.shutdown.assert_called_once_with()
         self.assertEqual(1, fake_chat.released)
+
+    def test_profile_task_writes_export_import_filters_unconfirmed_expired_and_caps_entries(self) -> None:
+        now = 1_700_000_000.0
+        src = credential_proxy.ProfileTaskWrites(clock=lambda: now, max_entries=10)
+        # Confirmed branch + proposal stay live; expired entries and unconfirmed pending claims do not export.
+        src._branches[("github:/acme/infra", "platform-agent/pending")] = credential_proxy._TaskOwned(
+            "task-1", now + 600.0, confirmed=False
+        )
+        src._branches[("github:/acme/infra", "platform-agent/expired")] = credential_proxy._TaskOwned(
+            "task-1", now - 10.0, confirmed=True
+        )
+        ok, fresh = src.claim_branch("task-1", now + 600.0, "github:/acme/infra", "platform-agent/live", lambda: False)
+        self.assertTrue((ok, fresh) == (True, True))
+        src.record_proposal("task-1", now + 600.0, "github:/acme/infra", 42)
+        src.record_proposal("task-1", now - 5.0, "github:/acme/infra", 99)
+
+        exported = src.export_state()
+        self.assertEqual(
+            [{"repository": "github:/acme/infra", "branch": "platform-agent/live", "task": "task-1", "expires_at": now + 600.0}],
+            exported["branches"],
+        )
+        self.assertEqual(
+            [{"repository": "github:/acme/infra", "number": 42, "task": "task-1", "expires_at": now + 600.0}],
+            exported["proposals"],
+        )
+
+        # Target honors max_entries without evicting live entries and drops expired/invalid records.
+        capped = credential_proxy.ProfileTaskWrites(clock=lambda: now, max_entries=2)
+        capped.record_proposal("task-existing", now + 600.0, "github:/acme/infra", 1)
+        capped.import_state({
+            "branches": [
+                {"repository": "github:/acme/infra", "branch": "platform-agent/live", "task": "task-1", "expires_at": now + 600.0},
+                {"repository": "github:/acme/infra", "branch": "platform-agent/stale", "task": "task-1", "expires_at": now - 1.0},
+            ],
+            "proposals": [
+                {"repository": "github:/acme/infra", "number": 42, "task": "task-1", "expires_at": now + 600.0},
+            ],
+        })
+        self.assertTrue(capped.owns_proposal("task-existing", "github:/acme/infra", 1))
+        self.assertTrue(capped.owns_branch("task-1", "github:/acme/infra", "platform-agent/live"))
+        self.assertFalse(capped.owns_branch("task-1", "github:/acme/infra", "platform-agent/stale"))
+        self.assertFalse(capped.owns_proposal("task-1", "github:/acme/infra", 42))
+        atomic = credential_proxy.ProfileTaskWrites(clock=lambda: now, max_entries=10)
+        with self.assertRaises(ValueError):
+            atomic.import_state({
+                "branches": [
+                    {"repository": "github:/acme/infra", "branch": "platform-agent/first", "task": "task-1", "expires_at": now + 600.0},
+                    {"repository": "r", "branch": "b", "task": "t", "expires_at": True},
+                ]
+            })
+        self.assertFalse(atomic.owns_branch("task-1", "github:/acme/infra", "platform-agent/first"))
+        for bad_payload in ({"branches": False}, {"proposals": 0}):
+            with self.assertRaises(ValueError):
+                atomic.import_state(bad_payload)
+
+    def test_standby_refuses_vcs_and_active_standby_handoff_transfers_profile_task_writes(self) -> None:
+        import contextlib
+        import email.message
+        import io
+        import vcs_broker
+
+        now = time.time()
+        expires = now + 3600.0
+        repo = "acme/infra"
+        repo_url = f"https://github.com/{repo}"
+        forge = SimpleNamespace(name="github", hosts=("github.com",))
+        key = credential_proxy.task_repository_key(forge, repo)
+
+        class _StaticAuth:
+            authenticates = True
+            def authenticate(self, headers):
+                role = headers.get("X-Test-Role", credential_proxy.CALLER_ROLE_PROFILE)
+                return credential_proxy.Principal(workload="w", uid="u", role=role, pod="p", pod_uid="u")
+
+        class _StaticGate:
+            def admit(self, principal, token):  # noqa: ARG002
+                t = SimpleNamespace(task="task-1", expires=expires, permits=frozenset({credential_proxy.VCS_PROPOSAL_CREATE_PERMIT}), report_only=False)
+                return credential_proxy.replace(principal, task=t)
+
+        CredentialProxyHandler.authenticator = _StaticAuth()
+        CredentialProxyHandler.profile_gate = _StaticGate()
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.a2a_chat_relay = SimpleNamespace(subscription_path="projects/p/subscriptions/s")
+
+        # 1. Standby broker refuses POST /v1/vcs/publish (including >1 MiB bodies) over HTTP
+        # with retryable 503 bound="draining", and defers /v1/chat/a2a/events so subscription survives.
+        lifecycle = BrokerLifecycle(enabled=True, control_file=self.token_path)
+        CredentialProxyHandler.lifecycle = lifecycle
+        lifecycle.set_warm()
+        proxy_server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        metrics_server = MetricsServer(("127.0.0.1", 0), MetricsHandler)
+        for srv in (proxy_server, metrics_server):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.shutdown)
+            self.addCleanup(srv.server_close)
+
+        status, resp = _request(
+            proxy_server.server_address[1],
+            "POST",
+            "/v1/vcs/publish",
+            body=json.dumps({"repository": repo_url, "branch": "platform-agent/standby-test"}).encode("utf-8"),
+        )
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", resp["code"])
+        self.assertEqual("draining", resp["bound"])
+
+        large_body = json.dumps({"repository": repo_url, "branch": "platform-agent/big", "bundle": "x" * ((1 << 20) + 4096)}).encode("utf-8")
+        large_status, large_resp = _request(proxy_server.server_address[1], "POST", "/v1/vcs/publish", body=large_body)
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, large_status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", large_resp["code"])
+        self.assertEqual("draining", large_resp["bound"])
+
+        a2a_status, a2a_resp = _request(
+            proxy_server.server_address[1],
+            "GET",
+            "/v1/chat/a2a/events",
+            headers={"X-Test-Role": credential_proxy.CALLER_ROLE_A2A_CHAT},
+        )
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, a2a_status)
+        self.assertEqual("projects/p/subscriptions/s", a2a_resp.get("subscription"))
+
+        # 2. Simulate an active predecessor holding task-1's claimed branch + opened proposal (and task-2's),
+        # drain it over /control/drain, verify task_writes exports cleanly on drain and status,
+        # and import into a fresh standby record via HTTP POST /control/activate.
+        old_writes = credential_proxy.ProfileTaskWrites(clock=lambda: now)
+        ok, _ = old_writes.claim_branch("task-1", expires, key, "platform-agent/t1-branch", lambda: False)
+        self.assertTrue(ok)
+        old_writes.record_proposal("task-1", expires, key, 17)
+        old_writes.record_proposal("task-2", expires, key, 18)
+
+        CredentialProxyHandler.profile_task_writes = old_writes
+        old_lifecycle = BrokerLifecycle(enabled=True, control_file=self.token_path)
+        old_lifecycle.set_warm()
+        old_lifecycle.activate()
+        drain_status, drain_snap = old_lifecycle.drain()
+        self.assertEqual(HTTPStatus.OK, drain_status)
+        self.assertEqual(BROKER_STATE_DRAINED, drain_snap["state"])
+        self.assertIn("task_writes", drain_snap)
+        self.assertIn("task_writes", old_lifecycle.snapshot())
+
+        # Swap in fresh standby broker's empty record on the live metrics listener and activate with transferred state.
+        fresh_writes = credential_proxy.ProfileTaskWrites(clock=lambda: now)
+        CredentialProxyHandler.profile_task_writes = fresh_writes
+        CredentialProxyHandler.lifecycle = lifecycle
+        auth = {"Authorization": f"Bearer {self.token_value}", "Content-Type": "application/json"}
+        act_status, act_snap = _request(
+            metrics_server.server_address[1],
+            "POST",
+            "/control/activate",
+            headers=auth,
+            body=json.dumps({"task_writes": drain_snap["task_writes"]}).encode("utf-8"),
+        )
+        self.assertEqual(HTTPStatus.OK, act_status)
+        self.assertEqual(BROKER_STATE_ACTIVE, act_snap["state"])
+
+        # Verify task-1 keeps ownership of proposal #17 and branch on the activated pod, while task-2's #18 is refused.
+        principal = credential_proxy.replace(
+            credential_proxy.Principal(workload="w", uid="u", role=credential_proxy.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"),
+            task=SimpleNamespace(task="task-1", expires=expires, permits=frozenset({credential_proxy.VCS_PROPOSAL_CREATE_PERMIT})),
+        )
+        fake_vcs = SimpleNamespace(
+            registry=SimpleNamespace(resolve=lambda named: (forge, repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: None,
+            proposal_update=lambda payload: {"proposal": {"number": payload["number"]}},
+            proposal_create=lambda payload: {"proposal": {"number": 99}},
+        )
+
+        def call_vcs(verb: str, fields: dict[str, object]) -> tuple[int, dict[str, object]]:
+            raw = json.dumps({"repository": repo_url, **fields}).encode("utf-8")
+            handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+            handler.principal = principal
+            handler.vcs = fake_vcs
+            handler.profile_task_writes = fresh_writes
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(raw))
+            handler.rfile = io.BytesIO(raw)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, f: True
+            replies: list[tuple[int, dict[str, object]]] = []
+            handler._json = lambda st, pl: replies.append((int(st), pl))
+            with mock.patch.object(vcs_broker, "route_table", return_value={
+                "proposal-update": fake_vcs.proposal_update,
+                "proposal-create": fake_vcs.proposal_create,
+            }):
+                handler._dispatch_vcs_post(verb)
+            return replies[0]
+
+        st_own, _ = call_vcs("proposal-update", {"number": 17, "title": "continued"})
+        self.assertEqual(HTTPStatus.OK, st_own)
+        st_create, _ = call_vcs("proposal-create", {"source": "platform-agent/t1-branch", "title": "t", "target": "main"})
+        self.assertEqual(HTTPStatus.OK, st_create)
+        st_other, pl_other = call_vcs("proposal-update", {"number": 18, "title": "stolen"})
+        self.assertEqual(HTTPStatus.FORBIDDEN, st_other)
+        self.assertEqual(credential_proxy.PROPOSAL_NOT_THIS_TASKS_CODE, pl_other["code"])
 
 
 if __name__ == "__main__":

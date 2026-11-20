@@ -40,16 +40,18 @@ import (
 )
 
 type fakeBrokerPodServer struct {
-	mu       sync.Mutex
-	state    string
-	warm     bool
-	inFlight int
-	legacy   bool
-	wantAuth string
-	calls    []string
-	server   *httptest.Server
-	port     string
-	host     string
+	mu            sync.Mutex
+	state         string
+	warm          bool
+	inFlight      int
+	legacy        bool
+	wantAuth      string
+	calls         []string
+	taskWrites    *brokerTaskWritesState
+	activatedBody *brokerControlActivateRequest
+	server        *httptest.Server
+	port          string
+	host          string
 }
 
 func newFakeBrokerPodServer(wantAuth, initialState string, warm bool, inFlight int, legacy bool) *fakeBrokerPodServer {
@@ -75,18 +77,30 @@ func newFakeBrokerPodServer(wantAuth, initialState string, warm bool, inFlight i
 		f.calls = append(f.calls, r.Method+" "+r.URL.Path)
 		switch r.Method + " " + r.URL.Path {
 		case "GET " + credentialProxyControlStatusPath:
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(brokerControlSnapshot{
+			snap := brokerControlSnapshot{
 				State:    f.state,
 				Warm:     f.warm,
 				Enabled:  true,
 				InFlight: f.inFlight,
-			})
+			}
+			if f.state == credentialProxyStateDrained {
+				snap.TaskWrites = f.taskWrites
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(snap)
 		case "POST " + credentialProxyControlActivatePath:
 			if f.state == credentialProxyStateDrained || f.state == credentialProxyStateDraining {
 				w.WriteHeader(http.StatusConflict)
 				_ = json.NewEncoder(w).Encode(brokerControlSnapshot{State: f.state})
 				return
+			}
+			var reqPayload brokerControlActivateRequest
+			if r.ContentLength > 0 {
+				if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				f.activatedBody = &reqPayload
 			}
 			f.state = credentialProxyStateActive
 			w.WriteHeader(http.StatusOK)
@@ -97,13 +111,17 @@ func newFakeBrokerPodServer(wantAuth, initialState string, warm bool, inFlight i
 			} else {
 				f.state = credentialProxyStateDraining
 			}
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(brokerControlSnapshot{
+			snap := brokerControlSnapshot{
 				State:    f.state,
 				Warm:     f.warm,
 				Enabled:  true,
 				InFlight: f.inFlight,
-			})
+			}
+			if f.state == credentialProxyStateDrained {
+				snap.TaskWrites = f.taskWrites
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(snap)
 		default:
 			http.NotFound(w, r)
 		}
@@ -851,4 +869,109 @@ func TestCredentialProxyOffClusterOperatorSkipsStandbyAndHandoff(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCredentialProxyHandoffTransfersProfileTaskWrites(t *testing.T) {
+	t.Parallel()
+
+	t.Run("immediate drain and async drain both forward task_writes into activate", func(t *testing.T) {
+		t.Parallel()
+		for _, asyncDrain := range []bool{false, true} {
+			scheme := setupScheme()
+			agent := sizingAgent(sizingProfileSmall, sizingProfileSmall, nil, nil)
+			bearer := "test-control-secret-task-writes"
+			controlSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      credentialProxyControlSecretName(agent),
+					Namespace: agent.Namespace,
+				},
+				Data: map[string][]byte{credentialProxyControlDataKey: []byte(bearer)},
+			}
+
+			newDep := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+			oldDep := newDep.DeepCopy()
+			oldDep.Spec.Template.Spec.Containers[0].Image = "old-image:v1"
+			stampCredentialProxyTemplateHash(&oldDep.Spec.Template)
+
+			oldPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              credentialProxyName(agent) + "-old",
+					Namespace:         agent.Namespace,
+					Labels:            credentialProxySelector(agent),
+					Annotations:       maps.Clone(oldDep.Spec.Template.Annotations),
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+				},
+				Spec:   *oldDep.Spec.Template.Spec.DeepCopy(),
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.31"},
+			}
+			newPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              credentialProxyName(agent) + "-new",
+					Namespace:         agent.Namespace,
+					Labels:            credentialProxySelector(agent),
+					Annotations:       maps.Clone(newDep.Spec.Template.Annotations),
+					CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
+				},
+				Spec:   *newDep.Spec.Template.Spec.DeepCopy(),
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.32"},
+			}
+
+			inFlight := 0
+			if asyncDrain {
+				inFlight = 1
+			}
+			oldSrv := newFakeBrokerPodServer(bearer, credentialProxyStateActive, true, inFlight, false)
+			oldSrv.taskWrites = &brokerTaskWritesState{
+				Branches:  []brokerTaskWriteBranch{{Repository: "github:/acme/infra", Branch: "platform-agent/fix", Task: "task-1", ExpiresAt: 4_000_000_000}},
+				Proposals: []brokerTaskWriteProposal{{Repository: "github:/acme/infra", Number: 77, Task: "task-1", ExpiresAt: 4_000_000_000}},
+			}
+			defer oldSrv.close()
+			newSrv := newFakeBrokerPodServer(bearer, credentialProxyStateStandby, true, 0, false)
+			defer newSrv.close()
+
+			rt := roundTripFunc(func(httpReq *http.Request) (*http.Response, error) {
+				cloned := httpReq.Clone(httpReq.Context())
+				switch httpReq.URL.Hostname() {
+				case "127.0.0.31":
+					cloned.URL.Host = oldSrv.host + ":" + oldSrv.port
+				case "127.0.0.32":
+					cloned.URL.Host = newSrv.host + ":" + newSrv.port
+				}
+				return http.DefaultTransport.RoundTrip(cloned)
+			})
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, controlSecret, oldPod, newPod).Build()
+			r := &PlatformAgentReconciler{
+				Client:              cl,
+				APIReader:           cl,
+				Scheme:              scheme,
+				BrokerControlClient: &http.Client{Transport: rt, Timeout: 5 * time.Second},
+			}
+
+			if asyncDrain {
+				req1, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, newDep)
+				if err != nil || req1 != credentialProxyControlRequeueInterval {
+					t.Fatalf("async pass 1: req=%v err=%v", req1, err)
+				}
+				if newSrv.currentState() != credentialProxyStateStandby {
+					t.Fatalf("new pod activated before async drain completed: state=%s", newSrv.currentState())
+				}
+				oldSrv.finishDrain()
+			}
+
+			reqFinal, err := r.reconcileCredentialProxyHandoff(context.Background(), agent, newDep)
+			if err != nil || reqFinal != credentialProxyControlRequeueInterval {
+				t.Fatalf("final pass: req=%v err=%v", reqFinal, err)
+			}
+			if newSrv.currentState() != credentialProxyStateActive {
+				t.Fatalf("new pod state = %q, want active", newSrv.currentState())
+			}
+			newSrv.mu.Lock()
+			got := newSrv.activatedBody
+			newSrv.mu.Unlock()
+			if got == nil || got.TaskWrites == nil || len(got.TaskWrites.Branches) != 1 || len(got.TaskWrites.Proposals) != 1 ||
+				got.TaskWrites.Branches[0].Branch != "platform-agent/fix" || got.TaskWrites.Proposals[0].Number != 77 {
+				t.Fatalf("asyncDrain=%v: activate payload = %+v, want transferred task_writes", asyncDrain, got)
+			}
+		}
+	})
 }

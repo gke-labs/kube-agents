@@ -263,18 +263,47 @@ func TestTheBrokerRecreationGivesTheReconcileBackWhenTheDeleteHangs(t *testing.T
 	}
 }
 
-// The stateful broker is one pod, and a rollout never runs two. The broker's
-// per-task record of which profile task made which branch and proposal
-// (ProfileTaskWrites in agents/platform/scripts/credential_proxy.py, #6400) is
-// process-local, and is only right because one process serves /v1/vcs/. If
-// this ever changes, that record moves to shared state first; until then this
-// test is the tripwire, so a scale-out can't quietly let two pods disagree.
+// The stateful broker runs one active pod, and two active pods never serve
+// /v1/vcs/ at the same time. In-cluster active-standby RollingUpdate (maxSurge=1,
+// maxUnavailable=0) holds the standby surge pod on 503 standby until the
+// outgoing pod reaches drained (in_flight=0) and transfers ProfileTaskWrites
+// (#6400) across /control/drain -> /control/activate; off-cluster operators
+// revert via disableCredentialProxyStandby to Recreate.
 func TestTheStatefulBrokerIsOnePodAndARolloutNeverOverlaps(t *testing.T) {
 	deploy := buildCredentialProxyDeployment(a2aTestAgent(), "hash")
 	if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 1 {
 		t.Fatalf("the stateful broker renders %v replicas; it must be exactly 1 while ProfileTaskWrites is process-local (#6400)", deploy.Spec.Replicas)
 	}
-	if deploy.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
-		t.Fatalf("the stateful broker rolls out with %q; it must be Recreate, so no two pods serve /v1/vcs/ at once (#6400)", deploy.Spec.Strategy.Type)
+	if deploy.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType ||
+		deploy.Spec.Strategy.RollingUpdate == nil ||
+		deploy.Spec.Strategy.RollingUpdate.MaxSurge == nil ||
+		deploy.Spec.Strategy.RollingUpdate.MaxSurge.IntVal != credentialProxyMaxSurge ||
+		deploy.Spec.Strategy.RollingUpdate.MaxUnavailable == nil ||
+		deploy.Spec.Strategy.RollingUpdate.MaxUnavailable.IntVal != credentialProxyMaxUnavailable {
+		t.Fatalf("the stateful broker default strategy = %+v; expected active-standby RollingUpdate(maxSurge=%d, maxUnavailable=%d)",
+			deploy.Spec.Strategy, credentialProxyMaxSurge, credentialProxyMaxUnavailable)
+	}
+	hasStandby, hasControlFile := false, false
+	for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == credentialProxyStandbyEnv && env.Value == credentialProxyStandbyEnabledValue {
+			hasStandby = true
+		}
+		if env.Name == credentialProxyControlFileEnv && env.Value == credentialProxyControlFilePath() {
+			hasControlFile = true
+		}
+	}
+	if !hasStandby || !hasControlFile {
+		t.Fatalf("RollingUpdate stateful broker must render both standby (%v) and control file (%v) so a standby pod refuses /v1/* and transfers ProfileTaskWrites on activate", hasStandby, hasControlFile)
+	}
+
+	offCluster := deploy.DeepCopy()
+	disableCredentialProxyStandby(offCluster)
+	if offCluster.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || offCluster.Spec.Strategy.RollingUpdate != nil {
+		t.Fatalf("off-cluster broker rolls out with %+v; it must be Recreate without standby (#6400)", offCluster.Spec.Strategy)
+	}
+	for _, env := range offCluster.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == credentialProxyStandbyEnv {
+			t.Fatalf("off-cluster Recreate broker must not carry %s", credentialProxyStandbyEnv)
+		}
 	}
 }

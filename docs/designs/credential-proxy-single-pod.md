@@ -43,6 +43,13 @@ keep state in the process or in the pod's emptyDir:
   across the connections. The relay acknowledges an event to Slack when it arrives and holds it
   in an in-process queue, and a pull keeps its `receipt → event` map in the process that pulled.
   A settle that reaches the other pod fails, so a requeue after a failed turn loses the event.
+- `ProfileTaskWrites`: records in process memory which profile task created which
+  new branch and opened which proposal, so a permit-gated write reaches only that task's work.
+  In-cluster active-standby cutover keeps the standby pod off `/v1/*` (`503`) until the outgoing
+  pod reaches `BROKER_STATE_DRAINED` (`in_flight == 0`) and transfers live confirmed `task_writes`
+  entries across `/control/drain` (and `/control/status` while drained) into `/control/activate`.
+  Off-cluster runs revert via `disableCredentialProxyStandby` to `Recreate`. An unplanned crash still
+  loses the record and fails closed.
 
 The content workspace was on this list until it was retired (#4243). Its handles lived in the
 pod's emptyDir, so an `open` on one pod followed by a `commit` on another failed with

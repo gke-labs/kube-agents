@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -57,14 +58,14 @@ const (
 	credentialProxyStandbyEnabledValue = "1"
 
 	credentialProxyTemplateHashAnnotation = "kubeagents.x-k8s.io/proxy-template-hash" // #nosec G101 -- Annotation key name, not a credential.
-	credentialProxyPolicyHashAnnotation   = "kubeagents.x-k8s.io/proxy-policy-hash"   // #nosec G101 -- Annotation key name, not a credential.
 	kubectlRestartedAtAnnotation          = "kubectl.kubernetes.io/restartedAt"
 
-	credentialProxyControlScheme       = "http"
-	credentialProxyControlStatusPath   = "/control/status"
-	credentialProxyControlActivatePath = "/control/activate"
-	credentialProxyControlDrainPath    = "/control/drain"
-	credentialProxyControlBearerPrefix = "Bearer "
+	credentialProxyControlScheme          = "http"
+	credentialProxyControlStatusPath      = "/control/status"
+	credentialProxyControlActivatePath    = "/control/activate"
+	credentialProxyControlDrainPath       = "/control/drain"
+	credentialProxyControlBearerPrefix    = "Bearer "
+	credentialProxyControlJSONContentType = "application/json"
 
 	credentialProxyStateStandby  = "standby"
 	credentialProxyStateActive   = "active"
@@ -79,17 +80,41 @@ const (
 	credentialProxyControlHTTPTimeout     = 5 * time.Second
 	credentialProxyControlRequeueInterval = 2 * time.Second
 	credentialProxyControlRandomBytes     = 32
-	credentialProxyControlMaxBodyBytes    = 1 << 20
+	credentialProxyControlMaxBodyBytes    = 4 << 20
 	credentialProxyControlFileMode        = int32(0400)
 )
 
+type brokerTaskWriteBranch struct {
+	Repository string  `json:"repository"`
+	Branch     string  `json:"branch"`
+	Task       string  `json:"task"`
+	ExpiresAt  float64 `json:"expires_at"`
+}
+
+type brokerTaskWriteProposal struct {
+	Repository string  `json:"repository"`
+	Number     int     `json:"number"`
+	Task       string  `json:"task"`
+	ExpiresAt  float64 `json:"expires_at"`
+}
+
+type brokerTaskWritesState struct {
+	Branches  []brokerTaskWriteBranch   `json:"branches,omitempty"`
+	Proposals []brokerTaskWriteProposal `json:"proposals,omitempty"`
+}
+
+type brokerControlActivateRequest struct {
+	TaskWrites *brokerTaskWritesState `json:"task_writes,omitempty"`
+}
+
 type brokerControlSnapshot struct {
-	State         string `json:"state"`
-	Warm          bool   `json:"warm"`
-	Enabled       bool   `json:"enabled"`
-	InFlight      int    `json:"in_flight"`
-	UnsettledChat int    `json:"unsettled_chat"`
-	Error         string `json:"error,omitempty"`
+	State         string                 `json:"state"`
+	Warm          bool                   `json:"warm"`
+	Enabled       bool                   `json:"enabled"`
+	InFlight      int                    `json:"in_flight"`
+	UnsettledChat int                    `json:"unsettled_chat"`
+	TaskWrites    *brokerTaskWritesState `json:"task_writes,omitempty"`
+	Error         string                 `json:"error,omitempty"`
 }
 
 func credentialProxyControlSecretName(agent *agentv1alpha1.PlatformAgent) string {
@@ -285,13 +310,53 @@ func (r *PlatformAgentReconciler) ensureCredentialProxyLeaseHolder(ctx context.C
 	return r.Update(ctx, updated)
 }
 
-func (r *PlatformAgentReconciler) queryBrokerControl(ctx context.Context, podIP, bearer, method, reqPath string) (int, *brokerControlSnapshot, error) {
+func mergeBrokerTaskWrites(dst **brokerTaskWritesState, src *brokerTaskWritesState) {
+	if src == nil || (len(src.Branches) == 0 && len(src.Proposals) == 0) {
+		return
+	}
+	if *dst == nil {
+		*dst = &brokerTaskWritesState{}
+	}
+	for _, b := range src.Branches {
+		idx := slices.IndexFunc((*dst).Branches, func(cur brokerTaskWriteBranch) bool {
+			return cur.Repository == b.Repository && cur.Branch == b.Branch
+		})
+		if idx < 0 {
+			(*dst).Branches = append((*dst).Branches, b)
+		} else if (*dst).Branches[idx].Task == b.Task && b.ExpiresAt > (*dst).Branches[idx].ExpiresAt {
+			(*dst).Branches[idx].ExpiresAt = b.ExpiresAt
+		}
+	}
+	for _, p := range src.Proposals {
+		idx := slices.IndexFunc((*dst).Proposals, func(cur brokerTaskWriteProposal) bool {
+			return cur.Repository == p.Repository && cur.Number == p.Number
+		})
+		if idx < 0 {
+			(*dst).Proposals = append((*dst).Proposals, p)
+		} else if (*dst).Proposals[idx].Task == p.Task && p.ExpiresAt > (*dst).Proposals[idx].ExpiresAt {
+			(*dst).Proposals[idx].ExpiresAt = p.ExpiresAt
+		}
+	}
+}
+
+func (r *PlatformAgentReconciler) queryBrokerControl(ctx context.Context, podIP, bearer, method, reqPath string, payload any) (int, *brokerControlSnapshot, error) {
 	url := fmt.Sprintf("%s://%s%s", credentialProxyControlScheme, net.JoinHostPort(podIP, strconv.Itoa(int(credentialProxyMetricsPort))), reqPath)
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	var bodyReader io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return 0, nil, err
+		}
+		bodyReader = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return 0, nil, err
 	}
 	req.Header.Set("Authorization", credentialProxyControlBearerPrefix+bearer)
+	if payload != nil {
+		req.Header.Set("Content-Type", credentialProxyControlJSONContentType)
+	}
 	resp, err := r.brokerControlHTTPClient().Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -478,7 +543,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 	var targetCandidates []brokerPodProbe
 	var retireOnly []brokerPodProbe
 	for _, pod := range live {
-		status, snap, qerr := r.queryBrokerControl(ctx, pod.Status.PodIP, bearer, http.MethodGet, credentialProxyControlStatusPath)
+		status, snap, qerr := r.queryBrokerControl(ctx, pod.Status.PodIP, bearer, http.MethodGet, credentialProxyControlStatusPath, nil)
 		p := brokerPodProbe{
 			pod:     pod,
 			status:  status,
@@ -566,7 +631,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 			retireOnly = append(retireOnly, brokerPodProbe{pod: pod, deleting: true})
 			continue
 		}
-		status, snap, qerr := r.queryBrokerControl(ctx, pod.Status.PodIP, bearer, http.MethodGet, credentialProxyControlStatusPath)
+		status, snap, qerr := r.queryBrokerControl(ctx, pod.Status.PodIP, bearer, http.MethodGet, credentialProxyControlStatusPath, nil)
 		retireOnly = append(retireOnly, brokerPodProbe{
 			pod:      pod,
 			status:   status,
@@ -579,6 +644,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 
 	// Drain or retire all non-target live and terminating pods before activating a standby target.
 	waitingForDrain := false
+	var handoffTaskWrites *brokerTaskWritesState
 	others := make([]brokerPodProbe, 0, len(targetCandidates)-1+len(retireOnly))
 	others = append(others, targetCandidates[1:]...)
 	others = append(others, retireOnly...)
@@ -606,12 +672,15 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 			continue
 		}
 		switch other.snap.State {
-		case credentialProxyStateDrained, credentialProxyStateStandby:
+		case credentialProxyStateStandby:
+			continue
+		case credentialProxyStateDrained:
+			mergeBrokerTaskWrites(&handoffTaskWrites, other.snap.TaskWrites)
 			continue
 		case credentialProxyStateDraining:
 			waitingForDrain = true
 		case credentialProxyStateActive:
-			dStatus, dSnap, derr := r.queryBrokerControl(ctx, other.pod.Status.PodIP, bearer, http.MethodPost, credentialProxyControlDrainPath)
+			dStatus, dSnap, derr := r.queryBrokerControl(ctx, other.pod.Status.PodIP, bearer, http.MethodPost, credentialProxyControlDrainPath, nil)
 			if derr != nil {
 				waitingForDrain = true
 				continue
@@ -627,7 +696,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 			}
 			if dSnap == nil || dSnap.State != credentialProxyStateDrained {
 				waitingForDrain = true
+				continue
 			}
+			mergeBrokerTaskWrites(&handoffTaskWrites, dSnap.TaskWrites)
 		}
 	}
 	if waitingForDrain {
@@ -638,7 +709,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyHandoff(ctx context.Co
 		return 0, err
 	}
 	if !target.legacy && target.snap != nil && target.snap.State == credentialProxyStateStandby {
-		status, _, actErr := r.queryBrokerControl(ctx, target.pod.Status.PodIP, bearer, http.MethodPost, credentialProxyControlActivatePath)
+		var activateBody any
+		if handoffTaskWrites != nil && (len(handoffTaskWrites.Branches) > 0 || len(handoffTaskWrites.Proposals) > 0) {
+			activateBody = brokerControlActivateRequest{TaskWrites: handoffTaskWrites}
+		}
+		status, _, actErr := r.queryBrokerControl(ctx, target.pod.Status.PodIP, bearer, http.MethodPost, credentialProxyControlActivatePath, activateBody)
 		if actErr != nil || status != http.StatusOK {
 			log.Info("credential-proxy activation pending retry", "pod", target.pod.Name, "status", status, "err", actErr)
 			return credentialProxyControlRequeueInterval, nil

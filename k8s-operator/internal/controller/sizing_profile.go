@@ -1620,14 +1620,11 @@ func proxyContainerSlotCapEnv(pod *corev1.Pod) (string, bool) {
 }
 
 func proxyContainerMatchesTierForCluster(pod *corev1.Pod, deployment *agentv1alpha1.DeploymentSpec, autopilot bool, tier sizingTier, clamped bool) bool {
-	wantRes := renderedCredentialProxyResourcesAt(deployment, autopilot, tier)
-	if !proxyContainerMatchesTierResourcesForCluster(pod, wantRes, clamped) {
-		return false
-	}
 	if gotSlots, hasEnv := proxyContainerSlotCapEnv(pod); hasEnv {
 		return gotSlots == credentialProxyTierMaxConcurrentCommands(tier)
 	}
-	return true
+	wantRes := renderedCredentialProxyResourcesAt(deployment, autopilot, tier)
+	return proxyContainerMatchesTierResourcesForCluster(pod, wantRes, clamped)
 }
 
 func brokerActiveTierFromPods(pods []corev1.Pod, agent *agentv1alpha1.PlatformAgent, autopilot, clamped bool, target sizingTier) (sizingTier, bool) {
@@ -1657,6 +1654,19 @@ func brokerActiveTierFromPods(pods []corev1.Pod, agent *agentv1alpha1.PlatformAg
 	return 0, false
 }
 
+func hasRunningBrokerAtTier(pods []corev1.Pod, agent *agentv1alpha1.PlatformAgent, autopilot, clamped bool, target sizingTier) bool {
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || brokerPodContainer(pod) == nil {
+			continue
+		}
+		if proxyContainerMatchesTierForCluster(pod, agent.Spec.Deployment, autopilot, target, clamped) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *PlatformAgentReconciler) hasActiveBrokerAtOtherTier(ctx context.Context, agent *agentv1alpha1.PlatformAgent, autopilot, clamped bool, target sizingTier) bool {
 	pods := &corev1.PodList{}
 	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err != nil {
@@ -1671,9 +1681,14 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 	clamped := r.sizingRunningLimitsClamped(ctx, agent)
 	pods := &corev1.PodList{}
 	activeTier, hasActiveDiff := sizingTier(0), false
+	hasTargetPod := false
 	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(credentialProxySelector(agent))); err == nil {
 		activeTier, hasActiveDiff = brokerActiveTierFromPods(pods.Items, agent, autopilot, clamped, tier)
+		if !hasActiveDiff {
+			hasTargetPod = hasRunningBrokerAtTier(pods.Items, agent, autopilot, clamped, tier)
+		}
 	}
+	sameTierProxy := !hasActiveDiff && hasTargetPod
 	isStepDown := hasActiveDiff && activeTier > tier
 	if tier == sizingTierSmall && !isStepDown {
 		return nil
@@ -1684,15 +1699,24 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 		from = activeTier
 		rollbackTier = activeTier
 	}
-	sized := []struct {
+	var sized []struct {
 		key       client.ObjectKey
 		container string
-	}{{client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, credentialProxyContainerName}}
+	}
+	if !sameTierProxy {
+		sized = append(sized, struct {
+			key       client.ObjectKey
+			container string
+		}{client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, credentialProxyContainerName})
+	}
 	if !isStepDown && !useStatefulSet(agent) {
 		sized = append(sized, struct {
 			key       client.ObjectKey
 			container string
 		}{client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}, agentAPIAuthContainerName})
+	}
+	if len(sized) == 0 {
+		return nil
 	}
 	recorded := sizingCappedCondition(agent).message
 	canSurge := r.canControlBroker()
@@ -1871,6 +1895,9 @@ func (r *PlatformAgentReconciler) sizingSurgeStalled(ctx context.Context, agent 
 		return nil, 0
 	}
 	activeTier, hasActiveDiff := brokerActiveTierFromPods(pods.Items, agent, autopilot, clamped, tier)
+	if !hasActiveDiff && hasRunningBrokerAtTier(pods.Items, agent, autopilot, clamped, tier) {
+		return nil, 0
+	}
 	isStepDown := hasActiveDiff && activeTier > tier
 	if tier <= sizingTierSmall && !isStepDown {
 		return nil, 0

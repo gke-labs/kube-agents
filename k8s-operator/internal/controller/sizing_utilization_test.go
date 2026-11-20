@@ -1507,6 +1507,98 @@ func TestSizingSurgeQuotaPodsAndRollback(t *testing.T) {
 		}
 	})
 
+	t.Run("same-tier surge stall or quota refusal while settled pod matches tier never demotes", func(t *testing.T) {
+		t.Parallel()
+		now := time.Date(2026, 11, 18, 20, 30, 0, 0, time.UTC)
+		since := metav1.NewTime(now.Add(-sizingSurgePendingTimeout - time.Second))
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		agent.Status.Sizing = &agentv1alpha1.SizingStatus{
+			ActiveTier:         sizingProfileMedium,
+			DesiredTier:        sizingProfileMedium,
+			Trigger:            sizingTriggerClusterCount,
+			LastTransitionTime: ptr.To(metav1.NewTime(now.Add(-10 * time.Minute))),
+		}
+		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+		refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-med-new", "pod-cap", corev1.ResourcePods, "1")
+		runningMedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              credentialProxyName(agent) + "-med-active",
+				Namespace:         agent.Namespace,
+				Labels:            credentialProxySelector(agent),
+				CreationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
+			},
+			Spec:   *buildCredentialProxyDeployment(agent, "medium").Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		pendingSameTierPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              credentialProxyName(agent) + "-med-surge",
+				Namespace:         agent.Namespace,
+				Labels:            credentialProxySelector(agent),
+				CreationTimestamp: since,
+			},
+			Spec: *buildCredentialProxyDeployment(agent, "medium-new-hash").Spec.Template.Spec.DeepCopy(),
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{{
+					Type:               corev1.PodScheduled,
+					Status:             corev1.ConditionFalse,
+					Reason:             string(corev1.PodReasonUnschedulable),
+					Message:            "0/3 nodes are available: Insufficient cpu",
+					LastTransitionTime: since,
+				}},
+			},
+		}
+		scheme := setupScheme()
+		objs := append([]client.Object{agent, runningMedPod, pendingSameTierPod}, workloads...)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{
+			Client:            cl,
+			APIReader:         cl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
+		}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatal(err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("tier = %q after same-tier surge stall/refusal, want medium (no false demotion)", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none on same-tier rollout", cond)
+		}
+
+		// Same-tier resources edit while settled at medium (4Gi/12 slots -> 6Gi override/12 slots)
+		// must also still match medium by slot cap and never demote to small.
+		edited := agent.DeepCopy()
+		edited.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{
+			Resources: &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("6Gi")},
+			},
+		}
+		editedWorkloads := sizedWorkloadsAt(edited, sizingTierMedium)
+		refusedByQuotaOn(editedWorkloads[0].(*appsv1.Deployment), credentialProxyName(edited)+"-med-6gi", "pod-cap", corev1.ResourcePods, "1")
+		editedPending := pendingSameTierPod.DeepCopy()
+		editedPending.Spec.Containers[0].Resources = renderedCredentialProxyResourcesAt(edited.Spec.Deployment, false, sizingTierMedium)
+		editedCl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{edited, runningMedPod.DeepCopy(), editedPending}, editedWorkloads...)...).WithStatusSubresource(edited).Build()
+		rEdited := &PlatformAgentReconciler{
+			Client:            editedCl,
+			APIReader:         editedCl,
+			Scheme:            scheme,
+			Recorder:          record.NewFakeRecorder(8),
+			OperatorNamespace: "kubeagents-system",
+			nowFn:             func() time.Time { return now },
+		}
+		if err := rEdited.resolveSizingTier(context.Background(), edited); err != nil {
+			t.Fatal(err)
+		}
+		if edited.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("tier = %q after same-tier resources override surge stall/refusal, want medium", edited.Status.EffectiveSizingTier)
+		}
+	})
+
 	t.Run("pruned status.sizing CRD strips field cleanly without write storm", func(t *testing.T) {
 		t.Parallel()
 		now := time.Date(2026, 11, 18, 19, 0, 0, 0, time.UTC)

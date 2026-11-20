@@ -1161,6 +1161,24 @@ CONTROL_DRAIN_PATH = "/control/drain"
 CONTROL_JSON_CONTENT_TYPE = "application/json"
 CONTROL_BEARER_PREFIX = "Bearer "
 CONTROL_MAX_REQUEST_BYTES = 1024
+CONTROL_ACTIVATE_MAX_REQUEST_BYTES = 4 << 20
+CONTROL_CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,10}")
+TASK_WRITES_KEY = "task_writes"
+TASK_WRITES_BRANCHES_KEY = "branches"
+TASK_WRITES_PROPOSALS_KEY = "proposals"
+TASK_WRITES_REPOSITORY_KEY = "repository"
+TASK_WRITES_BRANCH_KEY = "branch"
+TASK_WRITES_NUMBER_KEY = "number"
+TASK_WRITES_TASK_KEY = "task"
+TASK_WRITES_EXPIRES_AT_KEY = "expires_at"
+VCS_BUNDLE_BODY_MULTIPLIER = 2
+VCS_ROUTE_PREFIX = "/v1/vcs/"
+SLACK_CHAT_ROUTE_PREFIX = "/v1/chat/slack/"
+STANDBY_DEFERRED_ROUTES = frozenset({
+    ("GET", HEALTHZ_PATH),
+    ("GET", "/v1/chat/events"),
+    ("GET", "/v1/chat/a2a/events"),
+})
 BROKER_STATE_STANDBY = "standby"
 BROKER_STATE_ACTIVE = "active"
 BROKER_STATE_DRAINING = "draining"
@@ -5576,15 +5594,17 @@ class ProfileTaskWrites:
         same new name the first wins and the second is refused;
       * a proposal is recorded for the task whose `proposal-create` opened it.
 
-    Process-local, which is only right because one broker pod serves
-    `/v1/vcs/`: the stateful broker renders one replica with the Recreate
-    strategy, so no second pod ever holds a different record (an operator test
-    pins both). If that route ever scales out, this record moves to shared
-    state first. Lost on a restart, which refuses rather than permits: a
-    branch on the remote with no claim, or a proposal with no record, is not
-    this task's. Entries expire with the task's credential plus
-    PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the credential's own
-    expiry is stated in.
+    Process-local, which stays single-writer across both rollout modes:
+    off-cluster uses Recreate, and in-cluster active-standby RollingUpdate
+    (maxSurge=1, maxUnavailable=0) keeps the standby pod out of /v1/*
+    (503 standby) until the outgoing broker reaches BROKER_STATE_DRAINED
+    (in_flight == 0) and exports its live confirmed writes over /control/drain
+    (and /control/status while drained) for /control/activate to import before
+    the replacement pod starts serving. Unplanned pod restarts still lose the
+    record and fail closed: a branch on the remote with no claim, or a
+    proposal with no record, is not this task's. Entries expire with the task's
+    credential plus PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the
+    credential's own expiry is stated in.
     """
 
     def __init__(
@@ -5678,6 +5698,118 @@ class ProfileTaskWrites:
             self._prune_locked()
             owned = self._proposals.get((repository, number))
             return owned is not None and owned.task == task
+
+    def export_state(self) -> dict[str, list[dict[str, Any]]]:
+        """Return a JSON-serializable snapshot of live confirmed writes for handoff."""
+        with self._lock:
+            self._prune_locked()
+            return {
+                TASK_WRITES_BRANCHES_KEY: [
+                    {
+                        TASK_WRITES_REPOSITORY_KEY: repository,
+                        TASK_WRITES_BRANCH_KEY: branch,
+                        TASK_WRITES_TASK_KEY: owned.task,
+                        TASK_WRITES_EXPIRES_AT_KEY: owned.expires_at,
+                    }
+                    for (repository, branch), owned in sorted(self._branches.items())
+                    if owned.confirmed
+                ],
+                TASK_WRITES_PROPOSALS_KEY: [
+                    {
+                        TASK_WRITES_REPOSITORY_KEY: repository,
+                        TASK_WRITES_NUMBER_KEY: number,
+                        TASK_WRITES_TASK_KEY: owned.task,
+                        TASK_WRITES_EXPIRES_AT_KEY: owned.expires_at,
+                    }
+                    for (repository, number), owned in sorted(self._proposals.items())
+                ],
+            }
+
+    def import_state(self, data: Any) -> None:
+        """Atomically load live confirmed writes received from a drained predecessor."""
+        if data is None:
+            return
+        if not isinstance(data, dict):
+            raise ValueError("task_writes must be a JSON object")
+        raw_branches = data.get(TASK_WRITES_BRANCHES_KEY)
+        if raw_branches is None:
+            raw_branches = []
+        raw_proposals = data.get(TASK_WRITES_PROPOSALS_KEY)
+        if raw_proposals is None:
+            raw_proposals = []
+        if not isinstance(raw_branches, list) or not isinstance(raw_proposals, list):
+            raise ValueError("task_writes branches and proposals must be lists")
+
+        # Validate every entry before taking the lock so partial/malformed payloads never mutate state.
+        staged_branches: list[tuple[tuple[str, str], str, float]] = []
+        for item in raw_branches:
+            if not isinstance(item, dict):
+                raise ValueError("branch entry must be an object")
+            repo = item.get(TASK_WRITES_REPOSITORY_KEY)
+            branch = item.get(TASK_WRITES_BRANCH_KEY)
+            task = item.get(TASK_WRITES_TASK_KEY)
+            expires_at = item.get(TASK_WRITES_EXPIRES_AT_KEY)
+            if (
+                not isinstance(repo, str)
+                or not repo
+                or not isinstance(branch, str)
+                or not branch
+                or not isinstance(task, str)
+                or not task
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+                or not math.isfinite(expires_at)
+            ):
+                raise ValueError("invalid branch entry in task_writes")
+            staged_branches.append(((repo, branch), task, float(expires_at)))
+
+        staged_proposals: list[tuple[tuple[str, int], str, float]] = []
+        for item in raw_proposals:
+            if not isinstance(item, dict):
+                raise ValueError("proposal entry must be an object")
+            repo = item.get(TASK_WRITES_REPOSITORY_KEY)
+            number = item.get(TASK_WRITES_NUMBER_KEY)
+            task = item.get(TASK_WRITES_TASK_KEY)
+            expires_at = item.get(TASK_WRITES_EXPIRES_AT_KEY)
+            if (
+                not isinstance(repo, str)
+                or not repo
+                or isinstance(number, bool)
+                or not isinstance(number, int)
+                or not isinstance(task, str)
+                or not task
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+                or not math.isfinite(expires_at)
+            ):
+                raise ValueError("invalid proposal entry in task_writes")
+            staged_proposals.append(((repo, number), task, float(expires_at)))
+
+        with self._lock:
+            self._prune_locked()
+            now = self._clock()
+            for key, task, expires_at in staged_branches:
+                if expires_at <= now:
+                    continue
+                existing = self._branches.get(key)
+                if existing is not None:
+                    if existing.confirmed and existing.task == task:
+                        existing.expires_at = max(existing.expires_at, expires_at)
+                    continue
+                if self._full_locked():
+                    continue
+                self._branches[key] = _TaskOwned(task, expires_at, confirmed=True)
+            for key_p, task, expires_at in staged_proposals:
+                if expires_at <= now:
+                    continue
+                existing = self._proposals.get(key_p)
+                if existing is not None:
+                    if existing.task == task:
+                        existing.expires_at = max(existing.expires_at, expires_at)
+                    continue
+                if self._full_locked():
+                    continue
+                self._proposals[key_p] = _TaskOwned(task, expires_at)
 
 
 class ServiceAccountAuthenticator:
@@ -14572,22 +14704,22 @@ class BrokerLifecycle:
     def snapshot(self) -> dict[str, Any]:
         unsettled = sum(1 for r in self._relays if r.has_unsettled())
         with self._lock:
-            return {
-                "state": self._state,
-                "warm": self._warm,
-                "enabled": self.enabled,
-                "in_flight": CredentialProxyHandler.in_flight.count(),
-                "unsettled_chat": unsettled,
-            }
+            return self._locked_snapshot(unsettled=unsettled)
 
-    def activate(self) -> tuple[HTTPStatus, dict[str, Any]]:
+    def activate(self, task_writes: Any = None) -> tuple[HTTPStatus, dict[str, Any]]:
         cb: Callable[[], None] | None = None
+        unsettled = sum(1 for r in self._relays if r.has_unsettled())
         with self._lock:
             if self._state in (BROKER_STATE_DRAINING, BROKER_STATE_DRAINED):
-                return HTTPStatus.CONFLICT, {**self._locked_snapshot(), "error": "pod is draining"}
+                return HTTPStatus.CONFLICT, {**self._locked_snapshot(unsettled=unsettled), "error": "pod is draining"}
             if not self._warm:
-                return HTTPStatus.SERVICE_UNAVAILABLE, {**self._locked_snapshot(), "error": "broker warming"}
+                return HTTPStatus.SERVICE_UNAVAILABLE, {**self._locked_snapshot(unsettled=unsettled), "error": "broker warming"}
             if self._state == BROKER_STATE_STANDBY:
+                if task_writes is not None:
+                    try:
+                        CredentialProxyHandler.profile_task_writes.import_state(task_writes)
+                    except ValueError as exc:
+                        return HTTPStatus.BAD_REQUEST, {**self._locked_snapshot(unsettled=unsettled), "error": str(exc)}
                 self._state = BROKER_STATE_ACTIVE
                 cb = self._on_activate
                 self._on_activate = None
@@ -14596,15 +14728,19 @@ class BrokerLifecycle:
             LOGGER.info("credential proxy activated by operator control")
         return HTTPStatus.OK, self.snapshot()
 
-    def _locked_snapshot(self) -> dict[str, Any]:
-        unsettled = sum(1 for r in self._relays if r.has_unsettled())
-        return {
+    def _locked_snapshot(self, *, unsettled: int | None = None) -> dict[str, Any]:
+        if unsettled is None:
+            unsettled = sum(1 for r in self._relays if r.has_unsettled())
+        snap: dict[str, Any] = {
             "state": self._state,
             "warm": self._warm,
             "enabled": self.enabled,
             "in_flight": CredentialProxyHandler.in_flight.count(),
             "unsettled_chat": unsettled,
         }
+        if self._state == BROKER_STATE_DRAINED:
+            snap[TASK_WRITES_KEY] = CredentialProxyHandler.profile_task_writes.export_state()
+        return snap
 
     def _finish_drain(self) -> None:
         if self._has_unsettled_work():
@@ -14765,19 +14901,27 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _control_authorized(self) -> BrokerLifecycle | None:
+    def _control_authorized(self, *, drain_on_reject: bool = False) -> BrokerLifecycle | None:
         lifecycle = CredentialProxyHandler.lifecycle
         if lifecycle is None or lifecycle.control_file is None:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
             self.send_error(HTTPStatus.NOT_FOUND)
             return None
         rejection = lifecycle.verify_bearer(self.headers.get("Authorization", ""))
         if rejection == HTTPStatus.NOT_FOUND:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
             self.send_error(HTTPStatus.NOT_FOUND)
             return None
         if rejection == HTTPStatus.UNAUTHORIZED:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
             self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return None
         if rejection is not None:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
             self._write_json(rejection, {"error": "control credential unavailable"})
             return None
         return lifecycle
@@ -14798,18 +14942,64 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_control_activate_task_writes(self) -> tuple[bool, Any]:
+        """Parse an optional JSON body on POST /control/activate, returning (ok, task_writes)."""
+        if self.headers.get("Transfer-Encoding"):
+            self._write_json(HTTPStatus.LENGTH_REQUIRED, {"error": "chunked control bodies are not supported"})
+            self.close_connection = True
+            return False, None
+        raw_lengths = self.headers.get_all("Content-Length") or []
+        if not raw_lengths:
+            return True, None
+        if len(set(raw_lengths)) != 1 or not CONTROL_CONTENT_LENGTH_RE.fullmatch(raw_lengths[0].strip()):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "invalid Content-Length"})
+            self.close_connection = True
+            return False, None
+        length = int(raw_lengths[0].strip())
+        if length == 0:
+            return True, None
+        if length > CONTROL_ACTIVATE_MAX_REQUEST_BYTES:
+            self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "control activate body exceeds limit"})
+            self.close_connection = True
+            return False, None
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            return False, None
+        if len(body) < length:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "control activate body ended early"})
+            self.close_connection = True
+            return False, None
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError, RecursionError):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "control activate body must be JSON"})
+            return False, None
+        if not isinstance(parsed, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "control activate body must be a JSON object"})
+            return False, None
+        return True, parsed.get(TASK_WRITES_KEY)
+
     def do_POST(self) -> None:  # noqa: N802
         if self.path not in (CONTROL_ACTIVATE_PATH, CONTROL_DRAIN_PATH):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
-        lifecycle = self._control_authorized()
+        if self.path == CONTROL_DRAIN_PATH:
+            drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+            lifecycle = self._control_authorized()
+            if lifecycle is None:
+                return
+            status, payload = lifecycle.drain()
+            self._write_json(status, payload)
+            return
+        lifecycle = self._control_authorized(drain_on_reject=True)
         if lifecycle is None:
             return
-        if self.path == CONTROL_ACTIVATE_PATH:
-            status, payload = lifecycle.activate()
-        else:
-            status, payload = lifecycle.drain()
+        ok, task_writes = self._read_control_activate_task_writes()
+        if not ok:
+            return
+        status, payload = lifecycle.activate(task_writes=task_writes)
         self._write_json(status, payload)
 
     def log_message(self, message: str, *args: Any) -> None:
@@ -17854,7 +18044,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # resets the connection, and a caller still sending a large body (a
         # publish bundle) reads a broken pipe in place of the refusal, which
         # vcs_client reports as a broker fault (#6247).
-        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
+        body_limit = self._vcs_body_limit()
         if not vcs_verb_permitted(role, verb):
             LOGGER.warning(
                 "vcs verb refused for role role=%s verb=%s rule=%s",
@@ -18517,6 +18707,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._counted_in_flight = False
             self.in_flight.leave()
 
+    def _vcs_body_limit(self) -> int:
+        return max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * VCS_BUNDLE_BODY_MULTIPLIER)
+
     def _refused_while_draining(self, method: str) -> bool:
         """Answer a new request 503 with the `draining` bound while the broker drains.
 
@@ -18542,11 +18735,22 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         )
         if open_route or long_poll:
             self._leave_in_flight()
-        if open_route or (method, parts.path) in DRAIN_OPEN_REPLY_ROUTES or not self.draining.is_set():
+        lifecycle = self.lifecycle
+        standby = lifecycle is not None and lifecycle.enabled and lifecycle.state == BROKER_STATE_STANDBY
+        if standby:
+            if (method, parts.path) in STANDBY_DEFERRED_ROUTES:
+                return False
+        elif open_route or (method, parts.path) in DRAIN_OPEN_REPLY_ROUTES or not self.draining.is_set():
             return False
         if method == "POST":
-            # Read first, so the refusal is not lost to a connection reset.
-            drain_request_body(self, self.max_request_bytes)
+            # Read first so 503 answers reach the peer instead of TCP resets,
+            # covering larger VCS bundle uploads and Slack event payloads too.
+            post_limit = self.max_request_bytes
+            if parts.path.startswith(VCS_ROUTE_PREFIX):
+                post_limit = self._vcs_body_limit()
+            elif parts.path.startswith(SLACK_CHAT_ROUTE_PREFIX):
+                post_limit = max(post_limit, getattr(self, "slack_max_request_bytes", post_limit))
+            drain_request_body(self, post_limit)
         elif method == "PUT":
             # An audit-report write (#5619), under its own cap.
             drain_request_body(self, AUDIT_REPORT_MAX_BYTES)
