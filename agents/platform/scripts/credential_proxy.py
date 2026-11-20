@@ -886,6 +886,13 @@ API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
 # Longer than the default 64 because an API path is caller text that has to be
 # readable in the audit line; the same 256 the exec route gives a `cwd`.
 API_RELAY_PATH_LOG_LENGTH = 256
+# What the forwarded line of a read with a body ends with: the one resource name
+# the body check passed. The path of such a read names no project.
+API_RELAY_RESOURCE_LOG_SUFFIX = " resource={}"
+# The line a read with a body writes when its body passes the route's check. It
+# names the same resource, which the check held to the route's grammar, and it
+# carries no audit mapping: the audit fields stay identifiers and outcomes.
+API_RELAY_BODY_CHECKED_LOG = "api body checked request_id=%s rule=%s resource=%s"
 # The width a principal is logged at, on the exec route's audit records and
 # the relay's lines alike. The value comes from the TokenReview, not from the
 # request, and a ServiceAccount username truncated at the default 64 loses
@@ -1501,6 +1508,20 @@ RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
 # `repo:` or `org:` in it would widen the search past the managed repository.
 RULE_CALLER_VCS_QUERY = "caller.vcs-query"
 PROFILE_QUERY_QUALIFIER_CODE = "PROFILE_QUERY_QUALIFIER"
+# A profile caller's `identity` with no repository answers the install's managed
+# repositories under this key (#6389): the names every profile verb is held to,
+# so a profile task that names no repository can find the one it may use.
+PROFILE_IDENTITY_MANAGED_KEY = "managedRepositories"
+# A profile caller's permitted write on a branch or proposal its own task did not
+# create (#6400), refused under RULE_CALLER_VCS_OWNERSHIP with this code.
+PROPOSAL_NOT_THIS_TASKS_CODE = "PROPOSAL_NOT_THIS_TASKS"
+# How long after its task credential expires a task's record is kept, so a write
+# racing the expiry is judged by the record rather than by its absence.
+PROFILE_TASK_RECORD_MARGIN_SECONDS = 300
+# The most branches and proposals the record holds at once. At the cap a new
+# claim or proposal is refused rather than any live entry dropped, so one task's
+# writes can never push out another's.
+PROFILE_TASK_RECORD_MAX_ENTRIES = 4096
 RULE_VCS_WRITE_MODE = "vcs.write-mode"
 # The route the autonomy dial's level is reported on (vcs_broker.set_dial_level).
 DIAL_PATH = "/v1/dial"
@@ -2513,6 +2534,8 @@ def executable_refusal_message(role: str, executable: str) -> str:
 #     and an issue-list's search fields may start no qualifier of their own:
 #     plain words in `query`, no quote or backslash in a label name
 #     (profile_issue_query_refusal, rule caller.vcs-query).
+#     `identity` with no repository answers the managed list's names instead
+#     (#6389), so a task that names no repository can find the one it may use.
 #   * publish, proposal-create and proposal-update, the writes that put a
 #     change up for review, each further gated in `_dispatch_vcs_post` on the
 #     task credential's permit (PROFILE_PERMIT_GATED_VCS_VERBS).
@@ -5428,6 +5451,145 @@ class ClaimTokens:
         if entry is None or entry.expires_at <= now:
             return None
         return entry
+
+
+@dataclass
+class _TaskOwned:
+    task: str
+    expires_at: float
+    # A branch claim is pending until its remote lookup says the name is free;
+    # nothing, the claiming task included, may rely on it before then.
+    confirmed: bool = True
+
+
+def task_repository_key(forge: Any, repository: str) -> str:
+    """The record's key for a repository: the forge's provider and host as well as the path.
+
+    `registry.resolve` answers the path alone, and two forges this install serves
+    can each have an `acme/infra`; keyed by the path, a proposal number one task
+    opened on one forge would admit another task's on the other. Lowercased, as
+    the managed list compares names.
+    """
+    hosts = getattr(forge, "hosts", None)
+    host = hosts[0] if isinstance(hosts, (tuple, list)) and hosts else ""
+    return f"{getattr(forge, 'name', '')}:{host}/{repository}".lower()
+
+
+class ProfileTaskWrites:
+    """Which profile task created which branch and proposal, so a permit reaches only its own (#6400).
+
+    The permit is per task, and the ownership check (`VcsBroker.require_agent_
+    proposal`) admits anything that is the install's, so without this one
+    confirmed task could retitle or advance another open `platform-agent/`
+    proposal. This holds each permit-gated write to what the same task made:
+
+      * a branch is claimed by the first task that publishes it while it is
+        absent from the remote, under one lock, so of two tasks publishing the
+        same new name the first wins and the second is refused;
+      * a proposal is recorded for the task whose `proposal-create` opened it.
+
+    Process-local, which is only right because one broker pod serves
+    `/v1/vcs/`: the stateful broker renders one replica with the Recreate
+    strategy, so no second pod ever holds a different record (an operator test
+    pins both). If that route ever scales out, this record moves to shared
+    state first. Lost on a restart, which refuses rather than permits: a
+    branch on the remote with no claim, or a proposal with no record, is not
+    this task's. Entries expire with the task's credential plus
+    PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the credential's own
+    expiry is stated in.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.time,
+        max_entries: int = PROFILE_TASK_RECORD_MAX_ENTRIES,
+    ) -> None:
+        self._clock = clock
+        self._max_entries = max_entries
+        self._branches: dict[tuple[str, str], _TaskOwned] = {}
+        self._proposals: dict[tuple[str, int], _TaskOwned] = {}
+        self._lock = threading.Lock()
+
+    def _prune_locked(self) -> None:
+        """Drop expired entries, and only those: a live one is never evicted."""
+        now = self._clock()
+        for table in (self._branches, self._proposals):
+            for key in [key for key, owned in table.items() if owned.expires_at <= now]:
+                del table[key]
+
+    def _full_locked(self) -> bool:
+        return len(self._branches) + len(self._proposals) >= self._max_entries
+
+    def claim_branch(
+        self, task: str, expires_at: float, repository: str, branch: str, on_remote: Callable[[], bool]
+    ) -> tuple[bool, bool]:
+        """(allowed, fresh): may ``task`` publish ``branch``, and is the claim new to this call.
+
+        Allowed when the task already holds a confirmed claim on the branch, or
+        when nobody holds it and it is absent from the remote (``on_remote``,
+        asked outside the lock). A lookup that raises releases the pending claim
+        and raises on, so the caller answers the forge's own failure rather than
+        an ownership refusal; nothing is written either way. A fresh claim
+        is taken, pending, before the remote is asked, so a second request racing
+        the same new name finds it held -- refused whoever sent it, the claiming
+        task included, until the lookup confirms the name is free. At the cap a
+        new claim is refused.
+        """
+        key = (repository, branch)
+        with self._lock:
+            self._prune_locked()
+            owned = self._branches.get(key)
+            if owned is not None:
+                if owned.task != task or not owned.confirmed:
+                    return False, False
+                owned.expires_at = max(owned.expires_at, expires_at)
+                return True, False
+            if self._full_locked():
+                return False, False
+            claim = _TaskOwned(task, expires_at, confirmed=False)
+            self._branches[key] = claim
+        try:
+            present = on_remote()
+        except Exception:
+            self.release_branch(task, repository, branch)
+            raise
+        with self._lock:
+            # Only this call's own claim: if it expired and was replaced while
+            # the remote was asked, the replacement is not this lookup's to judge.
+            if self._branches.get(key) is not claim:
+                return False, False
+            if present:
+                del self._branches[key]
+                return False, False
+            claim.confirmed = True
+        return True, True
+
+    def release_branch(self, task: str, repository: str, branch: str) -> None:
+        """Drop ``task``'s claim on ``branch``, if it holds it (a publish that failed)."""
+        with self._lock:
+            owned = self._branches.get((repository, branch))
+            if owned is not None and owned.task == task:
+                del self._branches[(repository, branch)]
+
+    def owns_branch(self, task: str, repository: str, branch: str) -> bool:
+        with self._lock:
+            self._prune_locked()
+            owned = self._branches.get((repository, branch))
+            return owned is not None and owned.task == task and owned.confirmed
+
+    def record_proposal(self, task: str, expires_at: float, repository: str, number: int) -> None:
+        """Record ``task``'s proposal; at the cap it goes unrecorded, so its later updates are refused."""
+        with self._lock:
+            self._prune_locked()
+            if (repository, number) not in self._proposals and self._full_locked():
+                return
+            self._proposals[(repository, number)] = _TaskOwned(task, expires_at)
+
+    def owns_proposal(self, task: str, repository: str, number: int) -> bool:
+        with self._lock:
+            self._prune_locked()
+            owned = self._proposals.get((repository, number))
+            return owned is not None and owned.task == task
 
 
 class ServiceAccountAuthenticator:
@@ -14550,6 +14712,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # The claim tokens `proposal-create` answers carry and `proposal-claim`
     # burns. One store per process, shared by every handler thread.
     claim_tokens: ClaimTokens = ClaimTokens()
+    # The branches and proposals each profile task made (#6400): one per process,
+    # which is one per /v1/vcs/ server -- see ProfileTaskWrites.
+    profile_task_writes: ProfileTaskWrites = ProfileTaskWrites()
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
@@ -14699,6 +14864,36 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             },
         )
         return False
+
+    def _answer_managed_repositories(self) -> str:
+        """Answer the managed repositories as `host/path` names, sorted, and return the outcome label.
+
+        The same entries `repository_is_managed` compares against
+        (`managed_repositories`), each written as the name a verb accepts: the
+        gate's keys lead with the entry's provider type (`github:github.com/
+        acme/infra`), which no verb reads as a repository, so the type is
+        dropped. An unreadable list is the 503 the managed check answers, a
+        fault rather than an empty answer; an install with nothing registered
+        answers an empty list.
+        """
+        try:
+            names = sorted({key.partition(":")[2] or key for key in managed_repositories()})
+        except Exception as exc:
+            LOGGER.warning(
+                "profile identity: the managed-repository list could not be read type=%s",
+                type(exc).__name__,
+            )
+            self.metrics.record_failure(_route_failure_kind(getattr(self, "path", "")))
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the managed repository list is unavailable",
+                    "code": "MANAGED_REPOSITORIES_UNAVAILABLE",
+                },
+            )
+            return TOOL_STATUS_ERROR
+        self._json(HTTPStatus.OK, {PROFILE_IDENTITY_MANAGED_KEY: names})
+        return TOOL_STATUS_SUCCESS
 
     def _repository_is_permitted(
         self, repository: str, forge: providers.Forge | None = None
@@ -15977,7 +16172,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
         decision and exactly one verdict -- rejected, blocked, forwarded, or
-        one of the upstream failures. Each carries the exec route's
+        one of the upstream failures. A read with a body that names one
+        resource writes a third line between them, API_RELAY_BODY_CHECKED_LOG,
+        which is no audit line. Each audit line carries the exec route's
         tool-execution audit mapping, under API_RELAY_AUDIT_TOOL and the host's
         service word: started, then rejected, blocked, completed (a forwarded
         answer, whatever its status) or failed. `host` and `path` are caller text and go through
@@ -16053,10 +16250,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
         forwarded_body: bytes | None = None
+        resource: str | None = None
         if has_body:
-            forwarded_body = self._api_relay_body(request_id, decision.rule_id, audit)
-            if forwarded_body is None:
+            checked = self._api_relay_body(request_id, decision.rule_id, audit)
+            if checked is None:
                 return
+            forwarded_body, resource = checked
+            if resource:
+                # Before the upstream call, so each verdict of this request follows a
+                # line that names what the body reads: a read that fails after the
+                # check was still let through for that resource, and over the cap
+                # the upstream has served it.
+                LOGGER.info(API_RELAY_BODY_CHECKED_LOG, request_id, decision.rule_id, resource)
         if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
@@ -16165,13 +16370,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
+        # `resource` has passed the route's body check, so it is logged as it is. The
+        # audit mapping stays identifiers and outcomes.
         LOGGER.info(
-            "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d",
+            "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d%s",
             request_id,
             host,
             upstream.status,
             len(upstream.body),
             duration_ms,
+            API_RELAY_RESOURCE_LOG_SUFFIX.format(resource) if resource else "",
             extra=audit(AUDIT_STATUS_COMPLETED, duration_ms=duration_ms, upstream_status=upstream.status),
         )
         self.send_response(upstream.status)
@@ -16183,13 +16391,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
 
     def _api_relay_body(
         self, request_id: str, rule_id: str, audit: Callable[..., dict[str, Any]]
-    ) -> bytes | None:
+    ) -> tuple[bytes, str | None] | None:
         """The body the broker forwards for the allowed route `rule_id`, or None after answering.
 
         The caller's body is read up to API_RELAY_MAX_BODY_BYTES, parsed as JSON
         and held to the route's body check. What is returned is the broker's own
         serialisation of the object that passed, so a duplicate key, a comment
-        or any byte the parser dropped never reaches the upstream.
+        or any byte the parser dropped never reaches the upstream, and with it
+        the one resource name of that object the `api body checked` line and
+        the forwarded line may carry (`api_policy.body_resource`), or None. A
+        refused body returns neither.
         """
         # The length `parse_request` framed the request with: None when it cannot
         # be framed (a Transfer-Encoding, a length that is not a number, two
@@ -16256,7 +16467,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return None
-        return json.dumps(parsed, separators=(",", ":")).encode()
+        return json.dumps(parsed, separators=(",", ":")).encode(), api_policy.body_resource(rule_id, parsed)
 
     def _handle_mcp_relay(self) -> None:
         """`POST /v1/mcp/<server>`: one JSON-RPC message to a remote MCP server.
@@ -17156,6 +17367,61 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         status = self._dispatch_vcs_post(verb)
         self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
 
+    def _profile_task_bar(
+        self, principal: Any, verb: str, payload: dict[str, Any], repository: str
+    ) -> tuple[str | None, tuple[str, str, str] | None]:
+        """(refusal, fresh claim): why this permitted profile write isn't its task's, or None.
+
+        The fresh claim is (task, repository, branch) when this call claimed a
+        new branch for a publish, so a failed publish can release it.
+        """
+        task = getattr(principal, "task", None)
+        task_id = str(getattr(task, "task", "") or "")
+        if not task_id:
+            return "this write needs the task its credential names, and the credential names none", None
+        expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
+        record = self.profile_task_writes
+        if verb == "publish":
+            branch = str(payload.get("branch") or "").strip()
+            allowed, fresh = record.claim_branch(
+                task_id, expires_at, repository, branch, lambda: self._remote_branch_exists(payload, branch)
+            )
+            if not allowed:
+                return (
+                    f"{branch} is not a branch this task created: it is on the remote already, or "
+                    "another task published it first, so this task does not publish to it."
+                ), None
+            return None, (task_id, repository, branch) if fresh else None
+        if verb == PROPOSAL_CREATE_VERB:
+            source = str(payload.get("source") or "").strip()
+            if not record.owns_branch(task_id, repository, source):
+                return (
+                    f"{source} is not a branch this task published, so this task does not open a "
+                    "proposal from it."
+                ), None
+            return None, None
+        if verb == "proposal-update":
+            number = payload.get("number")
+            if isinstance(number, bool) or not isinstance(number, int) or not record.owns_proposal(task_id, repository, number):
+                return f"proposal #{number} is not one this task opened, so this task does not update it.", None
+            return None, None
+        return f"{verb} is not a write the task bar knows, so it is refused", None
+
+    def _remote_branch_exists(self, payload: dict[str, Any], branch: str) -> bool:
+        """Whether ``branch`` is on the remote, through the broker's own branch-view."""
+        view = vcs_broker.route_table(self.vcs)["branch-view"]({"repository": payload.get("repository"), "branch": branch})
+        return bool((view or {}).get("branch", {}).get("exists"))
+
+    def _record_task_proposal(self, principal: Any, result: Any, repository: str) -> None:
+        """Record the proposal a profile task's `proposal-create` opened, for its later updates."""
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        number = proposal.get("number") if isinstance(proposal, dict) else None
+        task = getattr(principal, "task", None)
+        task_id = str(getattr(task, "task", "") or "")
+        if task_id and isinstance(number, int) and not isinstance(number, bool):
+            expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
+            self.profile_task_writes.record_proposal(task_id, expires_at, repository, number)
+
     def _mint_claim(self, result: Any, repository: Any) -> None:
         """Add a one-time claim token to a `proposal-create` answer that names its proposal.
 
@@ -17360,6 +17626,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # verb will read it (`snapshot_bare_name_fallback`): lifted
                 # onto the install's GitHub forge, or, when it is read from a
                 # host outside the table with no credential, not at all.
+                if role == CALLER_ROLE_PROFILE and verb == "identity" and not payload.get("repository"):
+                    # A profile's no-repository identity (#6389): the managed
+                    # list's names, read-only, and nothing else. They are the
+                    # names every profile verb is already held to, so this adds
+                    # knowledge of them and no reach: no repository is
+                    # resolved, no forge is called, no credential is spent.
+                    # `capabilities`, which resolves any repository, stays
+                    # refused to the role. Every other role keeps identity's
+                    # repository requirement.
+                    return self._answer_managed_repositories()
                 if verb == PROPOSAL_CLAIM_VERB:
                     # Burned before anything else is asked, so a claim whose
                     # forge check fails below has spent its token too. What
@@ -17440,7 +17716,41 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                             },
                         )
                         return TOOL_STATUS_BLOCKED
-                result = route(payload)
+                # The task bar (#6400): under the permit, only what this task
+                # itself created. The ownership bar above admitted anything the
+                # install made; the permit names one task, so its writes reach
+                # that task's branches and proposals alone.
+                fresh_branch = None
+                task_key = task_repository_key(forge, repository) if resolves else ""
+                if role == CALLER_ROLE_PROFILE and verb in PROFILE_OWNERSHIP_GATED_VCS_VERBS:
+                    refusal, fresh_branch = self._profile_task_bar(principal, verb, payload, task_key)
+                    if refusal is not None:
+                        LOGGER.warning(
+                            "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
+                            _sanitize_for_logging(verb),
+                            RULE_CALLER_VCS_OWNERSHIP,
+                            refusal,
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": refusal,
+                                "code": PROPOSAL_NOT_THIS_TASKS_CODE,
+                                "rule": RULE_CALLER_VCS_OWNERSHIP,
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
+                try:
+                    result = route(payload)
+                except BaseException:
+                    if fresh_branch is not None:
+                        # The publish that would have made the branch failed;
+                        # the name goes back to nobody.
+                        self.profile_task_writes.release_branch(*fresh_branch)
+                    raise
+                if role == CALLER_ROLE_PROFILE and verb == PROPOSAL_CREATE_VERB:
+                    self._record_task_proposal(principal, result, task_key)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)

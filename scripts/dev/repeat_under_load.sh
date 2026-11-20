@@ -11,6 +11,9 @@
 # process may use, so the load lands on the test rather than on idle cores. Go's test result cache
 # is turned off through GOFLAGS, otherwise every run after the first replays the
 # first. The command reads stdin from /dev/null, so every run sees the same input.
+# Each run is a process group of its own; the script sends Ctrl-C, TERM and HUP on to
+# it. A command cannot read the terminal itself (/dev/tty): with setsid the open
+# fails, and without it the run stops until Ctrl-C ends the script.
 # Each run's output is kept as run-<k>.log in a temporary directory named on
 # stderr. A run that fails makes the exit code non-zero and is named on stderr.
 set -euo pipefail
@@ -173,28 +176,33 @@ trap stop_load EXIT
 # normally, and bash would go on to the next run; these traps end the script instead.
 # The run in flight is stopped first: it runs in the background under `wait`, which a
 # trapped signal interrupts at once, where a foreground command would be waited out.
-# With setsid each run is its own process group, so the signal reaches the whole tree
-# (go test's pkg.test binary, pytest's workers) and not just the pid; the handler
-# forwards the signal there, since the terminal's Ctrl-C no longer does, waits a grace
-# period for the run's own interrupt report, then terminates what is left.
+# Each run is its own process group, so the signal reaches the whole tree (go test's
+# pkg.test binary, pytest's workers) and not just the pid; the handler forwards the
+# signal there, since the terminal's Ctrl-C no longer does, waits a grace period for
+# the run's own interrupt report, then terminates what is left. setsid makes the group
+# where the machine has it. Where it has none (macOS), bash's job control makes it.
 run_group=()
+run_job_control=""
 if command -v setsid >/dev/null 2>&1; then
   run_group=(setsid)
+else
+  run_job_control=1
 fi
 cmd_pid=""
 # Signals the run's process group, or its pid where there is no group yet: a signal
-# can land in the instant before the child's setsid has run.
+# can land in the instant before the child's setsid has run. Job control makes the
+# group at the fork, so there it is never missing.
 signal_run() {
-  if [ ${#run_group[@]} -gt 0 ] && kill "-$1" -- "-$cmd_pid" 2>/dev/null; then
+  if kill "-$1" -- "-$cmd_pid" 2>/dev/null; then
     return 0
   fi
   kill "-$1" "$cmd_pid" 2>/dev/null || true
 }
 run_is_alive() {
-  { [ ${#run_group[@]} -gt 0 ] && kill -0 -- "-$cmd_pid" 2>/dev/null; } || kill -0 "$cmd_pid" 2>/dev/null
+  kill -0 -- "-$cmd_pid" 2>/dev/null || kill -0 "$cmd_pid" 2>/dev/null
 }
-# Waits up to so many ticks for the run to be gone: the whole process group where
-# there is one, so a child that outlives the leader gets the same grace.
+# Waits up to so many ticks for the run to be gone: the whole process group, so a
+# child that outlives the leader gets the same grace.
 wait_for_run() {
   local ticks=$1 tick
   for ((tick = 0; tick < ticks; tick++)); do
@@ -204,7 +212,7 @@ wait_for_run() {
 }
 # Stops the run in flight, if one is recorded, and exits. A signal that lands in the
 # instant between starting a run and recording its pid leaves that run unsignalled; it
-# is a foreign command in its own session, and guessing at it from the job table can
+# is a foreign command in its own process group, and guessing at it from the job table can
 # pick a busy loop instead and wait on it forever.
 stop_run_and_exit() {
   local code=$1 sig=$2
@@ -236,13 +244,19 @@ passed=0
 failed_runs=()
 for k in $(seq "$runs"); do
   echo "run $k of $runs" >&2
-  # An async command in a non-interactive shell inherits SIGINT and SIGQUIT ignored,
-  # which would hide Ctrl-C from the test; the subshell restores them before exec
-  # (bash 3.2 does not restore them there, and the run starts with both ignored).
+  # With job control off, an async command in a non-interactive shell inherits SIGINT
+  # and SIGQUIT ignored, which would hide Ctrl-C from the test; the subshell restores
+  # them before exec. bash 3.2 does not restore them there, so with setsid on bash 3.2
+  # the run starts with both ignored. Under job control the async command is a process
+  # group of its own from the fork on, and its SIGINT and SIGQUIT stay at their
+  # defaults, on bash 3.2 too. Job control is on for the start of the run only, so
+  # that nothing else the script starts gets a process group of its own.
+  if [ -n "$run_job_control" ]; then set -m; fi
   (
     trap - INT QUIT
     exec ${run_group[@]+"${run_group[@]}"} ${pin[@]+"${pin[@]}"} "${command[@]}"
   ) </dev/null >"$log_dir/$RUN_LOG_PREFIX$k$RUN_LOG_SUFFIX" 2>&1 &
+  if [ -n "$run_job_control" ]; then set +m; fi
   cmd_pid=$!
   if wait "$cmd_pid"; then
     passed=$((passed + 1))
