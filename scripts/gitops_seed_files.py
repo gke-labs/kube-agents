@@ -32,7 +32,7 @@ GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudge
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a the declared-orphan-snap-seeded snapshot and the mtu-peer-declared peering carry eight postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a, the declared-orphan-snap-seeded snapshot and the mtu-peer-declared peering carry eight postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent

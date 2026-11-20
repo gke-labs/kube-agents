@@ -2278,7 +2278,7 @@ class GitopsSeededFileStateTest(unittest.TestCase):
         # the networking peering item eight); the repositories carry the seven-item
         # blob 3d3a1388, or the six-item cd9d2500, until the pre-merge re-seed
         # replaces it with this one.
-        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("dbf7c7d9"))
+        self.assertTrue(checker.gitops_seeded_blob_sha(checker.GITOPS_INTENT_NOTE_PATH).startswith("b53da76d"))
         with self.assertRaises(KeyError):
             checker.gitops_seeded_bytes("knowledge/other.md")
 

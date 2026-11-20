@@ -152,7 +152,7 @@ readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
 readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, declared-zonal-pool's single zone, declared-orphan-snap-seeded's retention, and the mtu-peer-declared peering's MTU mismatch, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a the declared-orphan-snap-seeded snapshot and the mtu-peer-declared peering carry eight postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom, the declared-zonal-pool of seeded-a, the declared-orphan-snap-seeded snapshot and the mtu-peer-declared peering carry eight postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
