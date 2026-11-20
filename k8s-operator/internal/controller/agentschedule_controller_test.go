@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -1017,4 +1018,38 @@ func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
 			t.Fatalf("a delivery was asked after past the window: %+v", s.Status.RecentRuns[0])
 		}
 	})
+}
+
+// A stop whose answer never made it into status (the stop failed and the
+// pass's last status write failed too, or the operator died meanwhile) is
+// sent again on the next pass: the token is recorded only once the gateway
+// has answered, never before.
+func TestAgentScheduleAStopLostBeforeItsAnswerIsSentAgain(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	inner := f.r.Client
+	writes := 0
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes++
+			if writes > 1 {
+				return errors.New("the API server is unavailable")
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	f.annotateStop(t, "s1")
+	f.clock = hourAt(1, 1)
+	_, _ = f.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: f.key})
+	if s := f.get(t); s.Status.LastHandledStop == "s1" {
+		t.Fatal("the token was persisted as handled before the gateway answered")
+	}
+	f.r.Client = inner
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 2 {
+		t.Fatalf("the lost stop: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
 }

@@ -640,17 +640,21 @@ func (r *AgentScheduleReconciler) handleStop(ctx context.Context, sched *agentv1
 	if r.Stopper == nil {
 		return false, nil
 	}
-	// The token is recorded before the stop is sent, and checked kept: an
-	// API server still serving a CRD from before lastHandledStop (helm
-	// upgrade never applies crds/) prunes it, and a token that can't be
-	// recorded would read as new on every pass and stop every later run.
-	prev, prevStopped := st.LastHandledStop, st.StoppedTaskID
-	st.LastHandledStop, st.StoppedTaskID = token, st.ActiveTaskID
+	// Two phases. First the run being stopped (stoppedTaskID) is written and
+	// checked kept: an API server still serving a CRD from before these
+	// fields (helm upgrade never applies crds/) prunes it, and there a token
+	// could never be recorded, would read as new on every pass, and would
+	// stop every later run. The token itself is recorded only once the
+	// gateway has answered, so a stop lost to a crash, a lost leadership or a
+	// failed write before it is sent again on the next pass (the gateway
+	// answers a repeat for a run it already stopped as stopped).
+	prevStopped := st.StoppedTaskID
+	st.StoppedTaskID = st.ActiveTaskID
 	if err := r.writeStatus(ctx, sched, pass); err != nil {
 		return false, err
 	}
-	if st.LastHandledStop != token {
-		logf.FromContext(ctx).Error(nil, "not stopping a scheduled run: the AgentSchedule CRD drops status.lastHandledStop; apply this release's CRDs",
+	if st.StoppedTaskID != st.ActiveTaskID {
+		logf.FromContext(ctx).Error(nil, "not stopping a scheduled run: the AgentSchedule CRD drops status.stoppedTaskID and lastHandledStop; apply this release's CRDs",
 			"schedule", sched.Name, "taskId", st.ActiveTaskID)
 		return false, nil
 	}
@@ -658,15 +662,17 @@ func (r *AgentScheduleReconciler) handleStop(ctx context.Context, sched *agentv1
 	switch {
 	case errors.Is(err, errTriggerStopRefused):
 		// The gateway refused this stop for good (the run predates the
-		// record of its trigger, say): the token stays handled, and the
-		// run ends at its deadline.
+		// record of its trigger, say): the token is handled, and the run
+		// ends at its deadline.
 		logf.FromContext(ctx).Error(err, "the gateway refused a scheduled run's stop", "schedule", sched.Name, "taskId", st.ActiveTaskID)
+		st.LastHandledStop, st.StoppedTaskID = token, prevStopped
 		return false, nil
 	case err != nil:
 		logf.FromContext(ctx).Error(err, "stopping a scheduled run", "schedule", sched.Name, "taskId", st.ActiveTaskID)
-		st.LastHandledStop, st.StoppedTaskID = prev, prevStopped
+		st.StoppedTaskID = prevStopped
 		return true, nil
 	}
+	st.LastHandledStop = token
 	// Stopped: the run's terminal (canceled) arrives through the tracker,
 	// which records it as Cancelled. Already final or unknown: the tracker
 	// settles it as it ends or goes missing.
