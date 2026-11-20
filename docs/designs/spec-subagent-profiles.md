@@ -670,7 +670,8 @@ is the harness process itself, and its death is the orphan path.
 
 The platform agent is the privileged doer - provisioning, fleet audits, the GitOps write
 path - and today it is also a kanban worker like any other when the front door delegates
-to it. As a profile:
+to it. Everything it does today, and what a profile still lacks for each, is in
+[the platform-as-profile inventory](platform-as-profile-inventory.md). As a profile:
 
 ```yaml
 apiVersion: kubeagents.x-k8s.io/v1alpha1
