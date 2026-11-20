@@ -1399,6 +1399,13 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# post-merge-verified-fixed: the post-merge check's verify-after-merge loop
+# (#6343 case 1), the eval record for #6311. A writer: the check merges the
+# agent's no-pdb fix, applies it and drives the cron's ticks (post_merge.py).
+# Cost: each repetition holds a serial writers slot for the agent's turn plus
+# up to 15 minutes of ticks, about 45 minutes a night across three.
+./tasks/post-merge-verified-fixed/task.yaml
+
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
 # into the platform charts context repository, names the chart template
