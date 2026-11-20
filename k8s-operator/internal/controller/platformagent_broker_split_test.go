@@ -1098,18 +1098,30 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 		t.Fatalf("the health listener shares a port with another broker listener: %v", listeners)
 	}
 
-	var healthRoutes int
+	var healthRoutes, proxyHealthRoutes, proxyCatchAllRoutes int
 	for _, listener := range config.StaticResources.Listeners {
-		if listener.Name != "credential_health" {
-			continue
-		}
 		for _, chain := range listener.FilterChains {
 			for _, filter := range chain.Filters {
 				for _, host := range filter.TypedConfig.RouteConfig.VirtualHosts {
-					for _, route := range host.Routes {
-						healthRoutes++
-						if route.Match.Path != "/healthz" || route.Match.Prefix != "" || route.Route.Cluster != "credential_health" {
-							t.Fatalf("the health listener routes %#v; want exactly /healthz to credential_health, so that nothing credentialed is reachable on the probe's port", route)
+					for i, route := range host.Routes {
+						switch listener.Name {
+						case "credential_health":
+							healthRoutes++
+							if route.Match.Path != "/healthz" || route.Match.Prefix != "" || route.Route.Cluster != "credential_health" {
+								t.Fatalf("the health listener routes %#v; want exactly /healthz to credential_health, so that nothing credentialed is reachable on the probe's port", route)
+							}
+						case "credential_proxy":
+							if route.Match.Path == "/healthz" {
+								if i != 0 || route.Route.Cluster != "credential_health" {
+									t.Fatalf("credential_proxy /healthz route (%d) = %#v; want index 0 to credential_health so watches never starve peer probes", i, route)
+								}
+								proxyHealthRoutes++
+							} else if route.Match.Prefix == "/" {
+								if route.Route.Cluster != "credential_runtime" {
+									t.Fatalf("credential_proxy catch-all route = %#v; want credential_runtime", route)
+								}
+								proxyCatchAllRoutes++
+							}
 						}
 					}
 				}
@@ -1118,6 +1130,9 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 	}
 	if healthRoutes != 1 {
 		t.Fatalf("the health listener has %d routes; want one, /healthz", healthRoutes)
+	}
+	if proxyHealthRoutes != 1 || proxyCatchAllRoutes != 1 {
+		t.Fatalf("credential_proxy listener has healthRoutes=%d catchAll=%d; want 1 and 1", proxyHealthRoutes, proxyCatchAllRoutes)
 	}
 
 	sockets := map[string]string{}

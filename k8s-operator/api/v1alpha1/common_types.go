@@ -994,23 +994,25 @@ type TuningSpec struct {
 	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
 	// coordinator waiting on its own children gives its slot back but stays resident, so
 	// processes can sit above six. The credential proxy at its default 2Gi memory limit
-	// admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
-	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
-	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
+	// admits 10 brokered commands at once, held to 8 by its small/default slot cap, which
+	// the stall watch's and cluster-agent reconcile's four-wide listings share. Per-install
+	// model rate limits are not measured: a small quota may see 429s at 6, so lower this if
 	// worker logs show them.
 	//
 	// Set it higher once a deployment has measured its own worker footprint and model
-	// quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
-	// already admits more than its slot cap of 8, so up to about eight workers' worth of
-	// commands fit at the defaults, fewer while the listings above run. Past that the
-	// slot cap binds, and no CR field moves it, so raising the memory limit in
-	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
-	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-	// more, since below it the memory budget (176 MiB per command after the 192 MiB
-	// resident reserve) binds first. Set it to 1 to serialise all delegated work. When
-	// quota rather than memory binds, note the related failure mode: workers that exhaust their retry
-	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
-	// as a "protocol violation" rather than as the quota exhaustion it actually is.
+	// quota. The credential proxy sets the ceiling on brokered commands: its small/default
+	// 2Gi already admits more than its slot cap of 8, so up to about eight workers' worth
+	// of commands fit at the defaults, fewer while the listings above run. Past that the
+	// slot cap binds (8 on fixed profiles and default, stepping 8/12/16 across
+	// small/medium/fleet under spec.deployment.sizingProfile: auto); raising only the
+	// proxy memory limit in spec.deployment.credentialProxy.resources without enabling
+	// auto does not raise the slot cap, and a command beyond the cap waits up to 60 s for
+	// a slot and is then refused busy. Keep that limit at 2Gi or more, since below it the memory budget
+	// (176 MiB per command after the 192 MiB resident reserve) binds first. Set it to 1 to
+	// serialise all delegated work. When quota rather than memory binds, note the related
+	// failure mode: workers that exhaust their retry budget exit without calling a terminal
+	// kanban tool, and the dispatcher reports that as a "protocol violation" rather than
+	// as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
@@ -1620,33 +1622,35 @@ type DeploymentSpec struct {
 	// 4Gi. "fleet" raises the broker to 4 CPU and 8Gi requests with 8 CPU and
 	// 8Gi limits and the 8Gi ephemeral-storage limit, the sidecar's memory
 	// limit to 8Gi and the shell's to 4Gi. "auto" promotes the tier from the
-	// cluster count the operator polls into status.usage, the larger of
+	// cluster count the operator polls into status.usage (the larger of
 	// clustersRegistered and clustersMonitored: medium at 10 clusters, fleet
-	// at 25. It continues from the tier status.effectiveSizingTier holds,
-	// which is small on a CR that never named a tier and the explicit tier
-	// on one that did; set small first to restart it from small. A promotion
-	// is upward only, latched in that status field, so a count that falls
-	// never lowers the tier; and before each step up the operator checks
-	// every ResourceQuota in the namespace that counts these pods for the
-	// cpu, memory and ephemeral-storage the step adds, and every LimitRange
-	// max, min and maxLimitRequestRatio in the namespace against the three
-	// containers' figures at the higher row, per container and summed per
-	// pod, takes the highest tier both admit (the running one when they
-	// admit none) and sets the
-	// SizingCappedByQuota condition for the step refused, naming the quota
-	// or the LimitRange, rather than rolling out pods admission would refuse.
-	// A pod the namespace admits between that check and the recreated
-	// broker's admission can take the room the check found; a step whose
-	// pod a quota then refuses is stepped back one tier, the condition
-	// naming the quota and admission's message.
-	// The check reads namespaced admission, not node capacity: on GKE
-	// Standard the medium and fleet rows' broker requests (1 and 4 CPU) have
-	// to fit on one node before the recreated broker can start, so a Standard
-	// pool needs nodes that fit the fleet row's 4 CPU request (e2-standard-8
-	// or larger) before the count reaches 25 under auto. An
-	// explicit tier is applied as written, without either check. The agent
-	// container's own resources are not part of a profile. A change of tier
-	// recreates the proxy pod once and rolls the gateway and the shell pod.
+	// at 25) and proactively from sustained utilization (>= 75% of the current
+	// tier's capacity for 5m across PodMetrics CPU/memory or credential-proxy
+	// slot/budget/cgroup metrics). Under "auto" the tier can also step down one
+	// tier at a time (never below the cluster-count floor) when all scaled
+	// dimensions stay <= 55% of the lower tier's capacity for 25m after a 30m
+	// transition cooldown. It continues from the tier
+	// status.effectiveSizingTier holds, which is small on a CR that never named
+	// a tier and the explicit tier on one that did; set small first to restart
+	// it from small. Before each tier transition the operator checks every ResourceQuota
+	// in the namespace that counts these pods (including surge room for the
+	// credential-proxy RollingUpdate replacement alongside the running pod) and
+	// every LimitRange max, min and maxLimitRequestRatio in the namespace
+	// against the three containers' figures at the candidate row, per container
+	// and summed per pod, takes the highest tier both admit on step-up (or stays
+	// on the running one when they admit none) and sets the SizingCappedByQuota condition for the
+	// step refused, naming the quota, LimitRange, or pending surge capacity. If
+	// a surge pod stays unschedulable past the warm timeout or is refused by
+	// admission, the operator rolls back to the active running tier without
+	// terminating the healthy active broker. An explicit tier ("small", "medium",
+	// "fleet") or unset default renders credential-proxy with Recreate and is
+	// applied as written, without either check. The agent container's own
+	// resources are not part of a profile. Under "auto", a change of tier rolls
+	// credential-proxy in-cluster with active-standby maxSurge 1 / maxUnavailable 0
+	// handoff (after one Recreate hop on upgrade from a pre-standby pod) and
+	// restarts the gateway (every tier change) and the shell pod (on fleet
+	// transitions only), while fixed-2Gi credential-proxy-exec pods keep their
+	// 8-slot cap unchanged.
 	// +kubebuilder:validation:Enum=small;medium;fleet;auto
 	// +optional
 	SizingProfile string `json:"sizingProfile,omitempty"`
@@ -1686,10 +1690,11 @@ type CredentialProxySpec struct {
 	// their number: the broker charges each command about 128Mi, the size of
 	// a listing of a small cluster, and a kubectl listing thousands of objects
 	// holds several hundred Mi on its own, so size the limit to the largest
-	// listing the fleet produces for every command that runs at once (eight
-	// at the slot cap) plus the 192Mi resident reserve for the broker and
-	// Envoy; the broker's child peak and memory high-water series give the
-	// figure.
+	// listing the fleet produces for every command that runs at once (8 on
+	// fixed/default profiles, or 8/12/16 across small/medium/fleet under
+	// sizingProfile: auto) plus the 192Mi resident reserve
+	// for the broker and Envoy; the broker's child peak and memory high-water
+	// series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a request
@@ -1698,7 +1703,8 @@ type CredentialProxySpec struct {
 	// one that was valid, renders the proxy Deployment at the sizing
 	// profile's row (the operator's defaults under small), not at the last
 	// accepted override, until it is corrected,
-	// which on the proxy's Recreate Deployment restarts the proxy once; the
+	// which rolls the proxy Deployment once (active-standby RollingUpdate under
+	// sizingProfile: auto in-cluster, or Recreate otherwise); the
 	// operator reports Degraded with reason InvalidCredentialProxyResources
 	// when no higher-ranked Degraded cause is present, the agent staying
 	// Ready, whether or not the validating webhook is enabled. Where the
@@ -2918,14 +2924,23 @@ type AgentStatus struct {
 	// EffectiveSizingTier is the sizing tier the operator last rendered the
 	// credential proxy, the agent-api-auth sidecar and the shell container at:
 	// "small", "medium" or "fleet". Under spec.deployment.sizingProfile "auto"
-	// it is also the latch: the tier rises from the value here with the
-	// cluster count, is stepped back one tier when admission refuses the pod
-	// a step recreated (the SizingCappedByQuota condition beside it says
-	// which quota), and a recreated CR starts again at small. Under an
-	// explicit profile it repeats that profile. Absent before the first pass
-	// that resolved it.
+	// it holds the current live tier: promoted proactively by sustained
+	// utilization (>= 75% for 5m) or cluster count (10 / 25), stepped down one
+	// tier when all dimensions stay <= 55% of the lower tier for 25m (never
+	// below the cluster-count floor, subject to a 30m cooldown), and rolled
+	// back when admission or node capacity cannot schedule the replacement pod
+	// (the SizingCappedByQuota condition beside it says why). Under an explicit
+	// profile it repeats that profile. Absent before the first pass that
+	// resolved it.
 	// +optional
 	EffectiveSizingTier string `json:"effectiveSizingTier,omitempty"`
+
+	// Sizing reports proactive utilization-driven auto-sizing telemetry,
+	// soak timestamps, and the current trigger beside EffectiveSizingTier.
+	// Absent until the first reconcile under a CRD carrying the field, and
+	// while the served CRD predates it.
+	// +optional
+	Sizing *SizingStatus `json:"sizing,omitempty"`
 
 	// DeploymentStatus tracks the state of the underlying compute.
 	// +optional
@@ -3023,6 +3038,61 @@ type AgentStatus struct {
 	// picked up within a day.
 	// +optional
 	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
+}
+
+// SizingStatus reports proactive utilization-driven sizing telemetry and
+// hysteresis soak state alongside status.effectiveSizingTier.
+type SizingStatus struct {
+	// ActiveTier is the tier currently rendered onto the sized workloads
+	// ("small", "medium", or "fleet").
+	// +optional
+	ActiveTier string `json:"activeTier,omitempty"`
+
+	// DesiredTier is the tier currently justified by cluster count and
+	// sustained utilization before any ResourceQuota, LimitRange, or surge
+	// capacity cap.
+	// +optional
+	DesiredTier string `json:"desiredTier,omitempty"`
+
+	// Trigger identifies what drove the current ActiveTier or DesiredTier
+	// decision: "manual", "cluster-count", "utilization", or "both".
+	// +optional
+	Trigger string `json:"trigger,omitempty"`
+
+	// ScaleUpSustainedSince records when a bottleneck dimension first stayed
+	// at or above the step-up utilization threshold (>= 75% of current tier
+	// capacity). Cleared when utilization falls below threshold or after
+	// promotion.
+	// +optional
+	ScaleUpSustainedSince *metav1.Time `json:"scaleUpSustainedSince,omitempty"`
+
+	// ScaleDownSustainedSince records when all dimensions that shrink in the
+	// lower tier first remained at or below the step-down threshold (<= 55%
+	// of the lower tier's capacity). Cleared when utilization rises above the
+	// threshold, at the cluster-count floor, or after demotion.
+	// +optional
+	ScaleDownSustainedSince *metav1.Time `json:"scaleDownSustainedSince,omitempty"`
+
+	// LastTransitionTime records when EffectiveSizingTier last changed, used to
+	// enforce the step-down cooldown window.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	// LastObservedPeakPct is the highest utilization percentage (0-100+) seen
+	// across the sized workloads on the latest sample.
+	// +optional
+	LastObservedPeakPct *int32 `json:"lastObservedPeakPct,omitempty"`
+
+	// LastObservedDimension names the bottleneck dimension for
+	// LastObservedPeakPct (for example "memory", "cpu", "slots",
+	// "child_memory", "cgroup_memory", or "watermark").
+	// +optional
+	LastObservedDimension string `json:"lastObservedDimension,omitempty"`
+
+	// LastObservedWorkload names the workload owning LastObservedDimension
+	// (for example "credential-proxy", "agent-api-auth", or "shell").
+	// +optional
+	LastObservedWorkload string `json:"lastObservedWorkload,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was

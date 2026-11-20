@@ -336,7 +336,7 @@ func TestTheExecTierIgnoresFieldsOthersSetOnTheBroker(t *testing.T) {
 			},
 		}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
+	if _, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
 		t.Fatal(err)
 	}
 	dep := &appsv1.Deployment{}
@@ -846,6 +846,55 @@ func TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier(t *testing.T) {
 					if !v.EmptyDir.SizeLimit.Equal(resource.MustParse(credentialProxyExecTierTmpSizeLimit)) {
 						t.Errorf("exec /tmp sizeLimit = %v", v.EmptyDir.SizeLimit)
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestTheExecTierPinsSlotCapAcrossSizingProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		name, profile, effectiveTier string
+		wantStatefulSlots            string
+	}{
+		{"small", sizingProfileSmall, "", credentialProxyMaxConcurrentCommands},
+		{"medium", sizingProfileMedium, "", credentialProxyMaxConcurrentCommands},
+		{"fleet", sizingProfileFleet, "", credentialProxyMaxConcurrentCommands},
+		{"auto-medium", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMaxConcurrentCommands},
+		{"auto-fleet", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMaxConcurrentCommands},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := execTierTestAgent(ptr.To(int32(1)))
+			agent.Spec.Deployment.SizingProfile = tc.profile
+			agent.Status.EffectiveSizingTier = tc.effectiveTier
+			statefulDep := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+			var gotStateful string
+			for _, c := range statefulDep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				for _, e := range c.Env {
+					if e.Name == credentialProxyMaxConcurrentCommandsEnv {
+						gotStateful = e.Value
+					}
+				}
+			}
+			if gotStateful != tc.wantStatefulSlots {
+				t.Fatalf("stateful %s at %s = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, tc.name, gotStateful, tc.wantStatefulSlots)
+			}
+			dep := buildCredentialProxyExecTierDeployment(agent, statefulDep)
+			for _, c := range dep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				var found string
+				for _, e := range c.Env {
+					if e.Name == credentialProxyMaxConcurrentCommandsEnv {
+						found = e.Value
+					}
+				}
+				if found != credentialProxyMaxConcurrentCommands {
+					t.Fatalf("exec %s at %s = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, tc.name, found, credentialProxyMaxConcurrentCommands)
 				}
 			}
 		})

@@ -135,7 +135,7 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # default is None (unbounded). A test that calls `serve` puts them back: a later
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
-_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots", "lifecycle", "readings_sweep")
 
 
 def setUpModule():
@@ -10217,6 +10217,9 @@ class GracefulDrainTest(unittest.TestCase):
         slack = mock.patch.object(CredentialProxyHandler, "slack_relay", None)
         slack.start()
         self.addCleanup(slack.stop)
+        lifecycle = mock.patch.object(CredentialProxyHandler, "lifecycle", None)
+        lifecycle.start()
+        self.addCleanup(lifecycle.stop)
 
     def _handler(self, path):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
@@ -10226,7 +10229,9 @@ class GracefulDrainTest(unittest.TestCase):
         handler._authenticated = lambda: object()
         handler._counted_in_flight = False
         captured = {}
-        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+        handler._json = lambda status, payload, headers=None: captured.update(
+            status=status, payload=payload, headers=headers
+        )
         return handler, captured
 
     def test_a_new_request_is_refused_with_the_draining_bound(self):
@@ -10245,6 +10250,10 @@ class GracefulDrainTest(unittest.TestCase):
                 with mock.patch.object(credential_proxy, "drain_request_body") as drained:
                     getattr(handler, f"do_{method}")()
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+                self.assertEqual(
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)},
+                    captured["headers"],
+                )
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
                      "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
@@ -10269,15 +10278,15 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual({}, captured)
 
     def test_a_draining_exec_pod_fails_its_readiness_probe(self):
-        # The readiness probe reads /healthz. An exec pod that drains answers
-        # 503, so the Service stops sending it new connections and a caller at
-        # one replica falls back to the stateful broker; the broker, which
-        # rolls with Recreate, and any pod that does not drain answer ok.
+        # The readiness probe reads /healthz. Both an exec pod and a RollingUpdate
+        # standalone broker return 503 while draining so Kubernetes stops routing
+        # new connections to them while in-flight requests finish; a sidecar role
+        # or non-draining pod answers ok.
         cases = (
             (credential_proxy_client.EXEC_ROLE, True, HTTPStatus.SERVICE_UNAVAILABLE,
              credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             (credential_proxy_client.EXEC_ROLE, False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
-            ("broker", True, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", True, HTTPStatus.SERVICE_UNAVAILABLE, credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             ("broker", False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
         )
         for role, draining, status, payload in cases:
@@ -22083,7 +22092,13 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.metrics = credential_proxy.ProxyMetrics()
         handler.replies = []
-        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        handler.reply_headers = []
+
+        def _capture_json(status, payload, headers=None):
+            handler.replies.append((status, payload))
+            handler.reply_headers.append(headers)
+
+        handler._json = _capture_json
         handler._busy(credential_proxy.CommandSlotUnavailable("held", bound=bound))
         return handler
 
@@ -22102,6 +22117,12 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
                        credential_proxy_client.BUSY_BOUND_KEY: bound, "error": "held"})],
                     handler.replies,
                 )
+                expected_headers = (
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)}
+                    if bound == credential_proxy_client.ADMISSION_BOUND_DRAINING
+                    else None
+                )
+                self.assertEqual([expected_headers], handler.reply_headers)
                 self.assertIn(
                     f'{credential_proxy.ADMISSION_REFUSALS_METRIC}{{bound="{bound}",class="interactive"}} 1',
                     handler.metrics.render(),
